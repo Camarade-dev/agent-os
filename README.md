@@ -1,19 +1,43 @@
 # Agent OS
 
-Agent OS is a **local epistemic protocol** for governed agentic execution. It is not a dashboard, agent panel, SaaS, or orchestration platform.
+**v0.1.0** — local governed-delegation prototype · [release notes](docs/release-notes-v0.1.0.md) · [why Agent OS](docs/why-agent-os.md)
 
-It helps a human owner delegate work to fallible coding and research agents by structuring:
+Agent OS is a **local filesystem protocol and CLI** for governed delegation to fallible coding and research agents. It is not a dashboard, SaaS, runtime, orchestrator, benchmark, or agent panel.
 
-- mission and scope
-- authority and autonomy gates
-- context separation
-- evidence and audit
-- owner decision and closure
-- memory hygiene
+## What problem it solves
 
-**Agent OS v0 does not execute agents, orchestrate agents, or replace owner judgment.** It provides a filesystem-based protocol and CLI to create, review, and close governed runs locally.
+Coding and research agents are useful but fallible. Ad-hoc prompts and chat threads do not reliably preserve mission, authority, evidence, audit, owner decision, or closure. Agent OS structures those concerns as inspectable markdown artifacts so delegation stays bounded and reviewable. It does **not** make agents reliable by itself, execute agents, or replace owner judgment.
 
-For the formal v0 scope boundary (in scope, out of scope, trust model, release checklist), see [`docs/v0-release-boundary.md`](docs/v0-release-boundary.md). Release history: [`CHANGELOG.md`](CHANGELOG.md) · [`docs/release-notes-v0.1.0.md`](docs/release-notes-v0.1.0.md).
+## What is in v0.1.0
+
+- **CLI** (`init`, `mission`, `status`, `audit`, `close`) plus registrar-only **evidence** helpers (`add`, `add-file`, `add-command-output`, `snapshot-git`, `list`)
+- **Templates** for mission, scope, authority, autonomy, evidence, audit, owner decision, closure, and memory update
+- **Fail-closed closure** — runs cannot close until required fields are filled
+- **Stdlib-only Python package** — install from source, Python 3.10+, no runtime dependencies
+- **Documentation** — protocol primitives, operating loop, evidence doctrine, dogfood examples
+
+## What is not included
+
+Agent OS v0.1.0 is **not**: a UI or dashboard, an agent executor or orchestrator, a cloud service or API, multi-user auth, billing, benchmarks, LLM calls, auto-audit, or auto-close. See [`docs/v0-release-boundary.md`](docs/v0-release-boundary.md) for the formal boundary.
+
+## Who it is for
+
+Owners who delegate non-trivial work to agents and need **governed handoffs** — real scope risk, reviewable artifacts, and closure that waits on explicit fields, not on the agent stopping. Skip it for one-shot prompts where structure would be overhead.
+
+## Try it locally
+
+```bash
+git clone https://github.com/Camarade-dev/agent-os.git
+cd agent-os
+pip install -e .
+agent-os init .
+agent-os mission .
+agent-os status .
+```
+
+Fill run artifacts under `.agent-os/runs/<run-id>/`, then `agent-os audit <run-id> .` and `agent-os close <run-id> .`. Full walkthrough below.
+
+---
 
 ## When to use Agent OS (v0)
 
@@ -29,7 +53,7 @@ For concrete dogfood evidence and the usage-threshold tradeoff, see `docs/dogfoo
 ## Install from source
 
 ```bash
-git clone <repo-url> agent-os
+git clone https://github.com/Camarade-dev/agent-os.git
 cd agent-os
 pip install -e .
 ```
@@ -120,4 +144,4 @@ agent-os/
 
 Agent OS v0 is intentionally minimal: CLI and scripts only, local-only, no cloud, no UI, no API server, no multi-user features, no billing, and no autonomous agent execution. The protocol lives in markdown artifacts under `.agent-os/` inside projects that adopt it.
 
-See `docs/v0-release-boundary.md` for the v0 release boundary, `docs/thesis.md` for the product thesis, `docs/dogfood-001-todo-cli.md`, `docs/dogfood-002-markdown-evidence-pack.md`, `docs/dogfood-003-local-site-audit.md`, and `docs/dogfood-004-json-config-linter.md` for dogfood synthesis, `docs/evidence-capture-doctrine-v0.md` for evidence capture doctrine, `docs/evidence-capture-boundaries-v0.md` for evidence helper boundaries, and `examples/manual-agent-workflow.md` for a walkthrough.
+See [`docs/why-agent-os.md`](docs/why-agent-os.md) for the epistemic rationale, `docs/v0-release-boundary.md` for the v0 release boundary, `docs/thesis.md` for the product thesis, `docs/dogfood-001-todo-cli.md`, `docs/dogfood-002-markdown-evidence-pack.md`, `docs/dogfood-003-local-site-audit.md`, and `docs/dogfood-004-json-config-linter.md` for dogfood synthesis, `docs/evidence-capture-doctrine-v0.md` for evidence capture doctrine, `docs/evidence-capture-boundaries-v0.md` for evidence helper boundaries, and `examples/manual-agent-workflow.md` for a walkthrough.
