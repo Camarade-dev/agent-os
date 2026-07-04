@@ -13,6 +13,8 @@ It helps a human owner delegate work to fallible coding and research agents by s
 
 **Agent OS v0 does not execute agents, orchestrate agents, or replace owner judgment.** It provides a filesystem-based protocol and CLI to create, review, and close governed runs locally.
 
+For the formal v0 scope boundary (in scope, out of scope, trust model, release checklist), see [`docs/v0-release-boundary.md`](docs/v0-release-boundary.md).
+
 ## When to use Agent OS (v0)
 
 Agent OS v0 is **not** meant for tiny one-shot tasks where a normal prompt is enough. It is meant for **governed delegation** where mission, authority, evidence, audit, and closure matter — work with real scope risk, a need for reviewable artifacts, or handoffs that must not close until required fields are filled.
@@ -118,4 +120,4 @@ agent-os/
 
 Agent OS v0 is intentionally minimal: CLI and scripts only, local-only, no cloud, no UI, no API server, no multi-user features, no billing, and no autonomous agent execution. The protocol lives in markdown artifacts under `.agent-os/` inside projects that adopt it.
 
-See `docs/thesis.md` for the product thesis, `docs/dogfood-001-todo-cli.md`, `docs/dogfood-002-markdown-evidence-pack.md`, `docs/dogfood-003-local-site-audit.md`, and `docs/dogfood-004-json-config-linter.md` for dogfood synthesis, `docs/evidence-capture-doctrine-v0.md` for evidence capture doctrine, `docs/evidence-capture-boundaries-v0.md` for evidence helper boundaries, and `examples/manual-agent-workflow.md` for a walkthrough.
+See `docs/v0-release-boundary.md` for the v0 release boundary, `docs/thesis.md` for the product thesis, `docs/dogfood-001-todo-cli.md`, `docs/dogfood-002-markdown-evidence-pack.md`, `docs/dogfood-003-local-site-audit.md`, and `docs/dogfood-004-json-config-linter.md` for dogfood synthesis, `docs/evidence-capture-doctrine-v0.md` for evidence capture doctrine, `docs/evidence-capture-boundaries-v0.md` for evidence helper boundaries, and `examples/manual-agent-workflow.md` for a walkthrough.
