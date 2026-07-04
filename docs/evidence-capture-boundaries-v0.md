@@ -127,7 +127,9 @@ Design constraints for any implementation:
 
 **`agent-os evidence add` is implemented** as the first minimal bounded helper. It is **registrar-only**: it appends a structured block to `evidence.md` with timestamp, type (default `note`), optional path reference, and claim text. It does not copy files, run commands, judge sufficiency, modify audit/owner-decision/closure artifacts, or auto-close runs.
 
-Other helpers listed in section 5 (`add-file`, `add-command-output`, `list`, `snapshot-git`) remain **not implemented**.
+**`agent-os evidence list` is implemented** as a read-only index helper. It reads `evidence.md` and prints structured entries previously appended by `evidence add` (timestamp, type, optional path, claim preview). It does not modify any run artifacts or change validation behavior.
+
+Other helpers listed in section 5 (`add-file`, `add-command-output`, `snapshot-git`) remain **not implemented**.
 
 In v0:
 

@@ -12,6 +12,7 @@ from agent_os.workspace import (
     close_run,
     create_mission,
     init_workspace,
+    list_evidence,
     list_runs,
     record_audit,
 )
@@ -67,6 +68,17 @@ def cmd_audit(args: argparse.Namespace) -> int:
         print(str(exc), file=sys.stderr)
         return 1
     print(f"audit recorded for run {args.run_id}: {args.verdict}")
+    return 0
+
+
+def cmd_evidence_list(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        output = list_evidence(project, args.run_id)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(output)
     return 0
 
 
@@ -165,6 +177,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional local artifact path reference (not copied)",
     )
     evidence_add_parser.set_defaults(func=cmd_evidence_add)
+
+    evidence_list_parser = evidence_sub.add_parser(
+        "list",
+        help="print a read-only index of structured evidence entries",
+    )
+    evidence_list_parser.add_argument("run_id", help="run identifier")
+    evidence_list_parser.add_argument("path", nargs="?", help="target project directory")
+    evidence_list_parser.set_defaults(func=cmd_evidence_list)
 
     return parser
 

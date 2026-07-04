@@ -18,6 +18,7 @@ from agent_os.workspace import (
     close_run,
     create_mission,
     init_workspace,
+    list_evidence,
     list_runs,
     record_audit,
 )
@@ -313,6 +314,111 @@ class AgentOsTests(unittest.TestCase):
         self.assertIn("audit verdict field is placeholder", errors)
         self.assertIn("owner decision field is placeholder", errors)
         self.assertIn("closure verdict field is placeholder", errors)
+
+    def test_evidence_list_prints_structured_entries(self) -> None:
+        run_id = create_mission(self.project, "20260704-020")
+        add_evidence(
+            self.project,
+            run_id,
+            "unittest: 18 passed",
+            evidence_type="test",
+        )
+        add_evidence(
+            self.project,
+            run_id,
+            "report generated",
+            evidence_type="artifact",
+            artifact_path="reports/report.md",
+        )
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["evidence", "list", run_id, str(self.project)])
+        self.assertEqual(code, 0)
+        output = buf.getvalue()
+        self.assertIn(f"Evidence for run {run_id}:", output)
+        self.assertRegex(output, r"1\. \d{4}-\d{2}-\d{2}T.*\[test\] unittest: 18 passed")
+        self.assertRegex(output, r"2\. \d{4}-\d{2}-\d{2}T.*\[artifact\] report generated")
+
+    def test_evidence_list_includes_optional_path(self) -> None:
+        run_id = create_mission(self.project, "20260704-021")
+        add_evidence(
+            self.project,
+            run_id,
+            "report generated",
+            evidence_type="artifact",
+            artifact_path="reports/report.md",
+        )
+
+        output = list_evidence(self.project, run_id)
+        self.assertIn("path: reports/report.md", output)
+
+    def test_evidence_list_handles_no_entries_gracefully(self) -> None:
+        run_id = create_mission(self.project, "20260704-022")
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["evidence", "list", run_id, str(self.project)])
+        self.assertEqual(code, 0)
+        output = buf.getvalue().strip()
+        self.assertEqual(output, f"Evidence for run {run_id}:")
+
+    def test_evidence_list_fails_for_missing_run(self) -> None:
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(["evidence", "list", "missing-run", str(self.project)])
+        self.assertEqual(code, 1)
+        self.assertIn("run not found", buf.getvalue())
+
+    def test_evidence_list_fails_for_missing_evidence_file(self) -> None:
+        run_id = create_mission(self.project, "20260704-023")
+        (run_path(self.project, run_id) / "evidence.md").unlink()
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(["evidence", "list", run_id, str(self.project)])
+        self.assertEqual(code, 1)
+        self.assertIn("evidence file missing", buf.getvalue())
+
+    def test_evidence_list_does_not_modify_evidence_md(self) -> None:
+        run_id = create_mission(self.project, "20260704-024")
+        add_evidence(self.project, run_id, "immutable listing")
+        evidence_path = run_path(self.project, run_id) / "evidence.md"
+        before = evidence_path.read_text(encoding="utf-8")
+        list_evidence(self.project, run_id)
+        self.assertEqual(before, evidence_path.read_text(encoding="utf-8"))
+
+    def test_evidence_list_does_not_modify_audit_owner_closure_or_run_json(self) -> None:
+        run_id = create_mission(self.project, "20260704-025")
+        base = run_path(self.project, run_id)
+        add_evidence(self.project, run_id, "read-only index")
+        snapshots = {
+            "evidence.md": (base / "evidence.md").read_text(encoding="utf-8"),
+            "audit.md": (base / "audit.md").read_text(encoding="utf-8"),
+            "owner-decision.md": (base / "owner-decision.md").read_text(encoding="utf-8"),
+            "closure.md": (base / "closure.md").read_text(encoding="utf-8"),
+            "run.json": (base / "run.json").read_text(encoding="utf-8"),
+        }
+        list_evidence(self.project, run_id)
+        self.assertEqual(snapshots["evidence.md"], (base / "evidence.md").read_text(encoding="utf-8"))
+        self.assertEqual(snapshots["audit.md"], (base / "audit.md").read_text(encoding="utf-8"))
+        self.assertEqual(
+            snapshots["owner-decision.md"],
+            (base / "owner-decision.md").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(snapshots["closure.md"], (base / "closure.md").read_text(encoding="utf-8"))
+        self.assertEqual(snapshots["run.json"], (base / "run.json").read_text(encoding="utf-8"))
+
+    def test_closure_validation_unchanged_after_evidence_list(self) -> None:
+        run_id = create_mission(self.project, "20260704-026")
+        add_evidence(self.project, run_id, "listed but not closed")
+        before = validate_run_for_closure(self.project, run_id)
+        list_evidence(self.project, run_id)
+        after = validate_run_for_closure(self.project, run_id)
+        self.assertEqual(before.ok, after.ok)
+        self.assertEqual(before.errors, after.errors)
+        self.assertFalse(before.ok)
+        self.assertIn("mission statement is placeholder/unfilled", before.errors)
 
 
 if __name__ == "__main__":

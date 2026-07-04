@@ -62,6 +62,7 @@ agent-os status .
 #    authority, autonomy, evidence, owner decision, closure verdict)
 #    Or append evidence with the registrar helper:
 #    agent-os evidence add <run-id> . --note "pytest: 6 passed"
+#    agent-os evidence list <run-id> .   # read-only index of structured entries
 
 # 5. Record an audit verdict
 agent-os audit <run-id> . --verdict pass
@@ -90,6 +91,7 @@ agent-os mission [PATH]       # create a new run from templates
 agent-os status [PATH]        # list runs and fields blocking closure
 agent-os audit RUN_ID [PATH]  # record an audit verdict
 agent-os evidence add RUN_ID [PATH] --note "..."  # append evidence block (registrar only)
+agent-os evidence list RUN_ID [PATH]  # read-only index of structured evidence entries
 agent-os close RUN_ID [PATH]  # attempt fail-closed run closure
 ```
 

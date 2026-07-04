@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -142,6 +144,72 @@ def add_evidence(
     if existing and not existing.endswith("\n"):
         existing += "\n"
     evidence_path.write_text(existing + "\n".join(block_lines) + "\n", encoding="utf-8")
+
+
+_EVIDENCE_ENTRY_HEADER = re.compile(r"^## Evidence Entry — (.+)$", re.MULTILINE)
+
+
+@dataclass(frozen=True)
+class EvidenceEntry:
+    timestamp: str
+    evidence_type: str
+    claim: str
+    artifact_path: str | None = None
+
+
+def parse_evidence_entries(text: str) -> list[EvidenceEntry]:
+    """Parse structured evidence blocks appended by add_evidence."""
+    entries: list[EvidenceEntry] = []
+    parts = _EVIDENCE_ENTRY_HEADER.split(text)
+    for index in range(1, len(parts), 2):
+        timestamp = parts[index].strip()
+        block = parts[index + 1] if index + 1 < len(parts) else ""
+        evidence_type = "note"
+        artifact_path: str | None = None
+        claim: str | None = None
+        for line in block.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("type:"):
+                evidence_type = stripped[5:].strip() or "note"
+            elif stripped.startswith("path:"):
+                artifact_path = stripped[5:].strip() or None
+            elif stripped.startswith("claim:"):
+                claim = stripped[6:].strip()
+        if claim is not None:
+            entries.append(
+                EvidenceEntry(
+                    timestamp=timestamp,
+                    evidence_type=evidence_type,
+                    claim=claim,
+                    artifact_path=artifact_path,
+                )
+            )
+    return entries
+
+
+def format_evidence_index(run_id: str, entries: list[EvidenceEntry]) -> str:
+    lines = [f"Evidence for run {run_id}:"]
+    for index, entry in enumerate(entries, start=1):
+        lines.append(
+            f"{index}. {entry.timestamp} [{entry.evidence_type}] {entry.claim}"
+        )
+        if entry.artifact_path:
+            lines.append(f"   path: {entry.artifact_path}")
+    return "\n".join(lines)
+
+
+def list_evidence(project: Path, run_id: str) -> str:
+    """Read and index structured evidence entries (read-only)."""
+    base = run_path(project, run_id)
+    if not base.is_dir():
+        raise FileNotFoundError(f"run not found: {run_id}")
+
+    evidence_path = base / "evidence.md"
+    if not evidence_path.is_file():
+        raise FileNotFoundError(f"evidence file missing: {run_id}")
+
+    text = evidence_path.read_text(encoding="utf-8")
+    return format_evidence_index(run_id, parse_evidence_entries(text))
 
 
 def record_audit(project: Path, run_id: str, verdict: str, notes: str = "") -> None:
