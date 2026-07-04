@@ -146,6 +146,40 @@ def add_evidence(
     evidence_path.write_text(existing + "\n".join(block_lines) + "\n", encoding="utf-8")
 
 
+def add_evidence_file(
+    project: Path,
+    run_id: str,
+    file_path: str,
+    note: str,
+) -> None:
+    """Register an existing local file path as evidence (registrar only; no copy)."""
+    base = run_path(project, run_id)
+    if not base.is_dir():
+        raise FileNotFoundError(f"run not found: {run_id}")
+
+    evidence_path = base / "evidence.md"
+    if not evidence_path.is_file():
+        raise FileNotFoundError(f"evidence file missing: {run_id}")
+
+    if not file_path.strip():
+        raise ValueError("file path must not be empty")
+
+    if not note.strip():
+        raise ValueError("note must not be empty or whitespace-only")
+
+    referenced = Path(file_path.strip())
+    if not referenced.is_file():
+        raise FileNotFoundError(f"referenced file not found: {file_path.strip()}")
+
+    add_evidence(
+        project,
+        run_id,
+        note,
+        evidence_type="file",
+        artifact_path=file_path.strip(),
+    )
+
+
 _EVIDENCE_ENTRY_HEADER = re.compile(r"^## Evidence Entry — (.+)$", re.MULTILINE)
 
 

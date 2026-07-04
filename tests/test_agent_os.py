@@ -15,6 +15,7 @@ from agent_os.paths import TEMPLATE_FILES, run_path
 from agent_os.validate import validate_run_for_closure
 from agent_os.workspace import (
     add_evidence,
+    add_evidence_file,
     close_run,
     create_mission,
     init_workspace,
@@ -414,6 +415,217 @@ class AgentOsTests(unittest.TestCase):
         add_evidence(self.project, run_id, "listed but not closed")
         before = validate_run_for_closure(self.project, run_id)
         list_evidence(self.project, run_id)
+        after = validate_run_for_closure(self.project, run_id)
+        self.assertEqual(before.ok, after.ok)
+        self.assertEqual(before.errors, after.errors)
+        self.assertFalse(before.ok)
+        self.assertIn("mission statement is placeholder/unfilled", before.errors)
+
+    def test_evidence_add_file_appends_structured_block(self) -> None:
+        run_id = create_mission(self.project, "20260704-030")
+        ref_file = self.project / "report.txt"
+        ref_file.write_text("report content\n", encoding="utf-8")
+        add_evidence_file(self.project, run_id, str(ref_file), "build report")
+        text = (run_path(self.project, run_id) / "evidence.md").read_text(encoding="utf-8")
+        self.assertIn("## Evidence Entry —", text)
+        self.assertIn("type: file", text)
+        self.assertIn(f"path: {ref_file}", text)
+        self.assertIn("claim: build report", text)
+        self.assertRegex(text, r"## Evidence Entry — \d{4}-\d{2}-\d{2}T")
+
+    def test_evidence_add_file_path_appears_in_list(self) -> None:
+        run_id = create_mission(self.project, "20260704-031")
+        ref_file = self.project / "output.log"
+        ref_file.write_text("log line\n", encoding="utf-8")
+        add_evidence_file(self.project, run_id, str(ref_file), "test output log")
+        output = list_evidence(self.project, run_id)
+        self.assertIn("[file] test output log", output)
+        self.assertIn(f"path: {ref_file}", output)
+
+    def test_evidence_add_file_preserves_previous_evidence(self) -> None:
+        run_id = create_mission(self.project, "20260704-032")
+        evidence_path = run_path(self.project, run_id) / "evidence.md"
+        original = evidence_path.read_text(encoding="utf-8")
+        ref_file = self.project / "data.json"
+        ref_file.write_text("{}\n", encoding="utf-8")
+        add_evidence(self.project, run_id, "first note")
+        add_evidence_file(self.project, run_id, str(ref_file), "json data file")
+        text = evidence_path.read_text(encoding="utf-8")
+        self.assertTrue(text.startswith(original.rstrip("\n")))
+        self.assertIn("claim: first note", text)
+        self.assertIn("claim: json data file", text)
+        self.assertIn("type: file", text)
+
+    def test_evidence_add_file_fails_for_missing_run(self) -> None:
+        ref_file = self.project / "exists.txt"
+        ref_file.write_text("x\n", encoding="utf-8")
+        with self.assertRaises(FileNotFoundError):
+            add_evidence_file(self.project, "missing-run", str(ref_file), "note")
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "evidence",
+                    "add-file",
+                    "missing-run",
+                    str(self.project),
+                    "--file",
+                    str(ref_file),
+                    "--note",
+                    "note",
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("run not found", buf.getvalue())
+
+    def test_evidence_add_file_fails_for_missing_evidence_file(self) -> None:
+        run_id = create_mission(self.project, "20260704-033")
+        (run_path(self.project, run_id) / "evidence.md").unlink()
+        ref_file = self.project / "exists.txt"
+        ref_file.write_text("x\n", encoding="utf-8")
+        with self.assertRaises(FileNotFoundError):
+            add_evidence_file(self.project, run_id, str(ref_file), "note")
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "evidence",
+                    "add-file",
+                    run_id,
+                    str(self.project),
+                    "--file",
+                    str(ref_file),
+                    "--note",
+                    "note",
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("evidence file missing", buf.getvalue())
+
+    def test_evidence_add_file_fails_for_empty_note(self) -> None:
+        run_id = create_mission(self.project, "20260704-034")
+        ref_file = self.project / "exists.txt"
+        ref_file.write_text("x\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            add_evidence_file(self.project, run_id, str(ref_file), "   ")
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "evidence",
+                    "add-file",
+                    run_id,
+                    str(self.project),
+                    "--file",
+                    str(ref_file),
+                    "--note",
+                    "   ",
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("note must not be empty", buf.getvalue())
+
+    def test_evidence_add_file_fails_for_empty_file_path(self) -> None:
+        run_id = create_mission(self.project, "20260704-035")
+        with self.assertRaises(ValueError):
+            add_evidence_file(self.project, run_id, "   ", "note")
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "evidence",
+                    "add-file",
+                    run_id,
+                    str(self.project),
+                    "--file",
+                    "   ",
+                    "--note",
+                    "note",
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("file path must not be empty", buf.getvalue())
+
+    def test_evidence_add_file_fails_for_nonexistent_referenced_file(self) -> None:
+        run_id = create_mission(self.project, "20260704-036")
+        missing = self.project / "does-not-exist.txt"
+        with self.assertRaises(FileNotFoundError):
+            add_evidence_file(self.project, run_id, str(missing), "note")
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "evidence",
+                    "add-file",
+                    run_id,
+                    str(self.project),
+                    "--file",
+                    str(missing),
+                    "--note",
+                    "note",
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("referenced file not found", buf.getvalue())
+
+    def test_evidence_add_file_does_not_copy_file(self) -> None:
+        run_id = create_mission(self.project, "20260704-037")
+        ref_file = self.project / "source.txt"
+        ref_file.write_text("original\n", encoding="utf-8")
+        base = run_path(self.project, run_id)
+        before = {p.name for p in base.iterdir()}
+        add_evidence_file(self.project, run_id, str(ref_file), "source reference")
+        after = {p.name for p in base.iterdir()}
+        self.assertEqual(before, after)
+        self.assertFalse((base / "source.txt").exists())
+
+    def test_evidence_add_file_does_not_inspect_or_mutate_file(self) -> None:
+        run_id = create_mission(self.project, "20260704-038")
+        ref_file = self.project / "immutable.txt"
+        original_content = "must not change\n"
+        ref_file.write_text(original_content, encoding="utf-8")
+        mtime_before = ref_file.stat().st_mtime
+        add_evidence_file(self.project, run_id, str(ref_file), "unchanged file")
+        self.assertEqual(ref_file.read_text(encoding="utf-8"), original_content)
+        self.assertEqual(ref_file.stat().st_mtime, mtime_before)
+
+    def test_evidence_add_file_does_not_change_run_status(self) -> None:
+        run_id = create_mission(self.project, "20260704-039")
+        base = run_path(self.project, run_id)
+        ref_file = self.project / "ref.txt"
+        ref_file.write_text("x\n", encoding="utf-8")
+        meta_before = (base / "run.json").read_text(encoding="utf-8")
+        add_evidence_file(self.project, run_id, str(ref_file), "status unchanged")
+        meta_after = (base / "run.json").read_text(encoding="utf-8")
+        self.assertEqual(meta_before, meta_after)
+        meta = json.loads(meta_after)
+        self.assertEqual(meta["status"], "open")
+
+    def test_evidence_add_file_does_not_modify_audit_owner_closure(self) -> None:
+        run_id = create_mission(self.project, "20260704-040")
+        base = run_path(self.project, run_id)
+        ref_file = self.project / "ref.txt"
+        ref_file.write_text("x\n", encoding="utf-8")
+        audit_before = (base / "audit.md").read_text(encoding="utf-8")
+        owner_before = (base / "owner-decision.md").read_text(encoding="utf-8")
+        closure_before = (base / "closure.md").read_text(encoding="utf-8")
+        add_evidence_file(self.project, run_id, str(ref_file), "audit untouched")
+        self.assertEqual(audit_before, (base / "audit.md").read_text(encoding="utf-8"))
+        self.assertEqual(owner_before, (base / "owner-decision.md").read_text(encoding="utf-8"))
+        self.assertEqual(closure_before, (base / "closure.md").read_text(encoding="utf-8"))
+
+    def test_closure_validation_unchanged_after_evidence_add_file(self) -> None:
+        run_id = create_mission(self.project, "20260704-041")
+        ref_file = self.project / "ref.txt"
+        ref_file.write_text("x\n", encoding="utf-8")
+        add_evidence(self.project, run_id, "baseline evidence")
+        before = validate_run_for_closure(self.project, run_id)
+        add_evidence_file(self.project, run_id, str(ref_file), "additional file reference")
         after = validate_run_for_closure(self.project, run_id)
         self.assertEqual(before.ok, after.ok)
         self.assertEqual(before.errors, after.errors)

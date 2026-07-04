@@ -9,6 +9,7 @@ from pathlib import Path
 from agent_os import __version__
 from agent_os.workspace import (
     add_evidence,
+    add_evidence_file,
     close_run,
     create_mission,
     init_workspace,
@@ -99,6 +100,17 @@ def cmd_evidence_add(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_evidence_add_file(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        add_evidence_file(project, args.run_id, args.file, args.note)
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"file evidence registered for run {args.run_id}")
+    return 0
+
+
 def cmd_close(args: argparse.Namespace) -> int:
     project = _project_path(args.path)
     ok, errors = close_run(project, args.run_id)
@@ -177,6 +189,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional local artifact path reference (not copied)",
     )
     evidence_add_parser.set_defaults(func=cmd_evidence_add)
+
+    evidence_add_file_parser = evidence_sub.add_parser(
+        "add-file",
+        help="register an existing local file path as evidence (reference only)",
+    )
+    evidence_add_file_parser.add_argument("run_id", help="run identifier")
+    evidence_add_file_parser.add_argument("path", nargs="?", help="target project directory")
+    evidence_add_file_parser.add_argument(
+        "--file",
+        required=True,
+        help="path to an existing local file (not copied)",
+    )
+    evidence_add_file_parser.add_argument(
+        "--note",
+        required=True,
+        help="evidence claim text for the referenced file",
+    )
+    evidence_add_file_parser.set_defaults(func=cmd_evidence_add_file)
 
     evidence_list_parser = evidence_sub.add_parser(
         "list",

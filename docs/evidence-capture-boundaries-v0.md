@@ -127,13 +127,15 @@ Design constraints for any implementation:
 
 **`agent-os evidence add` is implemented** as the first minimal bounded helper. It is **registrar-only**: it appends a structured block to `evidence.md` with timestamp, type (default `note`), optional path reference, and claim text. It does not copy files, run commands, judge sufficiency, modify audit/owner-decision/closure artifacts, or auto-close runs.
 
-**`agent-os evidence list` is implemented** as a read-only index helper. It reads `evidence.md` and prints structured entries previously appended by `evidence add` (timestamp, type, optional path, claim preview). It does not modify any run artifacts or change validation behavior.
+**`agent-os evidence list` is implemented** as a read-only index helper. It reads `evidence.md` and prints structured entries previously appended by `evidence add` or `evidence add-file` (timestamp, type, optional path, claim preview). It does not modify any run artifacts or change validation behavior.
 
-Other helpers listed in section 5 (`add-file`, `add-command-output`, `snapshot-git`) remain **not implemented**.
+**`agent-os evidence add-file` is implemented** as a **reference-only** registrar. It records an existing local file path in `evidence.md` with timestamp, type `file`, path, and claim text. It verifies the path exists but does **not** copy, hash, inspect, parse, or mutate the referenced file. It does not modify audit/owner-decision/closure artifacts or auto-close runs.
+
+Other helpers listed in section 5 (`add-command-output`, `snapshot-git`) remain **not implemented**.
 
 In v0:
 
-- Evidence capture may be **manual** (edit `evidence.md` directly) or via `agent-os evidence add`.
+- Evidence capture may be **manual** (edit `evidence.md` directly) or via `agent-os evidence add` / `agent-os evidence add-file`.
 - Validation checks **presence** of evidence body, not quality or sufficiency.
 - Audit, owner decision, and closure behavior are **unchanged**.
 
