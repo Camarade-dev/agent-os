@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import re
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -14,6 +15,7 @@ from agent_os.cli import main
 from agent_os.paths import TEMPLATE_FILES, run_path
 from agent_os.validate import validate_run_for_closure
 from agent_os.workspace import (
+    GIT_SNAPSHOT_READONLY_ARGV,
     add_evidence,
     add_evidence_command_output,
     add_evidence_file,
@@ -23,6 +25,7 @@ from agent_os.workspace import (
     list_evidence,
     list_runs,
     record_audit,
+    snapshot_evidence_git,
 )
 
 
@@ -72,6 +75,42 @@ def _fill_run_for_closure(base: Path) -> None:
         "# Closure\n\nDone.\n",
         encoding="utf-8",
     )
+
+
+def _init_git_repo(path: Path, *, with_commit: bool = True) -> None:
+    """Create a minimal local git repo for snapshot-git tests."""
+    subprocess.run(
+        ["git", "init", str(path)],
+        capture_output=True,
+        check=True,
+        shell=False,
+    )
+    readme = path / "README.md"
+    readme.write_text("# test repo\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(path), "add", "README.md"],
+        capture_output=True,
+        check=True,
+        shell=False,
+    )
+    if with_commit:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(path),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "init",
+            ],
+            capture_output=True,
+            check=True,
+            shell=False,
+        )
 
 
 class AgentOsTests(unittest.TestCase):
@@ -956,6 +995,382 @@ class AgentOsTests(unittest.TestCase):
         self.assertEqual(before.errors, after.errors)
         self.assertFalse(before.ok)
         self.assertIn("mission statement is placeholder/unfilled", before.errors)
+
+    def test_evidence_snapshot_git_appends_structured_block(self) -> None:
+        run_id = create_mission(self.project, "20260704-070")
+        git_repo = self.project / "git-target"
+        git_repo.mkdir()
+        _init_git_repo(git_repo)
+        (git_repo / "README.md").write_text("# changed\n", encoding="utf-8")
+        snapshot_evidence_git(
+            self.project,
+            run_id,
+            "pre-commit repository state",
+            repo=str(git_repo),
+        )
+        text = (run_path(self.project, run_id) / "evidence.md").read_text(encoding="utf-8")
+        self.assertIn("## Evidence Entry —", text)
+        self.assertIn("type: git-snapshot", text)
+        self.assertIn(f"repo: {git_repo.resolve()}", text)
+        self.assertIn("claim: pre-commit repository state", text)
+        self.assertIn("git status --porcelain", text)
+        self.assertIn("git diff --stat", text)
+        self.assertRegex(text, r"## Evidence Entry — \d{4}-\d{2}-\d{2}T")
+
+    def test_evidence_snapshot_git_records_head_when_available(self) -> None:
+        run_id = create_mission(self.project, "20260704-071")
+        git_repo = self.project / "git-head"
+        git_repo.mkdir()
+        _init_git_repo(git_repo)
+        snapshot_evidence_git(
+            self.project,
+            run_id,
+            "head snapshot",
+            repo=str(git_repo),
+        )
+        text = (run_path(self.project, run_id) / "evidence.md").read_text(encoding="utf-8")
+        self.assertIn("head:", text)
+        self.assertRegex(text, r"head: [0-9a-f]+")
+
+    def test_evidence_snapshot_git_records_status_output(self) -> None:
+        run_id = create_mission(self.project, "20260704-072")
+        git_repo = self.project / "git-status"
+        git_repo.mkdir()
+        _init_git_repo(git_repo)
+        dirty = git_repo / "dirty.txt"
+        dirty.write_text("untracked\n", encoding="utf-8")
+        snapshot_evidence_git(
+            self.project,
+            run_id,
+            "dirty tree",
+            repo=str(git_repo),
+        )
+        text = (run_path(self.project, run_id) / "evidence.md").read_text(encoding="utf-8")
+        self.assertIn("?? dirty.txt", text)
+
+    def test_evidence_snapshot_git_records_diff_stat_when_enabled(self) -> None:
+        run_id = create_mission(self.project, "20260704-073")
+        git_repo = self.project / "git-diff"
+        git_repo.mkdir()
+        _init_git_repo(git_repo)
+        (git_repo / "README.md").write_text("# modified\n", encoding="utf-8")
+        snapshot_evidence_git(
+            self.project,
+            run_id,
+            "diff stat",
+            repo=str(git_repo),
+            include_diff_stat=True,
+        )
+        text = (run_path(self.project, run_id) / "evidence.md").read_text(encoding="utf-8")
+        self.assertIn("git diff --stat", text)
+        self.assertIn("README.md", text)
+
+    def test_evidence_snapshot_git_omits_diff_stat_when_disabled(self) -> None:
+        run_id = create_mission(self.project, "20260704-074")
+        git_repo = self.project / "git-no-diff"
+        git_repo.mkdir()
+        _init_git_repo(git_repo)
+        (git_repo / "README.md").write_text("# modified\n", encoding="utf-8")
+        snapshot_evidence_git(
+            self.project,
+            run_id,
+            "no diff stat",
+            repo=str(git_repo),
+            include_diff_stat=False,
+        )
+        text = (run_path(self.project, run_id) / "evidence.md").read_text(encoding="utf-8")
+        self.assertIn("git status --porcelain", text)
+        self.assertNotIn("git diff --stat", text)
+
+    def test_evidence_snapshot_git_preserves_previous_evidence(self) -> None:
+        run_id = create_mission(self.project, "20260704-075")
+        evidence_path = run_path(self.project, run_id) / "evidence.md"
+        original = evidence_path.read_text(encoding="utf-8")
+        git_repo = self.project / "git-preserve"
+        git_repo.mkdir()
+        _init_git_repo(git_repo)
+        add_evidence(self.project, run_id, "first note")
+        snapshot_evidence_git(
+            self.project,
+            run_id,
+            "git state",
+            repo=str(git_repo),
+        )
+        text = evidence_path.read_text(encoding="utf-8")
+        self.assertTrue(text.startswith(original.rstrip("\n")))
+        self.assertIn("claim: first note", text)
+        self.assertIn("claim: git state", text)
+        self.assertIn("type: git-snapshot", text)
+
+    def test_evidence_list_shows_git_snapshot_entries(self) -> None:
+        run_id = create_mission(self.project, "20260704-076")
+        git_repo = self.project / "git-list"
+        git_repo.mkdir()
+        _init_git_repo(git_repo)
+        snapshot_evidence_git(
+            self.project,
+            run_id,
+            "pre-commit repository state",
+            repo=str(git_repo),
+        )
+        output = list_evidence(self.project, run_id)
+        self.assertIn("[git-snapshot] pre-commit repository state", output)
+        self.assertIn(f"repo: {git_repo.resolve()}", output)
+        self.assertRegex(output, r"branch/head: .+ @ [0-9a-f]+")
+
+    def test_evidence_snapshot_git_fails_for_missing_run(self) -> None:
+        git_repo = self.project / "git-missing-run"
+        git_repo.mkdir()
+        _init_git_repo(git_repo)
+        with self.assertRaises(FileNotFoundError):
+            snapshot_evidence_git(
+                self.project,
+                "missing-run",
+                "note",
+                repo=str(git_repo),
+            )
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "evidence",
+                    "snapshot-git",
+                    "missing-run",
+                    str(self.project),
+                    "--note",
+                    "note",
+                    "--repo",
+                    str(git_repo),
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("run not found", buf.getvalue())
+
+    def test_evidence_snapshot_git_fails_for_missing_evidence_file(self) -> None:
+        run_id = create_mission(self.project, "20260704-077")
+        (run_path(self.project, run_id) / "evidence.md").unlink()
+        git_repo = self.project / "git-no-evidence"
+        git_repo.mkdir()
+        _init_git_repo(git_repo)
+        with self.assertRaises(FileNotFoundError):
+            snapshot_evidence_git(
+                self.project,
+                run_id,
+                "note",
+                repo=str(git_repo),
+            )
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "evidence",
+                    "snapshot-git",
+                    run_id,
+                    str(self.project),
+                    "--note",
+                    "note",
+                    "--repo",
+                    str(git_repo),
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("evidence file missing", buf.getvalue())
+
+    def test_evidence_snapshot_git_fails_for_empty_note(self) -> None:
+        run_id = create_mission(self.project, "20260704-078")
+        git_repo = self.project / "git-empty-note"
+        git_repo.mkdir()
+        _init_git_repo(git_repo)
+        with self.assertRaises(ValueError):
+            snapshot_evidence_git(
+                self.project,
+                run_id,
+                "   ",
+                repo=str(git_repo),
+            )
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "evidence",
+                    "snapshot-git",
+                    run_id,
+                    str(self.project),
+                    "--note",
+                    "   ",
+                    "--repo",
+                    str(git_repo),
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("note must not be empty", buf.getvalue())
+
+    def test_evidence_snapshot_git_fails_for_missing_repo_path(self) -> None:
+        run_id = create_mission(self.project, "20260704-079")
+        missing = self.project / "does-not-exist"
+        with self.assertRaises(FileNotFoundError):
+            snapshot_evidence_git(
+                self.project,
+                run_id,
+                "note",
+                repo=str(missing),
+            )
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "evidence",
+                    "snapshot-git",
+                    run_id,
+                    str(self.project),
+                    "--note",
+                    "note",
+                    "--repo",
+                    str(missing),
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("repo path not found", buf.getvalue())
+
+    def test_evidence_snapshot_git_fails_gracefully_for_non_git_repo(self) -> None:
+        run_id = create_mission(self.project, "20260704-080")
+        not_git = self.project / "plain-dir"
+        not_git.mkdir()
+        with self.assertRaises(ValueError) as ctx:
+            snapshot_evidence_git(
+                self.project,
+                run_id,
+                "note",
+                repo=str(not_git),
+            )
+        self.assertIn("not a git repository", str(ctx.exception))
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "evidence",
+                    "snapshot-git",
+                    run_id,
+                    str(self.project),
+                    "--note",
+                    "note",
+                    "--repo",
+                    str(not_git),
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("not a git repository", buf.getvalue())
+
+    def test_evidence_snapshot_git_does_not_change_run_status(self) -> None:
+        run_id = create_mission(self.project, "20260704-081")
+        base = run_path(self.project, run_id)
+        git_repo = self.project / "git-status-unchanged"
+        git_repo.mkdir()
+        _init_git_repo(git_repo)
+        meta_before = (base / "run.json").read_text(encoding="utf-8")
+        snapshot_evidence_git(
+            self.project,
+            run_id,
+            "status unchanged",
+            repo=str(git_repo),
+        )
+        meta_after = (base / "run.json").read_text(encoding="utf-8")
+        self.assertEqual(meta_before, meta_after)
+        meta = json.loads(meta_after)
+        self.assertEqual(meta["status"], "open")
+
+    def test_evidence_snapshot_git_does_not_modify_audit_owner_closure(self) -> None:
+        run_id = create_mission(self.project, "20260704-082")
+        base = run_path(self.project, run_id)
+        git_repo = self.project / "git-audit-untouched"
+        git_repo.mkdir()
+        _init_git_repo(git_repo)
+        audit_before = (base / "audit.md").read_text(encoding="utf-8")
+        owner_before = (base / "owner-decision.md").read_text(encoding="utf-8")
+        closure_before = (base / "closure.md").read_text(encoding="utf-8")
+        snapshot_evidence_git(
+            self.project,
+            run_id,
+            "audit untouched",
+            repo=str(git_repo),
+        )
+        self.assertEqual(audit_before, (base / "audit.md").read_text(encoding="utf-8"))
+        self.assertEqual(owner_before, (base / "owner-decision.md").read_text(encoding="utf-8"))
+        self.assertEqual(closure_before, (base / "closure.md").read_text(encoding="utf-8"))
+
+    def test_closure_validation_unchanged_after_evidence_snapshot_git(self) -> None:
+        run_id = create_mission(self.project, "20260704-083")
+        git_repo = self.project / "git-validation"
+        git_repo.mkdir()
+        _init_git_repo(git_repo)
+        add_evidence(self.project, run_id, "baseline evidence")
+        before = validate_run_for_closure(self.project, run_id)
+        snapshot_evidence_git(
+            self.project,
+            run_id,
+            "additional git snapshot",
+            repo=str(git_repo),
+        )
+        after = validate_run_for_closure(self.project, run_id)
+        self.assertEqual(before.ok, after.ok)
+        self.assertEqual(before.errors, after.errors)
+        self.assertFalse(before.ok)
+        self.assertIn("mission statement is placeholder/unfilled", before.errors)
+
+    def test_evidence_snapshot_git_uses_fixed_readonly_git_commands_only(self) -> None:
+        expected = {
+            ("rev-parse", "--is-inside-work-tree"),
+            ("rev-parse", "--short", "HEAD"),
+            ("branch", "--show-current"),
+            ("status", "--porcelain"),
+            ("diff", "--stat"),
+        }
+        self.assertEqual(set(GIT_SNAPSHOT_READONLY_ARGV), expected)
+        forbidden = {
+            "add",
+            "commit",
+            "push",
+            "pull",
+            "checkout",
+            "reset",
+            "clean",
+            "merge",
+            "rebase",
+        }
+        for argv in GIT_SNAPSHOT_READONLY_ARGV:
+            self.assertNotIn(argv[0], forbidden)
+
+    def test_evidence_snapshot_git_does_not_use_shell_true(self) -> None:
+        workspace_source = (
+            Path(__file__).resolve().parent.parent / "agent_os" / "workspace.py"
+        ).read_text(encoding="utf-8")
+        snapshot_section = workspace_source.split("GIT_SNAPSHOT_READONLY_ARGV", 1)[1]
+        snapshot_section = snapshot_section.split("def add_evidence_file", 1)[0]
+        self.assertNotIn("shell=True", snapshot_section)
+        self.assertIn("shell=False", snapshot_section)
+
+    def test_evidence_snapshot_git_does_not_expose_arbitrary_command_execution(self) -> None:
+        run_id = create_mission(self.project, "20260704-084")
+        git_repo = self.project / "git-no-shell"
+        git_repo.mkdir()
+        _init_git_repo(git_repo)
+        side_effect = self.project / "must-not-be-created-by-git.txt"
+        self.assertFalse(side_effect.exists())
+        snapshot_evidence_git(
+            self.project,
+            run_id,
+            "fixed commands only",
+            repo=str(git_repo),
+        )
+        self.assertFalse(side_effect.exists())
+        text = (run_path(self.project, run_id) / "evidence.md").read_text(encoding="utf-8")
+        self.assertIn("type: git-snapshot", text)
+        self.assertNotIn("must-not-be-created", text)
 
 
 if __name__ == "__main__":

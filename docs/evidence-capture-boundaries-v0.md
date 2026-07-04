@@ -127,17 +127,19 @@ Design constraints for any implementation:
 
 **`agent-os evidence add` is implemented** as the first minimal bounded helper. It is **registrar-only**: it appends a structured block to `evidence.md` with timestamp, type (default `note`), optional path reference, and claim text. It does not copy files, run commands, judge sufficiency, modify audit/owner-decision/closure artifacts, or auto-close runs.
 
-**`agent-os evidence list` is implemented** as a read-only index helper. It reads `evidence.md` and prints structured entries previously appended by `evidence add`, `evidence add-file`, or `evidence add-command-output` (timestamp, type, optional path, optional command, claim preview). It does not modify any run artifacts or change validation behavior.
+**`agent-os evidence list` is implemented** as a read-only index helper. It reads `evidence.md` and prints structured entries previously appended by `evidence add`, `evidence add-file`, `evidence add-command-output`, or `evidence snapshot-git` (timestamp, type, optional path, optional command, claim preview, and for git-snapshot entries repo path and branch/head when available). It does not modify any run artifacts or change validation behavior.
 
 **`agent-os evidence add-file` is implemented** as a **reference-only** registrar. It records an existing local file path in `evidence.md` with timestamp, type `file`, path, and claim text. It verifies the path exists but does **not** copy, hash, inspect, parse, or mutate the referenced file. It does not modify audit/owner-decision/closure artifacts or auto-close runs.
 
 **`agent-os evidence add-command-output` is implemented** as **owner-supplied transcript registration only**. It records a declared command string and reads an existing output file (text) into a structured `command-output` block in `evidence.md`, with an 8 KB embedded excerpt limit when the file is larger. It does **not** execute `--command`, validate pass/fail, parse output, or mutate the referenced output file. It does not modify audit/owner-decision/closure artifacts or auto-close runs.
 
-Other helpers listed in section 5 (`snapshot-git`) remain **not implemented**.
+**`agent-os evidence snapshot-git` is implemented** as a **narrow, explicit, read-only Git exception**. When the owner invokes it, Agent OS runs only a fixed allowlist of read-only `git` commands (`rev-parse`, `branch --show-current`, `status --porcelain`, and optionally `diff --stat`) via `subprocess` with `shell=False`. No user-provided command strings are executed. It appends a structured `git-snapshot` block to `evidence.md` with repo path, branch, short HEAD, status output, and optional diff stat. It does **not** run `git add`, `commit`, `push`, `pull`, `checkout`, `reset`, `clean`, or any other mutating Git operation. It is **not** arbitrary command execution. It does not modify audit/owner-decision/closure artifacts, run status, or auto-close runs.
+
+Other helpers listed in section 5 remain **not implemented**.
 
 In v0:
 
-- Evidence capture may be **manual** (edit `evidence.md` directly) or via `agent-os evidence add`, `agent-os evidence add-file`, or `agent-os evidence add-command-output`.
+- Evidence capture may be **manual** (edit `evidence.md` directly) or via `agent-os evidence add`, `agent-os evidence add-file`, `agent-os evidence add-command-output`, or `agent-os evidence snapshot-git`.
 - Validation checks **presence** of evidence body, not quality or sufficiency.
 - Audit, owner decision, and closure behavior are **unchanged**.
 

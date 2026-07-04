@@ -17,6 +17,7 @@ from agent_os.workspace import (
     list_evidence,
     list_runs,
     record_audit,
+    snapshot_evidence_git,
 )
 
 
@@ -126,6 +127,23 @@ def cmd_evidence_add_command_output(args: argparse.Namespace) -> int:
         print(str(exc), file=sys.stderr)
         return 1
     print(f"command-output evidence registered for run {args.run_id}")
+    return 0
+
+
+def cmd_evidence_snapshot_git(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        snapshot_evidence_git(
+            project,
+            args.run_id,
+            args.note,
+            repo=args.repo,
+            include_diff_stat=args.include_diff_stat,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"git snapshot evidence added for run {args.run_id}")
     return 0
 
 
@@ -256,6 +274,29 @@ def build_parser() -> argparse.ArgumentParser:
     evidence_list_parser.add_argument("run_id", help="run identifier")
     evidence_list_parser.add_argument("path", nargs="?", help="target project directory")
     evidence_list_parser.set_defaults(func=cmd_evidence_list)
+
+    evidence_snapshot_git_parser = evidence_sub.add_parser(
+        "snapshot-git",
+        help="capture read-only git state into evidence.md (fixed allowlist only)",
+    )
+    evidence_snapshot_git_parser.add_argument("run_id", help="run identifier")
+    evidence_snapshot_git_parser.add_argument("path", nargs="?", help="target project directory")
+    evidence_snapshot_git_parser.add_argument(
+        "--note",
+        required=True,
+        help="evidence claim text for the git snapshot",
+    )
+    evidence_snapshot_git_parser.add_argument(
+        "--repo",
+        help="git repository path to inspect (default: target project)",
+    )
+    evidence_snapshot_git_parser.add_argument(
+        "--include-diff-stat",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="include git diff --stat output (default: true)",
+    )
+    evidence_snapshot_git_parser.set_defaults(func=cmd_evidence_snapshot_git)
 
     return parser
 

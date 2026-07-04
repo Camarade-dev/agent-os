@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -213,6 +214,107 @@ def add_evidence_command_output(
     evidence_path.write_text(existing + "\n".join(block_lines) + "\n", encoding="utf-8")
 
 
+# Fixed read-only git argv suffixes used by snapshot_evidence_git (no shell, no user input).
+GIT_SNAPSHOT_READONLY_ARGV: tuple[tuple[str, ...], ...] = (
+    ("rev-parse", "--is-inside-work-tree"),
+    ("rev-parse", "--short", "HEAD"),
+    ("branch", "--show-current"),
+    ("status", "--porcelain"),
+    ("diff", "--stat"),
+)
+
+
+def _run_git_readonly(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    argv = ["git", "-C", str(repo.resolve()), *args]
+    return subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        shell=False,
+    )
+
+
+def snapshot_evidence_git(
+    project: Path,
+    run_id: str,
+    note: str,
+    repo: str | None = None,
+    include_diff_stat: bool = True,
+) -> None:
+    """Append a read-only git state snapshot to evidence.md (explicit invocation only)."""
+    base = run_path(project, run_id)
+    if not base.is_dir():
+        raise FileNotFoundError(f"run not found: {run_id}")
+
+    evidence_path = base / "evidence.md"
+    if not evidence_path.is_file():
+        raise FileNotFoundError(f"evidence file missing: {run_id}")
+
+    if not note.strip():
+        raise ValueError("note must not be empty or whitespace-only")
+
+    repo_path = Path((repo or str(project)).strip()).resolve()
+    if not repo_path.exists():
+        raise FileNotFoundError(f"repo path not found: {repo_path}")
+
+    inside = _run_git_readonly(repo_path, "rev-parse", "--is-inside-work-tree")
+    if inside.returncode != 0 or inside.stdout.strip() != "true":
+        raise ValueError(f"not a git repository: {repo_path}")
+
+    head_result = _run_git_readonly(repo_path, "rev-parse", "--short", "HEAD")
+    head = head_result.stdout.strip() if head_result.returncode == 0 else ""
+
+    branch_result = _run_git_readonly(repo_path, "branch", "--show-current")
+    branch = branch_result.stdout.strip() if branch_result.returncode == 0 else ""
+
+    status_result = _run_git_readonly(repo_path, "status", "--porcelain")
+    status_output = status_result.stdout.rstrip("\n")
+
+    diff_stat_output = ""
+    if include_diff_stat:
+        diff_result = _run_git_readonly(repo_path, "diff", "--stat")
+        diff_stat_output = diff_result.stdout.rstrip("\n")
+
+    timestamp = _utc_now()
+    repo_display = str(repo_path)
+    block_lines = [
+        "",
+        f"## Evidence Entry — {timestamp}",
+        "",
+        "type: git-snapshot",
+        f"repo: {repo_display}",
+    ]
+    if branch:
+        block_lines.append(f"branch: {branch}")
+    if head:
+        block_lines.append(f"head: {head}")
+    block_lines.append(f"claim: {note.strip()}")
+    block_lines.extend(
+        [
+            "",
+            "```text",
+            "git status --porcelain",
+            status_output,
+            "```",
+        ]
+    )
+    if include_diff_stat:
+        block_lines.extend(
+            [
+                "",
+                "```text",
+                "git diff --stat",
+                diff_stat_output,
+                "```",
+            ]
+        )
+
+    existing = evidence_path.read_text(encoding="utf-8")
+    if existing and not existing.endswith("\n"):
+        existing += "\n"
+    evidence_path.write_text(existing + "\n".join(block_lines) + "\n", encoding="utf-8")
+
+
 def add_evidence_file(
     project: Path,
     run_id: str,
@@ -257,6 +359,9 @@ class EvidenceEntry:
     claim: str
     artifact_path: str | None = None
     command: str | None = None
+    repo: str | None = None
+    branch: str | None = None
+    head: str | None = None
 
 
 def parse_evidence_entries(text: str) -> list[EvidenceEntry]:
@@ -269,6 +374,9 @@ def parse_evidence_entries(text: str) -> list[EvidenceEntry]:
         evidence_type = "note"
         artifact_path: str | None = None
         command: str | None = None
+        repo: str | None = None
+        branch: str | None = None
+        head: str | None = None
         claim: str | None = None
         for line in block.splitlines():
             stripped = line.strip()
@@ -278,6 +386,12 @@ def parse_evidence_entries(text: str) -> list[EvidenceEntry]:
                 artifact_path = stripped[5:].strip() or None
             elif stripped.startswith("command:"):
                 command = stripped[8:].strip() or None
+            elif stripped.startswith("repo:"):
+                repo = stripped[5:].strip() or None
+            elif stripped.startswith("branch:"):
+                branch = stripped[7:].strip() or None
+            elif stripped.startswith("head:"):
+                head = stripped[5:].strip() or None
             elif stripped.startswith("claim:"):
                 claim = stripped[6:].strip()
         if claim is not None:
@@ -288,6 +402,9 @@ def parse_evidence_entries(text: str) -> list[EvidenceEntry]:
                     claim=claim,
                     artifact_path=artifact_path,
                     command=command,
+                    repo=repo,
+                    branch=branch,
+                    head=head,
                 )
             )
     return entries
@@ -303,6 +420,13 @@ def format_evidence_index(run_id: str, entries: list[EvidenceEntry]) -> str:
             lines.append(f"   command: {entry.command}")
         if entry.artifact_path:
             lines.append(f"   path: {entry.artifact_path}")
+        if entry.repo:
+            lines.append(f"   repo: {entry.repo}")
+        if entry.branch or entry.head:
+            branch_head = entry.branch or "?"
+            if entry.head:
+                branch_head = f"{branch_head} @ {entry.head}" if entry.branch else entry.head
+            lines.append(f"   branch/head: {branch_head}")
     return "\n".join(lines)
 
 
