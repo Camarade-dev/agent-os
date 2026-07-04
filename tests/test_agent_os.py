@@ -15,6 +15,7 @@ from agent_os.paths import TEMPLATE_FILES, run_path
 from agent_os.validate import validate_run_for_closure
 from agent_os.workspace import (
     add_evidence,
+    add_evidence_command_output,
     add_evidence_file,
     close_run,
     create_mission,
@@ -626,6 +627,330 @@ class AgentOsTests(unittest.TestCase):
         add_evidence(self.project, run_id, "baseline evidence")
         before = validate_run_for_closure(self.project, run_id)
         add_evidence_file(self.project, run_id, str(ref_file), "additional file reference")
+        after = validate_run_for_closure(self.project, run_id)
+        self.assertEqual(before.ok, after.ok)
+        self.assertEqual(before.errors, after.errors)
+        self.assertFalse(before.ok)
+        self.assertIn("mission statement is placeholder/unfilled", before.errors)
+
+    def test_evidence_add_command_output_appends_structured_block(self) -> None:
+        run_id = create_mission(self.project, "20260704-050")
+        output_file = self.project / "unittest-output.txt"
+        output_file.write_text("test_foo ... ok\n", encoding="utf-8")
+        cmd = "python -m unittest discover -s tests -v"
+        add_evidence_command_output(
+            self.project,
+            run_id,
+            cmd,
+            str(output_file),
+            "unit test output from local shell",
+        )
+        text = (run_path(self.project, run_id) / "evidence.md").read_text(encoding="utf-8")
+        self.assertIn("## Evidence Entry —", text)
+        self.assertIn("type: command-output", text)
+        self.assertIn(f"command: {cmd}", text)
+        self.assertIn(f"path: {output_file}", text)
+        self.assertIn("claim: unit test output from local shell", text)
+        self.assertIn("```text", text)
+        self.assertIn("test_foo ... ok", text)
+        self.assertRegex(text, r"## Evidence Entry — \d{4}-\d{2}-\d{2}T")
+
+    def test_evidence_add_command_output_includes_bounded_output(self) -> None:
+        run_id = create_mission(self.project, "20260704-051")
+        output_file = self.project / "large-output.txt"
+        output_file.write_text("x" * 9000, encoding="utf-8")
+        add_evidence_command_output(
+            self.project,
+            run_id,
+            "echo large",
+            str(output_file),
+            "large output",
+        )
+        text = (run_path(self.project, run_id) / "evidence.md").read_text(encoding="utf-8")
+        self.assertIn("output truncated", text)
+        self.assertIn("x" * 100, text)
+        self.assertNotIn("x" * 9000, text)
+
+    def test_evidence_add_command_output_does_not_modify_output_file(self) -> None:
+        run_id = create_mission(self.project, "20260704-052")
+        output_file = self.project / "immutable-output.txt"
+        original = "must not change\n"
+        output_file.write_text(original, encoding="utf-8")
+        mtime_before = output_file.stat().st_mtime
+        add_evidence_command_output(
+            self.project,
+            run_id,
+            "python -m unittest",
+            str(output_file),
+            "unchanged output file",
+        )
+        self.assertEqual(output_file.read_text(encoding="utf-8"), original)
+        self.assertEqual(output_file.stat().st_mtime, mtime_before)
+
+    def test_evidence_add_command_output_preserves_previous_evidence(self) -> None:
+        run_id = create_mission(self.project, "20260704-053")
+        evidence_path = run_path(self.project, run_id) / "evidence.md"
+        original = evidence_path.read_text(encoding="utf-8")
+        output_file = self.project / "out.txt"
+        output_file.write_text("ok\n", encoding="utf-8")
+        add_evidence(self.project, run_id, "first note")
+        add_evidence_command_output(
+            self.project,
+            run_id,
+            "pytest -v",
+            str(output_file),
+            "pytest output",
+        )
+        text = evidence_path.read_text(encoding="utf-8")
+        self.assertTrue(text.startswith(original.rstrip("\n")))
+        self.assertIn("claim: first note", text)
+        self.assertIn("claim: pytest output", text)
+        self.assertIn("type: command-output", text)
+
+    def test_evidence_list_shows_command_output_entries(self) -> None:
+        run_id = create_mission(self.project, "20260704-054")
+        output_file = self.project / "test-out.txt"
+        output_file.write_text("passed\n", encoding="utf-8")
+        cmd = "python -m unittest discover -s tests -v"
+        add_evidence_command_output(
+            self.project,
+            run_id,
+            cmd,
+            str(output_file),
+            "unit test output from local shell",
+        )
+        output = list_evidence(self.project, run_id)
+        self.assertIn("[command-output] unit test output from local shell", output)
+        self.assertIn(f"command: {cmd}", output)
+        self.assertIn(f"path: {output_file}", output)
+
+    def test_evidence_add_command_output_fails_for_missing_run(self) -> None:
+        output_file = self.project / "exists.txt"
+        output_file.write_text("x\n", encoding="utf-8")
+        with self.assertRaises(FileNotFoundError):
+            add_evidence_command_output(
+                self.project,
+                "missing-run",
+                "echo hi",
+                str(output_file),
+                "note",
+            )
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "evidence",
+                    "add-command-output",
+                    "missing-run",
+                    str(self.project),
+                    "--command",
+                    "echo hi",
+                    "--output-file",
+                    str(output_file),
+                    "--note",
+                    "note",
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("run not found", buf.getvalue())
+
+    def test_evidence_add_command_output_fails_for_missing_evidence_file(self) -> None:
+        run_id = create_mission(self.project, "20260704-055")
+        (run_path(self.project, run_id) / "evidence.md").unlink()
+        output_file = self.project / "exists.txt"
+        output_file.write_text("x\n", encoding="utf-8")
+        with self.assertRaises(FileNotFoundError):
+            add_evidence_command_output(
+                self.project,
+                run_id,
+                "echo hi",
+                str(output_file),
+                "note",
+            )
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "evidence",
+                    "add-command-output",
+                    run_id,
+                    str(self.project),
+                    "--command",
+                    "echo hi",
+                    "--output-file",
+                    str(output_file),
+                    "--note",
+                    "note",
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("evidence file missing", buf.getvalue())
+
+    def test_evidence_add_command_output_fails_for_empty_command(self) -> None:
+        run_id = create_mission(self.project, "20260704-056")
+        output_file = self.project / "exists.txt"
+        output_file.write_text("x\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            add_evidence_command_output(
+                self.project,
+                run_id,
+                "   ",
+                str(output_file),
+                "note",
+            )
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "evidence",
+                    "add-command-output",
+                    run_id,
+                    str(self.project),
+                    "--command",
+                    "   ",
+                    "--output-file",
+                    str(output_file),
+                    "--note",
+                    "note",
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("command must not be empty", buf.getvalue())
+
+    def test_evidence_add_command_output_fails_for_empty_note(self) -> None:
+        run_id = create_mission(self.project, "20260704-057")
+        output_file = self.project / "exists.txt"
+        output_file.write_text("x\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            add_evidence_command_output(
+                self.project,
+                run_id,
+                "echo hi",
+                str(output_file),
+                "   ",
+            )
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "evidence",
+                    "add-command-output",
+                    run_id,
+                    str(self.project),
+                    "--command",
+                    "echo hi",
+                    "--output-file",
+                    str(output_file),
+                    "--note",
+                    "   ",
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("note must not be empty", buf.getvalue())
+
+    def test_evidence_add_command_output_fails_for_missing_output_file(self) -> None:
+        run_id = create_mission(self.project, "20260704-058")
+        missing = self.project / "does-not-exist.txt"
+        with self.assertRaises(FileNotFoundError):
+            add_evidence_command_output(
+                self.project,
+                run_id,
+                "echo hi",
+                str(missing),
+                "note",
+            )
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "evidence",
+                    "add-command-output",
+                    run_id,
+                    str(self.project),
+                    "--command",
+                    "echo hi",
+                    "--output-file",
+                    str(missing),
+                    "--note",
+                    "note",
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("output file not found", buf.getvalue())
+
+    def test_evidence_add_command_output_does_not_execute_command(self) -> None:
+        run_id = create_mission(self.project, "20260704-059")
+        side_effect = self.project / "must-not-be-created.txt"
+        output_file = self.project / "real-output.txt"
+        output_file.write_text("captured output\n", encoding="utf-8")
+        destructive_cmd = f'echo BOOM > "{side_effect}"'
+        add_evidence_command_output(
+            self.project,
+            run_id,
+            destructive_cmd,
+            str(output_file),
+            "declared but not run",
+        )
+        self.assertFalse(side_effect.exists())
+        text = (run_path(self.project, run_id) / "evidence.md").read_text(encoding="utf-8")
+        self.assertIn(f"command: {destructive_cmd}", text)
+        self.assertIn("captured output", text)
+
+    def test_evidence_add_command_output_does_not_change_run_status(self) -> None:
+        run_id = create_mission(self.project, "20260704-060")
+        base = run_path(self.project, run_id)
+        output_file = self.project / "out.txt"
+        output_file.write_text("x\n", encoding="utf-8")
+        meta_before = (base / "run.json").read_text(encoding="utf-8")
+        add_evidence_command_output(
+            self.project,
+            run_id,
+            "pytest -v",
+            str(output_file),
+            "status unchanged",
+        )
+        meta_after = (base / "run.json").read_text(encoding="utf-8")
+        self.assertEqual(meta_before, meta_after)
+        meta = json.loads(meta_after)
+        self.assertEqual(meta["status"], "open")
+
+    def test_evidence_add_command_output_does_not_modify_audit_owner_closure(self) -> None:
+        run_id = create_mission(self.project, "20260704-061")
+        base = run_path(self.project, run_id)
+        output_file = self.project / "out.txt"
+        output_file.write_text("x\n", encoding="utf-8")
+        audit_before = (base / "audit.md").read_text(encoding="utf-8")
+        owner_before = (base / "owner-decision.md").read_text(encoding="utf-8")
+        closure_before = (base / "closure.md").read_text(encoding="utf-8")
+        add_evidence_command_output(
+            self.project,
+            run_id,
+            "pytest -v",
+            str(output_file),
+            "audit untouched",
+        )
+        self.assertEqual(audit_before, (base / "audit.md").read_text(encoding="utf-8"))
+        self.assertEqual(owner_before, (base / "owner-decision.md").read_text(encoding="utf-8"))
+        self.assertEqual(closure_before, (base / "closure.md").read_text(encoding="utf-8"))
+
+    def test_closure_validation_unchanged_after_evidence_add_command_output(self) -> None:
+        run_id = create_mission(self.project, "20260704-062")
+        output_file = self.project / "out.txt"
+        output_file.write_text("x\n", encoding="utf-8")
+        add_evidence(self.project, run_id, "baseline evidence")
+        before = validate_run_for_closure(self.project, run_id)
+        add_evidence_command_output(
+            self.project,
+            run_id,
+            "pytest -v",
+            str(output_file),
+            "additional command output",
+        )
         after = validate_run_for_closure(self.project, run_id)
         self.assertEqual(before.ok, after.ok)
         self.assertEqual(before.errors, after.errors)

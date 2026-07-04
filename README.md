@@ -17,7 +17,7 @@ It helps a human owner delegate work to fallible coding and research agents by s
 
 Agent OS v0 is **not** meant for tiny one-shot tasks where a normal prompt is enough. It is meant for **governed delegation** where mission, authority, evidence, audit, and closure matter — work with real scope risk, a need for reviewable artifacts, or handoffs that must not close until required fields are filled.
 
-For concrete dogfood evidence and the usage-threshold tradeoff, see `docs/dogfood-001-todo-cli.md` (first run), `docs/dogfood-002-markdown-evidence-pack.md` (medium-scope local CLI), and `docs/dogfood-003-local-site-audit.md` (medium-risk local site audit). For what counts as acceptable evidence and how to capture it without turning Agent OS into a runtime, see `docs/evidence-capture-doctrine-v0.md`. For what evidence helpers may and may not do, see `docs/evidence-capture-boundaries-v0.md` (`agent-os evidence add` and `agent-os evidence add-file` are implemented as registrar-only).
+For concrete dogfood evidence and the usage-threshold tradeoff, see `docs/dogfood-001-todo-cli.md` (first run), `docs/dogfood-002-markdown-evidence-pack.md` (medium-scope local CLI), and `docs/dogfood-003-local-site-audit.md` (medium-risk local site audit). For what counts as acceptable evidence and how to capture it without turning Agent OS into a runtime, see `docs/evidence-capture-doctrine-v0.md`. For what evidence helpers may and may not do, see `docs/evidence-capture-boundaries-v0.md` (`agent-os evidence add`, `agent-os evidence add-file`, and `agent-os evidence add-command-output` are implemented as registrar-only).
 
 ## Requirements
 
@@ -63,6 +63,9 @@ agent-os status .
 #    Or append evidence with the registrar helper:
 #    agent-os evidence add <run-id> . --note "pytest: 6 passed"
 #    agent-os evidence add-file <run-id> . --file path/to/report.txt --note "build report"
+#    agent-os evidence add-command-output <run-id> . \
+#      --command "python -m unittest discover -s tests -v" \
+#      --output-file /tmp/test-out.txt --note "unit test output from local shell"
 #    agent-os evidence list <run-id> .   # read-only index of structured entries
 
 # 5. Record an audit verdict
@@ -93,6 +96,7 @@ agent-os status [PATH]        # list runs and fields blocking closure
 agent-os audit RUN_ID [PATH]  # record an audit verdict
 agent-os evidence add RUN_ID [PATH] --note "..."  # append evidence block (registrar only)
 agent-os evidence add-file RUN_ID [PATH] --file <path> --note "..."  # register file path (reference only)
+agent-os evidence add-command-output RUN_ID [PATH] --command "..." --output-file <path> --note "..."  # register command + output (no execution)
 agent-os evidence list RUN_ID [PATH]  # read-only index of structured evidence entries
 agent-os close RUN_ID [PATH]  # attempt fail-closed run closure
 ```

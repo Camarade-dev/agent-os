@@ -146,6 +146,73 @@ def add_evidence(
     evidence_path.write_text(existing + "\n".join(block_lines) + "\n", encoding="utf-8")
 
 
+COMMAND_OUTPUT_MAX_BYTES = 8192
+
+
+def _read_bounded_text(path: Path, max_bytes: int) -> tuple[str, bool]:
+    """Read file as text; return content and whether it was truncated."""
+    raw = path.read_bytes()
+    truncated = len(raw) > max_bytes
+    excerpt = raw[:max_bytes].decode("utf-8", errors="replace")
+    return excerpt, truncated
+
+
+def add_evidence_command_output(
+    project: Path,
+    run_id: str,
+    command: str,
+    output_file: str,
+    note: str,
+) -> None:
+    """Register a declared command and owner-supplied output file (registrar only; no execution)."""
+    base = run_path(project, run_id)
+    if not base.is_dir():
+        raise FileNotFoundError(f"run not found: {run_id}")
+
+    evidence_path = base / "evidence.md"
+    if not evidence_path.is_file():
+        raise FileNotFoundError(f"evidence file missing: {run_id}")
+
+    if not command.strip():
+        raise ValueError("command must not be empty or whitespace-only")
+
+    if not note.strip():
+        raise ValueError("note must not be empty or whitespace-only")
+
+    if not output_file.strip():
+        raise ValueError("output file path must not be empty")
+
+    referenced = Path(output_file.strip())
+    if not referenced.is_file():
+        raise FileNotFoundError(f"output file not found: {output_file.strip()}")
+
+    output_text, truncated = _read_bounded_text(referenced, COMMAND_OUTPUT_MAX_BYTES)
+    timestamp = _utc_now()
+    path_str = output_file.strip()
+
+    block_lines = [
+        "",
+        f"## Evidence Entry — {timestamp}",
+        "",
+        "type: command-output",
+        f"command: {command.strip()}",
+        f"path: {path_str}",
+        f"claim: {note.strip()}",
+        "",
+    ]
+    if truncated:
+        block_lines.append(
+            f"(output truncated; see referenced path for full output: {path_str})"
+        )
+        block_lines.append("")
+    block_lines.extend(["```text", output_text, "```"])
+
+    existing = evidence_path.read_text(encoding="utf-8")
+    if existing and not existing.endswith("\n"):
+        existing += "\n"
+    evidence_path.write_text(existing + "\n".join(block_lines) + "\n", encoding="utf-8")
+
+
 def add_evidence_file(
     project: Path,
     run_id: str,
@@ -189,6 +256,7 @@ class EvidenceEntry:
     evidence_type: str
     claim: str
     artifact_path: str | None = None
+    command: str | None = None
 
 
 def parse_evidence_entries(text: str) -> list[EvidenceEntry]:
@@ -200,6 +268,7 @@ def parse_evidence_entries(text: str) -> list[EvidenceEntry]:
         block = parts[index + 1] if index + 1 < len(parts) else ""
         evidence_type = "note"
         artifact_path: str | None = None
+        command: str | None = None
         claim: str | None = None
         for line in block.splitlines():
             stripped = line.strip()
@@ -207,6 +276,8 @@ def parse_evidence_entries(text: str) -> list[EvidenceEntry]:
                 evidence_type = stripped[5:].strip() or "note"
             elif stripped.startswith("path:"):
                 artifact_path = stripped[5:].strip() or None
+            elif stripped.startswith("command:"):
+                command = stripped[8:].strip() or None
             elif stripped.startswith("claim:"):
                 claim = stripped[6:].strip()
         if claim is not None:
@@ -216,6 +287,7 @@ def parse_evidence_entries(text: str) -> list[EvidenceEntry]:
                     evidence_type=evidence_type,
                     claim=claim,
                     artifact_path=artifact_path,
+                    command=command,
                 )
             )
     return entries
@@ -227,6 +299,8 @@ def format_evidence_index(run_id: str, entries: list[EvidenceEntry]) -> str:
         lines.append(
             f"{index}. {entry.timestamp} [{entry.evidence_type}] {entry.claim}"
         )
+        if entry.command:
+            lines.append(f"   command: {entry.command}")
         if entry.artifact_path:
             lines.append(f"   path: {entry.artifact_path}")
     return "\n".join(lines)

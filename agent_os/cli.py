@@ -9,6 +9,7 @@ from pathlib import Path
 from agent_os import __version__
 from agent_os.workspace import (
     add_evidence,
+    add_evidence_command_output,
     add_evidence_file,
     close_run,
     create_mission,
@@ -111,6 +112,23 @@ def cmd_evidence_add_file(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_evidence_add_command_output(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        add_evidence_command_output(
+            project,
+            args.run_id,
+            args.command,
+            args.output_file,
+            args.note,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"command-output evidence registered for run {args.run_id}")
+    return 0
+
+
 def cmd_close(args: argparse.Namespace) -> int:
     project = _project_path(args.path)
     ok, errors = close_run(project, args.run_id)
@@ -207,6 +225,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="evidence claim text for the referenced file",
     )
     evidence_add_file_parser.set_defaults(func=cmd_evidence_add_file)
+
+    evidence_add_cmd_parser = evidence_sub.add_parser(
+        "add-command-output",
+        help="register a declared command and owner-supplied output file (no execution)",
+    )
+    evidence_add_cmd_parser.add_argument("run_id", help="run identifier")
+    evidence_add_cmd_parser.add_argument("path", nargs="?", help="target project directory")
+    evidence_add_cmd_parser.add_argument(
+        "--command",
+        required=True,
+        help="declared command string (not executed)",
+    )
+    evidence_add_cmd_parser.add_argument(
+        "--output-file",
+        required=True,
+        help="path to an existing output file (read as text; not created by running --command)",
+    )
+    evidence_add_cmd_parser.add_argument(
+        "--note",
+        required=True,
+        help="evidence claim text for the command output",
+    )
+    evidence_add_cmd_parser.set_defaults(func=cmd_evidence_add_command_output)
 
     evidence_list_parser = evidence_sub.add_parser(
         "list",
