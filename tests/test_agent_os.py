@@ -13,7 +13,14 @@ from pathlib import Path
 from agent_os.cli import main
 from agent_os.paths import TEMPLATE_FILES, run_path
 from agent_os.validate import validate_run_for_closure
-from agent_os.workspace import close_run, create_mission, init_workspace, list_runs, record_audit
+from agent_os.workspace import (
+    add_evidence,
+    close_run,
+    create_mission,
+    init_workspace,
+    list_runs,
+    record_audit,
+)
 
 
 def _fill_run_for_closure(base: Path) -> None:
@@ -214,6 +221,98 @@ class AgentOsTests(unittest.TestCase):
         result = validate_run_for_closure(self.project, run_id)
         self.assertIn("authority field missing", result.errors)
         self.assertNotIn("authority field is placeholder", result.errors)
+
+    def test_evidence_add_appends_structured_block(self) -> None:
+        run_id = create_mission(self.project, "20260704-010")
+        add_evidence(self.project, run_id, "unittest passed", artifact_path="out.txt")
+        text = (run_path(self.project, run_id) / "evidence.md").read_text(encoding="utf-8")
+        self.assertIn("## Evidence Entry —", text)
+        self.assertIn("type: note", text)
+        self.assertIn("path: out.txt", text)
+        self.assertIn("claim: unittest passed", text)
+        self.assertRegex(text, r"## Evidence Entry — \d{4}-\d{2}-\d{2}T")
+
+    def test_evidence_add_preserves_previous_evidence(self) -> None:
+        run_id = create_mission(self.project, "20260704-011")
+        evidence_path = run_path(self.project, run_id) / "evidence.md"
+        original = evidence_path.read_text(encoding="utf-8")
+        add_evidence(self.project, run_id, "first note")
+        add_evidence(self.project, run_id, "second note", evidence_type="observation")
+        text = evidence_path.read_text(encoding="utf-8")
+        self.assertTrue(text.startswith(original.rstrip("\n")))
+        self.assertIn("claim: first note", text)
+        self.assertIn("claim: second note", text)
+        self.assertIn("type: observation", text)
+
+    def test_evidence_add_fails_for_missing_run(self) -> None:
+        with self.assertRaises(FileNotFoundError):
+            add_evidence(self.project, "missing-run", "note text")
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                ["evidence", "add", "missing-run", str(self.project), "--note", "note text"]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("run not found", buf.getvalue())
+
+    def test_evidence_add_fails_for_missing_evidence_file(self) -> None:
+        run_id = create_mission(self.project, "20260704-012")
+        (run_path(self.project, run_id) / "evidence.md").unlink()
+        with self.assertRaises(FileNotFoundError):
+            add_evidence(self.project, run_id, "note text")
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                ["evidence", "add", run_id, str(self.project), "--note", "note text"]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("evidence file missing", buf.getvalue())
+
+    def test_evidence_add_fails_for_empty_note(self) -> None:
+        run_id = create_mission(self.project, "20260704-013")
+        with self.assertRaises(ValueError):
+            add_evidence(self.project, run_id, "   ")
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                ["evidence", "add", run_id, str(self.project), "--note", "   "]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("note must not be empty", buf.getvalue())
+
+    def test_evidence_add_does_not_change_run_status(self) -> None:
+        run_id = create_mission(self.project, "20260704-014")
+        base = run_path(self.project, run_id)
+        meta_before = (base / "run.json").read_text(encoding="utf-8")
+        add_evidence(self.project, run_id, "status unchanged")
+        meta_after = (base / "run.json").read_text(encoding="utf-8")
+        self.assertEqual(meta_before, meta_after)
+        meta = json.loads(meta_after)
+        self.assertEqual(meta["status"], "open")
+
+    def test_evidence_add_does_not_modify_audit_owner_closure(self) -> None:
+        run_id = create_mission(self.project, "20260704-015")
+        base = run_path(self.project, run_id)
+        audit_before = (base / "audit.md").read_text(encoding="utf-8")
+        owner_before = (base / "owner-decision.md").read_text(encoding="utf-8")
+        closure_before = (base / "closure.md").read_text(encoding="utf-8")
+        add_evidence(self.project, run_id, "audit untouched")
+        self.assertEqual(audit_before, (base / "audit.md").read_text(encoding="utf-8"))
+        self.assertEqual(owner_before, (base / "owner-decision.md").read_text(encoding="utf-8"))
+        self.assertEqual(closure_before, (base / "closure.md").read_text(encoding="utf-8"))
+
+    def test_closure_still_blocked_when_audit_owner_closure_missing(self) -> None:
+        run_id = create_mission(self.project, "20260704-016")
+        add_evidence(self.project, run_id, "evidence only is not enough")
+        ok, errors = close_run(self.project, run_id)
+        self.assertFalse(ok)
+        self.assertIn("mission statement is placeholder/unfilled", errors)
+        self.assertIn("audit verdict field is placeholder", errors)
+        self.assertIn("owner decision field is placeholder", errors)
+        self.assertIn("closure verdict field is placeholder", errors)
 
 
 if __name__ == "__main__":

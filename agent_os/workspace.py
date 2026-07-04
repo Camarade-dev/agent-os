@@ -108,6 +108,42 @@ def list_runs(project: Path) -> list[dict]:
     return items
 
 
+def add_evidence(
+    project: Path,
+    run_id: str,
+    note: str,
+    evidence_type: str = "note",
+    artifact_path: str | None = None,
+) -> None:
+    """Append a structured evidence block to evidence.md (registrar only)."""
+    base = run_path(project, run_id)
+    if not base.is_dir():
+        raise FileNotFoundError(f"run not found: {run_id}")
+
+    evidence_path = base / "evidence.md"
+    if not evidence_path.is_file():
+        raise FileNotFoundError(f"evidence file missing: {run_id}")
+
+    if not note.strip():
+        raise ValueError("note must not be empty or whitespace-only")
+
+    timestamp = _utc_now()
+    block_lines = [
+        "",
+        f"## Evidence Entry — {timestamp}",
+        "",
+        f"type: {evidence_type}",
+    ]
+    if artifact_path:
+        block_lines.append(f"path: {artifact_path}")
+    block_lines.append(f"claim: {note.strip()}")
+
+    existing = evidence_path.read_text(encoding="utf-8")
+    if existing and not existing.endswith("\n"):
+        existing += "\n"
+    evidence_path.write_text(existing + "\n".join(block_lines) + "\n", encoding="utf-8")
+
+
 def record_audit(project: Path, run_id: str, verdict: str, notes: str = "") -> None:
     base = run_path(project, run_id)
     if not base.is_dir():

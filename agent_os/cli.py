@@ -8,6 +8,7 @@ from pathlib import Path
 
 from agent_os import __version__
 from agent_os.workspace import (
+    add_evidence,
     close_run,
     create_mission,
     init_workspace,
@@ -69,6 +70,23 @@ def cmd_audit(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_evidence_add(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        add_evidence(
+            project,
+            args.run_id,
+            args.note,
+            evidence_type=args.type,
+            artifact_path=args.artifact_path,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"evidence added for run {args.run_id}")
+    return 0
+
+
 def cmd_close(args: argparse.Namespace) -> int:
     project = _project_path(args.path)
     ok, errors = close_run(project, args.run_id)
@@ -125,6 +143,28 @@ def build_parser() -> argparse.ArgumentParser:
     close_parser.add_argument("run_id", help="run identifier")
     close_parser.add_argument("path", nargs="?", help="target project directory")
     close_parser.set_defaults(func=cmd_close)
+
+    evidence_parser = sub.add_parser("evidence", help="evidence capture helpers (registrar only)")
+    evidence_sub = evidence_parser.add_subparsers(dest="evidence_command", required=True)
+
+    evidence_add_parser = evidence_sub.add_parser(
+        "add",
+        help="append a structured evidence block to evidence.md",
+    )
+    evidence_add_parser.add_argument("run_id", help="run identifier")
+    evidence_add_parser.add_argument("path", nargs="?", help="target project directory")
+    evidence_add_parser.add_argument("--note", required=True, help="evidence note text")
+    evidence_add_parser.add_argument(
+        "--type",
+        default="note",
+        help="evidence type (default: note)",
+    )
+    evidence_add_parser.add_argument(
+        "--path",
+        dest="artifact_path",
+        help="optional local artifact path reference (not copied)",
+    )
+    evidence_add_parser.set_defaults(func=cmd_evidence_add)
 
     return parser
 
