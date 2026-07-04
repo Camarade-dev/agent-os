@@ -13,7 +13,7 @@ It helps a human owner delegate work to fallible coding and research agents by s
 
 **Agent OS v0 does not execute agents, orchestrate agents, or replace owner judgment.** It provides a filesystem-based protocol and CLI to create, review, and close governed runs locally.
 
-For the formal v0 scope boundary (in scope, out of scope, trust model, release checklist), see [`docs/v0-release-boundary.md`](docs/v0-release-boundary.md).
+For the formal v0 scope boundary (in scope, out of scope, trust model, release checklist), see [`docs/v0-release-boundary.md`](docs/v0-release-boundary.md). Release history: [`CHANGELOG.md`](CHANGELOG.md) · [`docs/release-notes-v0.1.0.md`](docs/release-notes-v0.1.0.md).
 
 ## When to use Agent OS (v0)
 
