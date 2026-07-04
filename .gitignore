@@ -1,0 +1,22 @@
+# Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Packaging / build
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+
+# Local demo workspaces created during development
+.agent-os/
