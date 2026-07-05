@@ -100,6 +100,50 @@ Eight ordered slices take a greenfield static project from spec confirmation thr
 
 **dependencies:** slice-01-spec-confirmation
 
+### Structured slice contract (EXAMPLE_ONLY — `slice-001-scaffold`)
+
+> **EXAMPLE_ONLY** — canonical machine-readable contract for the scaffold slice.  
+> `slice_id` `slice-001-scaffold` is the demo id used in runner planning-reference tests.  
+> This block does not create runs, approve proposals, or invoke executors.  
+> Structured runner import is **not implemented**; see `docs/planning-structured-slice-format.md`.
+
+```json
+{
+  "artifact_type": "PLANNING_RUN_SLICE",
+  "schema_version": "0.1",
+  "slice_id": "slice-001-scaffold",
+  "mission": "Create minimal slither-demo/ with index.html, style.css, game.js stubs.",
+  "scope": "Scaffold files only; no game logic beyond placeholders.",
+  "authority": "L2",
+  "allowed_paths": [
+    "slither-demo/index.html",
+    "slither-demo/style.css",
+    "slither-demo/game.js"
+  ],
+  "check_command": "",
+  "expected_evidence": [
+    "Three files exist; browser opens blank canvas container."
+  ],
+  "stop_conditions": [
+    "Do not implement loop or snake in this slice."
+  ],
+  "owner_gates": [
+    "Next Run Proposal approval per runner doctrine."
+  ],
+  "dependencies": [
+    "slice-01-spec-confirmation"
+  ],
+  "non_authority": {
+    "does_not_create_run": true,
+    "does_not_approve_proposal": true,
+    "does_not_invoke_executor": true,
+    "requires_runner_proposal": true,
+    "requires_approve_next_run": true,
+    "requires_invoke_run_allow_executor": true
+  }
+}
+```
+
 ---
 
 ## Planned run: slice-03-canvas-loop

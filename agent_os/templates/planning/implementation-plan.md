@@ -59,6 +59,47 @@ PLACEHOLDER — how the goal will be achieved across ordered slices. One paragra
 
 **dependencies:** PLACEHOLDER — prior slices or external prerequisites.
 
+### Structured slice contract (future runner import)
+
+> **Optional today; required for future structured runner import.**  
+> Machine-readable contract only — does not create runs, approve proposals, or invoke executors.  
+> See `docs/planning-structured-slice-format.md`.
+
+Replace `PLACEHOLDER` values and remove this notice when filling the plan. One fenced JSON block per slice; `slice_id` must be unique in the file.
+
+```json
+{
+  "artifact_type": "PLANNING_RUN_SLICE",
+  "schema_version": "0.1",
+  "slice_id": "PLACEHOLDER-slice-id",
+  "mission": "PLACEHOLDER",
+  "scope": "PLACEHOLDER",
+  "authority": "PLACEHOLDER",
+  "allowed_paths": [
+    "PLACEHOLDER/path/or/glob"
+  ],
+  "check_command": "PLACEHOLDER or empty string if none",
+  "expected_evidence": [
+    "PLACEHOLDER"
+  ],
+  "stop_conditions": [
+    "PLACEHOLDER"
+  ],
+  "owner_gates": [
+    "PLACEHOLDER"
+  ],
+  "dependencies": [],
+  "non_authority": {
+    "does_not_create_run": true,
+    "does_not_approve_proposal": true,
+    "does_not_invoke_executor": true,
+    "requires_runner_proposal": true,
+    "requires_approve_next_run": true,
+    "requires_invoke_run_allow_executor": true
+  }
+}
+```
+
 ---
 
 ## Planned run: {{RUN_LABEL_2}}

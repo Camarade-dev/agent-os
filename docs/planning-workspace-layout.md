@@ -94,6 +94,8 @@ Copied or rendered from `agent_os/templates/planning/local-agentic-spec.md`. Bou
 
 Copied or rendered from `agent_os/templates/planning/implementation-plan.md`. Ordered **slices** (planned runs), each with mission, scope, `allowed_paths`, authority, `check_command` (if applicable), expected evidence, stop conditions, owner gates, and dependencies. Slices are **not executable** until converted to a Next Run Proposal and approved.
 
+**Structured slice blocks:** each slice may include a fenced JSON block with `"artifact_type": "PLANNING_RUN_SLICE"` — a machine-readable contract for **future** runner structured import. Prose sections remain human-readable; import must not infer authority from free text. See [`docs/planning-structured-slice-format.md`](planning-structured-slice-format.md). Blocks are optional today and do not execute anything.
+
 ### `planning-audit.md`
 
 Copied or rendered from `agent_os/templates/planning/planning-audit.md`. Independent review of planning artifacts before plan-driven run proposals. Verdict is `PASS`, `PASS_WITH_NOTES`, `FAIL`, or `BLOCKED`. Does **not** approve execution.
@@ -285,6 +287,7 @@ Does **not** record owner decisions, approve run proposals, create runs, invoke 
 ## 8. References
 
 - `docs/planning-layer-doctrine.md` — planning doctrine and role boundaries
+- `docs/planning-structured-slice-format.md` — `PLANNING_RUN_SLICE` JSON contract for future runner import
 - `agent_os/templates/planning/` — artifact templates
 - `examples/planning-workspace-slither-like/` — EXAMPLE_ONLY sample package
 - `agent-os-runner-experimental/docs/planning-artifact-consumption.md` — future runner read rules

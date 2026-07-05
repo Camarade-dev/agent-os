@@ -13,6 +13,8 @@ Use a temporary project outside this repository and substitute its path for `<de
 
 `APPROVED_FOR_RUN_PROPOSALS` is not execution approval. It only means the filled planning artifacts may be used to prepare future run proposals. Runner integration remains out of scope here, and no run exists until a future explicit runner proposal/import command is implemented and separately approved.
 
+**Structured slice blocks** (`PLANNING_RUN_SLICE` JSON inside `implementation-plan.md`) are **optional today**. They document the machine-readable contract a future runner import may consume; they do not import fields, create proposals, or execute runs. See [`docs/planning-structured-slice-format.md`](planning-structured-slice-format.md).
+
 In this demo:
 
 - no agent is invoked
@@ -151,6 +153,7 @@ Minimum fill requirements:
 - required sections remain present
 - non-authority notices remain present
 - the implementation plan includes bounded slices with `allowed_paths`, `check_command`, and stop conditions
+- optional `PLANNING_RUN_SLICE` JSON blocks per slice are recommended when preparing for future structured runner import (see `docs/planning-structured-slice-format.md`)
 - the planning audit records an acceptable verdict, `PASS` or `PASS_WITH_NOTES`
 - the plan keeps the boundary that planned runs are not executable until converted into future approved run proposals
 
