@@ -41,6 +41,69 @@ PLANNING_AUTHORITY_KEYS = (
     "no_self_approval",
 )
 
+PLANNING_STATUSES = (
+    "DRAFT",
+    "CONTEXT_READY",
+    "SPEC_READY",
+    "PLAN_READY",
+    "PLANNING_AUDIT_READY",
+    "APPROVED_FOR_RUN_PROPOSALS",
+    "BLOCKED",
+    "SUPERSEDED",
+    "CLOSED",
+)
+
+PLANNING_ARTIFACT_PATH_KEYS = (
+    "context_pack",
+    "local_agentic_spec",
+    "implementation_plan",
+    "planning_audit",
+)
+
+PLANNING_DIRECTORY_KEYS = PLANNING_SUBDIRS
+
+PLACEHOLDER_TOKEN_PATTERN = re.compile(r"\{\{[^}]+\}\}")
+
+NON_AUTHORITY_PATTERN = re.compile(r"does\s+not", re.IGNORECASE)
+
+ARTIFACT_TYPE_MARKERS = {
+    "context-pack.md": "CONTEXT_PACK",
+    "local-agentic-spec.md": "LOCAL_AGENTIC_SPEC",
+    "implementation-plan.md": "IMPLEMENTATION_PLAN",
+    "planning-audit.md": "PLANNING_AUDIT",
+}
+
+ARTIFACT_REQUIRED_SECTIONS: dict[str, tuple[str, ...]] = {
+    "context-pack.md": (
+        "Goal reference",
+        "Source boundaries",
+        "Files inspected",
+        "Unknowns",
+        "Evidence",
+    ),
+    "local-agentic-spec.md": (
+        "Goal summary",
+        "In-scope",
+        "Out-of-scope",
+        "Success criteria",
+        "Non-goals",
+    ),
+    "implementation-plan.md": (
+        "Plan summary",
+        "Ordered slices",
+        "allowed_paths",
+        "check_command",
+        "stop conditions",
+    ),
+    "planning-audit.md": (
+        "Artifacts audited",
+        "Completeness",
+        "Scope consistency",
+        "Verdict",
+        "Required fixes",
+    ),
+}
+
 _WORKSPACE_README = """\
 # Planning workspace
 
@@ -153,6 +216,15 @@ class PlanningStatusReport:
     structural_ok: bool
 
 
+def _inspect_planning_structure(
+    dest: Path,
+) -> tuple[dict[str, bool], dict[str, bool], bool]:
+    file_status = {name: (dest / name).is_file() for name in PLANNING_REQUIRED_FILES}
+    dir_status = {name: (dest / name).is_dir() for name in PLANNING_SUBDIRS}
+    structural_ok = all(file_status.values()) and all(dir_status.values())
+    return file_status, dir_status, structural_ok
+
+
 def _load_planning_manifest(manifest_path: Path, plan_id: str) -> dict:
     if not manifest_path.is_file():
         raise FileNotFoundError(f"manifest.json missing in planning workspace: {plan_id}")
@@ -247,9 +319,7 @@ def status_planning_workspace(project: Path, plan_id: str) -> PlanningStatusRepo
 
     manifest = _load_planning_manifest(dest / "manifest.json", plan_id)
 
-    file_status = {name: (dest / name).is_file() for name in PLANNING_REQUIRED_FILES}
-    dir_status = {name: (dest / name).is_dir() for name in PLANNING_SUBDIRS}
-    structural_ok = all(file_status.values()) and all(dir_status.values())
+    file_status, dir_status, structural_ok = _inspect_planning_structure(dest)
 
     output = format_planning_status(
         dest,
@@ -260,3 +330,195 @@ def status_planning_workspace(project: Path, plan_id: str) -> PlanningStatusRepo
         structural_ok,
     )
     return PlanningStatusReport(output, structural_ok)
+
+
+def _validate_manifest_fields(manifest: dict, plan_id: str) -> list[str]:
+    errors: list[str] = []
+
+    if manifest.get("package_type") != "PLANNING_WORKSPACE":
+        found = manifest.get("package_type")
+        errors.append(
+            f"wrong package_type: expected PLANNING_WORKSPACE, found {found!r}"
+        )
+
+    status = manifest.get("status")
+    if status is None:
+        errors.append("missing manifest field: status")
+    elif status not in PLANNING_STATUSES:
+        errors.append(f"invalid manifest status: {status!r}")
+
+    if not manifest.get("created_at"):
+        errors.append("missing manifest field: created_at")
+
+    artifact_paths = manifest.get("artifact_paths")
+    if not isinstance(artifact_paths, dict):
+        errors.append("missing manifest field: artifact_paths")
+    else:
+        for key in PLANNING_ARTIFACT_PATH_KEYS:
+            if key not in artifact_paths:
+                errors.append(f"missing artifact_paths key: {key}")
+
+    directories = manifest.get("directories")
+    if not isinstance(directories, dict):
+        errors.append("missing manifest field: directories")
+    else:
+        for key in PLANNING_DIRECTORY_KEYS:
+            if key not in directories:
+                errors.append(f"missing directories key: {key}")
+
+    gates = manifest.get("gates")
+    if not isinstance(gates, dict):
+        errors.append("missing manifest field: gates")
+    else:
+        for key in PLANNING_GATE_KEYS:
+            if key not in gates:
+                errors.append(f"missing gate: {key}")
+
+    authority = manifest.get("authority")
+    if not isinstance(authority, dict):
+        errors.append("missing manifest field: authority")
+    else:
+        for key in PLANNING_AUTHORITY_KEYS:
+            if key not in authority:
+                errors.append(f"missing authority flag: {key}")
+            elif authority[key] is not True:
+                errors.append(f"authority flag must be true: {key}")
+
+    if manifest.get("plan_id") != plan_id:
+        errors.append(
+            f"manifest plan_id mismatch: requested {plan_id!r}, "
+            f"found {manifest.get('plan_id')!r}"
+        )
+
+    return errors
+
+
+def _validate_artifact_file(dest: Path, filename: str) -> list[str]:
+    errors: list[str] = []
+    path = dest / filename
+
+    if not path.is_file():
+        errors.append(f"artifact missing: {filename}")
+        return errors
+
+    content = path.read_text(encoding="utf-8")
+    if not content.strip():
+        errors.append(f"artifact empty: {filename}")
+        return errors
+
+    marker = ARTIFACT_TYPE_MARKERS[filename]
+    if marker not in content:
+        errors.append(f"missing artifact type marker {marker!r} in {filename}")
+
+    if not NON_AUTHORITY_PATTERN.search(content):
+        errors.append(f"missing non-authority notice in {filename}")
+
+    for match in PLACEHOLDER_TOKEN_PATTERN.findall(content):
+        errors.append(f"placeholder still present in {filename}: {match}")
+
+    lower = content.lower()
+    for section in ARTIFACT_REQUIRED_SECTIONS[filename]:
+        if section.lower() not in lower:
+            errors.append(f"required section missing in {filename}: {section}")
+
+    return errors
+
+
+def _validate_planning_artifacts(dest: Path) -> list[str]:
+    errors: list[str] = []
+    for filename in PLANNING_ARTIFACT_FILES:
+        errors.extend(_validate_artifact_file(dest, filename))
+    return errors
+
+
+@dataclass(frozen=True)
+class PlanningValidationReport:
+    output: str
+    structural_ok: bool
+    manifest_ok: bool
+    artifacts_ok: bool
+
+    @property
+    def valid(self) -> bool:
+        return self.structural_ok and self.manifest_ok and self.artifacts_ok
+
+
+def format_planning_validation(
+    dest: Path,
+    plan_id: str,
+    manifest: dict,
+    structural_ok: bool,
+    manifest_errors: list[str],
+    artifact_errors: list[str],
+) -> str:
+    lines = [
+        f"planning workspace: {dest}",
+        f"plan_id: {plan_id}",
+        f"status: {manifest.get('status', '?')}",
+        f"structural result: {'OK' if structural_ok else 'BROKEN'}",
+        f"manifest validation: {'OK' if not manifest_errors else 'INVALID'}",
+    ]
+    for error in manifest_errors:
+        lines.append(f"  - {error}")
+
+    lines.append(f"artifact validation: {'OK' if not artifact_errors else 'INVALID'}")
+    for error in artifact_errors:
+        lines.append(f"  - {error}")
+
+    valid = structural_ok and not manifest_errors and not artifact_errors
+    lines.append(f"final validation result: {'OK' if valid else 'INVALID'}")
+    if valid:
+        lines.append(
+            "note: no files were modified, no runs were created, no agents were invoked"
+        )
+    return "\n".join(lines)
+
+
+def validate_planning_workspace(project: Path, plan_id: str) -> PlanningValidationReport:
+    """Weak read-only validation of an existing planning workspace."""
+    validate_plan_id(plan_id)
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        raise FileNotFoundError("no workspace found (run `agent-os init` first)")
+
+    dest = planning_path(project, plan_id)
+    if not dest.is_dir():
+        raise FileNotFoundError(f"planning workspace not found: {plan_id}")
+
+    _, _, structural_ok = _inspect_planning_structure(dest)
+
+    manifest_errors: list[str] = []
+    manifest: dict = {}
+    try:
+        manifest = _load_planning_manifest(dest / "manifest.json", plan_id)
+        manifest_errors = _validate_manifest_fields(manifest, plan_id)
+    except (FileNotFoundError, ValueError) as exc:
+        manifest_errors = [str(exc)]
+        structural_ok = False
+
+    artifact_errors: list[str] = []
+    if structural_ok:
+        artifact_errors = _validate_planning_artifacts(dest)
+    elif dest.is_dir():
+        for filename in PLANNING_ARTIFACT_FILES:
+            path = dest / filename
+            if not path.is_file():
+                artifact_errors.append(f"artifact missing: {filename}")
+            elif not path.read_text(encoding="utf-8").strip():
+                artifact_errors.append(f"artifact empty: {filename}")
+
+    output = format_planning_validation(
+        dest,
+        plan_id,
+        manifest,
+        structural_ok,
+        manifest_errors,
+        artifact_errors,
+    )
+    return PlanningValidationReport(
+        output,
+        structural_ok,
+        not manifest_errors,
+        not artifact_errors,
+    )

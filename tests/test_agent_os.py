@@ -13,7 +13,12 @@ from pathlib import Path
 
 from agent_os.cli import main
 from agent_os.paths import TEMPLATE_FILES, planning_path, run_path
-from agent_os.planning import init_planning_workspace, status_planning_workspace, validate_plan_id
+from agent_os.planning import (
+    init_planning_workspace,
+    status_planning_workspace,
+    validate_planning_workspace,
+    validate_plan_id,
+)
 from agent_os.validate import validate_run_for_closure
 from agent_os.workspace import (
     GIT_SNAPSHOT_READONLY_ARGV,
@@ -1723,6 +1728,223 @@ class PlanningStatusTests(unittest.TestCase):
         )
         self.assertEqual(planning_snapshots, self._snapshot_planning_tree())
         self.assertIn("structural result: OK", buf.getvalue())
+
+
+def _prepare_valid_planning_workspace(project: Path, plan_id: str) -> Path:
+    """Fill init workspace enough to pass weak validation."""
+    dest = init_planning_workspace(project, plan_id)
+    impl = dest / "implementation-plan.md"
+    text = impl.read_text(encoding="utf-8")
+    text = text.replace("{{RUN_LABEL_1}}", "slice-01")
+    text = text.replace("{{RUN_LABEL_2}}", "slice-02")
+    impl.write_text(text, encoding="utf-8")
+    return dest
+
+
+class PlanningValidateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self._tmp.name)
+        init_workspace(self.project)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _snapshot_planning_tree(self) -> dict[str, str]:
+        workspace = self.project / ".agent-os"
+        snapshots: dict[str, str] = {}
+        for path in workspace.rglob("*"):
+            if path.is_file():
+                rel = path.relative_to(workspace).as_posix()
+                snapshots[rel] = path.read_text(encoding="utf-8")
+        return snapshots
+
+    def test_planning_validate_success_on_acceptable_workspace(self) -> None:
+        plan_id = "slither-demo"
+        dest = _prepare_valid_planning_workspace(self.project, plan_id)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["planning", "validate", plan_id, str(self.project)])
+        self.assertEqual(code, 0)
+        output = buf.getvalue()
+        self.assertIn(f"planning workspace: {dest}", output)
+        self.assertIn(f"plan_id: {plan_id}", output)
+        self.assertIn("status: DRAFT", output)
+        self.assertIn("structural result: OK", output)
+        self.assertIn("manifest validation: OK", output)
+        self.assertIn("artifact validation: OK", output)
+        self.assertIn("final validation result: OK", output)
+        self.assertIn("no files were modified", output)
+        self.assertIn("no runs were created", output)
+        self.assertIn("no agents were invoked", output)
+
+    def test_planning_validate_api_matches_cli(self) -> None:
+        plan_id = "planning_001"
+        _prepare_valid_planning_workspace(self.project, plan_id)
+        report = validate_planning_workspace(self.project, plan_id)
+        self.assertTrue(report.valid)
+        self.assertIn("final validation result: OK", report.output)
+
+    def test_planning_validate_fails_after_init_due_to_placeholders(self) -> None:
+        plan_id = "fresh-plan"
+        init_planning_workspace(self.project, plan_id)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["planning", "validate", plan_id, str(self.project)])
+        self.assertEqual(code, 1)
+        output = buf.getvalue()
+        self.assertIn("artifact validation: INVALID", output)
+        self.assertIn("placeholder still present", output)
+        self.assertIn("final validation result: INVALID", output)
+
+    def test_planning_validate_fails_for_missing_manifest_field(self) -> None:
+        plan_id = "missing-status"
+        dest = _prepare_valid_planning_workspace(self.project, plan_id)
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        del manifest["status"]
+        (dest / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["planning", "validate", plan_id, str(self.project)])
+        self.assertEqual(code, 1)
+        output = buf.getvalue()
+        self.assertIn("manifest validation: INVALID", output)
+        self.assertIn("missing manifest field: status", output)
+        self.assertIn("final validation result: INVALID", output)
+
+    def test_planning_validate_fails_for_wrong_package_type(self) -> None:
+        plan_id = "wrong-type"
+        dest = _prepare_valid_planning_workspace(self.project, plan_id)
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        manifest["package_type"] = "RUN_PACKAGE"
+        (dest / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["planning", "validate", plan_id, str(self.project)])
+        self.assertEqual(code, 1)
+        self.assertIn("wrong package_type", buf.getvalue())
+
+    def test_planning_validate_fails_for_missing_gate(self) -> None:
+        plan_id = "missing-gate"
+        dest = _prepare_valid_planning_workspace(self.project, plan_id)
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        del manifest["gates"]["run_proposal_allowed"]
+        (dest / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["planning", "validate", plan_id, str(self.project)])
+        self.assertEqual(code, 1)
+        self.assertIn("missing gate: run_proposal_allowed", buf.getvalue())
+
+    def test_planning_validate_fails_for_missing_authority_flag(self) -> None:
+        plan_id = "missing-authority"
+        dest = _prepare_valid_planning_workspace(self.project, plan_id)
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        manifest["authority"]["no_execution"] = False
+        (dest / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["planning", "validate", plan_id, str(self.project)])
+        self.assertEqual(code, 1)
+        output = buf.getvalue()
+        self.assertIn("authority flag must be true: no_execution", output)
+
+    def test_planning_validate_fails_for_missing_artifact_type_marker(self) -> None:
+        plan_id = "missing-marker"
+        dest = _prepare_valid_planning_workspace(self.project, plan_id)
+        path = dest / "context-pack.md"
+        path.write_text(path.read_text(encoding="utf-8").replace("CONTEXT_PACK", "MISSING"), encoding="utf-8")
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["planning", "validate", plan_id, str(self.project)])
+        self.assertEqual(code, 1)
+        self.assertIn("missing artifact type marker", buf.getvalue())
+
+    def test_planning_validate_fails_for_missing_required_section(self) -> None:
+        plan_id = "missing-section"
+        dest = _prepare_valid_planning_workspace(self.project, plan_id)
+        path = dest / "local-agentic-spec.md"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("## Non-goals", "## Removed"),
+            encoding="utf-8",
+        )
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["planning", "validate", plan_id, str(self.project)])
+        self.assertEqual(code, 1)
+        self.assertIn("required section missing", buf.getvalue())
+        self.assertIn("Non-goals", buf.getvalue())
+
+    def test_planning_validate_fails_for_placeholder_token(self) -> None:
+        plan_id = "placeholder-token"
+        dest = _prepare_valid_planning_workspace(self.project, plan_id)
+        path = dest / "planning-audit.md"
+        path.write_text(
+            path.read_text(encoding="utf-8") + "\n{{CUSTOM_PLACEHOLDER}}\n",
+            encoding="utf-8",
+        )
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["planning", "validate", plan_id, str(self.project)])
+        self.assertEqual(code, 1)
+        self.assertIn("placeholder still present", buf.getvalue())
+
+    def test_planning_validate_fails_for_structurally_broken_workspace(self) -> None:
+        plan_id = "broken-structure"
+        dest = _prepare_valid_planning_workspace(self.project, plan_id)
+        (dest / "context-pack.md").unlink()
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["planning", "validate", plan_id, str(self.project)])
+        self.assertEqual(code, 1)
+        output = buf.getvalue()
+        self.assertIn("structural result: BROKEN", output)
+        self.assertIn("artifact missing: context-pack.md", output)
+        self.assertIn("final validation result: INVALID", output)
+
+    def test_planning_validate_is_read_only(self) -> None:
+        plan_id = "slither-demo"
+        _prepare_valid_planning_workspace(self.project, plan_id)
+        workspace = self.project / ".agent-os"
+        before_runs = list((workspace / "runs").iterdir())
+        workspace_json_before = (workspace / "workspace.json").read_text(encoding="utf-8")
+        planning_snapshots = self._snapshot_planning_tree()
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["planning", "validate", plan_id, str(self.project)])
+        self.assertEqual(code, 0)
+
+        after_runs = list((workspace / "runs").iterdir())
+        self.assertEqual(before_runs, after_runs)
+        self.assertEqual(
+            workspace_json_before,
+            (workspace / "workspace.json").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(planning_snapshots, self._snapshot_planning_tree())
+
+    def test_planning_validate_fails_when_agent_os_not_initialized(self) -> None:
+        bare = Path(tempfile.mkdtemp())
+        try:
+            with self.assertRaises(FileNotFoundError):
+                validate_planning_workspace(bare, "demo-plan")
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                code = main(["planning", "validate", "demo-plan", str(bare)])
+            self.assertEqual(code, 1)
+            self.assertIn("no workspace found", buf.getvalue())
+        finally:
+            import shutil
+
+            shutil.rmtree(bare)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,11 @@ import sys
 from pathlib import Path
 
 from agent_os import __version__
-from agent_os.planning import init_planning_workspace, status_planning_workspace
+from agent_os.planning import (
+    init_planning_workspace,
+    status_planning_workspace,
+    validate_planning_workspace,
+)
 from agent_os.workspace import (
     add_evidence,
     add_evidence_command_output,
@@ -171,6 +175,17 @@ def cmd_planning_status(args: argparse.Namespace) -> int:
         return 1
     print(report.output)
     return 0 if report.structural_ok else 1
+
+
+def cmd_planning_validate(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        report = validate_planning_workspace(project, args.plan_id)
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(report.output)
+    return 0 if report.valid else 1
 
 
 def cmd_close(args: argparse.Namespace) -> int:
@@ -345,6 +360,14 @@ def build_parser() -> argparse.ArgumentParser:
     planning_status_parser.add_argument("plan_id", help="plan identifier (filesystem-safe slug)")
     planning_status_parser.add_argument("path", nargs="?", help="target project directory")
     planning_status_parser.set_defaults(func=cmd_planning_status)
+
+    planning_validate_parser = planning_sub.add_parser(
+        "validate",
+        help="weak read-only validation of a planning workspace (no execution approval)",
+    )
+    planning_validate_parser.add_argument("plan_id", help="plan identifier (filesystem-safe slug)")
+    planning_validate_parser.add_argument("path", nargs="?", help="target project directory")
+    planning_validate_parser.set_defaults(func=cmd_planning_validate)
 
     return parser
 

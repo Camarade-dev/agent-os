@@ -1,6 +1,6 @@
 # Planning workspace layout
 
-> **Status:** layout contract — bootstrap via `agent-os planning init <plan-id>`; no validation or automation  
+> **Status:** layout contract — bootstrap via `agent-os planning init <plan-id>`; weak validation via `agent-os planning validate <plan-id>`  
 > **Doctrine:** `docs/planning-layer-doctrine.md`  
 > **Templates:** `agent_os/templates/planning/`  
 > **Example:** `examples/planning-workspace-slither-like/` (EXAMPLE_ONLY)
@@ -222,6 +222,14 @@ agent-os planning status <plan-id> [PATH]
 ```
 
 Reports workspace path, manifest status, expected artifact files and directories (present/missing), gate and authority flags from `manifest.json`, and a structural result (`OK` or `BROKEN`). Fails closed when the workspace, manifest, or required structure is missing or invalid. Does **not** create, modify, or delete files.
+
+Weak read-only validation (does not approve execution):
+
+```bash
+agent-os planning validate <plan-id> [PATH]
+```
+
+Checks manifest fields, authority safety flags, artifact type markers, required sections, and obvious unfilled `{{...}}` placeholders. Reports structural, manifest, and artifact validation results plus a final result (`OK` or `INVALID`). This is **not** semantic validation — it does not judge plan quality, approve execution, infer readiness, or advance status or gates. Does **not** create, modify, or delete files, create runs, or invoke agents.
 
 ### Manual
 

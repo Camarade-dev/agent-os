@@ -86,6 +86,9 @@ agent-os planning init <plan-id> .
 # 1c. Inspect an existing planning workspace (read-only)
 agent-os planning status <plan-id> .
 
+# 1d. Weak read-only validation of a planning workspace (does not approve execution)
+agent-os planning validate <plan-id> .
+
 # 2. Create a run from templates
 agent-os mission .
 
@@ -128,6 +131,7 @@ agent-os --help
 agent-os init [PATH]          # bootstrap .agent-os/ in a target project
 agent-os planning init PLAN_ID [PATH]  # bootstrap DRAFT planning workspace (registrar only)
 agent-os planning status PLAN_ID [PATH]  # inspect planning workspace structure (read-only)
+agent-os planning validate PLAN_ID [PATH]  # weak read-only validation (does not approve execution)
 agent-os mission [PATH]       # create a new run from templates
 agent-os status [PATH]        # list runs and fields blocking closure
 agent-os audit RUN_ID [PATH]  # record an audit verdict
