@@ -92,6 +92,9 @@ agent-os planning validate <plan-id> .
 # 1e. Record an owner decision (evidence only; does not execute or create runs)
 agent-os planning decide <plan-id> . --decision REQUEST_REVISION --summary "fix scope"
 
+# 1f. List owner decision records (read-only)
+agent-os planning decisions list <plan-id> .
+
 # 2. Create a run from templates
 agent-os mission .
 
@@ -136,6 +139,7 @@ agent-os planning init PLAN_ID [PATH]  # bootstrap DRAFT planning workspace (reg
 agent-os planning status PLAN_ID [PATH]  # inspect planning workspace structure (read-only)
 agent-os planning validate PLAN_ID [PATH]  # weak read-only validation (does not approve execution)
 agent-os planning decide PLAN_ID [PATH] --decision DECISION --summary "..."  # record owner decision (evidence only)
+agent-os planning decisions list PLAN_ID [PATH]  # list owner decision records (read-only)
 agent-os mission [PATH]       # create a new run from templates
 agent-os status [PATH]        # list runs and fields blocking closure
 agent-os audit RUN_ID [PATH]  # record an audit verdict

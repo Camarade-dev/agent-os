@@ -60,6 +60,18 @@ PLANNING_OWNER_DECISIONS = (
     "CLOSE",
 )
 
+PLANNING_OWNER_DECISION_RECORD_TYPE = "PLANNING_OWNER_DECISION"
+
+PLANNING_OWNER_DECISION_REQUIRED_FIELDS = (
+    "record_type",
+    "plan_id",
+    "decision",
+    "summary",
+    "created_at",
+    "workspace_status_at_decision",
+    "authority",
+)
+
 PLANNING_ARTIFACT_PATH_KEYS = (
     "context_pack",
     "local_agentic_spec",
@@ -637,4 +649,166 @@ def record_planning_owner_decision(
         decision_path,
         str(workspace_status),
         "\n".join(lines),
+    )
+
+
+@dataclass(frozen=True)
+class PlanningOwnerDecisionRecord:
+    created_at: str
+    decision: str
+    workspace_status_at_decision: str
+    summary: str
+    filename: str
+
+
+@dataclass(frozen=True)
+class PlanningDecisionsListReport:
+    output: str
+    count: int
+    records: tuple[PlanningOwnerDecisionRecord, ...]
+    skipped_files: tuple[str, ...]
+
+
+def _parse_owner_decision_json(path: Path, plan_id: str) -> dict:
+    """Load one decisions/*.json file; fail closed on malformed owner records."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"invalid decision JSON in {path.name}: {exc.msg}"
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"invalid decision JSON in {path.name}: expected object"
+        )
+
+    record_type = data.get("record_type")
+    if record_type != PLANNING_OWNER_DECISION_RECORD_TYPE:
+        return data
+
+    for field in PLANNING_OWNER_DECISION_REQUIRED_FIELDS:
+        value = data.get(field)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            raise ValueError(
+                f"missing required field {field!r} in decision file {path.name}"
+            )
+
+    if data.get("plan_id") != plan_id:
+        raise ValueError(
+            "decision plan_id mismatch in "
+            f"{path.name}: expected {plan_id!r}, found {data.get('plan_id')!r}"
+        )
+
+    if not isinstance(data["authority"], dict):
+        raise ValueError(
+            f"invalid authority in decision file {path.name}: expected object"
+        )
+
+    return data
+
+
+def _load_planning_owner_decisions(
+    dest: Path,
+    plan_id: str,
+) -> tuple[list[PlanningOwnerDecisionRecord], list[str]]:
+    """
+    Read owner decision records from decisions/.
+
+    Policy:
+    - Malformed JSON in any .json file -> fail closed.
+    - JSON with record_type other than PLANNING_OWNER_DECISION -> skip (reported).
+    - PLANNING_OWNER_DECISION missing required fields -> fail closed.
+    - PLANNING_OWNER_DECISION with mismatched plan_id -> fail closed.
+    - Non-.json files (e.g. markdown) are ignored.
+    """
+    decisions_dir = dest / "decisions"
+    records: list[PlanningOwnerDecisionRecord] = []
+    skipped: list[str] = []
+
+    for path in sorted(decisions_dir.glob("*.json")):
+        data = _parse_owner_decision_json(path, plan_id)
+        if data.get("record_type") != PLANNING_OWNER_DECISION_RECORD_TYPE:
+            found = data.get("record_type", "(missing)")
+            skipped.append(
+                f"{path.name}: record_type {found!r} (not {PLANNING_OWNER_DECISION_RECORD_TYPE})"
+            )
+            continue
+
+        records.append(
+            PlanningOwnerDecisionRecord(
+                created_at=str(data["created_at"]),
+                decision=str(data["decision"]),
+                workspace_status_at_decision=str(data["workspace_status_at_decision"]),
+                summary=str(data["summary"]),
+                filename=path.name,
+            )
+        )
+
+    records.sort(key=lambda r: r.created_at)
+    return records, skipped
+
+
+def format_planning_decisions_list(
+    dest: Path,
+    plan_id: str,
+    records: list[PlanningOwnerDecisionRecord],
+    skipped: list[str],
+) -> str:
+    lines = [
+        f"planning workspace: {dest}",
+        f"plan_id: {plan_id}",
+        f"decision records: {len(records)}",
+    ]
+
+    if skipped:
+        lines.append("skipped files:")
+        for entry in skipped:
+            lines.append(f"  - {entry}")
+
+    lines.append("decisions:")
+    if not records:
+        lines.append("  (none)")
+    else:
+        for index, record in enumerate(records, start=1):
+            lines.append(f"  {index}. created_at: {record.created_at}")
+            lines.append(f"     decision: {record.decision}")
+            lines.append(
+                f"     workspace_status_at_decision: {record.workspace_status_at_decision}"
+            )
+            lines.append(f"     summary: {record.summary}")
+            lines.append(f"     filename: {record.filename}")
+
+    lines.append("latest decision:")
+    if records:
+        latest = records[-1]
+        lines.append(f"  created_at: {latest.created_at}")
+        lines.append(f"  decision: {latest.decision}")
+        lines.append(
+            f"  workspace_status_at_decision: {latest.workspace_status_at_decision}"
+        )
+        lines.append(f"  summary: {latest.summary}")
+        lines.append(f"  filename: {latest.filename}")
+    else:
+        lines.append("  none")
+
+    lines.append(
+        "note: read-only; no files modified, no runs created, no agents invoked"
+    )
+    return "\n".join(lines)
+
+
+def list_planning_owner_decisions(
+    project: Path,
+    plan_id: str,
+) -> PlanningDecisionsListReport:
+    """List owner decision records from decisions/ (read-only)."""
+    dest, _manifest = _inspect_decision_workspace(project, plan_id)
+    records, skipped = _load_planning_owner_decisions(dest, plan_id)
+    output = format_planning_decisions_list(dest, plan_id, records, skipped)
+    return PlanningDecisionsListReport(
+        output,
+        len(records),
+        tuple(records),
+        tuple(skipped),
     )

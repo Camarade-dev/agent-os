@@ -108,6 +108,8 @@ Recorded owner decisions about planning artifacts (spec acceptance, plan approva
 
 **CLI-recorded decisions** (via `agent-os planning decide`) are JSON files named `<UTC_TIMESTAMP>__owner-decision.json` (e.g. `2026-07-05T20-15-30Z__owner-decision.json`). Each record has `record_type: PLANNING_OWNER_DECISION`, the decision value (`APPROVE_FOR_RUN_PROPOSALS`, `REQUEST_REVISION`, `BLOCK`, or `CLOSE`), a short `summary`, and authority flags stating the record is evidence only — it does not execute, create runs, mutate `manifest.json`, or approve runner execution.
 
+**Listing decisions** (`agent-os planning decisions list <plan-id>`) is read-only: it prints valid `PLANNING_OWNER_DECISION` JSON records sorted by `created_at`, reports the latest decision, and skips (with a note) JSON files whose `record_type` is not `PLANNING_OWNER_DECISION`. Malformed JSON or invalid owner records fail closed. No files are modified; no runs are created; no agents are invoked.
+
 Manual markdown decision files are also permitted (e.g. `decisions/20260705-spec-accepted.md`).
 
 ### `revisions/`

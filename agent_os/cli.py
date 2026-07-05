@@ -10,6 +10,7 @@ from agent_os import __version__
 from agent_os.planning import (
     PLANNING_OWNER_DECISIONS,
     init_planning_workspace,
+    list_planning_owner_decisions,
     record_planning_owner_decision,
     status_planning_workspace,
     validate_planning_workspace,
@@ -188,6 +189,17 @@ def cmd_planning_validate(args: argparse.Namespace) -> int:
         return 1
     print(report.output)
     return 0 if report.valid else 1
+
+
+def cmd_planning_decisions_list(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        report = list_planning_owner_decisions(project, args.plan_id)
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(report.output)
+    return 0
 
 
 def cmd_planning_decide(args: argparse.Namespace) -> int:
@@ -386,6 +398,30 @@ def build_parser() -> argparse.ArgumentParser:
     planning_validate_parser.add_argument("plan_id", help="plan identifier (filesystem-safe slug)")
     planning_validate_parser.add_argument("path", nargs="?", help="target project directory")
     planning_validate_parser.set_defaults(func=cmd_planning_validate)
+
+    planning_decisions_parser = planning_sub.add_parser(
+        "decisions",
+        help="read-only owner decision listing (no execution)",
+    )
+    planning_decisions_sub = planning_decisions_parser.add_subparsers(
+        dest="planning_decisions_command",
+        required=True,
+    )
+
+    planning_decisions_list_parser = planning_decisions_sub.add_parser(
+        "list",
+        help="list owner decision records in a planning workspace (read-only)",
+    )
+    planning_decisions_list_parser.add_argument(
+        "plan_id",
+        help="plan identifier (filesystem-safe slug)",
+    )
+    planning_decisions_list_parser.add_argument(
+        "path",
+        nargs="?",
+        help="target project directory",
+    )
+    planning_decisions_list_parser.set_defaults(func=cmd_planning_decisions_list)
 
     planning_decide_parser = planning_sub.add_parser(
         "decide",

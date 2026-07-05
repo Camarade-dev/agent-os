@@ -15,6 +15,7 @@ from agent_os.cli import main
 from agent_os.paths import TEMPLATE_FILES, planning_path, run_path
 from agent_os.planning import (
     init_planning_workspace,
+    list_planning_owner_decisions,
     record_planning_owner_decision,
     status_planning_workspace,
     validate_planning_workspace,
@@ -2291,6 +2292,290 @@ class PlanningDecideTests(unittest.TestCase):
         self.assertIn("manifest status was not changed", output)
         self.assertIn("no runs were created", output)
         self.assertIn("no agents were invoked", output)
+
+
+class PlanningDecisionsListTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self._tmp.name)
+        init_workspace(self.project)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _snapshot_agent_os_tree(self) -> dict[str, str]:
+        workspace = self.project / ".agent-os"
+        snapshots: dict[str, str] = {}
+        for path in workspace.rglob("*"):
+            if path.is_file():
+                rel = path.relative_to(workspace).as_posix()
+                snapshots[rel] = path.read_text(encoding="utf-8")
+        return snapshots
+
+    def _write_owner_decision(
+        self,
+        dest: Path,
+        filename: str,
+        *,
+        plan_id: str,
+        decision: str = "BLOCK",
+        summary: str = "test summary",
+        created_at: str = "2026-01-01T00:00:00+00:00",
+        workspace_status: str = "DRAFT",
+    ) -> None:
+        _write_json(
+            dest / "decisions" / filename,
+            {
+                "record_type": "PLANNING_OWNER_DECISION",
+                "plan_id": plan_id,
+                "decision": decision,
+                "summary": summary,
+                "created_at": created_at,
+                "workspace_status_at_decision": workspace_status,
+                "authority": {
+                    "records_decision_only": True,
+                    "does_not_execute": True,
+                    "does_not_create_runs": True,
+                    "does_not_mutate_manifest": True,
+                    "does_not_approve_runner_execution": True,
+                },
+            },
+        )
+
+    def test_list_zero_decisions_succeeds(self) -> None:
+        plan_id = "list-empty"
+        dest = init_planning_workspace(self.project, plan_id)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["planning", "decisions", "list", plan_id, str(self.project)])
+        self.assertEqual(code, 0)
+        output = buf.getvalue()
+        self.assertIn(f"planning workspace: {dest}", output)
+        self.assertIn(f"plan_id: {plan_id}", output)
+        self.assertIn("decision records: 0", output)
+        self.assertIn("latest decision:", output)
+        self.assertIn("none", output)
+
+    def test_list_one_decision_from_decide_succeeds(self) -> None:
+        plan_id = "list-one"
+        dest = init_planning_workspace(self.project, plan_id)
+        record_planning_owner_decision(
+            self.project,
+            plan_id,
+            "REQUEST_REVISION",
+            "spec needs scope fix",
+        )
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["planning", "decisions", "list", plan_id, str(self.project)])
+        self.assertEqual(code, 0)
+        output = buf.getvalue()
+        self.assertIn("decision records: 1", output)
+        self.assertIn("decision: REQUEST_REVISION", output)
+        self.assertIn("summary: spec needs scope fix", output)
+        self.assertIn("workspace_status_at_decision: DRAFT", output)
+        self.assertIn("__owner-decision.json", output)
+
+    def test_list_multiple_decisions_sorted_by_created_at(self) -> None:
+        plan_id = "list-multi"
+        dest = init_planning_workspace(self.project, plan_id)
+        self._write_owner_decision(
+            dest,
+            "2026-01-03T00-00-00Z__owner-decision.json",
+            plan_id=plan_id,
+            decision="BLOCK",
+            summary="third",
+            created_at="2026-01-03T00:00:00+00:00",
+        )
+        self._write_owner_decision(
+            dest,
+            "2026-01-01T00-00-00Z__owner-decision.json",
+            plan_id=plan_id,
+            decision="REQUEST_REVISION",
+            summary="first",
+            created_at="2026-01-01T00:00:00+00:00",
+        )
+        self._write_owner_decision(
+            dest,
+            "2026-01-02T00-00-00Z__owner-decision.json",
+            plan_id=plan_id,
+            decision="CLOSE",
+            summary="second",
+            created_at="2026-01-02T00:00:00+00:00",
+        )
+
+        report = list_planning_owner_decisions(self.project, plan_id)
+        self.assertEqual(report.count, 3)
+        summaries = [r.summary for r in report.records]
+        self.assertEqual(summaries, ["first", "second", "third"])
+
+    def test_list_displays_latest_decision(self) -> None:
+        plan_id = "list-latest"
+        dest = init_planning_workspace(self.project, plan_id)
+        self._write_owner_decision(
+            dest,
+            "2026-01-01T00-00-00Z__owner-decision.json",
+            plan_id=plan_id,
+            decision="BLOCK",
+            summary="earlier",
+            created_at="2026-01-01T00:00:00+00:00",
+        )
+        self._write_owner_decision(
+            dest,
+            "2026-01-02T00-00-00Z__owner-decision.json",
+            plan_id=plan_id,
+            decision="CLOSE",
+            summary="latest one",
+            created_at="2026-01-02T00:00:00+00:00",
+        )
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["planning", "decisions", "list", plan_id, str(self.project)])
+        self.assertEqual(code, 0)
+        output = buf.getvalue()
+        latest_section = output.split("latest decision:", 1)[1]
+        self.assertIn("decision: CLOSE", latest_section)
+        self.assertIn("summary: latest one", latest_section)
+
+    def test_list_fails_for_malformed_decision_json(self) -> None:
+        plan_id = "list-bad-json"
+        dest = init_planning_workspace(self.project, plan_id)
+        (dest / "decisions" / "broken.json").write_text("{not json", encoding="utf-8")
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(["planning", "decisions", "list", plan_id, str(self.project)])
+        self.assertEqual(code, 1)
+        self.assertIn("invalid decision JSON", buf.getvalue())
+
+    def test_list_fails_for_missing_required_field(self) -> None:
+        plan_id = "list-missing-field"
+        dest = init_planning_workspace(self.project, plan_id)
+        (dest / "decisions" / "incomplete.json").write_text(
+            json.dumps(
+                {
+                    "record_type": "PLANNING_OWNER_DECISION",
+                    "plan_id": plan_id,
+                    "decision": "BLOCK",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(ValueError) as ctx:
+            list_planning_owner_decisions(self.project, plan_id)
+        self.assertIn("missing required field", str(ctx.exception))
+
+    def test_list_fails_for_plan_id_mismatch(self) -> None:
+        plan_id = "list-mismatch"
+        dest = init_planning_workspace(self.project, plan_id)
+        self._write_owner_decision(
+            dest,
+            "bad-plan.json",
+            plan_id="other-plan",
+            summary="wrong plan",
+        )
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(["planning", "decisions", "list", plan_id, str(self.project)])
+        self.assertEqual(code, 1)
+        self.assertIn("decision plan_id mismatch", buf.getvalue())
+
+    def test_list_skips_non_owner_decision_json(self) -> None:
+        plan_id = "list-skip"
+        dest = init_planning_workspace(self.project, plan_id)
+        self._write_owner_decision(
+            dest,
+            "2026-01-01T00-00-00Z__owner-decision.json",
+            plan_id=plan_id,
+            summary="real decision",
+        )
+        (dest / "decisions" / "other.json").write_text(
+            json.dumps({"record_type": "OTHER_RECORD", "note": "ignored"}) + "\n",
+            encoding="utf-8",
+        )
+
+        report = list_planning_owner_decisions(self.project, plan_id)
+        self.assertEqual(report.count, 1)
+        self.assertEqual(len(report.skipped_files), 1)
+        self.assertIn("OTHER_RECORD", report.skipped_files[0])
+        self.assertIn("skipped files:", report.output)
+
+    def test_list_fails_for_missing_workspace(self) -> None:
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                ["planning", "decisions", "list", "missing-plan", str(self.project)]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("planning workspace not found", buf.getvalue())
+
+    def test_list_fails_for_missing_manifest(self) -> None:
+        plan_id = "list-no-manifest"
+        dest = planning_path(self.project, plan_id)
+        dest.mkdir(parents=True)
+        (dest / "decisions").mkdir()
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(["planning", "decisions", "list", plan_id, str(self.project)])
+        self.assertEqual(code, 1)
+        self.assertIn("manifest.json missing", buf.getvalue())
+
+    def test_list_fails_for_missing_decisions_directory(self) -> None:
+        plan_id = "list-no-decisions-dir"
+        dest = init_planning_workspace(self.project, plan_id)
+        import shutil
+
+        shutil.rmtree(dest / "decisions")
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(["planning", "decisions", "list", plan_id, str(self.project)])
+        self.assertEqual(code, 1)
+        self.assertIn("decisions directory missing", buf.getvalue())
+
+    def test_list_is_read_only(self) -> None:
+        plan_id = "list-readonly"
+        dest = init_planning_workspace(self.project, plan_id)
+        record_planning_owner_decision(
+            self.project,
+            plan_id,
+            "BLOCK",
+            "blocked for now",
+        )
+        workspace = self.project / ".agent-os"
+        before_runs = list((workspace / "runs").iterdir())
+        snapshots_before = self._snapshot_agent_os_tree()
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["planning", "decisions", "list", plan_id, str(self.project)])
+        self.assertEqual(code, 0)
+
+        after_runs = list((workspace / "runs").iterdir())
+        self.assertEqual(before_runs, after_runs)
+        self.assertEqual(snapshots_before, self._snapshot_agent_os_tree())
+
+    def test_list_cli_output_includes_readonly_note(self) -> None:
+        plan_id = "list-note"
+        init_planning_workspace(self.project, plan_id)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["planning", "decisions", "list", plan_id, str(self.project)])
+        self.assertEqual(code, 0)
+        output = buf.getvalue()
+        self.assertIn("read-only", output)
+        self.assertIn("no files modified", output)
+        self.assertIn("no runs created", output)
+        self.assertIn("no agents invoked", output)
+
+
+def _write_json(path: Path, data: dict) -> None:
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
