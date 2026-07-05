@@ -124,7 +124,7 @@ Local instructions for operators working in this directory: how artifacts relate
 
 ## 3. Allowed statuses
 
-Statuses describe **planning maturity**, not execution state. Transitions are manual; no status self-advances.
+Statuses describe **planning maturity**, not execution state. Transitions are manual; no status self-advances. Owner decision records under `decisions/` do **not** change `status` or `gates` by themselves — see [`docs/planning-decision-transition-doctrine.md`](planning-decision-transition-doctrine.md) for which decisions may authorize future explicit manifest transitions.
 
 | Status | Meaning |
 |--------|---------|
@@ -151,7 +151,7 @@ DRAFT → CONTEXT_READY → SPEC_READY → PLAN_READY → PLANNING_AUDIT_READY
 
 ## 4. Gate semantics
 
-Gates are recorded in `manifest.json` under `gates` (open = `true`). Closing a gate requires an explicit owner or role-bounded action documented in `decisions/`.
+Gates are recorded in `manifest.json` under `gates` (open = `true`). Closing a gate requires an explicit owner or role-bounded action documented in `decisions/` and, in the future, an explicit manifest transition command — decision records alone do not flip gates ([`docs/planning-decision-transition-doctrine.md`](planning-decision-transition-doctrine.md) §7).
 
 | Gate key | When open | Closed by |
 |----------|-----------|-----------|

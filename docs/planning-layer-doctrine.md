@@ -334,7 +334,7 @@ The concrete layout — paths, allowed statuses, gate semantics, and hard rules 
 
 The workspace layout is a **local artifact contract**. Use `agent-os planning init <plan-id>` to bootstrap a DRAFT workspace (registrar only), or create directories and copy templates manually. Artifact validation and gate advancement remain manual.
 
-**Owner decision records** under `decisions/` are **evidence of owner judgment**, not execution authority. `agent-os planning decide` appends one JSON decision file per invocation; it does not create runs, invoke agents, mutate `manifest.json` status or gates, or approve runner execution. Status and gate updates remain a separate manual step after review.
+**Owner decision records** under `decisions/` are **evidence of owner judgment**, not execution authority. `agent-os planning decide` appends one JSON decision file per invocation; it does not create runs, invoke agents, mutate `manifest.json` status or gates, or approve runner execution. Owner decisions and manifest transitions are **separated**: decisions may authorize future transitions but do not perform them — see [`docs/planning-decision-transition-doctrine.md`](planning-decision-transition-doctrine.md). Status and gate updates remain a separate manual step after review (future explicit transition command).
 
 ---
 
@@ -353,6 +353,7 @@ No step above is authorized by this document alone. Owner must approve each impl
 ## 13. References
 
 - `docs/planning-workspace-layout.md` — planning package layout and gates
+- `docs/planning-decision-transition-doctrine.md` — owner decision vs manifest transition separation
 - `docs/v0-release-boundary.md` — Agent OS v0.1.0 core boundary
 - `docs/operating-loop.md` — execution lifecycle
 - `docs/evidence-capture-doctrine-v0.md` — execution evidence doctrine
