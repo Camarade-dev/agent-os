@@ -20,6 +20,7 @@ In this demo:
 - no run is created
 - no runner import happens
 - `agent-os planning decide` records an owner decision only
+- `agent-os planning progress` advances artifact-readiness status only
 - `agent-os planning transition` is a separate operation that mutates `manifest.json` and writes one transition evidence record
 
 ## 0. Prepare an empty demo project
@@ -239,31 +240,50 @@ Expected artifact state:
 - listing is read-only
 - no files are modified
 
-## 8. Prepare manifest status for transition
+## 8. Apply artifact-progress transitions
 
-Current residual debt: artifact-progress transitions are not implemented yet. Planning 010 and the current explicit transition command allow `APPROVED_FOR_RUN_PROPOSALS` only from:
+After artifacts pass validation, advance manifest status through artifact-readiness stages. This is separate from owner decisions and run-proposal approval.
 
-- `PLANNING_AUDIT_READY`, or
-- `PLAN_READY` when validation is `OK`
+Commands (run in order after section 5 validation is `OK`):
 
-Therefore the operator must currently perform one manual status preparation step before transition, or use a fixture/demo manifest already in that state.
-
-Manual operator step:
-
-1. Open `<demo-project>/.agent-os/planning/slither-demo/manifest.json`.
-2. Set `status` to `PLANNING_AUDIT_READY` after the audit verdict is `PASS` or `PASS_WITH_NOTES`.
-3. Optionally update `updated_at`.
-4. Do not manually set `run_proposal_allowed`; the transition command owns that gate update.
-
-Minimal manifest change:
-
-```json
-{
-  "status": "PLANNING_AUDIT_READY"
-}
+```bash
+agent-os planning progress slither-demo <demo-project> --to CONTEXT_READY
+agent-os planning progress slither-demo <demo-project> --to SPEC_READY
+agent-os planning progress slither-demo <demo-project> --to PLAN_READY
+agent-os planning progress slither-demo <demo-project> --to PLANNING_AUDIT_READY
 ```
 
-This manual status edit is a documented operator step and current workflow debt. It is not hidden by the demo.
+Expected stable output lines (each command):
+
+```text
+artifact progress applied
+plan_id: slither-demo
+from status: <previous>
+to status: <target>
+evidence record: <demo-project>/.agent-os/planning/slither-demo/evidence/<timestamp>__artifact-progress.json
+manifest updated explicitly
+no owner decision was recorded
+no run proposals were approved
+no runs were created
+no agents were invoked
+```
+
+Expected artifact state after the full chain:
+
+- `manifest.json` status is `PLANNING_AUDIT_READY`
+- `manifest.json` contains `last_progress_transition` from the final step
+- gates after `PLANNING_AUDIT_READY`:
+  - `planning_audit_required: false`
+  - `planning_owner_decision_required: true`
+  - `plan_revision_required: false`
+  - `run_proposal_allowed: false`
+- exactly four `PLANNING_ARTIFACT_PROGRESS` JSON files under `evidence/` (one per step)
+- no owner decision is recorded by `planning progress`
+- no run is created
+- no agent is invoked
+- runner execution is not approved
+
+`PLANNING_AUDIT_READY` does not approve run proposals. It only means planning artifacts and the planning audit are ready for an owner decision.
 
 ## 9. Apply explicit transition
 

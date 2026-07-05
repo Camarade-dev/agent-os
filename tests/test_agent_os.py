@@ -16,6 +16,7 @@ from agent_os.paths import TEMPLATE_FILES, planning_path, run_path
 from agent_os.planning import (
     init_planning_workspace,
     list_planning_owner_decisions,
+    progress_planning_workspace,
     record_planning_owner_decision,
     status_planning_workspace,
     transition_planning_workspace,
@@ -3064,6 +3065,429 @@ class PlanningTransitionTests(unittest.TestCase):
         )
         self.assertEqual(result.to_status, "APPROVED_FOR_RUN_PROPOSALS")
         self.assertIn("transition applied", result.output)
+
+
+class PlanningProgressTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self._tmp.name)
+        init_workspace(self.project)
+        self._progress_ts_counter = 0
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _next_progress_timestamp(self) -> str:
+        self._progress_ts_counter += 1
+        return f"2026-07-05T20-15-{self._progress_ts_counter:02d}Z"
+
+    def _snapshot_agent_os_tree(self) -> dict[str, str]:
+        workspace = self.project / ".agent-os"
+        snapshots: dict[str, str] = {}
+        for path in workspace.rglob("*"):
+            if path.is_file():
+                rel = path.relative_to(workspace).as_posix()
+                snapshots[rel] = path.read_text(encoding="utf-8")
+        return snapshots
+
+    def _set_manifest_status(self, dest: Path, status: str) -> None:
+        manifest_path = dest / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["status"] = status
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+    def _fill_implementation_plan(self, dest: Path) -> None:
+        impl = dest / "implementation-plan.md"
+        text = impl.read_text(encoding="utf-8")
+        text = text.replace("{{RUN_LABEL_1}}", "slice-01")
+        text = text.replace("{{RUN_LABEL_2}}", "slice-02")
+        impl.write_text(text, encoding="utf-8")
+
+    def _progress_cli(
+        self,
+        plan_id: str,
+        to_status: str,
+        *,
+        fixed_timestamp: str | None = None,
+    ) -> tuple[int, str, str]:
+        from unittest.mock import patch
+
+        timestamp = fixed_timestamp or self._next_progress_timestamp()
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        with patch(
+            "agent_os.planning._progress_filename_timestamp",
+            return_value=timestamp,
+        ):
+            with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                code = main(
+                    [
+                        "planning",
+                        "progress",
+                        plan_id,
+                        str(self.project),
+                        "--to",
+                        to_status,
+                    ]
+                )
+        return code, out_buf.getvalue(), err_buf.getvalue()
+
+    def _progress_to_plan_ready(self, plan_id: str) -> Path:
+        dest = init_planning_workspace(self.project, plan_id)
+        code, _output, err = self._progress_cli(plan_id, "CONTEXT_READY")
+        self.assertEqual(code, 0, msg=err)
+        code, _output, err = self._progress_cli(plan_id, "SPEC_READY")
+        self.assertEqual(code, 0, msg=err)
+        self._fill_implementation_plan(dest)
+        code, _output, err = self._progress_cli(plan_id, "PLAN_READY")
+        self.assertEqual(code, 0, msg=err)
+        return dest
+
+    def test_draft_to_context_ready_succeeds(self) -> None:
+        plan_id = "progress-context"
+        dest = init_planning_workspace(self.project, plan_id)
+
+        code, output, _err = self._progress_cli(plan_id, "CONTEXT_READY")
+        self.assertEqual(code, 0)
+        self.assertIn("artifact progress applied", output)
+        self.assertIn(f"plan_id: {plan_id}", output)
+        self.assertIn("from status: DRAFT", output)
+        self.assertIn("to status: CONTEXT_READY", output)
+        self.assertIn("manifest updated explicitly", output)
+        self.assertIn("no owner decision was recorded", output)
+        self.assertIn("no run proposals were approved", output)
+        self.assertIn("no runs were created", output)
+        self.assertIn("no agents were invoked", output)
+
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["status"], "CONTEXT_READY")
+        self.assertTrue(manifest["gates"]["planning_audit_required"])
+        self.assertTrue(manifest["gates"]["planning_owner_decision_required"])
+        self.assertFalse(manifest["gates"]["run_proposal_allowed"])
+
+        evidence_files = list((dest / "evidence").glob("*__artifact-progress.json"))
+        self.assertEqual(len(evidence_files), 1)
+        record = json.loads(evidence_files[0].read_text(encoding="utf-8"))
+        self.assertEqual(record["record_type"], "PLANNING_ARTIFACT_PROGRESS")
+        self.assertTrue(record["authority"]["artifact_progress_only"])
+
+    def test_context_ready_to_spec_ready_succeeds(self) -> None:
+        plan_id = "progress-spec"
+        dest = init_planning_workspace(self.project, plan_id)
+        self._progress_cli(plan_id, "CONTEXT_READY")
+
+        code, output, _err = self._progress_cli(plan_id, "SPEC_READY")
+        self.assertEqual(code, 0)
+        self.assertIn("from status: CONTEXT_READY", output)
+        self.assertIn("to status: SPEC_READY", output)
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["status"], "SPEC_READY")
+
+    def test_spec_ready_to_plan_ready_succeeds(self) -> None:
+        plan_id = "progress-plan"
+        dest = init_planning_workspace(self.project, plan_id)
+        self._progress_cli(plan_id, "CONTEXT_READY")
+        self._progress_cli(plan_id, "SPEC_READY")
+        self._fill_implementation_plan(dest)
+
+        code, output, _err = self._progress_cli(plan_id, "PLAN_READY")
+        self.assertEqual(code, 0)
+        self.assertIn("from status: SPEC_READY", output)
+        self.assertIn("to status: PLAN_READY", output)
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["status"], "PLAN_READY")
+
+    def test_plan_ready_to_planning_audit_ready_succeeds(self) -> None:
+        plan_id = "progress-audit-ready"
+        dest = self._progress_to_plan_ready(plan_id)
+
+        code, output, _err = self._progress_cli(plan_id, "PLANNING_AUDIT_READY")
+        self.assertEqual(code, 0)
+        self.assertIn("from status: PLAN_READY", output)
+        self.assertIn("to status: PLANNING_AUDIT_READY", output)
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["status"], "PLANNING_AUDIT_READY")
+        self.assertFalse(manifest["gates"]["planning_audit_required"])
+        self.assertTrue(manifest["gates"]["planning_owner_decision_required"])
+        self.assertFalse(manifest["gates"]["run_proposal_allowed"])
+
+        evidence_files = sorted((dest / "evidence").glob("*__artifact-progress.json"))
+        record = json.loads(evidence_files[-1].read_text(encoding="utf-8"))
+        self.assertTrue(record["validation_required"])
+        self.assertEqual(record["validation_result"], "OK")
+
+    def test_skip_draft_to_spec_ready_fails(self) -> None:
+        plan_id = "progress-skip"
+        dest = init_planning_workspace(self.project, plan_id)
+
+        code, _output, err = self._progress_cli(plan_id, "SPEC_READY")
+        self.assertEqual(code, 1)
+        self.assertIn("progress transition not sequential", err)
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["status"], "DRAFT")
+
+    def test_backwards_spec_ready_to_context_ready_fails(self) -> None:
+        plan_id = "progress-backwards"
+        dest = init_planning_workspace(self.project, plan_id)
+        self._progress_cli(plan_id, "CONTEXT_READY")
+        self._progress_cli(plan_id, "SPEC_READY")
+
+        code, _output, err = self._progress_cli(plan_id, "CONTEXT_READY")
+        self.assertEqual(code, 1)
+        self.assertIn("progress transition not sequential", err)
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["status"], "SPEC_READY")
+
+    def test_same_status_transition_fails(self) -> None:
+        plan_id = "progress-same"
+        dest = init_planning_workspace(self.project, plan_id)
+        self._progress_cli(plan_id, "CONTEXT_READY")
+
+        code, _output, err = self._progress_cli(plan_id, "CONTEXT_READY")
+        self.assertEqual(code, 1)
+        self.assertIn("progress transition not sequential", err)
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["status"], "CONTEXT_READY")
+
+    def test_unsupported_target_approved_for_run_proposals_fails(self) -> None:
+        plan_id = "progress-target-approve"
+        dest = init_planning_workspace(self.project, plan_id)
+
+        code, _output, err = self._progress_cli(plan_id, "APPROVED_FOR_RUN_PROPOSALS")
+        self.assertEqual(code, 1)
+        self.assertIn("unsupported progress target", err)
+        self.assertEqual(
+            json.loads((dest / "manifest.json").read_text(encoding="utf-8"))["status"],
+            "DRAFT",
+        )
+
+    def test_unsupported_target_blocked_fails(self) -> None:
+        plan_id = "progress-target-blocked"
+        init_planning_workspace(self.project, plan_id)
+
+        code, _output, err = self._progress_cli(plan_id, "BLOCKED")
+        self.assertEqual(code, 1)
+        self.assertIn("unsupported progress target", err)
+
+    def test_unsupported_target_closed_fails(self) -> None:
+        plan_id = "progress-target-closed"
+        init_planning_workspace(self.project, plan_id)
+
+        code, _output, err = self._progress_cli(plan_id, "CLOSED")
+        self.assertEqual(code, 1)
+        self.assertIn("unsupported progress target", err)
+
+    def test_unsupported_target_superseded_fails(self) -> None:
+        plan_id = "progress-target-superseded"
+        init_planning_workspace(self.project, plan_id)
+
+        code, _output, err = self._progress_cli(plan_id, "SUPERSEDED")
+        self.assertEqual(code, 1)
+        self.assertIn("unsupported progress target", err)
+
+    def test_terminal_workspace_fails(self) -> None:
+        plan_id = "progress-terminal"
+        dest = init_planning_workspace(self.project, plan_id)
+        self._set_manifest_status(dest, "CLOSED")
+
+        code, _output, err = self._progress_cli(plan_id, "CONTEXT_READY")
+        self.assertEqual(code, 1)
+        self.assertIn("terminal workspace cannot progress", err)
+
+    def test_blocked_workspace_fails(self) -> None:
+        plan_id = "progress-blocked-ws"
+        dest = init_planning_workspace(self.project, plan_id)
+        self._set_manifest_status(dest, "BLOCKED")
+
+        code, _output, err = self._progress_cli(plan_id, "CONTEXT_READY")
+        self.assertEqual(code, 1)
+        self.assertIn("BLOCKED workspace cannot receive artifact progress", err)
+
+    def test_approved_workspace_fails(self) -> None:
+        plan_id = "progress-approved-ws"
+        dest = init_planning_workspace(self.project, plan_id)
+        self._set_manifest_status(dest, "APPROVED_FOR_RUN_PROPOSALS")
+
+        code, _output, err = self._progress_cli(plan_id, "CONTEXT_READY")
+        self.assertEqual(code, 1)
+        self.assertIn("APPROVED_FOR_RUN_PROPOSALS workspace cannot receive", err)
+
+    def test_context_ready_fails_if_context_pack_has_placeholder(self) -> None:
+        plan_id = "progress-context-placeholder"
+        dest = init_planning_workspace(self.project, plan_id)
+        path = dest / "context-pack.md"
+        path.write_text(
+            path.read_text(encoding="utf-8") + "\n{{CUSTOM_PLACEHOLDER}}\n",
+            encoding="utf-8",
+        )
+        manifest_before = (dest / "manifest.json").read_text(encoding="utf-8")
+
+        code, _output, err = self._progress_cli(plan_id, "CONTEXT_READY")
+        self.assertEqual(code, 1)
+        self.assertIn("artifact readiness check failed", err)
+        self.assertIn("placeholder still present", err)
+        self.assertEqual(manifest_before, (dest / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(list((dest / "evidence").iterdir()), [])
+
+    def test_spec_ready_fails_if_local_spec_missing_section(self) -> None:
+        plan_id = "progress-spec-section"
+        dest = init_planning_workspace(self.project, plan_id)
+        self._progress_cli(plan_id, "CONTEXT_READY")
+        path = dest / "local-agentic-spec.md"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("## Non-goals", "## Removed"),
+            encoding="utf-8",
+        )
+
+        code, _output, err = self._progress_cli(plan_id, "SPEC_READY")
+        self.assertEqual(code, 1)
+        self.assertIn("artifact readiness check failed", err)
+        self.assertIn("Non-goals", err)
+
+    def test_plan_ready_fails_if_implementation_plan_missing_allowed_paths(self) -> None:
+        plan_id = "progress-plan-paths"
+        dest = init_planning_workspace(self.project, plan_id)
+        self._progress_cli(plan_id, "CONTEXT_READY")
+        self._progress_cli(plan_id, "SPEC_READY")
+        path = dest / "implementation-plan.md"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("allowed_paths", "removed_paths"),
+            encoding="utf-8",
+        )
+
+        code, _output, err = self._progress_cli(plan_id, "PLAN_READY")
+        self.assertEqual(code, 1)
+        self.assertIn("artifact readiness check failed", err)
+        self.assertIn("allowed_paths", err)
+
+    def test_planning_audit_ready_fails_if_full_validation_not_ok(self) -> None:
+        plan_id = "progress-audit-invalid"
+        dest = self._progress_to_plan_ready(plan_id)
+        path = dest / "planning-audit.md"
+        path.write_text(
+            path.read_text(encoding="utf-8") + "\n{{STALE_PLACEHOLDER}}\n",
+            encoding="utf-8",
+        )
+
+        code, _output, err = self._progress_cli(plan_id, "PLANNING_AUDIT_READY")
+        self.assertEqual(code, 1)
+        self.assertIn("planning validation is not OK", err)
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["status"], "PLAN_READY")
+
+    def test_missing_evidence_directory_fails(self) -> None:
+        plan_id = "progress-no-evidence-dir"
+        dest = init_planning_workspace(self.project, plan_id)
+        import shutil
+
+        shutil.rmtree(dest / "evidence")
+
+        code, _output, err = self._progress_cli(plan_id, "CONTEXT_READY")
+        self.assertEqual(code, 1)
+        self.assertIn("evidence directory missing", err)
+
+    def test_manifest_missing_gates_fails(self) -> None:
+        plan_id = "progress-no-gates"
+        dest = init_planning_workspace(self.project, plan_id)
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        del manifest["gates"]
+        (dest / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+        code, _output, err = self._progress_cli(plan_id, "CONTEXT_READY")
+        self.assertEqual(code, 1)
+        self.assertIn("manifest lacks gates object", err)
+
+    def test_evidence_filename_collision_fails(self) -> None:
+        plan_id = "progress-evidence-collision"
+        dest = init_planning_workspace(self.project, plan_id)
+        fixed_ts = "2026-07-05T20-15-30Z"
+        collision = dest / "evidence" / f"{fixed_ts}__artifact-progress.json"
+        collision.write_text("{}", encoding="utf-8")
+        manifest_before = (dest / "manifest.json").read_text(encoding="utf-8")
+
+        code, _output, err = self._progress_cli(
+            plan_id,
+            "CONTEXT_READY",
+            fixed_timestamp=fixed_ts,
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("progress evidence file already exists", err)
+        self.assertEqual(manifest_before, (dest / "manifest.json").read_text(encoding="utf-8"))
+
+    def test_success_writes_only_manifest_and_one_evidence_record(self) -> None:
+        plan_id = "progress-write-boundary"
+        init_planning_workspace(self.project, plan_id)
+        snapshots_before = self._snapshot_agent_os_tree()
+
+        code, _output, _err = self._progress_cli(plan_id, "CONTEXT_READY")
+        self.assertEqual(code, 0)
+
+        snapshots_after = self._snapshot_agent_os_tree()
+        changed = {
+            rel
+            for rel in set(snapshots_before) | set(snapshots_after)
+            if snapshots_before.get(rel) != snapshots_after.get(rel)
+        }
+        self.assertEqual(len(changed), 2)
+        changed_list = sorted(changed)
+        self.assertTrue(changed_list[0].startswith(f"planning/{plan_id}/evidence/"))
+        self.assertTrue(changed_list[0].endswith("__artifact-progress.json"))
+        self.assertEqual(changed_list[1], f"planning/{plan_id}/manifest.json")
+
+    def test_success_does_not_mutate_decisions_or_artifacts(self) -> None:
+        plan_id = "progress-preserve-artifacts"
+        dest = init_planning_workspace(self.project, plan_id)
+        artifact_snapshots = {
+            name: (dest / name).read_text(encoding="utf-8")
+            for name in (
+                "context-pack.md",
+                "local-agentic-spec.md",
+                "implementation-plan.md",
+                "planning-audit.md",
+                "README.md",
+            )
+        }
+
+        code, _output, _err = self._progress_cli(plan_id, "CONTEXT_READY")
+        self.assertEqual(code, 0)
+
+        for name, content in artifact_snapshots.items():
+            self.assertEqual((dest / name).read_text(encoding="utf-8"), content)
+        self.assertFalse(list((dest / "decisions").glob("*.json")))
+
+    def test_common_failure_does_not_mutate_manifest_or_create_evidence(self) -> None:
+        plan_id = "progress-failure-no-write"
+        dest = init_planning_workspace(self.project, plan_id)
+        path = dest / "context-pack.md"
+        path.write_text(
+            path.read_text(encoding="utf-8") + "\n{{FAIL_PLACEHOLDER}}\n",
+            encoding="utf-8",
+        )
+        manifest_before = (dest / "manifest.json").read_text(encoding="utf-8")
+        evidence_before = list((dest / "evidence").iterdir())
+
+        code, _output, _err = self._progress_cli(plan_id, "CONTEXT_READY")
+        self.assertEqual(code, 1)
+        self.assertEqual(manifest_before, (dest / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(evidence_before, list((dest / "evidence").iterdir()))
+
+    def test_success_does_not_create_runs(self) -> None:
+        plan_id = "progress-no-runs"
+        init_planning_workspace(self.project, plan_id)
+        workspace = self.project / ".agent-os"
+        before_runs = list((workspace / "runs").iterdir())
+
+        code, _output, _err = self._progress_cli(plan_id, "CONTEXT_READY")
+        self.assertEqual(code, 0)
+        after_runs = list((workspace / "runs").iterdir())
+        self.assertEqual(before_runs, after_runs)
+
+    def test_api_matches_cli_for_success(self) -> None:
+        plan_id = "progress-api"
+        init_planning_workspace(self.project, plan_id)
+        result = progress_planning_workspace(self.project, plan_id, "CONTEXT_READY")
+        self.assertEqual(result.to_status, "CONTEXT_READY")
+        self.assertIn("artifact progress applied", result.output)
 
 
 def _write_json(path: Path, data: dict) -> None:

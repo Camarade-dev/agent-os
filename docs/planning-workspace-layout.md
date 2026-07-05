@@ -126,7 +126,10 @@ Local instructions for operators working in this directory: how artifacts relate
 
 ## 3. Allowed statuses
 
-Statuses describe **planning maturity**, not execution state. Transitions are explicit: `agent-os planning transition <plan-id> --to <status>` may update `manifest.json` only when the latest valid owner decision authorizes the target — see [`docs/planning-decision-transition-doctrine.md`](planning-decision-transition-doctrine.md). Decision records alone do not change `status` or `gates`.
+Statuses describe **planning maturity**, not execution state. Two explicit CLI paths update `manifest.json` status:
+
+- **`agent-os planning progress`** — artifact-readiness transitions (`DRAFT` → `CONTEXT_READY` → `SPEC_READY` → `PLAN_READY` → `PLANNING_AUDIT_READY`). Records artifact readiness only; does not consume owner decisions or approve run proposals.
+- **`agent-os planning transition`** — owner-decision transitions (`APPROVED_FOR_RUN_PROPOSALS`, `BLOCKED`, `CLOSED`) when the latest valid owner decision authorizes the target — see [`docs/planning-decision-transition-doctrine.md`](planning-decision-transition-doctrine.md). Decision records alone do not change `status` or `gates`.
 
 | Status | Meaning |
 |--------|---------|
@@ -160,6 +163,13 @@ Gates are recorded in `manifest.json` under `gates` (open = `true`). Closing a g
 | `APPROVED_FOR_RUN_PROPOSALS` | `run_proposal_allowed: true`; `planning_owner_decision_required`, `planning_audit_required`, `plan_revision_required`: `false` |
 | `BLOCKED` | `run_proposal_allowed: false`; `plan_revision_required: true`; `planning_owner_decision_required: false`; `planning_audit_required` preserved (default `true` if absent) |
 | `CLOSED` | All planning gates closed (`false` for open-required gates; `run_proposal_allowed: false`) |
+
+| Progress target (`planning progress`) | Gate effects applied by `planning progress` |
+|-------------------------------------|---------------------------------------------|
+| `CONTEXT_READY`, `SPEC_READY`, `PLAN_READY` | `planning_audit_required: true`; `planning_owner_decision_required: true`; `plan_revision_required: false`; `run_proposal_allowed: false` |
+| `PLANNING_AUDIT_READY` | `planning_audit_required: false`; `planning_owner_decision_required: true`; `plan_revision_required: false`; `run_proposal_allowed: false` |
+
+Artifact-progress transitions do **not** approve run proposals. `PLANNING_AUDIT_READY` means planning artifacts and the planning audit are ready for an owner decision — not that run proposals are allowed.
 
 | Gate key | When open | Closed by |
 |----------|-----------|-----------|
@@ -244,6 +254,20 @@ agent-os planning validate <plan-id> [PATH]
 ```
 
 Checks manifest fields, authority safety flags, artifact type markers, required sections, and obvious unfilled `{{...}}` placeholders. Reports structural, manifest, and artifact validation results plus a final result (`OK` or `INVALID`). This is **not** semantic validation — it does not judge plan quality, approve execution, infer readiness, or advance status or gates. Does **not** create, modify, or delete files, create runs, or invoke agents.
+
+Apply artifact-progress manifest transitions (no owner decision):
+
+```bash
+agent-os planning progress <plan-id> [PATH] --to <status>
+```
+
+Supported targets: `CONTEXT_READY`, `SPEC_READY`, `PLAN_READY`, `PLANNING_AUDIT_READY`. Enforces sequential progress from the current status, runs weak per-artifact readiness checks (full validation required for `PLANNING_AUDIT_READY`), updates `manifest.json` (`status`, `gates`, `updated_at`, `last_progress_transition`), and writes exactly one evidence record under `evidence/`:
+
+- Filename: `<UTC_TIMESTAMP>__artifact-progress.json` (filesystem-safe UTC, e.g. `2026-07-05T20-15-30Z__artifact-progress.json`)
+- `record_type`: `PLANNING_ARTIFACT_PROGRESS`
+- Authority flags: `artifact_progress_only`, `does_not_record_owner_decision`, `does_not_approve_run_proposals`, `does_not_create_runs`, `does_not_execute`, `does_not_invoke_agents`, `does_not_touch_runner`
+
+Does **not** record owner decisions, approve run proposals, create runs, invoke agents, or touch the runner.
 
 ### Manual
 

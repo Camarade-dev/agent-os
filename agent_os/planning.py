@@ -70,6 +70,22 @@ PLANNING_TRANSITION_TARGETS = (
     "CLOSED",
 )
 
+PLANNING_PROGRESS_TARGETS = (
+    "CONTEXT_READY",
+    "SPEC_READY",
+    "PLAN_READY",
+    "PLANNING_AUDIT_READY",
+)
+
+PLANNING_ARTIFACT_PROGRESS_RECORD_TYPE = "PLANNING_ARTIFACT_PROGRESS"
+
+PLANNING_PROGRESS_TRANSITION_MAP: dict[str, str] = {
+    "DRAFT": "CONTEXT_READY",
+    "CONTEXT_READY": "SPEC_READY",
+    "SPEC_READY": "PLAN_READY",
+    "PLAN_READY": "PLANNING_AUDIT_READY",
+}
+
 PLANNING_TERMINAL_STATUSES = ("CLOSED", "SUPERSEDED")
 
 PLANNING_ACTIVE_STATUSES = (
@@ -171,6 +187,11 @@ def _decision_filename_timestamp() -> str:
 
 def _transition_filename_timestamp() -> str:
     """Filesystem-safe UTC timestamp for manifest transition evidence filenames."""
+    return _decision_filename_timestamp()
+
+
+def _progress_filename_timestamp() -> str:
+    """Filesystem-safe UTC timestamp for artifact-progress evidence filenames."""
     return _decision_filename_timestamp()
 
 
@@ -1086,6 +1107,260 @@ def transition_planning_workspace(
         from_status,
         to_status,
         latest.decision,
+        evidence_path,
+        "\n".join(lines),
+    )
+
+
+def _inspect_progress_workspace(project: Path, plan_id: str) -> tuple[Path, dict]:
+    """Verify workspace, manifest, and evidence/ exist (fail closed)."""
+    validate_plan_id(plan_id)
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        raise FileNotFoundError("no workspace found (run `agent-os init` first)")
+
+    dest = planning_path(project, plan_id)
+    if not dest.is_dir():
+        raise FileNotFoundError(f"planning workspace not found: {plan_id}")
+
+    manifest = _load_planning_manifest(dest / "manifest.json", plan_id)
+
+    status = manifest.get("status")
+    if status is None:
+        raise ValueError("missing manifest field: status")
+
+    if not (dest / "evidence").is_dir():
+        raise FileNotFoundError(
+            f"evidence directory missing in planning workspace: {plan_id}"
+        )
+
+    return dest, manifest
+
+
+def _authorize_progress_transition(from_status: str, to_status: str) -> None:
+    """Raise ValueError when artifact-progress transition is not authorized."""
+    if to_status not in PLANNING_PROGRESS_TARGETS:
+        raise ValueError(f"unsupported progress target: {to_status!r}")
+
+    if from_status in PLANNING_TERMINAL_STATUSES:
+        raise ValueError(
+            f"terminal workspace cannot progress: status is {from_status!r}"
+        )
+
+    if from_status == "APPROVED_FOR_RUN_PROPOSALS":
+        raise ValueError(
+            "APPROVED_FOR_RUN_PROPOSALS workspace cannot receive artifact progress"
+        )
+
+    if from_status == "BLOCKED":
+        raise ValueError("BLOCKED workspace cannot receive artifact progress")
+
+    expected = PLANNING_PROGRESS_TRANSITION_MAP.get(from_status)
+    if expected is None:
+        raise ValueError(
+            f"artifact progress not allowed from status {from_status!r}"
+        )
+
+    if to_status != expected:
+        raise ValueError(
+            "progress transition not sequential: "
+            f"cannot transition from {from_status!r} to {to_status!r}"
+        )
+
+
+def _artifact_readiness_result(dest: Path, filename: str) -> dict:
+    errors = _validate_artifact_file(dest, filename)
+    return {"ok": not errors, "errors": errors}
+
+
+def _run_progress_readiness_checks(
+    project: Path,
+    plan_id: str,
+    dest: Path,
+    to_status: str,
+) -> tuple[dict, bool, str | None]:
+    """
+    Return (artifact_checks, validation_required, validation_result) for the target.
+
+    Raises ValueError when readiness checks fail.
+    """
+    artifact_checks: dict = {}
+
+    if to_status == "CONTEXT_READY":
+        artifact_checks["context-pack.md"] = _artifact_readiness_result(
+            dest, "context-pack.md"
+        )
+        if not artifact_checks["context-pack.md"]["ok"]:
+            errors = artifact_checks["context-pack.md"]["errors"]
+            raise ValueError(
+                "artifact readiness check failed for progress to CONTEXT_READY: "
+                + "; ".join(errors)
+            )
+        return artifact_checks, False, None
+
+    if to_status == "SPEC_READY":
+        for filename in ("context-pack.md", "local-agentic-spec.md"):
+            artifact_checks[filename] = _artifact_readiness_result(dest, filename)
+            if not artifact_checks[filename]["ok"]:
+                errors = artifact_checks[filename]["errors"]
+                raise ValueError(
+                    f"artifact readiness check failed for progress to SPEC_READY: "
+                    + "; ".join(errors)
+                )
+        return artifact_checks, False, None
+
+    if to_status == "PLAN_READY":
+        for filename in (
+            "context-pack.md",
+            "local-agentic-spec.md",
+            "implementation-plan.md",
+        ):
+            artifact_checks[filename] = _artifact_readiness_result(dest, filename)
+            if not artifact_checks[filename]["ok"]:
+                errors = artifact_checks[filename]["errors"]
+                raise ValueError(
+                    f"artifact readiness check failed for progress to PLAN_READY: "
+                    + "; ".join(errors)
+                )
+        return artifact_checks, False, None
+
+    if to_status == "PLANNING_AUDIT_READY":
+        validation_report = validate_planning_workspace(project, plan_id)
+        artifact_checks["full_validation"] = {
+            "ok": validation_report.valid,
+            "structural_ok": validation_report.structural_ok,
+            "manifest_ok": validation_report.manifest_ok,
+            "artifacts_ok": validation_report.artifacts_ok,
+        }
+        if not validation_report.valid:
+            raise ValueError(
+                "Cannot progress to PLANNING_AUDIT_READY because planning "
+                "validation is not OK."
+            )
+        return artifact_checks, True, "OK"
+
+    raise ValueError(f"unsupported progress target: {to_status!r}")
+
+
+def _gate_effects_for_progress(to_status: str) -> dict[str, bool]:
+    if to_status in ("CONTEXT_READY", "SPEC_READY", "PLAN_READY"):
+        return {
+            "planning_audit_required": True,
+            "planning_owner_decision_required": True,
+            "plan_revision_required": False,
+            "run_proposal_allowed": False,
+        }
+
+    if to_status == "PLANNING_AUDIT_READY":
+        return {
+            "planning_audit_required": False,
+            "planning_owner_decision_required": True,
+            "plan_revision_required": False,
+            "run_proposal_allowed": False,
+        }
+
+    raise ValueError(f"unsupported progress target: {to_status!r}")
+
+
+@dataclass(frozen=True)
+class PlanningProgressResult:
+    plan_id: str
+    from_status: str
+    to_status: str
+    evidence_path: Path
+    output: str
+
+
+def progress_planning_workspace(
+    project: Path,
+    plan_id: str,
+    to_status: str,
+) -> PlanningProgressResult:
+    """Apply an explicit artifact-progress manifest transition (no owner decision)."""
+    dest, manifest = _inspect_progress_workspace(project, plan_id)
+
+    gates = manifest.get("gates")
+    if not isinstance(gates, dict):
+        raise ValueError("manifest lacks gates object required for safe mutation")
+
+    from_status = manifest.get("status")
+    if not isinstance(from_status, str) or not from_status:
+        raise ValueError("manifest lacks status required for progress")
+
+    _authorize_progress_transition(from_status, to_status)
+
+    artifact_checks, validation_required, validation_result = (
+        _run_progress_readiness_checks(project, plan_id, dest, to_status)
+    )
+
+    gate_effects = _gate_effects_for_progress(to_status)
+    created_at = _utc_now()
+    evidence_filename = f"{_progress_filename_timestamp()}__artifact-progress.json"
+    evidence_path = dest / "evidence" / evidence_filename
+    if evidence_path.exists():
+        raise FileExistsError(
+            f"progress evidence file already exists: {evidence_filename}"
+        )
+
+    manifest_path = dest / "manifest.json"
+    updated_manifest = dict(manifest)
+    updated_manifest["status"] = to_status
+    updated_manifest["updated_at"] = created_at
+    updated_manifest["last_progress_transition"] = {
+        "from_status": from_status,
+        "to_status": to_status,
+        "created_at": created_at,
+        "validation_required": validation_required,
+        "validation_result": validation_result,
+        "progress_record": evidence_filename,
+    }
+
+    updated_gates = dict(gates)
+    updated_gates.update(gate_effects)
+    updated_manifest["gates"] = updated_gates
+
+    evidence_record = {
+        "record_type": PLANNING_ARTIFACT_PROGRESS_RECORD_TYPE,
+        "plan_id": plan_id,
+        "from_status": from_status,
+        "to_status": to_status,
+        "created_at": created_at,
+        "manifest_path": str(manifest_path),
+        "validation_required": validation_required,
+        "validation_result": validation_result,
+        "artifact_checks": artifact_checks,
+        "gate_effects": gate_effects,
+        "authority": {
+            "artifact_progress_only": True,
+            "does_not_record_owner_decision": True,
+            "does_not_approve_run_proposals": True,
+            "does_not_create_runs": True,
+            "does_not_execute": True,
+            "does_not_invoke_agents": True,
+            "does_not_touch_runner": True,
+        },
+    }
+
+    _atomic_write_json(manifest_path, updated_manifest)
+    _write_json(evidence_path, evidence_record)
+
+    lines = [
+        "artifact progress applied",
+        f"plan_id: {plan_id}",
+        f"from status: {from_status}",
+        f"to status: {to_status}",
+        f"evidence record: {evidence_path}",
+        "manifest updated explicitly",
+        "no owner decision was recorded",
+        "no run proposals were approved",
+        "no runs were created",
+        "no agents were invoked",
+    ]
+    return PlanningProgressResult(
+        plan_id,
+        from_status,
+        to_status,
         evidence_path,
         "\n".join(lines),
     )

@@ -231,9 +231,12 @@ Violations are process defects, not features to automate away.
 | `agent-os planning validate` | Read-only structural validation; prerequisite for recording `APPROVE_FOR_RUN_PROPOSALS` |
 | `agent-os planning decide` | Append one owner decision record — no manifest mutation |
 | `agent-os planning decisions list` | Read-only decision history; reports latest valid decision |
-| `agent-os planning transition` | Apply explicit manifest transition when latest owner decision and doctrine authorize it; writes one evidence record |
+| `agent-os planning progress` | Apply explicit artifact-progress manifest transition when artifacts pass readiness checks; writes one progress evidence record; does not consume owner decisions |
+| `agent-os planning transition` | Apply explicit manifest transition when latest owner decision and doctrine authorize it; writes one transition evidence record |
 
-`agent-os planning transition` does not create decisions, runs, or agent invocations. Unsupported targets (including `SUPERSEDED` and artifact-progress statuses) fail closed.
+`agent-os planning progress` handles artifact-readiness statuses only (`CONTEXT_READY` through `PLANNING_AUDIT_READY`). It does not record owner decisions, approve run proposals, create runs, or invoke agents.
+
+`agent-os planning transition` handles owner-decision statuses only (`APPROVED_FOR_RUN_PROPOSALS`, `BLOCKED`, `CLOSED`). It does not create decisions, runs, or agent invocations. Unsupported targets (including `SUPERSEDED` and artifact-progress statuses) fail closed.
 
 ---
 

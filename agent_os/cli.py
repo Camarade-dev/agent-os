@@ -11,6 +11,7 @@ from agent_os.planning import (
     PLANNING_OWNER_DECISIONS,
     init_planning_workspace,
     list_planning_owner_decisions,
+    progress_planning_workspace,
     record_planning_owner_decision,
     status_planning_workspace,
     transition_planning_workspace,
@@ -223,6 +224,21 @@ def cmd_planning_transition(args: argparse.Namespace) -> int:
     project = _project_path(args.path)
     try:
         result = transition_planning_workspace(
+            project,
+            args.plan_id,
+            args.to_status,
+        )
+    except (FileNotFoundError, FileExistsError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(result.output)
+    return 0
+
+
+def cmd_planning_progress(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        result = progress_planning_workspace(
             project,
             args.plan_id,
             args.to_status,
@@ -474,6 +490,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="target manifest status (APPROVED_FOR_RUN_PROPOSALS, BLOCKED, or CLOSED)",
     )
     planning_transition_parser.set_defaults(func=cmd_planning_transition)
+
+    planning_progress_parser = planning_sub.add_parser(
+        "progress",
+        help="apply an explicit artifact-progress manifest transition (no owner decision)",
+    )
+    planning_progress_parser.add_argument(
+        "plan_id",
+        help="plan identifier (filesystem-safe slug)",
+    )
+    planning_progress_parser.add_argument("path", nargs="?", help="target project directory")
+    planning_progress_parser.add_argument(
+        "--to",
+        dest="to_status",
+        required=True,
+        help=(
+            "target artifact-readiness status "
+            "(CONTEXT_READY, SPEC_READY, PLAN_READY, or PLANNING_AUDIT_READY)"
+        ),
+    )
+    planning_progress_parser.set_defaults(func=cmd_planning_progress)
 
     return parser
 
