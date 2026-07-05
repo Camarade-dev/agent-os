@@ -13,6 +13,7 @@ from pathlib import Path
 
 from agent_os.cli import main
 from agent_os.paths import TEMPLATE_FILES, planning_path, run_path
+from agent_os import planning as planning_module
 from agent_os.planning import (
     init_planning_workspace,
     list_planning_owner_decisions,
@@ -3706,6 +3707,87 @@ class PlanningLifecycleIntegrationTests(unittest.TestCase):
 
 def _write_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+class PlanningDocsHygieneTests(unittest.TestCase):
+    """Regression guard for obsolete normal-flow manual manifest/status guidance."""
+
+    _FORBIDDEN_NORMAL_FLOW_PHRASES: tuple[str, ...] = (
+        "edit manifest.status",
+        "manifest.status manually",
+        "manually edit manifest",
+        "update manifest manually",
+        "update manifest.json manually",
+        "advance gates manually",
+        "gate advancement remain manual",
+        "manual status edit",
+        "current manual operator step",
+        "artifact-progress transitions remain manual",
+    )
+
+    _RECOVERY_LINE_MARKERS: tuple[str, ...] = (
+        "emergency",
+        "outside the normal flow",
+        "outside normal flow",
+        "not the normal path",
+        "not the normal flow",
+        "emergency/recovery",
+        "emergency recovery",
+    )
+
+    @classmethod
+    def _iter_scan_texts(cls, repo_root: Path) -> list[tuple[str, str]]:
+        items: list[tuple[str, str]] = []
+
+        readme = repo_root / "README.md"
+        if readme.is_file():
+            items.append(("README.md", readme.read_text(encoding="utf-8")))
+
+        for directory in ("docs", "agent_os/templates", "examples"):
+            root = repo_root / directory
+            if not root.is_dir():
+                continue
+            for path in sorted(root.rglob("*")):
+                if not path.is_file():
+                    continue
+                rel = path.relative_to(repo_root).as_posix()
+                items.append((rel, path.read_text(encoding="utf-8")))
+
+        items.append(
+            (
+                "agent_os/planning.py::_WORKSPACE_README",
+                planning_module._WORKSPACE_README,
+            )
+        )
+        return items
+
+    def _line_is_allowed_exception(self, line: str) -> bool:
+        lowered = line.lower()
+        if any(marker in lowered for marker in self._RECOVERY_LINE_MARKERS):
+            return True
+        return "do not " in lowered or "don't " in lowered
+
+    def test_docs_do_not_instruct_obsolete_manual_manifest_normal_flow(self) -> None:
+        repo_root = Path(__file__).resolve().parent.parent
+        violations: list[str] = []
+
+        for label, text in self._iter_scan_texts(repo_root):
+            for line_no, line in enumerate(text.splitlines(), start=1):
+                if self._line_is_allowed_exception(line):
+                    continue
+                lowered_line = line.lower()
+                for phrase in self._FORBIDDEN_NORMAL_FLOW_PHRASES:
+                    if phrase in lowered_line:
+                        violations.append(
+                            f"{label}:{line_no}: forbidden phrase {phrase!r}"
+                        )
+
+        self.assertEqual(
+            violations,
+            [],
+            "obsolete normal-flow manual manifest/status guidance found:\n"
+            + "\n".join(violations),
+        )
 
 
 if __name__ == "__main__":
