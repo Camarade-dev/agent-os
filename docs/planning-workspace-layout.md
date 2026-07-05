@@ -277,7 +277,8 @@ Does **not** record owner decisions, approve run proposals, create runs, invoke 
 4. Write `README.md` with local instructions and non-authority notice.
 5. Create empty `evidence/`, `decisions/`, `revisions/` as needed.
 6. Fill artifacts in order: Context Pack → Spec → Plan → Planning Audit.
-7. Record owner decisions and update `manifest.json` status and gates manually.
+7. Advance artifact-readiness with `agent-os planning progress` (see [`docs/planning-end-to-end-demo.md`](planning-end-to-end-demo.md) for the full lifecycle).
+8. Record owner decisions and apply explicit manifest transitions with `agent-os planning decide` and `agent-os planning transition`.
 
 ---
 

@@ -1737,12 +1737,27 @@ class PlanningStatusTests(unittest.TestCase):
 def _prepare_valid_planning_workspace(project: Path, plan_id: str) -> Path:
     """Fill init workspace enough to pass weak validation."""
     dest = init_planning_workspace(project, plan_id)
-    impl = dest / "implementation-plan.md"
-    text = impl.read_text(encoding="utf-8")
-    text = text.replace("{{RUN_LABEL_1}}", "slice-01")
-    text = text.replace("{{RUN_LABEL_2}}", "slice-02")
-    impl.write_text(text, encoding="utf-8")
+    _fill_planning_lifecycle_artifacts(dest, plan_id)
     return dest
+
+
+def _fill_planning_lifecycle_artifacts(dest: Path, plan_id: str) -> None:
+    """Write valid minimal planning artifact content for lifecycle integration tests."""
+    examples = (
+        Path(__file__).resolve().parent.parent
+        / "examples"
+        / "planning-workspace-slither-like"
+    )
+    for filename in (
+        "context-pack.md",
+        "local-agentic-spec.md",
+        "implementation-plan.md",
+        "planning-audit.md",
+    ):
+        text = (examples / filename).read_text(encoding="utf-8")
+        text = text.replace("slither-like-example", plan_id)
+        text = text.replace("example_only: true\n", "")
+        (dest / filename).write_text(text, encoding="utf-8")
 
 
 class PlanningValidateTests(unittest.TestCase):
@@ -3488,6 +3503,205 @@ class PlanningProgressTests(unittest.TestCase):
         result = progress_planning_workspace(self.project, plan_id, "CONTEXT_READY")
         self.assertEqual(result.to_status, "CONTEXT_READY")
         self.assertIn("artifact progress applied", result.output)
+
+
+class PlanningLifecycleIntegrationTests(unittest.TestCase):
+    plan_id = "slither-demo"
+    approve_summary = (
+        "Planning artifacts reviewed and approved for run proposals only."
+    )
+    progress_chain = (
+        "CONTEXT_READY",
+        "SPEC_READY",
+        "PLAN_READY",
+        "PLANNING_AUDIT_READY",
+    )
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self._tmp.name)
+        init_workspace(self.project)
+        self._progress_ts_counter = 0
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _next_progress_timestamp(self) -> str:
+        self._progress_ts_counter += 1
+        return f"2026-07-05T20-30-{self._progress_ts_counter:02d}Z"
+
+    def _artifact_filenames(self) -> tuple[str, ...]:
+        return (
+            "context-pack.md",
+            "local-agentic-spec.md",
+            "implementation-plan.md",
+            "planning-audit.md",
+        )
+
+    def _snapshot_artifacts(self, dest: Path) -> dict[str, str]:
+        return {
+            name: (dest / name).read_text(encoding="utf-8")
+            for name in self._artifact_filenames()
+        }
+
+    def _progress_cli(self, to_status: str) -> tuple[int, str]:
+        from unittest.mock import patch
+
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        with patch(
+            "agent_os.planning._progress_filename_timestamp",
+            return_value=self._next_progress_timestamp(),
+        ):
+            with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                code = main(
+                    [
+                        "planning",
+                        "progress",
+                        self.plan_id,
+                        str(self.project),
+                        "--to",
+                        to_status,
+                    ]
+                )
+        if code != 0:
+            self.fail(err_buf.getvalue() or out_buf.getvalue())
+        return code, out_buf.getvalue()
+
+    def test_full_planning_lifecycle_reaches_approved_for_run_proposals(self) -> None:
+        plan_id = self.plan_id
+        workspace = self.project / ".agent-os"
+
+        init_planning_workspace(self.project, plan_id)
+        dest = planning_path(self.project, plan_id)
+
+        fresh_report = validate_planning_workspace(self.project, plan_id)
+        self.assertFalse(fresh_report.valid)
+        self.assertIn("artifact validation: INVALID", fresh_report.output)
+
+        _fill_planning_lifecycle_artifacts(dest, plan_id)
+        artifact_snapshots = self._snapshot_artifacts(dest)
+
+        filled_report = validate_planning_workspace(self.project, plan_id)
+        self.assertTrue(filled_report.valid)
+        self.assertIn("status: DRAFT", filled_report.output)
+
+        progress_evidence_count = 0
+        for to_status in self.progress_chain:
+            code, output = self._progress_cli(to_status)
+            self.assertEqual(code, 0)
+            self.assertIn("artifact progress applied", output)
+            self.assertIn(f"to status: {to_status}", output)
+            self.assertIn("no owner decision was recorded", output)
+            self.assertIn("no runs were created", output)
+            self.assertIn("no agents were invoked", output)
+
+            manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["status"], to_status)
+            progress_evidence_count += 1
+            progress_files = list(dest.glob("evidence/*__artifact-progress.json"))
+            self.assertEqual(len(progress_files), progress_evidence_count)
+            record = json.loads(progress_files[-1].read_text(encoding="utf-8"))
+            self.assertEqual(record["record_type"], "PLANNING_ARTIFACT_PROGRESS")
+            self.assertFalse(list((dest / "decisions").glob("*.json")))
+
+        progress_report = validate_planning_workspace(self.project, plan_id)
+        self.assertTrue(progress_report.valid)
+        self.assertIn("status: PLANNING_AUDIT_READY", progress_report.output)
+
+        decide_buf = io.StringIO()
+        with redirect_stdout(decide_buf):
+            decide_code = main(
+                [
+                    "planning",
+                    "decide",
+                    plan_id,
+                    str(self.project),
+                    "--decision",
+                    "APPROVE_FOR_RUN_PROPOSALS",
+                    "--summary",
+                    self.approve_summary,
+                ]
+            )
+        self.assertEqual(decide_code, 0)
+        decide_output = decide_buf.getvalue()
+        self.assertIn("decision recorded", decide_output)
+        self.assertIn("manifest status was not changed", decide_output)
+
+        decision_files = sorted(dest.glob("decisions/*__owner-decision.json"))
+        self.assertEqual(len(decision_files), 1)
+        decision_record = json.loads(decision_files[0].read_text(encoding="utf-8"))
+        self.assertEqual(decision_record["decision"], "APPROVE_FOR_RUN_PROPOSALS")
+        manifest_after_decide = json.loads(
+            (dest / "manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(manifest_after_decide["status"], "PLANNING_AUDIT_READY")
+        self.assertEqual(list((workspace / "runs").iterdir()), [])
+
+        list_report = list_planning_owner_decisions(self.project, plan_id)
+        self.assertEqual(list_report.count, 1)
+        self.assertEqual(len(list_report.records), 1)
+        self.assertEqual(
+            list_report.records[-1].decision,
+            "APPROVE_FOR_RUN_PROPOSALS",
+        )
+        self.assertIn("APPROVE_FOR_RUN_PROPOSALS", list_report.output)
+
+        decision_snapshots = {
+            path.name: path.read_text(encoding="utf-8") for path in decision_files
+        }
+        transition_buf = io.StringIO()
+        with redirect_stdout(transition_buf):
+            transition_code = main(
+                [
+                    "planning",
+                    "transition",
+                    plan_id,
+                    str(self.project),
+                    "--to",
+                    "APPROVED_FOR_RUN_PROPOSALS",
+                ]
+            )
+        self.assertEqual(transition_code, 0)
+        transition_output = transition_buf.getvalue()
+        self.assertIn("transition applied", transition_output)
+        self.assertIn("to status: APPROVED_FOR_RUN_PROPOSALS", transition_output)
+        self.assertIn("no runs were created", transition_output)
+
+        manifest_final = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest_final["status"], "APPROVED_FOR_RUN_PROPOSALS")
+        gates = manifest_final["gates"]
+        self.assertTrue(gates["run_proposal_allowed"])
+        self.assertFalse(gates["planning_owner_decision_required"])
+        self.assertFalse(gates["planning_audit_required"])
+        self.assertFalse(gates["plan_revision_required"])
+
+        transition_files = list(dest.glob("evidence/*__manifest-transition.json"))
+        self.assertEqual(len(transition_files), 1)
+        transition_record = json.loads(
+            transition_files[0].read_text(encoding="utf-8")
+        )
+        self.assertEqual(transition_record["record_type"], "PLANNING_MANIFEST_TRANSITION")
+        self.assertEqual(list((workspace / "runs").iterdir()), [])
+
+        status_report = status_planning_workspace(self.project, plan_id)
+        self.assertTrue(status_report.structural_ok)
+        self.assertIn("status: APPROVED_FOR_RUN_PROPOSALS", status_report.output)
+        self.assertIn("run_proposal_allowed: true", status_report.output)
+
+        final_report = validate_planning_workspace(self.project, plan_id)
+        self.assertTrue(final_report.valid)
+        self.assertIn("final validation result: OK", final_report.output)
+
+        for name, content in artifact_snapshots.items():
+            self.assertEqual((dest / name).read_text(encoding="utf-8"), content)
+        for name, content in decision_snapshots.items():
+            self.assertEqual((dest / "decisions" / name).read_text(encoding="utf-8"), content)
+
+        authority = manifest_final["authority"]
+        self.assertTrue(authority["no_agent_invocation"])
+        self.assertTrue(authority["no_run_creation"])
+        self.assertTrue(authority["no_execution"])
 
 
 def _write_json(path: Path, data: dict) -> None:

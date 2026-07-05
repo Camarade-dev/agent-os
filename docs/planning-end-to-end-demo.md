@@ -20,7 +20,7 @@ In this demo:
 - no run is created
 - no runner import happens
 - `agent-os planning decide` records an owner decision only
-- `agent-os planning progress` advances artifact-readiness status only
+- `agent-os planning progress` advances artifact-readiness status only; it does not record owner decisions, approve run proposals, create runs, or invoke agents
 - `agent-os planning transition` is a separate operation that mutates `manifest.json` and writes one transition evidence record
 
 ## 0. Prepare an empty demo project
@@ -185,64 +185,11 @@ Expected artifact state:
 - no runs are created
 - no agents are invoked
 
-## 6. Record owner decision
+## 6. Apply artifact-progress transitions
 
-Command:
+After artifacts pass validation at `DRAFT`, advance manifest status through artifact-readiness stages using `planning progress`. This is separate from owner decisions and run-proposal approval.
 
-```bash
-agent-os planning decide slither-demo <demo-project> --decision APPROVE_FOR_RUN_PROPOSALS --summary "Planning artifacts reviewed and approved for run proposals only."
-```
-
-Expected stable output lines:
-
-```text
-decision recorded
-decision: APPROVE_FOR_RUN_PROPOSALS
-path: <demo-project>/.agent-os/planning/slither-demo/decisions/<timestamp>__owner-decision.json
-manifest status was not changed
-no runs were created
-no agents were invoked
-```
-
-Expected artifact state:
-
-- exactly one `PLANNING_OWNER_DECISION` JSON file is created under `decisions/`
-- the latest decision is `APPROVE_FOR_RUN_PROPOSALS`
-- `manifest.json` remains unchanged by the decision command
-- no run is created
-- no agent is invoked
-- runner execution is not approved
-
-## 7. List decisions
-
-Command:
-
-```bash
-agent-os planning decisions list slither-demo <demo-project>
-```
-
-Expected stable output lines:
-
-```text
-planning workspace: <demo-project>/.agent-os/planning/slither-demo
-plan_id: slither-demo
-decision records: 1
-latest decision:
-  decision: APPROVE_FOR_RUN_PROPOSALS
-  summary: Planning artifacts reviewed and approved for run proposals only.
-note: read-only; no files modified, no runs created, no agents invoked
-```
-
-Expected artifact state:
-
-- count is `1`
-- latest decision is `APPROVE_FOR_RUN_PROPOSALS`
-- listing is read-only
-- no files are modified
-
-## 8. Apply artifact-progress transitions
-
-After artifacts pass validation, advance manifest status through artifact-readiness stages. This is separate from owner decisions and run-proposal approval.
+`planning progress` is artifact-readiness only. It does not record owner decisions, approve run proposals, create runs, or invoke agents.
 
 Commands (run in order after section 5 validation is `OK`):
 
@@ -285,7 +232,93 @@ Expected artifact state after the full chain:
 
 `PLANNING_AUDIT_READY` does not approve run proposals. It only means planning artifacts and the planning audit are ready for an owner decision.
 
-## 9. Apply explicit transition
+Do not manually edit `manifest.json` status to reach `PLANNING_AUDIT_READY`. Use the progress chain above.
+
+## 7. Validate after artifact progress
+
+Command:
+
+```bash
+agent-os planning validate slither-demo <demo-project>
+```
+
+Expected stable output lines:
+
+```text
+planning workspace: <demo-project>/.agent-os/planning/slither-demo
+plan_id: slither-demo
+status: PLANNING_AUDIT_READY
+structural result: OK
+manifest validation: OK
+artifact validation: OK
+final validation result: OK
+note: no files were modified, no runs were created, no agents were invoked
+```
+
+Expected artifact state:
+
+- final validation result is `OK` at `PLANNING_AUDIT_READY`
+- validation is read-only
+- no files are modified by validation
+- no runs are created
+- no agents are invoked
+
+## 8. Record owner decision
+
+Command:
+
+```bash
+agent-os planning decide slither-demo <demo-project> --decision APPROVE_FOR_RUN_PROPOSALS --summary "Planning artifacts reviewed and approved for run proposals only."
+```
+
+Expected stable output lines:
+
+```text
+decision recorded
+decision: APPROVE_FOR_RUN_PROPOSALS
+path: <demo-project>/.agent-os/planning/slither-demo/decisions/<timestamp>__owner-decision.json
+manifest status was not changed
+no runs were created
+no agents were invoked
+```
+
+Expected artifact state:
+
+- exactly one `PLANNING_OWNER_DECISION` JSON file is created under `decisions/`
+- the latest decision is `APPROVE_FOR_RUN_PROPOSALS`
+- `manifest.json` status remains `PLANNING_AUDIT_READY`
+- no run is created
+- no agent is invoked
+- runner execution is not approved
+
+## 9. List decisions
+
+Command:
+
+```bash
+agent-os planning decisions list slither-demo <demo-project>
+```
+
+Expected stable output lines:
+
+```text
+planning workspace: <demo-project>/.agent-os/planning/slither-demo
+plan_id: slither-demo
+decision records: 1
+latest decision:
+  decision: APPROVE_FOR_RUN_PROPOSALS
+  summary: Planning artifacts reviewed and approved for run proposals only.
+note: read-only; no files modified, no runs created, no agents invoked
+```
+
+Expected artifact state:
+
+- count is `1`
+- latest decision is `APPROVE_FOR_RUN_PROPOSALS`
+- listing is read-only
+- no files are modified
+
+## 10. Apply explicit transition
 
 Command:
 
@@ -316,12 +349,12 @@ Expected artifact state:
   - `planning_owner_decision_required: false`
   - `planning_audit_required: false`
   - `plan_revision_required: false`
-- exactly one `PLANNING_MANIFEST_TRANSITION` JSON file is created under `evidence/`
+- exactly one `PLANNING_MANIFEST_TRANSITION` JSON file is created under `evidence/` (in addition to the four progress records)
 - no run is created
 - no agent is invoked
 - no runner import happens
 
-## 10. Final status
+## 11. Final status
 
 Command:
 
@@ -346,11 +379,11 @@ structural result: OK
 Expected artifact state:
 
 - `manifest.json` contains `last_transition`
-- `last_transition.from_status` is `PLANNING_AUDIT_READY` if the manual step used that source state
+- `last_transition.from_status` is `PLANNING_AUDIT_READY`
 - `last_transition.to_status` is `APPROVED_FOR_RUN_PROPOSALS`
 - status inspection remains read-only
 
-## 11. Final validation
+## 12. Final validation
 
 Command:
 
@@ -384,7 +417,7 @@ After the demo completes:
 
 - `.agent-os/planning/slither-demo/manifest.json` has `status: "APPROVED_FOR_RUN_PROPOSALS"`
 - `decisions/` contains one owner decision JSON
-- `evidence/` contains one manifest transition JSON
+- `evidence/` contains four artifact-progress JSON files and one manifest transition JSON
 - `.agent-os/runs/` is still empty
 - no executor, agent, Cursor session, or runner was invoked
 - no execution evidence exists because no execution happened
