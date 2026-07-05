@@ -47,6 +47,8 @@ Agent OS v0 is **not** meant for tiny one-shot tasks where a normal prompt is en
 
 For concrete dogfood evidence and the usage-threshold tradeoff, see `docs/dogfood-001-todo-cli.md` (first run), `docs/dogfood-002-markdown-evidence-pack.md` (medium-scope local CLI), `docs/dogfood-003-local-site-audit.md` (medium-risk local site audit), and `docs/dogfood-004-json-config-linter.md` (full evidence stack on a JSON config linter). For what counts as acceptable evidence and how to capture it without turning Agent OS into a runtime, see `docs/evidence-capture-doctrine-v0.md`. For what evidence helpers may and may not do, see `docs/evidence-capture-boundaries-v0.md` (`agent-os evidence add`, `agent-os evidence add-file`, `agent-os evidence add-command-output`, and `agent-os evidence snapshot-git` are implemented as registrar-only; `snapshot-git` is the narrow explicit read-only Git exception — not arbitrary command execution).
 
+For an end-to-end local planning lifecycle demo, see [`docs/planning-end-to-end-demo.md`](docs/planning-end-to-end-demo.md).
+
 ## Requirements
 
 - Python 3.10+
