@@ -95,6 +95,9 @@ agent-os planning decide <plan-id> . --decision REQUEST_REVISION --summary "fix 
 # 1f. List owner decision records (read-only)
 agent-os planning decisions list <plan-id> .
 
+# 1g. Apply an explicit manifest transition authorized by owner decision
+agent-os planning transition <plan-id> . --to APPROVED_FOR_RUN_PROPOSALS
+
 # 2. Create a run from templates
 agent-os mission .
 
@@ -140,6 +143,7 @@ agent-os planning status PLAN_ID [PATH]  # inspect planning workspace structure 
 agent-os planning validate PLAN_ID [PATH]  # weak read-only validation (does not approve execution)
 agent-os planning decide PLAN_ID [PATH] --decision DECISION --summary "..."  # record owner decision (evidence only)
 agent-os planning decisions list PLAN_ID [PATH]  # list owner decision records (read-only)
+agent-os planning transition PLAN_ID [PATH] --to STATUS  # explicit manifest transition (owner decision required)
 agent-os mission [PATH]       # create a new run from templates
 agent-os status [PATH]        # list runs and fields blocking closure
 agent-os audit RUN_ID [PATH]  # record an audit verdict

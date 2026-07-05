@@ -1,10 +1,10 @@
 # Planning decision-to-transition doctrine
 
-> **Status:** doctrine only — no manifest transitions, no gate mutation, no automation  
+> **Status:** doctrine — manifest transitions implemented via `agent-os planning transition`  
 > **Relation to Agent OS:** extension layer; not part of Agent OS v0.1.0 core behavior  
 > **Companion:** [`docs/planning-workspace-layout.md`](planning-workspace-layout.md), [`docs/planning-layer-doctrine.md`](planning-layer-doctrine.md)
 
-This document defines how **recorded owner decisions** relate to **future explicit manifest transitions** in a planning workspace. It authorizes nothing by itself. Decision records are evidence; manifest transitions are separate operations that a future command may perform only when doctrine, validation, and the latest valid owner decision align.
+This document defines how **recorded owner decisions** relate to **explicit manifest transitions** in a planning workspace. It authorizes nothing by itself. Decision records are evidence; manifest transitions are separate operations performed only when doctrine, validation (where required), and the latest valid owner decision align.
 
 ---
 
@@ -15,15 +15,15 @@ Governed planning separates **judgment** from **state change**:
 | Concept | Role |
 |---------|------|
 | **Owner decision record** | Append-only evidence of owner judgment under `decisions/` |
-| **Manifest transition** | Future explicit operation that may update `manifest.json` `status` and `gates` |
+| **Manifest transition** | Explicit operation via `agent-os planning transition` that updates `manifest.json` `status` and `gates` when authorized |
 | **Validation** | Read-only structural check (`agent-os planning validate`) — not approval |
 
 **Core rules:**
 
 - Decision records are **evidence**. They document what the owner decided and when.
-- Manifest transitions are **separate explicit operations**. No decision record mutates `manifest.status` or `gates` by itself.
+- Manifest transitions are **separate explicit operations** (`agent-os planning transition`). No decision record mutates `manifest.status` or `gates` by itself.
 - No transition creates runs, invokes agents, imports plans into the runner, or approves executor execution.
-- `agent-os planning decide` records judgment only. Status and gate updates remain manual today and will require a future explicit transition command when implemented.
+- `agent-os planning decide` records judgment only. Status and gate updates require `agent-os planning transition` when doctrine authorizes them.
 
 ---
 
@@ -73,7 +73,7 @@ Decision records remain **historical evidence**. A later decision does not delet
 
 ## 4. Transition authorization matrix
 
-This matrix defines which owner decision **may authorize** which future explicit manifest transition. **Authorization is not execution.** A future `planning transition` (or equivalent) command must still be invoked explicitly, verify preconditions, and fail closed when doctrine is not met.
+This matrix defines which owner decision **may authorize** which explicit manifest transition. **Authorization is not automatic.** `agent-os planning transition` must be invoked explicitly, verify preconditions, and fail closed when doctrine is not met.
 
 Legend: **✓** = may authorize (subject to preconditions); **—** = not allowed by default
 
@@ -171,18 +171,16 @@ Canonical gate keys in `manifest.json` `gates`:
 | `plan_revision_required` | Material plan change needed after audit or owner review |
 | `run_proposal_allowed` | Plan may feed Next Run Proposal derivation (one slice at a time) |
 
-### Possible future transition effects
+### Possible transition effects (`agent-os planning transition`)
 
-> **This slice does not implement gate mutation.** The table below describes intended effects for a **future explicit transition command** only.
-
-| Transition outcome | Possible future gate effects |
+| Transition outcome | Gate effects |
 |--------------------|------------------------------|
-| → `APPROVED_FOR_RUN_PROPOSALS` | May set `run_proposal_allowed: true`; may close `planning_owner_decision_required` |
-| → `BLOCKED` (from `BLOCK` or `REQUEST_REVISION`) | May set `plan_revision_required: true` |
-| → `CLOSED` | May close all planning gates (`false` for open-required gates; `run_proposal_allowed: false`) |
-| → `SUPERSEDED` | May close all planning gates; `run_proposal_allowed: false` |
+| → `APPROVED_FOR_RUN_PROPOSALS` | Sets `run_proposal_allowed: true`; closes `planning_owner_decision_required`, `planning_audit_required`, `plan_revision_required` |
+| → `BLOCKED` (from `BLOCK` or `REQUEST_REVISION`) | Sets `plan_revision_required: true`; `run_proposal_allowed: false` |
+| → `CLOSED` | Closes all planning gates (`false` for open-required gates; `run_proposal_allowed: false`) |
+| → `SUPERSEDED` | Not implemented in current slice — requires future supersession workflow |
 
-Gate changes require an explicit future transition command. Decision records alone do not flip gates.
+Gate changes require `agent-os planning transition`. Decision records alone do not flip gates.
 
 ---
 
@@ -193,7 +191,7 @@ Gate changes require an explicit future transition command. Decision records alo
 - Execute code
 - Invoke agents or Cursor
 - Create runs or run metadata
-- Mutate `manifest.json` `status` or `gates`
+- Mutate `manifest.json` `status` or `gates` (except via explicit `agent-os planning transition` when authorized)
 - Flip gate flags
 - Approve runner execution
 - Import plans into the runner
@@ -233,8 +231,9 @@ Violations are process defects, not features to automate away.
 | `agent-os planning validate` | Read-only structural validation; prerequisite for recording `APPROVE_FOR_RUN_PROPOSALS` |
 | `agent-os planning decide` | Append one owner decision record — no manifest mutation |
 | `agent-os planning decisions list` | Read-only decision history; reports latest valid decision |
+| `agent-os planning transition` | Apply explicit manifest transition when latest owner decision and doctrine authorize it; writes one evidence record |
 
-No command in this slice performs manifest transitions.
+`agent-os planning transition` does not create decisions, runs, or agent invocations. Unsupported targets (including `SUPERSEDED` and artifact-progress statuses) fail closed.
 
 ---
 

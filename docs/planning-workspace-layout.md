@@ -102,6 +102,8 @@ Copied or rendered from `agent_os/templates/planning/planning-audit.md`. Indepen
 
 Planning evidence and provenance: context citations, revision diffs, checklists, owner notes supporting planning claims. Separate from **execution** evidence under `.agent-os/runs/<run-id>/evidence.md`.
 
+**Manifest transition records** (via `agent-os planning transition`) are JSON files named `<UTC_TIMESTAMP>__manifest-transition.json` (e.g. `2026-07-05T20-15-30Z__manifest-transition.json`). Each record has `record_type: PLANNING_MANIFEST_TRANSITION`, `from_status`, `to_status`, the owner `decision` and `decision_file` that authorized the transition, `validation_required` / `validation_result`, `gate_effects`, and authority flags stating the record applies an owner decision only — it does not create decisions, execute, create runs, or invoke agents. Transition writes exactly one evidence file plus an explicit `manifest.json` update; planning artifacts and `decisions/` are not modified.
+
 ### `decisions/`
 
 Recorded owner decisions about planning artifacts (spec acceptance, plan approval, audit acknowledgment, gate overrides). One file per decision is recommended.
@@ -124,7 +126,7 @@ Local instructions for operators working in this directory: how artifacts relate
 
 ## 3. Allowed statuses
 
-Statuses describe **planning maturity**, not execution state. Transitions are manual; no status self-advances. Owner decision records under `decisions/` do **not** change `status` or `gates` by themselves — see [`docs/planning-decision-transition-doctrine.md`](planning-decision-transition-doctrine.md) for which decisions may authorize future explicit manifest transitions.
+Statuses describe **planning maturity**, not execution state. Transitions are explicit: `agent-os planning transition <plan-id> --to <status>` may update `manifest.json` only when the latest valid owner decision authorizes the target — see [`docs/planning-decision-transition-doctrine.md`](planning-decision-transition-doctrine.md). Decision records alone do not change `status` or `gates`.
 
 | Status | Meaning |
 |--------|---------|
@@ -151,7 +153,13 @@ DRAFT → CONTEXT_READY → SPEC_READY → PLAN_READY → PLANNING_AUDIT_READY
 
 ## 4. Gate semantics
 
-Gates are recorded in `manifest.json` under `gates` (open = `true`). Closing a gate requires an explicit owner or role-bounded action documented in `decisions/` and, in the future, an explicit manifest transition command — decision records alone do not flip gates ([`docs/planning-decision-transition-doctrine.md`](planning-decision-transition-doctrine.md) §7).
+Gates are recorded in `manifest.json` under `gates` (open = `true`). Closing a gate requires an explicit owner or role-bounded action documented in `decisions/` and an explicit manifest transition (`agent-os planning transition`) — decision records alone do not flip gates ([`docs/planning-decision-transition-doctrine.md`](planning-decision-transition-doctrine.md) §7).
+
+| Transition target | Gate effects applied by `planning transition` |
+|-------------------|-----------------------------------------------|
+| `APPROVED_FOR_RUN_PROPOSALS` | `run_proposal_allowed: true`; `planning_owner_decision_required`, `planning_audit_required`, `plan_revision_required`: `false` |
+| `BLOCKED` | `run_proposal_allowed: false`; `plan_revision_required: true`; `planning_owner_decision_required: false`; `planning_audit_required` preserved (default `true` if absent) |
+| `CLOSED` | All planning gates closed (`false` for open-required gates; `run_proposal_allowed: false`) |
 
 | Gate key | When open | Closed by |
 |----------|-----------|-----------|

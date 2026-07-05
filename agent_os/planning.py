@@ -62,6 +62,26 @@ PLANNING_OWNER_DECISIONS = (
 
 PLANNING_OWNER_DECISION_RECORD_TYPE = "PLANNING_OWNER_DECISION"
 
+PLANNING_MANIFEST_TRANSITION_RECORD_TYPE = "PLANNING_MANIFEST_TRANSITION"
+
+PLANNING_TRANSITION_TARGETS = (
+    "APPROVED_FOR_RUN_PROPOSALS",
+    "BLOCKED",
+    "CLOSED",
+)
+
+PLANNING_TERMINAL_STATUSES = ("CLOSED", "SUPERSEDED")
+
+PLANNING_ACTIVE_STATUSES = (
+    "DRAFT",
+    "CONTEXT_READY",
+    "SPEC_READY",
+    "PLAN_READY",
+    "PLANNING_AUDIT_READY",
+    "APPROVED_FOR_RUN_PROPOSALS",
+    "BLOCKED",
+)
+
 PLANNING_OWNER_DECISION_REQUIRED_FIELDS = (
     "record_type",
     "plan_id",
@@ -147,6 +167,17 @@ def _decision_filename_timestamp() -> str:
     """Filesystem-safe UTC timestamp for owner decision filenames."""
     ts = datetime.now(timezone.utc).replace(microsecond=0)
     return ts.strftime("%Y-%m-%dT%H-%M-%SZ")
+
+
+def _transition_filename_timestamp() -> str:
+    """Filesystem-safe UTC timestamp for manifest transition evidence filenames."""
+    return _decision_filename_timestamp()
+
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    _write_json(tmp, data)
+    tmp.replace(path)
 
 
 def _write_json(path: Path, data: dict) -> None:
@@ -811,4 +842,250 @@ def list_planning_owner_decisions(
         len(records),
         tuple(records),
         tuple(skipped),
+    )
+
+
+def _inspect_transition_workspace(project: Path, plan_id: str) -> tuple[Path, dict]:
+    """Verify workspace, manifest, decisions/, and evidence/ exist (fail closed)."""
+    validate_plan_id(plan_id)
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        raise FileNotFoundError("no workspace found (run `agent-os init` first)")
+
+    dest = planning_path(project, plan_id)
+    if not dest.is_dir():
+        raise FileNotFoundError(f"planning workspace not found: {plan_id}")
+
+    manifest = _load_planning_manifest(dest / "manifest.json", plan_id)
+
+    if not (dest / "decisions").is_dir():
+        raise FileNotFoundError(
+            f"decisions directory missing in planning workspace: {plan_id}"
+        )
+
+    if not (dest / "evidence").is_dir():
+        raise FileNotFoundError(
+            f"evidence directory missing in planning workspace: {plan_id}"
+        )
+
+    return dest, manifest
+
+
+def _authorize_manifest_transition(
+    from_status: str,
+    to_status: str,
+    decision: str,
+    validation_ok: bool,
+) -> tuple[bool, str | None]:
+    """
+    Return (validation_required, validation_result) when authorized.
+
+    Raises ValueError when the latest owner decision does not authorize the transition.
+    """
+    if to_status == "SUPERSEDED":
+        raise ValueError(
+            "SUPERSEDED requires a future explicit supersession workflow "
+            "with superseding plan_id"
+        )
+
+    if to_status not in PLANNING_TRANSITION_TARGETS:
+        raise ValueError(f"unsupported transition target: {to_status!r}")
+
+    if from_status in PLANNING_TERMINAL_STATUSES:
+        raise ValueError(
+            f"terminal workspace cannot transition: status is {from_status!r}"
+        )
+
+    if from_status not in PLANNING_ACTIVE_STATUSES:
+        raise ValueError(f"unknown source status: {from_status!r}")
+
+    if decision == "APPROVE_FOR_RUN_PROPOSALS":
+        if to_status != "APPROVED_FOR_RUN_PROPOSALS":
+            raise ValueError(
+                f"latest decision APPROVE_FOR_RUN_PROPOSALS does not authorize "
+                f"transition to {to_status!r}"
+            )
+        if from_status not in ("PLANNING_AUDIT_READY", "PLAN_READY"):
+            raise ValueError(
+                "APPROVE_FOR_RUN_PROPOSALS does not authorize transition "
+                f"from {from_status!r} to APPROVED_FOR_RUN_PROPOSALS"
+            )
+        if not validation_ok:
+            raise ValueError(
+                "Cannot transition to APPROVED_FOR_RUN_PROPOSALS because "
+                "planning validation is not OK."
+            )
+        return True, "OK"
+
+    if decision == "REQUEST_REVISION":
+        if to_status != "BLOCKED":
+            raise ValueError(
+                f"latest decision REQUEST_REVISION does not authorize "
+                f"transition to {to_status!r}"
+            )
+        return False, None
+
+    if decision == "BLOCK":
+        if to_status != "BLOCKED":
+            raise ValueError(
+                f"latest decision BLOCK does not authorize transition to {to_status!r}"
+            )
+        return False, None
+
+    if decision == "CLOSE":
+        if to_status != "CLOSED":
+            raise ValueError(
+                f"latest decision CLOSE does not authorize transition to {to_status!r}"
+            )
+        return False, None
+
+    raise ValueError(
+        f"latest owner decision {decision!r} does not authorize transition "
+        f"to {to_status!r}"
+    )
+
+
+def _gate_effects_for_transition(to_status: str, existing_gates: dict) -> dict[str, bool]:
+    if to_status == "APPROVED_FOR_RUN_PROPOSALS":
+        return {
+            "run_proposal_allowed": True,
+            "planning_owner_decision_required": False,
+            "planning_audit_required": False,
+            "plan_revision_required": False,
+        }
+
+    if to_status == "BLOCKED":
+        audit_required = existing_gates.get("planning_audit_required")
+        if not isinstance(audit_required, bool):
+            audit_required = True
+        return {
+            "run_proposal_allowed": False,
+            "planning_owner_decision_required": False,
+            "plan_revision_required": True,
+            "planning_audit_required": audit_required,
+        }
+
+    if to_status == "CLOSED":
+        return {
+            "run_proposal_allowed": False,
+            "planning_owner_decision_required": False,
+            "planning_audit_required": False,
+            "plan_revision_required": False,
+        }
+
+    raise ValueError(f"unsupported transition target: {to_status!r}")
+
+
+@dataclass(frozen=True)
+class PlanningTransitionResult:
+    plan_id: str
+    from_status: str
+    to_status: str
+    decision: str
+    evidence_path: Path
+    output: str
+
+
+def transition_planning_workspace(
+    project: Path,
+    plan_id: str,
+    to_status: str,
+) -> PlanningTransitionResult:
+    """Apply an explicit manifest transition authorized by the latest owner decision."""
+    dest, manifest = _inspect_transition_workspace(project, plan_id)
+
+    gates = manifest.get("gates")
+    if not isinstance(gates, dict):
+        raise ValueError("manifest lacks gates object required for safe mutation")
+
+    records, _skipped = _load_planning_owner_decisions(dest, plan_id)
+    if not records:
+        raise ValueError("no owner decision exists")
+
+    latest = records[-1]
+    from_status = manifest.get("status")
+    if not isinstance(from_status, str) or not from_status:
+        raise ValueError("manifest lacks status required for transition")
+
+    validation_report = validate_planning_workspace(project, plan_id)
+    validation_ok = validation_report.valid
+
+    validation_required, validation_result = _authorize_manifest_transition(
+        from_status,
+        to_status,
+        latest.decision,
+        validation_ok,
+    )
+
+    gate_effects = _gate_effects_for_transition(to_status, gates)
+    created_at = _utc_now()
+    evidence_filename = f"{_transition_filename_timestamp()}__manifest-transition.json"
+    evidence_path = dest / "evidence" / evidence_filename
+    if evidence_path.exists():
+        raise FileExistsError(
+            f"transition evidence file already exists: {evidence_filename}"
+        )
+
+    manifest_path = dest / "manifest.json"
+    updated_manifest = dict(manifest)
+    updated_manifest["status"] = to_status
+    updated_manifest["updated_at"] = created_at
+    updated_manifest["last_transition"] = {
+        "from_status": from_status,
+        "to_status": to_status,
+        "decision": latest.decision,
+        "decision_created_at": latest.created_at,
+        "transition_record": evidence_filename,
+        "created_at": created_at,
+    }
+
+    updated_gates = dict(gates)
+    updated_gates.update(gate_effects)
+    updated_manifest["gates"] = updated_gates
+
+    evidence_record = {
+        "record_type": PLANNING_MANIFEST_TRANSITION_RECORD_TYPE,
+        "plan_id": plan_id,
+        "from_status": from_status,
+        "to_status": to_status,
+        "created_at": created_at,
+        "manifest_path": str(manifest_path),
+        "decision_file": latest.filename,
+        "decision": latest.decision,
+        "decision_created_at": latest.created_at,
+        "validation_required": validation_required,
+        "validation_result": validation_result,
+        "gate_effects": gate_effects,
+        "authority": {
+            "applies_owner_decision_only": True,
+            "does_not_create_decision": True,
+            "does_not_execute": True,
+            "does_not_create_runs": True,
+            "does_not_invoke_agents": True,
+            "does_not_approve_runner_execution": True,
+        },
+    }
+
+    _atomic_write_json(manifest_path, updated_manifest)
+    _write_json(evidence_path, evidence_record)
+
+    lines = [
+        "transition applied",
+        f"plan_id: {plan_id}",
+        f"from status: {from_status}",
+        f"to status: {to_status}",
+        f"latest decision used: {latest.decision}",
+        f"evidence record: {evidence_path}",
+        "manifest updated explicitly",
+        "no runs were created",
+        "no agents were invoked",
+    ]
+    return PlanningTransitionResult(
+        plan_id,
+        from_status,
+        to_status,
+        latest.decision,
+        evidence_path,
+        "\n".join(lines),
     )

@@ -18,6 +18,7 @@ from agent_os.planning import (
     list_planning_owner_decisions,
     record_planning_owner_decision,
     status_planning_workspace,
+    transition_planning_workspace,
     validate_planning_workspace,
     validate_plan_id,
 )
@@ -2572,6 +2573,497 @@ class PlanningDecisionsListTests(unittest.TestCase):
         self.assertIn("no files modified", output)
         self.assertIn("no runs created", output)
         self.assertIn("no agents invoked", output)
+
+
+class PlanningTransitionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self._tmp.name)
+        init_workspace(self.project)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _snapshot_agent_os_tree(self) -> dict[str, str]:
+        workspace = self.project / ".agent-os"
+        snapshots: dict[str, str] = {}
+        for path in workspace.rglob("*"):
+            if path.is_file():
+                rel = path.relative_to(workspace).as_posix()
+                snapshots[rel] = path.read_text(encoding="utf-8")
+        return snapshots
+
+    def _write_owner_decision(
+        self,
+        dest: Path,
+        filename: str,
+        *,
+        plan_id: str,
+        decision: str,
+        summary: str = "test summary",
+        created_at: str = "2026-01-01T00:00:00+00:00",
+        workspace_status: str = "DRAFT",
+    ) -> None:
+        _write_json(
+            dest / "decisions" / filename,
+            {
+                "record_type": "PLANNING_OWNER_DECISION",
+                "plan_id": plan_id,
+                "decision": decision,
+                "summary": summary,
+                "created_at": created_at,
+                "workspace_status_at_decision": workspace_status,
+                "authority": {
+                    "records_decision_only": True,
+                    "does_not_execute": True,
+                    "does_not_create_runs": True,
+                    "does_not_mutate_manifest": True,
+                    "does_not_approve_runner_execution": True,
+                },
+            },
+        )
+
+    def _set_manifest_status(self, dest: Path, status: str) -> None:
+        manifest_path = dest / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["status"] = status
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+    def _transition_cli(self, plan_id: str, to_status: str) -> tuple[int, str, str]:
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        with redirect_stdout(out_buf), redirect_stderr(err_buf):
+            code = main(
+                [
+                    "planning",
+                    "transition",
+                    plan_id,
+                    str(self.project),
+                    "--to",
+                    to_status,
+                ]
+            )
+        return code, out_buf.getvalue(), err_buf.getvalue()
+
+    def _prepare_approved_workspace(
+        self,
+        plan_id: str,
+        *,
+        status: str = "PLANNING_AUDIT_READY",
+    ) -> Path:
+        dest = _prepare_valid_planning_workspace(self.project, plan_id)
+        self._set_manifest_status(dest, status)
+        record_planning_owner_decision(
+            self.project,
+            plan_id,
+            "APPROVE_FOR_RUN_PROPOSALS",
+            "approved for proposals",
+        )
+        return dest
+
+    def test_approve_from_planning_audit_ready_succeeds(self) -> None:
+        plan_id = "transition-approve-audit"
+        dest = self._prepare_approved_workspace(plan_id, status="PLANNING_AUDIT_READY")
+        manifest_before = (dest / "manifest.json").read_text(encoding="utf-8")
+
+        code, output, _err = self._transition_cli(plan_id, "APPROVED_FOR_RUN_PROPOSALS")
+        self.assertEqual(code, 0)
+        self.assertIn("transition applied", output)
+        self.assertIn(f"plan_id: {plan_id}", output)
+        self.assertIn("from status: PLANNING_AUDIT_READY", output)
+        self.assertIn("to status: APPROVED_FOR_RUN_PROPOSALS", output)
+        self.assertIn("latest decision used: APPROVE_FOR_RUN_PROPOSALS", output)
+        self.assertIn("manifest updated explicitly", output)
+        self.assertIn("no runs were created", output)
+        self.assertIn("no agents were invoked", output)
+
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        self.assertNotEqual(manifest_before, json.dumps(manifest, indent=2) + "\n")
+        self.assertEqual(manifest["status"], "APPROVED_FOR_RUN_PROPOSALS")
+        self.assertTrue(manifest["gates"]["run_proposal_allowed"])
+        self.assertFalse(manifest["gates"]["planning_owner_decision_required"])
+        self.assertFalse(manifest["gates"]["planning_audit_required"])
+        self.assertFalse(manifest["gates"]["plan_revision_required"])
+        self.assertEqual(manifest["last_transition"]["from_status"], "PLANNING_AUDIT_READY")
+        self.assertEqual(manifest["last_transition"]["to_status"], "APPROVED_FOR_RUN_PROPOSALS")
+
+        evidence_files = list((dest / "evidence").glob("*__manifest-transition.json"))
+        self.assertEqual(len(evidence_files), 1)
+        record = json.loads(evidence_files[0].read_text(encoding="utf-8"))
+        self.assertEqual(record["record_type"], "PLANNING_MANIFEST_TRANSITION")
+        self.assertEqual(record["validation_result"], "OK")
+        self.assertTrue(record["validation_required"])
+        self.assertTrue(record["authority"]["does_not_create_runs"])
+
+    def test_approve_from_plan_ready_succeeds(self) -> None:
+        plan_id = "transition-approve-plan"
+        dest = self._prepare_approved_workspace(plan_id, status="PLAN_READY")
+
+        code, output, _err = self._transition_cli(plan_id, "APPROVED_FOR_RUN_PROPOSALS")
+        self.assertEqual(code, 0)
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["status"], "APPROVED_FOR_RUN_PROPOSALS")
+        self.assertIn("from status: PLAN_READY", output)
+
+    def test_request_revision_to_blocked_when_validation_fails(self) -> None:
+        plan_id = "transition-revision-blocked"
+        dest = init_planning_workspace(self.project, plan_id)
+        self.assertFalse(validate_planning_workspace(self.project, plan_id).valid)
+        record_planning_owner_decision(
+            self.project,
+            plan_id,
+            "REQUEST_REVISION",
+            "needs revision",
+        )
+
+        code, _output, _err = self._transition_cli(plan_id, "BLOCKED")
+        self.assertEqual(code, 0)
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["status"], "BLOCKED")
+        self.assertTrue(manifest["gates"]["plan_revision_required"])
+        self.assertFalse(manifest["gates"]["run_proposal_allowed"])
+
+    def test_block_to_blocked_when_validation_fails(self) -> None:
+        plan_id = "transition-block-blocked"
+        dest = init_planning_workspace(self.project, plan_id)
+        record_planning_owner_decision(
+            self.project,
+            plan_id,
+            "BLOCK",
+            "blocked pending fix",
+        )
+
+        code, _output, _err = self._transition_cli(plan_id, "BLOCKED")
+        self.assertEqual(code, 0)
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["status"], "BLOCKED")
+
+    def test_close_to_closed_succeeds(self) -> None:
+        plan_id = "transition-close"
+        dest = init_planning_workspace(self.project, plan_id)
+        record_planning_owner_decision(
+            self.project,
+            plan_id,
+            "CLOSE",
+            "planning complete",
+        )
+
+        code, output, _err = self._transition_cli(plan_id, "CLOSED")
+        self.assertEqual(code, 0)
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["status"], "CLOSED")
+        self.assertFalse(manifest["gates"]["run_proposal_allowed"])
+        self.assertIn("to status: CLOSED", output)
+
+    def test_approve_from_draft_fails(self) -> None:
+        plan_id = "transition-approve-draft"
+        dest = _prepare_valid_planning_workspace(self.project, plan_id)
+        record_planning_owner_decision(
+            self.project,
+            plan_id,
+            "APPROVE_FOR_RUN_PROPOSALS",
+            "approved",
+        )
+
+        code, _output, err = self._transition_cli(plan_id, "APPROVED_FOR_RUN_PROPOSALS")
+        self.assertEqual(code, 1)
+        self.assertIn("does not authorize transition from 'DRAFT'", err)
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["status"], "DRAFT")
+
+    def test_approve_fails_when_validation_no_longer_ok(self) -> None:
+        plan_id = "transition-approve-stale-validation"
+        dest = self._prepare_approved_workspace(plan_id, status="PLANNING_AUDIT_READY")
+        path = dest / "planning-audit.md"
+        path.write_text(
+            path.read_text(encoding="utf-8") + "\n{{STALE_PLACEHOLDER}}\n",
+            encoding="utf-8",
+        )
+
+        code, _output, err = self._transition_cli(plan_id, "APPROVED_FOR_RUN_PROPOSALS")
+        self.assertEqual(code, 1)
+        self.assertIn("planning validation is not OK", err)
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["status"], "PLANNING_AUDIT_READY")
+
+    def test_request_revision_to_approved_fails(self) -> None:
+        plan_id = "transition-revision-not-approve"
+        dest = init_planning_workspace(self.project, plan_id)
+        record_planning_owner_decision(
+            self.project,
+            plan_id,
+            "REQUEST_REVISION",
+            "fix scope",
+        )
+
+        code, _output, err = self._transition_cli(plan_id, "APPROVED_FOR_RUN_PROPOSALS")
+        self.assertEqual(code, 1)
+        self.assertIn("REQUEST_REVISION does not authorize", err)
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["status"], "DRAFT")
+
+    def test_block_to_closed_fails(self) -> None:
+        plan_id = "transition-block-not-close"
+        dest = init_planning_workspace(self.project, plan_id)
+        record_planning_owner_decision(
+            self.project,
+            plan_id,
+            "BLOCK",
+            "blocked",
+        )
+
+        code, _output, err = self._transition_cli(plan_id, "CLOSED")
+        self.assertEqual(code, 1)
+        self.assertIn("BLOCK does not authorize transition to 'CLOSED'", err)
+
+    def test_close_to_blocked_fails(self) -> None:
+        plan_id = "transition-close-not-block"
+        dest = init_planning_workspace(self.project, plan_id)
+        record_planning_owner_decision(
+            self.project,
+            plan_id,
+            "CLOSE",
+            "close it",
+        )
+
+        code, _output, err = self._transition_cli(plan_id, "BLOCKED")
+        self.assertEqual(code, 1)
+        self.assertIn("CLOSE does not authorize transition to 'BLOCKED'", err)
+
+    def test_unsupported_target_status_fails(self) -> None:
+        plan_id = "transition-unsupported-target"
+        dest = init_planning_workspace(self.project, plan_id)
+        record_planning_owner_decision(
+            self.project,
+            plan_id,
+            "CLOSE",
+            "close it",
+        )
+
+        code, _output, err = self._transition_cli(plan_id, "DRAFT")
+        self.assertEqual(code, 1)
+        self.assertIn("unsupported transition target", err)
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["status"], "DRAFT")
+
+    def test_superseded_target_fails_with_future_workflow_message(self) -> None:
+        plan_id = "transition-superseded"
+        dest = init_planning_workspace(self.project, plan_id)
+        record_planning_owner_decision(
+            self.project,
+            plan_id,
+            "CLOSE",
+            "close it",
+        )
+
+        code, _output, err = self._transition_cli(plan_id, "SUPERSEDED")
+        self.assertEqual(code, 1)
+        self.assertIn("supersession workflow", err)
+        self.assertIn("superseding plan_id", err)
+
+    def test_terminal_workspace_fails(self) -> None:
+        plan_id = "transition-terminal"
+        dest = init_planning_workspace(self.project, plan_id)
+        self._set_manifest_status(dest, "CLOSED")
+        record_planning_owner_decision(
+            self.project,
+            plan_id,
+            "CLOSE",
+            "already closed",
+        )
+
+        code, _output, err = self._transition_cli(plan_id, "CLOSED")
+        self.assertEqual(code, 1)
+        self.assertIn("terminal workspace cannot transition", err)
+
+    def test_no_owner_decision_fails(self) -> None:
+        plan_id = "transition-no-decision"
+        init_planning_workspace(self.project, plan_id)
+
+        code, _output, err = self._transition_cli(plan_id, "BLOCKED")
+        self.assertEqual(code, 1)
+        self.assertIn("no owner decision exists", err)
+
+    def test_missing_evidence_directory_fails(self) -> None:
+        plan_id = "transition-no-evidence-dir"
+        dest = init_planning_workspace(self.project, plan_id)
+        import shutil
+
+        shutil.rmtree(dest / "evidence")
+        record_planning_owner_decision(
+            self.project,
+            plan_id,
+            "BLOCK",
+            "blocked",
+        )
+
+        code, _output, err = self._transition_cli(plan_id, "BLOCKED")
+        self.assertEqual(code, 1)
+        self.assertIn("evidence directory missing", err)
+
+    def test_missing_decisions_directory_fails(self) -> None:
+        plan_id = "transition-no-decisions-dir"
+        dest = init_planning_workspace(self.project, plan_id)
+        import shutil
+
+        shutil.rmtree(dest / "decisions")
+
+        code, _output, err = self._transition_cli(plan_id, "BLOCKED")
+        self.assertEqual(code, 1)
+        self.assertIn("decisions directory missing", err)
+
+    def test_malformed_decision_json_fails(self) -> None:
+        plan_id = "transition-bad-decision"
+        dest = init_planning_workspace(self.project, plan_id)
+        (dest / "decisions" / "broken.json").write_text("{not json", encoding="utf-8")
+
+        code, _output, err = self._transition_cli(plan_id, "BLOCKED")
+        self.assertEqual(code, 1)
+        self.assertIn("invalid decision JSON", err)
+
+    def test_decision_plan_id_mismatch_fails(self) -> None:
+        plan_id = "transition-decision-mismatch"
+        dest = init_planning_workspace(self.project, plan_id)
+        self._write_owner_decision(
+            dest,
+            "2026-01-01T00-00-00Z__owner-decision.json",
+            plan_id="other-plan",
+            decision="BLOCK",
+        )
+
+        code, _output, err = self._transition_cli(plan_id, "BLOCKED")
+        self.assertEqual(code, 1)
+        self.assertIn("decision plan_id mismatch", err)
+
+    def test_manifest_missing_gates_fails(self) -> None:
+        plan_id = "transition-no-gates"
+        dest = init_planning_workspace(self.project, plan_id)
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        del manifest["gates"]
+        (dest / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        record_planning_owner_decision(
+            self.project,
+            plan_id,
+            "BLOCK",
+            "blocked",
+        )
+
+        code, _output, err = self._transition_cli(plan_id, "BLOCKED")
+        self.assertEqual(code, 1)
+        self.assertIn("manifest lacks gates object", err)
+
+    def test_evidence_filename_collision_fails(self) -> None:
+        from unittest.mock import patch
+
+        plan_id = "transition-evidence-collision"
+        dest = init_planning_workspace(self.project, plan_id)
+        record_planning_owner_decision(
+            self.project,
+            plan_id,
+            "BLOCK",
+            "blocked",
+        )
+        fixed_ts = "2026-07-05T20-15-30Z"
+        collision = dest / "evidence" / f"{fixed_ts}__manifest-transition.json"
+        collision.write_text("{}", encoding="utf-8")
+        manifest_before = (dest / "manifest.json").read_text(encoding="utf-8")
+
+        with patch("agent_os.planning._transition_filename_timestamp", return_value=fixed_ts):
+            code, _output, err = self._transition_cli(plan_id, "BLOCKED")
+        self.assertEqual(code, 1)
+        self.assertIn("transition evidence file already exists", err)
+        self.assertEqual(manifest_before, (dest / "manifest.json").read_text(encoding="utf-8"))
+
+    def test_success_writes_only_manifest_and_one_evidence_record(self) -> None:
+        plan_id = "transition-write-boundary"
+        dest = init_planning_workspace(self.project, plan_id)
+        record_planning_owner_decision(
+            self.project,
+            plan_id,
+            "CLOSE",
+            "done",
+        )
+        snapshots_before = self._snapshot_agent_os_tree()
+
+        code, _output, _err = self._transition_cli(plan_id, "CLOSED")
+        self.assertEqual(code, 0)
+
+        snapshots_after = self._snapshot_agent_os_tree()
+        changed = {
+            rel
+            for rel in set(snapshots_before) | set(snapshots_after)
+            if snapshots_before.get(rel) != snapshots_after.get(rel)
+        }
+        self.assertEqual(len(changed), 2)
+        changed_list = sorted(changed)
+        self.assertTrue(changed_list[0].startswith(f"planning/{plan_id}/evidence/"))
+        self.assertTrue(changed_list[0].endswith("__manifest-transition.json"))
+        self.assertEqual(changed_list[1], f"planning/{plan_id}/manifest.json")
+
+    def test_success_does_not_mutate_decision_files(self) -> None:
+        plan_id = "transition-preserve-decisions"
+        dest = init_planning_workspace(self.project, plan_id)
+        record_planning_owner_decision(
+            self.project,
+            plan_id,
+            "CLOSE",
+            "done",
+        )
+        decision_snapshots = {
+            path.name: path.read_text(encoding="utf-8")
+            for path in (dest / "decisions").glob("*")
+        }
+
+        code, _output, _err = self._transition_cli(plan_id, "CLOSED")
+        self.assertEqual(code, 0)
+
+        for name, content in decision_snapshots.items():
+            self.assertEqual((dest / "decisions" / name).read_text(encoding="utf-8"), content)
+
+    def test_common_failure_does_not_mutate_manifest_or_create_evidence(self) -> None:
+        plan_id = "transition-failure-no-write"
+        dest = init_planning_workspace(self.project, plan_id)
+        record_planning_owner_decision(
+            self.project,
+            plan_id,
+            "BLOCK",
+            "blocked",
+        )
+        manifest_before = (dest / "manifest.json").read_text(encoding="utf-8")
+        evidence_before = list((dest / "evidence").iterdir())
+
+        code, _output, _err = self._transition_cli(plan_id, "CLOSED")
+        self.assertEqual(code, 1)
+        self.assertEqual(manifest_before, (dest / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(evidence_before, list((dest / "evidence").iterdir()))
+
+    def test_success_does_not_create_runs(self) -> None:
+        plan_id = "transition-no-runs"
+        init_planning_workspace(self.project, plan_id)
+        workspace = self.project / ".agent-os"
+        before_runs = list((workspace / "runs").iterdir())
+        record_planning_owner_decision(
+            self.project,
+            plan_id,
+            "CLOSE",
+            "done",
+        )
+
+        code, _output, _err = self._transition_cli(plan_id, "CLOSED")
+        self.assertEqual(code, 0)
+        after_runs = list((workspace / "runs").iterdir())
+        self.assertEqual(before_runs, after_runs)
+
+    def test_api_matches_cli_for_success(self) -> None:
+        plan_id = "transition-api"
+        self._prepare_approved_workspace(plan_id, status="PLANNING_AUDIT_READY")
+        result = transition_planning_workspace(
+            self.project,
+            plan_id,
+            "APPROVED_FOR_RUN_PROPOSALS",
+        )
+        self.assertEqual(result.to_status, "APPROVED_FOR_RUN_PROPOSALS")
+        self.assertIn("transition applied", result.output)
 
 
 def _write_json(path: Path, data: dict) -> None:

@@ -13,6 +13,7 @@ from agent_os.planning import (
     list_planning_owner_decisions,
     record_planning_owner_decision,
     status_planning_workspace,
+    transition_planning_workspace,
     validate_planning_workspace,
 )
 from agent_os.workspace import (
@@ -210,6 +211,21 @@ def cmd_planning_decide(args: argparse.Namespace) -> int:
             args.plan_id,
             args.decision,
             args.summary,
+        )
+    except (FileNotFoundError, FileExistsError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(result.output)
+    return 0
+
+
+def cmd_planning_transition(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        result = transition_planning_workspace(
+            project,
+            args.plan_id,
+            args.to_status,
         )
     except (FileNotFoundError, FileExistsError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
@@ -441,6 +457,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="short owner decision summary",
     )
     planning_decide_parser.set_defaults(func=cmd_planning_decide)
+
+    planning_transition_parser = planning_sub.add_parser(
+        "transition",
+        help="apply an explicit manifest transition authorized by owner decision",
+    )
+    planning_transition_parser.add_argument(
+        "plan_id",
+        help="plan identifier (filesystem-safe slug)",
+    )
+    planning_transition_parser.add_argument("path", nargs="?", help="target project directory")
+    planning_transition_parser.add_argument(
+        "--to",
+        dest="to_status",
+        required=True,
+        help="target manifest status (APPROVED_FOR_RUN_PROPOSALS, BLOCKED, or CLOSED)",
+    )
+    planning_transition_parser.set_defaults(func=cmd_planning_transition)
 
     return parser
 
