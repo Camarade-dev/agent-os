@@ -13,7 +13,7 @@ Coding and research agents are useful but fallible. Ad-hoc prompts and chat thre
 ## What is in v0.1.0
 
 - **CLI** (`init`, `mission`, `status`, `audit`, `close`) plus registrar-only **evidence** helpers (`add`, `add-file`, `add-command-output`, `snapshot-git`, `list`)
-- **Templates** for mission, scope, authority, autonomy, evidence, audit, owner decision, closure, and memory update
+- **Templates** for mission, scope, authority, autonomy, evidence, audit, owner decision, closure, and memory update; plus planning artifact contracts under `agent_os/templates/planning/` (doctrine extension — not v0 CLI)
 - **Fail-closed closure** — runs cannot close until required fields are filled
 - **Stdlib-only Python package** — install from source, Python 3.10+, no runtime dependencies
 - **Documentation** — protocol primitives, operating loop, evidence doctrine, dogfood examples

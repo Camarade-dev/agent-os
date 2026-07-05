@@ -309,9 +309,26 @@ The planning layer doctrine explicitly **does not** target:
 
 ---
 
-## 10. Recommended implementation order (post-doctrine)
+## 10. Planning artifact templates
 
-1. Planning workspace layout and artifact templates (docs + files only)
+Inspectable template contracts live under `agent_os/templates/planning/`:
+
+| Template | Artifact type | Role |
+|----------|---------------|------|
+| `context-pack.md` | `CONTEXT_PACK` | Assembled read-only context |
+| `local-agentic-spec.md` | `LOCAL_AGENTIC_SPEC` | Bounded planning intent |
+| `implementation-plan.md` | `IMPLEMENTATION_PLAN` | Ordered slice decomposition |
+| `planning-audit.md` | `PLANNING_AUDIT` | Pre-execution planning quality review |
+
+These templates are **contracts, not automation**. They define required sections, placeholders, and non-authority statements for human or external-tool authoring. They do **not** call agents, invoke executors, validate artifacts at runtime, or change Agent OS v0.1.0 CLI behavior. Copy or render them into a planning workspace (e.g. `.agent-os/planning/<plan-id>/`) when implementing the layout slice.
+
+Runner consumption doctrine (no implementation): `agent-os-runner-experimental/docs/planning-artifact-consumption.md`.
+
+---
+
+## 11. Recommended implementation order (post-doctrine)
+
+1. Planning workspace layout (copy templates into `.agent-os/planning/<plan-id>/`)
 2. Planning audit checklist (manual)
 3. Implementation Plan → Next Run Proposal field mapping (runner boundary)
 4. Structured `allowed_paths` in proposals (runner)
@@ -321,10 +338,12 @@ No step above is authorized by this document alone. Owner must approve each impl
 
 ---
 
-## 11. References
+## 12. References
 
 - `docs/v0-release-boundary.md` — Agent OS v0.1.0 core boundary
 - `docs/operating-loop.md` — execution lifecycle
 - `docs/evidence-capture-doctrine-v0.md` — execution evidence doctrine
 - `docs/autonomy-levels.md` — authority levels for runs
+- `agent_os/templates/planning/` — planning artifact template contracts
 - `agent-os-runner-experimental/docs/planning-to-run-boundary.md` — plan → runner mapping
+- `agent-os-runner-experimental/docs/planning-artifact-consumption.md` — future runner consumption rules
