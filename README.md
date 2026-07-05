@@ -2,6 +2,8 @@
 
 **v0.1.0** — local governed-delegation prototype · [release notes](docs/release-notes-v0.1.0.md) · [why Agent OS](docs/why-agent-os.md)
 
+**Live static demo:** https://camarade-dev.github.io/agent-os-demo-governed-agent-chat/ — see how Agent OS wraps a familiar coding-agent chat with mission, scope, evidence, audit, owner decision, and closure.
+
 Agent OS is a **local filesystem protocol and CLI** for governed delegation to fallible coding and research agents. It is not a dashboard, SaaS, runtime, orchestrator, benchmark, or agent panel.
 
 ## What problem it solves
