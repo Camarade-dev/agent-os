@@ -171,7 +171,10 @@ _WORKSPACE_README = """\
 - Implementation Plan slices are **not executable** until converted into next-run proposals and explicitly approved.
 
 Fill artifacts in order: Context Pack → Local Agentic Spec → Implementation Plan → Planning Audit.
-Record owner decisions under `decisions/` and update `manifest.json` manually.
+Use `agent-os planning progress <plan-id> --to <status>` for artifact-readiness progress.
+Use `agent-os planning decide ...` for owner decisions.
+Use `agent-os planning transition ...` for owner-decision-authorized status changes.
+Do not edit `manifest.json` manually except for emergency/manual recovery outside the normal flow.
 """
 
 

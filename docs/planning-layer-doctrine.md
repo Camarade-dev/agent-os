@@ -332,9 +332,9 @@ A **planning workspace** is the on-disk home for one governed planning package: 
 
 The concrete layout — paths, allowed statuses, gate semantics, and hard rules — is defined in [`docs/planning-workspace-layout.md`](planning-workspace-layout.md). A sample package (EXAMPLE_ONLY) lives at `examples/planning-workspace-slither-like/`.
 
-The workspace layout is a **local artifact contract**. Use `agent-os planning init <plan-id>` to bootstrap a DRAFT workspace (registrar only), or create directories and copy templates manually. Artifact validation and gate advancement remain manual.
+The workspace layout is a **local artifact contract**. Use `agent-os planning init <plan-id>` to bootstrap a DRAFT workspace (registrar only), or create directories and copy templates manually. Artifact content is filled manually; manifest status and gates advance via `agent-os planning progress` (artifact-readiness) and `agent-os planning transition` (owner-decision-authorized).
 
-**Owner decision records** under `decisions/` are **evidence of owner judgment**, not execution authority. `agent-os planning decide` appends one JSON decision file per invocation; it does not create runs, invoke agents, mutate `manifest.json` status or gates, or approve runner execution. Owner decisions and manifest transitions are **separated**: decisions may authorize future transitions but do not perform them — see [`docs/planning-decision-transition-doctrine.md`](planning-decision-transition-doctrine.md). Status and gate updates remain a separate manual step after review (future explicit transition command).
+**Owner decision records** under `decisions/` are **evidence of owner judgment**, not execution authority. `agent-os planning decide` appends one JSON decision file per invocation; it does not create runs, invoke agents, mutate `manifest.json` status or gates, or approve runner execution. Owner decisions and manifest transitions are **separated**: decisions may authorize future transitions but do not perform them — see [`docs/planning-decision-transition-doctrine.md`](planning-decision-transition-doctrine.md). Apply owner-decision-authorized status changes with `agent-os planning transition`; do not edit `manifest.json` manually in the normal flow.
 
 ---
 

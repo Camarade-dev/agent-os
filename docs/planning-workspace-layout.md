@@ -5,7 +5,7 @@
 > **Templates:** `agent_os/templates/planning/`  
 > **Example:** `examples/planning-workspace-slither-like/` (EXAMPLE_ONLY)
 
-This document defines where a **concrete planning package** lives in a target project and how governed planning artifacts are arranged. The layout is a **local artifact contract** — operators copy templates, fill artifacts, and advance gates manually. Nothing in this layout executes code, creates runs, or invokes agents.
+This document defines where a **concrete planning package** lives in a target project and how governed planning artifacts are arranged. The layout is a **local artifact contract** — operators fill artifacts manually and advance manifest status via explicit CLI commands (`planning progress`, `planning decide`, `planning transition`). Nothing in this layout executes code, creates runs, or invokes agents.
 
 ---
 
@@ -44,7 +44,7 @@ Multiple plans may coexist. Only one plan version is **active** per `<plan-id>` 
 
 ### `manifest.json`
 
-Machine-readable identity and gate state for the planning package. Updated manually by the owner or planning roles; no auto-advance.
+Machine-readable identity and gate state for the planning package. Updated by explicit CLI commands (`agent-os planning progress` for artifact-readiness statuses; `agent-os planning transition` for owner-decision statuses). Do not edit `manifest.json` manually in the normal flow except for emergency/recovery. No auto-advance.
 
 | Field | Type | Purpose |
 |-------|------|---------|
@@ -174,7 +174,7 @@ Artifact-progress transitions do **not** approve run proposals. `PLANNING_AUDIT_
 | Gate key | When open | Closed by |
 |----------|-----------|-----------|
 | `planning_owner_decision_required` | Owner must accept spec, plan, or audit acknowledgment | Owner decision record in `decisions/` |
-| `planning_audit_required` | Planning Audit not yet `PASS` / `PASS_WITH_NOTES` | Planning Audit artifact updated; gate cleared in manifest |
+| `planning_audit_required` | Planning Audit not yet `PASS` / `PASS_WITH_NOTES` | Planning Audit artifact updated; gate cleared via `agent-os planning progress --to PLANNING_AUDIT_READY` |
 | `plan_revision_required` | Material plan change needed after audit or owner review | New revision in `revisions/` approved; `active_revision` updated |
 | `run_proposal_allowed` | Plan may feed `propose-next-run` (one slice at a time) | Set when status is `APPROVED_FOR_RUN_PROPOSALS` and planning gates above are closed |
 
