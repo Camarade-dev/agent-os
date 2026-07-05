@@ -332,7 +332,7 @@ A **planning workspace** is the on-disk home for one governed planning package: 
 
 The concrete layout — paths, allowed statuses, gate semantics, and hard rules — is defined in [`docs/planning-workspace-layout.md`](planning-workspace-layout.md). A sample package (EXAMPLE_ONLY) lives at `examples/planning-workspace-slither-like/`.
 
-The workspace layout is a **local artifact contract**, not automation. Operators create directories, copy templates, fill artifacts, and update `manifest.json` manually. No Agent OS v0 CLI command creates or validates planning workspaces in this slice.
+The workspace layout is a **local artifact contract**. Use `agent-os planning init <plan-id>` to bootstrap a DRAFT workspace (registrar only), or create directories and copy templates manually. Artifact validation and gate advancement remain manual.
 
 ---
 

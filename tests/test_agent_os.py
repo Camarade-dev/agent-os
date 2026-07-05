@@ -12,7 +12,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from agent_os.cli import main
-from agent_os.paths import TEMPLATE_FILES, run_path
+from agent_os.paths import TEMPLATE_FILES, planning_path, run_path
+from agent_os.planning import init_planning_workspace, validate_plan_id
 from agent_os.validate import validate_run_for_closure
 from agent_os.workspace import (
     GIT_SNAPSHOT_READONLY_ARGV,
@@ -1371,6 +1372,173 @@ class AgentOsTests(unittest.TestCase):
         text = (run_path(self.project, run_id) / "evidence.md").read_text(encoding="utf-8")
         self.assertIn("type: git-snapshot", text)
         self.assertNotIn("must-not-be-created", text)
+
+
+class PlanningInitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self._tmp.name)
+        init_workspace(self.project)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_planning_init_creates_expected_structure(self) -> None:
+        plan_id = "slither-demo"
+        dest = init_planning_workspace(self.project, plan_id)
+        self.assertTrue(dest.is_dir())
+        for name in (
+            "manifest.json",
+            "README.md",
+            "context-pack.md",
+            "local-agentic-spec.md",
+            "implementation-plan.md",
+            "planning-audit.md",
+        ):
+            self.assertTrue((dest / name).is_file(), name)
+        for subdir in ("evidence", "decisions", "revisions"):
+            self.assertTrue((dest / subdir).is_dir(), subdir)
+
+    def test_planning_init_copies_templates(self) -> None:
+        plan_id = "planning_001"
+        dest = init_planning_workspace(self.project, plan_id)
+        template_dir = (
+            Path(__file__).resolve().parent.parent / "agent_os" / "templates" / "planning"
+        )
+        for filename in (
+            "context-pack.md",
+            "local-agentic-spec.md",
+            "implementation-plan.md",
+            "planning-audit.md",
+        ):
+            template_text = (template_dir / filename).read_text(encoding="utf-8")
+            actual = (dest / filename).read_text(encoding="utf-8")
+            self.assertIn(f"plan_id: {plan_id}", actual)
+            self.assertNotIn("{{PLAN_ID}}", actual)
+            self.assertNotIn("{{CREATED_AT}}", actual)
+            self.assertIn("# ", actual)
+            self.assertIn(
+                template_text.split("# ", 1)[1][:40].replace("{{PLAN_ID}}", plan_id),
+                actual,
+            )
+
+    def test_planning_init_manifest_has_draft_status_and_safety_flags(self) -> None:
+        plan_id = "planning_001"
+        dest = init_planning_workspace(self.project, plan_id)
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["plan_id"], plan_id)
+        self.assertEqual(manifest["status"], "DRAFT")
+        self.assertEqual(manifest["package_type"], "PLANNING_WORKSPACE")
+        self.assertRegex(manifest["created_at"], r"^\d{4}-\d{2}-\d{2}T")
+        self.assertEqual(manifest["artifact_paths"]["context_pack"], "context-pack.md")
+        self.assertEqual(
+            manifest["artifact_paths"]["local_agentic_spec"],
+            "local-agentic-spec.md",
+        )
+        self.assertEqual(
+            manifest["artifact_paths"]["implementation_plan"],
+            "implementation-plan.md",
+        )
+        self.assertEqual(
+            manifest["artifact_paths"]["planning_audit"],
+            "planning-audit.md",
+        )
+        self.assertEqual(manifest["directories"]["evidence"], "evidence/")
+        self.assertEqual(manifest["directories"]["decisions"], "decisions/")
+        self.assertEqual(manifest["directories"]["revisions"], "revisions/")
+        self.assertTrue(manifest["gates"]["planning_owner_decision_required"])
+        self.assertTrue(manifest["gates"]["planning_audit_required"])
+        self.assertFalse(manifest["gates"]["plan_revision_required"])
+        self.assertFalse(manifest["gates"]["run_proposal_allowed"])
+        self.assertTrue(manifest["authority"]["no_execution"])
+        self.assertTrue(manifest["authority"]["no_agent_invocation"])
+        self.assertTrue(manifest["authority"]["no_run_creation"])
+        self.assertTrue(manifest["authority"]["no_self_approval"])
+
+    def test_planning_init_rejects_invalid_plan_ids(self) -> None:
+        invalid_ids = ["", "../x", "a/b", "my plan", ".hidden", "-bad", "Bad", "a.b"]
+        for plan_id in invalid_ids:
+            with self.subTest(plan_id=plan_id):
+                with self.assertRaises(ValueError):
+                    validate_plan_id(plan_id)
+                if plan_id.startswith("-"):
+                    continue
+                buf = io.StringIO()
+                with redirect_stderr(buf):
+                    code = main(["planning", "init", plan_id, str(self.project)])
+                self.assertEqual(code, 1)
+                self.assertTrue(buf.getvalue().strip())
+
+    def test_planning_init_does_not_overwrite_existing_workspace(self) -> None:
+        plan_id = "slither-demo"
+        init_planning_workspace(self.project, plan_id)
+        manifest_path = planning_path(self.project, plan_id) / "manifest.json"
+        original = manifest_path.read_text(encoding="utf-8")
+
+        with self.assertRaises(FileExistsError):
+            init_planning_workspace(self.project, plan_id)
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(["planning", "init", plan_id, str(self.project)])
+        self.assertEqual(code, 1)
+        self.assertIn("already exists", buf.getvalue())
+        self.assertEqual(original, manifest_path.read_text(encoding="utf-8"))
+
+    def test_planning_init_fails_when_agent_os_not_initialized(self) -> None:
+        bare = Path(tempfile.mkdtemp())
+        try:
+            with self.assertRaises(FileNotFoundError):
+                init_planning_workspace(bare, "demo-plan")
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                code = main(["planning", "init", "demo-plan", str(bare)])
+            self.assertEqual(code, 1)
+            self.assertIn("no workspace found", buf.getvalue())
+        finally:
+            import shutil
+
+            shutil.rmtree(bare)
+
+    def test_planning_init_does_not_create_runs_or_unrelated_files(self) -> None:
+        plan_id = "slither-demo"
+        workspace = self.project / ".agent-os"
+        before_runs = list((workspace / "runs").iterdir())
+        workspace_json_before = (workspace / "workspace.json").read_text(encoding="utf-8")
+
+        init_planning_workspace(self.project, plan_id)
+
+        after_runs = list((workspace / "runs").iterdir())
+        self.assertEqual(before_runs, after_runs)
+        self.assertEqual(
+            workspace_json_before,
+            (workspace / "workspace.json").read_text(encoding="utf-8"),
+        )
+        planning_root = workspace / "planning"
+        self.assertEqual({plan_id}, {p.name for p in planning_root.iterdir()})
+
+    def test_planning_init_cli_success_output(self) -> None:
+        plan_id = "slither-demo"
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["planning", "init", plan_id, str(self.project)])
+        self.assertEqual(code, 0)
+        output = buf.getvalue()
+        self.assertIn("created planning workspace:", output)
+        self.assertIn("status: DRAFT", output)
+        self.assertIn("next step: fill context-pack.md", output)
+        self.assertIn("no runs were created and no agents were invoked", output)
+
+    def test_planning_init_readme_has_non_authority_notice(self) -> None:
+        plan_id = "slither-demo"
+        dest = init_planning_workspace(self.project, plan_id)
+        readme = (dest / "README.md").read_text(encoding="utf-8")
+        self.assertIn("planning artifacts only", readme)
+        self.assertIn("does **not** execute code", readme)
+        self.assertIn("does **not** create runs", readme)
+        self.assertIn("does **not** approve work", readme)
+        self.assertIn("does **not** invoke agents", readme)
+        self.assertIn("not executable", readme)
 
 
 if __name__ == "__main__":

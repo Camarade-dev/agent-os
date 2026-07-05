@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from agent_os import __version__
+from agent_os.planning import init_planning_workspace
 from agent_os.workspace import (
     add_evidence,
     add_evidence_command_output,
@@ -144,6 +145,20 @@ def cmd_evidence_snapshot_git(args: argparse.Namespace) -> int:
         print(str(exc), file=sys.stderr)
         return 1
     print(f"git snapshot evidence added for run {args.run_id}")
+    return 0
+
+
+def cmd_planning_init(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        dest = init_planning_workspace(project, args.plan_id)
+    except (FileNotFoundError, FileExistsError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"created planning workspace: {dest}")
+    print("status: DRAFT")
+    print("next step: fill context-pack.md")
+    print("note: no runs were created and no agents were invoked")
     return 0
 
 
@@ -297,6 +312,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="include git diff --stat output (default: true)",
     )
     evidence_snapshot_git_parser.set_defaults(func=cmd_evidence_snapshot_git)
+
+    planning_parser = sub.add_parser(
+        "planning",
+        help="planning workspace bootstrap (registrar only; no execution)",
+    )
+    planning_sub = planning_parser.add_subparsers(dest="planning_command", required=True)
+
+    planning_init_parser = planning_sub.add_parser(
+        "init",
+        help="bootstrap a DRAFT planning workspace under .agent-os/planning/<plan-id>/",
+    )
+    planning_init_parser.add_argument("plan_id", help="plan identifier (filesystem-safe slug)")
+    planning_init_parser.add_argument("path", nargs="?", help="target project directory")
+    planning_init_parser.set_defaults(func=cmd_planning_init)
 
     return parser
 

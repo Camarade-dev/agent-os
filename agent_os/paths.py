@@ -7,6 +7,7 @@ from pathlib import Path
 
 WORKSPACE_DIR = ".agent-os"
 RUNS_DIR = "runs"
+PLANNING_DIR = "planning"
 META_FILE = "run.json"
 
 PLACEHOLDER_VALUES = frozenset(
@@ -28,12 +29,20 @@ def templates_dir() -> Path:
     return Path(__file__).resolve().parent / "templates"
 
 
+def planning_templates_dir() -> Path:
+    return templates_dir() / "planning"
+
+
 def workspace_path(project: Path) -> Path:
     return project.resolve() / WORKSPACE_DIR
 
 
 def runs_path(project: Path) -> Path:
     return workspace_path(project) / RUNS_DIR
+
+
+def planning_path(project: Path, plan_id: str) -> Path:
+    return workspace_path(project) / PLANNING_DIR / plan_id
 
 
 def run_path(project: Path, run_id: str) -> Path:

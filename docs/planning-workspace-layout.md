@@ -1,6 +1,6 @@
 # Planning workspace layout
 
-> **Status:** layout contract only — no CLI, no validation, no automation  
+> **Status:** layout contract — bootstrap via `agent-os planning init <plan-id>`; no validation or automation  
 > **Doctrine:** `docs/planning-layer-doctrine.md`  
 > **Templates:** `agent_os/templates/planning/`  
 > **Example:** `examples/planning-workspace-slither-like/` (EXAMPLE_ONLY)
@@ -191,7 +191,19 @@ Violations are process defects, not features to automate away.
 
 ---
 
-## 7. Bootstrapping a new package (manual)
+## 7. Bootstrapping a new package
+
+### CLI (registrar only)
+
+After `agent-os init`, create a DRAFT planning workspace:
+
+```bash
+agent-os planning init <plan-id> [PATH]
+```
+
+This creates `.agent-os/planning/<plan-id>/` with templates copied from `agent_os/templates/planning/`, a DRAFT `manifest.json`, subdirectories, and a non-authority `README.md`. It does **not** execute code, create runs, invoke agents, or validate artifact content.
+
+### Manual
 
 1. Choose `<plan-id>` and create `.agent-os/planning/<plan-id>/`.
 2. Copy `agent_os/templates/planning/*.md` into the directory (rename to kebab-case filenames above).
@@ -200,8 +212,6 @@ Violations are process defects, not features to automate away.
 5. Create empty `evidence/`, `decisions/`, `revisions/` as needed.
 6. Fill artifacts in order: Context Pack → Spec → Plan → Planning Audit.
 7. Record owner decisions and update `manifest.json` status and gates manually.
-
-No CLI command is defined in this slice.
 
 ---
 
