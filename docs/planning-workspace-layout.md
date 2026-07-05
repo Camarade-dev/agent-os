@@ -104,7 +104,11 @@ Planning evidence and provenance: context citations, revision diffs, checklists,
 
 ### `decisions/`
 
-Recorded owner decisions about planning artifacts (spec acceptance, plan approval, audit acknowledgment, gate overrides). One file per decision is recommended (e.g. `decisions/20260705-spec-accepted.md`).
+Recorded owner decisions about planning artifacts (spec acceptance, plan approval, audit acknowledgment, gate overrides). One file per decision is recommended.
+
+**CLI-recorded decisions** (via `agent-os planning decide`) are JSON files named `<UTC_TIMESTAMP>__owner-decision.json` (e.g. `2026-07-05T20-15-30Z__owner-decision.json`). Each record has `record_type: PLANNING_OWNER_DECISION`, the decision value (`APPROVE_FOR_RUN_PROPOSALS`, `REQUEST_REVISION`, `BLOCK`, or `CLOSE`), a short `summary`, and authority flags stating the record is evidence only — it does not execute, create runs, mutate `manifest.json`, or approve runner execution.
+
+Manual markdown decision files are also permitted (e.g. `decisions/20260705-spec-accepted.md`).
 
 ### `revisions/`
 

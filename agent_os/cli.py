@@ -8,7 +8,9 @@ from pathlib import Path
 
 from agent_os import __version__
 from agent_os.planning import (
+    PLANNING_OWNER_DECISIONS,
     init_planning_workspace,
+    record_planning_owner_decision,
     status_planning_workspace,
     validate_planning_workspace,
 )
@@ -186,6 +188,22 @@ def cmd_planning_validate(args: argparse.Namespace) -> int:
         return 1
     print(report.output)
     return 0 if report.valid else 1
+
+
+def cmd_planning_decide(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        result = record_planning_owner_decision(
+            project,
+            args.plan_id,
+            args.decision,
+            args.summary,
+        )
+    except (FileNotFoundError, FileExistsError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(result.output)
+    return 0
 
 
 def cmd_close(args: argparse.Namespace) -> int:
@@ -368,6 +386,25 @@ def build_parser() -> argparse.ArgumentParser:
     planning_validate_parser.add_argument("plan_id", help="plan identifier (filesystem-safe slug)")
     planning_validate_parser.add_argument("path", nargs="?", help="target project directory")
     planning_validate_parser.set_defaults(func=cmd_planning_validate)
+
+    planning_decide_parser = planning_sub.add_parser(
+        "decide",
+        help="record an owner decision in a planning workspace (evidence only)",
+    )
+    planning_decide_parser.add_argument("plan_id", help="plan identifier (filesystem-safe slug)")
+    planning_decide_parser.add_argument("path", nargs="?", help="target project directory")
+    planning_decide_parser.add_argument(
+        "--decision",
+        required=True,
+        choices=list(PLANNING_OWNER_DECISIONS),
+        help="owner decision value",
+    )
+    planning_decide_parser.add_argument(
+        "--summary",
+        required=True,
+        help="short owner decision summary",
+    )
+    planning_decide_parser.set_defaults(func=cmd_planning_decide)
 
     return parser
 

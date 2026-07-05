@@ -15,6 +15,7 @@ from agent_os.cli import main
 from agent_os.paths import TEMPLATE_FILES, planning_path, run_path
 from agent_os.planning import (
     init_planning_workspace,
+    record_planning_owner_decision,
     status_planning_workspace,
     validate_planning_workspace,
     validate_plan_id,
@@ -1945,6 +1946,351 @@ class PlanningValidateTests(unittest.TestCase):
             import shutil
 
             shutil.rmtree(bare)
+
+
+class PlanningDecideTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self._tmp.name)
+        init_workspace(self.project)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _snapshot_planning_tree(self) -> dict[str, str]:
+        workspace = self.project / ".agent-os"
+        snapshots: dict[str, str] = {}
+        for path in workspace.rglob("*"):
+            if path.is_file():
+                rel = path.relative_to(workspace).as_posix()
+                snapshots[rel] = path.read_text(encoding="utf-8")
+        return snapshots
+
+    def _decision_files(self, dest: Path) -> list[Path]:
+        return sorted((dest / "decisions").glob("*__owner-decision.json"))
+
+    def test_request_revision_creates_one_decision_record(self) -> None:
+        plan_id = "decide-revision"
+        dest = init_planning_workspace(self.project, plan_id)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(
+                [
+                    "planning",
+                    "decide",
+                    plan_id,
+                    str(self.project),
+                    "--decision",
+                    "REQUEST_REVISION",
+                    "--summary",
+                    "spec needs scope fix",
+                ]
+            )
+        self.assertEqual(code, 0)
+        files = self._decision_files(dest)
+        self.assertEqual(len(files), 1)
+        record = json.loads(files[0].read_text(encoding="utf-8"))
+        self.assertEqual(record["record_type"], "PLANNING_OWNER_DECISION")
+        self.assertEqual(record["plan_id"], plan_id)
+        self.assertEqual(record["decision"], "REQUEST_REVISION")
+        self.assertEqual(record["summary"], "spec needs scope fix")
+        self.assertRegex(record["created_at"], r"^\d{4}-\d{2}-\d{2}T")
+        self.assertEqual(record["workspace_status_at_decision"], "DRAFT")
+        self.assertTrue(record["authority"]["does_not_mutate_manifest"])
+
+    def test_block_succeeds_when_validation_fails(self) -> None:
+        plan_id = "decide-block-invalid"
+        dest = init_planning_workspace(self.project, plan_id)
+        report = validate_planning_workspace(self.project, plan_id)
+        self.assertFalse(report.valid)
+
+        result = record_planning_owner_decision(
+            self.project,
+            plan_id,
+            "BLOCK",
+            "artifacts incomplete",
+        )
+        self.assertEqual(len(self._decision_files(dest)), 1)
+        self.assertEqual(result.decision, "BLOCK")
+        output = result.output
+        self.assertIn("planning validation is not OK", output)
+
+    def test_approve_succeeds_when_validation_passes(self) -> None:
+        plan_id = "decide-approve-ok"
+        dest = _prepare_valid_planning_workspace(self.project, plan_id)
+        report = validate_planning_workspace(self.project, plan_id)
+        self.assertTrue(report.valid)
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(
+                [
+                    "planning",
+                    "decide",
+                    plan_id,
+                    str(self.project),
+                    "--decision",
+                    "APPROVE_FOR_RUN_PROPOSALS",
+                    "--summary",
+                    "planning package acceptable",
+                ]
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self._decision_files(dest)), 1)
+        record = json.loads(self._decision_files(dest)[0].read_text(encoding="utf-8"))
+        self.assertEqual(record["decision"], "APPROVE_FOR_RUN_PROPOSALS")
+
+    def test_approve_fails_when_validation_fails(self) -> None:
+        plan_id = "decide-approve-invalid"
+        init_planning_workspace(self.project, plan_id)
+        report = validate_planning_workspace(self.project, plan_id)
+        self.assertFalse(report.valid)
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "planning",
+                    "decide",
+                    plan_id,
+                    str(self.project),
+                    "--decision",
+                    "APPROVE_FOR_RUN_PROPOSALS",
+                    "--summary",
+                    "should not record",
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "Cannot record APPROVE_FOR_RUN_PROPOSALS because planning validation is not OK.",
+            buf.getvalue(),
+        )
+        dest = planning_path(self.project, plan_id)
+        self.assertEqual(len(self._decision_files(dest)), 0)
+
+    def test_close_creates_one_decision_record(self) -> None:
+        plan_id = "decide-close"
+        dest = init_planning_workspace(self.project, plan_id)
+        result = record_planning_owner_decision(
+            self.project,
+            plan_id,
+            "CLOSE",
+            "planning abandoned",
+        )
+        self.assertEqual(len(self._decision_files(dest)), 1)
+        record = json.loads(result.decision_path.read_text(encoding="utf-8"))
+        self.assertEqual(record["decision"], "CLOSE")
+
+    def test_invalid_decision_value_rejected(self) -> None:
+        plan_id = "decide-bad-value"
+        init_planning_workspace(self.project, plan_id)
+        with self.assertRaises(ValueError) as ctx:
+            record_planning_owner_decision(
+                self.project,
+                plan_id,
+                "ACCEPT",
+                "not allowed",
+            )
+        self.assertIn("invalid decision", str(ctx.exception))
+
+    def test_empty_summary_rejected(self) -> None:
+        plan_id = "decide-empty-summary"
+        init_planning_workspace(self.project, plan_id)
+        with self.assertRaises(ValueError):
+            record_planning_owner_decision(
+                self.project,
+                plan_id,
+                "BLOCK",
+                "   ",
+            )
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "planning",
+                    "decide",
+                    plan_id,
+                    str(self.project),
+                    "--decision",
+                    "BLOCK",
+                    "--summary",
+                    "   ",
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("summary must not be empty", buf.getvalue())
+
+    def test_fails_for_missing_workspace(self) -> None:
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "planning",
+                    "decide",
+                    "missing-plan",
+                    str(self.project),
+                    "--decision",
+                    "BLOCK",
+                    "--summary",
+                    "no workspace",
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("planning workspace not found", buf.getvalue())
+
+    def test_fails_for_missing_manifest(self) -> None:
+        plan_id = "no-manifest-decide"
+        dest = planning_path(self.project, plan_id)
+        dest.mkdir(parents=True)
+        (dest / "decisions").mkdir()
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "planning",
+                    "decide",
+                    plan_id,
+                    str(self.project),
+                    "--decision",
+                    "BLOCK",
+                    "--summary",
+                    "missing manifest",
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("manifest.json missing", buf.getvalue())
+
+    def test_fails_for_manifest_plan_id_mismatch(self) -> None:
+        plan_id = "mismatch-decide"
+        dest = init_planning_workspace(self.project, plan_id)
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        manifest["plan_id"] = "other-plan"
+        (dest / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "planning",
+                    "decide",
+                    plan_id,
+                    str(self.project),
+                    "--decision",
+                    "BLOCK",
+                    "--summary",
+                    "mismatch",
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("manifest plan_id mismatch", buf.getvalue())
+
+    def test_fails_for_missing_decisions_directory(self) -> None:
+        plan_id = "no-decisions-dir"
+        dest = init_planning_workspace(self.project, plan_id)
+        import shutil
+
+        shutil.rmtree(dest / "decisions")
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "planning",
+                    "decide",
+                    plan_id,
+                    str(self.project),
+                    "--decision",
+                    "BLOCK",
+                    "--summary",
+                    "no decisions dir",
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("decisions directory missing", buf.getvalue())
+
+    def test_does_not_mutate_manifest(self) -> None:
+        plan_id = "decide-manifest-unchanged"
+        dest = init_planning_workspace(self.project, plan_id)
+        manifest_before = (dest / "manifest.json").read_text(encoding="utf-8")
+        record_planning_owner_decision(
+            self.project,
+            plan_id,
+            "REQUEST_REVISION",
+            "fix spec",
+        )
+        self.assertEqual(
+            manifest_before,
+            (dest / "manifest.json").read_text(encoding="utf-8"),
+        )
+
+    def test_does_not_create_runs_or_unrelated_files(self) -> None:
+        plan_id = "decide-no-runs"
+        dest = init_planning_workspace(self.project, plan_id)
+        workspace = self.project / ".agent-os"
+        before_runs = list((workspace / "runs").iterdir())
+        workspace_json_before = (workspace / "workspace.json").read_text(encoding="utf-8")
+        snapshots_before = self._snapshot_planning_tree()
+
+        record_planning_owner_decision(
+            self.project,
+            plan_id,
+            "BLOCK",
+            "stop here",
+        )
+
+        after_runs = list((workspace / "runs").iterdir())
+        self.assertEqual(before_runs, after_runs)
+        self.assertEqual(
+            workspace_json_before,
+            (workspace / "workspace.json").read_text(encoding="utf-8"),
+        )
+        snapshots_after = self._snapshot_planning_tree()
+        new_keys = set(snapshots_after) - set(snapshots_before)
+        self.assertEqual(len(new_keys), 1)
+        self.assertTrue(new_keys.pop().endswith("__owner-decision.json"))
+
+    def test_preserves_existing_decision_files(self) -> None:
+        plan_id = "decide-preserve"
+        dest = init_planning_workspace(self.project, plan_id)
+        existing = dest / "decisions" / "2026-01-01T00-00-00Z__owner-decision.json"
+        existing_content = '{"record_type": "PLANNING_OWNER_DECISION", "decision": "BLOCK"}\n'
+        existing.write_text(existing_content, encoding="utf-8")
+
+        record_planning_owner_decision(
+            self.project,
+            plan_id,
+            "REQUEST_REVISION",
+            "new decision",
+        )
+
+        self.assertEqual(len(self._decision_files(dest)), 2)
+        self.assertEqual(existing.read_text(encoding="utf-8"), existing_content)
+
+    def test_cli_output_includes_safety_notes(self) -> None:
+        plan_id = "decide-cli-output"
+        init_planning_workspace(self.project, plan_id)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(
+                [
+                    "planning",
+                    "decide",
+                    plan_id,
+                    str(self.project),
+                    "--decision",
+                    "BLOCK",
+                    "--summary",
+                    "blocked for now",
+                ]
+            )
+        self.assertEqual(code, 0)
+        output = buf.getvalue()
+        self.assertIn("decision recorded", output)
+        self.assertIn("manifest status was not changed", output)
+        self.assertIn("no runs were created", output)
+        self.assertIn("no agents were invoked", output)
 
 
 if __name__ == "__main__":

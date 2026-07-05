@@ -334,6 +334,8 @@ The concrete layout — paths, allowed statuses, gate semantics, and hard rules 
 
 The workspace layout is a **local artifact contract**. Use `agent-os planning init <plan-id>` to bootstrap a DRAFT workspace (registrar only), or create directories and copy templates manually. Artifact validation and gate advancement remain manual.
 
+**Owner decision records** under `decisions/` are **evidence of owner judgment**, not execution authority. `agent-os planning decide` appends one JSON decision file per invocation; it does not create runs, invoke agents, mutate `manifest.json` status or gates, or approve runner execution. Status and gate updates remain a separate manual step after review.
+
 ---
 
 ## 12. Recommended implementation order (post-doctrine)

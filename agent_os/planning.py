@@ -53,6 +53,13 @@ PLANNING_STATUSES = (
     "CLOSED",
 )
 
+PLANNING_OWNER_DECISIONS = (
+    "APPROVE_FOR_RUN_PROPOSALS",
+    "REQUEST_REVISION",
+    "BLOCK",
+    "CLOSE",
+)
+
 PLANNING_ARTIFACT_PATH_KEYS = (
     "context_pack",
     "local_agentic_spec",
@@ -122,6 +129,12 @@ Record owner decisions under `decisions/` and update `manifest.json` manually.
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _decision_filename_timestamp() -> str:
+    """Filesystem-safe UTC timestamp for owner decision filenames."""
+    ts = datetime.now(timezone.utc).replace(microsecond=0)
+    return ts.strftime("%Y-%m-%dT%H-%M-%SZ")
 
 
 def _write_json(path: Path, data: dict) -> None:
@@ -521,4 +534,107 @@ def validate_planning_workspace(project: Path, plan_id: str) -> PlanningValidati
         structural_ok,
         not manifest_errors,
         not artifact_errors,
+    )
+
+
+@dataclass(frozen=True)
+class PlanningDecisionResult:
+    decision: str
+    decision_path: Path
+    manifest_status: str
+    output: str
+
+
+def _inspect_decision_workspace(project: Path, plan_id: str) -> tuple[Path, dict]:
+    """Verify planning workspace, manifest, and decisions/ exist (fail closed)."""
+    validate_plan_id(plan_id)
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        raise FileNotFoundError("no workspace found (run `agent-os init` first)")
+
+    dest = planning_path(project, plan_id)
+    if not dest.is_dir():
+        raise FileNotFoundError(f"planning workspace not found: {plan_id}")
+
+    manifest = _load_planning_manifest(dest / "manifest.json", plan_id)
+
+    if not (dest / "decisions").is_dir():
+        raise FileNotFoundError(
+            f"decisions directory missing in planning workspace: {plan_id}"
+        )
+
+    return dest, manifest
+
+
+def record_planning_owner_decision(
+    project: Path,
+    plan_id: str,
+    decision: str,
+    summary: str,
+) -> PlanningDecisionResult:
+    """Record one owner decision JSON file under decisions/ (evidence only)."""
+    if decision not in PLANNING_OWNER_DECISIONS:
+        raise ValueError(
+            f"invalid decision: {decision!r}; "
+            f"allowed: {', '.join(PLANNING_OWNER_DECISIONS)}"
+        )
+
+    trimmed_summary = summary.strip()
+    if not trimmed_summary:
+        raise ValueError("summary must not be empty")
+
+    dest, manifest = _inspect_decision_workspace(project, plan_id)
+
+    validation_report = validate_planning_workspace(project, plan_id)
+    if decision == "APPROVE_FOR_RUN_PROPOSALS" and not validation_report.valid:
+        raise ValueError(
+            "Cannot record APPROVE_FOR_RUN_PROPOSALS because planning validation is not OK."
+        )
+
+    created_at = _utc_now()
+    filename = f"{_decision_filename_timestamp()}__owner-decision.json"
+    decision_path = dest / "decisions" / filename
+    if decision_path.exists():
+        raise FileExistsError(f"decision file already exists: {decision_path.name}")
+
+    manifest_path = dest / "manifest.json"
+    workspace_status = manifest.get("status", "?")
+
+    _write_json(
+        decision_path,
+        {
+            "record_type": "PLANNING_OWNER_DECISION",
+            "plan_id": plan_id,
+            "decision": decision,
+            "summary": trimmed_summary,
+            "created_at": created_at,
+            "workspace_status_at_decision": workspace_status,
+            "manifest_path": str(manifest_path),
+            "authority": {
+                "records_decision_only": True,
+                "does_not_execute": True,
+                "does_not_create_runs": True,
+                "does_not_mutate_manifest": True,
+                "does_not_approve_runner_execution": True,
+            },
+        },
+    )
+
+    lines = [
+        "decision recorded",
+        f"decision: {decision}",
+        f"path: {decision_path}",
+        "manifest status was not changed",
+        "no runs were created",
+        "no agents were invoked",
+    ]
+    if decision != "APPROVE_FOR_RUN_PROPOSALS" and not validation_report.valid:
+        lines.append("note: planning validation is not OK (decision recorded anyway)")
+
+    return PlanningDecisionResult(
+        decision,
+        decision_path,
+        str(workspace_status),
+        "\n".join(lines),
     )
