@@ -55,7 +55,8 @@ Machine-readable identity and gate state for the planning package. Updated manua
 | `created_at` | string | ISO 8601 timestamp |
 | `updated_at` | string | ISO 8601 timestamp (optional) |
 | `owner` | string | Responsible owner (optional) |
-| `gates` | object | Open/closed gate flags (§4) |
+| `gates` | object | Open/closed gate flags (§4); keys use snake_case |
+| `authority` | object | Safety flags set at bootstrap (`no_execution`, `no_agent_invocation`, `no_run_creation`, `no_self_approval`) |
 | `active_revision` | string | `1` or revision label; which plan body is authoritative |
 | `example_only` | boolean | `true` for samples; must not be used for real execution |
 
@@ -67,6 +68,17 @@ Default `artifact_paths`:
   "local_agentic_spec": "local-agentic-spec.md",
   "implementation_plan": "implementation-plan.md",
   "planning_audit": "planning-audit.md"
+}
+```
+
+Default `gates` (snake_case keys):
+
+```json
+{
+  "planning_owner_decision_required": true,
+  "planning_audit_required": true,
+  "plan_revision_required": false,
+  "run_proposal_allowed": false
 }
 ```
 
@@ -135,14 +147,14 @@ DRAFT → CONTEXT_READY → SPEC_READY → PLAN_READY → PLANNING_AUDIT_READY
 
 Gates are recorded in `manifest.json` under `gates` (open = `true`). Closing a gate requires an explicit owner or role-bounded action documented in `decisions/`.
 
-| Gate | When open | Closed by |
-|------|-----------|-----------|
-| `planning-owner-decision-required` | Owner must accept spec, plan, or audit acknowledgment | Owner decision record in `decisions/` |
-| `planning-audit-required` | Planning Audit not yet `PASS` / `PASS_WITH_NOTES` | Planning Audit artifact updated; gate cleared in manifest |
-| `plan-revision-required` | Material plan change needed after audit or owner review | New revision in `revisions/` approved; `active_revision` updated |
-| `run-proposal-allowed` | Plan may feed `propose-next-run` (one slice at a time) | Set when status is `APPROVED_FOR_RUN_PROPOSALS` and planning gates above are closed |
+| Gate key | When open | Closed by |
+|----------|-----------|-----------|
+| `planning_owner_decision_required` | Owner must accept spec, plan, or audit acknowledgment | Owner decision record in `decisions/` |
+| `planning_audit_required` | Planning Audit not yet `PASS` / `PASS_WITH_NOTES` | Planning Audit artifact updated; gate cleared in manifest |
+| `plan_revision_required` | Material plan change needed after audit or owner review | New revision in `revisions/` approved; `active_revision` updated |
+| `run_proposal_allowed` | Plan may feed `propose-next-run` (one slice at a time) | Set when status is `APPROVED_FOR_RUN_PROPOSALS` and planning gates above are closed |
 
-**`run-proposal-allowed` does not invoke an executor.** It only signals that an operator may manually derive a Next Run Proposal from an Implementation Plan slice, subject to runner approval gates.
+**`run_proposal_allowed` does not invoke an executor.** It only signals that an operator may manually derive a Next Run Proposal from an Implementation Plan slice, subject to runner approval gates.
 
 ---
 
@@ -202,6 +214,14 @@ agent-os planning init <plan-id> [PATH]
 ```
 
 This creates `.agent-os/planning/<plan-id>/` with templates copied from `agent_os/templates/planning/`, a DRAFT `manifest.json`, subdirectories, and a non-authority `README.md`. It does **not** execute code, create runs, invoke agents, or validate artifact content.
+
+Inspect an existing planning workspace (read-only):
+
+```bash
+agent-os planning status <plan-id> [PATH]
+```
+
+Reports workspace path, manifest status, expected artifact files and directories (present/missing), gate and authority flags from `manifest.json`, and a structural result (`OK` or `BROKEN`). Fails closed when the workspace, manifest, or required structure is missing or invalid. Does **not** create, modify, or delete files.
 
 ### Manual
 

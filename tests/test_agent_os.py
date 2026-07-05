@@ -13,7 +13,7 @@ from pathlib import Path
 
 from agent_os.cli import main
 from agent_os.paths import TEMPLATE_FILES, planning_path, run_path
-from agent_os.planning import init_planning_workspace, validate_plan_id
+from agent_os.planning import init_planning_workspace, status_planning_workspace, validate_plan_id
 from agent_os.validate import validate_run_for_closure
 from agent_os.workspace import (
     GIT_SNAPSHOT_READONLY_ARGV,
@@ -1539,6 +1539,190 @@ class PlanningInitTests(unittest.TestCase):
         self.assertIn("does **not** approve work", readme)
         self.assertIn("does **not** invoke agents", readme)
         self.assertIn("not executable", readme)
+
+
+class PlanningStatusTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self._tmp.name)
+        init_workspace(self.project)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _init_plan(self, plan_id: str = "slither-demo") -> Path:
+        return init_planning_workspace(self.project, plan_id)
+
+    def _snapshot_planning_tree(self) -> dict[str, str]:
+        workspace = self.project / ".agent-os"
+        snapshots: dict[str, str] = {}
+        for path in workspace.rglob("*"):
+            if path.is_file():
+                rel = path.relative_to(workspace).as_posix()
+                snapshots[rel] = path.read_text(encoding="utf-8")
+        return snapshots
+
+    def test_planning_status_success_on_init_workspace(self) -> None:
+        plan_id = "slither-demo"
+        dest = self._init_plan(plan_id)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["planning", "status", plan_id, str(self.project)])
+        self.assertEqual(code, 0)
+        output = buf.getvalue()
+        self.assertIn(f"planning workspace: {dest}", output)
+        self.assertIn(f"plan_id: {plan_id}", output)
+        self.assertIn("status: DRAFT", output)
+        self.assertIn("created_at:", output)
+        self.assertIn("manifest.json: present", output)
+        self.assertIn("README.md: present", output)
+        self.assertIn("context-pack.md: present", output)
+        self.assertIn("local-agentic-spec.md: present", output)
+        self.assertIn("implementation-plan.md: present", output)
+        self.assertIn("planning-audit.md: present", output)
+        self.assertIn("evidence/: present", output)
+        self.assertIn("decisions/: present", output)
+        self.assertIn("revisions/: present", output)
+        self.assertIn("planning_owner_decision_required: true", output)
+        self.assertIn("planning_audit_required: true", output)
+        self.assertIn("plan_revision_required: false", output)
+        self.assertIn("run_proposal_allowed: false", output)
+        self.assertIn("no_execution: true", output)
+        self.assertIn("no_agent_invocation: true", output)
+        self.assertIn("no_run_creation: true", output)
+        self.assertIn("no_self_approval: true", output)
+        self.assertIn("structural result: OK", output)
+
+    def test_planning_status_api_matches_cli(self) -> None:
+        plan_id = "planning_001"
+        self._init_plan(plan_id)
+        report = status_planning_workspace(self.project, plan_id)
+        self.assertTrue(report.structural_ok)
+        self.assertIn("status: DRAFT", report.output)
+        self.assertIn("structural result: OK", report.output)
+
+    def test_planning_status_rejects_invalid_plan_ids(self) -> None:
+        invalid_ids = ["", "../x", "a/b", "my plan", ".hidden", "-bad", "Bad", "a.b"]
+        for plan_id in invalid_ids:
+            with self.subTest(plan_id=plan_id):
+                with self.assertRaises(ValueError):
+                    validate_plan_id(plan_id)
+                if plan_id.startswith("-"):
+                    continue
+                buf = io.StringIO()
+                with redirect_stderr(buf):
+                    code = main(["planning", "status", plan_id, str(self.project)])
+                self.assertEqual(code, 1)
+                self.assertTrue(buf.getvalue().strip())
+
+    def test_planning_status_fails_when_agent_os_not_initialized(self) -> None:
+        bare = Path(tempfile.mkdtemp())
+        try:
+            with self.assertRaises(FileNotFoundError):
+                status_planning_workspace(bare, "demo-plan")
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                code = main(["planning", "status", "demo-plan", str(bare)])
+            self.assertEqual(code, 1)
+            self.assertIn("no workspace found", buf.getvalue())
+        finally:
+            import shutil
+
+            shutil.rmtree(bare)
+
+    def test_planning_status_fails_for_missing_workspace(self) -> None:
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(["planning", "status", "missing-plan", str(self.project)])
+        self.assertEqual(code, 1)
+        self.assertIn("planning workspace not found", buf.getvalue())
+
+    def test_planning_status_fails_for_missing_manifest(self) -> None:
+        plan_id = "no-manifest"
+        dest = planning_path(self.project, plan_id)
+        dest.mkdir(parents=True)
+        for subdir in ("evidence", "decisions", "revisions"):
+            (dest / subdir).mkdir()
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(["planning", "status", plan_id, str(self.project)])
+        self.assertEqual(code, 1)
+        self.assertIn("manifest.json missing", buf.getvalue())
+
+    def test_planning_status_fails_for_malformed_manifest(self) -> None:
+        plan_id = "bad-manifest"
+        dest = self._init_plan(plan_id)
+        (dest / "manifest.json").write_text("{not json", encoding="utf-8")
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(["planning", "status", plan_id, str(self.project)])
+        self.assertEqual(code, 1)
+        self.assertIn("invalid manifest.json", buf.getvalue())
+
+    def test_planning_status_fails_for_manifest_plan_id_mismatch(self) -> None:
+        plan_id = "mismatch-plan"
+        dest = self._init_plan(plan_id)
+        manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        manifest["plan_id"] = "other-plan"
+        (dest / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(["planning", "status", plan_id, str(self.project)])
+        self.assertEqual(code, 1)
+        self.assertIn("manifest plan_id mismatch", buf.getvalue())
+
+    def test_planning_status_reports_broken_when_artifact_missing(self) -> None:
+        plan_id = "broken-artifact"
+        dest = self._init_plan(plan_id)
+        (dest / "context-pack.md").unlink()
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["planning", "status", plan_id, str(self.project)])
+        self.assertEqual(code, 1)
+        output = buf.getvalue()
+        self.assertIn("context-pack.md: missing", output)
+        self.assertIn("structural result: BROKEN", output)
+
+    def test_planning_status_reports_broken_when_directory_missing(self) -> None:
+        plan_id = "broken-dir"
+        dest = self._init_plan(plan_id)
+        import shutil
+
+        shutil.rmtree(dest / "evidence")
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["planning", "status", plan_id, str(self.project)])
+        self.assertEqual(code, 1)
+        output = buf.getvalue()
+        self.assertIn("evidence/: missing", output)
+        self.assertIn("structural result: BROKEN", output)
+
+    def test_planning_status_is_read_only(self) -> None:
+        plan_id = "slither-demo"
+        self._init_plan(plan_id)
+        workspace = self.project / ".agent-os"
+        before_runs = list((workspace / "runs").iterdir())
+        workspace_json_before = (workspace / "workspace.json").read_text(encoding="utf-8")
+        planning_snapshots = self._snapshot_planning_tree()
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["planning", "status", plan_id, str(self.project)])
+        self.assertEqual(code, 0)
+
+        after_runs = list((workspace / "runs").iterdir())
+        self.assertEqual(before_runs, after_runs)
+        self.assertEqual(
+            workspace_json_before,
+            (workspace / "workspace.json").read_text(encoding="utf-8"),
+        )
+        self.assertEqual(planning_snapshots, self._snapshot_planning_tree())
+        self.assertIn("structural result: OK", buf.getvalue())
 
 
 if __name__ == "__main__":

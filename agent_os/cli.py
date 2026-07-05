@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from agent_os import __version__
-from agent_os.planning import init_planning_workspace
+from agent_os.planning import init_planning_workspace, status_planning_workspace
 from agent_os.workspace import (
     add_evidence,
     add_evidence_command_output,
@@ -160,6 +160,17 @@ def cmd_planning_init(args: argparse.Namespace) -> int:
     print("next step: fill context-pack.md")
     print("note: no runs were created and no agents were invoked")
     return 0
+
+
+def cmd_planning_status(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        report = status_planning_workspace(project, args.plan_id)
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(report.output)
+    return 0 if report.structural_ok else 1
 
 
 def cmd_close(args: argparse.Namespace) -> int:
@@ -326,6 +337,14 @@ def build_parser() -> argparse.ArgumentParser:
     planning_init_parser.add_argument("plan_id", help="plan identifier (filesystem-safe slug)")
     planning_init_parser.add_argument("path", nargs="?", help="target project directory")
     planning_init_parser.set_defaults(func=cmd_planning_init)
+
+    planning_status_parser = planning_sub.add_parser(
+        "status",
+        help="inspect an existing planning workspace (read-only)",
+    )
+    planning_status_parser.add_argument("plan_id", help="plan identifier (filesystem-safe slug)")
+    planning_status_parser.add_argument("path", nargs="?", help="target project directory")
+    planning_status_parser.set_defaults(func=cmd_planning_status)
 
     return parser
 

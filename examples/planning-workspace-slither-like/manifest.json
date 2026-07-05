@@ -14,10 +14,10 @@
     "planning_audit": "planning-audit.md"
   },
   "gates": {
-    "planning-owner-decision-required": true,
-    "planning-audit-required": true,
-    "plan-revision-required": false,
-    "run-proposal-allowed": false
+    "planning_owner_decision_required": true,
+    "planning_audit_required": true,
+    "plan_revision_required": false,
+    "run_proposal_allowed": false
   },
   "_notice": "EXAMPLE_ONLY — sample layout for documentation. Not approved for execution or runner import."
 }
