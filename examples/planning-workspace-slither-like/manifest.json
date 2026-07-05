@@ -1,0 +1,23 @@
+{
+  "plan_id": "slither-like-example",
+  "goal": "Build a small Slither-like browser game as static HTML/CSS/JS.",
+  "status": "PLAN_READY",
+  "example_only": true,
+  "created_at": "2026-07-05T00:00:00Z",
+  "updated_at": "2026-07-05T00:00:00Z",
+  "owner": "EXAMPLE_OWNER",
+  "active_revision": "1",
+  "artifact_paths": {
+    "context_pack": "context-pack.md",
+    "local_agentic_spec": "local-agentic-spec.md",
+    "implementation_plan": "implementation-plan.md",
+    "planning_audit": "planning-audit.md"
+  },
+  "gates": {
+    "planning-owner-decision-required": true,
+    "planning-audit-required": true,
+    "plan-revision-required": false,
+    "run-proposal-allowed": false
+  },
+  "_notice": "EXAMPLE_ONLY — sample layout for documentation. Not approved for execution or runner import."
+}

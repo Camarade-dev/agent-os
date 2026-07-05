@@ -326,9 +326,19 @@ Runner consumption doctrine (no implementation): `agent-os-runner-experimental/d
 
 ---
 
-## 11. Recommended implementation order (post-doctrine)
+## 11. Planning workspace
 
-1. Planning workspace layout (copy templates into `.agent-os/planning/<plan-id>/`)
+A **planning workspace** is the on-disk home for one governed planning package: manifest, filled artifacts, planning evidence, owner decisions, and optional revisions under `.agent-os/planning/<plan-id>/`.
+
+The concrete layout — paths, allowed statuses, gate semantics, and hard rules — is defined in [`docs/planning-workspace-layout.md`](planning-workspace-layout.md). A sample package (EXAMPLE_ONLY) lives at `examples/planning-workspace-slither-like/`.
+
+The workspace layout is a **local artifact contract**, not automation. Operators create directories, copy templates, fill artifacts, and update `manifest.json` manually. No Agent OS v0 CLI command creates or validates planning workspaces in this slice.
+
+---
+
+## 12. Recommended implementation order (post-doctrine)
+
+1. ~~Planning workspace layout (copy templates into `.agent-os/planning/<plan-id>/`)~~ — documented in `docs/planning-workspace-layout.md`
 2. Planning audit checklist (manual)
 3. Implementation Plan → Next Run Proposal field mapping (runner boundary)
 4. Structured `allowed_paths` in proposals (runner)
@@ -338,8 +348,9 @@ No step above is authorized by this document alone. Owner must approve each impl
 
 ---
 
-## 12. References
+## 13. References
 
+- `docs/planning-workspace-layout.md` — planning package layout and gates
 - `docs/v0-release-boundary.md` — Agent OS v0.1.0 core boundary
 - `docs/operating-loop.md` — execution lifecycle
 - `docs/evidence-capture-doctrine-v0.md` — execution evidence doctrine
@@ -347,3 +358,4 @@ No step above is authorized by this document alone. Owner must approve each impl
 - `agent_os/templates/planning/` — planning artifact template contracts
 - `agent-os-runner-experimental/docs/planning-to-run-boundary.md` — plan → runner mapping
 - `agent-os-runner-experimental/docs/planning-artifact-consumption.md` — future runner consumption rules
+- `examples/planning-workspace-slither-like/` — EXAMPLE_ONLY planning workspace sample
