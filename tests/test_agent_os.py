@@ -19,28 +19,38 @@ from agent_os.orchestrator import (
     GOAL_INTAKE_REQUIRED_FIELDS,
     OWNER_CLARIFICATION_NON_AUTHORITY_FLAGS,
     OWNER_CLARIFICATION_REQUIRED_FIELDS,
+    OWNER_READINESS_DECISION_NON_AUTHORITY_FLAGS,
+    OWNER_READINESS_DECISION_REQUIRED_FIELDS,
     READINESS_REVIEW_NON_AUTHORITY_FLAGS,
     build_goal_intake_artifact,
     build_owner_clarification_artifact,
+    build_owner_readiness_decision_artifact,
     create_goal_intake,
     create_owner_clarification,
+    create_owner_readiness_decision,
     goal_intake_status,
     list_owner_clarifications,
+    list_owner_readiness_decisions,
     load_goal_intake,
     load_owner_clarification,
+    load_owner_readiness_decision,
     normalize_goal,
     review_goal_intake_readiness,
     validate_clarification_id,
     validate_goal_intake,
     validate_intake_id,
     validate_owner_clarification,
+    validate_owner_readiness_decision,
+    validate_readiness_decision_id,
 )
 from agent_os.paths import (
     CLARIFICATIONS_DIR,
     GOAL_INTAKE_FILE,
+    READINESS_DECISIONS_DIR,
     TEMPLATE_FILES,
     orchestrator_clarification_path,
     orchestrator_intake_path,
+    orchestrator_readiness_decision_path,
     planning_path,
     run_path,
 )
@@ -5567,6 +5577,966 @@ class OrchestratorGoalIntakeReadinessTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("owner_clarifications: 0", buf.getvalue())
         self.assertEqual(original, artifact_path.read_text(encoding="utf-8"))
+        self.assertEqual(before, self._project_files())
+
+
+class OrchestratorOwnerReadinessDecisionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self._tmp.name)
+        init_workspace(self.project)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _artifact_path(self, intake_id: str) -> Path:
+        return orchestrator_intake_path(self.project, intake_id) / GOAL_INTAKE_FILE
+
+    def _clarification_path(self, intake_id: str, clarification_id: str) -> Path:
+        return orchestrator_clarification_path(
+            self.project,
+            intake_id,
+            clarification_id,
+        )
+
+    def _decision_path(self, intake_id: str, decision_id: str) -> Path:
+        return orchestrator_readiness_decision_path(
+            self.project,
+            intake_id,
+            decision_id,
+        )
+
+    def _create_slither_intake(self, intake_id: str = "slither-demo") -> Path:
+        return create_goal_intake(
+            self.project,
+            intake_id,
+            "Build me an online slither.io-like game",
+        )
+
+    def _create_simple_intake(self, intake_id: str = "fix-login") -> Path:
+        return create_goal_intake(
+            self.project,
+            intake_id,
+            "Fix the login timeout bug in the auth module",
+        )
+
+    def _write_artifact(self, intake_id: str, artifact: dict) -> Path:
+        path = self._artifact_path(intake_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+        return path
+
+    def _project_files(self) -> set[str]:
+        return {
+            path.relative_to(self.project).as_posix()
+            for path in self.project.rglob("*")
+            if path.is_file()
+        }
+
+    def _slither_with_clarification(self, intake_id: str = "slither-demo") -> None:
+        self._create_slither_intake(intake_id)
+        create_owner_clarification(
+            self.project,
+            intake_id,
+            "scope-v1",
+            "Browser-only demo with 10 players max; no persistence.",
+        )
+
+    def test_decide_readiness_creates_expected_artifact_path(self) -> None:
+        intake_id = "slither-demo"
+        decision_id = "owner-v1"
+        self._slither_with_clarification(intake_id)
+
+        dest = create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            decision_id,
+            "AUTHORIZE_DRAFT_PREPARATION",
+            "Scope is clear enough for draft prep.",
+        )
+
+        self.assertEqual(dest, self._decision_path(intake_id, decision_id))
+        self.assertTrue(dest.is_file())
+
+    def test_owner_readiness_decision_artifact_contains_all_required_fields(self) -> None:
+        artifact = build_owner_readiness_decision_artifact(
+            "slither-demo",
+            "owner-v1",
+            "BLOCK_INTAKE",
+            "Stopping this intake.",
+            readiness_review_state_at_decision="OWNER_REVIEW_REQUIRED",
+            next_required_action_at_decision="OWNER_READINESS_DECISION_REQUIRED",
+            owner_clarification_count_at_decision=0,
+            latest_clarification_id_at_decision=None,
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        missing = [
+            field
+            for field in OWNER_READINESS_DECISION_REQUIRED_FIELDS
+            if field not in artifact
+        ]
+        self.assertEqual(missing, [])
+
+    def test_owner_summary_preserves_exact_input(self) -> None:
+        intake_id = "slither-demo"
+        summary = "  Authorize draft prep after review.\t\n\nNot approval.  "
+        self._slither_with_clarification(intake_id)
+
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "AUTHORIZE_DRAFT_PREPARATION",
+            summary,
+        )
+        artifact = load_owner_readiness_decision(self.project, intake_id, "owner-v1")
+        self.assertEqual(artifact["owner_summary"], summary)
+
+    def test_artifact_includes_readiness_review_snapshot_fields(self) -> None:
+        intake_id = "slither-demo"
+        self._slither_with_clarification(intake_id)
+        report = review_goal_intake_readiness(self.project, intake_id)
+
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "AUTHORIZE_DRAFT_PREPARATION",
+            "Ready for future draft prep.",
+        )
+        artifact = load_owner_readiness_decision(self.project, intake_id, "owner-v1")
+        self.assertEqual(
+            artifact["readiness_review_state_at_decision"],
+            report.readiness_review_state,
+        )
+        self.assertEqual(
+            artifact["next_required_action_at_decision"],
+            report.next_required_action,
+        )
+        self.assertEqual(
+            artifact["owner_clarification_count_at_decision"],
+            report.owner_clarification_count,
+        )
+        self.assertEqual(
+            artifact["latest_clarification_id_at_decision"],
+            report.latest_clarification_id,
+        )
+
+    def test_artifact_includes_all_required_non_authority_flags(self) -> None:
+        intake_id = "fix-login"
+        self._create_simple_intake(intake_id)
+
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "BLOCK_INTAKE",
+            "Stopping intake.",
+        )
+        artifact = load_owner_readiness_decision(self.project, intake_id, "owner-v1")
+        for flag in OWNER_READINESS_DECISION_NON_AUTHORITY_FLAGS:
+            self.assertTrue(artifact["non_authority"][flag])
+
+    def test_decision_creation_requires_valid_goal_intake(self) -> None:
+        intake_id = "invalid-intake"
+        artifact = build_goal_intake_artifact(
+            intake_id,
+            "Build a game",
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        artifact["artifact_type"] = "PLANNING_WORKSPACE_DRAFT"
+        self._write_artifact(intake_id, artifact)
+
+        with self.assertRaises(ValueError) as ctx:
+            create_owner_readiness_decision(
+                self.project,
+                intake_id,
+                "owner-v1",
+                "BLOCK_INTAKE",
+                "Stop.",
+            )
+        self.assertIn("invalid goal intake artifact", str(ctx.exception))
+        self.assertFalse(self._decision_path(intake_id, "owner-v1").exists())
+
+    def test_decide_readiness_missing_workspace_fails_without_orchestrator_tree(
+        self,
+    ) -> None:
+        bare = Path(tempfile.mkdtemp())
+        try:
+            with self.assertRaises(FileNotFoundError):
+                create_owner_readiness_decision(
+                    bare,
+                    "slither-demo",
+                    "owner-v1",
+                    "BLOCK_INTAKE",
+                    "Stop.",
+                )
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                code = main(
+                    [
+                        "orchestrator",
+                        "decide-readiness",
+                        "slither-demo",
+                        str(bare),
+                        "--decision",
+                        "BLOCK_INTAKE",
+                        "--decision-id",
+                        "owner-v1",
+                        "--summary",
+                        "Stop.",
+                    ]
+                )
+            self.assertEqual(code, 1)
+            self.assertIn("no workspace found", buf.getvalue())
+            self.assertFalse((bare / ".agent-os" / "orchestrator").exists())
+        finally:
+            import shutil
+
+            shutil.rmtree(bare)
+
+    def test_decide_readiness_missing_intake_fails_without_decision_artifact(
+        self,
+    ) -> None:
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "decide-readiness",
+                    "missing-intake",
+                    str(self.project),
+                    "--decision",
+                    "BLOCK_INTAKE",
+                    "--decision-id",
+                    "owner-v1",
+                    "--summary",
+                    "Stop.",
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("goal intake artifact not found", buf.getvalue())
+        self.assertFalse(
+            (
+                self.project
+                / ".agent-os"
+                / "orchestrator"
+                / "intakes"
+                / "missing-intake"
+            ).exists()
+        )
+
+    def test_decide_readiness_invalid_intake_fails_without_decision_artifact(
+        self,
+    ) -> None:
+        intake_id = "invalid-decision"
+        artifact = build_goal_intake_artifact(
+            intake_id,
+            "Build a game",
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        artifact["artifact_type"] = "PLANNING_WORKSPACE_DRAFT"
+        self._write_artifact(intake_id, artifact)
+
+        with self.assertRaises(ValueError):
+            create_owner_readiness_decision(
+                self.project,
+                intake_id,
+                "owner-v1",
+                "BLOCK_INTAKE",
+                "Stop.",
+            )
+        self.assertFalse(self._decision_path(intake_id, "owner-v1").exists())
+
+    def test_decide_readiness_rejects_empty_summary(self) -> None:
+        intake_id = "fix-login"
+        self._create_simple_intake(intake_id)
+
+        with self.assertRaises(ValueError) as ctx:
+            create_owner_readiness_decision(
+                self.project,
+                intake_id,
+                "owner-v1",
+                "BLOCK_INTAKE",
+                "",
+            )
+        self.assertIn("owner summary must not be empty", str(ctx.exception))
+
+    def test_decide_readiness_rejects_invalid_decision_ids(self) -> None:
+        intake_id = "fix-login"
+        self._create_simple_intake(intake_id)
+        invalid_ids = ("", " ", "../escape", "bad id", ".hidden")
+
+        for decision_id in invalid_ids:
+            with self.subTest(decision_id=decision_id):
+                with self.assertRaises(ValueError):
+                    create_owner_readiness_decision(
+                        self.project,
+                        intake_id,
+                        decision_id,
+                        "BLOCK_INTAKE",
+                        "Stop.",
+                    )
+                self.assertFalse(self._decision_path(intake_id, decision_id).exists())
+
+    def test_decide_readiness_rejects_unsupported_decision_values(self) -> None:
+        intake_id = "fix-login"
+        self._create_simple_intake(intake_id)
+
+        with self.assertRaises(ValueError) as ctx:
+            create_owner_readiness_decision(
+                self.project,
+                intake_id,
+                "owner-v1",
+                "APPROVE_PLANNING",
+                "Not allowed.",
+            )
+        self.assertIn("unsupported decision value", str(ctx.exception))
+
+    def test_decide_readiness_refuses_to_overwrite_existing_decision(self) -> None:
+        intake_id = "fix-login"
+        self._create_simple_intake(intake_id)
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "BLOCK_INTAKE",
+            "First decision.",
+        )
+        existing = self._decision_path(intake_id, "owner-v1").read_text(encoding="utf-8")
+
+        with self.assertRaises(FileExistsError):
+            create_owner_readiness_decision(
+                self.project,
+                intake_id,
+                "owner-v1",
+                "REQUEST_MORE_CLARIFICATION",
+                "Second decision.",
+            )
+        self.assertEqual(
+            existing,
+            self._decision_path(intake_id, "owner-v1").read_text(encoding="utf-8"),
+        )
+
+    def test_decide_readiness_rejects_path_escape_attempts(self) -> None:
+        intake_id = "../escape"
+        self._create_simple_intake("fix-login")
+        before = self._project_files()
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "decide-readiness",
+                    intake_id,
+                    str(self.project),
+                    "--decision",
+                    "BLOCK_INTAKE",
+                    "--decision-id",
+                    "owner-v1",
+                    "--summary",
+                    "Escape attempt.",
+                ]
+            )
+
+        self.assertEqual(code, 1)
+        self.assertIn("invalid intake id", buf.getvalue())
+        self.assertEqual(before, self._project_files())
+
+    def test_authorize_draft_preparation_rejected_when_blocked_requires_clarification(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        self._create_slither_intake(intake_id)
+
+        with self.assertRaises(ValueError) as ctx:
+            create_owner_readiness_decision(
+                self.project,
+                intake_id,
+                "owner-v1",
+                "AUTHORIZE_DRAFT_PREPARATION",
+                "Too early.",
+            )
+        self.assertIn("AUTHORIZE_DRAFT_PREPARATION is not allowed", str(ctx.exception))
+        self.assertIn("BLOCKED_REQUIRES_CLARIFICATION", str(ctx.exception))
+        self.assertFalse(self._decision_path(intake_id, "owner-v1").exists())
+
+    def test_authorize_draft_preparation_succeeds_when_clarification_present(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        self._slither_with_clarification(intake_id)
+
+        dest = create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "AUTHORIZE_DRAFT_PREPARATION",
+            "Scope clarified; authorize future draft prep only.",
+        )
+
+        artifact = json.loads(dest.read_text(encoding="utf-8"))
+        self.assertEqual(artifact["decision"], "AUTHORIZE_DRAFT_PREPARATION")
+        self.assertEqual(
+            artifact["readiness_review_state_at_decision"],
+            "OWNER_CLARIFICATION_PRESENT_REVIEW_REQUIRED",
+        )
+
+    def test_request_more_clarification_succeeds_without_planning_draft(self) -> None:
+        intake_id = "slither-demo"
+        self._create_slither_intake(intake_id)
+        forbidden_names = set(planning_module.PLANNING_ARTIFACT_FILES)
+
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "REQUEST_MORE_CLARIFICATION",
+            "Need more scope detail.",
+        )
+
+        created_names = {path.name for path in self.project.rglob("*") if path.is_file()}
+        self.assertTrue(forbidden_names.isdisjoint(created_names))
+        self.assertFalse((self.project / ".agent-os" / "planning").exists())
+
+    def test_block_intake_succeeds_without_planning_draft(self) -> None:
+        intake_id = "fix-login"
+        self._create_simple_intake(intake_id)
+        forbidden_names = set(planning_module.PLANNING_ARTIFACT_FILES)
+
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "BLOCK_INTAKE",
+            "Stopping this intake.",
+        )
+
+        created_names = {path.name for path in self.project.rglob("*") if path.is_file()}
+        self.assertTrue(forbidden_names.isdisjoint(created_names))
+
+    def test_decision_creation_preserves_goal_intake_byte_for_byte(self) -> None:
+        intake_id = "slither-demo"
+        self._slither_with_clarification(intake_id)
+        artifact_path = self._artifact_path(intake_id)
+        original = artifact_path.read_bytes()
+
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "AUTHORIZE_DRAFT_PREPARATION",
+            "Future draft only.",
+        )
+
+        self.assertEqual(original, artifact_path.read_bytes())
+
+    def test_decision_creation_preserves_clarification_artifacts_byte_for_byte(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        self._slither_with_clarification(intake_id)
+        clarification_path = self._clarification_path(intake_id, "scope-v1")
+        original = clarification_path.read_bytes()
+
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "AUTHORIZE_DRAFT_PREPARATION",
+            "Future draft only.",
+        )
+
+        self.assertEqual(original, clarification_path.read_bytes())
+
+    def test_decision_creation_does_not_change_planning_readiness(self) -> None:
+        intake_id = "slither-demo"
+        self._slither_with_clarification(intake_id)
+        artifact_path = self._artifact_path(intake_id)
+        before = json.loads(artifact_path.read_text(encoding="utf-8"))["planning_readiness"]
+
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "AUTHORIZE_DRAFT_PREPARATION",
+            "Future draft only.",
+        )
+
+        after = json.loads(artifact_path.read_text(encoding="utf-8"))["planning_readiness"]
+        self.assertEqual(before, after)
+
+    def test_decision_creation_does_not_create_planning_artifacts(self) -> None:
+        intake_id = "slither-demo"
+        self._slither_with_clarification(intake_id)
+        forbidden_names = set(planning_module.PLANNING_ARTIFACT_FILES)
+
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "AUTHORIZE_DRAFT_PREPARATION",
+            "Future draft only.",
+        )
+
+        created_names = {path.name for path in self.project.rglob("*") if path.is_file()}
+        self.assertTrue(forbidden_names.isdisjoint(created_names))
+
+    def test_decision_creation_does_not_create_planning_run_slice(self) -> None:
+        intake_id = "fix-login"
+        self._create_simple_intake(intake_id)
+
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "BLOCK_INTAKE",
+            "Stop.",
+        )
+
+        combined = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in self.project.rglob("*")
+            if path.is_file()
+        )
+        self.assertNotIn("PLANNING_RUN_SLICE", combined)
+
+    def test_decision_creation_does_not_create_runs(self) -> None:
+        intake_id = "fix-login"
+        workspace = self.project / ".agent-os"
+        before_runs = list((workspace / "runs").iterdir())
+        self._create_simple_intake(intake_id)
+
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "BLOCK_INTAKE",
+            "Stop.",
+        )
+
+        after_runs = list((workspace / "runs").iterdir())
+        self.assertEqual(before_runs, after_runs)
+
+    def test_decision_creation_does_not_invoke_external_subprocess(self) -> None:
+        intake_id = "fix-login"
+        self._create_simple_intake(intake_id)
+
+        with patch("subprocess.run", side_effect=AssertionError("subprocess invoked")):
+            code = main(
+                [
+                    "orchestrator",
+                    "decide-readiness",
+                    intake_id,
+                    str(self.project),
+                    "--decision",
+                    "BLOCK_INTAKE",
+                    "--decision-id",
+                    "owner-v1",
+                    "--summary",
+                    "Stop.",
+                ]
+            )
+        self.assertEqual(code, 0)
+
+    def test_orchestrator_validate_unchanged_without_readiness_decision_requirement(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        self._slither_with_clarification(intake_id)
+
+        report = validate_goal_intake(self.project, intake_id)
+        self.assertTrue(report.valid)
+
+    def test_orchestrator_readiness_remains_read_only_and_does_not_mutate_decisions(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        self._slither_with_clarification(intake_id)
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "AUTHORIZE_DRAFT_PREPARATION",
+            "Future draft only.",
+        )
+        decision_path = self._decision_path(intake_id, "owner-v1")
+        original = decision_path.read_text(encoding="utf-8")
+        before = self._project_files()
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["orchestrator", "readiness", intake_id, str(self.project)])
+
+        self.assertEqual(code, 0)
+        output = buf.getvalue()
+        self.assertIn("owner_readiness_decision_count: 1", output)
+        self.assertIn("latest_readiness_decision_id: owner-v1", output)
+        self.assertIn("latest_readiness_decision: AUTHORIZE_DRAFT_PREPARATION", output)
+        self.assertIn("owner readiness decisions do not generate a planning draft", output)
+        self.assertEqual(original, decision_path.read_text(encoding="utf-8"))
+        self.assertEqual(before, self._project_files())
+
+    def test_orchestrator_decide_readiness_cli_help_marks_non_authoritative(self) -> None:
+        parser = build_parser()
+        orchestrator_action = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        orchestrator_parser = orchestrator_action.choices["orchestrator"]
+        orchestrator_sub = next(
+            action
+            for action in orchestrator_parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+
+        help_text = orchestrator_sub.choices["decide-readiness"].format_help()
+        compact_help = re.sub(r"\s+", " ", help_text)
+        self.assertIn("owner-provided", compact_help.lower())
+        self.assertIn("Does not call an LLM", compact_help)
+        self.assertIn("generate planning drafts", compact_help)
+        self.assertIn("AUTHORIZE_DRAFT_PREPARATION authorizes only a future", compact_help)
+
+    def test_orchestrator_decide_readiness_cli_success_includes_boundary_notes(
+        self,
+    ) -> None:
+        intake_id = "fix-login"
+        self._create_simple_intake(intake_id)
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "decide-readiness",
+                    intake_id,
+                    str(self.project),
+                    "--decision",
+                    "BLOCK_INTAKE",
+                    "--decision-id",
+                    "owner-v1",
+                    "--summary",
+                    "Stop.",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        output = buf.getvalue()
+        self.assertIn("created owner readiness decision artifact:", output)
+        self.assertIn("artifact_type: OWNER_READINESS_DECISION", output)
+        self.assertIn("decision: BLOCK_INTAKE", output)
+        self.assertIn("no planning draft", output)
+        self.assertIn("no executor invocation", output)
+
+    def test_orchestrator_decide_readiness_cli_success_includes_decision_request_more(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        self._create_slither_intake(intake_id)
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "decide-readiness",
+                    intake_id,
+                    str(self.project),
+                    "--decision",
+                    "REQUEST_MORE_CLARIFICATION",
+                    "--decision-id",
+                    "owner-v1",
+                    "--summary",
+                    "Need more scope detail.",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertIn("decision: REQUEST_MORE_CLARIFICATION", buf.getvalue())
+
+    def test_orchestrator_decide_readiness_cli_success_includes_decision_authorize(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        self._slither_with_clarification(intake_id)
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "decide-readiness",
+                    intake_id,
+                    str(self.project),
+                    "--decision",
+                    "AUTHORIZE_DRAFT_PREPARATION",
+                    "--decision-id",
+                    "owner-v1",
+                    "--summary",
+                    "Future draft prep only.",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        output = buf.getvalue()
+        self.assertIn("decision: AUTHORIZE_DRAFT_PREPARATION", output)
+        self.assertIn("no draft was generated", output)
+
+    def test_validate_owner_readiness_decision_succeeds_on_valid_artifact(self) -> None:
+        intake_id = "fix-login"
+        self._create_simple_intake(intake_id)
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "BLOCK_INTAKE",
+            "Stop.",
+        )
+
+        report = validate_owner_readiness_decision(self.project, intake_id, "owner-v1")
+        self.assertTrue(report.valid)
+        self.assertIn("structural validation: OK", report.output)
+        self.assertIn("final validation result: OK", report.output)
+
+    def test_validate_owner_readiness_decision_rejects_wrong_artifact_type(
+        self,
+    ) -> None:
+        intake_id = "fix-login"
+        self._create_simple_intake(intake_id)
+        artifact = build_owner_readiness_decision_artifact(
+            intake_id,
+            "owner-v1",
+            "BLOCK_INTAKE",
+            "Stop.",
+            readiness_review_state_at_decision="OWNER_REVIEW_REQUIRED",
+            next_required_action_at_decision="OWNER_READINESS_DECISION_REQUIRED",
+            owner_clarification_count_at_decision=0,
+            latest_clarification_id_at_decision=None,
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        artifact["artifact_type"] = "PLANNING_WORKSPACE_DRAFT"
+        path = self._decision_path(intake_id, "owner-v1")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+
+        report = validate_owner_readiness_decision(self.project, intake_id, "owner-v1")
+        self.assertFalse(report.valid)
+        self.assertTrue(
+            any("wrong artifact_type" in error for error in report.errors)
+        )
+
+    def test_validate_owner_readiness_decision_rejects_unsupported_schema_version(
+        self,
+    ) -> None:
+        intake_id = "fix-login"
+        self._create_simple_intake(intake_id)
+        artifact = build_owner_readiness_decision_artifact(
+            intake_id,
+            "owner-v1",
+            "BLOCK_INTAKE",
+            "Stop.",
+            readiness_review_state_at_decision="OWNER_REVIEW_REQUIRED",
+            next_required_action_at_decision="OWNER_READINESS_DECISION_REQUIRED",
+            owner_clarification_count_at_decision=0,
+            latest_clarification_id_at_decision=None,
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        artifact["schema_version"] = "9.9"
+        path = self._decision_path(intake_id, "owner-v1")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+
+        report = validate_owner_readiness_decision(self.project, intake_id, "owner-v1")
+        self.assertFalse(report.valid)
+        self.assertTrue(
+            any("unsupported schema_version" in error for error in report.errors)
+        )
+
+    def test_validate_owner_readiness_decision_rejects_missing_non_authority_flag(
+        self,
+    ) -> None:
+        intake_id = "fix-login"
+        self._create_simple_intake(intake_id)
+        artifact = build_owner_readiness_decision_artifact(
+            intake_id,
+            "owner-v1",
+            "BLOCK_INTAKE",
+            "Stop.",
+            readiness_review_state_at_decision="OWNER_REVIEW_REQUIRED",
+            next_required_action_at_decision="OWNER_READINESS_DECISION_REQUIRED",
+            owner_clarification_count_at_decision=0,
+            latest_clarification_id_at_decision=None,
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        del artifact["non_authority"]["does_not_create_run"]
+        path = self._decision_path(intake_id, "owner-v1")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+
+        report = validate_owner_readiness_decision(self.project, intake_id, "owner-v1")
+        self.assertFalse(report.valid)
+        self.assertTrue(
+            any(
+                "missing non_authority flag: does_not_create_run" in error
+                for error in report.errors
+            )
+        )
+
+    def test_validate_owner_readiness_decision_rejects_false_non_authority_flag(
+        self,
+    ) -> None:
+        intake_id = "fix-login"
+        self._create_simple_intake(intake_id)
+        artifact = build_owner_readiness_decision_artifact(
+            intake_id,
+            "owner-v1",
+            "BLOCK_INTAKE",
+            "Stop.",
+            readiness_review_state_at_decision="OWNER_REVIEW_REQUIRED",
+            next_required_action_at_decision="OWNER_READINESS_DECISION_REQUIRED",
+            owner_clarification_count_at_decision=0,
+            latest_clarification_id_at_decision=None,
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        artifact["non_authority"]["does_not_invoke_executor"] = False
+        path = self._decision_path(intake_id, "owner-v1")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+
+        report = validate_owner_readiness_decision(self.project, intake_id, "owner-v1")
+        self.assertFalse(report.valid)
+        self.assertTrue(
+            any(
+                "non_authority flag must be true: does_not_invoke_executor" in error
+                for error in report.errors
+            )
+        )
+
+    def test_validate_owner_readiness_decision_rejects_decision_id_mismatch(
+        self,
+    ) -> None:
+        intake_id = "fix-login"
+        self._create_simple_intake(intake_id)
+        artifact = build_owner_readiness_decision_artifact(
+            intake_id,
+            "artifact-id",
+            "BLOCK_INTAKE",
+            "Stop.",
+            readiness_review_state_at_decision="OWNER_REVIEW_REQUIRED",
+            next_required_action_at_decision="OWNER_READINESS_DECISION_REQUIRED",
+            owner_clarification_count_at_decision=0,
+            latest_clarification_id_at_decision=None,
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        path = self._decision_path(intake_id, "path-id")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+
+        report = validate_owner_readiness_decision(self.project, intake_id, "path-id")
+        self.assertFalse(report.valid)
+        self.assertTrue(
+            any("decision_id mismatch" in error for error in report.errors)
+        )
+
+    def test_authorize_draft_preparation_succeeds_when_owner_review_required(
+        self,
+    ) -> None:
+        intake_id = "fix-login"
+        self._create_simple_intake(intake_id)
+        report = review_goal_intake_readiness(self.project, intake_id)
+        self.assertEqual(report.readiness_review_state, "OWNER_REVIEW_REQUIRED")
+
+        forbidden_names = set(planning_module.PLANNING_ARTIFACT_FILES)
+        workspace = self.project / ".agent-os"
+        before_runs = list((workspace / "runs").iterdir())
+
+        dest = create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "AUTHORIZE_DRAFT_PREPARATION",
+            "Simple intake ready for future draft prep only.",
+        )
+
+        artifact = json.loads(dest.read_text(encoding="utf-8"))
+        self.assertEqual(artifact["decision"], "AUTHORIZE_DRAFT_PREPARATION")
+        self.assertEqual(
+            artifact["readiness_review_state_at_decision"],
+            "OWNER_REVIEW_REQUIRED",
+        )
+        created_names = {path.name for path in self.project.rglob("*") if path.is_file()}
+        self.assertTrue(forbidden_names.isdisjoint(created_names))
+        self.assertFalse((self.project / ".agent-os" / "planning").exists())
+        combined = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in self.project.rglob("*")
+            if path.is_file()
+        )
+        self.assertNotIn("PLANNING_RUN_SLICE", combined)
+        self.assertEqual(before_runs, list((workspace / "runs").iterdir()))
+
+    def test_authorize_draft_preparation_blocked_when_clarification_structurally_invalid(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        artifact_path = self._create_slither_intake(intake_id)
+        intake_original = artifact_path.read_text(encoding="utf-8")
+        clarification_path = self._clarification_path(intake_id, "broken")
+        clarification_path.parent.mkdir(parents=True, exist_ok=True)
+        clarification_path.write_text("{not-json", encoding="utf-8")
+        clarification_original = clarification_path.read_text(encoding="utf-8")
+        before = self._project_files()
+
+        with self.assertRaises(ValueError) as ctx:
+            create_owner_readiness_decision(
+                self.project,
+                intake_id,
+                "owner-v1",
+                "AUTHORIZE_DRAFT_PREPARATION",
+                "Should not authorize.",
+            )
+        self.assertIn("AUTHORIZE_DRAFT_PREPARATION is not allowed", str(ctx.exception))
+        self.assertIn("BLOCKED_INVALID_INTAKE", str(ctx.exception))
+        self.assertFalse(self._decision_path(intake_id, "owner-v1").exists())
+        self.assertEqual(intake_original, artifact_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            clarification_original,
+            clarification_path.read_text(encoding="utf-8"),
+        )
+        self.assertEqual(before, self._project_files())
+
+    def test_orchestrator_status_reports_latest_readiness_decision_read_only(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        self._slither_with_clarification(intake_id)
+        artifact_path = self._artifact_path(intake_id)
+        original_intake = artifact_path.read_text(encoding="utf-8")
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "AUTHORIZE_DRAFT_PREPARATION",
+            "Future draft only.",
+        )
+        before = self._project_files()
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["orchestrator", "status", intake_id, str(self.project)])
+
+        self.assertEqual(code, 0)
+        output = buf.getvalue()
+        self.assertIn("owner_readiness_decisions: 1", output)
+        self.assertIn("latest_readiness_decision_id: owner-v1", output)
+        self.assertIn(
+            "latest_readiness_decision: AUTHORIZE_DRAFT_PREPARATION",
+            output,
+        )
+        self.assertIn("they do not generate a planning draft", output)
+        self.assertEqual(original_intake, artifact_path.read_text(encoding="utf-8"))
         self.assertEqual(before, self._project_files())
 
 

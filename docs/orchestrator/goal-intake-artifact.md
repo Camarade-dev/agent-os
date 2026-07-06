@@ -1,15 +1,17 @@
 # Goal intake artifact
 
-> **Status:** deterministic scaffold in `CORE_ORCHESTRATOR_002`; read-only status and validation in `CORE_ORCHESTRATOR_003`; owner clarification records in `CORE_ORCHESTRATOR_004`; read-only readiness review in `CORE_ORCHESTRATOR_005`  
+> **Status:** deterministic scaffold in `CORE_ORCHESTRATOR_002`; read-only status and validation in `CORE_ORCHESTRATOR_003`; owner clarification records in `CORE_ORCHESTRATOR_004`; read-only readiness review in `CORE_ORCHESTRATOR_005`; owner readiness decision records in `CORE_ORCHESTRATOR_006`  
 > **Commands:**
 > - `agent-os orchestrator intake <intake-id> --goal "<raw goal>" [PATH]`
 > - `agent-os orchestrator clarify <intake-id> --clarification-id <clarification-id> --answer "<owner-provided clarification>" [PATH]`
+> - `agent-os orchestrator decide-readiness <intake-id> --decision <decision> --decision-id <decision-id> --summary "<owner summary>" [PATH]`
 > - `agent-os orchestrator status <intake-id> [PATH]` (read-only)
 > - `agent-os orchestrator validate <intake-id> [PATH]` (read-only)
 > - `agent-os orchestrator readiness <intake-id> [PATH]` (read-only)
 > **Output:**
 > - `.agent-os/orchestrator/intakes/<intake-id>/goal-intake.json`
 > - `.agent-os/orchestrator/intakes/<intake-id>/clarifications/<clarification-id>.json`
+> - `.agent-os/orchestrator/intakes/<intake-id>/readiness-decisions/<decision-id>.json`
 
 The goal intake command creates a durable, reviewable JSON artifact from an owner-provided natural-language goal. It is a registrar-only scaffold: it records input and conservative deterministic metadata so later orchestrator slices can consume the artifact without treating prose as authority. It does **not** call an LLM, use Cursor, invoke an agent, call external APIs, choose architecture, generate planning artifacts, validate or approve a planning workspace, create runner proposals, create runs, or invoke an executor.
 
@@ -17,7 +19,9 @@ The clarify command records owner-provided clarification context for an existing
 
 The status and validate commands inspect the goal intake artifact only. They are read-only and do not call an LLM, use Cursor, invoke an agent, call external APIs, choose architecture, generate planning artifacts, validate or approve a planning workspace, create runner proposals, create runs, or invoke an executor. Status also reports clarification record counts when present; clarification records are additive context only.
 
-The readiness command performs a read-only readiness review of the goal intake artifact and any owner clarification records. It summarizes intake validity, ambiguity, clarification count, and the next required action. It does **not** call an LLM, modify artifacts, change `planning_readiness`, mark an intake draft-ready, generate planning artifacts, validate or approve a planning workspace, create runner proposals, create runs, or invoke an executor. **Readiness review is not owner readiness decision, not approval, and not planning generation.** Owner clarification records do not automatically make an intake draft-ready. Future owner readiness decision and draft/export generation remain future work.
+The readiness command performs a read-only readiness review of the goal intake artifact and any owner clarification records. It summarizes intake validity, ambiguity, clarification count, and the next required action. It does **not** call an LLM, modify artifacts, change `planning_readiness`, mark an intake draft-ready, generate planning artifacts, validate or approve a planning workspace, create runner proposals, create runs, or invoke an executor. **Readiness review is not owner readiness decision, not approval, and not planning generation.** Owner clarification records do not automatically make an intake draft-ready. Status and readiness also report owner readiness decision counts when present; those records do not generate a planning draft.
+
+The decide-readiness command records an owner-provided readiness decision after readiness review. It writes a separate `OWNER_READINESS_DECISION` JSON file only. It does **not** call an LLM, modify `goal-intake.json`, modify clarification artifacts, change `planning_readiness`, generate planning drafts, create planning workspaces, approve architecture, create runner proposals, create runs, or invoke an executor. **`AUTHORIZE_DRAFT_PREPARATION` authorizes only a future draft-preparation step** — not draft generation now, not planning approval, not architecture approval, and not execution. Future generated drafts would still need independent validation and owner approval.
 
 ---
 
@@ -145,6 +149,77 @@ Every clarification artifact includes:
 ```
 
 The clarify command refuses to overwrite an existing clarification artifact, rejects invalid intake or clarification identifiers, rejects empty answers, and fails closed before write when the workspace or goal intake is missing or invalid. Future readiness or draft generation remains future work.
+
+---
+
+## Owner readiness decision records
+
+`agent-os orchestrator decide-readiness` records an owner-provided readiness decision for an existing, structurally valid `GOAL_INTAKE` artifact after readiness review.
+
+Readiness decision records are:
+
+- **owner-provided** — no LLM-generated decision exists in this slice
+- **non-authoritative** — they do not modify `goal-intake.json` or clarification artifacts
+- **not planning approval** — they do not validate or approve a planning workspace
+- **not architecture approval** — they do not choose or approve architecture
+- **not draft generation** — no planning workspace, planning artifact, runner proposal, run, or executor invocation is created
+- **future-draft gate only when authorized** — `AUTHORIZE_DRAFT_PREPARATION` means only that a future slice may attempt draft preparation; it does not generate a draft now
+
+### Readiness decision artifact path
+
+```text
+.agent-os/orchestrator/intakes/<intake-id>/readiness-decisions/<decision-id>.json
+```
+
+### Allowed decision values
+
+| Decision | Meaning in this slice |
+|----------|------------------------|
+| `REQUEST_MORE_CLARIFICATION` | Owner requests more clarification before proceeding |
+| `BLOCK_INTAKE` | Owner chooses to stop the intake |
+| `AUTHORIZE_DRAFT_PREPARATION` | Owner allows a **future** draft-preparation step only |
+
+`AUTHORIZE_DRAFT_PREPARATION` is rejected when readiness review state is `BLOCKED_INVALID_INTAKE` or `BLOCKED_REQUIRES_CLARIFICATION`. It is allowed only when readiness review state is `OWNER_CLARIFICATION_PRESENT_REVIEW_REQUIRED` or `OWNER_REVIEW_REQUIRED`.
+
+### Readiness decision artifact schema
+
+| Field | Current deterministic behavior |
+|-------|--------------------------------|
+| `artifact_type` | Always `OWNER_READINESS_DECISION` |
+| `schema_version` | Always `"0.1"` |
+| `intake_id` | Parent intake identifier |
+| `decision_id` | Filesystem-safe decision identifier supplied by the operator |
+| `decision` | One of the allowed decision values above |
+| `owner_summary` | Exact `--summary` value, preserved verbatim |
+| `readiness_review_state_at_decision` | Snapshot from current readiness review |
+| `next_required_action_at_decision` | Snapshot from current readiness review |
+| `owner_clarification_count_at_decision` | Snapshot from current readiness review |
+| `latest_clarification_id_at_decision` | Snapshot from current readiness review (`null` when none) |
+| `created_at` | UTC creation timestamp |
+| `non_authority` | Required non-authority flags, all `true` |
+
+### Readiness decision non-authority flags
+
+Every readiness decision artifact includes:
+
+```json
+{
+  "does_not_create_plan": true,
+  "does_not_generate_planning_draft": true,
+  "does_not_validate_planning_workspace": true,
+  "does_not_approve_plan": true,
+  "does_not_transition_workspace": true,
+  "does_not_create_runner_proposal": true,
+  "does_not_create_run": true,
+  "does_not_invoke_executor": true,
+  "does_not_approve_architecture": true,
+  "does_not_modify_goal_intake": true,
+  "does_not_modify_clarifications": true,
+  "authorizes_future_draft_preparation_only_when_decision_is_authorize": true
+}
+```
+
+The decide-readiness command refuses to overwrite an existing decision artifact, rejects invalid intake or decision identifiers, rejects empty summaries, rejects unsupported decision values, and fails closed before write when the workspace or goal intake is missing or invalid. Future draft/export generation remains future work and would still require independent validation and owner approval.
 
 ---
 

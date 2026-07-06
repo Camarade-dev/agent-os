@@ -8,8 +8,10 @@ from pathlib import Path
 
 from agent_os import __version__
 from agent_os.orchestrator import (
+    OWNER_READINESS_DECISION_VALUES,
     create_goal_intake,
     create_owner_clarification,
+    create_owner_readiness_decision,
     goal_intake_status,
     review_goal_intake_readiness,
     validate_goal_intake,
@@ -302,6 +304,35 @@ def cmd_orchestrator_readiness(args: argparse.Namespace) -> int:
         return 1
     print(report.output)
     return 0 if report.goal_intake_valid else 1
+
+
+def cmd_orchestrator_decide_readiness(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        dest = create_owner_readiness_decision(
+            project,
+            args.intake_id,
+            args.decision_id,
+            args.decision,
+            args.summary,
+        )
+    except (FileNotFoundError, FileExistsError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"created owner readiness decision artifact: {dest}")
+    print("artifact_type: OWNER_READINESS_DECISION")
+    print(f"decision: {args.decision}")
+    print("mode: owner-provided readiness decision only")
+    print(
+        "note: no LLM, no planning draft, no planning workspace, "
+        "no architecture approval, no runs, no executor invocation"
+    )
+    if args.decision == "AUTHORIZE_DRAFT_PREPARATION":
+        print(
+            "note: AUTHORIZE_DRAFT_PREPARATION authorizes only a future "
+            "draft-preparation step; no draft was generated"
+        )
+    return 0
 
 
 def cmd_orchestrator_clarify(args: argparse.Namespace) -> int:
@@ -694,6 +725,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="owner-provided clarification text (preserved verbatim)",
     )
     orchestrator_clarify_parser.set_defaults(func=cmd_orchestrator_clarify)
+
+    orchestrator_decide_readiness_parser = orchestrator_sub.add_parser(
+        "decide-readiness",
+        help="record owner readiness decision after review (non-authoritative)",
+        description=(
+            "Record an owner-provided readiness decision for an existing GOAL_INTAKE "
+            "after readiness review. Does not call an LLM, modify goal-intake.json, "
+            "modify clarifications, change planning_readiness, generate planning drafts, "
+            "create planning workspaces, approve architecture, create runs, "
+            "or invoke an executor. AUTHORIZE_DRAFT_PREPARATION authorizes only a "
+            "future draft-preparation step."
+        ),
+    )
+    orchestrator_decide_readiness_parser.add_argument(
+        "intake_id",
+        help="intake identifier (filesystem-safe slug)",
+    )
+    orchestrator_decide_readiness_parser.add_argument(
+        "path",
+        nargs="?",
+        help="target project directory",
+    )
+    orchestrator_decide_readiness_parser.add_argument(
+        "--decision",
+        required=True,
+        choices=sorted(OWNER_READINESS_DECISION_VALUES),
+        help="owner readiness decision value",
+    )
+    orchestrator_decide_readiness_parser.add_argument(
+        "--decision-id",
+        required=True,
+        help="decision identifier (filesystem-safe slug)",
+    )
+    orchestrator_decide_readiness_parser.add_argument(
+        "--summary",
+        required=True,
+        help="owner-provided decision summary (preserved verbatim)",
+    )
+    orchestrator_decide_readiness_parser.set_defaults(func=cmd_orchestrator_decide_readiness)
 
     return parser
 

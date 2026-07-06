@@ -11,13 +11,16 @@ from pathlib import Path
 from agent_os.paths import (
     CLARIFICATIONS_DIR,
     GOAL_INTAKE_FILE,
+    READINESS_DECISIONS_DIR,
     orchestrator_clarification_path,
     orchestrator_intake_path,
+    orchestrator_readiness_decision_path,
     workspace_path,
 )
 
 INTAKE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 CLARIFICATION_ID_PATTERN = INTAKE_ID_PATTERN
+READINESS_DECISION_ID_PATTERN = INTAKE_ID_PATTERN
 
 GOAL_INTAKE_REQUIRED_FIELDS = (
     "artifact_type",
@@ -100,6 +103,61 @@ READINESS_REVIEW_NON_AUTHORITY_FLAGS = (
 
 FORBIDDEN_READINESS_REVIEW_STATES = frozenset({"DRAFT_ALLOWED", "READY_FOR_DRAFT"})
 
+OWNER_READINESS_DECISION_ARTIFACT_TYPE = "OWNER_READINESS_DECISION"
+OWNER_READINESS_DECISION_SCHEMA_VERSION = "0.1"
+
+OWNER_READINESS_DECISION_VALUES = frozenset(
+    {
+        "REQUEST_MORE_CLARIFICATION",
+        "BLOCK_INTAKE",
+        "AUTHORIZE_DRAFT_PREPARATION",
+    }
+)
+
+AUTHORIZE_DRAFT_PREPARATION_ALLOWED_STATES = frozenset(
+    {
+        "OWNER_CLARIFICATION_PRESENT_REVIEW_REQUIRED",
+        "OWNER_REVIEW_REQUIRED",
+    }
+)
+
+AUTHORIZE_DRAFT_PREPARATION_FORBIDDEN_STATES = frozenset(
+    {
+        "BLOCKED_INVALID_INTAKE",
+        "BLOCKED_REQUIRES_CLARIFICATION",
+    }
+)
+
+OWNER_READINESS_DECISION_REQUIRED_FIELDS = (
+    "artifact_type",
+    "schema_version",
+    "intake_id",
+    "decision_id",
+    "decision",
+    "owner_summary",
+    "readiness_review_state_at_decision",
+    "next_required_action_at_decision",
+    "owner_clarification_count_at_decision",
+    "latest_clarification_id_at_decision",
+    "created_at",
+    "non_authority",
+)
+
+OWNER_READINESS_DECISION_NON_AUTHORITY_FLAGS = (
+    "does_not_create_plan",
+    "does_not_generate_planning_draft",
+    "does_not_validate_planning_workspace",
+    "does_not_approve_plan",
+    "does_not_transition_workspace",
+    "does_not_create_runner_proposal",
+    "does_not_create_run",
+    "does_not_invoke_executor",
+    "does_not_approve_architecture",
+    "does_not_modify_goal_intake",
+    "does_not_modify_clarifications",
+    "authorizes_future_draft_preparation_only_when_decision_is_authorize",
+)
+
 GOAL_INTAKE_REQUIRED_STRING_FIELDS = (
     "artifact_type",
     "schema_version",
@@ -150,6 +208,28 @@ def validate_intake_id(intake_id: str) -> None:
         raise ValueError(f"invalid intake id: {intake_id!r}")
     if not INTAKE_ID_PATTERN.match(intake_id):
         raise ValueError(f"invalid intake id: {intake_id!r}")
+
+
+def validate_readiness_decision_id(decision_id: str) -> None:
+    """Reject unsafe or invalid readiness decision identifiers."""
+    if not decision_id:
+        raise ValueError("decision id must not be empty")
+    if decision_id != decision_id.strip():
+        raise ValueError(
+            "decision id must not contain leading or trailing whitespace"
+        )
+    if " " in decision_id:
+        raise ValueError(f"invalid decision id: {decision_id!r}")
+    if "/" in decision_id or "\\" in decision_id or ".." in decision_id:
+        raise ValueError(f"invalid decision id: {decision_id!r}")
+    if decision_id.startswith(".") or any(
+        part.startswith(".") for part in re.split(r"[\\/]", decision_id)
+    ):
+        raise ValueError(f"invalid decision id: {decision_id!r}")
+    if Path(decision_id).is_absolute():
+        raise ValueError(f"invalid decision id: {decision_id!r}")
+    if not READINESS_DECISION_ID_PATTERN.match(decision_id):
+        raise ValueError(f"invalid decision id: {decision_id!r}")
 
 
 def validate_clarification_id(clarification_id: str) -> None:
@@ -475,6 +555,7 @@ def _format_goal_intake_status(
     artifact: dict,
     validation_errors: list[str],
     clarifications: tuple[OwnerClarificationRecord, ...] = (),
+    readiness_decisions: tuple[OwnerReadinessDecisionRecord, ...] = (),
 ) -> str:
     goal_text = artifact.get("normalized_goal") or artifact.get("raw_goal") or "?"
     open_questions = artifact.get("open_questions")
@@ -498,6 +579,11 @@ def _format_goal_intake_status(
         latest = clarifications[-1]
         lines.append(f"latest_clarification_id: {latest.clarification_id}")
         lines.append(f"latest_clarification_created_at: {latest.created_at}")
+    lines.append(f"owner_readiness_decisions: {len(readiness_decisions)}")
+    if readiness_decisions:
+        latest_decision = readiness_decisions[-1]
+        lines.append(f"latest_readiness_decision_id: {latest_decision.decision_id}")
+        lines.append(f"latest_readiness_decision: {latest_decision.decision}")
     lines.append(f"validation: {'OK' if not validation_errors else 'INVALID'}")
     for error in validation_errors:
         lines.append(f"  - {error}")
@@ -505,6 +591,10 @@ def _format_goal_intake_status(
     lines.append(
         "note: owner clarifications are additive context only; "
         "they do not create a planning draft and do not change planning_readiness"
+    )
+    lines.append(
+        "note: owner readiness decisions are owner-provided records only; "
+        "they do not generate a planning draft"
     )
     lines.append(
         "note: read-only inspection; validation is not approval or planning generation"
@@ -543,11 +633,13 @@ def goal_intake_status(project: Path, intake_id: str) -> GoalIntakeStatusReport:
         raw_text=raw_text,
     )
     clarifications = list_owner_clarifications(project, intake_id)
+    readiness_decisions = list_owner_readiness_decisions(project, intake_id)
     output = _format_goal_intake_status(
         path,
         artifact,
         validation_errors,
         clarifications,
+        readiness_decisions,
     )
     return GoalIntakeStatusReport(output, not validation_errors)
 
@@ -920,6 +1012,7 @@ def _format_goal_intake_readiness(
     goal_intake_valid: bool,
     artifact: dict | None,
     clarifications: tuple[OwnerClarificationRecord, ...],
+    readiness_decisions: tuple[OwnerReadinessDecisionRecord, ...],
     readiness_review_state: str,
     next_required_action: str,
     blocking_reasons: list[str],
@@ -944,6 +1037,11 @@ def _format_goal_intake_readiness(
     ]
     if latest_clarification_id is not None:
         lines.append(f"latest_clarification_id: {latest_clarification_id}")
+    lines.append(f"owner_readiness_decision_count: {len(readiness_decisions)}")
+    if readiness_decisions:
+        latest_decision = readiness_decisions[-1]
+        lines.append(f"latest_readiness_decision_id: {latest_decision.decision_id}")
+        lines.append(f"latest_readiness_decision: {latest_decision.decision}")
     lines.append(f"readiness_review_state: {readiness_review_state}")
     lines.append(f"next_required_action: {next_required_action}")
     if blocking_reasons:
@@ -959,6 +1057,9 @@ def _format_goal_intake_readiness(
     )
     lines.append(
         "note: owner clarifications do not automatically make an intake draft-ready"
+    )
+    lines.append(
+        "note: owner readiness decisions do not generate a planning draft"
     )
     return "\n".join(lines)
 
@@ -1015,6 +1116,7 @@ def review_goal_intake_readiness(
         project,
         intake_id,
     )
+    readiness_decisions = list_owner_readiness_decisions(project, intake_id)
     readiness_review_state, next_required_action, blocking_reasons = (
         _determine_readiness_review(
             validation_errors=validation_errors,
@@ -1047,6 +1149,7 @@ def review_goal_intake_readiness(
         goal_intake_valid=goal_intake_valid,
         artifact=artifact,
         clarifications=clarifications,
+        readiness_decisions=readiness_decisions,
         readiness_review_state=readiness_review_state,
         next_required_action=next_required_action,
         blocking_reasons=blocking_reasons,
@@ -1064,6 +1167,342 @@ def review_goal_intake_readiness(
         blocking_reasons=tuple(blocking_reasons),
         non_authority=non_authority,
     )
+
+
+def _validate_readiness_decision_allowed(
+    decision: str,
+    readiness_report: GoalIntakeReadinessReport,
+) -> None:
+    """Enforce decision gating from the current readiness review snapshot."""
+    if decision not in OWNER_READINESS_DECISION_VALUES:
+        raise ValueError(f"unsupported decision value: {decision!r}")
+
+    if not readiness_report.goal_intake_valid:
+        raise ValueError("decision requires a valid goal intake artifact")
+
+    state = readiness_report.readiness_review_state
+    if decision == "AUTHORIZE_DRAFT_PREPARATION":
+        if state in AUTHORIZE_DRAFT_PREPARATION_FORBIDDEN_STATES:
+            raise ValueError(
+                f"AUTHORIZE_DRAFT_PREPARATION is not allowed when "
+                f"readiness_review_state is {state!r}"
+            )
+        if state not in AUTHORIZE_DRAFT_PREPARATION_ALLOWED_STATES:
+            raise ValueError(
+                f"AUTHORIZE_DRAFT_PREPARATION is not allowed when "
+                f"readiness_review_state is {state!r}"
+            )
+
+
+@dataclass(frozen=True)
+class OwnerReadinessDecisionRecord:
+    decision_id: str
+    decision: str
+    created_at: str
+    path: Path
+
+
+@dataclass(frozen=True)
+class OwnerReadinessDecisionValidationReport:
+    output: str
+    valid: bool
+    errors: tuple[str, ...]
+
+
+def build_owner_readiness_decision_artifact(
+    intake_id: str,
+    decision_id: str,
+    decision: str,
+    owner_summary: str,
+    *,
+    readiness_review_state_at_decision: str,
+    next_required_action_at_decision: str,
+    owner_clarification_count_at_decision: int,
+    latest_clarification_id_at_decision: str | None,
+    created_at: str | None = None,
+) -> dict:
+    """Build the deterministic OWNER_READINESS_DECISION artifact payload."""
+    validate_intake_id(intake_id)
+    validate_readiness_decision_id(decision_id)
+    if decision not in OWNER_READINESS_DECISION_VALUES:
+        raise ValueError(f"unsupported decision value: {decision!r}")
+    if not owner_summary:
+        raise ValueError("owner summary must not be empty")
+
+    return {
+        "artifact_type": OWNER_READINESS_DECISION_ARTIFACT_TYPE,
+        "schema_version": OWNER_READINESS_DECISION_SCHEMA_VERSION,
+        "intake_id": intake_id,
+        "decision_id": decision_id,
+        "decision": decision,
+        "owner_summary": owner_summary,
+        "readiness_review_state_at_decision": readiness_review_state_at_decision,
+        "next_required_action_at_decision": next_required_action_at_decision,
+        "owner_clarification_count_at_decision": owner_clarification_count_at_decision,
+        "latest_clarification_id_at_decision": latest_clarification_id_at_decision,
+        "created_at": created_at or _utc_now(),
+        "non_authority": {
+            key: True for key in OWNER_READINESS_DECISION_NON_AUTHORITY_FLAGS
+        },
+    }
+
+
+def _validate_owner_readiness_decision_payload(
+    artifact: object,
+    intake_id: str,
+    decision_id: str,
+) -> list[str]:
+    """Return structural validation errors for OWNER_READINESS_DECISION payload."""
+    errors: list[str] = []
+
+    if not isinstance(artifact, dict):
+        return ["owner readiness decision artifact must be a JSON object"]
+
+    for field in OWNER_READINESS_DECISION_REQUIRED_FIELDS:
+        if field not in artifact:
+            errors.append(f"missing required field: {field}")
+
+    artifact_type = artifact.get("artifact_type")
+    if (
+        artifact_type is not None
+        and artifact_type != OWNER_READINESS_DECISION_ARTIFACT_TYPE
+    ):
+        errors.append(
+            f"wrong artifact_type: expected {OWNER_READINESS_DECISION_ARTIFACT_TYPE!r}, "
+            f"found {artifact_type!r}"
+        )
+
+    schema_version = artifact.get("schema_version")
+    if (
+        schema_version is not None
+        and schema_version != OWNER_READINESS_DECISION_SCHEMA_VERSION
+    ):
+        errors.append(
+            f"unsupported schema_version: expected "
+            f"{OWNER_READINESS_DECISION_SCHEMA_VERSION!r}, found {schema_version!r}"
+        )
+
+    artifact_intake_id = artifact.get("intake_id")
+    if isinstance(artifact_intake_id, str) and artifact_intake_id != intake_id:
+        errors.append(
+            "intake_id mismatch: "
+            f"path {intake_id!r}, artifact {artifact_intake_id!r}"
+        )
+
+    artifact_decision_id = artifact.get("decision_id")
+    if isinstance(artifact_decision_id, str) and artifact_decision_id != decision_id:
+        errors.append(
+            "decision_id mismatch: "
+            f"path {decision_id!r}, artifact {artifact_decision_id!r}"
+        )
+
+    decision = artifact.get("decision")
+    if decision is not None and decision not in OWNER_READINESS_DECISION_VALUES:
+        errors.append(f"invalid decision value: {decision!r}")
+
+    owner_summary = artifact.get("owner_summary")
+    if owner_summary is not None:
+        error = _non_empty_string(owner_summary, "owner_summary")
+        if error:
+            errors.append(error)
+
+    clarification_count = artifact.get("owner_clarification_count_at_decision")
+    if clarification_count is not None and not isinstance(clarification_count, int):
+        errors.append("owner_clarification_count_at_decision must be an integer")
+
+    latest_clarification = artifact.get("latest_clarification_id_at_decision")
+    if latest_clarification is not None and not isinstance(
+        latest_clarification, (str, type(None))
+    ):
+        errors.append("latest_clarification_id_at_decision must be a string or null")
+
+    created_at = artifact.get("created_at")
+    if created_at is not None and not _parse_created_at(created_at):
+        errors.append("created_at must be a parseable ISO-8601 timestamp")
+
+    non_authority = artifact.get("non_authority")
+    if non_authority is None:
+        errors.append("missing required field: non_authority")
+    elif not isinstance(non_authority, dict):
+        errors.append("non_authority must be an object")
+    else:
+        for flag in OWNER_READINESS_DECISION_NON_AUTHORITY_FLAGS:
+            if flag not in non_authority:
+                errors.append(f"missing non_authority flag: {flag}")
+            elif non_authority[flag] is not True:
+                errors.append(f"non_authority flag must be true: {flag}")
+
+    return errors
+
+
+def create_owner_readiness_decision(
+    project: Path,
+    intake_id: str,
+    decision_id: str,
+    decision: str,
+    owner_summary: str,
+) -> Path:
+    """Create an OWNER_READINESS_DECISION artifact without mutating intake or clarifications."""
+    validate_readiness_decision_id(decision_id)
+    if decision not in OWNER_READINESS_DECISION_VALUES:
+        raise ValueError(f"unsupported decision value: {decision!r}")
+    if not owner_summary:
+        raise ValueError("owner summary must not be empty")
+
+    _require_valid_goal_intake(project, intake_id)
+    readiness_report = review_goal_intake_readiness(project, intake_id)
+    _validate_readiness_decision_allowed(decision, readiness_report)
+
+    artifact = build_owner_readiness_decision_artifact(
+        intake_id,
+        decision_id,
+        decision,
+        owner_summary,
+        readiness_review_state_at_decision=readiness_report.readiness_review_state,
+        next_required_action_at_decision=readiness_report.next_required_action,
+        owner_clarification_count_at_decision=readiness_report.owner_clarification_count,
+        latest_clarification_id_at_decision=readiness_report.latest_clarification_id,
+    )
+
+    dest = orchestrator_readiness_decision_path(project, intake_id, decision_id)
+    if dest.exists():
+        raise FileExistsError(
+            f"owner readiness decision artifact already exists: {decision_id}"
+        )
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(dest, artifact)
+    return dest
+
+
+def load_owner_readiness_decision(
+    project: Path,
+    intake_id: str,
+    decision_id: str,
+) -> dict:
+    """Load an OWNER_READINESS_DECISION artifact from disk (read-only)."""
+    validate_intake_id(intake_id)
+    validate_readiness_decision_id(decision_id)
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        raise FileNotFoundError("no workspace found (run `agent-os init` first)")
+
+    path = orchestrator_readiness_decision_path(project, intake_id, decision_id)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"owner readiness decision artifact not found: {decision_id}"
+        )
+
+    try:
+        artifact = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"invalid readiness decision artifact for {decision_id}: {exc.msg}"
+        ) from exc
+
+    if not isinstance(artifact, dict):
+        raise ValueError(
+            f"invalid readiness decision artifact for {decision_id}: expected object"
+        )
+
+    return artifact
+
+
+def list_owner_readiness_decisions(
+    project: Path,
+    intake_id: str,
+) -> tuple[OwnerReadinessDecisionRecord, ...]:
+    """List owner readiness decision records for an intake (read-only)."""
+    validate_intake_id(intake_id)
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        raise FileNotFoundError("no workspace found (run `agent-os init` first)")
+
+    decisions_dir = (
+        orchestrator_intake_path(project, intake_id) / READINESS_DECISIONS_DIR
+    )
+    if not decisions_dir.is_dir():
+        return ()
+
+    records: list[OwnerReadinessDecisionRecord] = []
+    for path in sorted(decisions_dir.glob("*.json")):
+        decision_id = path.stem
+        try:
+            artifact = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(artifact, dict):
+            continue
+        created_at = artifact.get("created_at")
+        if not isinstance(created_at, str):
+            created_at = ""
+        decision = artifact.get("decision")
+        if not isinstance(decision, str):
+            decision = ""
+        records.append(
+            OwnerReadinessDecisionRecord(
+                decision_id=decision_id,
+                decision=decision,
+                created_at=created_at,
+                path=path,
+            )
+        )
+
+    records.sort(key=lambda record: (record.created_at, record.decision_id))
+    return tuple(records)
+
+
+def validate_owner_readiness_decision(
+    project: Path,
+    intake_id: str,
+    decision_id: str,
+) -> OwnerReadinessDecisionValidationReport:
+    """Strict read-only structural validation of an OWNER_READINESS_DECISION artifact."""
+    validate_intake_id(intake_id)
+    validate_readiness_decision_id(decision_id)
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        raise FileNotFoundError("no workspace found (run `agent-os init` first)")
+
+    path = orchestrator_readiness_decision_path(project, intake_id, decision_id)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"owner readiness decision artifact not found: {decision_id}"
+        )
+
+    raw_text = path.read_text(encoding="utf-8")
+    errors: list[str] = []
+    try:
+        artifact = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        errors = [f"malformed JSON: {exc.msg}"]
+    else:
+        errors = _validate_owner_readiness_decision_payload(
+            artifact,
+            intake_id,
+            decision_id,
+        )
+
+    lines = [
+        f"owner readiness decision artifact: {path}",
+        f"intake_id: {intake_id}",
+        f"decision_id: {decision_id}",
+        f"structural validation: {'OK' if not errors else 'INVALID'}",
+    ]
+    for error in errors:
+        lines.append(f"  - {error}")
+    lines.append(f"final validation result: {'OK' if not errors else 'INVALID'}")
+    if not errors:
+        lines.append(
+            "note: readiness decision is owner-provided context only; "
+            "not approval, not planning generation, and no intake files were modified"
+        )
+
+    output = "\n".join(lines)
+    return OwnerReadinessDecisionValidationReport(output, not errors, tuple(errors))
 
 
 def create_goal_intake(project: Path, intake_id: str, raw_goal: str) -> Path:
