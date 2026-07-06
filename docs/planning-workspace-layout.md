@@ -241,6 +241,19 @@ agent-os planning init <plan-id> [PATH]
 
 This creates `.agent-os/planning/<plan-id>/` with templates copied from `agent_os/templates/planning/`, a DRAFT `manifest.json`, subdirectories, and a non-authority `README.md`. It does **not** execute code, create runs, invoke agents, or validate artifact content.
 
+After orchestrator intake authorization, a DRAFT scaffold may also be created from intake provenance:
+
+```bash
+agent-os orchestrator prepare-planning-draft <intake-id> --plan-id <plan-id> [PATH]
+```
+
+Requires successful `agent-os orchestrator draft-preflight` first. Creates the same DRAFT workspace layout as `planning init`, plus orchestrator traceability artifacts under `evidence/`:
+
+- `evidence/orchestrator-provenance.json` — links the scaffold to the intake and authorize decision; **provenance is traceability only, not authority**
+- `evidence/orchestrator-draft-scaffold-notes.md` — explicit scaffold boundary notes only; **not architecture approval, not plan approval, not workspace validation**
+
+The workspace remains **`DRAFT`** — it is **not validated or approved**. Architecture and implementation plan content are **not generated** (only existing template placeholders). Does **not** generate `PLANNING_RUN_SLICE`; does **not** transition status; does **not** create runner proposals, runs, or executor invocations; and does **not** mutate orchestrator intake artifacts.
+
 Inspect an existing planning workspace (read-only):
 
 ```bash

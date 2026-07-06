@@ -13,6 +13,8 @@ INTAKES_DIR = "intakes"
 GOAL_INTAKE_FILE = "goal-intake.json"
 CLARIFICATIONS_DIR = "clarifications"
 READINESS_DECISIONS_DIR = "readiness-decisions"
+ORCHESTRATOR_PROVENANCE_FILE = "orchestrator-provenance.json"
+ORCHESTRATOR_DRAFT_SCAFFOLD_NOTES_FILE = "orchestrator-draft-scaffold-notes.md"
 META_FILE = "run.json"
 
 PLACEHOLDER_VALUES = frozenset(

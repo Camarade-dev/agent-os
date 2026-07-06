@@ -14,6 +14,7 @@ from agent_os.orchestrator import (
     create_owner_readiness_decision,
     goal_intake_status,
     preflight_draft_preparation,
+    prepare_planning_workspace_draft,
     review_goal_intake_readiness,
     validate_goal_intake,
 )
@@ -349,6 +350,21 @@ def cmd_orchestrator_draft_preflight(args: argparse.Namespace) -> int:
         == "DRAFT_PREPARATION_AUTHORIZATION_CONFIRMED_NO_DRAFT_GENERATED"
     )
     return 0 if confirmed else 1
+
+
+def cmd_orchestrator_prepare_planning_draft(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        report = prepare_planning_workspace_draft(
+            project,
+            args.intake_id,
+            args.plan_id,
+        )
+    except (FileNotFoundError, FileExistsError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(report.output)
+    return 0
 
 
 def cmd_orchestrator_clarify(args: argparse.Namespace) -> int:
@@ -804,6 +820,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="target project directory",
     )
     orchestrator_draft_preflight_parser.set_defaults(func=cmd_orchestrator_draft_preflight)
+
+    orchestrator_prepare_planning_draft_parser = orchestrator_sub.add_parser(
+        "prepare-planning-draft",
+        help="create DRAFT planning workspace scaffold after draft-preflight (no architecture)",
+        description=(
+            "Create a DRAFT planning workspace scaffold from an orchestrator intake "
+            "only after draft-preflight confirms AUTHORIZE_DRAFT_PREPARATION remains "
+            "coherent. Copies normal planning init templates and writes orchestrator "
+            "provenance under evidence/. Does not call an LLM, generate architecture "
+            "decisions, generate an implementation plan, generate PLANNING_RUN_SLICE, "
+            "validate or approve the workspace, transition status, create runner "
+            "proposals, create runs, or invoke an executor."
+        ),
+    )
+    orchestrator_prepare_planning_draft_parser.add_argument(
+        "intake_id",
+        help="intake identifier (filesystem-safe slug)",
+    )
+    orchestrator_prepare_planning_draft_parser.add_argument(
+        "path",
+        nargs="?",
+        help="target project directory",
+    )
+    orchestrator_prepare_planning_draft_parser.add_argument(
+        "--plan-id",
+        required=True,
+        help="planning workspace identifier (filesystem-safe slug)",
+    )
+    orchestrator_prepare_planning_draft_parser.set_defaults(
+        func=cmd_orchestrator_prepare_planning_draft
+    )
 
     return parser
 

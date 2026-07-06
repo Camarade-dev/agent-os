@@ -1,11 +1,12 @@
 # Goal intake artifact
 
-> **Status:** deterministic scaffold in `CORE_ORCHESTRATOR_002`; read-only status and validation in `CORE_ORCHESTRATOR_003`; owner clarification records in `CORE_ORCHESTRATOR_004`; read-only readiness review in `CORE_ORCHESTRATOR_005`; owner readiness decision records in `CORE_ORCHESTRATOR_006`; read-only draft-preparation authorization preflight in `CORE_ORCHESTRATOR_007`  
+> **Status:** deterministic scaffold in `CORE_ORCHESTRATOR_002`; read-only status and validation in `CORE_ORCHESTRATOR_003`; owner clarification records in `CORE_ORCHESTRATOR_004`; read-only readiness review in `CORE_ORCHESTRATOR_005`; owner readiness decision records in `CORE_ORCHESTRATOR_006`; read-only draft-preparation authorization preflight in `CORE_ORCHESTRATOR_007`; DRAFT planning workspace scaffold in `CORE_ORCHESTRATOR_008`  
 > **Commands:**
 > - `agent-os orchestrator intake <intake-id> --goal "<raw goal>" [PATH]`
 > - `agent-os orchestrator clarify <intake-id> --clarification-id <clarification-id> --answer "<owner-provided clarification>" [PATH]`
 > - `agent-os orchestrator decide-readiness <intake-id> --decision <decision> --decision-id <decision-id> --summary "<owner summary>" [PATH]`
 > - `agent-os orchestrator draft-preflight <intake-id> [PATH]` (read-only)
+> - `agent-os orchestrator prepare-planning-draft <intake-id> --plan-id <plan-id> [PATH]`
 > - `agent-os orchestrator status <intake-id> [PATH]` (read-only)
 > - `agent-os orchestrator validate <intake-id> [PATH]` (read-only)
 > - `agent-os orchestrator readiness <intake-id> [PATH]` (read-only)
@@ -25,6 +26,8 @@ The readiness command performs a read-only readiness review of the goal intake a
 The decide-readiness command records an owner-provided readiness decision after readiness review. It writes a separate `OWNER_READINESS_DECISION` JSON file only. It does **not** call an LLM, modify `goal-intake.json`, modify clarification artifacts, change `planning_readiness`, generate planning drafts, create planning workspaces, approve architecture, create runner proposals, create runs, or invoke an executor. **`AUTHORIZE_DRAFT_PREPARATION` authorizes only a future draft-preparation step** — not draft generation now, not planning approval, not architecture approval, and not execution. Future generated drafts would still need independent validation and owner approval.
 
 The draft-preflight command performs a read-only draft-preparation authorization preflight for an existing intake. It runs the current readiness review, loads owner readiness decision records, identifies the latest decision, and checks whether `AUTHORIZE_DRAFT_PREPARATION` remains coherent with the current readiness review snapshot. It does **not** call an LLM, generate planning drafts, create planning workspaces, approve architecture, approve plans, create runner proposals, create runs, or invoke an executor. **Draft-preparation preflight is not draft generation** — it confirms authorization only and points to a separate future draft-preparation command. Future generated drafts would still need independent validation and owner approval.
+
+The prepare-planning-draft command creates a **DRAFT planning workspace scaffold** from an orchestrator intake only after draft-preflight confirms authorization. It uses the same template bootstrap as `agent-os planning init`, writes orchestrator provenance under `evidence/orchestrator-provenance.json`, and records explicit scaffold boundary notes. It does **not** call an LLM, generate architecture decisions, generate an implementation plan, generate `PLANNING_RUN_SLICE`, validate or approve the workspace, transition workspace status, create runner proposals, create runs, or invoke an executor. It does **not** modify `goal-intake.json`, clarification artifacts, or readiness decision artifacts. **Draft scaffold is not a validated workspace, not architecture approval, and not plan approval.** Provenance is traceability only, not authority. Future manual or agent planning, independent validation, and owner approval remain required.
 
 ---
 
