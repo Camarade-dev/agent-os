@@ -254,6 +254,19 @@ Requires successful `agent-os orchestrator draft-preflight` first. Creates the s
 
 The workspace remains **`DRAFT`** — it is **not validated or approved**. Architecture and implementation plan content are **not generated** (only existing template placeholders). Does **not** generate `PLANNING_RUN_SLICE`; does **not** transition status; does **not** create runner proposals, runs, or executor invocations; and does **not** mutate orchestrator intake artifacts.
 
+After scaffold creation, transport owner-provided intake context into the planning workspace:
+
+```bash
+agent-os orchestrator transport-planning-context <intake-id> --plan-id <plan-id> [PATH]
+```
+
+Requires an existing DRAFT scaffold from `prepare-planning-draft` for the same intake/plan pair, confirmed draft-preflight, and matching orchestrator provenance. Writes bounded context transport artifacts under `evidence/`:
+
+- `evidence/orchestrator-context-transport.json` — structured copy of goal intake context, clarifications, readiness decision, and preflight snapshot; **transported context is source material only, not authority**
+- `evidence/orchestrator-context-transport.md` — human-readable copy with explicit boundary notes; **not architecture approval, not implementation plan, not workspace validation**
+
+Transport copies owner-provided context; it does **not** interpret it, generate architecture, generate implementation plans, or generate `PLANNING_RUN_SLICE`. The workspace remains **`DRAFT`** — it is **not validated or approved**. Does **not** mutate core planning templates (`context-pack.md`, `local-agentic-spec.md`, `implementation-plan.md`, `planning-audit.md`), orchestrator intake artifacts, or orchestrator provenance. Future architecture decision, independent validation, owner approval, and runner proposal generation remain separate.
+
 Inspect an existing planning workspace (read-only):
 
 ```bash

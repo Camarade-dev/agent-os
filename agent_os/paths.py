@@ -15,6 +15,8 @@ CLARIFICATIONS_DIR = "clarifications"
 READINESS_DECISIONS_DIR = "readiness-decisions"
 ORCHESTRATOR_PROVENANCE_FILE = "orchestrator-provenance.json"
 ORCHESTRATOR_DRAFT_SCAFFOLD_NOTES_FILE = "orchestrator-draft-scaffold-notes.md"
+ORCHESTRATOR_CONTEXT_TRANSPORT_FILE = "orchestrator-context-transport.json"
+ORCHESTRATOR_CONTEXT_TRANSPORT_MD_FILE = "orchestrator-context-transport.md"
 META_FILE = "run.json"
 
 PLACEHOLDER_VALUES = frozenset(
