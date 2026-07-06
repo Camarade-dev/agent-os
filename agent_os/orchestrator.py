@@ -158,6 +158,29 @@ OWNER_READINESS_DECISION_NON_AUTHORITY_FLAGS = (
     "authorizes_future_draft_preparation_only_when_decision_is_authorize",
 )
 
+DRAFT_PREPARATION_PREFLIGHT_NON_AUTHORITY_FLAGS = (
+    "does_not_create_plan",
+    "does_not_generate_planning_draft",
+    "does_not_create_planning_workspace",
+    "does_not_validate_planning_workspace",
+    "does_not_approve_plan",
+    "does_not_approve_architecture",
+    "does_not_transition_workspace",
+    "does_not_create_runner_proposal",
+    "does_not_create_run",
+    "does_not_invoke_executor",
+    "does_not_modify_goal_intake",
+    "does_not_modify_clarifications",
+    "does_not_modify_readiness_decisions",
+    "requires_separate_future_draft_preparation_command",
+    "requires_future_independent_validation_before_plan_approval",
+    "requires_future_owner_approval_before_run_proposals",
+)
+
+FORBIDDEN_DRAFT_PREPARATION_PREFLIGHT_STATES = frozenset(
+    {"DRAFT_ALLOWED", "READY_FOR_DRAFT"}
+)
+
 GOAL_INTAKE_REQUIRED_STRING_FIELDS = (
     "artifact_type",
     "schema_version",
@@ -1503,6 +1526,301 @@ def validate_owner_readiness_decision(
 
     output = "\n".join(lines)
     return OwnerReadinessDecisionValidationReport(output, not errors, tuple(errors))
+
+
+@dataclass(frozen=True)
+class _PreflightDecisionEntry:
+    record: OwnerReadinessDecisionRecord
+    artifact: dict | None
+    validation_errors: tuple[str, ...]
+
+
+def _collect_preflight_decision_entries(
+    project: Path,
+    intake_id: str,
+) -> tuple[tuple[_PreflightDecisionEntry, ...], list[str]]:
+    """Load readiness decision files with validation metadata (read-only)."""
+    decisions_dir = (
+        orchestrator_intake_path(project, intake_id) / READINESS_DECISIONS_DIR
+    )
+    if not decisions_dir.is_dir():
+        return (), []
+
+    entries: list[_PreflightDecisionEntry] = []
+    blocking: list[str] = []
+
+    for path in sorted(decisions_dir.glob("*.json")):
+        decision_id = path.stem
+        raw_text = path.read_text(encoding="utf-8")
+        validation_errors: list[str] = []
+        artifact: dict | None = None
+        try:
+            loaded = json.loads(raw_text)
+        except json.JSONDecodeError as exc:
+            validation_errors = [f"malformed JSON: {exc.msg}"]
+        else:
+            validation_errors = _validate_owner_readiness_decision_payload(
+                loaded,
+                intake_id,
+                decision_id,
+            )
+            if isinstance(loaded, dict):
+                artifact = loaded
+            else:
+                validation_errors.append(
+                    "owner readiness decision artifact must be a JSON object"
+                )
+
+        created_at = ""
+        decision = ""
+        if artifact is not None:
+            created_at_value = artifact.get("created_at")
+            if isinstance(created_at_value, str):
+                created_at = created_at_value
+            decision_value = artifact.get("decision")
+            if isinstance(decision_value, str):
+                decision = decision_value
+
+        record = OwnerReadinessDecisionRecord(
+            decision_id=decision_id,
+            decision=decision,
+            created_at=created_at,
+            path=path,
+        )
+        if validation_errors:
+            for error in validation_errors:
+                blocking.append(f"invalid readiness decision {decision_id}: {error}")
+
+        entries.append(
+            _PreflightDecisionEntry(
+                record=record,
+                artifact=artifact,
+                validation_errors=tuple(validation_errors),
+            )
+        )
+
+    entries.sort(key=lambda entry: (entry.record.created_at, entry.record.decision_id))
+    return tuple(entries), blocking
+
+
+def _authorization_snapshot_coherent(
+    artifact: dict,
+    readiness_report: GoalIntakeReadinessReport,
+) -> bool:
+    """Return whether decision snapshot fields match the current readiness review."""
+    snapshot_state = artifact.get("readiness_review_state_at_decision")
+    snapshot_action = artifact.get("next_required_action_at_decision")
+    snapshot_count = artifact.get("owner_clarification_count_at_decision")
+    snapshot_latest = artifact.get("latest_clarification_id_at_decision")
+
+    if snapshot_state != readiness_report.readiness_review_state:
+        return False
+    if snapshot_action != readiness_report.next_required_action:
+        return False
+    if snapshot_count != readiness_report.owner_clarification_count:
+        return False
+    if snapshot_latest != readiness_report.latest_clarification_id:
+        return False
+    return True
+
+
+def _format_draft_preparation_preflight(
+    path: Path,
+    *,
+    intake_id: str,
+    goal_intake_valid: bool,
+    current_readiness_review_state: str,
+    current_next_required_action: str,
+    owner_readiness_decision_count: int,
+    latest_decision_id: str | None,
+    latest_decision: str | None,
+    latest_decision_created_at: str | None,
+    latest_decision_snapshot_state: str | None,
+    preflight_state: str,
+    next_required_action: str,
+    blocking_reasons: list[str],
+    non_authority: dict[str, bool],
+) -> str:
+    lines = [
+        f"draft-preparation authorization preflight: {path}",
+        f"intake_id: {intake_id}",
+        f"goal_intake_valid: {'yes' if goal_intake_valid else 'no'}",
+        f"current_readiness_review_state: {current_readiness_review_state}",
+        f"current_next_required_action: {current_next_required_action}",
+        f"owner_readiness_decision_count: {owner_readiness_decision_count}",
+    ]
+    if latest_decision_id is not None:
+        lines.append(f"latest_decision_id: {latest_decision_id}")
+    if latest_decision is not None:
+        lines.append(f"latest_decision: {latest_decision}")
+    if latest_decision_created_at is not None:
+        lines.append(f"latest_decision_created_at: {latest_decision_created_at}")
+    if latest_decision_snapshot_state is not None:
+        lines.append(
+            f"latest_decision_snapshot_state: {latest_decision_snapshot_state}"
+        )
+    lines.append(f"preflight_state: {preflight_state}")
+    lines.append(f"next_required_action: {next_required_action}")
+    if blocking_reasons:
+        lines.append("blocking_reasons:")
+        for reason in blocking_reasons:
+            lines.append(f"  - {reason}")
+    lines.append("non_authority:")
+    for flag in DRAFT_PREPARATION_PREFLIGHT_NON_AUTHORITY_FLAGS:
+        lines.append(f"  {flag}: true")
+    lines.append(
+        "note: draft-preparation preflight is read-only; "
+        "not draft generation, not planning workspace creation, "
+        "not architecture approval, not plan approval, and no files were modified"
+    )
+    if (
+        preflight_state
+        == "DRAFT_PREPARATION_AUTHORIZATION_CONFIRMED_NO_DRAFT_GENERATED"
+    ):
+        lines.append(
+            "note: authorization confirmed for a future draft-preparation command only; "
+            "no planning draft was generated"
+        )
+    return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class DraftPreparationPreflightReport:
+    output: str
+    intake_id: str
+    goal_intake_valid: bool
+    current_readiness_review_state: str
+    current_next_required_action: str
+    owner_readiness_decision_count: int
+    latest_decision_id: str | None
+    latest_decision: str | None
+    latest_decision_created_at: str | None
+    latest_decision_snapshot_state: str | None
+    preflight_state: str
+    next_required_action: str
+    blocking_reasons: tuple[str, ...]
+    non_authority: dict[str, bool]
+
+
+def preflight_draft_preparation(
+    project: Path,
+    intake_id: str,
+) -> DraftPreparationPreflightReport:
+    """Read-only draft-preparation authorization preflight for an existing intake."""
+    validate_intake_id(intake_id)
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        raise FileNotFoundError("no workspace found (run `agent-os init` first)")
+
+    path = _goal_intake_artifact_path(project, intake_id)
+    if not path.is_file():
+        raise FileNotFoundError(f"goal intake artifact not found: {intake_id}")
+
+    readiness_report = review_goal_intake_readiness(project, intake_id)
+    decision_entries, decision_blocking = _collect_preflight_decision_entries(
+        project,
+        intake_id,
+    )
+    non_authority = {
+        key: True for key in DRAFT_PREPARATION_PREFLIGHT_NON_AUTHORITY_FLAGS
+    }
+
+    latest_decision_id: str | None = None
+    latest_decision: str | None = None
+    latest_decision_created_at: str | None = None
+    latest_decision_snapshot_state: str | None = None
+    blocking_reasons: list[str] = list(decision_blocking)
+    preflight_state: str
+    next_required_action: str
+
+    if not readiness_report.goal_intake_valid:
+        preflight_state = "BLOCKED_INVALID_INTAKE"
+        next_required_action = "FIX_GOAL_INTAKE_STRUCTURE"
+        blocking_reasons = list(readiness_report.blocking_reasons) + blocking_reasons
+    elif not decision_entries:
+        preflight_state = "BLOCKED_NO_READINESS_DECISION"
+        next_required_action = "ADD_OWNER_READINESS_DECISION"
+    else:
+        latest_entry = decision_entries[-1]
+        latest_decision_id = latest_entry.record.decision_id
+        latest_decision = latest_entry.record.decision or None
+        latest_decision_created_at = latest_entry.record.created_at or None
+        if latest_entry.artifact is not None:
+            snapshot_state = latest_entry.artifact.get(
+                "readiness_review_state_at_decision"
+            )
+            if isinstance(snapshot_state, str):
+                latest_decision_snapshot_state = snapshot_state
+
+        if latest_entry.validation_errors:
+            preflight_state = "BLOCKED_INVALID_READINESS_DECISION"
+            next_required_action = "RESOLVE_OR_REPLACE_READINESS_DECISION"
+        elif latest_decision == "REQUEST_MORE_CLARIFICATION":
+            preflight_state = "BLOCKED_LATEST_DECISION_REQUESTS_CLARIFICATION"
+            next_required_action = "ADD_OWNER_CLARIFICATION"
+        elif latest_decision == "BLOCK_INTAKE":
+            preflight_state = "BLOCKED_LATEST_DECISION_BLOCKS_INTAKE"
+            next_required_action = "STOP_INTAKE"
+        elif latest_decision == "AUTHORIZE_DRAFT_PREPARATION":
+            if latest_entry.artifact is None or not _authorization_snapshot_coherent(
+                latest_entry.artifact,
+                readiness_report,
+            ):
+                preflight_state = "BLOCKED_AUTHORIZATION_STALE_OR_INCOHERENT"
+                next_required_action = "RESOLVE_OR_REPLACE_READINESS_DECISION"
+                blocking_reasons.append(
+                    "authorization snapshot no longer matches current readiness review"
+                )
+            else:
+                preflight_state = (
+                    "DRAFT_PREPARATION_AUTHORIZATION_CONFIRMED_NO_DRAFT_GENERATED"
+                )
+                next_required_action = (
+                    "FUTURE_DRAFT_PREPARATION_STEP_REQUIRES_SEPARATE_COMMAND"
+                )
+        elif latest_decision in OWNER_READINESS_DECISION_VALUES:
+            preflight_state = "BLOCKED_LATEST_DECISION_NOT_AUTHORIZE"
+            next_required_action = "RESOLVE_OR_REPLACE_READINESS_DECISION"
+        else:
+            preflight_state = "BLOCKED_INVALID_READINESS_DECISION"
+            next_required_action = "RESOLVE_OR_REPLACE_READINESS_DECISION"
+
+    if preflight_state in FORBIDDEN_DRAFT_PREPARATION_PREFLIGHT_STATES:
+        raise ValueError(f"forbidden draft-preparation preflight state: {preflight_state}")
+
+    output = _format_draft_preparation_preflight(
+        path,
+        intake_id=intake_id,
+        goal_intake_valid=readiness_report.goal_intake_valid,
+        current_readiness_review_state=readiness_report.readiness_review_state,
+        current_next_required_action=readiness_report.next_required_action,
+        owner_readiness_decision_count=len(decision_entries),
+        latest_decision_id=latest_decision_id,
+        latest_decision=latest_decision,
+        latest_decision_created_at=latest_decision_created_at,
+        latest_decision_snapshot_state=latest_decision_snapshot_state,
+        preflight_state=preflight_state,
+        next_required_action=next_required_action,
+        blocking_reasons=blocking_reasons,
+        non_authority=non_authority,
+    )
+    return DraftPreparationPreflightReport(
+        output=output,
+        intake_id=intake_id,
+        goal_intake_valid=readiness_report.goal_intake_valid,
+        current_readiness_review_state=readiness_report.readiness_review_state,
+        current_next_required_action=readiness_report.next_required_action,
+        owner_readiness_decision_count=len(decision_entries),
+        latest_decision_id=latest_decision_id,
+        latest_decision=latest_decision,
+        latest_decision_created_at=latest_decision_created_at,
+        latest_decision_snapshot_state=latest_decision_snapshot_state,
+        preflight_state=preflight_state,
+        next_required_action=next_required_action,
+        blocking_reasons=tuple(blocking_reasons),
+        non_authority=non_authority,
+    )
 
 
 def create_goal_intake(project: Path, intake_id: str, raw_goal: str) -> Path:

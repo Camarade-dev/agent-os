@@ -13,6 +13,7 @@ from agent_os.orchestrator import (
     create_owner_clarification,
     create_owner_readiness_decision,
     goal_intake_status,
+    preflight_draft_preparation,
     review_goal_intake_readiness,
     validate_goal_intake,
 )
@@ -333,6 +334,21 @@ def cmd_orchestrator_decide_readiness(args: argparse.Namespace) -> int:
             "draft-preparation step; no draft was generated"
         )
     return 0
+
+
+def cmd_orchestrator_draft_preflight(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        report = preflight_draft_preparation(project, args.intake_id)
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(report.output)
+    confirmed = (
+        report.preflight_state
+        == "DRAFT_PREPARATION_AUTHORIZATION_CONFIRMED_NO_DRAFT_GENERATED"
+    )
+    return 0 if confirmed else 1
 
 
 def cmd_orchestrator_clarify(args: argparse.Namespace) -> int:
@@ -764,6 +780,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="owner-provided decision summary (preserved verbatim)",
     )
     orchestrator_decide_readiness_parser.set_defaults(func=cmd_orchestrator_decide_readiness)
+
+    orchestrator_draft_preflight_parser = orchestrator_sub.add_parser(
+        "draft-preflight",
+        help="read-only draft-preparation authorization preflight (no draft generation)",
+        description=(
+            "Read-only draft-preparation authorization preflight for an existing "
+            "GOAL_INTAKE after owner readiness review and decisions. Verifies that "
+            "the latest owner readiness decision authorizes a future "
+            "draft-preparation step and remains coherent with the current readiness "
+            "review. Does not call an LLM, generate planning drafts, create planning "
+            "workspaces, approve architecture, approve plans, create runs, or invoke "
+            "an executor. No draft generation occurs in this command."
+        ),
+    )
+    orchestrator_draft_preflight_parser.add_argument(
+        "intake_id",
+        help="intake identifier (filesystem-safe slug)",
+    )
+    orchestrator_draft_preflight_parser.add_argument(
+        "path",
+        nargs="?",
+        help="target project directory",
+    )
+    orchestrator_draft_preflight_parser.set_defaults(func=cmd_orchestrator_draft_preflight)
 
     return parser
 

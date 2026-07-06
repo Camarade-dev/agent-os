@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 from agent_os.cli import build_parser, main
 from agent_os.orchestrator import (
+    DRAFT_PREPARATION_PREFLIGHT_NON_AUTHORITY_FLAGS,
     GOAL_INTAKE_NON_AUTHORITY_FLAGS,
     GOAL_INTAKE_REQUIRED_FIELDS,
     OWNER_CLARIFICATION_NON_AUTHORITY_FLAGS,
@@ -35,6 +36,7 @@ from agent_os.orchestrator import (
     load_owner_clarification,
     load_owner_readiness_decision,
     normalize_goal,
+    preflight_draft_preparation,
     review_goal_intake_readiness,
     validate_clarification_id,
     validate_goal_intake,
@@ -6538,6 +6540,595 @@ class OrchestratorOwnerReadinessDecisionTests(unittest.TestCase):
         self.assertIn("they do not generate a planning draft", output)
         self.assertEqual(original_intake, artifact_path.read_text(encoding="utf-8"))
         self.assertEqual(before, self._project_files())
+
+
+class OrchestratorDraftPreparationPreflightTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self._tmp.name)
+        init_workspace(self.project)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _artifact_path(self, intake_id: str) -> Path:
+        return orchestrator_intake_path(self.project, intake_id) / GOAL_INTAKE_FILE
+
+    def _clarification_path(self, intake_id: str, clarification_id: str) -> Path:
+        return orchestrator_clarification_path(
+            self.project,
+            intake_id,
+            clarification_id,
+        )
+
+    def _decision_path(self, intake_id: str, decision_id: str) -> Path:
+        return orchestrator_readiness_decision_path(
+            self.project,
+            intake_id,
+            decision_id,
+        )
+
+    def _create_slither_intake(self, intake_id: str = "slither-demo") -> Path:
+        return create_goal_intake(
+            self.project,
+            intake_id,
+            "Build me an online slither.io-like game",
+        )
+
+    def _create_simple_intake(self, intake_id: str = "fix-login") -> Path:
+        return create_goal_intake(
+            self.project,
+            intake_id,
+            "Fix the login timeout bug in the auth module",
+        )
+
+    def _write_artifact(self, intake_id: str, artifact: dict) -> Path:
+        path = self._artifact_path(intake_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+        return path
+
+    def _project_files(self) -> set[str]:
+        return {
+            path.relative_to(self.project).as_posix()
+            for path in self.project.rglob("*")
+            if path.is_file()
+        }
+
+    def _slither_with_clarification(self, intake_id: str = "slither-demo") -> None:
+        self._create_slither_intake(intake_id)
+        create_owner_clarification(
+            self.project,
+            intake_id,
+            "scope-v1",
+            "Browser-only demo with 10 players max; no persistence.",
+        )
+
+    def _authorize_slither(self, intake_id: str = "slither-demo") -> None:
+        self._slither_with_clarification(intake_id)
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "AUTHORIZE_DRAFT_PREPARATION",
+            "Scope clarified; authorize future draft prep only.",
+        )
+
+    def test_draft_preflight_confirmed_when_latest_authorize_coherent(self) -> None:
+        intake_id = "slither-demo"
+        self._authorize_slither(intake_id)
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["orchestrator", "draft-preflight", intake_id, str(self.project)])
+
+        self.assertEqual(code, 0)
+        output = buf.getvalue()
+        report = preflight_draft_preparation(self.project, intake_id)
+        self.assertEqual(
+            report.preflight_state,
+            "DRAFT_PREPARATION_AUTHORIZATION_CONFIRMED_NO_DRAFT_GENERATED",
+        )
+        self.assertEqual(
+            report.next_required_action,
+            "FUTURE_DRAFT_PREPARATION_STEP_REQUIRES_SEPARATE_COMMAND",
+        )
+        self.assertIn(
+            "preflight_state: DRAFT_PREPARATION_AUTHORIZATION_CONFIRMED_NO_DRAFT_GENERATED",
+            output,
+        )
+        self.assertIn(
+            "next_required_action: FUTURE_DRAFT_PREPARATION_STEP_REQUIRES_SEPARATE_COMMAND",
+            output,
+        )
+        self.assertIn("latest_decision: AUTHORIZE_DRAFT_PREPARATION", output)
+
+    def test_draft_preflight_blocked_without_readiness_decisions(self) -> None:
+        intake_id = "fix-login"
+        self._create_simple_intake(intake_id)
+
+        report = preflight_draft_preparation(self.project, intake_id)
+        self.assertEqual(report.preflight_state, "BLOCKED_NO_READINESS_DECISION")
+        self.assertEqual(report.next_required_action, "ADD_OWNER_READINESS_DECISION")
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["orchestrator", "draft-preflight", intake_id, str(self.project)])
+        self.assertEqual(code, 1)
+        self.assertIn("preflight_state: BLOCKED_NO_READINESS_DECISION", buf.getvalue())
+        self.assertIn("next_required_action: ADD_OWNER_READINESS_DECISION", buf.getvalue())
+
+    def test_draft_preflight_blocked_when_latest_requests_clarification(self) -> None:
+        intake_id = "slither-demo"
+        self._create_slither_intake(intake_id)
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "REQUEST_MORE_CLARIFICATION",
+            "Need more scope detail.",
+        )
+
+        report = preflight_draft_preparation(self.project, intake_id)
+        self.assertEqual(
+            report.preflight_state,
+            "BLOCKED_LATEST_DECISION_REQUESTS_CLARIFICATION",
+        )
+        self.assertEqual(report.next_required_action, "ADD_OWNER_CLARIFICATION")
+
+    def test_draft_preflight_blocked_when_latest_blocks_intake(self) -> None:
+        intake_id = "fix-login"
+        self._create_simple_intake(intake_id)
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "BLOCK_INTAKE",
+            "Stopping intake.",
+        )
+
+        report = preflight_draft_preparation(self.project, intake_id)
+        self.assertEqual(
+            report.preflight_state,
+            "BLOCKED_LATEST_DECISION_BLOCKS_INTAKE",
+        )
+        self.assertEqual(report.next_required_action, "STOP_INTAKE")
+
+    def test_draft_preflight_more_recent_block_overrides_older_authorize(self) -> None:
+        intake_id = "slither-demo"
+        self._authorize_slither(intake_id)
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v2",
+            "BLOCK_INTAKE",
+            "Changed mind; stop intake.",
+        )
+
+        report = preflight_draft_preparation(self.project, intake_id)
+        self.assertEqual(
+            report.preflight_state,
+            "BLOCKED_LATEST_DECISION_BLOCKS_INTAKE",
+        )
+        self.assertEqual(report.latest_decision_id, "owner-v2")
+
+    def test_draft_preflight_more_recent_clarification_overrides_older_authorize(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        self._authorize_slither(intake_id)
+        artifact_path = self._artifact_path(intake_id)
+        clarification_path = self._clarification_path(intake_id, "scope-v1")
+        decision_path_v1 = self._decision_path(intake_id, "owner-v1")
+        original_intake = artifact_path.read_bytes()
+        original_clarification = clarification_path.read_bytes()
+        original_decision_v1 = decision_path_v1.read_bytes()
+
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v2",
+            "REQUEST_MORE_CLARIFICATION",
+            "Need updated scope constraints.",
+        )
+        decision_path_v2 = self._decision_path(intake_id, "owner-v2")
+        original_decision_v2 = decision_path_v2.read_bytes()
+        before_files = self._project_files()
+        workspace = self.project / ".agent-os"
+        before_runs = list((workspace / "runs").iterdir())
+        forbidden_names = set(planning_module.PLANNING_ARTIFACT_FILES)
+
+        report = preflight_draft_preparation(self.project, intake_id)
+        self.assertEqual(
+            report.preflight_state,
+            "BLOCKED_LATEST_DECISION_REQUESTS_CLARIFICATION",
+        )
+        self.assertEqual(report.next_required_action, "ADD_OWNER_CLARIFICATION")
+        self.assertEqual(report.latest_decision_id, "owner-v2")
+        self.assertEqual(report.latest_decision, "REQUEST_MORE_CLARIFICATION")
+        self.assertNotEqual(
+            report.preflight_state,
+            "DRAFT_PREPARATION_AUTHORIZATION_CONFIRMED_NO_DRAFT_GENERATED",
+        )
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["orchestrator", "draft-preflight", intake_id, str(self.project)])
+        self.assertEqual(code, 1)
+        output = buf.getvalue()
+        self.assertIn(
+            "preflight_state: BLOCKED_LATEST_DECISION_REQUESTS_CLARIFICATION",
+            output,
+        )
+        self.assertIn("next_required_action: ADD_OWNER_CLARIFICATION", output)
+        self.assertIn("latest_decision: REQUEST_MORE_CLARIFICATION", output)
+        self.assertNotIn(
+            "DRAFT_PREPARATION_AUTHORIZATION_CONFIRMED_NO_DRAFT_GENERATED",
+            output,
+        )
+
+        with patch("subprocess.run", side_effect=AssertionError("subprocess invoked")):
+            main(["orchestrator", "draft-preflight", intake_id, str(self.project)])
+
+        self.assertEqual(original_intake, artifact_path.read_bytes())
+        self.assertEqual(original_clarification, clarification_path.read_bytes())
+        self.assertEqual(original_decision_v1, decision_path_v1.read_bytes())
+        self.assertEqual(original_decision_v2, decision_path_v2.read_bytes())
+        self.assertEqual(before_files, self._project_files())
+
+        created_names = {path.name for path in self.project.rglob("*") if path.is_file()}
+        self.assertTrue(forbidden_names.isdisjoint(created_names))
+        combined = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in self.project.rglob("*")
+            if path.is_file()
+        )
+        self.assertNotIn("PLANNING_RUN_SLICE", combined)
+        self.assertEqual(before_runs, list((workspace / "runs").iterdir()))
+
+    def test_draft_preflight_blocked_when_authorization_snapshot_stale(self) -> None:
+        intake_id = "slither-demo"
+        self._authorize_slither(intake_id)
+        create_owner_clarification(
+            self.project,
+            intake_id,
+            "scope-v2",
+            "Add websocket transport requirement.",
+        )
+
+        report = preflight_draft_preparation(self.project, intake_id)
+        self.assertEqual(
+            report.preflight_state,
+            "BLOCKED_AUTHORIZATION_STALE_OR_INCOHERENT",
+        )
+        self.assertEqual(
+            report.next_required_action,
+            "RESOLVE_OR_REPLACE_READINESS_DECISION",
+        )
+
+    def test_draft_preflight_blocked_on_invalid_readiness_decision(self) -> None:
+        intake_id = "fix-login"
+        self._create_simple_intake(intake_id)
+        artifact = build_owner_readiness_decision_artifact(
+            intake_id,
+            "owner-v1",
+            "BLOCK_INTAKE",
+            "Stop.",
+            readiness_review_state_at_decision="OWNER_REVIEW_REQUIRED",
+            next_required_action_at_decision="OWNER_READINESS_DECISION_REQUIRED",
+            owner_clarification_count_at_decision=0,
+            latest_clarification_id_at_decision=None,
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        artifact["artifact_type"] = "PLANNING_WORKSPACE_DRAFT"
+        path = self._decision_path(intake_id, "owner-v1")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+
+        report = preflight_draft_preparation(self.project, intake_id)
+        self.assertEqual(report.preflight_state, "BLOCKED_INVALID_READINESS_DECISION")
+        self.assertEqual(
+            report.next_required_action,
+            "RESOLVE_OR_REPLACE_READINESS_DECISION",
+        )
+
+    def test_draft_preflight_missing_workspace_fails_without_orchestrator_tree(
+        self,
+    ) -> None:
+        bare = Path(tempfile.mkdtemp())
+        try:
+            with self.assertRaises(FileNotFoundError):
+                preflight_draft_preparation(bare, "slither-demo")
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                code = main(
+                    ["orchestrator", "draft-preflight", "slither-demo", str(bare)]
+                )
+            self.assertEqual(code, 1)
+            self.assertIn("no workspace found", buf.getvalue())
+            self.assertFalse((bare / ".agent-os" / "orchestrator").exists())
+        finally:
+            import shutil
+
+            shutil.rmtree(bare)
+
+    def test_draft_preflight_missing_intake_fails_without_creating_files(self) -> None:
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "draft-preflight",
+                    "missing-intake",
+                    str(self.project),
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("goal intake artifact not found", buf.getvalue())
+        self.assertFalse(
+            (
+                self.project
+                / ".agent-os"
+                / "orchestrator"
+                / "intakes"
+                / "missing-intake"
+            ).exists()
+        )
+
+    def test_draft_preflight_invalid_intake_blocked_without_writing_files(self) -> None:
+        intake_id = "invalid-preflight"
+        artifact = build_goal_intake_artifact(
+            intake_id,
+            "Build a game",
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        artifact["artifact_type"] = "PLANNING_WORKSPACE_DRAFT"
+        self._write_artifact(intake_id, artifact)
+        before = self._project_files()
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["orchestrator", "draft-preflight", intake_id, str(self.project)])
+
+        self.assertEqual(code, 1)
+        self.assertIn("preflight_state: BLOCKED_INVALID_INTAKE", buf.getvalue())
+        self.assertIn("next_required_action: FIX_GOAL_INTAKE_STRUCTURE", buf.getvalue())
+        self.assertEqual(before, self._project_files())
+
+    def test_draft_preflight_preserves_goal_intake_byte_for_byte(self) -> None:
+        intake_id = "slither-demo"
+        self._authorize_slither(intake_id)
+        artifact_path = self._artifact_path(intake_id)
+        original = artifact_path.read_bytes()
+
+        preflight_draft_preparation(self.project, intake_id)
+        main(["orchestrator", "draft-preflight", intake_id, str(self.project)])
+
+        self.assertEqual(original, artifact_path.read_bytes())
+
+    def test_draft_preflight_preserves_clarification_artifacts_byte_for_byte(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        self._authorize_slither(intake_id)
+        clarification_path = self._clarification_path(intake_id, "scope-v1")
+        original = clarification_path.read_bytes()
+
+        preflight_draft_preparation(self.project, intake_id)
+
+        self.assertEqual(original, clarification_path.read_bytes())
+
+    def test_draft_preflight_preserves_readiness_decision_artifacts_byte_for_byte(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        self._authorize_slither(intake_id)
+        decision_path = self._decision_path(intake_id, "owner-v1")
+        original = decision_path.read_bytes()
+
+        preflight_draft_preparation(self.project, intake_id)
+
+        self.assertEqual(original, decision_path.read_bytes())
+
+    def test_draft_preflight_does_not_change_planning_readiness(self) -> None:
+        intake_id = "slither-demo"
+        self._authorize_slither(intake_id)
+        artifact_path = self._artifact_path(intake_id)
+        before = json.loads(artifact_path.read_text(encoding="utf-8"))["planning_readiness"]
+
+        preflight_draft_preparation(self.project, intake_id)
+
+        after = json.loads(artifact_path.read_text(encoding="utf-8"))["planning_readiness"]
+        self.assertEqual(before, after)
+
+    def test_draft_preflight_includes_all_required_non_authority_flags(self) -> None:
+        intake_id = "slither-demo"
+        self._authorize_slither(intake_id)
+
+        report = preflight_draft_preparation(self.project, intake_id)
+        for flag in DRAFT_PREPARATION_PREFLIGHT_NON_AUTHORITY_FLAGS:
+            self.assertTrue(report.non_authority[flag])
+        for flag in DRAFT_PREPARATION_PREFLIGHT_NON_AUTHORITY_FLAGS:
+            self.assertIn(f"{flag}: true", report.output)
+
+    def test_draft_preflight_does_not_emit_draft_allowed_states(self) -> None:
+        intake_id = "slither-demo"
+        self._authorize_slither(intake_id)
+
+        report = preflight_draft_preparation(self.project, intake_id)
+        self.assertNotIn(report.preflight_state, {"DRAFT_ALLOWED", "READY_FOR_DRAFT"})
+        self.assertNotIn("preflight_state: DRAFT_ALLOWED", report.output)
+        self.assertNotIn("preflight_state: READY_FOR_DRAFT", report.output)
+
+    def test_draft_preflight_does_not_create_planning_artifacts(self) -> None:
+        intake_id = "slither-demo"
+        self._authorize_slither(intake_id)
+        forbidden_names = set(planning_module.PLANNING_ARTIFACT_FILES)
+
+        preflight_draft_preparation(self.project, intake_id)
+
+        created_names = {path.name for path in self.project.rglob("*") if path.is_file()}
+        self.assertTrue(forbidden_names.isdisjoint(created_names))
+
+    def test_draft_preflight_does_not_create_planning_run_slice(self) -> None:
+        intake_id = "fix-login"
+        self._create_simple_intake(intake_id)
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "AUTHORIZE_DRAFT_PREPARATION",
+            "Future draft only.",
+        )
+
+        preflight_draft_preparation(self.project, intake_id)
+        combined = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in self.project.rglob("*")
+            if path.is_file()
+        )
+        self.assertNotIn("PLANNING_RUN_SLICE", combined)
+
+    def test_draft_preflight_does_not_create_runs(self) -> None:
+        intake_id = "fix-login"
+        workspace = self.project / ".agent-os"
+        before_runs = list((workspace / "runs").iterdir())
+        self._create_simple_intake(intake_id)
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "AUTHORIZE_DRAFT_PREPARATION",
+            "Future draft only.",
+        )
+
+        preflight_draft_preparation(self.project, intake_id)
+
+        after_runs = list((workspace / "runs").iterdir())
+        self.assertEqual(before_runs, after_runs)
+
+    def test_draft_preflight_does_not_invoke_external_subprocess(self) -> None:
+        intake_id = "slither-demo"
+        self._authorize_slither(intake_id)
+
+        with patch("subprocess.run", side_effect=AssertionError("subprocess invoked")):
+            code = main(
+                ["orchestrator", "draft-preflight", intake_id, str(self.project)]
+            )
+        self.assertEqual(code, 0)
+
+    def test_orchestrator_draft_preflight_cli_help_marks_read_only(self) -> None:
+        parser = build_parser()
+        orchestrator_action = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        orchestrator_parser = orchestrator_action.choices["orchestrator"]
+        orchestrator_sub = next(
+            action
+            for action in orchestrator_parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+
+        help_text = orchestrator_sub.choices["draft-preflight"].format_help()
+        compact_help = re.sub(r"\s+", " ", help_text)
+        self.assertIn("read-only", compact_help.lower())
+        self.assertIn("No draft generation occurs", compact_help)
+
+    def test_orchestrator_draft_preflight_cli_output_includes_boundary_notes(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        self._authorize_slither(intake_id)
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["orchestrator", "draft-preflight", intake_id, str(self.project)])
+
+        self.assertEqual(code, 0)
+        output = buf.getvalue()
+        self.assertIn("preflight_state:", output)
+        self.assertIn("next_required_action:", output)
+        self.assertIn("latest_decision: AUTHORIZE_DRAFT_PREPARATION", output)
+        self.assertIn("draft-preparation preflight is read-only", output)
+        self.assertIn("no planning draft was generated", output)
+        self.assertNotIn("planning draft was created", output.lower())
+
+    def test_orchestrator_validate_unchanged_without_readiness_decision_requirement(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        self._authorize_slither(intake_id)
+
+        report = validate_goal_intake(self.project, intake_id)
+        self.assertTrue(report.valid)
+
+    def test_orchestrator_readiness_unchanged_and_read_only_after_preflight_slice(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        self._authorize_slither(intake_id)
+        before = self._project_files()
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["orchestrator", "readiness", intake_id, str(self.project)])
+
+        self.assertEqual(code, 0)
+        output = buf.getvalue()
+        self.assertIn("readiness review is read-only", output)
+        self.assertEqual(before, self._project_files())
+
+    def test_orchestrator_status_unchanged_and_read_only_after_preflight_slice(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        self._authorize_slither(intake_id)
+        artifact_path = self._artifact_path(intake_id)
+        original_intake = artifact_path.read_text(encoding="utf-8")
+        before = self._project_files()
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["orchestrator", "status", intake_id, str(self.project)])
+
+        self.assertEqual(code, 0)
+        output = buf.getvalue()
+        self.assertIn("read-only inspection", output)
+        self.assertIn("no planning draft was created", output)
+        self.assertEqual(original_intake, artifact_path.read_text(encoding="utf-8"))
+        self.assertEqual(before, self._project_files())
+
+    def test_no_existing_command_gained_draft_generation_after_preflight_slice(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        self._authorize_slither(intake_id)
+        decide_intake_id = "fix-login"
+        self._create_simple_intake(decide_intake_id)
+        forbidden_names = set(planning_module.PLANNING_ARTIFACT_FILES)
+
+        main(["orchestrator", "status", intake_id, str(self.project)])
+        main(["orchestrator", "validate", intake_id, str(self.project)])
+        main(["orchestrator", "readiness", intake_id, str(self.project)])
+        main(
+            [
+                "orchestrator",
+                "decide-readiness",
+                decide_intake_id,
+                str(self.project),
+                "--decision",
+                "BLOCK_INTAKE",
+                "--decision-id",
+                "owner-v1",
+                "--summary",
+                "Regression sweep only.",
+            ]
+        )
+
+        created_names = {path.name for path in self.project.rglob("*") if path.is_file()}
+        self.assertTrue(forbidden_names.isdisjoint(created_names))
 
 
 class OrchestratorDocsGuardTests(unittest.TestCase):

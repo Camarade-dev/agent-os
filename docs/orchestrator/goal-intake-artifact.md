@@ -1,10 +1,11 @@
 # Goal intake artifact
 
-> **Status:** deterministic scaffold in `CORE_ORCHESTRATOR_002`; read-only status and validation in `CORE_ORCHESTRATOR_003`; owner clarification records in `CORE_ORCHESTRATOR_004`; read-only readiness review in `CORE_ORCHESTRATOR_005`; owner readiness decision records in `CORE_ORCHESTRATOR_006`  
+> **Status:** deterministic scaffold in `CORE_ORCHESTRATOR_002`; read-only status and validation in `CORE_ORCHESTRATOR_003`; owner clarification records in `CORE_ORCHESTRATOR_004`; read-only readiness review in `CORE_ORCHESTRATOR_005`; owner readiness decision records in `CORE_ORCHESTRATOR_006`; read-only draft-preparation authorization preflight in `CORE_ORCHESTRATOR_007`  
 > **Commands:**
 > - `agent-os orchestrator intake <intake-id> --goal "<raw goal>" [PATH]`
 > - `agent-os orchestrator clarify <intake-id> --clarification-id <clarification-id> --answer "<owner-provided clarification>" [PATH]`
 > - `agent-os orchestrator decide-readiness <intake-id> --decision <decision> --decision-id <decision-id> --summary "<owner summary>" [PATH]`
+> - `agent-os orchestrator draft-preflight <intake-id> [PATH]` (read-only)
 > - `agent-os orchestrator status <intake-id> [PATH]` (read-only)
 > - `agent-os orchestrator validate <intake-id> [PATH]` (read-only)
 > - `agent-os orchestrator readiness <intake-id> [PATH]` (read-only)
@@ -22,6 +23,8 @@ The status and validate commands inspect the goal intake artifact only. They are
 The readiness command performs a read-only readiness review of the goal intake artifact and any owner clarification records. It summarizes intake validity, ambiguity, clarification count, and the next required action. It does **not** call an LLM, modify artifacts, change `planning_readiness`, mark an intake draft-ready, generate planning artifacts, validate or approve a planning workspace, create runner proposals, create runs, or invoke an executor. **Readiness review is not owner readiness decision, not approval, and not planning generation.** Owner clarification records do not automatically make an intake draft-ready. Status and readiness also report owner readiness decision counts when present; those records do not generate a planning draft.
 
 The decide-readiness command records an owner-provided readiness decision after readiness review. It writes a separate `OWNER_READINESS_DECISION` JSON file only. It does **not** call an LLM, modify `goal-intake.json`, modify clarification artifacts, change `planning_readiness`, generate planning drafts, create planning workspaces, approve architecture, create runner proposals, create runs, or invoke an executor. **`AUTHORIZE_DRAFT_PREPARATION` authorizes only a future draft-preparation step** — not draft generation now, not planning approval, not architecture approval, and not execution. Future generated drafts would still need independent validation and owner approval.
+
+The draft-preflight command performs a read-only draft-preparation authorization preflight for an existing intake. It runs the current readiness review, loads owner readiness decision records, identifies the latest decision, and checks whether `AUTHORIZE_DRAFT_PREPARATION` remains coherent with the current readiness review snapshot. It does **not** call an LLM, generate planning drafts, create planning workspaces, approve architecture, approve plans, create runner proposals, create runs, or invoke an executor. **Draft-preparation preflight is not draft generation** — it confirms authorization only and points to a separate future draft-preparation command. Future generated drafts would still need independent validation and owner approval.
 
 ---
 
@@ -220,6 +223,62 @@ Every readiness decision artifact includes:
 ```
 
 The decide-readiness command refuses to overwrite an existing decision artifact, rejects invalid intake or decision identifiers, rejects empty summaries, rejects unsupported decision values, and fails closed before write when the workspace or goal intake is missing or invalid. Future draft/export generation remains future work and would still require independent validation and owner approval.
+
+---
+
+## Read-only draft-preparation authorization preflight
+
+`agent-os orchestrator draft-preflight` loads an existing `goal-intake.json`, runs the current readiness review, loads owner readiness decision records, and prints a deterministic authorization preflight:
+
+- `goal_intake_valid` — structural validation result
+- `current_readiness_review_state`, `current_next_required_action` — from the current readiness review
+- `owner_readiness_decision_count` — readiness decision records found
+- `latest_decision_id`, `latest_decision`, `latest_decision_created_at` — latest decision by deterministic ordering
+- `latest_decision_snapshot_state` — `readiness_review_state_at_decision` from the latest decision when present
+- `preflight_state` — authorization preflight result (never `DRAFT_ALLOWED` or `READY_FOR_DRAFT`)
+- `next_required_action` — operator-facing next step
+- `blocking_reasons` — when intake, decisions, or snapshot coherence block preflight
+- `non_authority` — required non-authority flags for the preflight itself
+
+Deterministic preflight states in this slice:
+
+| State | Meaning |
+|-------|---------|
+| `BLOCKED_INVALID_INTAKE` | Goal intake structure is invalid |
+| `BLOCKED_NO_READINESS_DECISION` | No owner readiness decision records exist |
+| `BLOCKED_LATEST_DECISION_REQUESTS_CLARIFICATION` | Latest decision requests more clarification |
+| `BLOCKED_LATEST_DECISION_BLOCKS_INTAKE` | Latest decision blocks the intake |
+| `BLOCKED_LATEST_DECISION_NOT_AUTHORIZE` | Latest valid decision is not authorization |
+| `BLOCKED_AUTHORIZATION_STALE_OR_INCOHERENT` | Latest `AUTHORIZE_DRAFT_PREPARATION` snapshot no longer matches current readiness review |
+| `BLOCKED_INVALID_READINESS_DECISION` | Latest readiness decision artifact is malformed or invalid |
+| `DRAFT_PREPARATION_AUTHORIZATION_CONFIRMED_NO_DRAFT_GENERATED` | Authorization confirmed; no draft generated |
+
+Snapshot coherence compares `readiness_review_state_at_decision`, `next_required_action_at_decision`, `owner_clarification_count_at_decision`, and `latest_clarification_id_at_decision` against the current readiness review. Any mismatch treats authorization as stale.
+
+**Draft-preparation preflight is not draft generation.** It does not create planning workspace artifacts, approve architecture, approve plans, create runner proposals, create runs, or invoke an executor. `AUTHORIZE_DRAFT_PREPARATION` still requires a separate future draft-preparation command. Future runner proposal generation remains separate.
+
+Draft-preparation preflight non-authority flags (all `true`):
+
+```json
+{
+  "does_not_create_plan": true,
+  "does_not_generate_planning_draft": true,
+  "does_not_create_planning_workspace": true,
+  "does_not_validate_planning_workspace": true,
+  "does_not_approve_plan": true,
+  "does_not_approve_architecture": true,
+  "does_not_transition_workspace": true,
+  "does_not_create_runner_proposal": true,
+  "does_not_create_run": true,
+  "does_not_invoke_executor": true,
+  "does_not_modify_goal_intake": true,
+  "does_not_modify_clarifications": true,
+  "does_not_modify_readiness_decisions": true,
+  "requires_separate_future_draft_preparation_command": true,
+  "requires_future_independent_validation_before_plan_approval": true,
+  "requires_future_owner_approval_before_run_proposals": true
+}
+```
 
 ---
 

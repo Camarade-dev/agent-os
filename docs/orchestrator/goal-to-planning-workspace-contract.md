@@ -1,7 +1,7 @@
 # Goal-to-planning workspace contract
 
 > **Status:** doctrine and contract plus deterministic goal-intake scaffold CLI — no LLM adapter, no autonomous generation, no UI  
-> **Slice:** `CORE_ORCHESTRATOR_002` adds `agent-os orchestrator intake` for `GOAL_INTAKE` artifact creation only; `CORE_ORCHESTRATOR_003` adds read-only `orchestrator status` and `orchestrator validate`; `CORE_ORCHESTRATOR_004` adds owner clarification records via `orchestrator clarify`; `CORE_ORCHESTRATOR_005` adds read-only `orchestrator readiness` review; `CORE_ORCHESTRATOR_006` adds owner readiness decision records via `orchestrator decide-readiness`; planning workspace drafting remains future work  
+> **Slice:** `CORE_ORCHESTRATOR_002` adds `agent-os orchestrator intake` for `GOAL_INTAKE` artifact creation only; `CORE_ORCHESTRATOR_003` adds read-only `orchestrator status` and `orchestrator validate`; `CORE_ORCHESTRATOR_004` adds owner clarification records via `orchestrator clarify`; `CORE_ORCHESTRATOR_005` adds read-only `orchestrator readiness` review; `CORE_ORCHESTRATOR_006` adds owner readiness decision records via `orchestrator decide-readiness`; `CORE_ORCHESTRATOR_007` adds read-only `orchestrator draft-preflight` authorization preflight; planning workspace drafting remains future work  
 > **Companions:** [`goal-intake-artifact.md`](goal-intake-artifact.md), [`architecture-decision-boundary.md`](architecture-decision-boundary.md), [`slither-like-demo-contract.md`](slither-like-demo-contract.md), [`../planning-layer-doctrine.md`](../planning-layer-doctrine.md), [`../planning-workspace-layout.md`](../planning-workspace-layout.md)
 
 This document defines the **formal contract** for a future Agent OS orchestrator that receives a natural-language goal and eventually proposes a **governed planning workspace draft**. It authorizes nothing. The current implementation is limited to deterministic `GOAL_INTAKE` JSON artifact scaffolding; it does not implement architecture generation, planning generation, validation, transition, runner import, or executor invocation.
@@ -79,6 +79,8 @@ Owner readiness decision records live alongside the intake at:
 ```
 
 `agent-os orchestrator decide-readiness` records an owner-provided readiness decision after readiness review. Readiness decision is not planning approval, not architecture approval, and not draft generation. `AUTHORIZE_DRAFT_PREPARATION` authorizes only a future draft-preparation step. No planning workspace, planning artifact, runner proposal, run, or executor invocation is created. Future draft/export generation remains future work; any generated draft would still need independent validation and owner approval.
+
+`agent-os orchestrator draft-preflight` performs a read-only draft-preparation authorization preflight over the goal intake, clarification records, and owner readiness decisions. It checks authorization only: whether the latest owner readiness decision is `AUTHORIZE_DRAFT_PREPARATION` and whether its readiness snapshot still matches the current readiness review. Draft-preparation preflight is not draft generation, not planning workspace creation, not architecture approval, not plan approval, and does not create runner proposals, runs, or executor invocations. `AUTHORIZE_DRAFT_PREPARATION` still requires a separate future draft-preparation command. Future generated drafts would still need independent validation and owner approval. Future runner proposal generation remains separate.
 
 ### 2.1 Minimum fields
 
@@ -287,6 +289,8 @@ These commands exist today and remain **operator-driven**; the orchestrator must
 **Implemented read-only readiness review:** `agent-os orchestrator readiness <intake-id> [PATH]` performs a read-only readiness review over the goal intake and clarification records. It does not modify artifacts, authorize draft generation, create planning workspace artifacts, create runs, or invoke an executor.
 
 **Implemented owner readiness decision:** `agent-os orchestrator decide-readiness <intake-id> --decision <decision> --decision-id <decision-id> --summary "<owner summary>" [PATH]` records an `OWNER_READINESS_DECISION` JSON artifact only. It does not modify the goal intake, modify clarifications, change readiness, generate planning drafts, create planning workspaces, approve architecture, create runs, or invoke an executor. `AUTHORIZE_DRAFT_PREPARATION` authorizes only a future draft-preparation step.
+
+**Implemented read-only draft-preparation authorization preflight:** `agent-os orchestrator draft-preflight <intake-id> [PATH]` performs a read-only authorization preflight only. It does not generate planning drafts, create planning workspaces, approve architecture, approve plans, create runner proposals, create runs, or invoke an executor. Confirmed authorization means a future draft-preparation command may be attempted separately; no draft is generated in this slice.
 
 **Future work (not implemented):** `agent-os orchestrator draft-export` or any command that auto-runs the planning lifecycle above. Documenting draft-export does not imply implementation.
 
