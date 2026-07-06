@@ -1,11 +1,12 @@
 # Goal intake artifact
 
-> **Status:** deterministic scaffold in `CORE_ORCHESTRATOR_002`; read-only status and validation in `CORE_ORCHESTRATOR_003`; owner clarification records in `CORE_ORCHESTRATOR_004`  
+> **Status:** deterministic scaffold in `CORE_ORCHESTRATOR_002`; read-only status and validation in `CORE_ORCHESTRATOR_003`; owner clarification records in `CORE_ORCHESTRATOR_004`; read-only readiness review in `CORE_ORCHESTRATOR_005`  
 > **Commands:**
 > - `agent-os orchestrator intake <intake-id> --goal "<raw goal>" [PATH]`
 > - `agent-os orchestrator clarify <intake-id> --clarification-id <clarification-id> --answer "<owner-provided clarification>" [PATH]`
 > - `agent-os orchestrator status <intake-id> [PATH]` (read-only)
 > - `agent-os orchestrator validate <intake-id> [PATH]` (read-only)
+> - `agent-os orchestrator readiness <intake-id> [PATH]` (read-only)
 > **Output:**
 > - `.agent-os/orchestrator/intakes/<intake-id>/goal-intake.json`
 > - `.agent-os/orchestrator/intakes/<intake-id>/clarifications/<clarification-id>.json`
@@ -15,6 +16,8 @@ The goal intake command creates a durable, reviewable JSON artifact from an owne
 The clarify command records owner-provided clarification context for an existing `GOAL_INTAKE` artifact. It writes a separate `OWNER_CLARIFICATION` JSON file only. It does **not** call an LLM, modify `goal-intake.json`, change `planning_readiness`, generate planning artifacts, validate or approve a planning workspace, create runner proposals, create runs, or invoke an executor.
 
 The status and validate commands inspect the goal intake artifact only. They are read-only and do not call an LLM, use Cursor, invoke an agent, call external APIs, choose architecture, generate planning artifacts, validate or approve a planning workspace, create runner proposals, create runs, or invoke an executor. Status also reports clarification record counts when present; clarification records are additive context only.
+
+The readiness command performs a read-only readiness review of the goal intake artifact and any owner clarification records. It summarizes intake validity, ambiguity, clarification count, and the next required action. It does **not** call an LLM, modify artifacts, change `planning_readiness`, mark an intake draft-ready, generate planning artifacts, validate or approve a planning workspace, create runner proposals, create runs, or invoke an executor. **Readiness review is not owner readiness decision, not approval, and not planning generation.** Owner clarification records do not automatically make an intake draft-ready. Future owner readiness decision and draft/export generation remain future work.
 
 ---
 
@@ -44,6 +47,48 @@ The status and validate commands inspect the goal intake artifact only. They are
 **Validation is not approval.** A structurally valid intake may still have `planning_readiness: REQUIRES_CLARIFICATION`. Validation does not require clarification records. Clarification records are additive context, not approval. Validation does not authorize planning workspace generation, runner proposals, runs, or executor invocation. Future draft generation remains future work.
 
 Neither command mutates files, repairs artifacts, infers missing fields, or creates missing directories beyond what already exists on disk.
+
+---
+
+## Read-only readiness review
+
+`agent-os orchestrator readiness` loads an existing `goal-intake.json` and any clarification records under `clarifications/`, then prints a deterministic readiness review:
+
+- `goal_intake_valid` — structural validation result
+- `ambiguity_level`, `planning_readiness` — from the intake artifact (unchanged)
+- `owner_clarification_count`, `latest_clarification_id` — from clarification records when present
+- `readiness_review_state` — conservative review state (never `DRAFT_ALLOWED` or `READY_FOR_DRAFT`)
+- `next_required_action` — operator-facing next step
+- `blocking_reasons` — when intake or clarification structure is invalid
+- `non_authority` — required non-authority flags for the review itself
+
+Deterministic readiness states in this slice:
+
+| State | Meaning |
+|-------|---------|
+| `BLOCKED_INVALID_INTAKE` | Goal intake structure is invalid |
+| `BLOCKED_REQUIRES_CLARIFICATION` | High ambiguity, clarification required, zero clarifications recorded |
+| `OWNER_CLARIFICATION_PRESENT_REVIEW_REQUIRED` | Clarifications exist but owner readiness decision is still required |
+| `OWNER_REVIEW_REQUIRED` | Conservative default for intakes not blocked on clarification |
+
+**Readiness review is not owner readiness decision.** It does not approve planning, authorize draft generation, choose architecture, create planning workspace artifacts, create `PLANNING_RUN_SLICE` blocks, create runner proposals, create runs, or invoke an executor. Owner clarification records do not automatically make an intake draft-ready. Future owner readiness decision and draft/export generation remain future work.
+
+Readiness review non-authority flags (all `true`):
+
+```json
+{
+  "does_not_create_plan": true,
+  "does_not_generate_planning_draft": true,
+  "does_not_validate_planning_workspace": true,
+  "does_not_approve_plan": true,
+  "does_not_transition_workspace": true,
+  "does_not_create_runner_proposal": true,
+  "does_not_create_run": true,
+  "does_not_invoke_executor": true,
+  "does_not_mark_intake_draft_ready": true,
+  "requires_future_owner_readiness_decision": true
+}
+```
 
 ---
 

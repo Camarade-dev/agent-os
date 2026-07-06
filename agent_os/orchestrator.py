@@ -85,6 +85,21 @@ OWNER_CLARIFICATION_NON_AUTHORITY_FLAGS = (
     "does_not_modify_goal_intake",
 )
 
+READINESS_REVIEW_NON_AUTHORITY_FLAGS = (
+    "does_not_create_plan",
+    "does_not_generate_planning_draft",
+    "does_not_validate_planning_workspace",
+    "does_not_approve_plan",
+    "does_not_transition_workspace",
+    "does_not_create_runner_proposal",
+    "does_not_create_run",
+    "does_not_invoke_executor",
+    "does_not_mark_intake_draft_ready",
+    "requires_future_owner_readiness_decision",
+)
+
+FORBIDDEN_READINESS_REVIEW_STATES = frozenset({"DRAFT_ALLOWED", "READY_FOR_DRAFT"})
+
 GOAL_INTAKE_REQUIRED_STRING_FIELDS = (
     "artifact_type",
     "schema_version",
@@ -808,6 +823,247 @@ def validate_owner_clarification(
 
     output = "\n".join(lines)
     return OwnerClarificationValidationReport(output, not errors, tuple(errors))
+
+
+def _validate_clarifications_for_readiness(
+    project: Path,
+    intake_id: str,
+) -> tuple[tuple[OwnerClarificationRecord, ...], list[str]]:
+    """Validate clarification artifacts for readiness review (read-only)."""
+    clarifications_dir = orchestrator_intake_path(project, intake_id) / CLARIFICATIONS_DIR
+    if not clarifications_dir.is_dir():
+        return (), []
+
+    records: list[OwnerClarificationRecord] = []
+    errors: list[str] = []
+
+    for path in sorted(clarifications_dir.glob("*.json")):
+        clarification_id = path.stem
+        raw_text = path.read_text(encoding="utf-8")
+        try:
+            artifact = json.loads(raw_text)
+        except json.JSONDecodeError as exc:
+            errors.append(
+                f"invalid clarification artifact {clarification_id}: malformed JSON: {exc.msg}"
+            )
+            continue
+
+        payload_errors = _validate_owner_clarification_payload(
+            artifact,
+            intake_id,
+            clarification_id,
+        )
+        if payload_errors:
+            for error in payload_errors:
+                errors.append(
+                    f"invalid clarification artifact {clarification_id}: {error}"
+                )
+            continue
+
+        created_at = artifact.get("created_at") if isinstance(artifact, dict) else ""
+        if not isinstance(created_at, str):
+            created_at = ""
+        records.append(
+            OwnerClarificationRecord(
+                clarification_id=clarification_id,
+                created_at=created_at,
+                path=path,
+            )
+        )
+
+    records.sort(key=lambda record: (record.created_at, record.clarification_id))
+    return tuple(records), errors
+
+
+def _determine_readiness_review(
+    *,
+    validation_errors: list[str],
+    artifact: dict | None,
+    clarifications: tuple[OwnerClarificationRecord, ...],
+    clarification_errors: list[str],
+) -> tuple[str, str, list[str]]:
+    """Return readiness_review_state, next_required_action, blocking_reasons."""
+    blocking: list[str] = list(validation_errors)
+    if validation_errors:
+        return "BLOCKED_INVALID_INTAKE", "FIX_GOAL_INTAKE_STRUCTURE", blocking
+
+    blocking.extend(clarification_errors)
+    if clarification_errors:
+        return "BLOCKED_INVALID_INTAKE", "FIX_CLARIFICATION_STRUCTURE", blocking
+
+    if artifact is None:
+        return "BLOCKED_INVALID_INTAKE", "FIX_GOAL_INTAKE_STRUCTURE", blocking
+
+    ambiguity_level = artifact.get("ambiguity_level")
+    planning_readiness = artifact.get("planning_readiness")
+    clarification_count = len(clarifications)
+
+    if (
+        ambiguity_level == "HIGH"
+        and planning_readiness == "REQUIRES_CLARIFICATION"
+    ):
+        if clarification_count == 0:
+            return "BLOCKED_REQUIRES_CLARIFICATION", "ADD_OWNER_CLARIFICATION", blocking
+        return (
+            "OWNER_CLARIFICATION_PRESENT_REVIEW_REQUIRED",
+            "OWNER_READINESS_DECISION_REQUIRED",
+            blocking,
+        )
+
+    return "OWNER_REVIEW_REQUIRED", "OWNER_READINESS_DECISION_REQUIRED", blocking
+
+
+def _format_goal_intake_readiness(
+    path: Path,
+    intake_id: str,
+    *,
+    goal_intake_valid: bool,
+    artifact: dict | None,
+    clarifications: tuple[OwnerClarificationRecord, ...],
+    readiness_review_state: str,
+    next_required_action: str,
+    blocking_reasons: list[str],
+) -> str:
+    ambiguity_level = (
+        artifact.get("ambiguity_level", "?") if artifact is not None else "?"
+    )
+    planning_readiness = (
+        artifact.get("planning_readiness", "?") if artifact is not None else "?"
+    )
+    latest_clarification_id = (
+        clarifications[-1].clarification_id if clarifications else None
+    )
+
+    lines = [
+        f"goal intake readiness review: {path}",
+        f"intake_id: {intake_id}",
+        f"goal_intake_valid: {'yes' if goal_intake_valid else 'no'}",
+        f"ambiguity_level: {ambiguity_level}",
+        f"planning_readiness: {planning_readiness}",
+        f"owner_clarification_count: {len(clarifications)}",
+    ]
+    if latest_clarification_id is not None:
+        lines.append(f"latest_clarification_id: {latest_clarification_id}")
+    lines.append(f"readiness_review_state: {readiness_review_state}")
+    lines.append(f"next_required_action: {next_required_action}")
+    if blocking_reasons:
+        lines.append("blocking_reasons:")
+        for reason in blocking_reasons:
+            lines.append(f"  - {reason}")
+    lines.append("non_authority:")
+    for flag in READINESS_REVIEW_NON_AUTHORITY_FLAGS:
+        lines.append(f"  {flag}: true")
+    lines.append(
+        "note: readiness review is read-only; not owner readiness decision, "
+        "not approval, not planning generation, and no files were modified"
+    )
+    lines.append(
+        "note: owner clarifications do not automatically make an intake draft-ready"
+    )
+    return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class GoalIntakeReadinessReport:
+    output: str
+    intake_id: str
+    goal_intake_valid: bool
+    ambiguity_level: str | None
+    planning_readiness: str | None
+    owner_clarification_count: int
+    latest_clarification_id: str | None
+    readiness_review_state: str
+    next_required_action: str
+    blocking_reasons: tuple[str, ...]
+    non_authority: dict[str, bool]
+
+
+def review_goal_intake_readiness(
+    project: Path,
+    intake_id: str,
+) -> GoalIntakeReadinessReport:
+    """Read-only readiness review for a GOAL_INTAKE and its clarifications."""
+    validate_intake_id(intake_id)
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        raise FileNotFoundError("no workspace found (run `agent-os init` first)")
+
+    path = _goal_intake_artifact_path(project, intake_id)
+    if not path.is_file():
+        raise FileNotFoundError(f"goal intake artifact not found: {intake_id}")
+
+    raw_text = path.read_text(encoding="utf-8")
+    validation_errors: list[str] = []
+    artifact: dict | None = None
+    try:
+        loaded = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        validation_errors = [f"malformed JSON: {exc.msg}"]
+    else:
+        validation_errors = _validate_goal_intake_payload(
+            loaded,
+            intake_id,
+            raw_text=raw_text,
+        )
+        if isinstance(loaded, dict):
+            artifact = loaded
+        else:
+            validation_errors.append("goal intake artifact must be a JSON object")
+
+    clarifications, clarification_errors = _validate_clarifications_for_readiness(
+        project,
+        intake_id,
+    )
+    readiness_review_state, next_required_action, blocking_reasons = (
+        _determine_readiness_review(
+            validation_errors=validation_errors,
+            artifact=artifact,
+            clarifications=clarifications,
+            clarification_errors=clarification_errors,
+        )
+    )
+
+    if readiness_review_state in FORBIDDEN_READINESS_REVIEW_STATES:
+        raise ValueError(
+            f"forbidden readiness review state: {readiness_review_state}"
+        )
+
+    goal_intake_valid = not validation_errors
+    ambiguity_level = (
+        artifact.get("ambiguity_level") if artifact is not None else None
+    )
+    planning_readiness = (
+        artifact.get("planning_readiness") if artifact is not None else None
+    )
+    latest_clarification_id = (
+        clarifications[-1].clarification_id if clarifications else None
+    )
+    non_authority = {key: True for key in READINESS_REVIEW_NON_AUTHORITY_FLAGS}
+
+    output = _format_goal_intake_readiness(
+        path,
+        intake_id,
+        goal_intake_valid=goal_intake_valid,
+        artifact=artifact,
+        clarifications=clarifications,
+        readiness_review_state=readiness_review_state,
+        next_required_action=next_required_action,
+        blocking_reasons=blocking_reasons,
+    )
+    return GoalIntakeReadinessReport(
+        output=output,
+        intake_id=intake_id,
+        goal_intake_valid=goal_intake_valid,
+        ambiguity_level=ambiguity_level,
+        planning_readiness=planning_readiness,
+        owner_clarification_count=len(clarifications),
+        latest_clarification_id=latest_clarification_id,
+        readiness_review_state=readiness_review_state,
+        next_required_action=next_required_action,
+        blocking_reasons=tuple(blocking_reasons),
+        non_authority=non_authority,
+    )
 
 
 def create_goal_intake(project: Path, intake_id: str, raw_goal: str) -> Path:

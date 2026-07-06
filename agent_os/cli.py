@@ -11,6 +11,7 @@ from agent_os.orchestrator import (
     create_goal_intake,
     create_owner_clarification,
     goal_intake_status,
+    review_goal_intake_readiness,
     validate_goal_intake,
 )
 from agent_os.planning import (
@@ -290,6 +291,17 @@ def cmd_orchestrator_validate(args: argparse.Namespace) -> int:
         return 1
     print(report.output)
     return 0 if report.valid else 1
+
+
+def cmd_orchestrator_readiness(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        report = review_goal_intake_readiness(project, args.intake_id)
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(report.output)
+    return 0 if report.goal_intake_valid else 1
 
 
 def cmd_orchestrator_clarify(args: argparse.Namespace) -> int:
@@ -637,6 +649,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     orchestrator_validate_parser.add_argument("path", nargs="?", help="target project directory")
     orchestrator_validate_parser.set_defaults(func=cmd_orchestrator_validate)
+
+    orchestrator_readiness_parser = orchestrator_sub.add_parser(
+        "readiness",
+        help="read-only readiness review of a GOAL_INTAKE and clarifications",
+        description=(
+            "Read-only readiness review of an existing GOAL_INTAKE artifact and "
+            "any owner clarification records. Summarizes ambiguity, clarification "
+            "status, and the next required action without authorizing draft "
+            "generation. Does not call an LLM, create planning drafts, choose "
+            "architecture, approve planning, create runs, or invoke an executor."
+        ),
+    )
+    orchestrator_readiness_parser.add_argument(
+        "intake_id",
+        help="intake identifier (filesystem-safe slug)",
+    )
+    orchestrator_readiness_parser.add_argument("path", nargs="?", help="target project directory")
+    orchestrator_readiness_parser.set_defaults(func=cmd_orchestrator_readiness)
 
     orchestrator_clarify_parser = orchestrator_sub.add_parser(
         "clarify",

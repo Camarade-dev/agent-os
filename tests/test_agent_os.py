@@ -19,6 +19,7 @@ from agent_os.orchestrator import (
     GOAL_INTAKE_REQUIRED_FIELDS,
     OWNER_CLARIFICATION_NON_AUTHORITY_FLAGS,
     OWNER_CLARIFICATION_REQUIRED_FIELDS,
+    READINESS_REVIEW_NON_AUTHORITY_FLAGS,
     build_goal_intake_artifact,
     build_owner_clarification_artifact,
     create_goal_intake,
@@ -28,6 +29,7 @@ from agent_os.orchestrator import (
     load_goal_intake,
     load_owner_clarification,
     normalize_goal,
+    review_goal_intake_readiness,
     validate_clarification_id,
     validate_goal_intake,
     validate_intake_id,
@@ -5180,6 +5182,392 @@ class OrchestratorOwnerClarificationTests(unittest.TestCase):
 
         report = validate_owner_clarification(self.project, intake_id, "scope-v1")
         self.assertTrue(report.valid)
+
+
+class OrchestratorGoalIntakeReadinessTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self._tmp.name)
+        init_workspace(self.project)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _artifact_path(self, intake_id: str) -> Path:
+        return orchestrator_intake_path(self.project, intake_id) / GOAL_INTAKE_FILE
+
+    def _clarification_path(self, intake_id: str, clarification_id: str) -> Path:
+        return orchestrator_clarification_path(
+            self.project,
+            intake_id,
+            clarification_id,
+        )
+
+    def _create_slither_intake(self, intake_id: str = "slither-demo") -> Path:
+        return create_goal_intake(
+            self.project,
+            intake_id,
+            "Build me an online slither.io-like game",
+        )
+
+    def _create_simple_intake(self, intake_id: str = "fix-login") -> Path:
+        return create_goal_intake(
+            self.project,
+            intake_id,
+            "Fix the login timeout bug in the auth module",
+        )
+
+    def _write_artifact(self, intake_id: str, artifact: dict) -> Path:
+        path = self._artifact_path(intake_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+        return path
+
+    def _project_files(self) -> set[str]:
+        return {
+            path.relative_to(self.project).as_posix()
+            for path in self.project.rglob("*")
+            if path.is_file()
+        }
+
+    def test_orchestrator_readiness_succeeds_read_only_for_valid_intake_zero_clarifications(
+        self,
+    ) -> None:
+        intake_id = "fix-login"
+        artifact_path = self._create_simple_intake(intake_id)
+        original = artifact_path.read_text(encoding="utf-8")
+        before = self._project_files()
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["orchestrator", "readiness", intake_id, str(self.project)])
+
+        self.assertEqual(code, 0)
+        output = buf.getvalue()
+        self.assertIn("goal_intake_valid: yes", output)
+        self.assertIn("owner_clarification_count: 0", output)
+        self.assertIn("readiness_review_state: OWNER_REVIEW_REQUIRED", output)
+        self.assertIn("next_required_action: OWNER_READINESS_DECISION_REQUIRED", output)
+        self.assertIn("readiness review is read-only", output)
+        self.assertEqual(original, artifact_path.read_text(encoding="utf-8"))
+        self.assertEqual(before, self._project_files())
+
+    def test_high_requires_clarification_zero_clarifications_blocked(self) -> None:
+        intake_id = "slither-demo"
+        self._create_slither_intake(intake_id)
+
+        report = review_goal_intake_readiness(self.project, intake_id)
+
+        self.assertEqual(report.readiness_review_state, "BLOCKED_REQUIRES_CLARIFICATION")
+        self.assertEqual(report.next_required_action, "ADD_OWNER_CLARIFICATION")
+        self.assertEqual(report.owner_clarification_count, 0)
+        self.assertIsNone(report.latest_clarification_id)
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["orchestrator", "readiness", intake_id, str(self.project)])
+        self.assertEqual(code, 0)
+        output = buf.getvalue()
+        self.assertIn("readiness_review_state: BLOCKED_REQUIRES_CLARIFICATION", output)
+        self.assertIn("next_required_action: ADD_OWNER_CLARIFICATION", output)
+
+    def test_high_requires_clarification_one_clarification_owner_review_required(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        self._create_slither_intake(intake_id)
+        create_owner_clarification(
+            self.project,
+            intake_id,
+            "scope-v1",
+            "Browser-only demo with 10 players max; no persistence.",
+        )
+
+        report = review_goal_intake_readiness(self.project, intake_id)
+
+        self.assertEqual(
+            report.readiness_review_state,
+            "OWNER_CLARIFICATION_PRESENT_REVIEW_REQUIRED",
+        )
+        self.assertEqual(report.next_required_action, "OWNER_READINESS_DECISION_REQUIRED")
+        self.assertEqual(report.owner_clarification_count, 1)
+        self.assertEqual(report.latest_clarification_id, "scope-v1")
+
+    def test_readiness_review_never_modifies_goal_intake_json(self) -> None:
+        intake_id = "slither-demo"
+        artifact_path = self._create_slither_intake(intake_id)
+        original = artifact_path.read_text(encoding="utf-8")
+
+        review_goal_intake_readiness(self.project, intake_id)
+        main(["orchestrator", "readiness", intake_id, str(self.project)])
+
+        self.assertEqual(original, artifact_path.read_text(encoding="utf-8"))
+
+    def test_readiness_review_never_modifies_clarification_artifacts(self) -> None:
+        intake_id = "slither-demo"
+        self._create_slither_intake(intake_id)
+        clarification_path = create_owner_clarification(
+            self.project,
+            intake_id,
+            "scope-v1",
+            "Browser-only demo with 10 players max.",
+        )
+        original = clarification_path.read_text(encoding="utf-8")
+
+        review_goal_intake_readiness(self.project, intake_id)
+
+        self.assertEqual(original, clarification_path.read_text(encoding="utf-8"))
+
+    def test_readiness_review_includes_non_authority_flags(self) -> None:
+        intake_id = "fix-login"
+        self._create_simple_intake(intake_id)
+
+        report = review_goal_intake_readiness(self.project, intake_id)
+
+        for flag in READINESS_REVIEW_NON_AUTHORITY_FLAGS:
+            self.assertTrue(report.non_authority[flag])
+        self.assertIn("does_not_generate_planning_draft: true", report.output)
+        self.assertIn(
+            "requires_future_owner_readiness_decision: true",
+            report.output,
+        )
+
+    def test_readiness_review_does_not_emit_draft_allowed_states(self) -> None:
+        intake_id = "fix-login"
+        self._create_simple_intake(intake_id)
+
+        report = review_goal_intake_readiness(self.project, intake_id)
+
+        self.assertNotIn(report.readiness_review_state, {"DRAFT_ALLOWED", "READY_FOR_DRAFT"})
+        self.assertNotIn("readiness_review_state: DRAFT_ALLOWED", report.output)
+        self.assertNotIn("readiness_review_state: READY_FOR_DRAFT", report.output)
+
+    def test_readiness_review_does_not_create_planning_artifacts(self) -> None:
+        intake_id = "slither-demo"
+        self._create_slither_intake(intake_id)
+        forbidden_names = set(planning_module.PLANNING_ARTIFACT_FILES)
+
+        main(["orchestrator", "readiness", intake_id, str(self.project)])
+
+        created_names = {
+            path.name for path in self.project.rglob("*") if path.is_file()
+        }
+        self.assertTrue(forbidden_names.isdisjoint(created_names))
+        self.assertFalse((self.project / ".agent-os" / "planning").exists())
+
+    def test_readiness_review_does_not_create_planning_run_slice(self) -> None:
+        intake_id = "slither-demo"
+        self._create_slither_intake(intake_id)
+
+        main(["orchestrator", "readiness", intake_id, str(self.project)])
+
+        combined = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in self.project.rglob("*")
+            if path.is_file()
+        )
+        self.assertNotIn("PLANNING_RUN_SLICE", combined)
+
+    def test_readiness_review_does_not_create_runs(self) -> None:
+        intake_id = "slither-demo"
+        self._create_slither_intake(intake_id)
+        workspace = self.project / ".agent-os"
+        before_runs = list((workspace / "runs").iterdir())
+
+        main(["orchestrator", "readiness", intake_id, str(self.project)])
+
+        after_runs = list((workspace / "runs").iterdir())
+        self.assertEqual(before_runs, after_runs)
+
+    def test_readiness_review_does_not_invoke_external_subprocess(self) -> None:
+        intake_id = "slither-demo"
+        self._create_slither_intake(intake_id)
+
+        with patch("subprocess.run", side_effect=AssertionError("subprocess invoked")):
+            code = main(["orchestrator", "readiness", intake_id, str(self.project)])
+        self.assertEqual(code, 0)
+
+    def test_readiness_missing_workspace_fails_without_orchestrator_tree(self) -> None:
+        bare = Path(tempfile.mkdtemp())
+        try:
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                code = main(["orchestrator", "readiness", "slither-demo", str(bare)])
+            self.assertEqual(code, 1)
+            self.assertIn("no workspace found", buf.getvalue())
+            self.assertFalse((bare / ".agent-os" / "orchestrator").exists())
+        finally:
+            import shutil
+
+            shutil.rmtree(bare)
+
+    def test_readiness_missing_intake_fails_without_creating_files(self) -> None:
+        before = self._project_files()
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                ["orchestrator", "readiness", "missing-intake", str(self.project)]
+            )
+
+        self.assertEqual(code, 1)
+        self.assertIn("goal intake artifact not found", buf.getvalue())
+        self.assertEqual(before, self._project_files())
+        self.assertFalse(
+            (
+                self.project
+                / ".agent-os"
+                / "orchestrator"
+                / "intakes"
+                / "missing-intake"
+            ).exists()
+        )
+
+    def test_readiness_invalid_intake_blocked_without_writing_files(self) -> None:
+        intake_id = "invalid-readiness"
+        artifact = build_goal_intake_artifact(
+            intake_id,
+            "Build a game",
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        artifact["artifact_type"] = "PLANNING_WORKSPACE_DRAFT"
+        artifact_path = self._write_artifact(intake_id, artifact)
+        original = artifact_path.read_text(encoding="utf-8")
+        before = self._project_files()
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["orchestrator", "readiness", intake_id, str(self.project)])
+
+        self.assertEqual(code, 1)
+        output = buf.getvalue()
+        self.assertIn("goal_intake_valid: no", output)
+        self.assertIn("readiness_review_state: BLOCKED_INVALID_INTAKE", output)
+        self.assertIn("next_required_action: FIX_GOAL_INTAKE_STRUCTURE", output)
+        self.assertIn("wrong artifact_type", output)
+        self.assertEqual(original, artifact_path.read_text(encoding="utf-8"))
+        self.assertEqual(before, self._project_files())
+
+    def test_readiness_invalid_clarification_reported_blocking_without_mutation(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        self._create_slither_intake(intake_id)
+        clarification_path = self._clarification_path(intake_id, "broken")
+        clarification_path.parent.mkdir(parents=True, exist_ok=True)
+        clarification_path.write_text("{not-json", encoding="utf-8")
+        original = clarification_path.read_text(encoding="utf-8")
+
+        report = review_goal_intake_readiness(self.project, intake_id)
+
+        self.assertEqual(report.intake_id, intake_id)
+        self.assertEqual(report.readiness_review_state, "BLOCKED_INVALID_INTAKE")
+        self.assertEqual(report.next_required_action, "FIX_CLARIFICATION_STRUCTURE")
+        self.assertTrue(any("malformed JSON" in reason for reason in report.blocking_reasons))
+        self.assertEqual(original, clarification_path.read_text(encoding="utf-8"))
+
+    def test_readiness_report_carries_intake_id(self) -> None:
+        intake_id = "fix-login"
+        self._create_simple_intake(intake_id)
+
+        report = review_goal_intake_readiness(self.project, intake_id)
+
+        self.assertEqual(report.intake_id, intake_id)
+
+    def test_orchestrator_readiness_cli_invalid_clarification_blocking_without_mutation(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        artifact_path = self._create_slither_intake(intake_id)
+        intake_original = artifact_path.read_text(encoding="utf-8")
+        clarification_path = self._clarification_path(intake_id, "broken")
+        clarification_path.parent.mkdir(parents=True, exist_ok=True)
+        clarification_path.write_text("{not-json", encoding="utf-8")
+        clarification_original = clarification_path.read_text(encoding="utf-8")
+        before = self._project_files()
+        forbidden_names = set(planning_module.PLANNING_ARTIFACT_FILES)
+        workspace = self.project / ".agent-os"
+        before_runs = list((workspace / "runs").iterdir())
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["orchestrator", "readiness", intake_id, str(self.project)])
+
+        output = buf.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn("goal intake readiness review:", output)
+        self.assertIn(f"intake_id: {intake_id}", output)
+        self.assertIn("goal_intake_valid: yes", output)
+        self.assertIn("readiness_review_state: BLOCKED_INVALID_INTAKE", output)
+        self.assertIn("next_required_action: FIX_CLARIFICATION_STRUCTURE", output)
+        self.assertIn("blocking_reasons:", output)
+        self.assertIn("malformed JSON", output)
+        self.assertIn("readiness review is read-only", output)
+        self.assertEqual(intake_original, artifact_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            clarification_original,
+            clarification_path.read_text(encoding="utf-8"),
+        )
+        self.assertEqual(before, self._project_files())
+        created_names = {
+            path.name for path in self.project.rglob("*") if path.is_file()
+        }
+        self.assertTrue(forbidden_names.isdisjoint(created_names))
+        self.assertFalse((self.project / ".agent-os" / "planning").exists())
+        combined = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in self.project.rglob("*")
+            if path.is_file()
+        )
+        self.assertNotIn("PLANNING_RUN_SLICE", combined)
+        after_runs = list((workspace / "runs").iterdir())
+        self.assertEqual(before_runs, after_runs)
+
+    def test_orchestrator_readiness_cli_help_marks_read_only(self) -> None:
+        parser = build_parser()
+        orchestrator_action = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        orchestrator_parser = orchestrator_action.choices["orchestrator"]
+        orchestrator_sub = next(
+            action
+            for action in orchestrator_parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+
+        help_text = orchestrator_sub.choices["readiness"].format_help()
+        compact_help = re.sub(r"\s+", " ", help_text)
+        self.assertIn("read-only", compact_help.lower())
+        self.assertIn("Does not call an LLM", compact_help)
+        self.assertIn("create planning drafts", compact_help)
+        self.assertIn("invoke an executor", compact_help)
+        self.assertIn("approve planning", compact_help)
+
+    def test_orchestrator_validate_unchanged_without_clarification_requirement(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        self._create_slither_intake(intake_id)
+
+        report = validate_goal_intake(self.project, intake_id)
+        self.assertTrue(report.valid)
+
+    def test_orchestrator_status_remains_read_only_after_readiness_slice(self) -> None:
+        intake_id = "slither-demo"
+        artifact_path = self._create_slither_intake(intake_id)
+        original = artifact_path.read_text(encoding="utf-8")
+        before = self._project_files()
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["orchestrator", "status", intake_id, str(self.project)])
+
+        self.assertEqual(code, 0)
+        self.assertIn("owner_clarifications: 0", buf.getvalue())
+        self.assertEqual(original, artifact_path.read_text(encoding="utf-8"))
+        self.assertEqual(before, self._project_files())
 
 
 class OrchestratorDocsGuardTests(unittest.TestCase):
