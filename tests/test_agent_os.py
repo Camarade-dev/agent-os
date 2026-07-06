@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import io
 import json
 import re
@@ -10,9 +11,18 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
-from agent_os.cli import main
-from agent_os.paths import TEMPLATE_FILES, planning_path, run_path
+from agent_os.cli import build_parser, main
+from agent_os.orchestrator import (
+    GOAL_INTAKE_NON_AUTHORITY_FLAGS,
+    GOAL_INTAKE_REQUIRED_FIELDS,
+    build_goal_intake_artifact,
+    create_goal_intake,
+    normalize_goal,
+    validate_intake_id,
+)
+from agent_os.paths import GOAL_INTAKE_FILE, TEMPLATE_FILES, orchestrator_intake_path, planning_path, run_path
 from agent_os import planning as planning_module
 from agent_os.planning import (
     init_planning_workspace,
@@ -3790,11 +3800,342 @@ class PlanningDocsHygieneTests(unittest.TestCase):
         )
 
 
+class OrchestratorGoalIntakeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self._tmp.name)
+        init_workspace(self.project)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _artifact_path(self, intake_id: str) -> Path:
+        return orchestrator_intake_path(self.project, intake_id) / GOAL_INTAKE_FILE
+
+    def _read_artifact(self, intake_id: str) -> dict:
+        return json.loads(self._artifact_path(intake_id).read_text(encoding="utf-8"))
+
+    def test_orchestrator_intake_creates_expected_goal_intake_artifact(self) -> None:
+        intake_id = "slither-demo"
+        raw_goal = "Build me an online slither.io-like game"
+
+        dest = create_goal_intake(self.project, intake_id, raw_goal)
+
+        self.assertEqual(dest, self._artifact_path(intake_id))
+        self.assertTrue(dest.is_file())
+        artifact = self._read_artifact(intake_id)
+        self.assertEqual(artifact["artifact_type"], "GOAL_INTAKE")
+        self.assertEqual(artifact["schema_version"], "0.1")
+        self.assertEqual(artifact["intake_id"], intake_id)
+
+    def test_goal_intake_artifact_contains_all_required_fields(self) -> None:
+        artifact = build_goal_intake_artifact(
+            "demo",
+            "Build a game",
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        missing = [field for field in GOAL_INTAKE_REQUIRED_FIELDS if field not in artifact]
+        self.assertEqual(missing, [])
+
+    def test_raw_goal_preserves_exact_input(self) -> None:
+        raw_goal = "  Build me\tan online\n\nslither.io-like game  "
+        create_goal_intake(self.project, "exact-input", raw_goal)
+        artifact = self._read_artifact("exact-input")
+        self.assertEqual(artifact["raw_goal"], raw_goal)
+
+    def test_normalized_goal_is_whitespace_normalized_only(self) -> None:
+        raw_goal = "  Build me\tan online\n\nslither.io-like game  "
+        self.assertEqual(
+            normalize_goal(raw_goal),
+            "Build me an online slither.io-like game",
+        )
+        artifact = build_goal_intake_artifact(
+            "normalize-only",
+            raw_goal,
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        self.assertEqual(
+            artifact["normalized_goal"],
+            "Build me an online slither.io-like game",
+        )
+        self.assertEqual(
+            artifact["user_visible_summary"],
+            artifact["normalized_goal"],
+        )
+
+    def test_broad_slither_like_goal_requires_clarification(self) -> None:
+        artifact = build_goal_intake_artifact(
+            "slither-demo",
+            "Build me an online slither.io-like game",
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        self.assertEqual(artifact["ambiguity_level"], "HIGH")
+        self.assertEqual(artifact["planning_readiness"], "REQUIRES_CLARIFICATION")
+        self.assertTrue(artifact["open_questions"])
+
+    def test_goal_intake_includes_all_non_authority_flags(self) -> None:
+        artifact = build_goal_intake_artifact(
+            "demo",
+            "Build a game",
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        self.assertEqual(
+            set(artifact["non_authority"]),
+            set(GOAL_INTAKE_NON_AUTHORITY_FLAGS),
+        )
+        self.assertTrue(all(artifact["non_authority"].values()))
+
+    def test_orchestrator_intake_rejects_empty_goals(self) -> None:
+        with self.assertRaises(ValueError):
+            build_goal_intake_artifact("demo", "   ")
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(["orchestrator", "intake", "demo", str(self.project), "--goal", ""])
+        self.assertEqual(code, 1)
+        self.assertIn("goal must not be empty", buf.getvalue())
+
+    def test_orchestrator_intake_rejects_invalid_intake_ids(self) -> None:
+        invalid_ids = ["", "../x", "a/b", "my plan", ".hidden", "-bad", "Bad", "a.b"]
+        for intake_id in invalid_ids:
+            with self.subTest(intake_id=intake_id):
+                with self.assertRaises(ValueError):
+                    validate_intake_id(intake_id)
+                if not intake_id or intake_id.startswith("-"):
+                    continue
+                buf = io.StringIO()
+                with redirect_stderr(buf):
+                    code = main(
+                        [
+                            "orchestrator",
+                            "intake",
+                            intake_id,
+                            str(self.project),
+                            "--goal",
+                            "Build a game",
+                        ]
+                    )
+                self.assertEqual(code, 1)
+                self.assertTrue(buf.getvalue().strip())
+
+    def test_orchestrator_intake_refuses_to_overwrite_existing_artifact(self) -> None:
+        intake_id = "slither-demo"
+        create_goal_intake(self.project, intake_id, "Build a game")
+        artifact_path = self._artifact_path(intake_id)
+        original = artifact_path.read_text(encoding="utf-8")
+
+        with self.assertRaises(FileExistsError):
+            create_goal_intake(self.project, intake_id, "Build another game")
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "intake",
+                    intake_id,
+                    str(self.project),
+                    "--goal",
+                    "Build another game",
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("already exists", buf.getvalue())
+        self.assertEqual(original, artifact_path.read_text(encoding="utf-8"))
+
+    def test_orchestrator_intake_writes_only_expected_artifact_file(self) -> None:
+        before = {
+            path.relative_to(self.project).as_posix()
+            for path in self.project.rglob("*")
+            if path.is_file()
+        }
+        intake_id = "slither-demo"
+
+        create_goal_intake(self.project, intake_id, "Build a game")
+
+        after = {
+            path.relative_to(self.project).as_posix()
+            for path in self.project.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(
+            after - before,
+            {".agent-os/orchestrator/intakes/slither-demo/goal-intake.json"},
+        )
+
+    def test_orchestrator_intake_does_not_create_planning_artifacts(self) -> None:
+        create_goal_intake(self.project, "slither-demo", "Build a game")
+        forbidden_names = set(planning_module.PLANNING_ARTIFACT_FILES)
+        created_names = {path.name for path in self.project.rglob("*") if path.is_file()}
+        self.assertTrue(forbidden_names.isdisjoint(created_names))
+        self.assertFalse((self.project / ".agent-os" / "planning").exists())
+
+    def test_orchestrator_intake_fails_without_agent_os_init(self) -> None:
+        bare = Path(tempfile.mkdtemp())
+        try:
+            with self.assertRaises(FileNotFoundError):
+                create_goal_intake(bare, "slither-demo", "Build a game")
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                code = main(
+                    [
+                        "orchestrator",
+                        "intake",
+                        "slither-demo",
+                        str(bare),
+                        "--goal",
+                        "Build a game",
+                    ]
+                )
+            self.assertEqual(code, 1)
+            self.assertIn("no workspace found", buf.getvalue())
+            self.assertFalse((bare / ".agent-os" / "orchestrator").exists())
+        finally:
+            import shutil
+
+            shutil.rmtree(bare)
+
+    def test_orchestrator_intake_validation_failure_leaves_no_orchestrator_files(
+        self,
+    ) -> None:
+        orchestrator_root = self.project / ".agent-os" / "orchestrator"
+        self.assertFalse(orchestrator_root.exists())
+
+        with self.assertRaises(ValueError):
+            create_goal_intake(self.project, "my plan", "Build a game")
+        self.assertFalse(orchestrator_root.exists())
+        self.assertEqual(list(self.project.rglob(GOAL_INTAKE_FILE)), [])
+
+        with self.assertRaises(ValueError):
+            create_goal_intake(self.project, "demo", "   ")
+        self.assertFalse(orchestrator_root.exists())
+        self.assertEqual(list(self.project.rglob(GOAL_INTAKE_FILE)), [])
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "intake",
+                    "my plan",
+                    str(self.project),
+                    "--goal",
+                    "Build a game",
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertFalse(orchestrator_root.exists())
+        self.assertEqual(list(self.project.rglob(GOAL_INTAKE_FILE)), [])
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                ["orchestrator", "intake", "demo", str(self.project), "--goal", ""]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("goal must not be empty", buf.getvalue())
+        self.assertFalse(orchestrator_root.exists())
+        self.assertEqual(list(self.project.rglob(GOAL_INTAKE_FILE)), [])
+
+    def test_orchestrator_intake_does_not_create_planning_run_slice(self) -> None:
+        create_goal_intake(self.project, "slither-demo", "Build a game")
+        combined = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in self.project.rglob("*")
+            if path.is_file()
+        )
+        self.assertNotIn("PLANNING_RUN_SLICE", combined)
+
+    def test_orchestrator_intake_does_not_create_runs(self) -> None:
+        workspace = self.project / ".agent-os"
+        before_runs = list((workspace / "runs").iterdir())
+
+        create_goal_intake(self.project, "slither-demo", "Build a game")
+
+        after_runs = list((workspace / "runs").iterdir())
+        self.assertEqual(before_runs, after_runs)
+
+    def test_orchestrator_intake_does_not_invoke_external_subprocess(self) -> None:
+        with patch("subprocess.run", side_effect=AssertionError("subprocess invoked")):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = main(
+                    [
+                        "orchestrator",
+                        "intake",
+                        "slither-demo",
+                        str(self.project),
+                        "--goal",
+                        "Build a game",
+                    ]
+                )
+        self.assertEqual(code, 0)
+        self.assertTrue(self._artifact_path("slither-demo").is_file())
+
+    def test_orchestrator_intake_does_not_require_runner_files(self) -> None:
+        self.assertFalse((self.project / "agent-os-runner-experimental").exists())
+
+        create_goal_intake(self.project, "slither-demo", "Build a game")
+
+        self.assertFalse((self.project / "agent-os-runner-experimental").exists())
+
+    def test_orchestrator_intake_cli_success_output_is_operator_readable(self) -> None:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "intake",
+                    "slither-demo",
+                    str(self.project),
+                    "--goal",
+                    "Build a game",
+                ]
+            )
+        self.assertEqual(code, 0)
+        output = buf.getvalue()
+        self.assertIn("created goal intake artifact:", output)
+        self.assertIn("artifact_type: GOAL_INTAKE", output)
+        self.assertIn("deterministic intake/scaffold only", output)
+        self.assertIn("no LLM", output)
+        self.assertIn("no planning approval", output)
+        self.assertIn("no runs", output)
+        self.assertIn("no executor invocation", output)
+
+    def test_orchestrator_intake_cli_help_marks_scaffold_only(self) -> None:
+        help_text = build_parser().format_help()
+        compact_help = re.sub(r"\s+", " ", help_text)
+        self.assertIn("orchestrator", help_text)
+        self.assertIn("no LLM", compact_help)
+        self.assertIn("no execution", compact_help)
+
+        parser = build_parser()
+        orchestrator_action = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        orchestrator_parser = orchestrator_action.choices["orchestrator"]
+        orchestrator_sub = next(
+            action
+            for action in orchestrator_parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        intake_help = orchestrator_sub.choices["intake"].format_help()
+        compact_intake_help = re.sub(r"\s+", " ", intake_help)
+        self.assertIn("GOAL_INTAKE artifact only", compact_intake_help)
+        self.assertIn("Does not call an LLM", compact_intake_help)
+        self.assertIn("choose architecture", compact_intake_help)
+        self.assertIn("create runs", compact_intake_help)
+        self.assertIn("invoke an executor", compact_intake_help)
+
+
 class OrchestratorDocsGuardTests(unittest.TestCase):
     """Guard doctrine for CORE_ORCHESTRATOR_001 goal-to-planning workspace contract."""
 
     _ORCHESTRATOR_DOCS: tuple[str, ...] = (
         "docs/orchestrator/goal-to-planning-workspace-contract.md",
+        "docs/orchestrator/goal-intake-artifact.md",
         "docs/orchestrator/architecture-decision-boundary.md",
         "docs/orchestrator/slither-like-demo-contract.md",
     )
@@ -3824,7 +4165,6 @@ class OrchestratorDocsGuardTests(unittest.TestCase):
     )
 
     _FUTURE_CLI_COMMANDS: tuple[str, ...] = (
-        "agent-os orchestrator intake",
         "agent-os orchestrator draft-export",
     )
 
@@ -3907,6 +4247,20 @@ class OrchestratorDocsGuardTests(unittest.TestCase):
                     "not implemented" in window or "future work" in window,
                     f"{command!r} must be marked as not implemented or future work",
                 )
+
+    def test_goal_intake_cli_marked_as_scaffold_only(self) -> None:
+        repo_root = self._repo_root()
+        doc = (
+            repo_root / "docs/orchestrator/goal-intake-artifact.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("agent-os orchestrator intake", doc)
+        lowered = doc.lower()
+        plain = lowered.replace("**", "")
+        self.assertIn("deterministic scaffold", lowered)
+        self.assertIn("does not call an llm", plain)
+        self.assertIn("does not create a planning workspace", plain)
+        self.assertIn("does_not_create_runner_proposal", doc)
+        self.assertIn("does_not_invoke_executor", doc)
 
 
 if __name__ == "__main__":

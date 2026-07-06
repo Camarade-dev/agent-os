@@ -1,10 +1,10 @@
 # Goal-to-planning workspace contract
 
-> **Status:** doctrine and contract only — no orchestrator CLI, no LLM adapter, no autonomous generation, no UI  
-> **Slice:** `CORE_ORCHESTRATOR_001` — goal intake → planning workspace **draft**; no execution  
-> **Companions:** [`architecture-decision-boundary.md`](architecture-decision-boundary.md), [`slither-like-demo-contract.md`](slither-like-demo-contract.md), [`../planning-layer-doctrine.md`](../planning-layer-doctrine.md), [`../planning-workspace-layout.md`](../planning-workspace-layout.md)
+> **Status:** doctrine and contract plus deterministic goal-intake scaffold CLI — no LLM adapter, no autonomous generation, no UI  
+> **Slice:** `CORE_ORCHESTRATOR_002` adds `agent-os orchestrator intake` for `GOAL_INTAKE` artifact creation only; planning workspace drafting remains future work  
+> **Companions:** [`goal-intake-artifact.md`](goal-intake-artifact.md), [`architecture-decision-boundary.md`](architecture-decision-boundary.md), [`slither-like-demo-contract.md`](slither-like-demo-contract.md), [`../planning-layer-doctrine.md`](../planning-layer-doctrine.md), [`../planning-workspace-layout.md`](../planning-workspace-layout.md)
 
-This document defines the **formal contract** for a future Agent OS orchestrator that receives a natural-language goal and produces a **governed planning workspace draft**. It authorizes nothing. It does not implement generation, validation, transition, runner import, or executor invocation.
+This document defines the **formal contract** for a future Agent OS orchestrator that receives a natural-language goal and eventually proposes a **governed planning workspace draft**. It authorizes nothing. The current implementation is limited to deterministic `GOAL_INTAKE` JSON artifact scaffolding; it does not implement architecture generation, planning generation, validation, transition, runner import, or executor invocation.
 
 ---
 
@@ -41,7 +41,9 @@ Planning workspace draft (artifacts + optional PLANNING_RUN_SLICE sketch)
 - LLM or agent adapters
 - Chat UI or hidden planners
 - Autonomous artifact generation
+- Architecture selection or implementation-plan generation
 - `agent-os planning init` automation from orchestrator output
+- `PLANNING_RUN_SLICE` creation in the intake scaffold
 - Runner proposal creation or structured import
 - Executor invocation
 - Modifications to `agent-os-runner-experimental`
@@ -50,22 +52,30 @@ Planning workspace draft (artifacts + optional PLANNING_RUN_SLICE sketch)
 
 ## 2. Goal intake contract
 
-A future orchestrator must normalize every user goal into a **Goal Intake Record** before drafting planning artifacts. Free-form prose is provenance only; machine processing uses the structured record.
+The current `agent-os orchestrator intake` command normalizes every user goal into a **Goal Intake Record** before any future drafting stage. Free-form prose is provenance only; machine processing uses the structured record. The implemented intake command is deterministic and does not call an LLM.
+
+The intake artifact is written to:
+
+```text
+.agent-os/orchestrator/intakes/<intake-id>/goal-intake.json
+```
+
+This file is planning-adjacent input. It is not a planning workspace, not a validated workspace, not an owner decision, not a runner proposal, and not an approved run.
 
 ### 2.1 Minimum fields
 
 | Field | Type | Purpose |
 |-------|------|---------|
 | `raw_goal` | string | Verbatim user input (e.g. `"Build me an online slither.io-like game"`) |
-| `normalized_goal` | string | Owner-reviewable restatement of intent; bounded, testable where possible |
+| `normalized_goal` | string | Whitespace-normalized goal text for the deterministic scaffold; no semantic rewrite in `CORE_ORCHESTRATOR_002` |
 | `user_visible_summary` | string | Short summary suitable for manifest `goal` and Context Pack header |
 | `explicit_constraints` | string[] | Constraints stated or confirmed by the user |
-| `inferred_assumptions` | object[] | Each: `{ assumption, basis, confidence, requires_owner_confirmation }` |
+| `inferred_assumptions` | object[] | Empty in `CORE_ORCHESTRATOR_002`; future inference must be labeled and reviewable |
 | `open_questions` | object[] | Each: `{ question, impact, suggested_owner_action, blocks_first_slice }` |
 | `non_goals` | string[] | Explicit exclusions to prevent scope creep |
 | `risk_flags` | object[] | Each: `{ risk, likelihood, impact, mitigation_planning_only }` |
 | `ambiguity_level` | enum | `LOW` \| `MEDIUM` \| `HIGH` |
-| `planning_readiness` | enum | `NOT_READY` \| `DRAFT_ALLOWED` \| `REQUIRES_CLARIFICATION` |
+| `planning_readiness` | enum | `NOT_READY` \| `DRAFT_ALLOWED` \| `REQUIRES_CLARIFICATION`; the deterministic intake scaffold never uses high ambiguity to allow drafts |
 
 ### 2.2 Doctrine
 
@@ -250,7 +260,9 @@ These commands exist today and remain **operator-driven**; the orchestrator must
 | `agent-os planning decide` | Owner judgment record |
 | `agent-os planning transition` | Manifest transition — explicit, gated |
 
-**Future work (not implemented):** `agent-os orchestrator intake`, `agent-os orchestrator draft-export`, or any command that auto-runs the above. Documenting such commands here does not imply implementation.
+**Implemented intake scaffold:** `agent-os orchestrator intake <intake-id> --goal "<raw goal>" [PATH]` creates a reviewable `GOAL_INTAKE` JSON artifact only.
+
+**Future work (not implemented):** `agent-os orchestrator draft-export` or any command that auto-runs the planning lifecycle above. Documenting draft-export does not imply implementation.
 
 ---
 

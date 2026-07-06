@@ -8,6 +8,9 @@ from pathlib import Path
 WORKSPACE_DIR = ".agent-os"
 RUNS_DIR = "runs"
 PLANNING_DIR = "planning"
+ORCHESTRATOR_DIR = "orchestrator"
+INTAKES_DIR = "intakes"
+GOAL_INTAKE_FILE = "goal-intake.json"
 META_FILE = "run.json"
 
 PLACEHOLDER_VALUES = frozenset(
@@ -43,6 +46,10 @@ def runs_path(project: Path) -> Path:
 
 def planning_path(project: Path, plan_id: str) -> Path:
     return workspace_path(project) / PLANNING_DIR / plan_id
+
+
+def orchestrator_intake_path(project: Path, intake_id: str) -> Path:
+    return workspace_path(project) / ORCHESTRATOR_DIR / INTAKES_DIR / intake_id
 
 
 def run_path(project: Path, run_id: str) -> Path:

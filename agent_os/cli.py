@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from agent_os import __version__
+from agent_os.orchestrator import create_goal_intake
 from agent_os.planning import (
     PLANNING_OWNER_DECISIONS,
     init_planning_workspace,
@@ -247,6 +248,20 @@ def cmd_planning_progress(args: argparse.Namespace) -> int:
         print(str(exc), file=sys.stderr)
         return 1
     print(result.output)
+    return 0
+
+
+def cmd_orchestrator_intake(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        dest = create_goal_intake(project, args.intake_id, args.goal)
+    except (FileNotFoundError, FileExistsError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"created goal intake artifact: {dest}")
+    print("artifact_type: GOAL_INTAKE")
+    print("mode: deterministic intake/scaffold only")
+    print("note: no LLM, no planning approval, no runs, no executor invocation")
     return 0
 
 
@@ -510,6 +525,36 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     planning_progress_parser.set_defaults(func=cmd_planning_progress)
+
+    orchestrator_parser = sub.add_parser(
+        "orchestrator",
+        help="deterministic orchestrator scaffolds only (no LLM, no execution)",
+    )
+    orchestrator_sub = orchestrator_parser.add_subparsers(
+        dest="orchestrator_command",
+        required=True,
+    )
+
+    orchestrator_intake_parser = orchestrator_sub.add_parser(
+        "intake",
+        help="create GOAL_INTAKE scaffold only; no planning generation",
+        description=(
+            "Create a deterministic, reviewable GOAL_INTAKE artifact only. "
+            "Does not call an LLM, choose architecture, validate planning, "
+            "create runs, or invoke an executor."
+        ),
+    )
+    orchestrator_intake_parser.add_argument(
+        "intake_id",
+        help="intake identifier (filesystem-safe slug)",
+    )
+    orchestrator_intake_parser.add_argument("path", nargs="?", help="target project directory")
+    orchestrator_intake_parser.add_argument(
+        "--goal",
+        required=True,
+        help="raw natural-language goal to preserve in the intake artifact",
+    )
+    orchestrator_intake_parser.set_defaults(func=cmd_orchestrator_intake)
 
     return parser
 
