@@ -267,6 +267,18 @@ Requires an existing DRAFT scaffold from `prepare-planning-draft` for the same i
 
 Transport copies owner-provided context; it does **not** interpret it, generate architecture, generate implementation plans, or generate `PLANNING_RUN_SLICE`. The workspace remains **`DRAFT`** — it is **not validated or approved**. Does **not** mutate core planning templates (`context-pack.md`, `local-agentic-spec.md`, `implementation-plan.md`, `planning-audit.md`), orchestrator intake artifacts, or orchestrator provenance. Future architecture decision, independent validation, owner approval, and runner proposal generation remain separate.
 
+After context transport, draft the planning workspace `context-pack.md` from transported context:
+
+```bash
+agent-os orchestrator draft-context-pack <intake-id> --plan-id <plan-id> [PATH]
+```
+
+Requires an existing DRAFT scaffold with matching orchestrator provenance and context transport artifacts for the same intake/plan pair, confirmed draft-preflight, and `context-pack.md` still in the planning init placeholder shape. Writes a bounded source-context draft to `context-pack.md` and provenance under `evidence/`:
+
+- `evidence/orchestrator-context-pack-draft-provenance.json` — links the draft to transport artifacts and authorize decision; **provenance is traceability only, not authority**
+
+The context pack draft copies transported source context only; it does **not** generate architecture, local agentic spec, implementation plan, or `PLANNING_RUN_SLICE`; does **not** validate or approve the workspace; does **not** transition status; does **not** create runner proposals, runs, or executor invocations; and does **not** mutate orchestrator intake artifacts, transport artifacts, orchestrator provenance, or other planning templates. **Context pack draft is source-context only** — not architecture decision, not approved context pack, not local agentic spec, not implementation plan. The planning workspace remains **`DRAFT`** — it is **not validated or approved**. Future architecture decision, local agentic spec, implementation plan, independent validation, and owner approval remain required. Runner proposal generation remains future/separate work.
+
 Inspect an existing planning workspace (read-only):
 
 ```bash

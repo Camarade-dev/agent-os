@@ -8894,6 +8894,1127 @@ class OrchestratorTransportPlanningContextTests(unittest.TestCase):
         self.assertFalse(validation.valid)
 
 
+class OrchestratorDraftContextPackTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self._tmp.name)
+        init_workspace(self.project)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _artifact_path(self, intake_id: str) -> Path:
+        return orchestrator_intake_path(self.project, intake_id) / GOAL_INTAKE_FILE
+
+    def _clarification_path(self, intake_id: str, clarification_id: str) -> Path:
+        return orchestrator_clarification_path(
+            self.project,
+            intake_id,
+            clarification_id,
+        )
+
+    def _decision_path(self, intake_id: str, decision_id: str) -> Path:
+        return orchestrator_readiness_decision_path(
+            self.project,
+            intake_id,
+            decision_id,
+        )
+
+    def _create_slither_intake(self, intake_id: str = "slither-demo") -> Path:
+        return create_goal_intake(
+            self.project,
+            intake_id,
+            "Build me an online slither.io-like game",
+        )
+
+    def _project_files(self) -> set[str]:
+        return {
+            path.relative_to(self.project).as_posix()
+            for path in self.project.rglob("*")
+            if path.is_file()
+        }
+
+    def _slither_with_clarification(self, intake_id: str = "slither-demo") -> None:
+        self._create_slither_intake(intake_id)
+        create_owner_clarification(
+            self.project,
+            intake_id,
+            "scope-v1",
+            "Browser-only demo with 10 players max; no persistence.",
+        )
+
+    def _authorize_slither(self, intake_id: str = "slither-demo") -> None:
+        self._slither_with_clarification(intake_id)
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "AUTHORIZE_DRAFT_PREPARATION",
+            "Scope clarified; authorize future draft prep only.",
+        )
+
+    def _prepare(
+        self,
+        intake_id: str = "slither-demo",
+        plan_id: str = "slither-plan-v1",
+    ) -> tuple[int, str]:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "prepare-planning-draft",
+                    intake_id,
+                    str(self.project),
+                    "--plan-id",
+                    plan_id,
+                ]
+            )
+        return code, buf.getvalue()
+
+    def _transport(
+        self,
+        intake_id: str = "slither-demo",
+        plan_id: str = "slither-plan-v1",
+    ) -> tuple[int, str]:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "transport-planning-context",
+                    intake_id,
+                    str(self.project),
+                    "--plan-id",
+                    plan_id,
+                ]
+            )
+        return code, buf.getvalue()
+
+    def _draft(
+        self,
+        intake_id: str = "slither-demo",
+        plan_id: str = "slither-plan-v1",
+    ) -> tuple[int, str]:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "draft-context-pack",
+                    intake_id,
+                    str(self.project),
+                    "--plan-id",
+                    plan_id,
+                ]
+            )
+        return code, buf.getvalue()
+
+    def _workspace(self, plan_id: str = "slither-plan-v1") -> Path:
+        return planning_path(self.project, plan_id)
+
+    def _context_pack_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return self._workspace(plan_id) / "context-pack.md"
+
+    def _draft_provenance_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return (
+            self._workspace(plan_id)
+            / "evidence"
+            / "orchestrator-context-pack-draft-provenance.json"
+        )
+
+    def _transport_json_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return (
+            self._workspace(plan_id)
+            / "evidence"
+            / "orchestrator-context-transport.json"
+        )
+
+    def _transport_md_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return (
+            self._workspace(plan_id)
+            / "evidence"
+            / "orchestrator-context-transport.md"
+        )
+
+    def _provenance_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return (
+            self._workspace(plan_id)
+            / "evidence"
+            / "orchestrator-provenance.json"
+        )
+
+    def _setup_ready_for_draft(
+        self,
+        intake_id: str = "slither-demo",
+        plan_id: str = "slither-plan-v1",
+    ) -> None:
+        self._authorize_slither(intake_id)
+        self.assertEqual(self._prepare(intake_id, plan_id)[0], 0)
+        self.assertEqual(self._transport(intake_id, plan_id)[0], 0)
+
+    def test_succeeds_only_when_draft_workspace_has_matching_transport(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(intake_id, plan_id)
+
+        code, output = self._draft(intake_id, plan_id)
+        self.assertEqual(code, 0)
+        self.assertIn("orchestrator context pack draft created:", output)
+
+    def test_context_pack_md_is_drafted(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(plan_id=plan_id)
+        before = self._context_pack_path(plan_id).read_bytes()
+
+        self._draft(plan_id=plan_id)
+
+        after = self._context_pack_path(plan_id).read_text(encoding="utf-8")
+        self.assertNotEqual(before, after.encode("utf-8"))
+        self.assertIn("DRAFT", after)
+
+    def test_context_pack_draft_provenance_created(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(plan_id=plan_id)
+        self._draft(plan_id=plan_id)
+        self.assertTrue(self._draft_provenance_path(plan_id).is_file())
+
+    def test_provenance_contains_required_fields(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(intake_id, plan_id)
+        self._draft(intake_id, plan_id)
+
+        artifact = json.loads(
+            self._draft_provenance_path(plan_id).read_text(encoding="utf-8")
+        )
+        required_fields = (
+            "artifact_type",
+            "schema_version",
+            "plan_id",
+            "intake_id",
+            "source_context_transport_json_path",
+            "source_context_transport_md_path",
+            "source_goal_intake_path",
+            "source_preflight_state",
+            "source_authorize_decision_id",
+            "context_pack_path",
+            "context_pack_status",
+            "planning_workspace_status_at_draft",
+            "created_at",
+            "non_authority",
+        )
+        for field in required_fields:
+            self.assertIn(field, artifact, f"missing field: {field}")
+        self.assertEqual(
+            artifact["artifact_type"],
+            "ORCHESTRATOR_CONTEXT_PACK_DRAFT_PROVENANCE",
+        )
+        self.assertEqual(artifact["schema_version"], "0.1")
+
+    def test_provenance_non_authority_flags_all_true(self) -> None:
+        from agent_os.orchestrator import (
+            ORCHESTRATOR_CONTEXT_PACK_DRAFT_NON_AUTHORITY_FLAGS,
+        )
+
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(plan_id=plan_id)
+        self._draft(plan_id=plan_id)
+
+        artifact = json.loads(
+            self._draft_provenance_path(plan_id).read_text(encoding="utf-8")
+        )
+        non_authority = artifact["non_authority"]
+        for flag in ORCHESTRATOR_CONTEXT_PACK_DRAFT_NON_AUTHORITY_FLAGS:
+            self.assertIn(flag, non_authority)
+            self.assertTrue(non_authority[flag])
+
+    def test_raw_goal_copied_verbatim(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        raw_goal = "Build me an online slither.io-like game"
+        self._setup_ready_for_draft(intake_id, plan_id)
+        self._draft(intake_id, plan_id)
+
+        context_pack = self._context_pack_path(plan_id).read_text(encoding="utf-8")
+        self.assertIn(raw_goal, context_pack)
+
+    def test_owner_clarification_answers_copied_verbatim(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        answer = "Browser-only demo with 10 players max; no persistence."
+        self._setup_ready_for_draft(intake_id, plan_id)
+        self._draft(intake_id, plan_id)
+
+        context_pack = self._context_pack_path(plan_id).read_text(encoding="utf-8")
+        self.assertIn(answer, context_pack)
+
+    def test_owner_readiness_decision_summary_copied_verbatim(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        summary = "Scope clarified; authorize future draft prep only."
+        self._setup_ready_for_draft(intake_id, plan_id)
+        self._draft(intake_id, plan_id)
+
+        context_pack = self._context_pack_path(plan_id).read_text(encoding="utf-8")
+        self.assertIn(summary, context_pack)
+
+    def test_drafted_context_pack_labels_draft_non_authority(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(plan_id=plan_id)
+        self._draft(plan_id=plan_id)
+
+        context_pack = self._context_pack_path(plan_id).read_text(encoding="utf-8").lower()
+        self.assertIn("draft", context_pack)
+        self.assertIn("non-authority", context_pack)
+
+    def test_drafted_context_pack_states_architecture_undecided(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(plan_id=plan_id)
+        self._draft(plan_id=plan_id)
+
+        context_pack = self._context_pack_path(plan_id).read_text(encoding="utf-8").lower()
+        self.assertIn("architecture", context_pack)
+        self.assertIn("undecided", context_pack)
+
+    def test_drafted_context_pack_states_local_agentic_spec_not_generated(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(plan_id=plan_id)
+        self._draft(plan_id=plan_id)
+
+        context_pack = self._context_pack_path(plan_id).read_text(encoding="utf-8").lower()
+        self.assertIn("local agentic spec", context_pack)
+        self.assertIn("not generated", context_pack)
+
+    def test_drafted_context_pack_states_implementation_plan_not_generated(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(plan_id=plan_id)
+        self._draft(plan_id=plan_id)
+
+        context_pack = self._context_pack_path(plan_id).read_text(encoding="utf-8").lower()
+        self.assertIn("implementation plan", context_pack)
+        self.assertIn("not generated", context_pack)
+
+    def test_drafted_context_pack_states_planning_run_slice_not_generated(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(plan_id=plan_id)
+        self._draft(plan_id=plan_id)
+
+        context_pack = self._context_pack_path(plan_id).read_text(encoding="utf-8")
+        self.assertIn("PLANNING_RUN_SLICE", context_pack)
+        self.assertIn("not generated", context_pack.lower())
+
+    def test_drafted_context_pack_states_workspace_not_validated_or_approved(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(plan_id=plan_id)
+        self._draft(plan_id=plan_id)
+
+        context_pack = self._context_pack_path(plan_id).read_text(encoding="utf-8").lower()
+        self.assertIn("not validated or approved", context_pack)
+
+    def test_refuses_missing_workspace(self) -> None:
+        bare = self.project / "bare"
+        bare.mkdir()
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "draft-context-pack",
+                    "slither-demo",
+                    str(bare),
+                    "--plan-id",
+                    "slither-plan-v1",
+                ]
+            )
+
+        self.assertEqual(code, 1)
+
+    def test_refuses_missing_intake(self) -> None:
+        plan_id = "orphan-plan"
+        self._authorize_slither()
+        self._prepare(plan_id=plan_id)
+        self._transport(plan_id=plan_id)
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "draft-context-pack",
+                    "missing-intake",
+                    str(self.project),
+                    "--plan-id",
+                    plan_id,
+                ]
+            )
+
+        self.assertEqual(code, 1)
+        self.assertTrue(self._context_pack_path(plan_id).read_bytes())
+
+    def test_refuses_invalid_intake(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(intake_id, plan_id)
+        path = self._artifact_path(intake_id)
+        artifact = json.loads(path.read_text(encoding="utf-8"))
+        artifact["artifact_type"] = "WRONG_TYPE"
+        path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "draft-context-pack",
+                    intake_id,
+                    str(self.project),
+                    "--plan-id",
+                    plan_id,
+                ]
+            )
+
+        self.assertEqual(code, 1)
+
+    def test_refuses_missing_planning_workspace(self) -> None:
+        self._authorize_slither()
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "draft-context-pack",
+                    "slither-demo",
+                    str(self.project),
+                    "--plan-id",
+                    "missing-plan",
+                ]
+            )
+
+        self.assertEqual(code, 1)
+
+    def test_refuses_non_draft_planning_workspace(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(intake_id, plan_id)
+        manifest_path = self._workspace(plan_id) / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["status"] = "CONTEXT_READY"
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+        code, _ = self._draft(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_missing_orchestrator_provenance(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._authorize_slither(intake_id)
+        init_planning_workspace(self.project, plan_id)
+        self._transport_json_path(plan_id).parent.mkdir(parents=True, exist_ok=True)
+        self._transport_json_path(plan_id).write_text("{}", encoding="utf-8")
+        self._transport_md_path(plan_id).write_text("# stub\n", encoding="utf-8")
+
+        code, _ = self._draft(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_missing_context_transport_json(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._authorize_slither(intake_id)
+        self._prepare(intake_id, plan_id)
+
+        code, _ = self._draft(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_missing_context_transport_markdown(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._authorize_slither(intake_id)
+        self._prepare(intake_id, plan_id)
+        transport = {
+            "artifact_type": "ORCHESTRATOR_CONTEXT_TRANSPORT",
+            "schema_version": "0.1",
+            "plan_id": plan_id,
+            "intake_id": intake_id,
+            "source_context": {},
+            "owner_clarifications": [],
+            "owner_readiness_decision": {},
+        }
+        self._transport_json_path(plan_id).parent.mkdir(parents=True, exist_ok=True)
+        self._transport_json_path(plan_id).write_text(
+            json.dumps(transport, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        code, _ = self._draft(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_provenance_plan_id_intake_id_mismatch(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(intake_id, plan_id)
+        provenance = json.loads(
+            self._provenance_path(plan_id).read_text(encoding="utf-8")
+        )
+        provenance["plan_id"] = "wrong-plan"
+        self._provenance_path(plan_id).write_text(
+            json.dumps(provenance, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        code, _ = self._draft(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_context_transport_plan_id_intake_id_mismatch(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(intake_id, plan_id)
+        transport = json.loads(
+            self._transport_json_path(plan_id).read_text(encoding="utf-8")
+        )
+        transport["intake_id"] = "wrong-intake"
+        self._transport_json_path(plan_id).write_text(
+            json.dumps(transport, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        code, _ = self._draft(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_stale_incoherent_authorization(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(intake_id, plan_id)
+        provenance = json.loads(
+            self._provenance_path(plan_id).read_text(encoding="utf-8")
+        )
+        provenance["source_authorize_decision_id"] = "stale-decision"
+        self._provenance_path(plan_id).write_text(
+            json.dumps(provenance, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        code, _ = self._draft(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_latest_request_more_clarification_after_older_authorize(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(intake_id, plan_id)
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v2",
+            "REQUEST_MORE_CLARIFICATION",
+            "Need more scope detail.",
+        )
+
+        code, _ = self._draft(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_latest_block_intake_after_older_authorize(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(intake_id, plan_id)
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v2",
+            "BLOCK_INTAKE",
+            "Stopping intake.",
+        )
+
+        code, _ = self._draft(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_modified_context_pack_and_does_not_overwrite(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(intake_id, plan_id)
+        context_pack = self._context_pack_path(plan_id)
+        original = context_pack.read_bytes()
+        context_pack.write_text(
+            context_pack.read_text(encoding="utf-8").replace(
+                "PLACEHOLDER",
+                "CUSTOMIZED",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        modified = context_pack.read_bytes()
+
+        code, _ = self._draft(intake_id, plan_id)
+        self.assertEqual(code, 1)
+        self.assertEqual(modified, context_pack.read_bytes())
+        self.assertNotEqual(original, context_pack.read_bytes())
+
+    def test_accepts_crlf_context_pack_placeholder_but_not_modified_crlf(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(intake_id, plan_id)
+        context_pack = self._context_pack_path(plan_id)
+        crlf_placeholder = context_pack.read_text(encoding="utf-8").replace("\n", "\r\n")
+        context_pack.write_bytes(crlf_placeholder.encode("utf-8"))
+
+        code, output = self._draft(intake_id, plan_id)
+        self.assertEqual(code, 0)
+        self.assertIn("orchestrator context pack draft created:", output)
+        self.assertTrue(self._draft_provenance_path(plan_id).is_file())
+        self.assertIn("DRAFT", self._context_pack_path(plan_id).read_text(encoding="utf-8"))
+
+        intake_id_2 = "slither-crlf-mod"
+        plan_id_2 = "slither-plan-crlf-mod"
+        self._setup_ready_for_draft(intake_id_2, plan_id_2)
+        context_pack_2 = self._context_pack_path(plan_id_2)
+        modified_crlf = (
+            context_pack_2.read_text(encoding="utf-8")
+            .replace("PLACEHOLDER", "CUSTOMIZED", 1)
+            .replace("\n", "\r\n")
+        )
+        context_pack_2.write_bytes(modified_crlf.encode("utf-8"))
+        modified_bytes = context_pack_2.read_bytes()
+
+        code, _ = self._draft(intake_id_2, plan_id_2)
+        self.assertEqual(code, 1)
+        self.assertEqual(modified_bytes, context_pack_2.read_bytes())
+        self.assertFalse(self._draft_provenance_path(plan_id_2).exists())
+
+    def test_refuses_invalid_plan_id(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(intake_id, plan_id)
+
+        context_pack_bytes = self._context_pack_path(plan_id).read_bytes()
+        transport_json_bytes = self._transport_json_path(plan_id).read_bytes()
+        transport_md_bytes = self._transport_md_path(plan_id).read_bytes()
+        provenance_bytes = self._provenance_path(plan_id).read_bytes()
+        artifact_bytes = self._artifact_path(intake_id).read_bytes()
+        clarification_bytes = self._clarification_path(intake_id, "scope-v1").read_bytes()
+        decision_bytes = self._decision_path(intake_id, "owner-v1").read_bytes()
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "draft-context-pack",
+                    intake_id,
+                    str(self.project),
+                    "--plan-id",
+                    "../escape",
+                ]
+            )
+
+        self.assertEqual(code, 1)
+        self.assertIn("invalid plan id", buf.getvalue())
+        self.assertFalse(self._draft_provenance_path(plan_id).exists())
+        self.assertFalse(planning_path(self.project, "../escape").exists())
+        self.assertEqual(context_pack_bytes, self._context_pack_path(plan_id).read_bytes())
+        self.assertEqual(
+            transport_json_bytes,
+            self._transport_json_path(plan_id).read_bytes(),
+        )
+        self.assertEqual(
+            transport_md_bytes,
+            self._transport_md_path(plan_id).read_bytes(),
+        )
+        self.assertEqual(provenance_bytes, self._provenance_path(plan_id).read_bytes())
+        self.assertEqual(artifact_bytes, self._artifact_path(intake_id).read_bytes())
+        self.assertEqual(
+            clarification_bytes,
+            self._clarification_path(intake_id, "scope-v1").read_bytes(),
+        )
+        self.assertEqual(
+            decision_bytes,
+            self._decision_path(intake_id, "owner-v1").read_bytes(),
+        )
+
+    def test_refuses_path_escape_intake_id(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(intake_id, plan_id)
+
+        artifact_path = self._artifact_path(intake_id)
+        goal_intake_bytes = artifact_path.read_bytes()
+        clarification_bytes = self._clarification_path(intake_id, "scope-v1").read_bytes()
+        decision_bytes = self._decision_path(intake_id, "owner-v1").read_bytes()
+        workspace = planning_path(self.project, plan_id)
+        context_pack_bytes = self._context_pack_path(plan_id).read_bytes()
+        provenance_bytes = self._provenance_path(plan_id).read_bytes()
+        transport_json_bytes = self._transport_json_path(plan_id).read_bytes()
+        transport_md_bytes = self._transport_md_path(plan_id).read_bytes()
+        evidence_paths = (
+            workspace / "evidence" / "orchestrator-draft-scaffold-notes.md",
+            self._transport_json_path(plan_id),
+            self._transport_md_path(plan_id),
+            self._provenance_path(plan_id),
+        )
+        evidence_bytes = {path: path.read_bytes() for path in evidence_paths}
+        before_files = self._project_files()
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "draft-context-pack",
+                    "../escape",
+                    str(self.project),
+                    "--plan-id",
+                    plan_id,
+                ]
+            )
+
+        self.assertEqual(code, 1)
+        self.assertIn("invalid intake id", buf.getvalue())
+        self.assertFalse(self._draft_provenance_path(plan_id).exists())
+        self.assertFalse(
+            (self.project / ".agent-os" / "orchestrator" / "intakes" / "escape").exists()
+        )
+        self.assertEqual(before_files, self._project_files())
+        self.assertEqual(goal_intake_bytes, artifact_path.read_bytes())
+        self.assertEqual(
+            clarification_bytes,
+            self._clarification_path(intake_id, "scope-v1").read_bytes(),
+        )
+        self.assertEqual(
+            decision_bytes,
+            self._decision_path(intake_id, "owner-v1").read_bytes(),
+        )
+        self.assertEqual(context_pack_bytes, self._context_pack_path(plan_id).read_bytes())
+        self.assertEqual(provenance_bytes, self._provenance_path(plan_id).read_bytes())
+        self.assertEqual(
+            transport_json_bytes,
+            self._transport_json_path(plan_id).read_bytes(),
+        )
+        self.assertEqual(
+            transport_md_bytes,
+            self._transport_md_path(plan_id).read_bytes(),
+        )
+        for path, original in evidence_bytes.items():
+            self.assertEqual(original, path.read_bytes(), msg=str(path))
+
+    def test_refuses_missing_context_pack_md(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(intake_id, plan_id)
+
+        workspace = planning_path(self.project, plan_id)
+        context_pack = self._context_pack_path(plan_id)
+        transport_json_bytes = self._transport_json_path(plan_id).read_bytes()
+        transport_md_bytes = self._transport_md_path(plan_id).read_bytes()
+        provenance_bytes = self._provenance_path(plan_id).read_bytes()
+        template_paths = (
+            workspace / "local-agentic-spec.md",
+            workspace / "implementation-plan.md",
+            workspace / "planning-audit.md",
+            workspace / "evidence" / "orchestrator-draft-scaffold-notes.md",
+        )
+        template_bytes = {path: path.read_bytes() for path in template_paths}
+        context_pack.unlink()
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "draft-context-pack",
+                    intake_id,
+                    str(self.project),
+                    "--plan-id",
+                    plan_id,
+                ]
+            )
+
+        self.assertEqual(code, 1)
+        self.assertIn("context-pack.md missing", buf.getvalue())
+        self.assertFalse(self._draft_provenance_path(plan_id).exists())
+        self.assertFalse(context_pack.exists())
+        self.assertEqual(
+            transport_json_bytes,
+            self._transport_json_path(plan_id).read_bytes(),
+        )
+        self.assertEqual(
+            transport_md_bytes,
+            self._transport_md_path(plan_id).read_bytes(),
+        )
+        self.assertEqual(provenance_bytes, self._provenance_path(plan_id).read_bytes())
+        for path, original in template_bytes.items():
+            self.assertEqual(original, path.read_bytes(), msg=str(path))
+
+    def test_refuses_existing_context_pack_draft_provenance(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(intake_id, plan_id)
+        self._draft(intake_id, plan_id)
+        context_pack_bytes = self._context_pack_path(plan_id).read_bytes()
+        provenance_bytes = self._draft_provenance_path(plan_id).read_bytes()
+
+        code, _ = self._draft(intake_id, plan_id)
+        self.assertEqual(code, 1)
+        self.assertEqual(context_pack_bytes, self._context_pack_path(plan_id).read_bytes())
+        self.assertEqual(
+            provenance_bytes,
+            self._draft_provenance_path(plan_id).read_bytes(),
+        )
+
+    def test_preserves_goal_intake_byte_for_byte(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(intake_id, plan_id)
+        artifact_path = self._artifact_path(intake_id)
+        original = artifact_path.read_bytes()
+
+        self._draft(intake_id, plan_id)
+
+        self.assertEqual(original, artifact_path.read_bytes())
+
+    def test_does_not_change_planning_readiness(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(intake_id, plan_id)
+        artifact_path = self._artifact_path(intake_id)
+        original_bytes = artifact_path.read_bytes()
+        before = json.loads(artifact_path.read_text(encoding="utf-8"))["planning_readiness"]
+
+        self._draft(intake_id, plan_id)
+
+        after = json.loads(artifact_path.read_text(encoding="utf-8"))["planning_readiness"]
+        self.assertEqual(before, after)
+        self.assertEqual(original_bytes, artifact_path.read_bytes())
+
+    def test_preserves_clarification_artifacts_byte_for_byte(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(intake_id, plan_id)
+        clarification_path = self._clarification_path(intake_id, "scope-v1")
+        original = clarification_path.read_bytes()
+
+        self._draft(intake_id, plan_id)
+
+        self.assertEqual(original, clarification_path.read_bytes())
+
+    def test_preserves_readiness_decision_artifacts_byte_for_byte(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(intake_id, plan_id)
+        decision_path = self._decision_path(intake_id, "owner-v1")
+        original = decision_path.read_bytes()
+
+        self._draft(intake_id, plan_id)
+
+        self.assertEqual(original, decision_path.read_bytes())
+
+    def test_preserves_orchestrator_provenance_byte_for_byte(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(plan_id=plan_id)
+        provenance_path = self._provenance_path(plan_id)
+        original = provenance_path.read_bytes()
+
+        self._draft(plan_id=plan_id)
+
+        self.assertEqual(original, provenance_path.read_bytes())
+
+    def test_preserves_scaffold_notes_byte_for_byte(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(plan_id=plan_id)
+        notes_path = (
+            self._workspace(plan_id)
+            / "evidence"
+            / "orchestrator-draft-scaffold-notes.md"
+        )
+        original = notes_path.read_bytes()
+
+        self._draft(plan_id=plan_id)
+
+        self.assertEqual(original, notes_path.read_bytes())
+
+    def test_preserves_context_transport_json_byte_for_byte(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(plan_id=plan_id)
+        transport_path = self._transport_json_path(plan_id)
+        original = transport_path.read_bytes()
+
+        self._draft(plan_id=plan_id)
+
+        self.assertEqual(original, transport_path.read_bytes())
+
+    def test_preserves_context_transport_markdown_byte_for_byte(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(plan_id=plan_id)
+        transport_md = self._transport_md_path(plan_id)
+        original = transport_md.read_bytes()
+
+        self._draft(plan_id=plan_id)
+
+        self.assertEqual(original, transport_md.read_bytes())
+
+    def test_preserves_local_agentic_spec_byte_for_byte(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(plan_id=plan_id)
+        spec_path = self._workspace(plan_id) / "local-agentic-spec.md"
+        original = spec_path.read_bytes()
+
+        self._draft(plan_id=plan_id)
+
+        self.assertEqual(original, spec_path.read_bytes())
+
+    def test_preserves_implementation_plan_byte_for_byte(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(plan_id=plan_id)
+        impl_path = self._workspace(plan_id) / "implementation-plan.md"
+        original = impl_path.read_bytes()
+
+        self._draft(plan_id=plan_id)
+
+        self.assertEqual(original, impl_path.read_bytes())
+
+    def test_preserves_planning_audit_byte_for_byte(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(plan_id=plan_id)
+        audit_path = self._workspace(plan_id) / "planning-audit.md"
+        original = audit_path.read_bytes()
+
+        self._draft(plan_id=plan_id)
+
+        self.assertEqual(original, audit_path.read_bytes())
+
+    def test_does_not_change_planning_workspace_status(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(plan_id=plan_id)
+        manifest_path = self._workspace(plan_id) / "manifest.json"
+        before = json.loads(manifest_path.read_text(encoding="utf-8"))["status"]
+
+        self._draft(plan_id=plan_id)
+
+        after = json.loads(manifest_path.read_text(encoding="utf-8"))["status"]
+        self.assertEqual(before, after)
+        self.assertEqual(after, "DRAFT")
+
+    def test_does_not_generate_architecture_choices(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(plan_id=plan_id)
+        self._draft(plan_id=plan_id)
+
+        context_pack = self._context_pack_path(plan_id).read_text(encoding="utf-8").lower()
+        for forbidden in (
+            "backend:",
+            "frontend:",
+            "database:",
+            "postgresql",
+            "react",
+            "kubernetes",
+            "selected architecture",
+            "chosen stack",
+        ):
+            self.assertNotIn(forbidden, context_pack)
+
+    def test_does_not_generate_local_agentic_spec(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(plan_id=plan_id)
+        spec_path = self._workspace(plan_id) / "local-agentic-spec.md"
+        original = spec_path.read_text(encoding="utf-8")
+
+        self._draft(plan_id=plan_id)
+
+        self.assertEqual(original, spec_path.read_text(encoding="utf-8"))
+
+    def test_does_not_generate_implementation_tasks(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(plan_id=plan_id)
+        self._draft(plan_id=plan_id)
+
+        context_pack = self._context_pack_path(plan_id).read_text(encoding="utf-8")
+        self.assertNotIn("allowed_paths", context_pack)
+        self.assertNotIn("check_command", context_pack)
+
+    def test_does_not_generate_planning_run_slice(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(plan_id=plan_id)
+        self._draft(plan_id=plan_id)
+
+        artifact = json.loads(
+            self._draft_provenance_path(plan_id).read_text(encoding="utf-8")
+        )
+        self.assertTrue(
+            artifact["non_authority"]["does_not_generate_planning_run_slice"]
+        )
+
+    def test_does_not_create_runner_proposals(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(plan_id=plan_id)
+        before_runs = list((self.project / ".agent-os" / "runs").iterdir())
+
+        self._draft(plan_id=plan_id)
+
+        after_runs = list((self.project / ".agent-os" / "runs").iterdir())
+        self.assertEqual(before_runs, after_runs)
+
+    def test_does_not_create_runs(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(plan_id=plan_id)
+        self._draft(plan_id=plan_id)
+
+        runs_dir = self.project / ".agent-os" / "runs"
+        self.assertEqual(list(runs_dir.iterdir()), [])
+
+    def test_does_not_invoke_external_subprocess(self) -> None:
+        self._setup_ready_for_draft()
+        with patch("subprocess.run", side_effect=AssertionError("subprocess invoked")):
+            code = main(
+                [
+                    "orchestrator",
+                    "draft-context-pack",
+                    "slither-demo",
+                    str(self.project),
+                    "--plan-id",
+                    "slither-plan-v1",
+                ]
+            )
+        self.assertEqual(code, 0)
+
+    def test_does_not_call_planning_progress_transition_decide(self) -> None:
+        self._setup_ready_for_draft()
+        with (
+            patch.object(
+                planning_module,
+                "progress_planning_workspace",
+                side_effect=AssertionError("progress invoked"),
+            ),
+            patch.object(
+                planning_module,
+                "transition_planning_workspace",
+                side_effect=AssertionError("transition invoked"),
+            ),
+            patch.object(
+                planning_module,
+                "record_planning_owner_decision",
+                side_effect=AssertionError("decide invoked"),
+            ),
+        ):
+            code = main(
+                [
+                    "orchestrator",
+                    "draft-context-pack",
+                    "slither-demo",
+                    str(self.project),
+                    "--plan-id",
+                    "slither-plan-v1",
+                ]
+            )
+        self.assertEqual(code, 0)
+
+    def test_restores_context_pack_when_provenance_write_fails(self) -> None:
+        from agent_os.orchestrator import draft_context_pack_from_transport
+
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(intake_id, plan_id)
+        context_pack = self._context_pack_path(plan_id)
+        original = context_pack.read_bytes()
+        provenance_path = self._draft_provenance_path(plan_id)
+
+        original_write_json = None
+        from agent_os import orchestrator as orchestrator_module
+
+        original_write_json = orchestrator_module._write_json
+
+        def failing_provenance_write(path: Path, data: dict) -> None:
+            if path == provenance_path:
+                raise OSError("simulated provenance write failure")
+            original_write_json(path, data)
+
+        with patch.object(orchestrator_module, "_write_json", failing_provenance_write):
+            with self.assertRaises(OSError) as ctx:
+                draft_context_pack_from_transport(self.project, intake_id, plan_id)
+            self.assertIn("simulated provenance write failure", str(ctx.exception))
+
+        self.assertEqual(original, context_pack.read_bytes())
+        self.assertFalse(provenance_path.exists())
+
+    def test_cli_help_states_context_pack_draft_boundaries(self) -> None:
+        parser = build_parser()
+        orchestrator_parser = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+            and "orchestrator" in action.choices
+        )
+        orchestrator_sub = next(
+            action
+            for action in orchestrator_parser.choices["orchestrator"]._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        help_text = orchestrator_sub.choices["draft-context-pack"].format_help()
+        compact = re.sub(r"\s+", " ", help_text)
+        self.assertIn("context-pack", compact.lower())
+        self.assertIn("architecture", compact.lower())
+        self.assertIn("local agentic spec", compact.lower())
+        self.assertIn("implementation plan", compact.lower())
+        self.assertIn("PLANNING_RUN_SLICE", compact)
+        self.assertIn("validate", compact.lower())
+        self.assertIn("executor", compact.lower())
+
+    def test_cli_output_includes_paths_status_and_boundary_notes(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(plan_id=plan_id)
+        code, output = self._draft(plan_id=plan_id)
+
+        self.assertEqual(code, 0)
+        self.assertIn("context pack:", output)
+        self.assertIn("context pack draft provenance:", output)
+        self.assertIn("context_pack_status: DRAFT_NON_AUTHORITY", output)
+        self.assertIn("workspace_status: DRAFT", output)
+        self.assertIn("no architecture generation", output)
+        self.assertIn("no runner proposals", output)
+
+    def test_existing_commands_unchanged(self) -> None:
+        intake_id = "slither-demo"
+        self._authorize_slither(intake_id)
+        self._prepare(intake_id)
+        self._transport(intake_id)
+        before = self._project_files()
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            preflight_code = main(
+                ["orchestrator", "draft-preflight", intake_id, str(self.project)]
+            )
+        self.assertEqual(preflight_code, 0)
+        self.assertIn("draft-preparation preflight is read-only", buf.getvalue())
+
+        validate_report = validate_goal_intake(self.project, intake_id)
+        self.assertTrue(validate_report.valid)
+        readiness_report = review_goal_intake_readiness(self.project, intake_id)
+        self.assertTrue(readiness_report.goal_intake_valid)
+        status_report = goal_intake_status(self.project, intake_id)
+        self.assertTrue(status_report.validation_ok)
+
+        transport_files = {
+            self._transport_json_path().relative_to(self.project).as_posix(),
+            self._transport_md_path().relative_to(self.project).as_posix(),
+        }
+        after = self._project_files()
+        self.assertEqual(before, after)
+        self.assertTrue(transport_files.issubset(after))
+
+    def test_context_pack_draft_not_confusable_with_approval(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_draft(plan_id=plan_id)
+        self._draft(plan_id=plan_id)
+
+        context_pack = self._context_pack_path(plan_id).read_text(encoding="utf-8").lower()
+        self.assertIn("non-authority", context_pack)
+        self.assertIn("not validated or approved", context_pack)
+        self.assertIn("source context", context_pack)
+        validation = validate_planning_workspace(self.project, plan_id)
+        self.assertFalse(validation.valid)
+
+
 class OrchestratorDocsGuardTests(unittest.TestCase):
     """Guard doctrine for CORE_ORCHESTRATOR_001 goal-to-planning workspace contract."""
 

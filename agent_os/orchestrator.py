@@ -12,6 +12,7 @@ from pathlib import Path
 from agent_os.paths import (
     CLARIFICATIONS_DIR,
     GOAL_INTAKE_FILE,
+    ORCHESTRATOR_CONTEXT_PACK_DRAFT_PROVENANCE_FILE,
     ORCHESTRATOR_CONTEXT_TRANSPORT_FILE,
     ORCHESTRATOR_CONTEXT_TRANSPORT_MD_FILE,
     ORCHESTRATOR_DRAFT_SCAFFOLD_NOTES_FILE,
@@ -20,10 +21,11 @@ from agent_os.paths import (
     orchestrator_clarification_path,
     orchestrator_intake_path,
     orchestrator_readiness_decision_path,
+    parse_frontmatter,
     planning_path,
     workspace_path,
 )
-from agent_os.planning import init_planning_workspace, validate_plan_id
+from agent_os.planning import init_planning_workspace, planning_templates_dir, validate_plan_id
 
 INTAKE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 CLARIFICATION_ID_PATTERN = INTAKE_ID_PATTERN
@@ -233,6 +235,35 @@ ORCHESTRATOR_CONTEXT_TRANSPORT_NON_AUTHORITY_FLAGS = (
     "requires_future_architecture_decision",
     "requires_future_independent_validation",
     "requires_future_owner_approval",
+)
+
+ORCHESTRATOR_CONTEXT_PACK_DRAFT_PROVENANCE_ARTIFACT_TYPE = (
+    "ORCHESTRATOR_CONTEXT_PACK_DRAFT_PROVENANCE"
+)
+ORCHESTRATOR_CONTEXT_PACK_DRAFT_PROVENANCE_SCHEMA_VERSION = "0.1"
+CONTEXT_PACK_DRAFT_STATUS = "DRAFT_NON_AUTHORITY"
+
+ORCHESTRATOR_CONTEXT_PACK_DRAFT_NON_AUTHORITY_FLAGS = (
+    "does_not_generate_architecture",
+    "does_not_choose_stack",
+    "does_not_choose_database",
+    "does_not_choose_networking",
+    "does_not_generate_local_agentic_spec",
+    "does_not_generate_implementation_plan",
+    "does_not_generate_planning_run_slice",
+    "does_not_validate_planning_workspace",
+    "does_not_approve_plan",
+    "does_not_transition_workspace",
+    "does_not_create_runner_proposal",
+    "does_not_create_run",
+    "does_not_invoke_executor",
+    "context_pack_is_draft_only",
+    "context_pack_is_source_context_only",
+    "requires_future_independent_validation",
+    "requires_future_owner_approval",
+    "requires_future_architecture_decision",
+    "requires_future_local_agentic_spec",
+    "requires_future_implementation_plan",
 )
 
 GOAL_INTAKE_REQUIRED_STRING_FIELDS = (
@@ -2524,6 +2555,455 @@ def transport_planning_context(
         intake_id=intake_id,
         json_path=json_path,
         markdown_path=markdown_path,
+        workspace_status=workspace_status,
+        non_authority=non_authority,
+    )
+
+
+def _is_context_pack_init_placeholder(content: str, plan_id: str) -> bool:
+    """Return True when context-pack.md still matches the planning init template shape."""
+    normalized_content = content.replace("\r\n", "\n").replace("\r", "\n")
+    meta, body = parse_frontmatter(normalized_content)
+    if meta.get("artifact_type") != "CONTEXT_PACK":
+        return False
+    if meta.get("author") != "PLACEHOLDER":
+        return False
+    if meta.get("plan_id") != plan_id:
+        return False
+
+    template_path = planning_templates_dir() / "context-pack.md"
+    if not template_path.is_file():
+        raise FileNotFoundError("planning template missing: context-pack.md")
+
+    _, template_body = parse_frontmatter(
+        template_path.read_text(encoding="utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    )
+    return body == template_body
+
+
+def _require_context_transport_for_draft(
+    json_path: Path,
+    *,
+    plan_id: str,
+    intake_id: str,
+) -> dict:
+    if not json_path.is_file():
+        raise FileNotFoundError(
+            f"context transport json not found for planning workspace: {plan_id}"
+        )
+
+    try:
+        transport = json.loads(json_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"invalid context transport json for planning workspace {plan_id}: {exc.msg}"
+        ) from exc
+
+    if not isinstance(transport, dict):
+        raise ValueError(
+            f"invalid context transport json for planning workspace {plan_id}: "
+            "expected object"
+        )
+
+    artifact_type = transport.get("artifact_type")
+    if artifact_type != ORCHESTRATOR_CONTEXT_TRANSPORT_ARTIFACT_TYPE:
+        raise ValueError(
+            f"context transport artifact_type mismatch: expected "
+            f"{ORCHESTRATOR_CONTEXT_TRANSPORT_ARTIFACT_TYPE!r}, found {artifact_type!r}"
+        )
+
+    transport_plan_id = transport.get("plan_id")
+    if transport_plan_id != plan_id:
+        raise ValueError(
+            f"context transport plan_id mismatch: "
+            f"expected {plan_id!r}, found {transport_plan_id!r}"
+        )
+
+    transport_intake_id = transport.get("intake_id")
+    if transport_intake_id != intake_id:
+        raise ValueError(
+            f"context transport intake_id mismatch: "
+            f"expected {intake_id!r}, found {transport_intake_id!r}"
+        )
+
+    return transport
+
+
+def _format_source_context_list(items: object) -> list[str]:
+    if not isinstance(items, list) or not items:
+        return ["- (none)"]
+    lines: list[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            lines.append(f"- {json.dumps(item, sort_keys=True)}")
+        else:
+            lines.append(f"- {item}")
+    return lines
+
+
+def _build_context_pack_draft_markdown(
+    *,
+    plan_id: str,
+    intake_id: str,
+    transport: dict,
+    source_goal_intake_path: Path,
+    transport_json_path: Path,
+    transport_md_path: Path,
+    provenance_path: Path,
+    created_at: str,
+) -> str:
+    source_context = transport.get("source_context")
+    if not isinstance(source_context, dict):
+        source_context = {}
+
+    raw_goal = source_context.get("raw_goal", "")
+    normalized_goal = source_context.get("normalized_goal", "")
+    user_visible_summary = source_context.get("user_visible_summary", "")
+    ambiguity_level = source_context.get("ambiguity_level", "")
+    planning_readiness = source_context.get("planning_readiness", "")
+    open_questions = source_context.get("open_questions")
+    risk_flags = source_context.get("risk_flags")
+
+    owner_clarifications = transport.get("owner_clarifications")
+    if not isinstance(owner_clarifications, list):
+        owner_clarifications = []
+
+    owner_readiness_decision = transport.get("owner_readiness_decision")
+    if not isinstance(owner_readiness_decision, dict):
+        owner_readiness_decision = {}
+
+    lines = [
+        "---",
+        f"plan_id: {plan_id}",
+        "artifact_type: CONTEXT_PACK",
+        f"context_pack_status: {CONTEXT_PACK_DRAFT_STATUS}",
+        "draft_source: ORCHESTRATOR_CONTEXT_TRANSPORT",
+        f"intake_id: {intake_id}",
+        f"created_at: {created_at}",
+        "author: ORCHESTRATOR_DRAFT_NON_AUTHORITY",
+        "version: 1",
+        "---",
+        "",
+        "# Context Pack (DRAFT — non-authority)",
+        "",
+        "> **Planning artifact type:** `CONTEXT_PACK`",
+        "> **Status:** `DRAFT_NON_AUTHORITY` — source-context draft only; not an approved "
+        "context pack, not architecture, not local agentic spec, not implementation plan.",
+        "",
+        "## Source identifiers",
+        "",
+        f"- **plan_id:** `{plan_id}`",
+        f"- **intake_id:** `{intake_id}`",
+        f"- **source goal intake:** `{source_goal_intake_path}`",
+        f"- **orchestrator provenance:** `{provenance_path}`",
+        f"- **context transport json:** `{transport_json_path}`",
+        f"- **context transport markdown:** `{transport_md_path}`",
+        "",
+        "## Raw goal (verbatim)",
+        "",
+        "```",
+        str(raw_goal),
+        "```",
+        "",
+        "## Normalized goal (from GOAL_INTAKE / transport)",
+        "",
+        str(normalized_goal),
+        "",
+    ]
+
+    if isinstance(user_visible_summary, str) and user_visible_summary.strip():
+        lines.extend(
+            [
+                "## Owner-visible summary (from GOAL_INTAKE)",
+                "",
+                str(user_visible_summary),
+                "",
+            ]
+        )
+
+    lines.extend(
+        [
+            "## Ambiguity level",
+            "",
+            str(ambiguity_level),
+            "",
+            "## Planning readiness",
+            "",
+            str(planning_readiness),
+            "",
+            "## Open questions (copied from transport)",
+            "",
+            *_format_source_context_list(open_questions),
+            "",
+            "## Risk flags (copied from transport)",
+            "",
+            *_format_source_context_list(risk_flags),
+            "",
+            "## Owner clarifications (verbatim answers)",
+            "",
+        ]
+    )
+
+    if owner_clarifications:
+        for item in owner_clarifications:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"- **{item.get('clarification_id', '')}** "
+                f"(`{item.get('created_at', '')}`): {item.get('owner_answer', '')}"
+            )
+    else:
+        lines.append("- (none)")
+    lines.append("")
+
+    lines.extend(
+        [
+            "## Owner readiness decision (verbatim summary)",
+            "",
+            f"- **decision_id:** `{owner_readiness_decision.get('decision_id', '')}`",
+            f"- **decision:** `{owner_readiness_decision.get('decision', '')}`",
+            f"- **owner_summary:** {owner_readiness_decision.get('owner_summary', '')}",
+            "",
+            "## Explicit boundaries",
+            "",
+            "- **architecture:** undecided — not generated by orchestrator",
+            "- **local agentic spec:** not generated",
+            "- **implementation plan:** not generated",
+            "- **PLANNING_RUN_SLICE:** not generated",
+            "- **planning workspace:** not validated or approved",
+            "- **runner proposals / runs / executor:** not created or invoked",
+            "- **future independent validation:** required",
+            "- **future owner approval:** required",
+            "",
+            "This context pack draft copies transported source context only. It does not "
+            "define architecture, approve work, or authorize execution.",
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _build_context_pack_draft_provenance_artifact(
+    *,
+    plan_id: str,
+    intake_id: str,
+    source_goal_intake_path: Path,
+    transport_json_path: Path,
+    transport_md_path: Path,
+    context_pack_path: Path,
+    preflight_report: DraftPreparationPreflightReport,
+    workspace_status: str,
+    created_at: str,
+) -> dict:
+    return {
+        "artifact_type": ORCHESTRATOR_CONTEXT_PACK_DRAFT_PROVENANCE_ARTIFACT_TYPE,
+        "schema_version": ORCHESTRATOR_CONTEXT_PACK_DRAFT_PROVENANCE_SCHEMA_VERSION,
+        "plan_id": plan_id,
+        "intake_id": intake_id,
+        "source_context_transport_json_path": str(transport_json_path),
+        "source_context_transport_md_path": str(transport_md_path),
+        "source_goal_intake_path": str(source_goal_intake_path),
+        "source_preflight_state": preflight_report.preflight_state,
+        "source_authorize_decision_id": preflight_report.latest_decision_id,
+        "context_pack_path": str(context_pack_path),
+        "context_pack_status": CONTEXT_PACK_DRAFT_STATUS,
+        "planning_workspace_status_at_draft": workspace_status,
+        "created_at": created_at,
+        "non_authority": {
+            key: True for key in ORCHESTRATOR_CONTEXT_PACK_DRAFT_NON_AUTHORITY_FLAGS
+        },
+    }
+
+
+def _format_drafted_context_pack(
+    *,
+    context_pack_path: Path,
+    provenance_path: Path,
+    plan_id: str,
+    intake_id: str,
+    workspace_status: str,
+) -> str:
+    lines = [
+        f"orchestrator context pack draft created: {context_pack_path.parent.parent}",
+        f"context pack: {context_pack_path}",
+        f"context pack draft provenance: {provenance_path}",
+        f"plan_id: {plan_id}",
+        f"intake_id: {intake_id}",
+        f"context_pack_status: {CONTEXT_PACK_DRAFT_STATUS}",
+        f"workspace_status: {workspace_status}",
+        "note: context pack draft only; copied source context from transport artifacts",
+        "note: no architecture generation, no local agentic spec generation, "
+        "no implementation plan generation, no PLANNING_RUN_SLICE",
+        "note: planning workspace not validated or approved; "
+        "no runner proposals, runs, or executor invocation",
+        "note: orchestrator intake artifacts, transport artifacts, and provenance "
+        "were not modified; future architecture decision, independent validation, "
+        "and owner approval remain required",
+    ]
+    return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class DraftedContextPackReport:
+    output: str
+    plan_id: str
+    intake_id: str
+    context_pack_path: Path
+    provenance_path: Path
+    context_pack_status: str
+    workspace_status: str
+    non_authority: dict[str, bool]
+
+
+def draft_context_pack_from_transport(
+    project: Path,
+    intake_id: str,
+    plan_id: str,
+) -> DraftedContextPackReport:
+    """Draft context-pack.md from transported orchestrator context in a DRAFT workspace."""
+    validate_intake_id(intake_id)
+    validate_plan_id(plan_id)
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        raise FileNotFoundError("no workspace found (run `agent-os init` first)")
+
+    intake_path, _intake_artifact = _require_valid_goal_intake(project, intake_id)
+
+    workspace_dest = planning_path(project, plan_id)
+    if not workspace_dest.is_dir():
+        raise FileNotFoundError(f"planning workspace not found: {plan_id}")
+
+    workspace_status = _load_planning_workspace_status(workspace_dest, plan_id)
+    if workspace_status != "DRAFT":
+        raise ValueError(
+            f"planning workspace must be DRAFT for context pack draft, found: "
+            f"{workspace_status!r}"
+        )
+
+    preflight_report = preflight_draft_preparation(project, intake_id)
+    if (
+        preflight_report.preflight_state
+        != DRAFT_PREPARATION_PREFLIGHT_CONFIRMED_STATE
+    ):
+        raise ValueError(
+            "draft-preparation preflight not confirmed: "
+            f"{preflight_report.preflight_state}"
+        )
+    if preflight_report.latest_decision != "AUTHORIZE_DRAFT_PREPARATION":
+        raise ValueError(
+            "latest readiness decision is not AUTHORIZE_DRAFT_PREPARATION"
+        )
+    if preflight_report.latest_decision_id is None:
+        raise ValueError("missing authorize decision id in preflight report")
+
+    provenance_path = workspace_dest / "evidence" / ORCHESTRATOR_PROVENANCE_FILE
+    _require_orchestrator_provenance_for_transport(
+        provenance_path,
+        plan_id=plan_id,
+        intake_id=intake_id,
+        preflight_report=preflight_report,
+    )
+
+    transport_json_path = (
+        workspace_dest / "evidence" / ORCHESTRATOR_CONTEXT_TRANSPORT_FILE
+    )
+    transport_md_path = (
+        workspace_dest / "evidence" / ORCHESTRATOR_CONTEXT_TRANSPORT_MD_FILE
+    )
+    if not transport_md_path.is_file():
+        raise FileNotFoundError(
+            f"context transport markdown not found for planning workspace: {plan_id}"
+        )
+
+    transport = _require_context_transport_for_draft(
+        transport_json_path,
+        plan_id=plan_id,
+        intake_id=intake_id,
+    )
+
+    context_pack_path = workspace_dest / "context-pack.md"
+    if not context_pack_path.is_file():
+        raise FileNotFoundError(
+            f"context-pack.md missing in planning workspace: {plan_id}"
+        )
+
+    original_context_pack = context_pack_path.read_bytes()
+    if not _is_context_pack_init_placeholder(
+        context_pack_path.read_text(encoding="utf-8"),
+        plan_id,
+    ):
+        raise FileExistsError(
+            f"context-pack.md already drafted or modified for plan: {plan_id}"
+        )
+
+    draft_provenance_path = (
+        workspace_dest / "evidence" / ORCHESTRATOR_CONTEXT_PACK_DRAFT_PROVENANCE_FILE
+    )
+    if draft_provenance_path.exists():
+        raise FileExistsError(
+            f"context pack draft provenance already exists for plan: {plan_id}"
+        )
+
+    created_at = _utc_now()
+    context_pack_markdown = _build_context_pack_draft_markdown(
+        plan_id=plan_id,
+        intake_id=intake_id,
+        transport=transport,
+        source_goal_intake_path=intake_path,
+        transport_json_path=transport_json_path,
+        transport_md_path=transport_md_path,
+        provenance_path=provenance_path,
+        created_at=created_at,
+    )
+    provenance_artifact = _build_context_pack_draft_provenance_artifact(
+        plan_id=plan_id,
+        intake_id=intake_id,
+        source_goal_intake_path=intake_path,
+        transport_json_path=transport_json_path,
+        transport_md_path=transport_md_path,
+        context_pack_path=context_pack_path,
+        preflight_report=preflight_report,
+        workspace_status=workspace_status,
+        created_at=created_at,
+    )
+
+    temp_context_pack = context_pack_path.with_suffix(".md.tmp")
+    try:
+        temp_context_pack.write_text(context_pack_markdown, encoding="utf-8")
+        temp_context_pack.replace(context_pack_path)
+        try:
+            _write_json(draft_provenance_path, provenance_artifact)
+        except Exception:
+            context_pack_path.write_bytes(original_context_pack)
+            if draft_provenance_path.is_file():
+                draft_provenance_path.unlink()
+            raise
+    except Exception:
+        if temp_context_pack.is_file():
+            temp_context_pack.unlink()
+        if context_pack_path.read_bytes() != original_context_pack:
+            context_pack_path.write_bytes(original_context_pack)
+        if draft_provenance_path.is_file():
+            draft_provenance_path.unlink()
+        raise
+
+    non_authority = {
+        key: True for key in ORCHESTRATOR_CONTEXT_PACK_DRAFT_NON_AUTHORITY_FLAGS
+    }
+    output = _format_drafted_context_pack(
+        context_pack_path=context_pack_path,
+        provenance_path=draft_provenance_path,
+        plan_id=plan_id,
+        intake_id=intake_id,
+        workspace_status=workspace_status,
+    )
+    return DraftedContextPackReport(
+        output=output,
+        plan_id=plan_id,
+        intake_id=intake_id,
+        context_pack_path=context_pack_path,
+        provenance_path=draft_provenance_path,
+        context_pack_status=CONTEXT_PACK_DRAFT_STATUS,
         workspace_status=workspace_status,
         non_authority=non_authority,
     )

@@ -12,6 +12,7 @@ from agent_os.orchestrator import (
     create_goal_intake,
     create_owner_clarification,
     create_owner_readiness_decision,
+    draft_context_pack_from_transport,
     goal_intake_status,
     preflight_draft_preparation,
     prepare_planning_workspace_draft,
@@ -372,6 +373,21 @@ def cmd_orchestrator_transport_planning_context(args: argparse.Namespace) -> int
     project = _project_path(args.path)
     try:
         report = transport_planning_context(
+            project,
+            args.intake_id,
+            args.plan_id,
+        )
+    except (FileNotFoundError, FileExistsError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(report.output)
+    return 0
+
+
+def cmd_orchestrator_draft_context_pack(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        report = draft_context_pack_from_transport(
             project,
             args.intake_id,
             args.plan_id,
@@ -897,6 +913,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     orchestrator_transport_planning_context_parser.set_defaults(
         func=cmd_orchestrator_transport_planning_context
+    )
+
+    orchestrator_draft_context_pack_parser = orchestrator_sub.add_parser(
+        "draft-context-pack",
+        help="draft context-pack.md from transported context (no architecture)",
+        description=(
+            "Draft planning workspace context-pack.md from existing orchestrator "
+            "context transport artifacts in a DRAFT workspace. Writes a bounded "
+            "source-context draft and provenance under evidence/ only. "
+            "Does not call an LLM, generate architecture decisions, generate local "
+            "agentic spec, generate an implementation plan, generate PLANNING_RUN_SLICE, "
+            "validate or approve the workspace, transition status, create runner "
+            "proposals, create runs, or invoke an executor."
+        ),
+    )
+    orchestrator_draft_context_pack_parser.add_argument(
+        "intake_id",
+        help="intake identifier (filesystem-safe slug)",
+    )
+    orchestrator_draft_context_pack_parser.add_argument(
+        "path",
+        nargs="?",
+        help="target project directory",
+    )
+    orchestrator_draft_context_pack_parser.add_argument(
+        "--plan-id",
+        required=True,
+        help="planning workspace identifier (filesystem-safe slug)",
+    )
+    orchestrator_draft_context_pack_parser.set_defaults(
+        func=cmd_orchestrator_draft_context_pack
     )
 
     return parser
