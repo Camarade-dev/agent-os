@@ -20,9 +20,11 @@ from agent_os.paths import (
     ORCHESTRATOR_DRAFT_SCAFFOLD_NOTES_FILE,
     ORCHESTRATOR_PROVENANCE_FILE,
     READINESS_DECISIONS_DIR,
+    REQUIREMENTS_EXTRACTION_DECISIONS_DIR,
     orchestrator_clarification_path,
     orchestrator_intake_path,
     orchestrator_readiness_decision_path,
+    orchestrator_requirements_extraction_decision_path,
     parse_frontmatter,
     planning_path,
     section_body,
@@ -395,6 +397,85 @@ REQUIREMENTS_EXTRACTION_PREFLIGHT_NON_AUTHORITY_FLAGS = (
     "requires_future_owner_approval",
 )
 
+REQUIREMENTS_EXTRACTION_OWNER_DECISION_ARTIFACT_TYPE = (
+    "REQUIREMENTS_EXTRACTION_OWNER_DECISION"
+)
+REQUIREMENTS_EXTRACTION_OWNER_DECISION_SCHEMA_VERSION = "0.1"
+
+REQUIREMENTS_EXTRACTION_OWNER_DECISION_VALUES = frozenset(
+    {
+        "REQUEST_MORE_CONTEXT",
+        "BLOCK_REQUIREMENTS_EXTRACTION",
+        "AUTHORIZE_REQUIREMENTS_EXTRACTION",
+    }
+)
+
+REQUIREMENTS_EXTRACTION_OWNER_DECISION_REQUIRED_FIELDS = (
+    "artifact_type",
+    "schema_version",
+    "intake_id",
+    "plan_id",
+    "decision_id",
+    "decision",
+    "owner_summary",
+    "created_at",
+    "source_requirements_extraction_scaffold_provenance_path",
+    "source_requirements_extraction_scaffold_status",
+    "source_requirements_extraction_scaffold_created_at",
+    "source_requirements_extraction_preflight_state",
+    "source_requirements_extraction_preflight_next_action",
+    "planning_workspace_status_at_decision",
+    "non_authority",
+)
+
+REQUIREMENTS_EXTRACTION_OWNER_DECISION_NON_AUTHORITY_FLAGS = (
+    "does_not_extract_requirements",
+    "does_not_infer_requirements",
+    "does_not_generate_requirements_content",
+    "does_not_generate_requirement_ids",
+    "does_not_generate_user_stories",
+    "does_not_generate_acceptance_criteria",
+    "does_not_generate_architecture",
+    "does_not_choose_stack",
+    "does_not_choose_database",
+    "does_not_choose_networking",
+    "does_not_generate_implementation_plan",
+    "does_not_generate_planning_run_slice",
+    "does_not_validate_planning_workspace",
+    "does_not_approve_requirements",
+    "does_not_approve_plan",
+    "does_not_transition_workspace",
+    "does_not_create_runner_proposal",
+    "does_not_create_run",
+    "does_not_invoke_executor",
+    "owner_decision_only",
+    "authorization_is_not_extraction",
+    "future_requirements_extraction_requires_separate_command",
+    "future_requirements_validation_requires_separate_command",
+    "future_architecture_decision_requires_separate_command",
+    "future_implementation_plan_requires_separate_command",
+    "requires_future_independent_validation",
+    "requires_future_owner_approval",
+)
+
+REQUIREMENTS_EXTRACTION_SCAFFOLD_REQUIRED_BOUNDARY_CHECKS: tuple[tuple[str, ...], ...] = (
+    ("requirements extraction", "not performed"),
+    ("architecture", "undecided"),
+    ("implementation plan", "not generated"),
+    ("planning_run_slice", "not generated"),
+    ("not validated or approved",),
+    ("runner", "not created or invoked"),
+)
+
+_IMPLEMENTATION_TASK_HEADING_PATTERN = re.compile(
+    r"^##\s+Implementation Tasks\s*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+_PLANNING_RUN_SLICE_HEADING_PATTERN = re.compile(
+    r"^##\s+PLANNING_RUN_SLICE\s*$",
+    re.MULTILINE,
+)
+
 LOCAL_AGENTIC_SPEC_SCAFFOLD_REQUIRED_BOUNDARY_CHECKS: tuple[tuple[str, ...], ...] = (
     ("requirements extraction", "not performed"),
     ("architecture", "undecided"),
@@ -504,6 +585,11 @@ def validate_readiness_decision_id(decision_id: str) -> None:
         raise ValueError(f"invalid decision id: {decision_id!r}")
     if not READINESS_DECISION_ID_PATTERN.match(decision_id):
         raise ValueError(f"invalid decision id: {decision_id!r}")
+
+
+def validate_requirements_extraction_decision_id(decision_id: str) -> None:
+    """Reject unsafe or invalid requirements-extraction decision identifiers."""
+    validate_readiness_decision_id(decision_id)
 
 
 def validate_clarification_id(clarification_id: str) -> None:
@@ -3356,6 +3442,291 @@ def _local_agentic_spec_has_architecture_decision_language(content: str) -> bool
     return False
 
 
+def _is_local_agentic_spec_requirements_extraction_scaffold_non_authority(
+    content: str,
+    plan_id: str,
+) -> bool:
+    normalized_content = content.replace("\r\n", "\n").replace("\r", "\n")
+    meta, _body = parse_frontmatter(normalized_content)
+    if meta.get("artifact_type") != "LOCAL_AGENTIC_SPEC":
+        return False
+    if meta.get("local_agentic_spec_status") != REQUIREMENTS_EXTRACTION_SCAFFOLD_STATUS:
+        return False
+    if meta.get("plan_id") != plan_id:
+        return False
+    if REQUIREMENTS_EXTRACTION_SCAFFOLD_STATUS not in normalized_content:
+        return False
+    return True
+
+
+def _requirements_extraction_scaffold_boundary_notes_present(content: str) -> bool:
+    lowered = content.lower()
+    for required_parts in REQUIREMENTS_EXTRACTION_SCAFFOLD_REQUIRED_BOUNDARY_CHECKS:
+        if not all(part.lower() in lowered for part in required_parts):
+            return False
+    return True
+
+
+def _local_agentic_spec_contains_only_requirements_extraction_scaffold_sections(
+    content: str,
+) -> bool:
+    if "NO_REQUIREMENTS_EXTRACTED" not in content:
+        return False
+    if _FUNCTIONAL_REQUIREMENT_ID_PATTERN.search(content):
+        return False
+    if _REQUIREMENT_ID_PATTERN.search(content):
+        return False
+    if _USER_STORIES_HEADING_PATTERN.search(content):
+        return False
+    return True
+
+
+def _local_agentic_spec_has_implementation_tasks(content: str) -> bool:
+    if _IMPLEMENTATION_TASK_HEADING_PATTERN.search(content):
+        section = section_body(content, "## Implementation Tasks")
+        if section.strip():
+            return True
+    return False
+
+
+def _local_agentic_spec_has_planning_run_slice_content(content: str) -> bool:
+    if '"artifact_type": "PLANNING_RUN_SLICE"' in content:
+        return True
+    if _PLANNING_RUN_SLICE_HEADING_PATTERN.search(content):
+        section = section_body(content, "## PLANNING_RUN_SLICE")
+        if section.strip():
+            return True
+    return False
+
+
+def _validate_requirements_extraction_scaffold_provenance(
+    provenance: dict,
+    *,
+    plan_id: str,
+    intake_id: str,
+) -> str | None:
+    """Return a blocking reason when requirements-extraction scaffold provenance is invalid."""
+    artifact_type = provenance.get("artifact_type")
+    if artifact_type != ORCHESTRATOR_REQUIREMENTS_EXTRACTION_SCAFFOLD_PROVENANCE_ARTIFACT_TYPE:
+        return (
+            f"requirements extraction scaffold provenance artifact_type mismatch: "
+            f"expected {ORCHESTRATOR_REQUIREMENTS_EXTRACTION_SCAFFOLD_PROVENANCE_ARTIFACT_TYPE!r}, "
+            f"found {artifact_type!r}"
+        )
+
+    provenance_plan_id = provenance.get("plan_id")
+    if provenance_plan_id != plan_id:
+        return (
+            f"requirements extraction scaffold provenance plan_id mismatch: "
+            f"expected {plan_id!r}, found {provenance_plan_id!r}"
+        )
+
+    provenance_intake_id = provenance.get("intake_id")
+    if provenance_intake_id != intake_id:
+        return (
+            f"requirements extraction scaffold provenance intake_id mismatch: "
+            f"expected {intake_id!r}, found {provenance_intake_id!r}"
+        )
+
+    if (
+        provenance.get("local_agentic_spec_status")
+        != REQUIREMENTS_EXTRACTION_SCAFFOLD_STATUS
+    ):
+        return (
+            "requirements extraction scaffold provenance local_agentic_spec_status is not "
+            "REQUIREMENTS_EXTRACTION_SCAFFOLD_NON_AUTHORITY"
+        )
+
+    if provenance.get("planning_workspace_status_at_scaffold") != "DRAFT":
+        return (
+            "requirements extraction scaffold provenance "
+            "planning_workspace_status_at_scaffold is not DRAFT"
+        )
+
+    if (
+        provenance.get("source_requirements_extraction_preflight_state")
+        != REQUIREMENTS_EXTRACTION_PREFLIGHT_CONFIRMED_STATE
+    ):
+        return (
+            "requirements extraction scaffold provenance "
+            "source_requirements_extraction_preflight_state is not "
+            "REQUIREMENTS_EXTRACTION_PREFLIGHT_CONFIRMED_NO_REQUIREMENTS_GENERATED"
+        )
+
+    if (
+        provenance.get("source_requirements_extraction_preflight_next_action")
+        != REQUIREMENTS_EXTRACTION_PREFLIGHT_CONFIRMED_NEXT_ACTION
+    ):
+        return (
+            "requirements extraction scaffold provenance "
+            "source_requirements_extraction_preflight_next_action is not "
+            "FUTURE_REQUIREMENTS_EXTRACTION_REQUIRES_SEPARATE_COMMAND"
+        )
+
+    non_authority = provenance.get("non_authority")
+    if not isinstance(non_authority, dict):
+        return (
+            "requirements extraction scaffold provenance non_authority must be an object"
+        )
+    for flag in ORCHESTRATOR_REQUIREMENTS_EXTRACTION_SCAFFOLD_NON_AUTHORITY_FLAGS:
+        if non_authority.get(flag) is not True:
+            return (
+                f"requirements extraction scaffold provenance non_authority.{flag} "
+                "must be true"
+            )
+
+    return None
+
+
+def _validate_requirements_extraction_post_scaffold_coherence(
+    project: Path,
+    intake_id: str,
+    plan_id: str,
+    *,
+    scaffold_provenance: dict,
+) -> None:
+    """Fail closed when post-scaffold requirements extraction gates are no longer coherent."""
+    workspace_dest = planning_path(project, plan_id)
+
+    draft_preflight_report = preflight_draft_preparation(project, intake_id)
+    if (
+        draft_preflight_report.preflight_state
+        != DRAFT_PREPARATION_PREFLIGHT_CONFIRMED_STATE
+    ):
+        raise ValueError(
+            "requirements extraction preflight not confirmed: "
+            f"{draft_preflight_report.preflight_state}"
+        )
+    if draft_preflight_report.latest_decision == "REQUEST_MORE_CLARIFICATION":
+        raise ValueError(
+            "latest readiness decision requests clarification; "
+            "requirements extraction preflight not confirmed"
+        )
+    if draft_preflight_report.latest_decision == "BLOCK_INTAKE":
+        raise ValueError(
+            "latest readiness decision blocks intake; "
+            "requirements extraction preflight not confirmed"
+        )
+    if draft_preflight_report.latest_decision != "AUTHORIZE_DRAFT_PREPARATION":
+        raise ValueError(
+            "latest readiness decision is not AUTHORIZE_DRAFT_PREPARATION; "
+            "requirements extraction preflight not confirmed"
+        )
+
+    if (
+        scaffold_provenance.get("source_requirements_extraction_preflight_state")
+        != REQUIREMENTS_EXTRACTION_PREFLIGHT_CONFIRMED_STATE
+    ):
+        raise ValueError(
+            "requirements extraction preflight not confirmed: "
+            f"{scaffold_provenance.get('source_requirements_extraction_preflight_state')!r}"
+        )
+    if (
+        scaffold_provenance.get("source_requirements_extraction_preflight_next_action")
+        != REQUIREMENTS_EXTRACTION_PREFLIGHT_CONFIRMED_NEXT_ACTION
+    ):
+        raise ValueError(
+            "requirements extraction preflight next action not expected: "
+            f"{scaffold_provenance.get('source_requirements_extraction_preflight_next_action')!r}"
+        )
+
+    workspace_status = _load_planning_workspace_status(workspace_dest, plan_id)
+    if workspace_status != "DRAFT":
+        raise ValueError(
+            f"planning workspace must be DRAFT for requirements extraction owner "
+            f"decision, found: {workspace_status!r}"
+        )
+
+    local_agentic_spec_path = workspace_dest / "local-agentic-spec.md"
+    if not local_agentic_spec_path.is_file():
+        raise FileNotFoundError(
+            f"local-agentic-spec.md missing in planning workspace: {plan_id}"
+        )
+
+    local_spec_content = local_agentic_spec_path.read_text(encoding="utf-8")
+    if not _is_local_agentic_spec_requirements_extraction_scaffold_non_authority(
+        local_spec_content,
+        plan_id,
+    ):
+        raise ValueError(
+            "local-agentic-spec.md is not REQUIREMENTS_EXTRACTION_SCAFFOLD_NON_AUTHORITY "
+            f"for plan: {plan_id}"
+        )
+    if not _requirements_extraction_scaffold_boundary_notes_present(local_spec_content):
+        raise ValueError(
+            "requirements extraction scaffold is incoherent: "
+            "local-agentic-spec.md missing required boundary notes "
+            f"for plan: {plan_id}"
+        )
+    if not _local_agentic_spec_contains_only_requirements_extraction_scaffold_sections(
+        local_spec_content
+    ):
+        raise ValueError(
+            "requirements extraction scaffold is incoherent: "
+            "local-agentic-spec.md no longer contains only scaffold/pending sections "
+            f"for plan: {plan_id}"
+        )
+    if _local_agentic_spec_has_generated_functional_requirements(local_spec_content):
+        raise ValueError(
+            f"local-agentic-spec.md already contains requirements for plan: {plan_id}"
+        )
+    if _local_agentic_spec_has_user_stories(local_spec_content):
+        raise ValueError(
+            f"local-agentic-spec.md already contains user stories for plan: {plan_id}"
+        )
+    if _local_agentic_spec_has_generated_acceptance_criteria(local_spec_content):
+        raise ValueError(
+            "local-agentic-spec.md already contains acceptance criteria "
+            f"for plan: {plan_id}"
+        )
+    if _local_agentic_spec_has_architecture_decision_language(local_spec_content):
+        raise ValueError(
+            "local-agentic-spec.md already contains architecture decision language "
+            f"for plan: {plan_id}"
+        )
+    if _local_agentic_spec_has_implementation_tasks(local_spec_content):
+        raise ValueError(
+            f"local-agentic-spec.md already contains implementation tasks for plan: {plan_id}"
+        )
+    if _local_agentic_spec_has_planning_run_slice_content(local_spec_content):
+        raise ValueError(
+            f"local-agentic-spec.md already contains PLANNING_RUN_SLICE content "
+            f"for plan: {plan_id}"
+        )
+
+    implementation_plan_path = workspace_dest / "implementation-plan.md"
+    planning_audit_path = workspace_dest / "planning-audit.md"
+    if not implementation_plan_path.is_file():
+        raise FileNotFoundError(
+            f"implementation-plan.md missing in planning workspace: {plan_id}"
+        )
+    if not planning_audit_path.is_file():
+        raise FileNotFoundError(
+            f"planning-audit.md missing in planning workspace: {plan_id}"
+        )
+    if not _is_planning_artifact_init_placeholder(
+        implementation_plan_path.read_text(encoding="utf-8"),
+        plan_id,
+        "implementation-plan.md",
+        artifact_type="IMPLEMENTATION_PLAN",
+    ):
+        raise ValueError(
+            "requirements extraction scaffold is incoherent: "
+            f"implementation-plan.md already modified for plan: {plan_id}"
+        )
+    if not _is_planning_artifact_init_placeholder(
+        planning_audit_path.read_text(encoding="utf-8"),
+        plan_id,
+        "planning-audit.md",
+        artifact_type="PLANNING_AUDIT",
+        identity_field="auditor",
+    ):
+        raise ValueError(
+            "requirements extraction scaffold is incoherent: "
+            f"planning-audit.md already modified for plan: {plan_id}"
+        )
+
+
 def _validate_local_agentic_spec_scaffold_provenance(
     provenance: dict,
     *,
@@ -5585,6 +5956,523 @@ def scaffold_requirements_extraction(
         local_agentic_spec_status=REQUIREMENTS_EXTRACTION_SCAFFOLD_STATUS,
         workspace_status=workspace_status,
         non_authority=non_authority,
+    )
+
+
+@dataclass(frozen=True)
+class RequirementsExtractionOwnerDecisionRecord:
+    decision_id: str
+    decision: str
+    created_at: str
+    path: Path
+
+
+@dataclass(frozen=True)
+class RequirementsExtractionOwnerDecisionValidationReport:
+    output: str
+    valid: bool
+    errors: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RequirementsExtractionOwnerDecisionReport:
+    output: str
+    decision_path: Path
+    plan_id: str
+    intake_id: str
+    decision_id: str
+    decision: str
+    workspace_status: str
+    latest_decision_id: str | None
+    latest_decision: str | None
+    non_authority: dict[str, bool]
+
+
+def build_requirements_extraction_owner_decision_artifact(
+    intake_id: str,
+    plan_id: str,
+    decision_id: str,
+    decision: str,
+    owner_summary: str,
+    *,
+    source_requirements_extraction_scaffold_provenance_path: str,
+    source_requirements_extraction_scaffold_status: str,
+    source_requirements_extraction_scaffold_created_at: str,
+    source_requirements_extraction_preflight_state: str,
+    source_requirements_extraction_preflight_next_action: str,
+    planning_workspace_status_at_decision: str,
+    created_at: str | None = None,
+) -> dict:
+    """Build the deterministic REQUIREMENTS_EXTRACTION_OWNER_DECISION artifact payload."""
+    validate_intake_id(intake_id)
+    validate_plan_id(plan_id)
+    validate_requirements_extraction_decision_id(decision_id)
+    if decision not in REQUIREMENTS_EXTRACTION_OWNER_DECISION_VALUES:
+        raise ValueError(f"unsupported decision value: {decision!r}")
+    if not owner_summary:
+        raise ValueError("owner summary must not be empty")
+
+    return {
+        "artifact_type": REQUIREMENTS_EXTRACTION_OWNER_DECISION_ARTIFACT_TYPE,
+        "schema_version": REQUIREMENTS_EXTRACTION_OWNER_DECISION_SCHEMA_VERSION,
+        "intake_id": intake_id,
+        "plan_id": plan_id,
+        "decision_id": decision_id,
+        "decision": decision,
+        "owner_summary": owner_summary,
+        "created_at": created_at or _utc_now(),
+        "source_requirements_extraction_scaffold_provenance_path": (
+            source_requirements_extraction_scaffold_provenance_path
+        ),
+        "source_requirements_extraction_scaffold_status": (
+            source_requirements_extraction_scaffold_status
+        ),
+        "source_requirements_extraction_scaffold_created_at": (
+            source_requirements_extraction_scaffold_created_at
+        ),
+        "source_requirements_extraction_preflight_state": (
+            source_requirements_extraction_preflight_state
+        ),
+        "source_requirements_extraction_preflight_next_action": (
+            source_requirements_extraction_preflight_next_action
+        ),
+        "planning_workspace_status_at_decision": planning_workspace_status_at_decision,
+        "non_authority": {
+            key: True
+            for key in REQUIREMENTS_EXTRACTION_OWNER_DECISION_NON_AUTHORITY_FLAGS
+        },
+    }
+
+
+def _validate_requirements_extraction_owner_decision_payload(
+    artifact: object,
+    intake_id: str,
+    plan_id: str,
+    decision_id: str,
+) -> list[str]:
+    """Return structural validation errors for REQUIREMENTS_EXTRACTION_OWNER_DECISION."""
+    errors: list[str] = []
+
+    if not isinstance(artifact, dict):
+        return ["requirements extraction owner decision artifact must be a JSON object"]
+
+    for field in REQUIREMENTS_EXTRACTION_OWNER_DECISION_REQUIRED_FIELDS:
+        if field not in artifact:
+            errors.append(f"missing required field: {field}")
+
+    artifact_type = artifact.get("artifact_type")
+    if (
+        artifact_type is not None
+        and artifact_type != REQUIREMENTS_EXTRACTION_OWNER_DECISION_ARTIFACT_TYPE
+    ):
+        errors.append(
+            f"wrong artifact_type: expected "
+            f"{REQUIREMENTS_EXTRACTION_OWNER_DECISION_ARTIFACT_TYPE!r}, "
+            f"found {artifact_type!r}"
+        )
+
+    schema_version = artifact.get("schema_version")
+    if (
+        schema_version is not None
+        and schema_version != REQUIREMENTS_EXTRACTION_OWNER_DECISION_SCHEMA_VERSION
+    ):
+        errors.append(
+            f"unsupported schema_version: expected "
+            f"{REQUIREMENTS_EXTRACTION_OWNER_DECISION_SCHEMA_VERSION!r}, "
+            f"found {schema_version!r}"
+        )
+
+    artifact_intake_id = artifact.get("intake_id")
+    if isinstance(artifact_intake_id, str) and artifact_intake_id != intake_id:
+        errors.append(
+            "intake_id mismatch: "
+            f"path {intake_id!r}, artifact {artifact_intake_id!r}"
+        )
+
+    artifact_plan_id = artifact.get("plan_id")
+    if isinstance(artifact_plan_id, str) and artifact_plan_id != plan_id:
+        errors.append(
+            f"plan_id mismatch: path {plan_id!r}, artifact {artifact_plan_id!r}"
+        )
+
+    artifact_decision_id = artifact.get("decision_id")
+    if isinstance(artifact_decision_id, str) and artifact_decision_id != decision_id:
+        errors.append(
+            "decision_id mismatch: "
+            f"path {decision_id!r}, artifact {artifact_decision_id!r}"
+        )
+
+    decision = artifact.get("decision")
+    if decision is not None and decision not in REQUIREMENTS_EXTRACTION_OWNER_DECISION_VALUES:
+        errors.append(f"invalid decision value: {decision!r}")
+
+    owner_summary = artifact.get("owner_summary")
+    if owner_summary is not None:
+        error = _non_empty_string(owner_summary, "owner_summary")
+        if error:
+            errors.append(error)
+
+    created_at = artifact.get("created_at")
+    if created_at is not None and not _parse_created_at(created_at):
+        errors.append("created_at must be a parseable ISO-8601 timestamp")
+
+    non_authority = artifact.get("non_authority")
+    if non_authority is None:
+        errors.append("missing required field: non_authority")
+    elif not isinstance(non_authority, dict):
+        errors.append("non_authority must be an object")
+    else:
+        for flag in REQUIREMENTS_EXTRACTION_OWNER_DECISION_NON_AUTHORITY_FLAGS:
+            if flag not in non_authority:
+                errors.append(f"missing non_authority flag: {flag}")
+            elif non_authority[flag] is not True:
+                errors.append(f"non_authority flag must be true: {flag}")
+
+    return errors
+
+
+def _format_requirements_extraction_owner_decision(
+    *,
+    decision_path: Path,
+    plan_id: str,
+    intake_id: str,
+    decision_id: str,
+    decision: str,
+    workspace_status: str,
+    latest_decision_id: str | None,
+    latest_decision: str | None,
+) -> str:
+    lines = [
+        f"created requirements extraction owner decision artifact: {decision_path}",
+        f"artifact_type: {REQUIREMENTS_EXTRACTION_OWNER_DECISION_ARTIFACT_TYPE}",
+        f"decision_id: {decision_id}",
+        f"decision: {decision}",
+        f"plan_id: {plan_id}",
+        f"intake_id: {intake_id}",
+        f"planning_workspace_status: {workspace_status}",
+    ]
+    if latest_decision_id is not None:
+        lines.append(f"latest_requirements_extraction_decision_id: {latest_decision_id}")
+    if latest_decision is not None:
+        lines.append(f"latest_requirements_extraction_decision: {latest_decision}")
+    lines.extend(
+        [
+            "mode: owner-provided requirements extraction decision only",
+            "note: no LLM, no requirements extraction, no requirements approval, "
+            "no architecture decision, no implementation plan, no PLANNING_RUN_SLICE, "
+            "no validation or approval, no runner proposals, no runs, "
+            "no executor invocation",
+            "note: does not mutate local-agentic-spec.md, context-pack.md, "
+            "implementation-plan.md, planning-audit.md, or evidence artifacts",
+        ]
+    )
+    if decision == "AUTHORIZE_REQUIREMENTS_EXTRACTION":
+        lines.append(
+            "note: AUTHORIZE_REQUIREMENTS_EXTRACTION authorizes only a future "
+            "separate requirements extraction command; authorization is not extraction"
+        )
+    return "\n".join(lines)
+
+
+def create_requirements_extraction_owner_decision(
+    project: Path,
+    intake_id: str,
+    plan_id: str,
+    decision_id: str,
+    decision: str,
+    owner_summary: str,
+) -> RequirementsExtractionOwnerDecisionReport:
+    """Record a REQUIREMENTS_EXTRACTION_OWNER_DECISION without mutating planning artifacts."""
+    validate_intake_id(intake_id)
+    validate_plan_id(plan_id)
+    validate_requirements_extraction_decision_id(decision_id)
+    if decision not in REQUIREMENTS_EXTRACTION_OWNER_DECISION_VALUES:
+        raise ValueError(f"unsupported decision value: {decision!r}")
+    if not owner_summary:
+        raise ValueError("owner summary must not be empty")
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        raise FileNotFoundError("no workspace found (run `agent-os init` first)")
+
+    _require_valid_goal_intake(project, intake_id)
+
+    workspace_dest = planning_path(project, plan_id)
+    if not workspace_dest.is_dir():
+        raise FileNotFoundError(f"planning workspace not found: {plan_id}")
+
+    workspace_status = _load_planning_workspace_status(workspace_dest, plan_id)
+    if workspace_status != "DRAFT":
+        raise ValueError(
+            f"planning workspace must be DRAFT for requirements extraction owner "
+            f"decision, found: {workspace_status!r}"
+        )
+
+    requirements_scaffold_provenance_path = (
+        workspace_dest
+        / "evidence"
+        / ORCHESTRATOR_REQUIREMENTS_EXTRACTION_SCAFFOLD_PROVENANCE_FILE
+    )
+    if not requirements_scaffold_provenance_path.is_file():
+        raise FileNotFoundError(
+            "requirements extraction scaffold provenance not found for planning "
+            f"workspace: {plan_id}"
+        )
+
+    try:
+        scaffold_provenance = json.loads(
+            requirements_scaffold_provenance_path.read_text(encoding="utf-8")
+        )
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"invalid requirements extraction scaffold provenance for planning "
+            f"workspace {plan_id}: {exc.msg}"
+        ) from exc
+
+    if not isinstance(scaffold_provenance, dict):
+        raise ValueError(
+            f"invalid requirements extraction scaffold provenance for planning "
+            f"workspace {plan_id}: expected object"
+        )
+
+    provenance_error = _validate_requirements_extraction_scaffold_provenance(
+        scaffold_provenance,
+        plan_id=plan_id,
+        intake_id=intake_id,
+    )
+    if provenance_error is not None:
+        raise ValueError(provenance_error)
+
+    _validate_requirements_extraction_post_scaffold_coherence(
+        project,
+        intake_id,
+        plan_id,
+        scaffold_provenance=scaffold_provenance,
+    )
+
+    dest = orchestrator_requirements_extraction_decision_path(
+        project,
+        intake_id,
+        plan_id,
+        decision_id,
+    )
+    if dest.exists():
+        raise FileExistsError(
+            f"requirements extraction owner decision artifact already exists: {decision_id}"
+        )
+
+    artifact = build_requirements_extraction_owner_decision_artifact(
+        intake_id,
+        plan_id,
+        decision_id,
+        decision,
+        owner_summary,
+        source_requirements_extraction_scaffold_provenance_path=str(
+            requirements_scaffold_provenance_path
+        ),
+        source_requirements_extraction_scaffold_status=scaffold_provenance.get(
+            "local_agentic_spec_status",
+            REQUIREMENTS_EXTRACTION_SCAFFOLD_STATUS,
+        ),
+        source_requirements_extraction_scaffold_created_at=scaffold_provenance.get(
+            "created_at",
+            "",
+        ),
+        source_requirements_extraction_preflight_state=scaffold_provenance.get(
+            "source_requirements_extraction_preflight_state",
+            REQUIREMENTS_EXTRACTION_PREFLIGHT_CONFIRMED_STATE,
+        ),
+        source_requirements_extraction_preflight_next_action=scaffold_provenance.get(
+            "source_requirements_extraction_preflight_next_action",
+            REQUIREMENTS_EXTRACTION_PREFLIGHT_CONFIRMED_NEXT_ACTION,
+        ),
+        planning_workspace_status_at_decision=workspace_status,
+    )
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(dest, artifact)
+
+    decisions = list_requirements_extraction_owner_decisions(
+        project,
+        intake_id,
+        plan_id,
+    )
+    latest_decision_id = decisions[-1].decision_id if decisions else None
+    latest_decision = decisions[-1].decision if decisions else None
+
+    non_authority = {
+        key: True
+        for key in REQUIREMENTS_EXTRACTION_OWNER_DECISION_NON_AUTHORITY_FLAGS
+    }
+    output = _format_requirements_extraction_owner_decision(
+        decision_path=dest,
+        plan_id=plan_id,
+        intake_id=intake_id,
+        decision_id=decision_id,
+        decision=decision,
+        workspace_status=workspace_status,
+        latest_decision_id=latest_decision_id,
+        latest_decision=latest_decision,
+    )
+    return RequirementsExtractionOwnerDecisionReport(
+        output=output,
+        decision_path=dest,
+        plan_id=plan_id,
+        intake_id=intake_id,
+        decision_id=decision_id,
+        decision=decision,
+        workspace_status=workspace_status,
+        latest_decision_id=latest_decision_id,
+        latest_decision=latest_decision,
+        non_authority=non_authority,
+    )
+
+
+def load_requirements_extraction_owner_decision(
+    project: Path,
+    intake_id: str,
+    plan_id: str,
+    decision_id: str,
+) -> dict:
+    """Load a REQUIREMENTS_EXTRACTION_OWNER_DECISION artifact from disk (read-only)."""
+    validate_intake_id(intake_id)
+    validate_plan_id(plan_id)
+    validate_requirements_extraction_decision_id(decision_id)
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        raise FileNotFoundError("no workspace found (run `agent-os init` first)")
+
+    path = orchestrator_requirements_extraction_decision_path(
+        project,
+        intake_id,
+        plan_id,
+        decision_id,
+    )
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"requirements extraction owner decision artifact not found: {decision_id}"
+        )
+
+    try:
+        artifact = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"invalid requirements extraction decision artifact for {decision_id}: "
+            f"{exc.msg}"
+        ) from exc
+
+    if not isinstance(artifact, dict):
+        raise ValueError(
+            f"invalid requirements extraction decision artifact for {decision_id}: "
+            "expected object"
+        )
+
+    return artifact
+
+
+def list_requirements_extraction_owner_decisions(
+    project: Path,
+    intake_id: str,
+    plan_id: str,
+) -> tuple[RequirementsExtractionOwnerDecisionRecord, ...]:
+    """List requirements extraction owner decisions for an intake/plan (read-only)."""
+    validate_intake_id(intake_id)
+    validate_plan_id(plan_id)
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        raise FileNotFoundError("no workspace found (run `agent-os init` first)")
+
+    decisions_dir = (
+        orchestrator_intake_path(project, intake_id)
+        / REQUIREMENTS_EXTRACTION_DECISIONS_DIR
+        / plan_id
+    )
+    if not decisions_dir.is_dir():
+        return ()
+
+    records: list[RequirementsExtractionOwnerDecisionRecord] = []
+    for path in sorted(decisions_dir.glob("*.json")):
+        decision_id = path.stem
+        try:
+            artifact = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(artifact, dict):
+            continue
+        created_at = artifact.get("created_at")
+        if not isinstance(created_at, str):
+            created_at = ""
+        decision = artifact.get("decision")
+        if not isinstance(decision, str):
+            decision = ""
+        records.append(
+            RequirementsExtractionOwnerDecisionRecord(
+                decision_id=decision_id,
+                decision=decision,
+                created_at=created_at,
+                path=path,
+            )
+        )
+
+    records.sort(key=lambda record: (record.created_at, record.decision_id))
+    return tuple(records)
+
+
+def validate_requirements_extraction_owner_decision(
+    project: Path,
+    intake_id: str,
+    plan_id: str,
+    decision_id: str,
+) -> RequirementsExtractionOwnerDecisionValidationReport:
+    """Strict read-only validation of a REQUIREMENTS_EXTRACTION_OWNER_DECISION artifact."""
+    validate_intake_id(intake_id)
+    validate_plan_id(plan_id)
+    validate_requirements_extraction_decision_id(decision_id)
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        raise FileNotFoundError("no workspace found (run `agent-os init` first)")
+
+    path = orchestrator_requirements_extraction_decision_path(
+        project,
+        intake_id,
+        plan_id,
+        decision_id,
+    )
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"requirements extraction owner decision artifact not found: {decision_id}"
+        )
+
+    raw_text = path.read_text(encoding="utf-8")
+    errors: list[str] = []
+    try:
+        artifact = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        errors = [f"malformed JSON: {exc.msg}"]
+    else:
+        errors = _validate_requirements_extraction_owner_decision_payload(
+            artifact,
+            intake_id,
+            plan_id,
+            decision_id,
+        )
+
+    output_lines = [
+        f"requirements extraction owner decision validation: {path}",
+        f"valid: {not errors}",
+    ]
+    if errors:
+        output_lines.append("errors:")
+        for error in errors:
+            output_lines.append(f"  - {error}")
+
+    return RequirementsExtractionOwnerDecisionValidationReport(
+        output="\n".join(output_lines),
+        valid=not errors,
+        errors=tuple(errors),
     )
 
 

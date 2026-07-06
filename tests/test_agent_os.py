@@ -29,6 +29,13 @@ from agent_os.orchestrator import (
     create_goal_intake,
     create_owner_clarification,
     create_owner_readiness_decision,
+    create_requirements_extraction_owner_decision,
+    build_requirements_extraction_owner_decision_artifact,
+    load_requirements_extraction_owner_decision,
+    list_requirements_extraction_owner_decisions,
+    validate_requirements_extraction_owner_decision,
+    REQUIREMENTS_EXTRACTION_OWNER_DECISION_NON_AUTHORITY_FLAGS,
+    REQUIREMENTS_EXTRACTION_OWNER_DECISION_REQUIRED_FIELDS,
     goal_intake_status,
     list_owner_clarifications,
     list_owner_readiness_decisions,
@@ -54,6 +61,8 @@ from agent_os.paths import (
     orchestrator_clarification_path,
     orchestrator_intake_path,
     orchestrator_readiness_decision_path,
+    orchestrator_requirements_extraction_decision_path,
+    REQUIREMENTS_EXTRACTION_DECISIONS_DIR,
     planning_path,
     run_path,
 )
@@ -14785,6 +14794,1845 @@ class OrchestratorRequirementsExtractionScaffoldTests(unittest.TestCase):
         self.assertNotIn("requirements approved", provenance)
         self.assertNotIn("requirements approved", spec)
         self.assertIn("does_not_approve_plan", provenance)
+
+
+class OrchestratorRequirementsExtractionOwnerDecisionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self._tmp.name)
+        init_workspace(self.project)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _artifact_path(self, intake_id: str) -> Path:
+        return orchestrator_intake_path(self.project, intake_id) / GOAL_INTAKE_FILE
+
+    def _clarification_path(self, intake_id: str, clarification_id: str) -> Path:
+        return orchestrator_clarification_path(
+            self.project,
+            intake_id,
+            clarification_id,
+        )
+
+    def _readiness_decision_path(self, intake_id: str, decision_id: str) -> Path:
+        return orchestrator_readiness_decision_path(
+            self.project,
+            intake_id,
+            decision_id,
+        )
+
+    def _requirements_extraction_decision_path(
+        self,
+        intake_id: str,
+        plan_id: str,
+        decision_id: str,
+    ) -> Path:
+        return orchestrator_requirements_extraction_decision_path(
+            self.project,
+            intake_id,
+            plan_id,
+            decision_id,
+        )
+
+    def _create_slither_intake(self, intake_id: str = "slither-demo") -> Path:
+        return create_goal_intake(
+            self.project,
+            intake_id,
+            "Build me an online slither.io-like game",
+        )
+
+    def _write_artifact(self, intake_id: str, artifact: dict) -> Path:
+        path = self._artifact_path(intake_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+        return path
+
+    def _project_files(self) -> set[str]:
+        return {
+            path.relative_to(self.project).as_posix()
+            for path in self.project.rglob("*")
+            if path.is_file()
+        }
+
+    def _slither_with_clarification(self, intake_id: str = "slither-demo") -> None:
+        self._create_slither_intake(intake_id)
+        create_owner_clarification(
+            self.project,
+            intake_id,
+            "scope-v1",
+            "Browser-only demo with 10 players max; no persistence.",
+        )
+
+    def _authorize_slither(self, intake_id: str = "slither-demo") -> None:
+        self._slither_with_clarification(intake_id)
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "AUTHORIZE_DRAFT_PREPARATION",
+            "Scope clarified; authorize future draft prep only.",
+        )
+
+    def _prepare(
+        self,
+        intake_id: str = "slither-demo",
+        plan_id: str = "slither-plan-v1",
+    ) -> tuple[int, str]:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "prepare-planning-draft",
+                    intake_id,
+                    str(self.project),
+                    "--plan-id",
+                    plan_id,
+                ]
+            )
+        return code, buf.getvalue()
+
+    def _transport(
+        self,
+        intake_id: str = "slither-demo",
+        plan_id: str = "slither-plan-v1",
+    ) -> tuple[int, str]:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "transport-planning-context",
+                    intake_id,
+                    str(self.project),
+                    "--plan-id",
+                    plan_id,
+                ]
+            )
+        return code, buf.getvalue()
+
+    def _draft_context_pack(
+        self,
+        intake_id: str = "slither-demo",
+        plan_id: str = "slither-plan-v1",
+    ) -> tuple[int, str]:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "draft-context-pack",
+                    intake_id,
+                    str(self.project),
+                    "--plan-id",
+                    plan_id,
+                ]
+            )
+        return code, buf.getvalue()
+
+    def _local_spec_preflight(
+        self,
+        intake_id: str = "slither-demo",
+        plan_id: str = "slither-plan-v1",
+    ) -> tuple[int, str]:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "local-agentic-spec-preflight",
+                    intake_id,
+                    str(self.project),
+                    "--plan-id",
+                    plan_id,
+                ]
+            )
+        return code, buf.getvalue()
+
+    def _scaffold_local_spec(
+        self,
+        intake_id: str = "slither-demo",
+        plan_id: str = "slither-plan-v1",
+    ) -> tuple[int, str]:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "scaffold-local-agentic-spec",
+                    intake_id,
+                    str(self.project),
+                    "--plan-id",
+                    plan_id,
+                ]
+            )
+        return code, buf.getvalue()
+
+    def _preflight(
+        self,
+        intake_id: str = "slither-demo",
+        plan_id: str = "slither-plan-v1",
+    ) -> tuple[int, str]:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "requirements-extraction-preflight",
+                    intake_id,
+                    str(self.project),
+                    "--plan-id",
+                    plan_id,
+                ]
+            )
+        return code, buf.getvalue()
+
+    def _scaffold(
+        self,
+        intake_id: str = "slither-demo",
+        plan_id: str = "slither-plan-v1",
+    ) -> tuple[int, str]:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "scaffold-requirements-extraction",
+                    intake_id,
+                    str(self.project),
+                    "--plan-id",
+                    plan_id,
+                ]
+            )
+        return code, buf.getvalue()
+
+    def _decide(
+        self,
+        intake_id: str = "slither-demo",
+        plan_id: str = "slither-plan-v1",
+        decision: str = "AUTHORIZE_REQUIREMENTS_EXTRACTION",
+        decision_id: str = "req-ext-owner-v1",
+        summary: str = "Authorize future extraction only.",
+    ) -> tuple[int, str]:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "decide-requirements-extraction",
+                    intake_id,
+                    str(self.project),
+                    "--plan-id",
+                    plan_id,
+                    "--decision",
+                    decision,
+                    "--decision-id",
+                    decision_id,
+                    "--summary",
+                    summary,
+                ]
+            )
+        return code, buf.getvalue()
+
+    def _workspace(self, plan_id: str = "slither-plan-v1") -> Path:
+        return planning_path(self.project, plan_id)
+
+    def _context_pack_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return self._workspace(plan_id) / "context-pack.md"
+
+    def _draft_provenance_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return (
+            self._workspace(plan_id)
+            / "evidence"
+            / "orchestrator-context-pack-draft-provenance.json"
+        )
+
+    def _scaffold_provenance_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return (
+            self._workspace(plan_id)
+            / "evidence"
+            / "orchestrator-local-agentic-spec-scaffold-provenance.json"
+        )
+
+    def _requirements_scaffold_provenance_path(
+        self,
+        plan_id: str = "slither-plan-v1",
+    ) -> Path:
+        return (
+            self._workspace(plan_id)
+            / "evidence"
+            / "orchestrator-requirements-extraction-scaffold-provenance.json"
+        )
+
+    def _transport_json_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return (
+            self._workspace(plan_id)
+            / "evidence"
+            / "orchestrator-context-transport.json"
+        )
+
+    def _transport_md_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return (
+            self._workspace(plan_id)
+            / "evidence"
+            / "orchestrator-context-transport.md"
+        )
+
+    def _provenance_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return (
+            self._workspace(plan_id)
+            / "evidence"
+            / "orchestrator-provenance.json"
+        )
+
+    def _local_spec_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return self._workspace(plan_id) / "local-agentic-spec.md"
+
+    def _implementation_plan_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return self._workspace(plan_id) / "implementation-plan.md"
+
+    def _planning_audit_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return self._workspace(plan_id) / "planning-audit.md"
+
+    def _setup_ready_for_scaffold(
+        self,
+        intake_id: str = "slither-demo",
+        plan_id: str = "slither-plan-v1",
+    ) -> None:
+        self._authorize_slither(intake_id)
+        self.assertEqual(self._prepare(intake_id, plan_id)[0], 0)
+        self.assertEqual(self._transport(intake_id, plan_id)[0], 0)
+        self.assertEqual(self._draft_context_pack(intake_id, plan_id)[0], 0)
+        self.assertEqual(self._local_spec_preflight(intake_id, plan_id)[0], 0)
+        self.assertEqual(self._scaffold_local_spec(intake_id, plan_id)[0], 0)
+        self.assertEqual(self._preflight(intake_id, plan_id)[0], 0)
+
+    def _setup_ready_for_decision(
+        self,
+        intake_id: str = "slither-demo",
+        plan_id: str = "slither-plan-v1",
+    ) -> None:
+        self._setup_ready_for_scaffold(intake_id, plan_id)
+        self.assertEqual(self._scaffold(intake_id, plan_id)[0], 0)
+
+    def _tracked_artifact_paths(
+        self,
+        intake_id: str = "slither-demo",
+        plan_id: str = "slither-plan-v1",
+    ) -> dict[Path, bytes]:
+        workspace = self._workspace(plan_id)
+        paths = [
+            self._artifact_path(intake_id),
+            self._clarification_path(intake_id, "scope-v1"),
+            self._readiness_decision_path(intake_id, "owner-v1"),
+            self._provenance_path(plan_id),
+            workspace / "evidence" / "orchestrator-draft-scaffold-notes.md",
+            self._transport_json_path(plan_id),
+            self._transport_md_path(plan_id),
+            self._draft_provenance_path(plan_id),
+            self._scaffold_provenance_path(plan_id),
+            self._requirements_scaffold_provenance_path(plan_id),
+            self._context_pack_path(plan_id),
+            self._local_spec_path(plan_id),
+            self._implementation_plan_path(plan_id),
+            self._planning_audit_path(plan_id),
+        ]
+        return {path: path.read_bytes() for path in paths if path.is_file()}
+
+    def _record_decision(
+        self,
+        intake_id: str = "slither-demo",
+        plan_id: str = "slither-plan-v1",
+        decision_id: str = "req-ext-owner-v1",
+        decision: str = "AUTHORIZE_REQUIREMENTS_EXTRACTION",
+        summary: str = "Authorize future extraction only.",
+    ):
+        return create_requirements_extraction_owner_decision(
+            self.project,
+            intake_id,
+            plan_id,
+            decision_id,
+            decision,
+            summary,
+        )
+
+    def test_succeeds_after_coherent_requirements_extraction_scaffold_exists(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+
+        code, output = self._decide(intake_id, plan_id)
+        self.assertEqual(code, 0)
+        self.assertIn("created requirements extraction owner decision artifact:", output)
+
+    def test_decision_artifact_created_at_expected_path(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        decision_id = "req-ext-owner-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+
+        report = self._record_decision(intake_id, plan_id, decision_id)
+
+        expected = self._requirements_extraction_decision_path(
+            intake_id,
+            plan_id,
+            decision_id,
+        )
+        self.assertEqual(report.decision_path, expected)
+        self.assertTrue(expected.is_file())
+        self.assertIn(
+            REQUIREMENTS_EXTRACTION_DECISIONS_DIR,
+            expected.as_posix(),
+        )
+
+    def test_decision_artifact_contains_required_fields(self) -> None:
+        artifact = build_requirements_extraction_owner_decision_artifact(
+            "slither-demo",
+            "slither-plan-v1",
+            "req-ext-owner-v1",
+            "AUTHORIZE_REQUIREMENTS_EXTRACTION",
+            "Authorize future extraction only.",
+            source_requirements_extraction_scaffold_provenance_path=(
+                ".agent-os/planning/slither-plan-v1/evidence/"
+                "orchestrator-requirements-extraction-scaffold-provenance.json"
+            ),
+            source_requirements_extraction_scaffold_status=(
+                "REQUIREMENTS_EXTRACTION_SCAFFOLD_NON_AUTHORITY"
+            ),
+            source_requirements_extraction_scaffold_created_at=(
+                "2026-07-06T10:00:00+00:00"
+            ),
+            source_requirements_extraction_preflight_state=(
+                "REQUIREMENTS_EXTRACTION_PREFLIGHT_CONFIRMED_NO_REQUIREMENTS_GENERATED"
+            ),
+            source_requirements_extraction_preflight_next_action=(
+                "FUTURE_REQUIREMENTS_EXTRACTION_REQUIRES_SEPARATE_COMMAND"
+            ),
+            planning_workspace_status_at_decision="DRAFT",
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        missing = [
+            field
+            for field in REQUIREMENTS_EXTRACTION_OWNER_DECISION_REQUIRED_FIELDS
+            if field not in artifact
+        ]
+        self.assertEqual(missing, [])
+
+    def test_decision_artifact_contains_all_non_authority_flags_true(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        self._record_decision(intake_id, plan_id)
+
+        artifact = load_requirements_extraction_owner_decision(
+            self.project,
+            intake_id,
+            plan_id,
+            "req-ext-owner-v1",
+        )
+        for flag in REQUIREMENTS_EXTRACTION_OWNER_DECISION_NON_AUTHORITY_FLAGS:
+            self.assertIn(flag, artifact["non_authority"])
+            self.assertTrue(artifact["non_authority"][flag])
+
+    def test_authorize_recorded_but_does_not_extract_requirements(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+        local_spec_before = self._local_spec_path(plan_id).read_bytes()
+
+        self._record_decision(plan_id=plan_id, decision="AUTHORIZE_REQUIREMENTS_EXTRACTION")
+
+        spec = self._local_spec_path(plan_id).read_text(encoding="utf-8")
+        self.assertEqual(local_spec_before, self._local_spec_path(plan_id).read_bytes())
+        self.assertIn("NO_REQUIREMENTS_EXTRACTED", spec)
+        self.assertNotIn("The system shall", spec)
+
+    def test_request_more_context_recorded_and_does_not_extract_requirements(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+
+        self._record_decision(
+            plan_id=plan_id,
+            decision="REQUEST_MORE_CONTEXT",
+            summary="Need more product context before extraction.",
+        )
+
+        artifact = load_requirements_extraction_owner_decision(
+            self.project,
+            "slither-demo",
+            plan_id,
+            "req-ext-owner-v1",
+        )
+        self.assertEqual(artifact["decision"], "REQUEST_MORE_CONTEXT")
+        self.assertIn("NO_REQUIREMENTS_EXTRACTED", self._local_spec_path(plan_id).read_text())
+
+    def test_block_recorded_and_does_not_extract_requirements(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+
+        self._record_decision(
+            plan_id=plan_id,
+            decision="BLOCK_REQUIREMENTS_EXTRACTION",
+            summary="Block extraction for now.",
+        )
+
+        artifact = load_requirements_extraction_owner_decision(
+            self.project,
+            "slither-demo",
+            plan_id,
+            "req-ext-owner-v1",
+        )
+        self.assertEqual(artifact["decision"], "BLOCK_REQUIREMENTS_EXTRACTION")
+        self.assertIn("NO_REQUIREMENTS_EXTRACTED", self._local_spec_path(plan_id).read_text())
+
+    def test_owner_summary_preserved_verbatim(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        summary = "  Authorize extraction later.\t\n\nNot approval.  "
+        self._setup_ready_for_decision(intake_id, plan_id)
+
+        self._record_decision(intake_id, plan_id, summary=summary)
+
+        artifact = load_requirements_extraction_owner_decision(
+            self.project,
+            intake_id,
+            plan_id,
+            "req-ext-owner-v1",
+        )
+        self.assertEqual(artifact["owner_summary"], summary)
+
+    def _valid_decision_artifact(
+        self,
+        intake_id: str = "slither-demo",
+        plan_id: str = "slither-plan-v1",
+        decision_id: str = "req-ext-owner-v1",
+    ) -> dict:
+        return build_requirements_extraction_owner_decision_artifact(
+            intake_id,
+            plan_id,
+            decision_id,
+            "AUTHORIZE_REQUIREMENTS_EXTRACTION",
+            "Authorize future extraction only.",
+            source_requirements_extraction_scaffold_provenance_path=(
+                f".agent-os/planning/{plan_id}/evidence/"
+                "orchestrator-requirements-extraction-scaffold-provenance.json"
+            ),
+            source_requirements_extraction_scaffold_status=(
+                "REQUIREMENTS_EXTRACTION_SCAFFOLD_NON_AUTHORITY"
+            ),
+            source_requirements_extraction_scaffold_created_at=(
+                "2026-07-06T10:00:00+00:00"
+            ),
+            source_requirements_extraction_preflight_state=(
+                "REQUIREMENTS_EXTRACTION_PREFLIGHT_CONFIRMED_NO_REQUIREMENTS_GENERATED"
+            ),
+            source_requirements_extraction_preflight_next_action=(
+                "FUTURE_REQUIREMENTS_EXTRACTION_REQUIRES_SEPARATE_COMMAND"
+            ),
+            planning_workspace_status_at_decision="DRAFT",
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+
+    def _write_decision_artifact(
+        self,
+        intake_id: str,
+        plan_id: str,
+        decision_id: str,
+        artifact: dict,
+    ) -> Path:
+        path = self._requirements_extraction_decision_path(
+            intake_id,
+            plan_id,
+            decision_id,
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+        return path
+
+    def test_validate_requirements_extraction_owner_decision_succeeds_on_valid_artifact(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        decision_id = "req-ext-owner-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        self._record_decision(intake_id, plan_id, decision_id)
+
+        report = validate_requirements_extraction_owner_decision(
+            self.project,
+            intake_id,
+            plan_id,
+            decision_id,
+        )
+        self.assertTrue(report.valid)
+        self.assertEqual(report.errors, ())
+
+    def test_validate_requirements_extraction_owner_decision_rejects_malformed_json(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        decision_id = "req-ext-owner-v1"
+        path = self._requirements_extraction_decision_path(
+            intake_id,
+            plan_id,
+            decision_id,
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not-json", encoding="utf-8")
+
+        report = validate_requirements_extraction_owner_decision(
+            self.project,
+            intake_id,
+            plan_id,
+            decision_id,
+        )
+        self.assertFalse(report.valid)
+        self.assertTrue(any("malformed JSON" in error for error in report.errors))
+
+    def test_validate_requirements_extraction_owner_decision_rejects_wrong_artifact_type(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        decision_id = "req-ext-owner-v1"
+        artifact = self._valid_decision_artifact(intake_id, plan_id, decision_id)
+        artifact["artifact_type"] = "PLANNING_WORKSPACE_DRAFT"
+        self._write_decision_artifact(intake_id, plan_id, decision_id, artifact)
+
+        report = validate_requirements_extraction_owner_decision(
+            self.project,
+            intake_id,
+            plan_id,
+            decision_id,
+        )
+        self.assertFalse(report.valid)
+        self.assertTrue(
+            any("wrong artifact_type" in error for error in report.errors)
+        )
+
+    def test_validate_requirements_extraction_owner_decision_rejects_invalid_decision_value(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        decision_id = "req-ext-owner-v1"
+        artifact = self._valid_decision_artifact(intake_id, plan_id, decision_id)
+        artifact["decision"] = "APPROVE_REQUIREMENTS"
+        self._write_decision_artifact(intake_id, plan_id, decision_id, artifact)
+
+        report = validate_requirements_extraction_owner_decision(
+            self.project,
+            intake_id,
+            plan_id,
+            decision_id,
+        )
+        self.assertFalse(report.valid)
+        self.assertTrue(
+            any("invalid decision value" in error for error in report.errors)
+        )
+
+    def test_validate_requirements_extraction_owner_decision_rejects_missing_non_authority_flag(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        decision_id = "req-ext-owner-v1"
+        artifact = self._valid_decision_artifact(intake_id, plan_id, decision_id)
+        del artifact["non_authority"]["does_not_create_run"]
+        self._write_decision_artifact(intake_id, plan_id, decision_id, artifact)
+
+        report = validate_requirements_extraction_owner_decision(
+            self.project,
+            intake_id,
+            plan_id,
+            decision_id,
+        )
+        self.assertFalse(report.valid)
+        self.assertTrue(
+            any(
+                "missing non_authority flag: does_not_create_run" in error
+                for error in report.errors
+            )
+        )
+
+    def test_validate_requirements_extraction_owner_decision_rejects_false_non_authority_flag(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        decision_id = "req-ext-owner-v1"
+        artifact = self._valid_decision_artifact(intake_id, plan_id, decision_id)
+        artifact["non_authority"]["does_not_invoke_executor"] = False
+        self._write_decision_artifact(intake_id, plan_id, decision_id, artifact)
+
+        report = validate_requirements_extraction_owner_decision(
+            self.project,
+            intake_id,
+            plan_id,
+            decision_id,
+        )
+        self.assertFalse(report.valid)
+        self.assertTrue(
+            any(
+                "non_authority flag must be true: does_not_invoke_executor" in error
+                for error in report.errors
+            )
+        )
+
+    def test_decide_requirements_extraction_rejects_empty_summary(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        decision_id = "req-ext-owner-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        before_artifacts = self._tracked_artifact_paths(intake_id, plan_id)
+        local_spec_bytes = self._local_spec_path(plan_id).read_bytes()
+        workspace = self.project / ".agent-os"
+        before_runs = list((workspace / "runs").iterdir())
+
+        with self.assertRaises(ValueError) as ctx:
+            create_requirements_extraction_owner_decision(
+                self.project,
+                intake_id,
+                plan_id,
+                decision_id,
+                "AUTHORIZE_REQUIREMENTS_EXTRACTION",
+                "",
+            )
+        self.assertIn("owner summary must not be empty", str(ctx.exception))
+        self.assertFalse(
+            self._requirements_extraction_decision_path(
+                intake_id,
+                plan_id,
+                decision_id,
+            ).exists()
+        )
+
+        with (
+            patch("subprocess.run", side_effect=AssertionError("subprocess invoked")),
+            patch.object(
+                planning_module,
+                "progress_planning_workspace",
+                side_effect=AssertionError("progress invoked"),
+            ),
+            patch.object(
+                planning_module,
+                "transition_planning_workspace",
+                side_effect=AssertionError("transition invoked"),
+            ),
+            patch.object(
+                planning_module,
+                "record_planning_owner_decision",
+                side_effect=AssertionError("decide invoked"),
+            ),
+        ):
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                code = main(
+                    [
+                        "orchestrator",
+                        "decide-requirements-extraction",
+                        intake_id,
+                        str(self.project),
+                        "--plan-id",
+                        plan_id,
+                        "--decision",
+                        "AUTHORIZE_REQUIREMENTS_EXTRACTION",
+                        "--decision-id",
+                        decision_id,
+                        "--summary",
+                        "",
+                    ]
+                )
+
+        self.assertEqual(code, 1)
+        self.assertIn("owner summary must not be empty", buf.getvalue())
+        self.assertFalse(
+            self._requirements_extraction_decision_path(
+                intake_id,
+                plan_id,
+                decision_id,
+            ).exists()
+        )
+        self.assertEqual(before_artifacts, self._tracked_artifact_paths(intake_id, plan_id))
+        self.assertEqual(local_spec_bytes, self._local_spec_path(plan_id).read_bytes())
+        self.assertEqual(before_runs, list((workspace / "runs").iterdir()))
+
+    def test_refuses_existing_decision_id_without_overwrite(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        decision_id = "req-ext-owner-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        self._record_decision(intake_id, plan_id, decision_id)
+        existing = self._requirements_extraction_decision_path(
+            intake_id,
+            plan_id,
+            decision_id,
+        ).read_text(encoding="utf-8")
+
+        with self.assertRaises(FileExistsError):
+            create_requirements_extraction_owner_decision(
+                self.project,
+                intake_id,
+                plan_id,
+                decision_id,
+                "REQUEST_MORE_CONTEXT",
+                "Second decision.",
+            )
+        self.assertEqual(
+            existing,
+            self._requirements_extraction_decision_path(
+                intake_id,
+                plan_id,
+                decision_id,
+            ).read_text(encoding="utf-8"),
+        )
+
+    def test_latest_decision_ordering_deterministic_by_created_at_then_decision_id(
+        self,
+    ) -> None:
+        from agent_os import orchestrator as orchestrator_module
+
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        times = iter(
+            [
+                "2026-07-06T10:00:00+00:00",
+                "2026-07-06T10:00:00+00:00",
+                "2026-07-06T11:00:00+00:00",
+            ]
+        )
+
+        with patch.object(orchestrator_module, "_utc_now", side_effect=lambda: next(times)):
+            create_requirements_extraction_owner_decision(
+                self.project,
+                intake_id,
+                plan_id,
+                "req-ext-bbb",
+                "REQUEST_MORE_CONTEXT",
+                "Earlier tie-breaker id.",
+            )
+            create_requirements_extraction_owner_decision(
+                self.project,
+                intake_id,
+                plan_id,
+                "req-ext-aaa",
+                "BLOCK_REQUIREMENTS_EXTRACTION",
+                "Same timestamp, earlier id.",
+            )
+            create_requirements_extraction_owner_decision(
+                self.project,
+                intake_id,
+                plan_id,
+                "req-ext-zzz",
+                "AUTHORIZE_REQUIREMENTS_EXTRACTION",
+                "Latest timestamp.",
+            )
+
+        decisions = list_requirements_extraction_owner_decisions(
+            self.project,
+            intake_id,
+            plan_id,
+        )
+        self.assertEqual(
+            [record.decision_id for record in decisions],
+            ["req-ext-aaa", "req-ext-bbb", "req-ext-zzz"],
+        )
+        self.assertEqual(decisions[-1].decision, "AUTHORIZE_REQUIREMENTS_EXTRACTION")
+
+    def test_refuses_missing_workspace(self) -> None:
+        bare = Path(tempfile.mkdtemp())
+        try:
+            with self.assertRaises(FileNotFoundError):
+                create_requirements_extraction_owner_decision(
+                    bare,
+                    "slither-demo",
+                    "slither-plan-v1",
+                    "req-ext-owner-v1",
+                    "BLOCK_REQUIREMENTS_EXTRACTION",
+                    "Stop.",
+                )
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                code = main(
+                    [
+                        "orchestrator",
+                        "decide-requirements-extraction",
+                        "slither-demo",
+                        str(bare),
+                        "--plan-id",
+                        "slither-plan-v1",
+                        "--decision",
+                        "BLOCK_REQUIREMENTS_EXTRACTION",
+                        "--decision-id",
+                        "req-ext-owner-v1",
+                        "--summary",
+                        "Stop.",
+                    ]
+                )
+            self.assertEqual(code, 1)
+            self.assertIn("no workspace found", buf.getvalue())
+        finally:
+            import shutil
+
+            shutil.rmtree(bare)
+
+    def test_refuses_missing_intake(self) -> None:
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "decide-requirements-extraction",
+                    "missing-intake",
+                    str(self.project),
+                    "--plan-id",
+                    "slither-plan-v1",
+                    "--decision",
+                    "BLOCK_REQUIREMENTS_EXTRACTION",
+                    "--decision-id",
+                    "req-ext-owner-v1",
+                    "--summary",
+                    "Stop.",
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("goal intake artifact not found", buf.getvalue())
+
+    def test_refuses_invalid_intake(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        artifact_path = self._artifact_path(intake_id)
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        artifact["artifact_type"] = "PLANNING_WORKSPACE_DRAFT"
+        artifact_path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+
+        with self.assertRaises(ValueError):
+            create_requirements_extraction_owner_decision(
+                self.project,
+                intake_id,
+                plan_id,
+                "req-ext-owner-v1",
+                "BLOCK_REQUIREMENTS_EXTRACTION",
+                "Stop.",
+            )
+        self.assertFalse(
+            self._requirements_extraction_decision_path(
+                intake_id,
+                plan_id,
+                "req-ext-owner-v1",
+            ).exists()
+        )
+
+    def test_refuses_missing_planning_workspace(self) -> None:
+        self._setup_ready_for_decision()
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "decide-requirements-extraction",
+                    "slither-demo",
+                    str(self.project),
+                    "--plan-id",
+                    "missing-plan",
+                    "--decision",
+                    "AUTHORIZE_REQUIREMENTS_EXTRACTION",
+                    "--decision-id",
+                    "req-ext-owner-v1",
+                    "--summary",
+                    "Authorize.",
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("planning workspace not found", buf.getvalue())
+
+    def test_refuses_non_draft_planning_workspace(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        manifest_path = self._workspace(plan_id) / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["status"] = "CONTEXT_READY"
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+        code, _ = self._decide(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_missing_requirements_extraction_scaffold_provenance(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        self._requirements_scaffold_provenance_path(plan_id).unlink()
+
+        code, _ = self._decide(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_malformed_requirements_extraction_scaffold_provenance(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        provenance_path = self._requirements_scaffold_provenance_path(plan_id)
+        provenance_path.write_text("{not-json", encoding="utf-8")
+
+        code, _ = self._decide(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_scaffold_provenance_plan_id_mismatch(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        provenance_path = self._requirements_scaffold_provenance_path(plan_id)
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        provenance["plan_id"] = "other-plan"
+        provenance_path.write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
+
+        code, _ = self._decide(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_scaffold_provenance_intake_id_mismatch(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        provenance_path = self._requirements_scaffold_provenance_path(plan_id)
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        provenance["intake_id"] = "other-intake"
+        provenance_path.write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
+
+        code, _ = self._decide(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_scaffold_provenance_non_authority_missing_or_false(self) -> None:
+        from agent_os.orchestrator import (
+            ORCHESTRATOR_REQUIREMENTS_EXTRACTION_SCAFFOLD_NON_AUTHORITY_FLAGS,
+        )
+
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        provenance_path = self._requirements_scaffold_provenance_path(plan_id)
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+        flag = ORCHESTRATOR_REQUIREMENTS_EXTRACTION_SCAFFOLD_NON_AUTHORITY_FLAGS[0]
+        provenance["non_authority"][flag] = False
+        provenance_path.write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
+
+        code, _ = self._decide(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_requirements_extraction_preflight_not_confirmed(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v2",
+            "BLOCK_INTAKE",
+            "Scope too broad; stop intake.",
+        )
+
+        code, _ = self._decide(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_incoherent_requirements_extraction_scaffold(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        local_spec = self._local_spec_path(plan_id)
+        local_spec.write_text(
+            local_spec.read_text(encoding="utf-8").replace("not performed", "done"),
+            encoding="utf-8",
+        )
+
+        code, _ = self._decide(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_missing_local_agentic_spec_md(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        self._local_spec_path(plan_id).unlink()
+
+        code, _ = self._decide(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_local_agentic_spec_not_requirements_extraction_scaffold_non_authority(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        local_spec = self._local_spec_path(plan_id)
+        local_spec.write_text(
+            local_spec.read_text(encoding="utf-8").replace(
+                "REQUIREMENTS_EXTRACTION_SCAFFOLD_NON_AUTHORITY",
+                "APPROVED",
+            ),
+            encoding="utf-8",
+        )
+
+        code, _ = self._decide(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_local_agentic_spec_containing_actual_requirements(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        local_spec = self._local_spec_path(plan_id)
+        local_spec.write_text(
+            local_spec.read_text(encoding="utf-8")
+            + "\n## Functional Requirements\n\nThe system shall handle login.\n",
+            encoding="utf-8",
+        )
+
+        code, _ = self._decide(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_local_agentic_spec_containing_requirement_id_pattern(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        local_spec = self._local_spec_path(plan_id)
+        local_spec.write_text(
+            local_spec.read_text(encoding="utf-8")
+            + "\nREQ-001: placeholder requirement.\n",
+            encoding="utf-8",
+        )
+
+        code, _ = self._decide(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_local_agentic_spec_containing_user_stories(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        local_spec = self._local_spec_path(plan_id)
+        local_spec.write_text(
+            local_spec.read_text(encoding="utf-8")
+            + "\n## User Stories\n\nAs a user I want to play.\n",
+            encoding="utf-8",
+        )
+
+        code, _ = self._decide(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_local_agentic_spec_containing_acceptance_criteria(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        local_spec = self._local_spec_path(plan_id)
+        local_spec.write_text(
+            local_spec.read_text(encoding="utf-8")
+            + "\n## Acceptance Criteria\n\nGiven a player When they join Then game starts.\n",
+            encoding="utf-8",
+        )
+
+        code, _ = self._decide(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_local_agentic_spec_containing_architecture_decision_language(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        local_spec = self._local_spec_path(plan_id)
+        local_spec.write_text(
+            local_spec.read_text(encoding="utf-8")
+            + "\nSelected backend: Node.js with WebSockets.\n",
+            encoding="utf-8",
+        )
+
+        code, _ = self._decide(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_local_agentic_spec_containing_implementation_tasks(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        local_spec = self._local_spec_path(plan_id)
+        local_spec.write_text(
+            local_spec.read_text(encoding="utf-8")
+            + "\n## Implementation Tasks\n\n- Task 1: build lobby.\n",
+            encoding="utf-8",
+        )
+
+        code, _ = self._decide(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_local_agentic_spec_containing_planning_run_slice_content(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        local_spec = self._local_spec_path(plan_id)
+        local_spec.write_text(
+            local_spec.read_text(encoding="utf-8")
+            + "\n## PLANNING_RUN_SLICE\n\nslice-id: demo-slice\n",
+            encoding="utf-8",
+        )
+
+        code, _ = self._decide(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_latest_readiness_request_more_clarification(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v2",
+            "REQUEST_MORE_CLARIFICATION",
+            "Need more detail on multiplayer scope.",
+        )
+
+        code, _ = self._decide(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_latest_readiness_block_intake(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v2",
+            "BLOCK_INTAKE",
+            "Scope too broad; stop intake.",
+        )
+
+        code, _ = self._decide(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_invalid_requirements_extraction_decision_value(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+
+        with self.assertRaises(ValueError) as ctx:
+            create_requirements_extraction_owner_decision(
+                self.project,
+                intake_id,
+                plan_id,
+                "req-ext-owner-v1",
+                "APPROVE_REQUIREMENTS",
+                "Not allowed.",
+            )
+        self.assertIn("unsupported decision value", str(ctx.exception))
+
+    def test_refuses_invalid_decision_id(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        invalid_ids = ("", " ", "../escape", "bad id", ".hidden")
+
+        for decision_id in invalid_ids:
+            with self.subTest(decision_id=decision_id):
+                with self.assertRaises(ValueError):
+                    create_requirements_extraction_owner_decision(
+                        self.project,
+                        intake_id,
+                        plan_id,
+                        decision_id,
+                        "BLOCK_REQUIREMENTS_EXTRACTION",
+                        "Stop.",
+                    )
+                self.assertFalse(
+                    self._requirements_extraction_decision_path(
+                        intake_id,
+                        plan_id,
+                        decision_id,
+                    ).exists()
+                )
+
+    def test_refuses_path_escape_decision_id(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        before = self._project_files()
+
+        with self.assertRaises(ValueError):
+            create_requirements_extraction_owner_decision(
+                self.project,
+                intake_id,
+                plan_id,
+                "../escape",
+                "BLOCK_REQUIREMENTS_EXTRACTION",
+                "Escape attempt.",
+            )
+        self.assertEqual(before, self._project_files())
+
+    def test_refuses_path_escape_intake_id(self) -> None:
+        self._setup_ready_for_decision()
+        before = self._project_files()
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "decide-requirements-extraction",
+                    "../escape",
+                    str(self.project),
+                    "--plan-id",
+                    "slither-plan-v1",
+                    "--decision",
+                    "BLOCK_REQUIREMENTS_EXTRACTION",
+                    "--decision-id",
+                    "req-ext-owner-v1",
+                    "--summary",
+                    "Escape attempt.",
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("invalid intake id", buf.getvalue())
+        self.assertEqual(before, self._project_files())
+
+    def test_refuses_invalid_plan_id(self) -> None:
+        self._setup_ready_for_decision()
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "decide-requirements-extraction",
+                    "slither-demo",
+                    str(self.project),
+                    "--plan-id",
+                    "../escape",
+                    "--decision",
+                    "AUTHORIZE_REQUIREMENTS_EXTRACTION",
+                    "--decision-id",
+                    "req-ext-owner-v1",
+                    "--summary",
+                    "Authorize.",
+                ]
+            )
+        self.assertEqual(code, 1)
+
+    def test_preserves_goal_intake_byte_for_byte(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        artifact_path = self._artifact_path(intake_id)
+        original = artifact_path.read_bytes()
+
+        self._record_decision(intake_id, plan_id)
+
+        self.assertEqual(original, artifact_path.read_bytes())
+
+    def test_preserves_clarification_artifacts_byte_for_byte(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        clarification_path = self._clarification_path(intake_id, "scope-v1")
+        original = clarification_path.read_bytes()
+
+        self._record_decision(intake_id, plan_id)
+
+        self.assertEqual(original, clarification_path.read_bytes())
+
+    def test_preserves_readiness_decision_artifacts_byte_for_byte(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        decision_path = self._readiness_decision_path(intake_id, "owner-v1")
+        original = decision_path.read_bytes()
+
+        self._record_decision(intake_id, plan_id)
+
+        self.assertEqual(original, decision_path.read_bytes())
+
+    def test_preserves_orchestrator_provenance_byte_for_byte(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+        provenance_path = self._provenance_path(plan_id)
+        original = provenance_path.read_bytes()
+
+        self._record_decision(plan_id=plan_id)
+
+        self.assertEqual(original, provenance_path.read_bytes())
+
+    def test_preserves_context_transport_json_byte_for_byte(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+        transport_path = self._transport_json_path(plan_id)
+        original = transport_path.read_bytes()
+
+        self._record_decision(plan_id=plan_id)
+
+        self.assertEqual(original, transport_path.read_bytes())
+
+    def test_preserves_context_transport_markdown_byte_for_byte(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+        transport_path = self._transport_md_path(plan_id)
+        original = transport_path.read_bytes()
+
+        self._record_decision(plan_id=plan_id)
+
+        self.assertEqual(original, transport_path.read_bytes())
+
+    def test_preserves_context_pack_draft_provenance_byte_for_byte(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+        provenance_path = self._draft_provenance_path(plan_id)
+        original = provenance_path.read_bytes()
+
+        self._record_decision(plan_id=plan_id)
+
+        self.assertEqual(original, provenance_path.read_bytes())
+
+    def test_preserves_local_agentic_spec_scaffold_provenance_byte_for_byte(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+        provenance_path = self._scaffold_provenance_path(plan_id)
+        original = provenance_path.read_bytes()
+
+        self._record_decision(plan_id=plan_id)
+
+        self.assertEqual(original, provenance_path.read_bytes())
+
+    def test_preserves_requirements_extraction_scaffold_provenance_byte_for_byte(
+        self,
+    ) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+        provenance_path = self._requirements_scaffold_provenance_path(plan_id)
+        original = provenance_path.read_bytes()
+
+        self._record_decision(plan_id=plan_id)
+
+        self.assertEqual(original, provenance_path.read_bytes())
+
+    def test_preserves_context_pack_md_byte_for_byte(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+        context_pack_path = self._context_pack_path(plan_id)
+        original = context_pack_path.read_bytes()
+
+        self._record_decision(plan_id=plan_id)
+
+        self.assertEqual(original, context_pack_path.read_bytes())
+
+    def test_preserves_local_agentic_spec_md_byte_for_byte(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+        local_spec_path = self._local_spec_path(plan_id)
+        original = local_spec_path.read_bytes()
+
+        self._record_decision(plan_id=plan_id)
+
+        self.assertEqual(original, local_spec_path.read_bytes())
+
+    def test_preserves_implementation_plan_md_byte_for_byte(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+        plan_path = self._implementation_plan_path(plan_id)
+        original = plan_path.read_bytes()
+
+        self._record_decision(plan_id=plan_id)
+
+        self.assertEqual(original, plan_path.read_bytes())
+
+    def test_preserves_planning_audit_md_byte_for_byte(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+        audit_path = self._planning_audit_path(plan_id)
+        original = audit_path.read_bytes()
+
+        self._record_decision(plan_id=plan_id)
+
+        self.assertEqual(original, audit_path.read_bytes())
+
+    def test_does_not_change_planning_workspace_status(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+        manifest_path = self._workspace(plan_id) / "manifest.json"
+        before = manifest_path.read_bytes()
+
+        self._record_decision(plan_id=plan_id)
+
+        self.assertEqual(before, manifest_path.read_bytes())
+
+    def test_does_not_extract_requirements(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+        self._record_decision(plan_id=plan_id)
+
+        spec = self._local_spec_path(plan_id).read_text(encoding="utf-8")
+        self.assertIn("NO_REQUIREMENTS_EXTRACTED", spec)
+        self.assertNotIn("The system shall", spec)
+
+    def test_does_not_generate_requirement_ids(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+        self._record_decision(plan_id=plan_id)
+
+        combined = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in self.project.rglob("*")
+            if path.is_file() and path.suffix in {".md", ".json"}
+        )
+        self.assertNotIn("REQ-001", combined)
+        self.assertNotIn("FR-", combined)
+
+    def test_does_not_generate_user_stories(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+        self._record_decision(plan_id=plan_id)
+
+        spec = self._local_spec_path(plan_id).read_text(encoding="utf-8")
+        self.assertNotIn("As a user", spec)
+
+    def test_does_not_generate_acceptance_criteria(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+        self._record_decision(plan_id=plan_id)
+
+        spec = self._local_spec_path(plan_id).read_text(encoding="utf-8")
+        self.assertNotIn("Given a", spec)
+
+    def test_does_not_generate_architecture_choices(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+        self._record_decision(plan_id=plan_id)
+
+        spec = self._local_spec_path(plan_id).read_text(encoding="utf-8").lower()
+        self.assertNotIn("selected backend", spec)
+
+    def test_does_not_generate_implementation_tasks(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+        self._record_decision(plan_id=plan_id)
+
+        spec = self._local_spec_path(plan_id).read_text(encoding="utf-8")
+        self.assertNotIn("allowed_paths", spec)
+
+    def test_does_not_generate_planning_run_slice(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+        self._record_decision(plan_id=plan_id)
+
+        implementation_plan = self._implementation_plan_path(plan_id).read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"artifact_type": "PLANNING_RUN_SLICE"', implementation_plan)
+        self.assertIn("PLACEHOLDER-slice-id", implementation_plan)
+
+    def test_does_not_create_runner_proposals(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+        workspace = self.project / ".agent-os"
+        before = list((workspace / "runs").iterdir())
+
+        self._record_decision(plan_id=plan_id)
+
+        after = list((workspace / "runs").iterdir())
+        self.assertEqual(before, after)
+
+    def test_does_not_create_runs(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+        workspace = self.project / ".agent-os"
+        before_runs = list((workspace / "runs").iterdir())
+
+        self._record_decision(plan_id=plan_id)
+
+        after_runs = list((workspace / "runs").iterdir())
+        self.assertEqual(before_runs, after_runs)
+
+    def test_does_not_invoke_external_subprocess(self) -> None:
+        self._setup_ready_for_decision()
+        with patch("subprocess.run", side_effect=AssertionError("subprocess invoked")):
+            code = main(
+                [
+                    "orchestrator",
+                    "decide-requirements-extraction",
+                    "slither-demo",
+                    str(self.project),
+                    "--plan-id",
+                    "slither-plan-v1",
+                    "--decision",
+                    "AUTHORIZE_REQUIREMENTS_EXTRACTION",
+                    "--decision-id",
+                    "req-ext-owner-v1",
+                    "--summary",
+                    "Authorize future extraction only.",
+                ]
+            )
+        self.assertEqual(code, 0)
+
+    def test_does_not_call_planning_progress_transition_decide(self) -> None:
+        self._setup_ready_for_decision()
+        with (
+            patch.object(planning_module, "progress_planning_workspace") as progress,
+            patch.object(planning_module, "transition_planning_workspace") as transition,
+            patch.object(planning_module, "record_planning_owner_decision") as decide,
+        ):
+            self._record_decision()
+        progress.assert_not_called()
+        transition.assert_not_called()
+        decide.assert_not_called()
+
+    def test_does_not_validate_or_approve_workspace(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+        before = validate_planning_workspace(self.project, plan_id)
+
+        self._record_decision(plan_id=plan_id)
+
+        after = validate_planning_workspace(self.project, plan_id)
+        self.assertFalse(before.valid)
+        self.assertFalse(after.valid)
+        self.assertEqual(before.output, after.output)
+
+    def test_does_not_approve_requirements(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+        self._record_decision(plan_id=plan_id)
+
+        artifact = load_requirements_extraction_owner_decision(
+            self.project,
+            "slither-demo",
+            plan_id,
+            "req-ext-owner-v1",
+        )
+        self.assertTrue(artifact["non_authority"]["does_not_approve_requirements"])
+        combined = json.dumps(artifact).lower()
+        self.assertNotIn("requirements approved", combined)
+
+    def test_failure_path_does_not_create_partial_decision_artifact(self) -> None:
+        from agent_os import orchestrator as orchestrator_module
+
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        decision_id = "req-ext-owner-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        dest = self._requirements_extraction_decision_path(
+            intake_id,
+            plan_id,
+            decision_id,
+        )
+        original_write_json = orchestrator_module._write_json
+
+        def failing_write(path: Path, data: dict) -> None:
+            if path == dest:
+                raise OSError("simulated decision write failure")
+            original_write_json(path, data)
+
+        with patch.object(orchestrator_module, "_write_json", failing_write):
+            with self.assertRaises(OSError) as ctx:
+                create_requirements_extraction_owner_decision(
+                    self.project,
+                    intake_id,
+                    plan_id,
+                    decision_id,
+                    "AUTHORIZE_REQUIREMENTS_EXTRACTION",
+                    "Authorize future extraction only.",
+                )
+            self.assertIn("simulated decision write failure", str(ctx.exception))
+        self.assertFalse(dest.exists())
+
+    def test_failure_path_preserves_source_evidence_and_planning_artifacts(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        path = self._implementation_plan_path(plan_id)
+        path.write_text(
+            path.read_text(encoding="utf-8") + "\nmodified\n",
+            encoding="utf-8",
+        )
+
+        before_artifacts = self._tracked_artifact_paths(intake_id, plan_id)
+        before_files = self._project_files()
+        manifest_path = self._workspace(plan_id) / "manifest.json"
+        manifest_bytes = manifest_path.read_bytes()
+        workspace = self.project / ".agent-os"
+        before_runs = list((workspace / "runs").iterdir())
+
+        with (
+            patch("subprocess.run", side_effect=AssertionError("subprocess invoked")),
+            patch.object(
+                planning_module,
+                "progress_planning_workspace",
+                side_effect=AssertionError("progress invoked"),
+            ),
+            patch.object(
+                planning_module,
+                "transition_planning_workspace",
+                side_effect=AssertionError("transition invoked"),
+            ),
+            patch.object(
+                planning_module,
+                "record_planning_owner_decision",
+                side_effect=AssertionError("decide invoked"),
+            ),
+        ):
+            code, _ = self._decide(intake_id, plan_id)
+
+        self.assertEqual(code, 1)
+        self.assertFalse(
+            self._requirements_extraction_decision_path(
+                intake_id,
+                plan_id,
+                "req-ext-owner-v1",
+            ).exists()
+        )
+        self.assertEqual(before_artifacts, self._tracked_artifact_paths(intake_id, plan_id))
+        self.assertEqual(before_files, self._project_files())
+        self.assertEqual(manifest_bytes, manifest_path.read_bytes())
+        self.assertEqual(before_runs, list((workspace / "runs").iterdir()))
+
+    def test_cli_help_states_owner_decision_boundaries(self) -> None:
+        parser = build_parser()
+        orchestrator_parser = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+            and "orchestrator" in action.choices
+        )
+        orchestrator_sub = next(
+            action
+            for action in orchestrator_parser.choices["orchestrator"]._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        help_text = orchestrator_sub.choices[
+            "decide-requirements-extraction"
+        ].format_help()
+        compact = re.sub(r"\s+", " ", help_text)
+        self.assertIn("owner-provided", compact.lower())
+        self.assertIn("extract or infer requirements", compact.lower())
+        self.assertIn("approve requirements", compact.lower())
+        self.assertIn("architecture", compact.lower())
+        self.assertIn("implementation plan", compact.lower())
+        self.assertIn("PLANNING_RUN_SLICE", compact)
+        self.assertIn("validate", compact.lower())
+        self.assertIn("executor", compact.lower())
+
+    def test_cli_output_includes_decision_path_status_and_boundary_notes(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+        code, output = self._decide(plan_id=plan_id)
+        self.assertEqual(code, 0)
+        self.assertIn("created requirements extraction owner decision artifact:", output)
+        self.assertIn("artifact_type: REQUIREMENTS_EXTRACTION_OWNER_DECISION", output)
+        self.assertIn(
+            "decision: AUTHORIZE_REQUIREMENTS_EXTRACTION",
+            output,
+        )
+        self.assertIn("planning_workspace_status: DRAFT", output)
+        self.assertIn("no requirements extraction", output.lower())
+        self.assertIn("no requirements approval", output.lower())
+
+    def test_cli_output_for_authorize_states_authorization_is_not_extraction(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+        code, output = self._decide(
+            plan_id=plan_id,
+            decision="AUTHORIZE_REQUIREMENTS_EXTRACTION",
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("authorization is not extraction", output.lower())
+
+    def test_existing_commands_unchanged(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(intake_id, plan_id)
+        before = self._project_files()
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            draft_preflight_code = main(
+                [
+                    "orchestrator",
+                    "draft-preflight",
+                    intake_id,
+                    str(self.project),
+                ]
+            )
+            req_preflight_code = main(
+                [
+                    "orchestrator",
+                    "requirements-extraction-preflight",
+                    intake_id,
+                    str(self.project),
+                    "--plan-id",
+                    plan_id,
+                ]
+            )
+            scaffold_code = main(
+                [
+                    "orchestrator",
+                    "scaffold-requirements-extraction",
+                    intake_id,
+                    str(self.project),
+                    "--plan-id",
+                    plan_id,
+                ]
+            )
+        self.assertEqual(draft_preflight_code, 0)
+        self.assertEqual(req_preflight_code, 1)
+        self.assertEqual(scaffold_code, 1)
+        self.assertIn("requirements extraction preflight", buf.getvalue().lower())
+        self.assertEqual(before, self._project_files())
+
+    def test_decision_not_confusable_with_extraction_approval_architecture_or_runner(
+        self,
+    ) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+        code, output = self._decide(plan_id=plan_id)
+        self.assertEqual(code, 0)
+        self.assertIn("no requirements extraction", output.lower())
+        self.assertIn("no requirements approval", output.lower())
+        self.assertIn("no architecture decision", output.lower())
+        self.assertIn("no implementation plan", output.lower())
+        self.assertIn("no executor invocation", output.lower())
+
+        artifact = load_requirements_extraction_owner_decision(
+            self.project,
+            "slither-demo",
+            plan_id,
+            "req-ext-owner-v1",
+        )
+        self.assertEqual(
+            artifact["artifact_type"],
+            "REQUIREMENTS_EXTRACTION_OWNER_DECISION",
+        )
+        self.assertTrue(artifact["non_authority"]["authorization_is_not_extraction"])
+        validation = validate_planning_workspace(self.project, plan_id)
+        self.assertFalse(validation.valid)
+
+    def test_no_artifact_claims_requirements_approval(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_decision(plan_id=plan_id)
+        self._record_decision(plan_id=plan_id)
+
+        decision_text = (
+            self._requirements_extraction_decision_path(
+                "slither-demo",
+                plan_id,
+                "req-ext-owner-v1",
+            )
+            .read_text(encoding="utf-8")
+            .lower()
+        )
+        spec = self._local_spec_path(plan_id).read_text(encoding="utf-8").lower()
+        provenance = (
+            self._requirements_scaffold_provenance_path(plan_id)
+            .read_text(encoding="utf-8")
+            .lower()
+        )
+        self.assertNotIn("requirements approved", decision_text)
+        self.assertNotIn("requirements approved", spec)
+        self.assertNotIn("requirements approved", provenance)
+        self.assertIn("does_not_approve_requirements", decision_text)
+
 
 
 class OrchestratorDocsGuardTests(unittest.TestCase):

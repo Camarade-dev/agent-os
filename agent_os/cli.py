@@ -9,9 +9,11 @@ from pathlib import Path
 from agent_os import __version__
 from agent_os.orchestrator import (
     OWNER_READINESS_DECISION_VALUES,
+    REQUIREMENTS_EXTRACTION_OWNER_DECISION_VALUES,
     create_goal_intake,
     create_owner_clarification,
     create_owner_readiness_decision,
+    create_requirements_extraction_owner_decision,
     draft_context_pack_from_transport,
     goal_intake_status,
     preflight_draft_preparation,
@@ -463,6 +465,24 @@ def cmd_orchestrator_scaffold_requirements_extraction(args: argparse.Namespace) 
             project,
             args.intake_id,
             args.plan_id,
+        )
+    except (FileNotFoundError, FileExistsError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(report.output)
+    return 0
+
+
+def cmd_orchestrator_decide_requirements_extraction(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        report = create_requirements_extraction_owner_decision(
+            project,
+            args.intake_id,
+            args.plan_id,
+            args.decision_id,
+            args.decision,
+            args.summary,
         )
     except (FileNotFoundError, FileExistsError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
@@ -1148,6 +1168,54 @@ def build_parser() -> argparse.ArgumentParser:
     )
     orchestrator_scaffold_requirements_extraction_parser.set_defaults(
         func=cmd_orchestrator_scaffold_requirements_extraction
+    )
+
+    orchestrator_decide_requirements_extraction_parser = orchestrator_sub.add_parser(
+        "decide-requirements-extraction",
+        help="record owner requirements-extraction decision only (no extraction)",
+        description=(
+            "Record an owner-provided requirements extraction decision for an existing "
+            "GOAL_INTAKE and DRAFT planning workspace after a coherent "
+            "requirements-extraction scaffold exists. Does not call an LLM, extract or "
+            "infer requirements, generate requirements content, approve requirements, "
+            "generate user stories or acceptance criteria, generate architecture "
+            "decisions, generate an implementation plan, generate PLANNING_RUN_SLICE, "
+            "validate or approve the workspace, transition status, create runner "
+            "proposals, create runs, or invoke an executor."
+        ),
+    )
+    orchestrator_decide_requirements_extraction_parser.add_argument(
+        "intake_id",
+        help="intake identifier (filesystem-safe slug)",
+    )
+    orchestrator_decide_requirements_extraction_parser.add_argument(
+        "path",
+        nargs="?",
+        help="target project directory",
+    )
+    orchestrator_decide_requirements_extraction_parser.add_argument(
+        "--plan-id",
+        required=True,
+        help="planning workspace identifier (filesystem-safe slug)",
+    )
+    orchestrator_decide_requirements_extraction_parser.add_argument(
+        "--decision",
+        required=True,
+        choices=sorted(REQUIREMENTS_EXTRACTION_OWNER_DECISION_VALUES),
+        help="owner requirements extraction decision value",
+    )
+    orchestrator_decide_requirements_extraction_parser.add_argument(
+        "--decision-id",
+        required=True,
+        help="filesystem-safe decision identifier (append-only; must not exist)",
+    )
+    orchestrator_decide_requirements_extraction_parser.add_argument(
+        "--summary",
+        required=True,
+        help="owner summary preserved verbatim in the decision artifact",
+    )
+    orchestrator_decide_requirements_extraction_parser.set_defaults(
+        func=cmd_orchestrator_decide_requirements_extraction
     )
 
     return parser
