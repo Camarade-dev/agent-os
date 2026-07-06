@@ -14,6 +14,7 @@ from agent_os.orchestrator import (
     create_owner_clarification,
     create_owner_readiness_decision,
     create_requirements_extraction_owner_decision,
+    check_requirements_extraction_execution_authorization,
     draft_context_pack_from_transport,
     goal_intake_status,
     preflight_draft_preparation,
@@ -489,6 +490,27 @@ def cmd_orchestrator_decide_requirements_extraction(args: argparse.Namespace) ->
         return 1
     print(report.output)
     return 0
+
+
+def cmd_orchestrator_requirements_extraction_execution_check(
+    args: argparse.Namespace,
+) -> int:
+    project = _project_path(args.path)
+    try:
+        report = check_requirements_extraction_execution_authorization(
+            project,
+            args.intake_id,
+            args.plan_id,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(report.output)
+    confirmed = (
+        report.check_state
+        == "REQUIREMENTS_EXTRACTION_EXECUTION_CHECK_CONFIRMED_NO_EXTRACTION_PERFORMED"
+    )
+    return 0 if confirmed else 1
 
 
 def cmd_orchestrator_clarify(args: argparse.Namespace) -> int:
@@ -1216,6 +1238,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     orchestrator_decide_requirements_extraction_parser.set_defaults(
         func=cmd_orchestrator_decide_requirements_extraction
+    )
+
+    orchestrator_requirements_extraction_execution_check_parser = (
+        orchestrator_sub.add_parser(
+            "requirements-extraction-execution-check",
+            help=(
+                "read-only requirements extraction pre-execution check "
+                "(no extraction)"
+            ),
+            description=(
+                "Read-only pre-execution check proving latest plan-scoped "
+                "AUTHORIZE_REQUIREMENTS_EXTRACTION, coherent requirements-extraction "
+                "scaffold/provenance, and DRAFT workspace gates before any future "
+                "requirements extraction command. Does not call an LLM, extract or "
+                "infer requirements, approve requirements, generate architecture, "
+                "generate implementation plan, validate or approve the workspace, "
+                "create runner proposals, create runs, or invoke an executor."
+            ),
+        )
+    )
+    orchestrator_requirements_extraction_execution_check_parser.add_argument(
+        "intake_id",
+        help="intake identifier (filesystem-safe slug)",
+    )
+    orchestrator_requirements_extraction_execution_check_parser.add_argument(
+        "path",
+        nargs="?",
+        help="target project directory",
+    )
+    orchestrator_requirements_extraction_execution_check_parser.add_argument(
+        "--plan-id",
+        required=True,
+        help="planning workspace identifier (filesystem-safe slug)",
+    )
+    orchestrator_requirements_extraction_execution_check_parser.set_defaults(
+        func=cmd_orchestrator_requirements_extraction_execution_check
     )
 
     return parser

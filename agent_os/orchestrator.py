@@ -458,6 +458,44 @@ REQUIREMENTS_EXTRACTION_OWNER_DECISION_NON_AUTHORITY_FLAGS = (
     "requires_future_owner_approval",
 )
 
+REQUIREMENTS_EXTRACTION_EXECUTION_CHECK_CONFIRMED_STATE = (
+    "REQUIREMENTS_EXTRACTION_EXECUTION_CHECK_CONFIRMED_NO_EXTRACTION_PERFORMED"
+)
+REQUIREMENTS_EXTRACTION_EXECUTION_CHECK_CONFIRMED_NEXT_ACTION = (
+    "FUTURE_REQUIREMENTS_EXTRACTION_COMMAND_MAY_BE_RUN_SEPARATELY"
+)
+
+REQUIREMENTS_EXTRACTION_EXECUTION_CHECK_NON_AUTHORITY_FLAGS = (
+    "does_not_extract_requirements",
+    "does_not_infer_requirements",
+    "does_not_generate_requirements_content",
+    "does_not_generate_requirement_ids",
+    "does_not_generate_user_stories",
+    "does_not_generate_acceptance_criteria",
+    "does_not_generate_architecture",
+    "does_not_choose_stack",
+    "does_not_choose_database",
+    "does_not_choose_networking",
+    "does_not_generate_implementation_plan",
+    "does_not_generate_planning_run_slice",
+    "does_not_validate_planning_workspace",
+    "does_not_approve_requirements",
+    "does_not_approve_plan",
+    "does_not_transition_workspace",
+    "does_not_create_runner_proposal",
+    "does_not_create_run",
+    "does_not_invoke_executor",
+    "pre_execution_check_only",
+    "authorization_check_is_not_extraction",
+    "latest_owner_authorization_required",
+    "future_requirements_extraction_requires_separate_command",
+    "future_requirements_validation_requires_separate_command",
+    "future_architecture_decision_requires_separate_command",
+    "future_implementation_plan_requires_separate_command",
+    "requires_future_independent_validation",
+    "requires_future_owner_approval",
+)
+
 REQUIREMENTS_EXTRACTION_SCAFFOLD_REQUIRED_BOUNDARY_CHECKS: tuple[tuple[str, ...], ...] = (
     ("requirements extraction", "not performed"),
     ("architecture", "undecided"),
@@ -3472,6 +3510,10 @@ def _local_agentic_spec_contains_only_requirements_extraction_scaffold_sections(
 ) -> bool:
     if "NO_REQUIREMENTS_EXTRACTED" not in content:
         return False
+    if "NOT_GENERATED" not in content:
+        return False
+    if "UNDECIDED_NOT_GENERATED" not in content:
+        return False
     if _FUNCTIONAL_REQUIREMENT_ID_PATTERN.search(content):
         return False
     if _REQUIREMENT_ID_PATTERN.search(content):
@@ -6473,6 +6515,964 @@ def validate_requirements_extraction_owner_decision(
         output="\n".join(output_lines),
         valid=not errors,
         errors=tuple(errors),
+    )
+
+
+def _validate_requirements_extraction_owner_decision_coherence(
+    artifact: dict,
+    *,
+    scaffold_provenance: dict,
+    scaffold_provenance_path: Path,
+) -> str | None:
+    """Return a blocking reason when an owner decision references stale scaffold metadata."""
+    expected_path = str(scaffold_provenance_path)
+    artifact_path = artifact.get("source_requirements_extraction_scaffold_provenance_path")
+    if artifact_path != expected_path:
+        return (
+            "requirements extraction owner decision references stale scaffold "
+            f"provenance path: expected {expected_path!r}, found {artifact_path!r}"
+        )
+
+    expected_status = REQUIREMENTS_EXTRACTION_SCAFFOLD_STATUS
+    artifact_status = artifact.get("source_requirements_extraction_scaffold_status")
+    if artifact_status != expected_status:
+        return (
+            "requirements extraction owner decision references stale scaffold "
+            f"status: expected {expected_status!r}, found {artifact_status!r}"
+        )
+
+    expected_created_at = scaffold_provenance.get("created_at")
+    artifact_created_at = artifact.get("source_requirements_extraction_scaffold_created_at")
+    if artifact_created_at != expected_created_at:
+        return (
+            "requirements extraction owner decision references stale scaffold "
+            f"created_at: expected {expected_created_at!r}, found {artifact_created_at!r}"
+        )
+
+    if (
+        artifact.get("source_requirements_extraction_preflight_state")
+        != REQUIREMENTS_EXTRACTION_PREFLIGHT_CONFIRMED_STATE
+    ):
+        return (
+            "requirements extraction owner decision references stale preflight state: "
+            f"expected {REQUIREMENTS_EXTRACTION_PREFLIGHT_CONFIRMED_STATE!r}, "
+            f"found {artifact.get('source_requirements_extraction_preflight_state')!r}"
+        )
+
+    if (
+        artifact.get("source_requirements_extraction_preflight_next_action")
+        != REQUIREMENTS_EXTRACTION_PREFLIGHT_CONFIRMED_NEXT_ACTION
+    ):
+        return (
+            "requirements extraction owner decision references stale preflight next action: "
+            f"expected {REQUIREMENTS_EXTRACTION_PREFLIGHT_CONFIRMED_NEXT_ACTION!r}, "
+            f"found {artifact.get('source_requirements_extraction_preflight_next_action')!r}"
+        )
+
+    if artifact.get("planning_workspace_status_at_decision") != "DRAFT":
+        return (
+            "requirements extraction owner decision planning_workspace_status_at_decision "
+            f"is not DRAFT: found {artifact.get('planning_workspace_status_at_decision')!r}"
+        )
+
+    return None
+
+
+def _load_validated_requirements_extraction_owner_decisions(
+    project: Path,
+    intake_id: str,
+    plan_id: str,
+) -> tuple[tuple[RequirementsExtractionOwnerDecisionRecord, ...], list[str]]:
+    """Load and validate all plan-scoped requirements-extraction owner decisions."""
+    decisions_dir = (
+        orchestrator_intake_path(project, intake_id)
+        / REQUIREMENTS_EXTRACTION_DECISIONS_DIR
+        / plan_id
+    )
+    if not decisions_dir.is_dir():
+        return (), []
+
+    records: list[RequirementsExtractionOwnerDecisionRecord] = []
+    errors: list[str] = []
+    for path in sorted(decisions_dir.glob("*.json")):
+        decision_id = path.stem
+        try:
+            artifact = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            errors.append(f"malformed decision artifact {decision_id}: {exc.msg}")
+            continue
+        if not isinstance(artifact, dict):
+            errors.append(
+                f"malformed decision artifact {decision_id}: expected object"
+            )
+            continue
+        payload_errors = _validate_requirements_extraction_owner_decision_payload(
+            artifact,
+            intake_id,
+            plan_id,
+            decision_id,
+        )
+        if payload_errors:
+            errors.extend(
+                f"decision artifact {decision_id}: {error}" for error in payload_errors
+            )
+            continue
+        records.append(
+            RequirementsExtractionOwnerDecisionRecord(
+                decision_id=decision_id,
+                decision=artifact["decision"],
+                created_at=artifact["created_at"],
+                path=path,
+            )
+        )
+
+    records.sort(key=lambda record: (record.created_at, record.decision_id))
+    return tuple(records), errors
+
+
+def _format_requirements_extraction_execution_check(
+    *,
+    plan_id: str,
+    intake_id: str,
+    planning_workspace_status: str | None,
+    local_agentic_spec_status: str | None,
+    local_agentic_spec_path: Path | None,
+    requirements_extraction_scaffold_provenance_path: Path | None,
+    latest_requirements_extraction_decision_id: str | None,
+    latest_requirements_extraction_decision: str | None,
+    latest_requirements_extraction_decision_created_at: str | None,
+    latest_requirements_extraction_decision_path: Path | None,
+    latest_readiness_decision_id: str | None,
+    latest_readiness_decision: str | None,
+    source_requirements_extraction_preflight_state: str | None,
+    source_requirements_extraction_preflight_next_action: str | None,
+    check_state: str,
+    next_required_action: str,
+    blocking_reasons: list[str],
+    checked_at: str,
+    non_authority: dict[str, bool],
+) -> str:
+    lines = [
+        "requirements extraction execution check",
+        f"plan_id: {plan_id}",
+        f"intake_id: {intake_id}",
+    ]
+    if planning_workspace_status is not None:
+        lines.append(f"planning_workspace_status: {planning_workspace_status}")
+    if local_agentic_spec_status is not None:
+        lines.append(f"local_agentic_spec_status: {local_agentic_spec_status}")
+    if local_agentic_spec_path is not None:
+        lines.append(f"local_agentic_spec_path: {local_agentic_spec_path}")
+    if requirements_extraction_scaffold_provenance_path is not None:
+        lines.append(
+            "requirements_extraction_scaffold_provenance_path: "
+            f"{requirements_extraction_scaffold_provenance_path}"
+        )
+    if latest_requirements_extraction_decision_id is not None:
+        lines.append(
+            "latest_requirements_extraction_decision_id: "
+            f"{latest_requirements_extraction_decision_id}"
+        )
+    if latest_requirements_extraction_decision is not None:
+        lines.append(
+            "latest_requirements_extraction_decision: "
+            f"{latest_requirements_extraction_decision}"
+        )
+    if latest_requirements_extraction_decision_created_at is not None:
+        lines.append(
+            "latest_requirements_extraction_decision_created_at: "
+            f"{latest_requirements_extraction_decision_created_at}"
+        )
+    if latest_requirements_extraction_decision_path is not None:
+        lines.append(
+            "latest_requirements_extraction_decision_path: "
+            f"{latest_requirements_extraction_decision_path}"
+        )
+    if latest_readiness_decision_id is not None:
+        lines.append(f"latest_readiness_decision_id: {latest_readiness_decision_id}")
+    if latest_readiness_decision is not None:
+        lines.append(f"latest_readiness_decision: {latest_readiness_decision}")
+    if source_requirements_extraction_preflight_state is not None:
+        lines.append(
+            "source_requirements_extraction_preflight_state: "
+            f"{source_requirements_extraction_preflight_state}"
+        )
+    if source_requirements_extraction_preflight_next_action is not None:
+        lines.append(
+            "source_requirements_extraction_preflight_next_action: "
+            f"{source_requirements_extraction_preflight_next_action}"
+        )
+    lines.append(f"check_state: {check_state}")
+    lines.append(f"next_required_action: {next_required_action}")
+    lines.append(f"checked_at: {checked_at}")
+    if blocking_reasons:
+        lines.append("blocking_reasons:")
+        for reason in blocking_reasons:
+            lines.append(f"  - {reason}")
+    lines.append("non_authority:")
+    for flag in REQUIREMENTS_EXTRACTION_EXECUTION_CHECK_NON_AUTHORITY_FLAGS:
+        lines.append(f"  {flag}: true")
+    lines.append(
+        "note: requirements extraction execution check is read-only; "
+        "not requirements extraction, not requirements approval, "
+        "not architecture decision, not implementation planning, "
+        "not validation or approval, and no files were modified"
+    )
+    if check_state == REQUIREMENTS_EXTRACTION_EXECUTION_CHECK_CONFIRMED_STATE:
+        lines.append(
+            "note: execution check confirmed for a future requirements extraction "
+            "command only; no requirements were extracted or generated"
+        )
+        lines.append(
+            "note: successful check is not extraction, not requirements approval, "
+            "not architecture decision, not implementation plan, not workspace "
+            "validation or approval, and does not authorize runner or executor"
+        )
+    return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class RequirementsExtractionExecutionCheckReport:
+    output: str
+    check_state: str
+    next_required_action: str
+    plan_id: str
+    intake_id: str
+    planning_workspace_status: str | None
+    local_agentic_spec_status: str | None
+    local_agentic_spec_path: Path | None
+    requirements_extraction_scaffold_provenance_path: Path | None
+    latest_requirements_extraction_decision_id: str | None
+    latest_requirements_extraction_decision: str | None
+    latest_requirements_extraction_decision_created_at: str | None
+    latest_requirements_extraction_decision_path: Path | None
+    latest_readiness_decision_id: str | None
+    latest_readiness_decision: str | None
+    source_requirements_extraction_preflight_state: str | None
+    source_requirements_extraction_preflight_next_action: str | None
+    checked_at: str
+    blocking_reasons: tuple[str, ...]
+    non_authority: dict[str, bool]
+
+
+def _build_requirements_extraction_execution_check_report(
+    *,
+    plan_id: str,
+    intake_id: str,
+    planning_workspace_status: str | None = None,
+    local_agentic_spec_status: str | None = None,
+    local_agentic_spec_path: Path | None = None,
+    requirements_extraction_scaffold_provenance_path: Path | None = None,
+    latest_requirements_extraction_decision_id: str | None = None,
+    latest_requirements_extraction_decision: str | None = None,
+    latest_requirements_extraction_decision_created_at: str | None = None,
+    latest_requirements_extraction_decision_path: Path | None = None,
+    latest_readiness_decision_id: str | None = None,
+    latest_readiness_decision: str | None = None,
+    source_requirements_extraction_preflight_state: str | None = None,
+    source_requirements_extraction_preflight_next_action: str | None = None,
+    check_state: str,
+    next_required_action: str,
+    blocking_reasons: list[str],
+    checked_at: str,
+    non_authority: dict[str, bool],
+) -> RequirementsExtractionExecutionCheckReport:
+    output = _format_requirements_extraction_execution_check(
+        plan_id=plan_id,
+        intake_id=intake_id,
+        planning_workspace_status=planning_workspace_status,
+        local_agentic_spec_status=local_agentic_spec_status,
+        local_agentic_spec_path=local_agentic_spec_path,
+        requirements_extraction_scaffold_provenance_path=(
+            requirements_extraction_scaffold_provenance_path
+        ),
+        latest_requirements_extraction_decision_id=latest_requirements_extraction_decision_id,
+        latest_requirements_extraction_decision=latest_requirements_extraction_decision,
+        latest_requirements_extraction_decision_created_at=(
+            latest_requirements_extraction_decision_created_at
+        ),
+        latest_requirements_extraction_decision_path=(
+            latest_requirements_extraction_decision_path
+        ),
+        latest_readiness_decision_id=latest_readiness_decision_id,
+        latest_readiness_decision=latest_readiness_decision,
+        source_requirements_extraction_preflight_state=(
+            source_requirements_extraction_preflight_state
+        ),
+        source_requirements_extraction_preflight_next_action=(
+            source_requirements_extraction_preflight_next_action
+        ),
+        check_state=check_state,
+        next_required_action=next_required_action,
+        blocking_reasons=blocking_reasons,
+        checked_at=checked_at,
+        non_authority=non_authority,
+    )
+    return RequirementsExtractionExecutionCheckReport(
+        output=output,
+        check_state=check_state,
+        next_required_action=next_required_action,
+        plan_id=plan_id,
+        intake_id=intake_id,
+        planning_workspace_status=planning_workspace_status,
+        local_agentic_spec_status=local_agentic_spec_status,
+        local_agentic_spec_path=local_agentic_spec_path,
+        requirements_extraction_scaffold_provenance_path=(
+            requirements_extraction_scaffold_provenance_path
+        ),
+        latest_requirements_extraction_decision_id=latest_requirements_extraction_decision_id,
+        latest_requirements_extraction_decision=latest_requirements_extraction_decision,
+        latest_requirements_extraction_decision_created_at=(
+            latest_requirements_extraction_decision_created_at
+        ),
+        latest_requirements_extraction_decision_path=(
+            latest_requirements_extraction_decision_path
+        ),
+        latest_readiness_decision_id=latest_readiness_decision_id,
+        latest_readiness_decision=latest_readiness_decision,
+        source_requirements_extraction_preflight_state=(
+            source_requirements_extraction_preflight_state
+        ),
+        source_requirements_extraction_preflight_next_action=(
+            source_requirements_extraction_preflight_next_action
+        ),
+        checked_at=checked_at,
+        blocking_reasons=tuple(blocking_reasons),
+        non_authority=non_authority,
+    )
+
+
+def check_requirements_extraction_execution_authorization(
+    project: Path,
+    intake_id: str,
+    plan_id: str,
+) -> RequirementsExtractionExecutionCheckReport:
+    """Read-only pre-execution check for future requirements extraction authorization."""
+    validate_intake_id(intake_id)
+    validate_plan_id(plan_id)
+
+    checked_at = _utc_now()
+    non_authority = {
+        key: True for key in REQUIREMENTS_EXTRACTION_EXECUTION_CHECK_NON_AUTHORITY_FLAGS
+    }
+    workspace_dest = planning_path(project, plan_id)
+    local_agentic_spec_path = workspace_dest / "local-agentic-spec.md"
+    requirements_scaffold_provenance_path = (
+        workspace_dest
+        / "evidence"
+        / ORCHESTRATOR_REQUIREMENTS_EXTRACTION_SCAFFOLD_PROVENANCE_FILE
+    )
+    implementation_plan_path = workspace_dest / "implementation-plan.md"
+    planning_audit_path = workspace_dest / "planning-audit.md"
+
+    def _blocked(
+        state: str,
+        next_action: str,
+        *,
+        blocking_reasons: list[str] | None = None,
+        planning_workspace_status: str | None = None,
+        local_agentic_spec_status: str | None = None,
+        latest_requirements_extraction_decision_id: str | None = None,
+        latest_requirements_extraction_decision: str | None = None,
+        latest_requirements_extraction_decision_created_at: str | None = None,
+        latest_requirements_extraction_decision_path: Path | None = None,
+        latest_readiness_decision_id: str | None = None,
+        latest_readiness_decision: str | None = None,
+        source_requirements_extraction_preflight_state: str | None = None,
+        source_requirements_extraction_preflight_next_action: str | None = None,
+    ) -> RequirementsExtractionExecutionCheckReport:
+        return _build_requirements_extraction_execution_check_report(
+            plan_id=plan_id,
+            intake_id=intake_id,
+            planning_workspace_status=planning_workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            local_agentic_spec_path=local_agentic_spec_path,
+            requirements_extraction_scaffold_provenance_path=(
+                requirements_scaffold_provenance_path
+                if requirements_scaffold_provenance_path.is_file()
+                else None
+            ),
+            latest_requirements_extraction_decision_id=(
+                latest_requirements_extraction_decision_id
+            ),
+            latest_requirements_extraction_decision=latest_requirements_extraction_decision,
+            latest_requirements_extraction_decision_created_at=(
+                latest_requirements_extraction_decision_created_at
+            ),
+            latest_requirements_extraction_decision_path=(
+                latest_requirements_extraction_decision_path
+            ),
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=(
+                source_requirements_extraction_preflight_state
+            ),
+            source_requirements_extraction_preflight_next_action=(
+                source_requirements_extraction_preflight_next_action
+            ),
+            check_state=state,
+            next_required_action=next_action,
+            blocking_reasons=blocking_reasons or [],
+            checked_at=checked_at,
+            non_authority=non_authority,
+        )
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        return _blocked(
+            "BLOCKED_MISSING_WORKSPACE",
+            "FIX_PLANNING_WORKSPACE_STRUCTURE",
+            blocking_reasons=["no workspace found (run `agent-os init` first)"],
+        )
+
+    intake_path = _goal_intake_artifact_path(project, intake_id)
+    if not intake_path.is_file():
+        return _blocked(
+            "BLOCKED_INVALID_INTAKE",
+            "FIX_GOAL_INTAKE_STRUCTURE",
+            blocking_reasons=[f"goal intake artifact not found: {intake_id}"],
+        )
+
+    readiness_report = review_goal_intake_readiness(project, intake_id)
+    if not readiness_report.goal_intake_valid:
+        return _blocked(
+            "BLOCKED_INVALID_INTAKE",
+            "FIX_GOAL_INTAKE_STRUCTURE",
+            blocking_reasons=list(readiness_report.blocking_reasons),
+        )
+
+    if not workspace_dest.is_dir():
+        return _blocked(
+            "BLOCKED_MISSING_PLANNING_WORKSPACE",
+            "FIX_PLANNING_WORKSPACE_STRUCTURE",
+            blocking_reasons=[f"planning workspace not found: {plan_id}"],
+        )
+
+    try:
+        workspace_status = _load_planning_workspace_status(workspace_dest, plan_id)
+    except (FileNotFoundError, ValueError) as exc:
+        return _blocked(
+            "BLOCKED_UNEXPECTED_STRUCTURE",
+            "FIX_PLANNING_WORKSPACE_STRUCTURE",
+            blocking_reasons=[str(exc)],
+        )
+
+    if workspace_status != "DRAFT":
+        return _blocked(
+            "BLOCKED_WORKSPACE_NOT_DRAFT",
+            "FIX_PLANNING_WORKSPACE_STRUCTURE",
+            planning_workspace_status=workspace_status,
+            blocking_reasons=[
+                f"planning workspace must be DRAFT for requirements extraction "
+                f"execution check, found: {workspace_status!r}"
+            ],
+        )
+
+    draft_preflight_report = preflight_draft_preparation(project, intake_id)
+    latest_readiness_decision_id = draft_preflight_report.latest_decision_id
+    latest_readiness_decision = draft_preflight_report.latest_decision
+    source_preflight_state = REQUIREMENTS_EXTRACTION_PREFLIGHT_CONFIRMED_STATE
+    source_preflight_next_action = REQUIREMENTS_EXTRACTION_PREFLIGHT_CONFIRMED_NEXT_ACTION
+
+    if latest_readiness_decision == "REQUEST_MORE_CLARIFICATION":
+        return _blocked(
+            "BLOCKED_LATEST_READINESS_DECISION_REQUESTS_CLARIFICATION",
+            "RESOLVE_OR_REPLACE_READINESS_DECISION",
+            planning_workspace_status=workspace_status,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+        )
+    if latest_readiness_decision == "BLOCK_INTAKE":
+        return _blocked(
+            "BLOCKED_LATEST_READINESS_DECISION_BLOCKS_INTAKE",
+            "STOP_REQUIREMENTS_EXTRACTION",
+            planning_workspace_status=workspace_status,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+        )
+    if (
+        draft_preflight_report.preflight_state
+        != DRAFT_PREPARATION_PREFLIGHT_CONFIRMED_STATE
+        or latest_readiness_decision != "AUTHORIZE_DRAFT_PREPARATION"
+    ):
+        return _blocked(
+            "BLOCKED_AUTHORIZATION_STALE_OR_INCOHERENT",
+            "RESOLVE_OR_REPLACE_READINESS_DECISION",
+            planning_workspace_status=workspace_status,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+            blocking_reasons=list(draft_preflight_report.blocking_reasons),
+        )
+
+    if not requirements_scaffold_provenance_path.is_file():
+        return _blocked(
+            "BLOCKED_MISSING_REQUIREMENTS_EXTRACTION_SCAFFOLD_PROVENANCE",
+            "FIX_OR_RECREATE_REQUIREMENTS_EXTRACTION_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+            blocking_reasons=[
+                "requirements extraction scaffold provenance not found for planning "
+                f"workspace: {plan_id}"
+            ],
+        )
+
+    try:
+        scaffold_provenance = json.loads(
+            requirements_scaffold_provenance_path.read_text(encoding="utf-8")
+        )
+    except json.JSONDecodeError as exc:
+        return _blocked(
+            "BLOCKED_MALFORMED_REQUIREMENTS_EXTRACTION_SCAFFOLD_PROVENANCE",
+            "FIX_OR_RECREATE_REQUIREMENTS_EXTRACTION_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+            blocking_reasons=[
+                f"invalid requirements extraction scaffold provenance for planning "
+                f"workspace {plan_id}: {exc.msg}"
+            ],
+        )
+
+    if not isinstance(scaffold_provenance, dict):
+        return _blocked(
+            "BLOCKED_MALFORMED_REQUIREMENTS_EXTRACTION_SCAFFOLD_PROVENANCE",
+            "FIX_OR_RECREATE_REQUIREMENTS_EXTRACTION_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+            blocking_reasons=[
+                f"invalid requirements extraction scaffold provenance for planning "
+                f"workspace {plan_id}: expected object"
+            ],
+        )
+
+    provenance_error = _validate_requirements_extraction_scaffold_provenance(
+        scaffold_provenance,
+        plan_id=plan_id,
+        intake_id=intake_id,
+    )
+    if provenance_error is not None:
+        if "mismatch" in provenance_error:
+            state = "BLOCKED_REQUIREMENTS_EXTRACTION_SCAFFOLD_PROVENANCE_MISMATCH"
+        elif "non_authority" in provenance_error:
+            state = "BLOCKED_MALFORMED_REQUIREMENTS_EXTRACTION_SCAFFOLD_PROVENANCE"
+        else:
+            state = "BLOCKED_MALFORMED_REQUIREMENTS_EXTRACTION_SCAFFOLD_PROVENANCE"
+        return _blocked(
+            state,
+            "FIX_OR_RECREATE_REQUIREMENTS_EXTRACTION_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=scaffold_provenance.get(
+                "source_requirements_extraction_preflight_state",
+                source_preflight_state,
+            ),
+            source_requirements_extraction_preflight_next_action=scaffold_provenance.get(
+                "source_requirements_extraction_preflight_next_action",
+                source_preflight_next_action,
+            ),
+            blocking_reasons=[provenance_error],
+        )
+
+    source_preflight_state = scaffold_provenance.get(
+        "source_requirements_extraction_preflight_state",
+        REQUIREMENTS_EXTRACTION_PREFLIGHT_CONFIRMED_STATE,
+    )
+    source_preflight_next_action = scaffold_provenance.get(
+        "source_requirements_extraction_preflight_next_action",
+        REQUIREMENTS_EXTRACTION_PREFLIGHT_CONFIRMED_NEXT_ACTION,
+    )
+
+    if source_preflight_state != REQUIREMENTS_EXTRACTION_PREFLIGHT_CONFIRMED_STATE:
+        return _blocked(
+            "BLOCKED_REQUIREMENTS_EXTRACTION_PREFLIGHT_NOT_CONFIRMED",
+            "FIX_OR_RECREATE_REQUIREMENTS_EXTRACTION_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+            blocking_reasons=[
+                "requirements extraction preflight not confirmed: "
+                f"{source_preflight_state!r}"
+            ],
+        )
+    if source_preflight_next_action != REQUIREMENTS_EXTRACTION_PREFLIGHT_CONFIRMED_NEXT_ACTION:
+        return _blocked(
+            "BLOCKED_REQUIREMENTS_EXTRACTION_PREFLIGHT_NOT_CONFIRMED",
+            "FIX_OR_RECREATE_REQUIREMENTS_EXTRACTION_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+            blocking_reasons=[
+                "requirements extraction preflight next action not expected: "
+                f"{source_preflight_next_action!r}"
+            ],
+        )
+
+    if not local_agentic_spec_path.is_file():
+        return _blocked(
+            "BLOCKED_REQUIREMENTS_EXTRACTION_SCAFFOLD_NOT_COHERENT",
+            "FIX_OR_RECREATE_REQUIREMENTS_EXTRACTION_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+            blocking_reasons=[
+                f"local-agentic-spec.md missing in planning workspace: {plan_id}"
+            ],
+        )
+
+    local_spec_content = local_agentic_spec_path.read_text(encoding="utf-8")
+    if not _is_local_agentic_spec_requirements_extraction_scaffold_non_authority(
+        local_spec_content,
+        plan_id,
+    ):
+        return _blocked(
+            "BLOCKED_LOCAL_AGENTIC_SPEC_NOT_REQUIREMENTS_EXTRACTION_SCAFFOLD",
+            "FIX_OR_RECREATE_REQUIREMENTS_EXTRACTION_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=None,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+        )
+
+    local_agentic_spec_status = REQUIREMENTS_EXTRACTION_SCAFFOLD_STATUS
+
+    if not _requirements_extraction_scaffold_boundary_notes_present(local_spec_content):
+        return _blocked(
+            "BLOCKED_REQUIREMENTS_EXTRACTION_SCAFFOLD_NOT_COHERENT",
+            "FIX_OR_RECREATE_REQUIREMENTS_EXTRACTION_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+            blocking_reasons=[
+                "requirements extraction scaffold is incoherent: "
+                "local-agentic-spec.md missing required boundary notes"
+            ],
+        )
+
+    if _REQUIREMENT_ID_PATTERN.search(local_spec_content):
+        return _blocked(
+            "BLOCKED_LOCAL_AGENTIC_SPEC_ALREADY_HAS_REQUIREMENT_IDS",
+            "FIX_OR_RECREATE_REQUIREMENTS_EXTRACTION_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+        )
+
+    if _local_agentic_spec_has_generated_functional_requirements(local_spec_content):
+        return _blocked(
+            "BLOCKED_LOCAL_AGENTIC_SPEC_ALREADY_HAS_REQUIREMENTS",
+            "FIX_OR_RECREATE_REQUIREMENTS_EXTRACTION_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+        )
+
+    if _local_agentic_spec_has_user_stories(local_spec_content):
+        return _blocked(
+            "BLOCKED_LOCAL_AGENTIC_SPEC_ALREADY_HAS_USER_STORIES",
+            "FIX_OR_RECREATE_REQUIREMENTS_EXTRACTION_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+        )
+
+    if _local_agentic_spec_has_generated_acceptance_criteria(local_spec_content):
+        return _blocked(
+            "BLOCKED_LOCAL_AGENTIC_SPEC_ALREADY_HAS_ACCEPTANCE_CRITERIA",
+            "FIX_OR_RECREATE_REQUIREMENTS_EXTRACTION_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+        )
+
+    if _local_agentic_spec_has_architecture_decision_language(local_spec_content):
+        return _blocked(
+            "BLOCKED_LOCAL_AGENTIC_SPEC_ALREADY_HAS_ARCHITECTURE",
+            "FIX_OR_RECREATE_REQUIREMENTS_EXTRACTION_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+        )
+
+    if _local_agentic_spec_has_implementation_tasks(local_spec_content):
+        return _blocked(
+            "BLOCKED_LOCAL_AGENTIC_SPEC_ALREADY_HAS_IMPLEMENTATION_TASKS",
+            "FIX_OR_RECREATE_REQUIREMENTS_EXTRACTION_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+        )
+
+    if _local_agentic_spec_has_planning_run_slice_content(local_spec_content):
+        return _blocked(
+            "BLOCKED_LOCAL_AGENTIC_SPEC_ALREADY_HAS_PLANNING_RUN_SLICE",
+            "FIX_OR_RECREATE_REQUIREMENTS_EXTRACTION_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+        )
+
+    if not _local_agentic_spec_contains_only_requirements_extraction_scaffold_sections(
+        local_spec_content
+    ):
+        return _blocked(
+            "BLOCKED_REQUIREMENTS_EXTRACTION_SCAFFOLD_NOT_COHERENT",
+            "FIX_OR_RECREATE_REQUIREMENTS_EXTRACTION_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+            blocking_reasons=[
+                "requirements extraction scaffold is incoherent: "
+                "local-agentic-spec.md no longer contains only empty containers"
+            ],
+        )
+
+    if not implementation_plan_path.is_file():
+        return _blocked(
+            "BLOCKED_UNEXPECTED_STRUCTURE",
+            "RESTORE_PLANNING_INIT_PLACEHOLDERS",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+            blocking_reasons=[
+                f"implementation-plan.md missing in planning workspace: {plan_id}"
+            ],
+        )
+
+    if not _is_planning_artifact_init_placeholder(
+        implementation_plan_path.read_text(encoding="utf-8"),
+        plan_id,
+        "implementation-plan.md",
+        artifact_type="IMPLEMENTATION_PLAN",
+    ):
+        return _blocked(
+            "BLOCKED_IMPLEMENTATION_PLAN_ALREADY_MODIFIED",
+            "RESTORE_PLANNING_INIT_PLACEHOLDERS",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+        )
+
+    if not planning_audit_path.is_file():
+        return _blocked(
+            "BLOCKED_UNEXPECTED_STRUCTURE",
+            "RESTORE_PLANNING_INIT_PLACEHOLDERS",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+            blocking_reasons=[
+                f"planning-audit.md missing in planning workspace: {plan_id}"
+            ],
+        )
+
+    if not _is_planning_artifact_init_placeholder(
+        planning_audit_path.read_text(encoding="utf-8"),
+        plan_id,
+        "planning-audit.md",
+        artifact_type="PLANNING_AUDIT",
+        identity_field="auditor",
+    ):
+        return _blocked(
+            "BLOCKED_PLANNING_AUDIT_ALREADY_MODIFIED",
+            "RESTORE_PLANNING_INIT_PLACEHOLDERS",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+        )
+
+    decision_records, decision_errors = _load_validated_requirements_extraction_owner_decisions(
+        project,
+        intake_id,
+        plan_id,
+    )
+    if decision_errors:
+        return _blocked(
+            "BLOCKED_MALFORMED_REQUIREMENTS_EXTRACTION_OWNER_DECISION",
+            "FIX_REQUIREMENTS_EXTRACTION_OWNER_DECISION_ARTIFACTS",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+            blocking_reasons=decision_errors,
+        )
+
+    if not decision_records:
+        return _blocked(
+            "BLOCKED_NO_REQUIREMENTS_EXTRACTION_OWNER_DECISION",
+            "CREATE_REQUIREMENTS_EXTRACTION_OWNER_DECISION",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+            blocking_reasons=[
+                "no requirements extraction owner decision artifacts found "
+                f"for intake {intake_id!r} and plan {plan_id!r}"
+            ],
+        )
+
+    latest_record = decision_records[-1]
+    latest_decision_id = latest_record.decision_id
+    latest_decision = latest_record.decision
+    latest_decision_created_at = latest_record.created_at
+    latest_decision_path = latest_record.path
+
+    if latest_decision == "REQUEST_MORE_CONTEXT":
+        return _blocked(
+            "BLOCKED_LATEST_REQUIREMENTS_EXTRACTION_DECISION_REQUESTS_MORE_CONTEXT",
+            "ADD_MORE_CONTEXT_BEFORE_EXTRACTION",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            latest_requirements_extraction_decision_id=latest_decision_id,
+            latest_requirements_extraction_decision=latest_decision,
+            latest_requirements_extraction_decision_created_at=latest_decision_created_at,
+            latest_requirements_extraction_decision_path=latest_decision_path,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+        )
+
+    if latest_decision == "BLOCK_REQUIREMENTS_EXTRACTION":
+        return _blocked(
+            "BLOCKED_LATEST_REQUIREMENTS_EXTRACTION_DECISION_BLOCKS_EXTRACTION",
+            "STOP_REQUIREMENTS_EXTRACTION",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            latest_requirements_extraction_decision_id=latest_decision_id,
+            latest_requirements_extraction_decision=latest_decision,
+            latest_requirements_extraction_decision_created_at=latest_decision_created_at,
+            latest_requirements_extraction_decision_path=latest_decision_path,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+        )
+
+    if latest_decision != "AUTHORIZE_REQUIREMENTS_EXTRACTION":
+        return _blocked(
+            "BLOCKED_LATEST_REQUIREMENTS_EXTRACTION_DECISION_NOT_AUTHORIZE",
+            "AUTHORIZE_REQUIREMENTS_EXTRACTION_WITH_OWNER_DECISION",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            latest_requirements_extraction_decision_id=latest_decision_id,
+            latest_requirements_extraction_decision=latest_decision,
+            latest_requirements_extraction_decision_created_at=latest_decision_created_at,
+            latest_requirements_extraction_decision_path=latest_decision_path,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+            blocking_reasons=[f"unsupported latest decision value: {latest_decision!r}"],
+        )
+
+    latest_artifact = json.loads(latest_decision_path.read_text(encoding="utf-8"))
+    coherence_error = _validate_requirements_extraction_owner_decision_coherence(
+        latest_artifact,
+        scaffold_provenance=scaffold_provenance,
+        scaffold_provenance_path=requirements_scaffold_provenance_path,
+    )
+    if coherence_error is not None:
+        return _blocked(
+            "BLOCKED_REQUIREMENTS_EXTRACTION_OWNER_DECISION_STALE_OR_INCOHERENT",
+            "FIX_REQUIREMENTS_EXTRACTION_OWNER_DECISION_ARTIFACTS",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            latest_requirements_extraction_decision_id=latest_decision_id,
+            latest_requirements_extraction_decision=latest_decision,
+            latest_requirements_extraction_decision_created_at=latest_decision_created_at,
+            latest_requirements_extraction_decision_path=latest_decision_path,
+            latest_readiness_decision_id=latest_readiness_decision_id,
+            latest_readiness_decision=latest_readiness_decision,
+            source_requirements_extraction_preflight_state=source_preflight_state,
+            source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+            blocking_reasons=[coherence_error],
+        )
+
+    return _build_requirements_extraction_execution_check_report(
+        plan_id=plan_id,
+        intake_id=intake_id,
+        planning_workspace_status=workspace_status,
+        local_agentic_spec_status=local_agentic_spec_status,
+        local_agentic_spec_path=local_agentic_spec_path,
+        requirements_extraction_scaffold_provenance_path=requirements_scaffold_provenance_path,
+        latest_requirements_extraction_decision_id=latest_decision_id,
+        latest_requirements_extraction_decision=latest_decision,
+        latest_requirements_extraction_decision_created_at=latest_decision_created_at,
+        latest_requirements_extraction_decision_path=latest_decision_path,
+        latest_readiness_decision_id=latest_readiness_decision_id,
+        latest_readiness_decision=latest_readiness_decision,
+        source_requirements_extraction_preflight_state=source_preflight_state,
+        source_requirements_extraction_preflight_next_action=source_preflight_next_action,
+        check_state=REQUIREMENTS_EXTRACTION_EXECUTION_CHECK_CONFIRMED_STATE,
+        next_required_action=REQUIREMENTS_EXTRACTION_EXECUTION_CHECK_CONFIRMED_NEXT_ACTION,
+        blocking_reasons=[],
+        checked_at=checked_at,
+        non_authority=non_authority,
     )
 
 
