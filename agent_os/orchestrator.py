@@ -24,6 +24,7 @@ from agent_os.paths import (
     orchestrator_readiness_decision_path,
     parse_frontmatter,
     planning_path,
+    section_body,
     workspace_path,
 )
 from agent_os.planning import init_planning_workspace, planning_templates_dir, validate_plan_id
@@ -324,6 +325,66 @@ ORCHESTRATOR_LOCAL_AGENTIC_SPEC_SCAFFOLD_NON_AUTHORITY_FLAGS = (
     "future_implementation_plan_requires_separate_command",
     "requires_future_independent_validation",
     "requires_future_owner_approval",
+)
+
+REQUIREMENTS_EXTRACTION_PREFLIGHT_CONFIRMED_STATE = (
+    "REQUIREMENTS_EXTRACTION_PREFLIGHT_CONFIRMED_NO_REQUIREMENTS_GENERATED"
+)
+REQUIREMENTS_EXTRACTION_PREFLIGHT_CONFIRMED_NEXT_ACTION = (
+    "FUTURE_REQUIREMENTS_EXTRACTION_REQUIRES_SEPARATE_COMMAND"
+)
+
+REQUIREMENTS_EXTRACTION_PREFLIGHT_NON_AUTHORITY_FLAGS = (
+    "does_not_extract_requirements",
+    "does_not_infer_requirements",
+    "does_not_generate_user_stories",
+    "does_not_generate_acceptance_criteria",
+    "does_not_mutate_local_agentic_spec",
+    "does_not_generate_architecture",
+    "does_not_choose_stack",
+    "does_not_choose_database",
+    "does_not_choose_networking",
+    "does_not_generate_implementation_plan",
+    "does_not_generate_planning_run_slice",
+    "does_not_validate_planning_workspace",
+    "does_not_approve_plan",
+    "does_not_transition_workspace",
+    "does_not_create_runner_proposal",
+    "does_not_create_run",
+    "does_not_invoke_executor",
+    "preflight_is_read_only",
+    "future_requirements_extraction_requires_separate_command",
+    "future_architecture_decision_requires_separate_command",
+    "future_implementation_plan_requires_separate_command",
+    "requires_future_independent_validation",
+    "requires_future_owner_approval",
+)
+
+LOCAL_AGENTIC_SPEC_SCAFFOLD_REQUIRED_BOUNDARY_CHECKS: tuple[tuple[str, ...], ...] = (
+    ("requirements extraction", "not performed"),
+    ("architecture", "undecided"),
+    ("implementation plan", "not generated"),
+    ("planning_run_slice", "not generated"),
+    ("not validated or approved",),
+    ("runner", "not created or invoked"),
+)
+
+_FUNCTIONAL_REQUIREMENT_PATTERN = re.compile(r"\bthe system shall\b", re.IGNORECASE)
+_FUNCTIONAL_REQUIREMENT_ID_PATTERN = re.compile(r"\bFR-\d+\b", re.IGNORECASE)
+_USER_STORY_PATTERN = re.compile(r"\bas a user\b", re.IGNORECASE)
+_USER_STORIES_HEADING_PATTERN = re.compile(r"^##\s+User Stories\s*$", re.MULTILINE)
+_ACCEPTANCE_CRITERIA_GWT_PATTERN = re.compile(
+    r"\bGiven\b.+\bWhen\b.+\bThen\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_ACCEPTANCE_CRITERIA_ID_PATTERN = re.compile(r"\bAC-\d+\b", re.IGNORECASE)
+_ARCHITECTURE_DECISION_PATTERN = re.compile(
+    r"\b(selected|recommended|chosen)\s+(backend|frontend|database|architecture)\b",
+    re.IGNORECASE,
+)
+_STACK_CHOICE_PATTERN = re.compile(
+    r"\b(backend|frontend|database|deployment):\s*(?!undecided|not\b)[a-z0-9]",
+    re.IGNORECASE,
 )
 
 CONTEXT_PACK_REQUIRED_BOUNDARY_CHECKS: tuple[tuple[str, ...], ...] = (
@@ -3182,6 +3243,148 @@ def _validate_context_pack_draft_provenance(
     return None
 
 
+def _is_local_agentic_spec_scaffold_non_authority(content: str, plan_id: str) -> bool:
+    normalized_content = content.replace("\r\n", "\n").replace("\r", "\n")
+    meta, _body = parse_frontmatter(normalized_content)
+    if meta.get("artifact_type") != "LOCAL_AGENTIC_SPEC":
+        return False
+    if meta.get("local_agentic_spec_status") != LOCAL_AGENTIC_SPEC_SCAFFOLD_STATUS:
+        return False
+    if meta.get("plan_id") != plan_id:
+        return False
+    if LOCAL_AGENTIC_SPEC_SCAFFOLD_STATUS not in normalized_content:
+        return False
+    return True
+
+
+def _local_agentic_spec_scaffold_boundary_notes_present(content: str) -> bool:
+    lowered = content.lower()
+    for required_parts in LOCAL_AGENTIC_SPEC_SCAFFOLD_REQUIRED_BOUNDARY_CHECKS:
+        if not all(part.lower() in lowered for part in required_parts):
+            return False
+    return True
+
+
+def _local_agentic_spec_contains_only_scaffold_sections(content: str) -> bool:
+    if "PENDING_FUTURE_REQUIREMENTS_EXTRACTION" not in content:
+        return False
+    if _FUNCTIONAL_REQUIREMENT_ID_PATTERN.search(content):
+        return False
+    if _USER_STORIES_HEADING_PATTERN.search(content):
+        return False
+    return True
+
+
+def _local_agentic_spec_has_generated_functional_requirements(content: str) -> bool:
+    if _FUNCTIONAL_REQUIREMENT_PATTERN.search(content):
+        return True
+    if _FUNCTIONAL_REQUIREMENT_ID_PATTERN.search(content):
+        return True
+    functional_section = section_body(content, "## Functional Requirements")
+    if functional_section.strip():
+        return True
+    return False
+
+
+def _local_agentic_spec_has_user_stories(content: str) -> bool:
+    if _USER_STORY_PATTERN.search(content):
+        return True
+    if _USER_STORIES_HEADING_PATTERN.search(content):
+        return True
+    lowered = content.lower()
+    if "user stories" in lowered and "not generated" not in lowered:
+        return True
+    return False
+
+
+def _local_agentic_spec_has_generated_acceptance_criteria(content: str) -> bool:
+    if _ACCEPTANCE_CRITERIA_GWT_PATTERN.search(content):
+        return True
+    if _ACCEPTANCE_CRITERIA_ID_PATTERN.search(content):
+        return True
+    criteria_section = section_body(content, "## Acceptance Criteria")
+    if criteria_section.strip():
+        return True
+    return False
+
+
+def _local_agentic_spec_has_architecture_decision_language(content: str) -> bool:
+    if _ARCHITECTURE_DECISION_PATTERN.search(content):
+        return True
+    if _STACK_CHOICE_PATTERN.search(content):
+        return True
+    return False
+
+
+def _validate_local_agentic_spec_scaffold_provenance(
+    provenance: dict,
+    *,
+    plan_id: str,
+    intake_id: str,
+) -> str | None:
+    """Return a blocking reason when local-agentic-spec scaffold provenance is invalid."""
+    artifact_type = provenance.get("artifact_type")
+    if artifact_type != ORCHESTRATOR_LOCAL_AGENTIC_SPEC_SCAFFOLD_PROVENANCE_ARTIFACT_TYPE:
+        return (
+            f"local agentic spec scaffold provenance artifact_type mismatch: "
+            f"expected {ORCHESTRATOR_LOCAL_AGENTIC_SPEC_SCAFFOLD_PROVENANCE_ARTIFACT_TYPE!r}, "
+            f"found {artifact_type!r}"
+        )
+
+    provenance_plan_id = provenance.get("plan_id")
+    if provenance_plan_id != plan_id:
+        return (
+            f"local agentic spec scaffold provenance plan_id mismatch: "
+            f"expected {plan_id!r}, found {provenance_plan_id!r}"
+        )
+
+    provenance_intake_id = provenance.get("intake_id")
+    if provenance_intake_id != intake_id:
+        return (
+            f"local agentic spec scaffold provenance intake_id mismatch: "
+            f"expected {intake_id!r}, found {provenance_intake_id!r}"
+        )
+
+    if provenance.get("local_agentic_spec_status") != LOCAL_AGENTIC_SPEC_SCAFFOLD_STATUS:
+        return (
+            "local agentic spec scaffold provenance local_agentic_spec_status is not "
+            "SCAFFOLD_DRAFT_NON_AUTHORITY"
+        )
+
+    if provenance.get("planning_workspace_status_at_scaffold") != "DRAFT":
+        return (
+            "local agentic spec scaffold provenance "
+            "planning_workspace_status_at_scaffold is not DRAFT"
+        )
+
+    if (
+        provenance.get("source_preflight_state")
+        != LOCAL_AGENTIC_SPEC_DRAFT_PREFLIGHT_CONFIRMED_STATE
+    ):
+        return (
+            "local agentic spec scaffold provenance source_preflight_state is not "
+            "LOCAL_AGENTIC_SPEC_DRAFT_PREFLIGHT_CONFIRMED_NO_SPEC_GENERATED"
+        )
+
+    if (
+        provenance.get("source_preflight_next_action")
+        != LOCAL_AGENTIC_SPEC_DRAFT_PREFLIGHT_CONFIRMED_NEXT_ACTION
+    ):
+        return (
+            "local agentic spec scaffold provenance source_preflight_next_action is not "
+            "FUTURE_LOCAL_AGENTIC_SPEC_DRAFT_REQUIRES_SEPARATE_COMMAND"
+        )
+
+    non_authority = provenance.get("non_authority")
+    if not isinstance(non_authority, dict):
+        return "local agentic spec scaffold provenance non_authority must be an object"
+    for flag in ORCHESTRATOR_LOCAL_AGENTIC_SPEC_SCAFFOLD_NON_AUTHORITY_FLAGS:
+        if non_authority.get(flag) is not True:
+            return f"local agentic spec scaffold provenance non_authority.{flag} must be true"
+
+    return None
+
+
 def _format_local_agentic_spec_draft_preflight(
     *,
     plan_id: str,
@@ -4170,6 +4373,768 @@ def scaffold_local_agentic_spec_from_context_pack(
         provenance_path=scaffold_provenance_path,
         local_agentic_spec_status=LOCAL_AGENTIC_SPEC_SCAFFOLD_STATUS,
         workspace_status=workspace_status,
+        non_authority=non_authority,
+    )
+
+
+def _format_requirements_extraction_preflight(
+    *,
+    plan_id: str,
+    intake_id: str,
+    planning_workspace_status: str | None,
+    local_agentic_spec_status: str | None,
+    local_agentic_spec_path: Path | None,
+    local_agentic_spec_scaffold_provenance_path: Path | None,
+    context_pack_path: Path | None,
+    context_pack_provenance_path: Path | None,
+    implementation_plan_path: Path | None,
+    planning_audit_path: Path | None,
+    latest_decision_id: str | None,
+    latest_decision: str | None,
+    source_preflight_state: str | None,
+    preflight_state: str,
+    next_required_action: str,
+    blocking_reasons: list[str],
+    checked_at: str,
+    non_authority: dict[str, bool],
+) -> str:
+    lines = [
+        "requirements extraction preflight",
+        f"plan_id: {plan_id}",
+        f"intake_id: {intake_id}",
+    ]
+    if planning_workspace_status is not None:
+        lines.append(f"planning_workspace_status: {planning_workspace_status}")
+    if local_agentic_spec_status is not None:
+        lines.append(f"local_agentic_spec_status: {local_agentic_spec_status}")
+    if local_agentic_spec_path is not None:
+        lines.append(f"local_agentic_spec_path: {local_agentic_spec_path}")
+    if local_agentic_spec_scaffold_provenance_path is not None:
+        lines.append(
+            "local_agentic_spec_scaffold_provenance_path: "
+            f"{local_agentic_spec_scaffold_provenance_path}"
+        )
+    if context_pack_path is not None:
+        lines.append(f"context_pack_path: {context_pack_path}")
+    if context_pack_provenance_path is not None:
+        lines.append(f"context_pack_provenance_path: {context_pack_provenance_path}")
+    if implementation_plan_path is not None:
+        lines.append(f"implementation_plan_path: {implementation_plan_path}")
+    if planning_audit_path is not None:
+        lines.append(f"planning_audit_path: {planning_audit_path}")
+    if latest_decision_id is not None:
+        lines.append(f"latest_decision_id: {latest_decision_id}")
+    if latest_decision is not None:
+        lines.append(f"latest_decision: {latest_decision}")
+    if source_preflight_state is not None:
+        lines.append(f"source_preflight_state: {source_preflight_state}")
+    lines.append(f"preflight_state: {preflight_state}")
+    lines.append(f"next_required_action: {next_required_action}")
+    lines.append(f"checked_at: {checked_at}")
+    if blocking_reasons:
+        lines.append("blocking_reasons:")
+        for reason in blocking_reasons:
+            lines.append(f"  - {reason}")
+    lines.append("non_authority:")
+    for flag in REQUIREMENTS_EXTRACTION_PREFLIGHT_NON_AUTHORITY_FLAGS:
+        lines.append(f"  {flag}: true")
+    lines.append(
+        "note: requirements extraction preflight is read-only; "
+        "not requirements extraction, not architecture decision, "
+        "not implementation planning, not validation or approval, "
+        "and no files were modified"
+    )
+    if preflight_state == REQUIREMENTS_EXTRACTION_PREFLIGHT_CONFIRMED_STATE:
+        lines.append(
+            "note: preflight confirmed for a future requirements extraction command "
+            "only; no requirements were extracted or generated"
+        )
+        lines.append(
+            "note: local-agentic-spec remains SCAFFOLD_DRAFT_NON_AUTHORITY; "
+            "architecture undecided; implementation plan not generated; "
+            "PLANNING_RUN_SLICE not generated; workspace not validated or approved"
+        )
+    return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class RequirementsExtractionPreflightReport:
+    output: str
+    preflight_state: str
+    next_required_action: str
+    plan_id: str
+    intake_id: str
+    planning_workspace_status: str | None
+    local_agentic_spec_status: str | None
+    local_agentic_spec_path: Path | None
+    local_agentic_spec_scaffold_provenance_path: Path | None
+    context_pack_path: Path | None
+    context_pack_provenance_path: Path | None
+    implementation_plan_path: Path | None
+    planning_audit_path: Path | None
+    latest_decision_id: str | None
+    latest_decision: str | None
+    source_preflight_state: str | None
+    checked_at: str
+    blocking_reasons: tuple[str, ...]
+    non_authority: dict[str, bool]
+
+
+def _build_requirements_extraction_preflight_report(
+    *,
+    plan_id: str,
+    intake_id: str,
+    planning_workspace_status: str | None = None,
+    local_agentic_spec_status: str | None = None,
+    local_agentic_spec_path: Path | None = None,
+    local_agentic_spec_scaffold_provenance_path: Path | None = None,
+    context_pack_path: Path | None = None,
+    context_pack_provenance_path: Path | None = None,
+    implementation_plan_path: Path | None = None,
+    planning_audit_path: Path | None = None,
+    latest_decision_id: str | None = None,
+    latest_decision: str | None = None,
+    source_preflight_state: str | None = None,
+    preflight_state: str,
+    next_required_action: str,
+    blocking_reasons: list[str],
+    checked_at: str,
+    non_authority: dict[str, bool],
+) -> RequirementsExtractionPreflightReport:
+    output = _format_requirements_extraction_preflight(
+        plan_id=plan_id,
+        intake_id=intake_id,
+        planning_workspace_status=planning_workspace_status,
+        local_agentic_spec_status=local_agentic_spec_status,
+        local_agentic_spec_path=local_agentic_spec_path,
+        local_agentic_spec_scaffold_provenance_path=local_agentic_spec_scaffold_provenance_path,
+        context_pack_path=context_pack_path,
+        context_pack_provenance_path=context_pack_provenance_path,
+        implementation_plan_path=implementation_plan_path,
+        planning_audit_path=planning_audit_path,
+        latest_decision_id=latest_decision_id,
+        latest_decision=latest_decision,
+        source_preflight_state=source_preflight_state,
+        preflight_state=preflight_state,
+        next_required_action=next_required_action,
+        blocking_reasons=blocking_reasons,
+        checked_at=checked_at,
+        non_authority=non_authority,
+    )
+    return RequirementsExtractionPreflightReport(
+        output=output,
+        preflight_state=preflight_state,
+        next_required_action=next_required_action,
+        plan_id=plan_id,
+        intake_id=intake_id,
+        planning_workspace_status=planning_workspace_status,
+        local_agentic_spec_status=local_agentic_spec_status,
+        local_agentic_spec_path=local_agentic_spec_path,
+        local_agentic_spec_scaffold_provenance_path=local_agentic_spec_scaffold_provenance_path,
+        context_pack_path=context_pack_path,
+        context_pack_provenance_path=context_pack_provenance_path,
+        implementation_plan_path=implementation_plan_path,
+        planning_audit_path=planning_audit_path,
+        latest_decision_id=latest_decision_id,
+        latest_decision=latest_decision,
+        source_preflight_state=source_preflight_state,
+        checked_at=checked_at,
+        blocking_reasons=tuple(blocking_reasons),
+        non_authority=non_authority,
+    )
+
+
+def preflight_requirements_extraction(
+    project: Path,
+    intake_id: str,
+    plan_id: str,
+) -> RequirementsExtractionPreflightReport:
+    """Read-only requirements extraction eligibility preflight for a DRAFT workspace."""
+    validate_intake_id(intake_id)
+    validate_plan_id(plan_id)
+
+    checked_at = _utc_now()
+    non_authority = {
+        key: True for key in REQUIREMENTS_EXTRACTION_PREFLIGHT_NON_AUTHORITY_FLAGS
+    }
+    workspace_dest = planning_path(project, plan_id)
+    context_pack_path = workspace_dest / "context-pack.md"
+    context_pack_provenance_path = (
+        workspace_dest / "evidence" / ORCHESTRATOR_CONTEXT_PACK_DRAFT_PROVENANCE_FILE
+    )
+    local_agentic_spec_path = workspace_dest / "local-agentic-spec.md"
+    local_agentic_spec_scaffold_provenance_path = (
+        workspace_dest
+        / "evidence"
+        / ORCHESTRATOR_LOCAL_AGENTIC_SPEC_SCAFFOLD_PROVENANCE_FILE
+    )
+    implementation_plan_path = workspace_dest / "implementation-plan.md"
+    planning_audit_path = workspace_dest / "planning-audit.md"
+    provenance_path = workspace_dest / "evidence" / ORCHESTRATOR_PROVENANCE_FILE
+    transport_json_path = workspace_dest / "evidence" / ORCHESTRATOR_CONTEXT_TRANSPORT_FILE
+    transport_md_path = workspace_dest / "evidence" / ORCHESTRATOR_CONTEXT_TRANSPORT_MD_FILE
+
+    def _blocked(
+        state: str,
+        next_action: str,
+        *,
+        blocking_reasons: list[str] | None = None,
+        planning_workspace_status: str | None = None,
+        local_agentic_spec_status: str | None = None,
+        latest_decision_id: str | None = None,
+        latest_decision: str | None = None,
+        source_preflight_state: str | None = None,
+    ) -> RequirementsExtractionPreflightReport:
+        return _build_requirements_extraction_preflight_report(
+            plan_id=plan_id,
+            intake_id=intake_id,
+            planning_workspace_status=planning_workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            local_agentic_spec_path=local_agentic_spec_path,
+            local_agentic_spec_scaffold_provenance_path=local_agentic_spec_scaffold_provenance_path,
+            context_pack_path=context_pack_path,
+            context_pack_provenance_path=context_pack_provenance_path,
+            implementation_plan_path=implementation_plan_path,
+            planning_audit_path=planning_audit_path,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            preflight_state=state,
+            next_required_action=next_action,
+            blocking_reasons=blocking_reasons or [],
+            checked_at=checked_at,
+            non_authority=non_authority,
+        )
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        return _blocked(
+            "BLOCKED_MISSING_WORKSPACE",
+            "FIX_PLANNING_WORKSPACE_STRUCTURE",
+            blocking_reasons=["no workspace found (run `agent-os init` first)"],
+        )
+
+    intake_path = _goal_intake_artifact_path(project, intake_id)
+    if not intake_path.is_file():
+        return _blocked(
+            "BLOCKED_INVALID_INTAKE",
+            "FIX_GOAL_INTAKE_STRUCTURE",
+            blocking_reasons=[f"goal intake artifact not found: {intake_id}"],
+        )
+
+    readiness_report = review_goal_intake_readiness(project, intake_id)
+    if not readiness_report.goal_intake_valid:
+        return _blocked(
+            "BLOCKED_INVALID_INTAKE",
+            "FIX_GOAL_INTAKE_STRUCTURE",
+            blocking_reasons=list(readiness_report.blocking_reasons),
+        )
+
+    if not workspace_dest.is_dir():
+        return _blocked(
+            "BLOCKED_MISSING_PLANNING_WORKSPACE",
+            "FIX_PLANNING_WORKSPACE_STRUCTURE",
+            blocking_reasons=[f"planning workspace not found: {plan_id}"],
+        )
+
+    try:
+        workspace_status = _load_planning_workspace_status(workspace_dest, plan_id)
+    except (FileNotFoundError, ValueError) as exc:
+        return _blocked(
+            "BLOCKED_UNEXPECTED_STRUCTURE",
+            "FIX_PLANNING_WORKSPACE_STRUCTURE",
+            blocking_reasons=[str(exc)],
+        )
+
+    if workspace_status != "DRAFT":
+        return _blocked(
+            "BLOCKED_WORKSPACE_NOT_DRAFT",
+            "FIX_PLANNING_WORKSPACE_STRUCTURE",
+            planning_workspace_status=workspace_status,
+            blocking_reasons=[
+                f"planning workspace must be DRAFT for requirements extraction "
+                f"preflight, found: {workspace_status!r}"
+            ],
+        )
+
+    draft_preflight_report = preflight_draft_preparation(project, intake_id)
+    latest_decision_id = draft_preflight_report.latest_decision_id
+    latest_decision = draft_preflight_report.latest_decision
+    source_preflight_state = draft_preflight_report.preflight_state
+
+    if latest_decision == "REQUEST_MORE_CLARIFICATION":
+        return _blocked(
+            "BLOCKED_LATEST_DECISION_REQUESTS_CLARIFICATION",
+            "ADD_OWNER_CLARIFICATION",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+        )
+    if latest_decision == "BLOCK_INTAKE":
+        return _blocked(
+            "BLOCKED_LATEST_DECISION_BLOCKS_INTAKE",
+            "STOP_INTAKE",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+        )
+    if (
+        draft_preflight_report.preflight_state
+        != DRAFT_PREPARATION_PREFLIGHT_CONFIRMED_STATE
+        or latest_decision != "AUTHORIZE_DRAFT_PREPARATION"
+    ):
+        return _blocked(
+            "BLOCKED_AUTHORIZATION_STALE_OR_INCOHERENT",
+            "RESOLVE_OR_REPLACE_READINESS_DECISION",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=list(draft_preflight_report.blocking_reasons),
+        )
+
+    if not provenance_path.is_file():
+        return _blocked(
+            "BLOCKED_MISSING_ORCHESTRATOR_PROVENANCE",
+            "FIX_PLANNING_WORKSPACE_STRUCTURE",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+        )
+
+    try:
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return _blocked(
+            "BLOCKED_UNEXPECTED_STRUCTURE",
+            "FIX_PLANNING_WORKSPACE_STRUCTURE",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[
+                f"invalid orchestrator provenance for planning workspace {plan_id}: "
+                f"{exc.msg}"
+            ],
+        )
+
+    if not isinstance(provenance, dict):
+        return _blocked(
+            "BLOCKED_UNEXPECTED_STRUCTURE",
+            "FIX_PLANNING_WORKSPACE_STRUCTURE",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[
+                f"invalid orchestrator provenance for planning workspace {plan_id}: "
+                "expected object"
+            ],
+        )
+
+    provenance_plan_id = provenance.get("plan_id")
+    if provenance_plan_id != plan_id:
+        return _blocked(
+            "BLOCKED_AUTHORIZATION_STALE_OR_INCOHERENT",
+            "RESOLVE_OR_REPLACE_READINESS_DECISION",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[
+                f"orchestrator provenance plan_id mismatch: "
+                f"expected {plan_id!r}, found {provenance_plan_id!r}"
+            ],
+        )
+
+    provenance_intake_id = provenance.get("intake_id")
+    if provenance_intake_id != intake_id:
+        return _blocked(
+            "BLOCKED_AUTHORIZATION_STALE_OR_INCOHERENT",
+            "RESOLVE_OR_REPLACE_READINESS_DECISION",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[
+                f"orchestrator provenance intake_id mismatch: "
+                f"expected {intake_id!r}, found {provenance_intake_id!r}"
+            ],
+        )
+
+    try:
+        _require_orchestrator_provenance_for_transport(
+            provenance_path,
+            plan_id=plan_id,
+            intake_id=intake_id,
+            preflight_report=draft_preflight_report,
+        )
+    except ValueError as exc:
+        return _blocked(
+            "BLOCKED_AUTHORIZATION_STALE_OR_INCOHERENT",
+            "RESOLVE_OR_REPLACE_READINESS_DECISION",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[str(exc)],
+        )
+
+    if not transport_json_path.is_file():
+        return _blocked(
+            "BLOCKED_MISSING_CONTEXT_TRANSPORT",
+            "FIX_OR_RECREATE_LOCAL_AGENTIC_SPEC_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[
+                f"context transport json not found for planning workspace: {plan_id}"
+            ],
+        )
+
+    if not transport_md_path.is_file():
+        return _blocked(
+            "BLOCKED_MISSING_CONTEXT_TRANSPORT",
+            "FIX_OR_RECREATE_LOCAL_AGENTIC_SPEC_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[
+                f"context transport markdown not found for planning workspace: {plan_id}"
+            ],
+        )
+
+    try:
+        _require_context_transport_for_draft(
+            transport_json_path,
+            plan_id=plan_id,
+            intake_id=intake_id,
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        return _blocked(
+            "BLOCKED_UNEXPECTED_STRUCTURE",
+            "FIX_OR_RECREATE_LOCAL_AGENTIC_SPEC_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[str(exc)],
+        )
+
+    if not context_pack_provenance_path.is_file():
+        return _blocked(
+            "BLOCKED_MISSING_CONTEXT_PACK_DRAFT_PROVENANCE",
+            "FIX_OR_RECREATE_LOCAL_AGENTIC_SPEC_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+        )
+
+    try:
+        draft_provenance = json.loads(
+            context_pack_provenance_path.read_text(encoding="utf-8")
+        )
+    except json.JSONDecodeError as exc:
+        return _blocked(
+            "BLOCKED_UNEXPECTED_STRUCTURE",
+            "FIX_OR_RECREATE_LOCAL_AGENTIC_SPEC_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[
+                f"invalid context pack draft provenance for planning workspace "
+                f"{plan_id}: {exc.msg}"
+            ],
+        )
+
+    if not isinstance(draft_provenance, dict):
+        return _blocked(
+            "BLOCKED_UNEXPECTED_STRUCTURE",
+            "FIX_OR_RECREATE_LOCAL_AGENTIC_SPEC_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[
+                f"invalid context pack draft provenance for planning workspace "
+                f"{plan_id}: expected object"
+            ],
+        )
+
+    provenance_error = _validate_context_pack_draft_provenance(
+        draft_provenance,
+        plan_id=plan_id,
+        intake_id=intake_id,
+    )
+    if provenance_error is not None:
+        mismatch = "mismatch" in provenance_error
+        return _blocked(
+            "BLOCKED_CONTEXT_PACK_PROVENANCE_MISMATCH"
+            if mismatch
+            else "BLOCKED_UNEXPECTED_STRUCTURE",
+            "FIX_OR_RECREATE_LOCAL_AGENTIC_SPEC_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[provenance_error],
+        )
+
+    if not local_agentic_spec_scaffold_provenance_path.is_file():
+        return _blocked(
+            "BLOCKED_MISSING_LOCAL_AGENTIC_SPEC_SCAFFOLD_PROVENANCE",
+            "FIX_OR_RECREATE_LOCAL_AGENTIC_SPEC_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+        )
+
+    try:
+        scaffold_provenance = json.loads(
+            local_agentic_spec_scaffold_provenance_path.read_text(encoding="utf-8")
+        )
+    except json.JSONDecodeError as exc:
+        return _blocked(
+            "BLOCKED_UNEXPECTED_STRUCTURE",
+            "FIX_OR_RECREATE_LOCAL_AGENTIC_SPEC_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[
+                f"invalid local agentic spec scaffold provenance for planning workspace "
+                f"{plan_id}: {exc.msg}"
+            ],
+        )
+
+    if not isinstance(scaffold_provenance, dict):
+        return _blocked(
+            "BLOCKED_UNEXPECTED_STRUCTURE",
+            "FIX_OR_RECREATE_LOCAL_AGENTIC_SPEC_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[
+                f"invalid local agentic spec scaffold provenance for planning workspace "
+                f"{plan_id}: expected object"
+            ],
+        )
+
+    scaffold_provenance_error = _validate_local_agentic_spec_scaffold_provenance(
+        scaffold_provenance,
+        plan_id=plan_id,
+        intake_id=intake_id,
+    )
+    if scaffold_provenance_error is not None:
+        mismatch = "mismatch" in scaffold_provenance_error
+        return _blocked(
+            "BLOCKED_LOCAL_AGENTIC_SPEC_PROVENANCE_MISMATCH"
+            if mismatch
+            else "BLOCKED_UNEXPECTED_STRUCTURE",
+            "FIX_OR_RECREATE_LOCAL_AGENTIC_SPEC_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[scaffold_provenance_error],
+        )
+
+    if not context_pack_path.is_file():
+        return _blocked(
+            "BLOCKED_UNEXPECTED_STRUCTURE",
+            "FIX_OR_RECREATE_LOCAL_AGENTIC_SPEC_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[f"context-pack.md missing in planning workspace: {plan_id}"],
+        )
+
+    if not local_agentic_spec_path.is_file():
+        return _blocked(
+            "BLOCKED_UNEXPECTED_STRUCTURE",
+            "FIX_OR_RECREATE_LOCAL_AGENTIC_SPEC_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[
+                f"local-agentic-spec.md missing in planning workspace: {plan_id}"
+            ],
+        )
+
+    local_spec_content = local_agentic_spec_path.read_text(encoding="utf-8")
+    if not _is_local_agentic_spec_scaffold_non_authority(local_spec_content, plan_id):
+        return _blocked(
+            "BLOCKED_LOCAL_AGENTIC_SPEC_NOT_SCAFFOLD_DRAFT_NON_AUTHORITY",
+            "FIX_OR_RECREATE_LOCAL_AGENTIC_SPEC_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=None,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+        )
+
+    if not _local_agentic_spec_scaffold_boundary_notes_present(local_spec_content):
+        return _blocked(
+            "BLOCKED_LOCAL_AGENTIC_SPEC_BOUNDARY_NOTES_MISSING",
+            "FIX_OR_RECREATE_LOCAL_AGENTIC_SPEC_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=LOCAL_AGENTIC_SPEC_SCAFFOLD_STATUS,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+        )
+
+    if _local_agentic_spec_has_generated_functional_requirements(local_spec_content):
+        return _blocked(
+            "BLOCKED_LOCAL_AGENTIC_SPEC_ALREADY_HAS_REQUIREMENTS",
+            "FIX_OR_RECREATE_LOCAL_AGENTIC_SPEC_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=LOCAL_AGENTIC_SPEC_SCAFFOLD_STATUS,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+        )
+
+    if _local_agentic_spec_has_user_stories(local_spec_content):
+        return _blocked(
+            "BLOCKED_LOCAL_AGENTIC_SPEC_ALREADY_HAS_USER_STORIES",
+            "FIX_OR_RECREATE_LOCAL_AGENTIC_SPEC_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=LOCAL_AGENTIC_SPEC_SCAFFOLD_STATUS,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+        )
+
+    if _local_agentic_spec_has_generated_acceptance_criteria(local_spec_content):
+        return _blocked(
+            "BLOCKED_LOCAL_AGENTIC_SPEC_ALREADY_HAS_ACCEPTANCE_CRITERIA",
+            "FIX_OR_RECREATE_LOCAL_AGENTIC_SPEC_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=LOCAL_AGENTIC_SPEC_SCAFFOLD_STATUS,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+        )
+
+    if not _local_agentic_spec_contains_only_scaffold_sections(local_spec_content):
+        return _blocked(
+            "BLOCKED_LOCAL_AGENTIC_SPEC_ALREADY_HAS_REQUIREMENTS",
+            "FIX_OR_RECREATE_LOCAL_AGENTIC_SPEC_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=LOCAL_AGENTIC_SPEC_SCAFFOLD_STATUS,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[
+                "local-agentic-spec.md no longer contains only scaffold/pending sections"
+            ],
+        )
+
+    if _local_agentic_spec_has_architecture_decision_language(local_spec_content):
+        return _blocked(
+            "BLOCKED_UNEXPECTED_STRUCTURE",
+            "FIX_OR_RECREATE_LOCAL_AGENTIC_SPEC_SCAFFOLD",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=LOCAL_AGENTIC_SPEC_SCAFFOLD_STATUS,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[
+                "local-agentic-spec appears to contain architecture decision language"
+            ],
+        )
+
+    if not implementation_plan_path.is_file():
+        return _blocked(
+            "BLOCKED_UNEXPECTED_STRUCTURE",
+            "RESTORE_PLANNING_INIT_PLACEHOLDERS",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=LOCAL_AGENTIC_SPEC_SCAFFOLD_STATUS,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[
+                f"implementation-plan.md missing in planning workspace: {plan_id}"
+            ],
+        )
+
+    if not _is_planning_artifact_init_placeholder(
+        implementation_plan_path.read_text(encoding="utf-8"),
+        plan_id,
+        "implementation-plan.md",
+        artifact_type="IMPLEMENTATION_PLAN",
+    ):
+        return _blocked(
+            "BLOCKED_IMPLEMENTATION_PLAN_ALREADY_MODIFIED",
+            "RESTORE_PLANNING_INIT_PLACEHOLDERS",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=LOCAL_AGENTIC_SPEC_SCAFFOLD_STATUS,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+        )
+
+    if not planning_audit_path.is_file():
+        return _blocked(
+            "BLOCKED_UNEXPECTED_STRUCTURE",
+            "RESTORE_PLANNING_INIT_PLACEHOLDERS",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=LOCAL_AGENTIC_SPEC_SCAFFOLD_STATUS,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[
+                f"planning-audit.md missing in planning workspace: {plan_id}"
+            ],
+        )
+
+    if not _is_planning_artifact_init_placeholder(
+        planning_audit_path.read_text(encoding="utf-8"),
+        plan_id,
+        "planning-audit.md",
+        artifact_type="PLANNING_AUDIT",
+        identity_field="auditor",
+    ):
+        return _blocked(
+            "BLOCKED_PLANNING_AUDIT_ALREADY_MODIFIED",
+            "RESTORE_PLANNING_INIT_PLACEHOLDERS",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=LOCAL_AGENTIC_SPEC_SCAFFOLD_STATUS,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+        )
+
+    return _build_requirements_extraction_preflight_report(
+        plan_id=plan_id,
+        intake_id=intake_id,
+        planning_workspace_status=workspace_status,
+        local_agentic_spec_status=LOCAL_AGENTIC_SPEC_SCAFFOLD_STATUS,
+        local_agentic_spec_path=local_agentic_spec_path,
+        local_agentic_spec_scaffold_provenance_path=local_agentic_spec_scaffold_provenance_path,
+        context_pack_path=context_pack_path,
+        context_pack_provenance_path=context_pack_provenance_path,
+        implementation_plan_path=implementation_plan_path,
+        planning_audit_path=planning_audit_path,
+        latest_decision_id=latest_decision_id,
+        latest_decision=latest_decision,
+        source_preflight_state=source_preflight_state,
+        preflight_state=REQUIREMENTS_EXTRACTION_PREFLIGHT_CONFIRMED_STATE,
+        next_required_action=REQUIREMENTS_EXTRACTION_PREFLIGHT_CONFIRMED_NEXT_ACTION,
+        blocking_reasons=[],
+        checked_at=checked_at,
         non_authority=non_authority,
     )
 

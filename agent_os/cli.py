@@ -16,6 +16,7 @@ from agent_os.orchestrator import (
     goal_intake_status,
     preflight_draft_preparation,
     preflight_local_agentic_spec_draft,
+    preflight_requirements_extraction,
     prepare_planning_workspace_draft,
     review_goal_intake_readiness,
     scaffold_local_agentic_spec_from_context_pack,
@@ -433,6 +434,25 @@ def cmd_orchestrator_scaffold_local_agentic_spec(args: argparse.Namespace) -> in
         return 1
     print(report.output)
     return 0
+
+
+def cmd_orchestrator_requirements_extraction_preflight(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        report = preflight_requirements_extraction(
+            project,
+            args.intake_id,
+            args.plan_id,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(report.output)
+    confirmed = (
+        report.preflight_state
+        == "REQUIREMENTS_EXTRACTION_PREFLIGHT_CONFIRMED_NO_REQUIREMENTS_GENERATED"
+    )
+    return 0 if confirmed else 1
 
 
 def cmd_orchestrator_clarify(args: argparse.Namespace) -> int:
@@ -1044,6 +1064,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     orchestrator_scaffold_local_agentic_spec_parser.set_defaults(
         func=cmd_orchestrator_scaffold_local_agentic_spec
+    )
+
+    orchestrator_requirements_extraction_preflight_parser = orchestrator_sub.add_parser(
+        "requirements-extraction-preflight",
+        help="read-only requirements extraction eligibility preflight (no requirements)",
+        description=(
+            "Read-only preflight for whether a future requirements extraction "
+            "command may be allowed in a DRAFT planning workspace with a coherent "
+            "local-agentic-spec scaffold. Verifies authorization, provenance, "
+            "transport, context-pack draft provenance, scaffold provenance, "
+            "local-agentic-spec scaffold boundaries, and planning init placeholders "
+            "for implementation-plan and planning-audit only. Does not call an LLM, "
+            "extract or infer requirements, generate user stories or acceptance "
+            "criteria, generate architecture decisions, generate an implementation "
+            "plan, generate PLANNING_RUN_SLICE, validate or approve the workspace, "
+            "transition status, create runner proposals, create runs, or invoke "
+            "an executor."
+        ),
+    )
+    orchestrator_requirements_extraction_preflight_parser.add_argument(
+        "intake_id",
+        help="intake identifier (filesystem-safe slug)",
+    )
+    orchestrator_requirements_extraction_preflight_parser.add_argument(
+        "path",
+        nargs="?",
+        help="target project directory",
+    )
+    orchestrator_requirements_extraction_preflight_parser.add_argument(
+        "--plan-id",
+        required=True,
+        help="planning workspace identifier (filesystem-safe slug)",
+    )
+    orchestrator_requirements_extraction_preflight_parser.set_defaults(
+        func=cmd_orchestrator_requirements_extraction_preflight
     )
 
     return parser

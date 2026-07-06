@@ -299,6 +299,14 @@ Requires an existing DRAFT scaffold with matching orchestrator provenance, conte
 
 The local-agentic-spec scaffold provides structure, provenance references, and explicit boundaries only; it does **not** extract or infer requirements, generate user stories or acceptance criteria, generate architecture, implementation plan, or `PLANNING_RUN_SLICE`; does **not** validate or approve the workspace; does **not** transition status; does **not** create runner proposals, runs, or executor invocations; and does **not** mutate orchestrator intake artifacts, transport artifacts, context-pack draft provenance, `context-pack.md`, `implementation-plan.md`, or `planning-audit.md`. **Local-agentic-spec scaffold is not requirements extraction** — not spec approval, not architecture decision, not implementation planning. The planning workspace remains **`DRAFT`** — it is **not validated or approved**. Future requirements extraction, architecture decision, implementation plan, independent validation, and owner approval remain required. Runner proposal generation remains future/separate work.
 
+After a coherent local-agentic-spec scaffold exists, run read-only requirements extraction eligibility preflight:
+
+```bash
+agent-os orchestrator requirements-extraction-preflight <intake-id> --plan-id <plan-id> [PATH]
+```
+
+Requires an existing DRAFT scaffold with matching orchestrator provenance, context transport artifacts, context-pack draft provenance, and local-agentic-spec scaffold provenance for the same intake/plan pair; confirmed draft-preparation authorization; `local-agentic-spec.md` labeled `SCAFFOLD_DRAFT_NON_AUTHORITY` with required boundary notes and only scaffold/pending sections; and `implementation-plan.md` and `planning-audit.md` still in planning init placeholder shape. **Does not write any artifact** — read-only gate only. Requirements extraction preflight does **not** extract or infer requirements; does **not** generate user stories or acceptance criteria; does **not** generate architecture decisions, implementation plans, or `PLANNING_RUN_SLICE`; does **not** validate or approve the workspace; does **not** transition status; does **not** create runner proposals, runs, or executor invocations; and does **not** mutate orchestrator intake artifacts, transport artifacts, context-pack draft provenance, local-agentic-spec scaffold provenance, `context-pack.md`, `local-agentic-spec.md`, `implementation-plan.md`, or `planning-audit.md`. **Successful preflight is not requirements extraction** — not spec approval, not architecture decision, not implementation planning, not validation or approval. A separate future requirements extraction command remains required. Future architecture decision, implementation plan, independent validation, and owner approval remain required.
+
 Inspect an existing planning workspace (read-only):
 
 ```bash
