@@ -11,6 +11,7 @@ PLANNING_DIR = "planning"
 ORCHESTRATOR_DIR = "orchestrator"
 INTAKES_DIR = "intakes"
 GOAL_INTAKE_FILE = "goal-intake.json"
+CLARIFICATIONS_DIR = "clarifications"
 META_FILE = "run.json"
 
 PLACEHOLDER_VALUES = frozenset(
@@ -50,6 +51,18 @@ def planning_path(project: Path, plan_id: str) -> Path:
 
 def orchestrator_intake_path(project: Path, intake_id: str) -> Path:
     return workspace_path(project) / ORCHESTRATOR_DIR / INTAKES_DIR / intake_id
+
+
+def orchestrator_clarification_path(
+    project: Path,
+    intake_id: str,
+    clarification_id: str,
+) -> Path:
+    return (
+        orchestrator_intake_path(project, intake_id)
+        / CLARIFICATIONS_DIR
+        / f"{clarification_id}.json"
+    )
 
 
 def run_path(project: Path, run_id: str) -> Path:

@@ -8,9 +8,16 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from agent_os.paths import GOAL_INTAKE_FILE, orchestrator_intake_path, workspace_path
+from agent_os.paths import (
+    CLARIFICATIONS_DIR,
+    GOAL_INTAKE_FILE,
+    orchestrator_clarification_path,
+    orchestrator_intake_path,
+    workspace_path,
+)
 
 INTAKE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+CLARIFICATION_ID_PATTERN = INTAKE_ID_PATTERN
 
 GOAL_INTAKE_REQUIRED_FIELDS = (
     "artifact_type",
@@ -47,6 +54,35 @@ GOAL_INTAKE_SCHEMA_VERSION = "0.1"
 GOAL_INTAKE_AMBIGUITY_LEVELS = frozenset({"LOW", "MEDIUM", "HIGH"})
 GOAL_INTAKE_PLANNING_READINESS = frozenset(
     {"NOT_READY", "DRAFT_ALLOWED", "REQUIRES_CLARIFICATION"}
+)
+
+OWNER_CLARIFICATION_ARTIFACT_TYPE = "OWNER_CLARIFICATION"
+OWNER_CLARIFICATION_SCHEMA_VERSION = "0.1"
+
+OWNER_CLARIFICATION_REQUIRED_FIELDS = (
+    "artifact_type",
+    "schema_version",
+    "intake_id",
+    "clarification_id",
+    "owner_answer",
+    "applies_to_open_questions",
+    "explicit_constraints_added",
+    "non_goals_added",
+    "risk_notes",
+    "created_at",
+    "non_authority",
+)
+
+OWNER_CLARIFICATION_NON_AUTHORITY_FLAGS = (
+    "does_not_create_plan",
+    "does_not_validate_workspace",
+    "does_not_approve_plan",
+    "does_not_transition_workspace",
+    "does_not_create_runner_proposal",
+    "does_not_create_run",
+    "does_not_invoke_executor",
+    "does_not_mark_intake_draft_ready",
+    "does_not_modify_goal_intake",
 )
 
 GOAL_INTAKE_REQUIRED_STRING_FIELDS = (
@@ -99,6 +135,28 @@ def validate_intake_id(intake_id: str) -> None:
         raise ValueError(f"invalid intake id: {intake_id!r}")
     if not INTAKE_ID_PATTERN.match(intake_id):
         raise ValueError(f"invalid intake id: {intake_id!r}")
+
+
+def validate_clarification_id(clarification_id: str) -> None:
+    """Reject unsafe or invalid clarification identifiers."""
+    if not clarification_id:
+        raise ValueError("clarification id must not be empty")
+    if clarification_id != clarification_id.strip():
+        raise ValueError(
+            "clarification id must not contain leading or trailing whitespace"
+        )
+    if " " in clarification_id:
+        raise ValueError(f"invalid clarification id: {clarification_id!r}")
+    if "/" in clarification_id or "\\" in clarification_id or ".." in clarification_id:
+        raise ValueError(f"invalid clarification id: {clarification_id!r}")
+    if clarification_id.startswith(".") or any(
+        part.startswith(".") for part in re.split(r"[\\/]", clarification_id)
+    ):
+        raise ValueError(f"invalid clarification id: {clarification_id!r}")
+    if Path(clarification_id).is_absolute():
+        raise ValueError(f"invalid clarification id: {clarification_id!r}")
+    if not CLARIFICATION_ID_PATTERN.match(clarification_id):
+        raise ValueError(f"invalid clarification id: {clarification_id!r}")
 
 
 def normalize_goal(raw_goal: str) -> str:
@@ -166,6 +224,40 @@ def build_goal_intake_artifact(
 
 def _goal_intake_artifact_path(project: Path, intake_id: str) -> Path:
     return orchestrator_intake_path(project, intake_id) / GOAL_INTAKE_FILE
+
+
+def _require_valid_goal_intake(project: Path, intake_id: str) -> tuple[Path, dict]:
+    """Load a GOAL_INTAKE artifact and fail closed when structurally invalid."""
+    validate_intake_id(intake_id)
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        raise FileNotFoundError("no workspace found (run `agent-os init` first)")
+
+    path = _goal_intake_artifact_path(project, intake_id)
+    if not path.is_file():
+        raise FileNotFoundError(f"goal intake artifact not found: {intake_id}")
+
+    raw_text = path.read_text(encoding="utf-8")
+    try:
+        artifact = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"invalid goal-intake.json for intake {intake_id}: {exc.msg}"
+        ) from exc
+
+    errors = _validate_goal_intake_payload(artifact, intake_id, raw_text=raw_text)
+    if errors:
+        raise ValueError(
+            f"invalid goal intake artifact for {intake_id}: " + "; ".join(errors)
+        )
+
+    if not isinstance(artifact, dict):
+        raise ValueError(
+            f"invalid goal-intake.json for intake {intake_id}: expected object"
+        )
+
+    return path, artifact
 
 
 def _parse_created_at(value: object) -> bool:
@@ -367,6 +459,7 @@ def _format_goal_intake_status(
     path: Path,
     artifact: dict,
     validation_errors: list[str],
+    clarifications: tuple[OwnerClarificationRecord, ...] = (),
 ) -> str:
     goal_text = artifact.get("normalized_goal") or artifact.get("raw_goal") or "?"
     open_questions = artifact.get("open_questions")
@@ -384,11 +477,20 @@ def _format_goal_intake_status(
         f"planning_readiness: {artifact.get('planning_readiness', '?')}",
         f"open_questions: {open_count}",
         f"risk_flags: {risk_count}",
-        f"validation: {'OK' if not validation_errors else 'INVALID'}",
+        f"owner_clarifications: {len(clarifications)}",
     ]
+    if clarifications:
+        latest = clarifications[-1]
+        lines.append(f"latest_clarification_id: {latest.clarification_id}")
+        lines.append(f"latest_clarification_created_at: {latest.created_at}")
+    lines.append(f"validation: {'OK' if not validation_errors else 'INVALID'}")
     for error in validation_errors:
         lines.append(f"  - {error}")
     lines.append("next step: no planning draft was created")
+    lines.append(
+        "note: owner clarifications are additive context only; "
+        "they do not create a planning draft and do not change planning_readiness"
+    )
     lines.append(
         "note: read-only inspection; validation is not approval or planning generation"
     )
@@ -425,8 +527,287 @@ def goal_intake_status(project: Path, intake_id: str) -> GoalIntakeStatusReport:
         intake_id,
         raw_text=raw_text,
     )
-    output = _format_goal_intake_status(path, artifact, validation_errors)
+    clarifications = list_owner_clarifications(project, intake_id)
+    output = _format_goal_intake_status(
+        path,
+        artifact,
+        validation_errors,
+        clarifications,
+    )
     return GoalIntakeStatusReport(output, not validation_errors)
+
+
+@dataclass(frozen=True)
+class OwnerClarificationRecord:
+    clarification_id: str
+    created_at: str
+    path: Path
+
+
+@dataclass(frozen=True)
+class OwnerClarificationValidationReport:
+    output: str
+    valid: bool
+    errors: tuple[str, ...]
+
+
+def build_owner_clarification_artifact(
+    intake_id: str,
+    clarification_id: str,
+    owner_answer: str,
+    *,
+    created_at: str | None = None,
+) -> dict:
+    """Build the deterministic OWNER_CLARIFICATION artifact payload."""
+    validate_intake_id(intake_id)
+    validate_clarification_id(clarification_id)
+    if not owner_answer or not owner_answer.strip():
+        raise ValueError("clarification answer must not be empty or whitespace-only")
+
+    return {
+        "artifact_type": OWNER_CLARIFICATION_ARTIFACT_TYPE,
+        "schema_version": OWNER_CLARIFICATION_SCHEMA_VERSION,
+        "intake_id": intake_id,
+        "clarification_id": clarification_id,
+        "owner_answer": owner_answer,
+        "applies_to_open_questions": [],
+        "explicit_constraints_added": [],
+        "non_goals_added": [],
+        "risk_notes": [],
+        "created_at": created_at or _utc_now(),
+        "non_authority": {
+            key: True for key in OWNER_CLARIFICATION_NON_AUTHORITY_FLAGS
+        },
+    }
+
+
+def _validate_owner_clarification_payload(
+    artifact: object,
+    intake_id: str,
+    clarification_id: str,
+) -> list[str]:
+    """Return structural validation errors for a loaded OWNER_CLARIFICATION payload."""
+    errors: list[str] = []
+
+    if not isinstance(artifact, dict):
+        return ["owner clarification artifact must be a JSON object"]
+
+    for field in OWNER_CLARIFICATION_REQUIRED_FIELDS:
+        if field not in artifact:
+            errors.append(f"missing required field: {field}")
+
+    artifact_type = artifact.get("artifact_type")
+    if artifact_type is not None and artifact_type != OWNER_CLARIFICATION_ARTIFACT_TYPE:
+        errors.append(
+            f"wrong artifact_type: expected {OWNER_CLARIFICATION_ARTIFACT_TYPE!r}, "
+            f"found {artifact_type!r}"
+        )
+
+    schema_version = artifact.get("schema_version")
+    if schema_version is not None and schema_version != OWNER_CLARIFICATION_SCHEMA_VERSION:
+        errors.append(
+            f"unsupported schema_version: expected "
+            f"{OWNER_CLARIFICATION_SCHEMA_VERSION!r}, found {schema_version!r}"
+        )
+
+    artifact_intake_id = artifact.get("intake_id")
+    if isinstance(artifact_intake_id, str) and artifact_intake_id != intake_id:
+        errors.append(
+            "intake_id mismatch: "
+            f"path {intake_id!r}, artifact {artifact_intake_id!r}"
+        )
+
+    artifact_clarification_id = artifact.get("clarification_id")
+    if (
+        isinstance(artifact_clarification_id, str)
+        and artifact_clarification_id != clarification_id
+    ):
+        errors.append(
+            "clarification_id mismatch: "
+            f"path {clarification_id!r}, artifact {artifact_clarification_id!r}"
+        )
+
+    owner_answer = artifact.get("owner_answer")
+    if owner_answer is not None:
+        error = _non_empty_string(owner_answer, "owner_answer")
+        if error:
+            errors.append(error)
+
+    for field in (
+        "applies_to_open_questions",
+        "explicit_constraints_added",
+        "non_goals_added",
+        "risk_notes",
+    ):
+        if field in artifact and not isinstance(artifact[field], list):
+            errors.append(f"{field} must be a list")
+
+    created_at = artifact.get("created_at")
+    if created_at is not None and not _parse_created_at(created_at):
+        errors.append("created_at must be a parseable ISO-8601 timestamp")
+
+    non_authority = artifact.get("non_authority")
+    if non_authority is None:
+        errors.append("missing required field: non_authority")
+    elif not isinstance(non_authority, dict):
+        errors.append("non_authority must be an object")
+    else:
+        for flag in OWNER_CLARIFICATION_NON_AUTHORITY_FLAGS:
+            if flag not in non_authority:
+                errors.append(f"missing non_authority flag: {flag}")
+            elif non_authority[flag] is not True:
+                errors.append(f"non_authority flag must be true: {flag}")
+
+    return errors
+
+
+def create_owner_clarification(
+    project: Path,
+    intake_id: str,
+    clarification_id: str,
+    owner_answer: str,
+) -> Path:
+    """Create an OWNER_CLARIFICATION artifact without modifying goal-intake.json."""
+    artifact = build_owner_clarification_artifact(
+        intake_id,
+        clarification_id,
+        owner_answer,
+    )
+    _require_valid_goal_intake(project, intake_id)
+
+    dest = orchestrator_clarification_path(project, intake_id, clarification_id)
+    if dest.exists():
+        raise FileExistsError(
+            f"owner clarification artifact already exists: {clarification_id}"
+        )
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(dest, artifact)
+    return dest
+
+
+def load_owner_clarification(
+    project: Path,
+    intake_id: str,
+    clarification_id: str,
+) -> dict:
+    """Load an OWNER_CLARIFICATION artifact from disk (read-only)."""
+    validate_intake_id(intake_id)
+    validate_clarification_id(clarification_id)
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        raise FileNotFoundError("no workspace found (run `agent-os init` first)")
+
+    path = orchestrator_clarification_path(project, intake_id, clarification_id)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"owner clarification artifact not found: {clarification_id}"
+        )
+
+    try:
+        artifact = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"invalid clarification artifact for {clarification_id}: {exc.msg}"
+        ) from exc
+
+    if not isinstance(artifact, dict):
+        raise ValueError(
+            f"invalid clarification artifact for {clarification_id}: expected object"
+        )
+
+    return artifact
+
+
+def list_owner_clarifications(
+    project: Path,
+    intake_id: str,
+) -> tuple[OwnerClarificationRecord, ...]:
+    """List owner clarification records for an intake (read-only)."""
+    validate_intake_id(intake_id)
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        raise FileNotFoundError("no workspace found (run `agent-os init` first)")
+
+    clarifications_dir = orchestrator_intake_path(project, intake_id) / CLARIFICATIONS_DIR
+    if not clarifications_dir.is_dir():
+        return ()
+
+    records: list[OwnerClarificationRecord] = []
+    for path in sorted(clarifications_dir.glob("*.json")):
+        clarification_id = path.stem
+        try:
+            artifact = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(artifact, dict):
+            continue
+        created_at = artifact.get("created_at")
+        if not isinstance(created_at, str):
+            created_at = ""
+        records.append(
+            OwnerClarificationRecord(
+                clarification_id=clarification_id,
+                created_at=created_at,
+                path=path,
+            )
+        )
+
+    records.sort(key=lambda record: (record.created_at, record.clarification_id))
+    return tuple(records)
+
+
+def validate_owner_clarification(
+    project: Path,
+    intake_id: str,
+    clarification_id: str,
+) -> OwnerClarificationValidationReport:
+    """Strict read-only structural validation of an OWNER_CLARIFICATION artifact."""
+    validate_intake_id(intake_id)
+    validate_clarification_id(clarification_id)
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        raise FileNotFoundError("no workspace found (run `agent-os init` first)")
+
+    path = orchestrator_clarification_path(project, intake_id, clarification_id)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"owner clarification artifact not found: {clarification_id}"
+        )
+
+    raw_text = path.read_text(encoding="utf-8")
+    errors: list[str] = []
+    try:
+        artifact = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        errors = [f"malformed JSON: {exc.msg}"]
+    else:
+        errors = _validate_owner_clarification_payload(
+            artifact,
+            intake_id,
+            clarification_id,
+        )
+
+    lines = [
+        f"owner clarification artifact: {path}",
+        f"intake_id: {intake_id}",
+        f"clarification_id: {clarification_id}",
+        f"structural validation: {'OK' if not errors else 'INVALID'}",
+    ]
+    for error in errors:
+        lines.append(f"  - {error}")
+    lines.append(f"final validation result: {'OK' if not errors else 'INVALID'}")
+    if not errors:
+        lines.append(
+            "note: clarification is owner-provided context only; "
+            "not approval, not planning generation, and goal-intake.json was not modified"
+        )
+
+    output = "\n".join(lines)
+    return OwnerClarificationValidationReport(output, not errors, tuple(errors))
 
 
 def create_goal_intake(project: Path, intake_id: str, raw_goal: str) -> Path:

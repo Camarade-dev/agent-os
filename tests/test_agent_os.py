@@ -17,15 +17,31 @@ from agent_os.cli import build_parser, main
 from agent_os.orchestrator import (
     GOAL_INTAKE_NON_AUTHORITY_FLAGS,
     GOAL_INTAKE_REQUIRED_FIELDS,
+    OWNER_CLARIFICATION_NON_AUTHORITY_FLAGS,
+    OWNER_CLARIFICATION_REQUIRED_FIELDS,
     build_goal_intake_artifact,
+    build_owner_clarification_artifact,
     create_goal_intake,
+    create_owner_clarification,
     goal_intake_status,
+    list_owner_clarifications,
     load_goal_intake,
+    load_owner_clarification,
     normalize_goal,
+    validate_clarification_id,
     validate_goal_intake,
     validate_intake_id,
+    validate_owner_clarification,
 )
-from agent_os.paths import GOAL_INTAKE_FILE, TEMPLATE_FILES, orchestrator_intake_path, planning_path, run_path
+from agent_os.paths import (
+    CLARIFICATIONS_DIR,
+    GOAL_INTAKE_FILE,
+    TEMPLATE_FILES,
+    orchestrator_clarification_path,
+    orchestrator_intake_path,
+    planning_path,
+    run_path,
+)
 from agent_os import planning as planning_module
 from agent_os.planning import (
     init_planning_workspace,
@@ -4179,6 +4195,9 @@ class OrchestratorGoalIntakeStatusValidationTests(unittest.TestCase):
         self.assertIn("schema_version: 0.1", output)
         self.assertIn("ambiguity_level: HIGH", output)
         self.assertIn("planning_readiness: REQUIRES_CLARIFICATION", output)
+        self.assertIn("owner_clarifications: 0", output)
+        self.assertNotIn("latest_clarification_id:", output)
+        self.assertNotIn("latest_clarification_created_at:", output)
         self.assertIn("validation: OK", output)
         self.assertIn("no planning draft was created", output)
         self.assertEqual(original, artifact_path.read_text(encoding="utf-8"))
@@ -4591,6 +4610,576 @@ class OrchestratorGoalIntakeStatusValidationTests(unittest.TestCase):
             import shutil
 
             shutil.rmtree(bare)
+
+
+class OrchestratorOwnerClarificationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self._tmp.name)
+        init_workspace(self.project)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _artifact_path(self, intake_id: str) -> Path:
+        return orchestrator_intake_path(self.project, intake_id) / GOAL_INTAKE_FILE
+
+    def _clarification_path(self, intake_id: str, clarification_id: str) -> Path:
+        return orchestrator_clarification_path(
+            self.project,
+            intake_id,
+            clarification_id,
+        )
+
+    def _create_slither_intake(self, intake_id: str = "slither-demo") -> Path:
+        return create_goal_intake(
+            self.project,
+            intake_id,
+            "Build me an online slither.io-like game",
+        )
+
+    def _write_artifact(self, intake_id: str, artifact: dict) -> Path:
+        path = self._artifact_path(intake_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+        return path
+
+    def test_orchestrator_clarify_creates_expected_owner_clarification_artifact(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        clarification_id = "scope-v1"
+        answer = "Target 20 players per room; browser-only MVP."
+        self._create_slither_intake(intake_id)
+
+        dest = create_owner_clarification(
+            self.project,
+            intake_id,
+            clarification_id,
+            answer,
+        )
+
+        self.assertEqual(dest, self._clarification_path(intake_id, clarification_id))
+        self.assertTrue(dest.is_file())
+        artifact = json.loads(dest.read_text(encoding="utf-8"))
+        self.assertEqual(artifact["artifact_type"], "OWNER_CLARIFICATION")
+        self.assertEqual(artifact["schema_version"], "0.1")
+        self.assertEqual(artifact["applies_to_open_questions"], [])
+        self.assertEqual(artifact["explicit_constraints_added"], [])
+        self.assertEqual(artifact["non_goals_added"], [])
+        self.assertEqual(artifact["risk_notes"], [])
+
+    def test_owner_clarification_artifact_contains_all_required_fields(self) -> None:
+        artifact = build_owner_clarification_artifact(
+            "slither-demo",
+            "scope-v1",
+            "Browser-only MVP.",
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        missing = [
+            field
+            for field in OWNER_CLARIFICATION_REQUIRED_FIELDS
+            if field not in artifact
+        ]
+        self.assertEqual(missing, [])
+        self.assertEqual(artifact["applies_to_open_questions"], [])
+        self.assertEqual(artifact["explicit_constraints_added"], [])
+        self.assertEqual(artifact["non_goals_added"], [])
+        self.assertEqual(artifact["risk_notes"], [])
+
+    def test_owner_answer_preserves_exact_input(self) -> None:
+        intake_id = "slither-demo"
+        answer = "  Target 20\tplayers per room.\n\nBrowser-only MVP.  "
+        self._create_slither_intake(intake_id)
+
+        create_owner_clarification(self.project, intake_id, "scope-v1", answer)
+        artifact = load_owner_clarification(self.project, intake_id, "scope-v1")
+        self.assertEqual(artifact["owner_answer"], answer)
+
+    def test_clarification_creation_preserves_goal_intake_byte_for_byte(self) -> None:
+        intake_id = "slither-demo"
+        artifact_path = self._create_slither_intake(intake_id)
+        original = artifact_path.read_bytes()
+
+        create_owner_clarification(
+            self.project,
+            intake_id,
+            "scope-v1",
+            "Browser-only MVP.",
+        )
+
+        self.assertEqual(original, artifact_path.read_bytes())
+
+    def test_clarification_creation_requires_valid_goal_intake(self) -> None:
+        intake_id = "invalid-intake"
+        artifact = build_goal_intake_artifact(
+            intake_id,
+            "Build a game",
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        artifact["artifact_type"] = "PLANNING_WORKSPACE_DRAFT"
+        self._write_artifact(intake_id, artifact)
+
+        with self.assertRaises(ValueError) as ctx:
+            create_owner_clarification(
+                self.project,
+                intake_id,
+                "scope-v1",
+                "Browser-only MVP.",
+            )
+        self.assertIn("invalid goal intake artifact", str(ctx.exception))
+        self.assertFalse(self._clarification_path(intake_id, "scope-v1").exists())
+
+    def test_clarify_missing_workspace_fails_without_orchestrator_tree(self) -> None:
+        bare = Path(tempfile.mkdtemp())
+        try:
+            with self.assertRaises(FileNotFoundError):
+                create_owner_clarification(
+                    bare,
+                    "slither-demo",
+                    "scope-v1",
+                    "Browser-only MVP.",
+                )
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                code = main(
+                    [
+                        "orchestrator",
+                        "clarify",
+                        "slither-demo",
+                        str(bare),
+                        "--clarification-id",
+                        "scope-v1",
+                        "--answer",
+                        "Browser-only MVP.",
+                    ]
+                )
+            self.assertEqual(code, 1)
+            self.assertIn("no workspace found", buf.getvalue())
+            self.assertFalse((bare / ".agent-os" / "orchestrator").exists())
+        finally:
+            import shutil
+
+            shutil.rmtree(bare)
+
+    def test_clarify_rejects_invalid_intake_id_without_creating_artifacts(self) -> None:
+        intake_id = "../escape"
+        clarification_id = "scope-v1"
+        self._create_slither_intake("slither-demo")
+        before = {
+            path.relative_to(self.project).as_posix()
+            for path in self.project.rglob("*")
+            if path.is_file()
+        }
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "clarify",
+                    intake_id,
+                    str(self.project),
+                    "--clarification-id",
+                    clarification_id,
+                    "--answer",
+                    "Escape attempt.",
+                ]
+            )
+
+        self.assertEqual(code, 1)
+        self.assertIn("invalid intake id", buf.getvalue())
+        self.assertFalse(self._clarification_path(intake_id, clarification_id).exists())
+        self.assertFalse(
+            (self.project / ".agent-os" / "orchestrator" / "intakes" / "escape").exists()
+        )
+        after = {
+            path.relative_to(self.project).as_posix()
+            for path in self.project.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(before, after)
+
+    def test_clarify_missing_intake_fails_without_clarification_artifact(self) -> None:
+        clarifications_dir = (
+            self.project
+            / ".agent-os"
+            / "orchestrator"
+            / "intakes"
+            / "missing-intake"
+            / CLARIFICATIONS_DIR
+        )
+
+        with self.assertRaises(FileNotFoundError):
+            create_owner_clarification(
+                self.project,
+                "missing-intake",
+                "scope-v1",
+                "Browser-only MVP.",
+            )
+
+        self.assertFalse(clarifications_dir.exists())
+
+    def test_clarify_invalid_intake_artifact_fails_without_clarification_artifact(
+        self,
+    ) -> None:
+        intake_id = "broken-intake"
+        path = self._artifact_path(intake_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not-json", encoding="utf-8")
+
+        with self.assertRaises(ValueError):
+            create_owner_clarification(
+                self.project,
+                intake_id,
+                "scope-v1",
+                "Browser-only MVP.",
+            )
+
+        self.assertFalse(self._clarification_path(intake_id, "scope-v1").exists())
+
+    def test_clarify_rejects_empty_answer(self) -> None:
+        intake_id = "slither-demo"
+        self._create_slither_intake(intake_id)
+
+        with self.assertRaises(ValueError):
+            create_owner_clarification(self.project, intake_id, "scope-v1", "   ")
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "clarify",
+                    intake_id,
+                    str(self.project),
+                    "--clarification-id",
+                    "scope-v1",
+                    "--answer",
+                    "",
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("clarification answer must not be empty", buf.getvalue())
+        self.assertFalse(self._clarification_path(intake_id, "scope-v1").exists())
+
+    def test_clarify_rejects_invalid_clarification_ids(self) -> None:
+        intake_id = "slither-demo"
+        self._create_slither_intake(intake_id)
+        invalid_ids = ["", "../x", "a/b", "my plan", ".hidden", "-bad", "Bad", "a.b"]
+
+        for clarification_id in invalid_ids:
+            with self.subTest(clarification_id=clarification_id):
+                with self.assertRaises(ValueError):
+                    validate_clarification_id(clarification_id)
+                if not clarification_id or clarification_id.startswith("-"):
+                    continue
+                buf = io.StringIO()
+                with redirect_stderr(buf):
+                    code = main(
+                        [
+                            "orchestrator",
+                            "clarify",
+                            intake_id,
+                            str(self.project),
+                            "--clarification-id",
+                            clarification_id,
+                            "--answer",
+                            "Browser-only MVP.",
+                        ]
+                    )
+                self.assertEqual(code, 1)
+                self.assertTrue(buf.getvalue().strip())
+
+    def test_clarify_refuses_to_overwrite_existing_clarification(self) -> None:
+        intake_id = "slither-demo"
+        clarification_id = "scope-v1"
+        self._create_slither_intake(intake_id)
+        create_owner_clarification(
+            self.project,
+            intake_id,
+            clarification_id,
+            "First answer.",
+        )
+        clarification_path = self._clarification_path(intake_id, clarification_id)
+        original = clarification_path.read_text(encoding="utf-8")
+
+        with self.assertRaises(FileExistsError):
+            create_owner_clarification(
+                self.project,
+                intake_id,
+                clarification_id,
+                "Second answer.",
+            )
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "clarify",
+                    intake_id,
+                    str(self.project),
+                    "--clarification-id",
+                    clarification_id,
+                    "--answer",
+                    "Second answer.",
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("already exists", buf.getvalue())
+        self.assertEqual(original, clarification_path.read_text(encoding="utf-8"))
+
+    def test_clarify_rejects_path_escape_attempts(self) -> None:
+        intake_id = "slither-demo"
+        self._create_slither_intake(intake_id)
+
+        with self.assertRaises(ValueError):
+            create_owner_clarification(
+                self.project,
+                intake_id,
+                "../escape",
+                "Escape attempt.",
+            )
+
+        clarifications_dir = orchestrator_intake_path(self.project, intake_id) / CLARIFICATIONS_DIR
+        self.assertFalse(clarifications_dir.exists())
+
+    def test_owner_clarification_includes_all_non_authority_flags(self) -> None:
+        artifact = build_owner_clarification_artifact(
+            "slither-demo",
+            "scope-v1",
+            "Browser-only MVP.",
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        self.assertEqual(
+            set(artifact["non_authority"]),
+            set(OWNER_CLARIFICATION_NON_AUTHORITY_FLAGS),
+        )
+        self.assertTrue(all(artifact["non_authority"].values()))
+
+    def test_clarification_creation_does_not_change_planning_readiness(self) -> None:
+        intake_id = "slither-demo"
+        artifact_path = self._create_slither_intake(intake_id)
+        before = json.loads(artifact_path.read_text(encoding="utf-8"))[
+            "planning_readiness"
+        ]
+
+        create_owner_clarification(
+            self.project,
+            intake_id,
+            "scope-v1",
+            "Browser-only MVP.",
+        )
+
+        after = json.loads(artifact_path.read_text(encoding="utf-8"))["planning_readiness"]
+        self.assertEqual(before, after)
+        self.assertEqual(before, "REQUIRES_CLARIFICATION")
+
+    def test_clarification_creation_does_not_create_planning_artifacts(self) -> None:
+        intake_id = "slither-demo"
+        self._create_slither_intake(intake_id)
+        forbidden_names = set(planning_module.PLANNING_ARTIFACT_FILES)
+
+        create_owner_clarification(
+            self.project,
+            intake_id,
+            "scope-v1",
+            "Browser-only MVP.",
+        )
+
+        created_names = {path.name for path in self.project.rglob("*") if path.is_file()}
+        self.assertTrue(forbidden_names.isdisjoint(created_names))
+        self.assertFalse((self.project / ".agent-os" / "planning").exists())
+
+    def test_clarification_creation_does_not_create_planning_run_slice(self) -> None:
+        intake_id = "slither-demo"
+        self._create_slither_intake(intake_id)
+
+        create_owner_clarification(
+            self.project,
+            intake_id,
+            "scope-v1",
+            "Browser-only MVP.",
+        )
+
+        combined = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in self.project.rglob("*")
+            if path.is_file()
+        )
+        self.assertNotIn("PLANNING_RUN_SLICE", combined)
+
+    def test_clarification_creation_does_not_create_runs(self) -> None:
+        intake_id = "slither-demo"
+        workspace = self.project / ".agent-os"
+        before_runs = list((workspace / "runs").iterdir())
+        self._create_slither_intake(intake_id)
+
+        create_owner_clarification(
+            self.project,
+            intake_id,
+            "scope-v1",
+            "Browser-only MVP.",
+        )
+
+        after_runs = list((workspace / "runs").iterdir())
+        self.assertEqual(before_runs, after_runs)
+
+    def test_clarification_creation_does_not_invoke_external_subprocess(self) -> None:
+        intake_id = "slither-demo"
+        self._create_slither_intake(intake_id)
+
+        with patch("subprocess.run", side_effect=AssertionError("subprocess invoked")):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = main(
+                    [
+                        "orchestrator",
+                        "clarify",
+                        intake_id,
+                        str(self.project),
+                        "--clarification-id",
+                        "scope-v1",
+                        "--answer",
+                        "Browser-only MVP.",
+                    ]
+                )
+        self.assertEqual(code, 0)
+        self.assertTrue(self._clarification_path(intake_id, "scope-v1").is_file())
+
+    def test_orchestrator_status_reports_latest_after_two_clarifications_read_only(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        artifact_path = self._create_slither_intake(intake_id)
+        original_intake = artifact_path.read_text(encoding="utf-8")
+        create_owner_clarification(
+            self.project,
+            intake_id,
+            "players-v2",
+            "Target 20 players per room.",
+        )
+        create_owner_clarification(
+            self.project,
+            intake_id,
+            "scope-v1",
+            "Browser-only MVP.",
+        )
+        records = list_owner_clarifications(self.project, intake_id)
+        self.assertEqual(len(records), 2)
+        latest = records[-1]
+        clarification_paths = {
+            path.relative_to(self.project).as_posix(): path.read_text(encoding="utf-8")
+            for path in self.project.rglob("clarifications/*.json")
+        }
+        before = {
+            path.relative_to(self.project).as_posix()
+            for path in self.project.rglob("*")
+            if path.is_file()
+        }
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["orchestrator", "status", intake_id, str(self.project)])
+
+        self.assertEqual(code, 0)
+        output = buf.getvalue()
+        self.assertIn("owner_clarifications: 2", output)
+        self.assertIn(f"latest_clarification_id: {latest.clarification_id}", output)
+        self.assertIn(
+            f"latest_clarification_created_at: {latest.created_at}",
+            output,
+        )
+        self.assertIn(
+            "they do not create a planning draft and do not change planning_readiness",
+            output,
+        )
+        self.assertEqual(original_intake, artifact_path.read_text(encoding="utf-8"))
+        for rel_path, original_text in clarification_paths.items():
+            current = (self.project / rel_path).read_text(encoding="utf-8")
+            self.assertEqual(original_text, current)
+        after = {
+            path.relative_to(self.project).as_posix()
+            for path in self.project.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(before, after)
+
+    def test_orchestrator_status_reports_clarification_count_read_only(self) -> None:
+        intake_id = "slither-demo"
+        artifact_path = self._create_slither_intake(intake_id)
+        original = artifact_path.read_text(encoding="utf-8")
+        create_owner_clarification(
+            self.project,
+            intake_id,
+            "scope-v1",
+            "Browser-only MVP.",
+        )
+        before = {
+            path.relative_to(self.project).as_posix()
+            for path in self.project.rglob("*")
+            if path.is_file()
+        }
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["orchestrator", "status", intake_id, str(self.project)])
+
+        self.assertEqual(code, 0)
+        output = buf.getvalue()
+        self.assertIn("owner_clarifications: 1", output)
+        self.assertIn("latest_clarification_id: scope-v1", output)
+        self.assertIn(
+            "they do not create a planning draft and do not change planning_readiness",
+            output,
+        )
+        self.assertEqual(original, artifact_path.read_text(encoding="utf-8"))
+        after = {
+            path.relative_to(self.project).as_posix()
+            for path in self.project.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(before, after)
+
+    def test_orchestrator_clarify_cli_help_marks_context_only(self) -> None:
+        parser = build_parser()
+        orchestrator_action = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        orchestrator_parser = orchestrator_action.choices["orchestrator"]
+        orchestrator_sub = next(
+            action
+            for action in orchestrator_parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        clarify_help = orchestrator_sub.choices["clarify"].format_help()
+        compact_help = re.sub(r"\s+", " ", clarify_help)
+        self.assertIn("owner-provided clarification", compact_help)
+        self.assertIn("Does not call an LLM", compact_help)
+        self.assertIn("modify goal-intake.json", compact_help)
+        self.assertIn("change planning_readiness", compact_help)
+        self.assertIn("generate planning drafts", compact_help)
+        self.assertIn("invoke an executor", compact_help)
+
+    def test_list_and_validate_owner_clarification_helpers(self) -> None:
+        intake_id = "slither-demo"
+        self._create_slither_intake(intake_id)
+        create_owner_clarification(
+            self.project,
+            intake_id,
+            "scope-v1",
+            "Browser-only MVP.",
+        )
+
+        records = list_owner_clarifications(self.project, intake_id)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].clarification_id, "scope-v1")
+
+        report = validate_owner_clarification(self.project, intake_id, "scope-v1")
+        self.assertTrue(report.valid)
 
 
 class OrchestratorDocsGuardTests(unittest.TestCase):

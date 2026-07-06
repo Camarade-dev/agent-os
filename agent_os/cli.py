@@ -9,6 +9,7 @@ from pathlib import Path
 from agent_os import __version__
 from agent_os.orchestrator import (
     create_goal_intake,
+    create_owner_clarification,
     goal_intake_status,
     validate_goal_intake,
 )
@@ -289,6 +290,28 @@ def cmd_orchestrator_validate(args: argparse.Namespace) -> int:
         return 1
     print(report.output)
     return 0 if report.valid else 1
+
+
+def cmd_orchestrator_clarify(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        dest = create_owner_clarification(
+            project,
+            args.intake_id,
+            args.clarification_id,
+            args.answer,
+        )
+    except (FileNotFoundError, FileExistsError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(f"created owner clarification artifact: {dest}")
+    print("artifact_type: OWNER_CLARIFICATION")
+    print("mode: owner-provided context only")
+    print(
+        "note: no LLM, no planning draft, no readiness change, "
+        "no runs, no executor invocation"
+    )
+    return 0
 
 
 def cmd_close(args: argparse.Namespace) -> int:
@@ -614,6 +637,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     orchestrator_validate_parser.add_argument("path", nargs="?", help="target project directory")
     orchestrator_validate_parser.set_defaults(func=cmd_orchestrator_validate)
+
+    orchestrator_clarify_parser = orchestrator_sub.add_parser(
+        "clarify",
+        help="record owner-provided clarification for a GOAL_INTAKE (context only)",
+        description=(
+            "Record an owner-provided clarification for an existing GOAL_INTAKE "
+            "artifact only. Does not call an LLM, modify goal-intake.json, "
+            "change planning_readiness, generate planning drafts, create runs, "
+            "or invoke an executor."
+        ),
+    )
+    orchestrator_clarify_parser.add_argument(
+        "intake_id",
+        help="intake identifier (filesystem-safe slug)",
+    )
+    orchestrator_clarify_parser.add_argument("path", nargs="?", help="target project directory")
+    orchestrator_clarify_parser.add_argument(
+        "--clarification-id",
+        required=True,
+        help="clarification identifier (filesystem-safe slug)",
+    )
+    orchestrator_clarify_parser.add_argument(
+        "--answer",
+        required=True,
+        help="owner-provided clarification text (preserved verbatim)",
+    )
+    orchestrator_clarify_parser.set_defaults(func=cmd_orchestrator_clarify)
 
     return parser
 
