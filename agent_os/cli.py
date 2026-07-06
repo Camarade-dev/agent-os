@@ -20,6 +20,7 @@ from agent_os.orchestrator import (
     prepare_planning_workspace_draft,
     review_goal_intake_readiness,
     scaffold_local_agentic_spec_from_context_pack,
+    scaffold_requirements_extraction,
     transport_planning_context,
     validate_goal_intake,
 )
@@ -453,6 +454,21 @@ def cmd_orchestrator_requirements_extraction_preflight(args: argparse.Namespace)
         == "REQUIREMENTS_EXTRACTION_PREFLIGHT_CONFIRMED_NO_REQUIREMENTS_GENERATED"
     )
     return 0 if confirmed else 1
+
+
+def cmd_orchestrator_scaffold_requirements_extraction(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        report = scaffold_requirements_extraction(
+            project,
+            args.intake_id,
+            args.plan_id,
+        )
+    except (FileNotFoundError, FileExistsError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(report.output)
+    return 0
 
 
 def cmd_orchestrator_clarify(args: argparse.Namespace) -> int:
@@ -1099,6 +1115,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     orchestrator_requirements_extraction_preflight_parser.set_defaults(
         func=cmd_orchestrator_requirements_extraction_preflight
+    )
+
+    orchestrator_scaffold_requirements_extraction_parser = orchestrator_sub.add_parser(
+        "scaffold-requirements-extraction",
+        help="scaffold empty requirements-extraction containers only (no requirements)",
+        description=(
+            "Replace local-agentic-spec.md SCAFFOLD_DRAFT_NON_AUTHORITY structure with "
+            "a REQUIREMENTS_EXTRACTION_SCAFFOLD_NON_AUTHORITY structure in a DRAFT "
+            "planning workspace after successful requirements-extraction-preflight. "
+            "Writes requirements-extraction scaffold provenance under evidence/ only. "
+            "Does not call an LLM, extract or infer requirements, generate user stories "
+            "or acceptance criteria, generate architecture decisions, generate an "
+            "implementation plan, generate PLANNING_RUN_SLICE, validate or approve the "
+            "workspace, transition status, create runner proposals, create runs, or "
+            "invoke an executor."
+        ),
+    )
+    orchestrator_scaffold_requirements_extraction_parser.add_argument(
+        "intake_id",
+        help="intake identifier (filesystem-safe slug)",
+    )
+    orchestrator_scaffold_requirements_extraction_parser.add_argument(
+        "path",
+        nargs="?",
+        help="target project directory",
+    )
+    orchestrator_scaffold_requirements_extraction_parser.add_argument(
+        "--plan-id",
+        required=True,
+        help="planning workspace identifier (filesystem-safe slug)",
+    )
+    orchestrator_scaffold_requirements_extraction_parser.set_defaults(
+        func=cmd_orchestrator_scaffold_requirements_extraction
     )
 
     return parser

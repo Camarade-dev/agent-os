@@ -23,6 +23,9 @@ ORCHESTRATOR_CONTEXT_PACK_DRAFT_PROVENANCE_FILE = (
 ORCHESTRATOR_LOCAL_AGENTIC_SPEC_SCAFFOLD_PROVENANCE_FILE = (
     "orchestrator-local-agentic-spec-scaffold-provenance.json"
 )
+ORCHESTRATOR_REQUIREMENTS_EXTRACTION_SCAFFOLD_PROVENANCE_FILE = (
+    "orchestrator-requirements-extraction-scaffold-provenance.json"
+)
 META_FILE = "run.json"
 
 PLACEHOLDER_VALUES = frozenset(
