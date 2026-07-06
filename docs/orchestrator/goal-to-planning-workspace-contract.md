@@ -1,7 +1,7 @@
 # Goal-to-planning workspace contract
 
 > **Status:** doctrine and contract plus deterministic goal-intake scaffold CLI — no LLM adapter, no autonomous generation, no UI  
-> **Slice:** `CORE_ORCHESTRATOR_002` adds `agent-os orchestrator intake` for `GOAL_INTAKE` artifact creation only; planning workspace drafting remains future work  
+> **Slice:** `CORE_ORCHESTRATOR_002` adds `agent-os orchestrator intake` for `GOAL_INTAKE` artifact creation only; `CORE_ORCHESTRATOR_003` adds read-only `orchestrator status` and `orchestrator validate`; planning workspace drafting remains future work  
 > **Companions:** [`goal-intake-artifact.md`](goal-intake-artifact.md), [`architecture-decision-boundary.md`](architecture-decision-boundary.md), [`slither-like-demo-contract.md`](slither-like-demo-contract.md), [`../planning-layer-doctrine.md`](../planning-layer-doctrine.md), [`../planning-workspace-layout.md`](../planning-workspace-layout.md)
 
 This document defines the **formal contract** for a future Agent OS orchestrator that receives a natural-language goal and eventually proposes a **governed planning workspace draft**. It authorizes nothing. The current implementation is limited to deterministic `GOAL_INTAKE` JSON artifact scaffolding; it does not implement architecture generation, planning generation, validation, transition, runner import, or executor invocation.
@@ -261,6 +261,8 @@ These commands exist today and remain **operator-driven**; the orchestrator must
 | `agent-os planning transition` | Manifest transition — explicit, gated |
 
 **Implemented intake scaffold:** `agent-os orchestrator intake <intake-id> --goal "<raw goal>" [PATH]` creates a reviewable `GOAL_INTAKE` JSON artifact only.
+
+**Implemented read-only inspection:** `agent-os orchestrator status <intake-id> [PATH]` and `agent-os orchestrator validate <intake-id> [PATH]` inspect and structurally validate that artifact. Validation is not approval, not owner decision, and not planning generation. A valid intake may still require clarification.
 
 **Future work (not implemented):** `agent-os orchestrator draft-export` or any command that auto-runs the planning lifecycle above. Documenting draft-export does not imply implementation.
 

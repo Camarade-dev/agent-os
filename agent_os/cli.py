@@ -7,7 +7,11 @@ import sys
 from pathlib import Path
 
 from agent_os import __version__
-from agent_os.orchestrator import create_goal_intake
+from agent_os.orchestrator import (
+    create_goal_intake,
+    goal_intake_status,
+    validate_goal_intake,
+)
 from agent_os.planning import (
     PLANNING_OWNER_DECISIONS,
     init_planning_workspace,
@@ -263,6 +267,28 @@ def cmd_orchestrator_intake(args: argparse.Namespace) -> int:
     print("mode: deterministic intake/scaffold only")
     print("note: no LLM, no planning approval, no runs, no executor invocation")
     return 0
+
+
+def cmd_orchestrator_status(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        report = goal_intake_status(project, args.intake_id)
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(report.output)
+    return 0 if report.validation_ok else 1
+
+
+def cmd_orchestrator_validate(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        report = validate_goal_intake(project, args.intake_id)
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(report.output)
+    return 0 if report.valid else 1
 
 
 def cmd_close(args: argparse.Namespace) -> int:
@@ -555,6 +581,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="raw natural-language goal to preserve in the intake artifact",
     )
     orchestrator_intake_parser.set_defaults(func=cmd_orchestrator_intake)
+
+    orchestrator_status_parser = orchestrator_sub.add_parser(
+        "status",
+        help="inspect an existing GOAL_INTAKE artifact (read-only)",
+        description=(
+            "Read-only inspection of a deterministic GOAL_INTAKE artifact. "
+            "Does not call an LLM, create planning drafts, create runs, "
+            "or invoke an executor."
+        ),
+    )
+    orchestrator_status_parser.add_argument(
+        "intake_id",
+        help="intake identifier (filesystem-safe slug)",
+    )
+    orchestrator_status_parser.add_argument("path", nargs="?", help="target project directory")
+    orchestrator_status_parser.set_defaults(func=cmd_orchestrator_status)
+
+    orchestrator_validate_parser = orchestrator_sub.add_parser(
+        "validate",
+        help="strict read-only validation of a GOAL_INTAKE artifact",
+        description=(
+            "Strict read-only structural validation of a GOAL_INTAKE artifact only. "
+            "Validation is not approval, not owner decision, and not planning "
+            "generation. Does not call an LLM, create planning drafts, "
+            "create runs, or invoke an executor."
+        ),
+    )
+    orchestrator_validate_parser.add_argument(
+        "intake_id",
+        help="intake identifier (filesystem-safe slug)",
+    )
+    orchestrator_validate_parser.add_argument("path", nargs="?", help="target project directory")
+    orchestrator_validate_parser.set_defaults(func=cmd_orchestrator_validate)
 
     return parser
 

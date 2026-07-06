@@ -19,7 +19,10 @@ from agent_os.orchestrator import (
     GOAL_INTAKE_REQUIRED_FIELDS,
     build_goal_intake_artifact,
     create_goal_intake,
+    goal_intake_status,
+    load_goal_intake,
     normalize_goal,
+    validate_goal_intake,
     validate_intake_id,
 )
 from agent_os.paths import GOAL_INTAKE_FILE, TEMPLATE_FILES, orchestrator_intake_path, planning_path, run_path
@@ -4128,6 +4131,466 @@ class OrchestratorGoalIntakeTests(unittest.TestCase):
         self.assertIn("choose architecture", compact_intake_help)
         self.assertIn("create runs", compact_intake_help)
         self.assertIn("invoke an executor", compact_intake_help)
+
+
+class OrchestratorGoalIntakeStatusValidationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self._tmp.name)
+        init_workspace(self.project)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _artifact_path(self, intake_id: str) -> Path:
+        return orchestrator_intake_path(self.project, intake_id) / GOAL_INTAKE_FILE
+
+    def _create_slither_intake(self, intake_id: str = "slither-demo") -> Path:
+        return create_goal_intake(
+            self.project,
+            intake_id,
+            "Build me an online slither.io-like game",
+        )
+
+    def _write_artifact(self, intake_id: str, artifact: dict) -> Path:
+        path = self._artifact_path(intake_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+        return path
+
+    def test_orchestrator_status_succeeds_on_valid_intake_and_is_read_only(self) -> None:
+        intake_id = "slither-demo"
+        artifact_path = self._create_slither_intake(intake_id)
+        original = artifact_path.read_text(encoding="utf-8")
+        before = {
+            path.relative_to(self.project).as_posix()
+            for path in self.project.rglob("*")
+            if path.is_file()
+        }
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["orchestrator", "status", intake_id, str(self.project)])
+
+        self.assertEqual(code, 0)
+        output = buf.getvalue()
+        self.assertIn("intake_id: slither-demo", output)
+        self.assertIn("artifact_type: GOAL_INTAKE", output)
+        self.assertIn("schema_version: 0.1", output)
+        self.assertIn("ambiguity_level: HIGH", output)
+        self.assertIn("planning_readiness: REQUIRES_CLARIFICATION", output)
+        self.assertIn("validation: OK", output)
+        self.assertIn("no planning draft was created", output)
+        self.assertEqual(original, artifact_path.read_text(encoding="utf-8"))
+        after = {
+            path.relative_to(self.project).as_posix()
+            for path in self.project.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(before, after)
+
+    def test_orchestrator_status_fails_on_missing_intake_and_creates_no_files(
+        self,
+    ) -> None:
+        before = {
+            path.relative_to(self.project).as_posix()
+            for path in self.project.rglob("*")
+            if path.is_file()
+        }
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                ["orchestrator", "status", "missing-intake", str(self.project)]
+            )
+
+        self.assertEqual(code, 1)
+        self.assertIn("goal intake artifact not found", buf.getvalue())
+        after = {
+            path.relative_to(self.project).as_posix()
+            for path in self.project.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(before, after)
+        self.assertFalse(
+            (
+                self.project
+                / ".agent-os"
+                / "orchestrator"
+                / "intakes"
+                / "missing-intake"
+            ).exists()
+        )
+
+    def test_orchestrator_status_fails_on_invalid_intake_and_does_not_modify_artifact(
+        self,
+    ) -> None:
+        intake_id = "invalid-status"
+        artifact = build_goal_intake_artifact(
+            intake_id,
+            "Build a game",
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        artifact["artifact_type"] = "PLANNING_WORKSPACE_DRAFT"
+        artifact_path = self._write_artifact(intake_id, artifact)
+        original = artifact_path.read_text(encoding="utf-8")
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["orchestrator", "status", intake_id, str(self.project)])
+
+        self.assertEqual(code, 1)
+        output = buf.getvalue()
+        self.assertIn(f"intake_id: {intake_id}", output)
+        self.assertIn("artifact_type: PLANNING_WORKSPACE_DRAFT", output)
+        self.assertIn("validation: INVALID", output)
+        self.assertIn("wrong artifact_type", output)
+        self.assertIn("no planning draft was created", output)
+        self.assertEqual(original, artifact_path.read_text(encoding="utf-8"))
+
+    def test_orchestrator_validate_succeeds_on_valid_intake_and_is_read_only(self) -> None:
+        intake_id = "slither-demo"
+        artifact_path = self._create_slither_intake(intake_id)
+        original = artifact_path.read_text(encoding="utf-8")
+        before = {
+            path.relative_to(self.project).as_posix()
+            for path in self.project.rglob("*")
+            if path.is_file()
+        }
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["orchestrator", "validate", intake_id, str(self.project)])
+
+        self.assertEqual(code, 0)
+        output = buf.getvalue()
+        self.assertIn("final validation result: OK", output)
+        self.assertIn("validation is not approval", output)
+        self.assertEqual(original, artifact_path.read_text(encoding="utf-8"))
+        after = {
+            path.relative_to(self.project).as_posix()
+            for path in self.project.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(before, after)
+
+    def test_broad_slither_like_intake_validates_with_high_ambiguity(self) -> None:
+        intake_id = "slither-demo"
+        self._create_slither_intake(intake_id)
+
+        report = validate_goal_intake(self.project, intake_id)
+
+        self.assertTrue(report.valid)
+        artifact = load_goal_intake(self.project, intake_id)
+        self.assertEqual(artifact["ambiguity_level"], "HIGH")
+        self.assertEqual(artifact["planning_readiness"], "REQUIRES_CLARIFICATION")
+
+    def test_validation_rejects_missing_intake(self) -> None:
+        with self.assertRaises(FileNotFoundError):
+            validate_goal_intake(self.project, "missing-intake")
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                ["orchestrator", "validate", "missing-intake", str(self.project)]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("goal intake artifact not found", buf.getvalue())
+
+    def test_validation_rejects_malformed_json(self) -> None:
+        intake_id = "broken-json"
+        path = self._artifact_path(intake_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not-json", encoding="utf-8")
+
+        report = validate_goal_intake(self.project, intake_id)
+        self.assertFalse(report.valid)
+        self.assertTrue(any("malformed JSON" in error for error in report.errors))
+
+    def test_validation_rejects_wrong_artifact_type(self) -> None:
+        intake_id = "wrong-type"
+        artifact = build_goal_intake_artifact(
+            intake_id,
+            "Build a game",
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        artifact["artifact_type"] = "PLANNING_WORKSPACE_DRAFT"
+        self._write_artifact(intake_id, artifact)
+
+        report = validate_goal_intake(self.project, intake_id)
+        self.assertFalse(report.valid)
+        self.assertTrue(any("wrong artifact_type" in error for error in report.errors))
+
+    def test_validation_rejects_unsupported_schema_version(self) -> None:
+        intake_id = "bad-version"
+        artifact = build_goal_intake_artifact(
+            intake_id,
+            "Build a game",
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        artifact["schema_version"] = "9.9"
+        self._write_artifact(intake_id, artifact)
+
+        report = validate_goal_intake(self.project, intake_id)
+        self.assertFalse(report.valid)
+        self.assertTrue(
+            any("unsupported schema_version" in error for error in report.errors)
+        )
+
+    def test_validation_rejects_missing_required_fields(self) -> None:
+        intake_id = "missing-field"
+        artifact = build_goal_intake_artifact(
+            intake_id,
+            "Build a game",
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        del artifact["raw_goal"]
+        self._write_artifact(intake_id, artifact)
+
+        report = validate_goal_intake(self.project, intake_id)
+        self.assertFalse(report.valid)
+        self.assertTrue(
+            any("missing required field: raw_goal" in error for error in report.errors)
+        )
+
+    def test_validation_rejects_wrong_field_types(self) -> None:
+        intake_id = "wrong-types"
+        artifact = build_goal_intake_artifact(
+            intake_id,
+            "Build a game",
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        artifact["open_questions"] = "not-a-list"
+        self._write_artifact(intake_id, artifact)
+
+        report = validate_goal_intake(self.project, intake_id)
+        self.assertFalse(report.valid)
+        self.assertTrue(
+            any("open_questions must be a list" in error for error in report.errors)
+        )
+
+    def test_validation_rejects_missing_non_authority_flags(self) -> None:
+        intake_id = "missing-flag"
+        artifact = build_goal_intake_artifact(
+            intake_id,
+            "Build a game",
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        del artifact["non_authority"]["does_not_create_run"]
+        self._write_artifact(intake_id, artifact)
+
+        report = validate_goal_intake(self.project, intake_id)
+        self.assertFalse(report.valid)
+        self.assertTrue(
+            any(
+                "missing non_authority flag: does_not_create_run" in error
+                for error in report.errors
+            )
+        )
+
+    def test_validation_rejects_false_non_authority_flags(self) -> None:
+        intake_id = "false-flag"
+        artifact = build_goal_intake_artifact(
+            intake_id,
+            "Build a game",
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        artifact["non_authority"]["does_not_invoke_executor"] = False
+        self._write_artifact(intake_id, artifact)
+
+        report = validate_goal_intake(self.project, intake_id)
+        self.assertFalse(report.valid)
+        self.assertTrue(
+            any(
+                "non_authority flag must be true: does_not_invoke_executor" in error
+                for error in report.errors
+            )
+        )
+
+    def test_validation_rejects_intake_id_mismatch(self) -> None:
+        intake_id = "path-id"
+        artifact = build_goal_intake_artifact(
+            "artifact-id",
+            "Build a game",
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        self._write_artifact(intake_id, artifact)
+
+        report = validate_goal_intake(self.project, intake_id)
+        self.assertFalse(report.valid)
+        self.assertTrue(any("intake_id mismatch" in error for error in report.errors))
+
+    def test_validation_rejects_high_ambiguity_with_draft_allowed(self) -> None:
+        intake_id = "incoherent"
+        artifact = build_goal_intake_artifact(
+            intake_id,
+            "Build a game",
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        artifact["ambiguity_level"] = "HIGH"
+        artifact["planning_readiness"] = "DRAFT_ALLOWED"
+        self._write_artifact(intake_id, artifact)
+
+        report = validate_goal_intake(self.project, intake_id)
+        self.assertFalse(report.valid)
+        self.assertTrue(
+            any("HIGH ambiguity must not be DRAFT_ALLOWED" in error for error in report.errors)
+        )
+
+    def test_validation_rejects_high_ambiguity_with_not_ready(self) -> None:
+        intake_id = "high-not-ready"
+        artifact = build_goal_intake_artifact(
+            intake_id,
+            "Build a game",
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        artifact["ambiguity_level"] = "HIGH"
+        artifact["planning_readiness"] = "NOT_READY"
+        artifact_path = self._write_artifact(intake_id, artifact)
+        original = artifact_path.read_text(encoding="utf-8")
+
+        report = validate_goal_intake(self.project, intake_id)
+        self.assertFalse(report.valid)
+        self.assertTrue(
+            any(
+                "incoherent readiness: HIGH ambiguity should be REQUIRES_CLARIFICATION"
+                in error
+                for error in report.errors
+            )
+        )
+        self.assertEqual(original, artifact_path.read_text(encoding="utf-8"))
+
+    def test_validation_rejects_planning_run_slice_in_artifact_content(self) -> None:
+        intake_id = "slice-contamination"
+        artifact = build_goal_intake_artifact(
+            intake_id,
+            "Build a game",
+            created_at="2026-07-06T10:00:00+00:00",
+        )
+        artifact["raw_goal"] = "Goal references PLANNING_RUN_SLICE in JSON content"
+        artifact_path = self._write_artifact(intake_id, artifact)
+        original = artifact_path.read_text(encoding="utf-8")
+
+        report = validate_goal_intake(self.project, intake_id)
+        self.assertFalse(report.valid)
+        self.assertTrue(
+            any(
+                "goal intake content must not contain PLANNING_RUN_SLICE" in error
+                for error in report.errors
+            )
+        )
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(["orchestrator", "validate", intake_id, str(self.project)])
+
+        self.assertEqual(code, 1)
+        self.assertIn("PLANNING_RUN_SLICE", buf.getvalue())
+        self.assertEqual(original, artifact_path.read_text(encoding="utf-8"))
+
+    def test_status_validate_do_not_create_planning_artifacts(self) -> None:
+        intake_id = "slither-demo"
+        self._create_slither_intake(intake_id)
+        forbidden_names = set(planning_module.PLANNING_ARTIFACT_FILES)
+
+        for command in ("status", "validate"):
+            with self.subTest(command=command):
+                code = main(["orchestrator", command, intake_id, str(self.project)])
+                self.assertEqual(code, 0)
+                created_names = {
+                    path.name for path in self.project.rglob("*") if path.is_file()
+                }
+                self.assertTrue(forbidden_names.isdisjoint(created_names))
+                self.assertFalse((self.project / ".agent-os" / "planning").exists())
+
+    def test_status_validate_do_not_create_planning_run_slice(self) -> None:
+        intake_id = "slither-demo"
+        self._create_slither_intake(intake_id)
+
+        for command in ("status", "validate"):
+            with self.subTest(command=command):
+                main(["orchestrator", command, intake_id, str(self.project)])
+                combined = "\n".join(
+                    path.read_text(encoding="utf-8")
+                    for path in self.project.rglob("*")
+                    if path.is_file()
+                )
+                self.assertNotIn("PLANNING_RUN_SLICE", combined)
+
+    def test_status_validate_do_not_create_runs(self) -> None:
+        intake_id = "slither-demo"
+        self._create_slither_intake(intake_id)
+        workspace = self.project / ".agent-os"
+        before_runs = list((workspace / "runs").iterdir())
+
+        for command in ("status", "validate"):
+            with self.subTest(command=command):
+                main(["orchestrator", command, intake_id, str(self.project)])
+
+        after_runs = list((workspace / "runs").iterdir())
+        self.assertEqual(before_runs, after_runs)
+
+    def test_status_validate_do_not_invoke_external_subprocess(self) -> None:
+        intake_id = "slither-demo"
+        self._create_slither_intake(intake_id)
+
+        with patch("subprocess.run", side_effect=AssertionError("subprocess invoked")):
+            for command in ("status", "validate"):
+                with self.subTest(command=command):
+                    code = main(["orchestrator", command, intake_id, str(self.project)])
+                    self.assertEqual(code, 0)
+
+    def test_status_validate_do_not_modify_goal_intake_json(self) -> None:
+        intake_id = "slither-demo"
+        artifact_path = self._create_slither_intake(intake_id)
+        original = artifact_path.read_text(encoding="utf-8")
+
+        main(["orchestrator", "status", intake_id, str(self.project)])
+        self.assertEqual(original, artifact_path.read_text(encoding="utf-8"))
+
+        main(["orchestrator", "validate", intake_id, str(self.project)])
+        self.assertEqual(original, artifact_path.read_text(encoding="utf-8"))
+
+    def test_orchestrator_status_validate_cli_help_marks_read_only(self) -> None:
+        parser = build_parser()
+        orchestrator_action = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        orchestrator_parser = orchestrator_action.choices["orchestrator"]
+        orchestrator_sub = next(
+            action
+            for action in orchestrator_parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+
+        for command in ("status", "validate"):
+            with self.subTest(command=command):
+                help_text = orchestrator_sub.choices[command].format_help()
+                compact_help = re.sub(r"\s+", " ", help_text)
+                self.assertIn("read-only", compact_help.lower())
+                self.assertIn("Does not call an LLM", compact_help)
+                self.assertIn("create planning drafts", compact_help)
+                self.assertIn("invoke an executor", compact_help)
+
+    def test_missing_workspace_fails_without_creating_orchestrator_dir(self) -> None:
+        bare = Path(tempfile.mkdtemp())
+        try:
+            for command in ("status", "validate"):
+                with self.subTest(command=command):
+                    buf = io.StringIO()
+                    with redirect_stderr(buf):
+                        code = main(
+                            ["orchestrator", command, "slither-demo", str(bare)]
+                        )
+                    self.assertEqual(code, 1)
+                    self.assertIn("no workspace found", buf.getvalue())
+                    self.assertFalse((bare / ".agent-os" / "orchestrator").exists())
+        finally:
+            import shutil
+
+            shutil.rmtree(bare)
 
 
 class OrchestratorDocsGuardTests(unittest.TestCase):
