@@ -266,6 +266,43 @@ ORCHESTRATOR_CONTEXT_PACK_DRAFT_NON_AUTHORITY_FLAGS = (
     "requires_future_implementation_plan",
 )
 
+LOCAL_AGENTIC_SPEC_DRAFT_PREFLIGHT_CONFIRMED_STATE = (
+    "LOCAL_AGENTIC_SPEC_DRAFT_PREFLIGHT_CONFIRMED_NO_SPEC_GENERATED"
+)
+LOCAL_AGENTIC_SPEC_DRAFT_PREFLIGHT_CONFIRMED_NEXT_ACTION = (
+    "FUTURE_LOCAL_AGENTIC_SPEC_DRAFT_REQUIRES_SEPARATE_COMMAND"
+)
+
+LOCAL_AGENTIC_SPEC_DRAFT_PREFLIGHT_NON_AUTHORITY_FLAGS = (
+    "does_not_generate_local_agentic_spec",
+    "does_not_mutate_local_agentic_spec",
+    "does_not_generate_architecture",
+    "does_not_choose_stack",
+    "does_not_choose_database",
+    "does_not_choose_networking",
+    "does_not_generate_implementation_plan",
+    "does_not_generate_planning_run_slice",
+    "does_not_validate_planning_workspace",
+    "does_not_approve_plan",
+    "does_not_transition_workspace",
+    "does_not_create_runner_proposal",
+    "does_not_create_run",
+    "does_not_invoke_executor",
+    "preflight_is_read_only",
+    "future_spec_draft_requires_separate_command",
+    "requires_future_independent_validation",
+    "requires_future_owner_approval",
+)
+
+CONTEXT_PACK_REQUIRED_BOUNDARY_CHECKS: tuple[tuple[str, ...], ...] = (
+    ("architecture", "undecided"),
+    ("local agentic spec", "not generated"),
+    ("implementation plan", "not generated"),
+    ("planning_run_slice", "not generated"),
+    ("not validated or approved",),
+    ("runner", "not created or invoked"),
+)
+
 GOAL_INTAKE_REQUIRED_STRING_FIELDS = (
     "artifact_type",
     "schema_version",
@@ -3005,6 +3042,752 @@ def draft_context_pack_from_transport(
         provenance_path=draft_provenance_path,
         context_pack_status=CONTEXT_PACK_DRAFT_STATUS,
         workspace_status=workspace_status,
+        non_authority=non_authority,
+    )
+
+
+def _is_planning_artifact_init_placeholder(
+    content: str,
+    plan_id: str,
+    template_name: str,
+    *,
+    artifact_type: str,
+    identity_field: str = "author",
+    identity_value: str = "PLACEHOLDER",
+) -> bool:
+    """Return True when a planning artifact still matches the init template shape."""
+    normalized_content = content.replace("\r\n", "\n").replace("\r", "\n")
+    meta, body = parse_frontmatter(normalized_content)
+    if meta.get("artifact_type") != artifact_type:
+        return False
+    if meta.get(identity_field) != identity_value:
+        return False
+    if meta.get("plan_id") != plan_id:
+        return False
+
+    template_path = planning_templates_dir() / template_name
+    if not template_path.is_file():
+        raise FileNotFoundError(f"planning template missing: {template_name}")
+
+    _, template_body = parse_frontmatter(
+        template_path.read_text(encoding="utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    )
+    return body == template_body
+
+
+def _is_context_pack_draft_non_authority(content: str, plan_id: str) -> bool:
+    normalized_content = content.replace("\r\n", "\n").replace("\r", "\n")
+    meta, _body = parse_frontmatter(normalized_content)
+    if meta.get("artifact_type") != "CONTEXT_PACK":
+        return False
+    if meta.get("context_pack_status") != CONTEXT_PACK_DRAFT_STATUS:
+        return False
+    if meta.get("plan_id") != plan_id:
+        return False
+    if CONTEXT_PACK_DRAFT_STATUS not in normalized_content:
+        return False
+    return True
+
+
+def _context_pack_boundary_notes_present(content: str) -> bool:
+    lowered = content.lower()
+    for required_parts in CONTEXT_PACK_REQUIRED_BOUNDARY_CHECKS:
+        if not all(part.lower() in lowered for part in required_parts):
+            return False
+    return True
+
+
+def _validate_context_pack_draft_provenance(
+    provenance: dict,
+    *,
+    plan_id: str,
+    intake_id: str,
+) -> str | None:
+    """Return a blocking reason when context-pack draft provenance is invalid."""
+    artifact_type = provenance.get("artifact_type")
+    if artifact_type != ORCHESTRATOR_CONTEXT_PACK_DRAFT_PROVENANCE_ARTIFACT_TYPE:
+        return (
+            f"context pack draft provenance artifact_type mismatch: "
+            f"expected {ORCHESTRATOR_CONTEXT_PACK_DRAFT_PROVENANCE_ARTIFACT_TYPE!r}, "
+            f"found {artifact_type!r}"
+        )
+
+    provenance_plan_id = provenance.get("plan_id")
+    if provenance_plan_id != plan_id:
+        return (
+            f"context pack draft provenance plan_id mismatch: "
+            f"expected {plan_id!r}, found {provenance_plan_id!r}"
+        )
+
+    provenance_intake_id = provenance.get("intake_id")
+    if provenance_intake_id != intake_id:
+        return (
+            f"context pack draft provenance intake_id mismatch: "
+            f"expected {intake_id!r}, found {provenance_intake_id!r}"
+        )
+
+    if provenance.get("context_pack_status") != CONTEXT_PACK_DRAFT_STATUS:
+        return "context pack draft provenance context_pack_status is not DRAFT_NON_AUTHORITY"
+
+    if provenance.get("planning_workspace_status_at_draft") != "DRAFT":
+        return "context pack draft provenance planning_workspace_status_at_draft is not DRAFT"
+
+    for field in (
+        "source_context_transport_json_path",
+        "source_context_transport_md_path",
+    ):
+        value = provenance.get(field)
+        if not isinstance(value, str) or not value.strip():
+            return f"context pack draft provenance missing {field}"
+
+    non_authority = provenance.get("non_authority")
+    if not isinstance(non_authority, dict):
+        return "context pack draft provenance non_authority must be an object"
+    for flag in ORCHESTRATOR_CONTEXT_PACK_DRAFT_NON_AUTHORITY_FLAGS:
+        if non_authority.get(flag) is not True:
+            return f"context pack draft provenance non_authority.{flag} must be true"
+
+    return None
+
+
+def _format_local_agentic_spec_draft_preflight(
+    *,
+    plan_id: str,
+    intake_id: str,
+    planning_workspace_status: str | None,
+    context_pack_status: str | None,
+    context_pack_path: Path | None,
+    context_pack_provenance_path: Path | None,
+    local_agentic_spec_path: Path | None,
+    implementation_plan_path: Path | None,
+    planning_audit_path: Path | None,
+    latest_decision_id: str | None,
+    latest_decision: str | None,
+    source_preflight_state: str | None,
+    preflight_state: str,
+    next_required_action: str,
+    blocking_reasons: list[str],
+    checked_at: str,
+    non_authority: dict[str, bool],
+) -> str:
+    lines = [
+        "local-agentic-spec draft preflight",
+        f"plan_id: {plan_id}",
+        f"intake_id: {intake_id}",
+    ]
+    if planning_workspace_status is not None:
+        lines.append(f"planning_workspace_status: {planning_workspace_status}")
+    if context_pack_status is not None:
+        lines.append(f"context_pack_status: {context_pack_status}")
+    if context_pack_path is not None:
+        lines.append(f"context_pack_path: {context_pack_path}")
+    if context_pack_provenance_path is not None:
+        lines.append(
+            f"context_pack_provenance_path: {context_pack_provenance_path}"
+        )
+    if local_agentic_spec_path is not None:
+        lines.append(f"local_agentic_spec_path: {local_agentic_spec_path}")
+    if implementation_plan_path is not None:
+        lines.append(f"implementation_plan_path: {implementation_plan_path}")
+    if planning_audit_path is not None:
+        lines.append(f"planning_audit_path: {planning_audit_path}")
+    if latest_decision_id is not None:
+        lines.append(f"latest_decision_id: {latest_decision_id}")
+    if latest_decision is not None:
+        lines.append(f"latest_decision: {latest_decision}")
+    if source_preflight_state is not None:
+        lines.append(f"source_preflight_state: {source_preflight_state}")
+    lines.append(f"preflight_state: {preflight_state}")
+    lines.append(f"next_required_action: {next_required_action}")
+    lines.append(f"checked_at: {checked_at}")
+    if blocking_reasons:
+        lines.append("blocking_reasons:")
+        for reason in blocking_reasons:
+            lines.append(f"  - {reason}")
+    lines.append("non_authority:")
+    for flag in LOCAL_AGENTIC_SPEC_DRAFT_PREFLIGHT_NON_AUTHORITY_FLAGS:
+        lines.append(f"  {flag}: true")
+    lines.append(
+        "note: local-agentic-spec draft preflight is read-only; "
+        "not local agentic spec generation, not architecture decision, "
+        "not implementation planning, not validation or approval, "
+        "and no files were modified"
+    )
+    if preflight_state == LOCAL_AGENTIC_SPEC_DRAFT_PREFLIGHT_CONFIRMED_STATE:
+        lines.append(
+            "note: preflight confirmed for a future local-agentic-spec draft command "
+            "only; no local agentic spec was generated"
+        )
+        lines.append(
+            "note: context pack remains DRAFT_NON_AUTHORITY source context; "
+            "architecture undecided; implementation plan not generated; "
+            "PLANNING_RUN_SLICE not generated; workspace not validated or approved"
+        )
+    return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class LocalAgenticSpecDraftPreflightReport:
+    output: str
+    preflight_state: str
+    next_required_action: str
+    plan_id: str
+    intake_id: str
+    planning_workspace_status: str | None
+    context_pack_status: str | None
+    context_pack_path: Path | None
+    context_pack_provenance_path: Path | None
+    local_agentic_spec_path: Path | None
+    implementation_plan_path: Path | None
+    planning_audit_path: Path | None
+    latest_decision_id: str | None
+    latest_decision: str | None
+    source_preflight_state: str | None
+    checked_at: str
+    blocking_reasons: tuple[str, ...]
+    non_authority: dict[str, bool]
+
+
+def _build_local_agentic_spec_preflight_report(
+    *,
+    plan_id: str,
+    intake_id: str,
+    planning_workspace_status: str | None = None,
+    context_pack_status: str | None = None,
+    context_pack_path: Path | None = None,
+    context_pack_provenance_path: Path | None = None,
+    local_agentic_spec_path: Path | None = None,
+    implementation_plan_path: Path | None = None,
+    planning_audit_path: Path | None = None,
+    latest_decision_id: str | None = None,
+    latest_decision: str | None = None,
+    source_preflight_state: str | None = None,
+    preflight_state: str,
+    next_required_action: str,
+    blocking_reasons: list[str],
+    checked_at: str,
+    non_authority: dict[str, bool],
+) -> LocalAgenticSpecDraftPreflightReport:
+    output = _format_local_agentic_spec_draft_preflight(
+        plan_id=plan_id,
+        intake_id=intake_id,
+        planning_workspace_status=planning_workspace_status,
+        context_pack_status=context_pack_status,
+        context_pack_path=context_pack_path,
+        context_pack_provenance_path=context_pack_provenance_path,
+        local_agentic_spec_path=local_agentic_spec_path,
+        implementation_plan_path=implementation_plan_path,
+        planning_audit_path=planning_audit_path,
+        latest_decision_id=latest_decision_id,
+        latest_decision=latest_decision,
+        source_preflight_state=source_preflight_state,
+        preflight_state=preflight_state,
+        next_required_action=next_required_action,
+        blocking_reasons=blocking_reasons,
+        checked_at=checked_at,
+        non_authority=non_authority,
+    )
+    return LocalAgenticSpecDraftPreflightReport(
+        output=output,
+        preflight_state=preflight_state,
+        next_required_action=next_required_action,
+        plan_id=plan_id,
+        intake_id=intake_id,
+        planning_workspace_status=planning_workspace_status,
+        context_pack_status=context_pack_status,
+        context_pack_path=context_pack_path,
+        context_pack_provenance_path=context_pack_provenance_path,
+        local_agentic_spec_path=local_agentic_spec_path,
+        implementation_plan_path=implementation_plan_path,
+        planning_audit_path=planning_audit_path,
+        latest_decision_id=latest_decision_id,
+        latest_decision=latest_decision,
+        source_preflight_state=source_preflight_state,
+        checked_at=checked_at,
+        blocking_reasons=tuple(blocking_reasons),
+        non_authority=non_authority,
+    )
+
+
+def preflight_local_agentic_spec_draft(
+    project: Path,
+    intake_id: str,
+    plan_id: str,
+) -> LocalAgenticSpecDraftPreflightReport:
+    """Read-only local-agentic-spec draft eligibility preflight for a DRAFT workspace."""
+    validate_intake_id(intake_id)
+    validate_plan_id(plan_id)
+
+    checked_at = _utc_now()
+    non_authority = {
+        key: True for key in LOCAL_AGENTIC_SPEC_DRAFT_PREFLIGHT_NON_AUTHORITY_FLAGS
+    }
+    workspace_dest = planning_path(project, plan_id)
+    context_pack_path = workspace_dest / "context-pack.md"
+    context_pack_provenance_path = (
+        workspace_dest / "evidence" / ORCHESTRATOR_CONTEXT_PACK_DRAFT_PROVENANCE_FILE
+    )
+    local_agentic_spec_path = workspace_dest / "local-agentic-spec.md"
+    implementation_plan_path = workspace_dest / "implementation-plan.md"
+    planning_audit_path = workspace_dest / "planning-audit.md"
+    provenance_path = workspace_dest / "evidence" / ORCHESTRATOR_PROVENANCE_FILE
+    transport_json_path = workspace_dest / "evidence" / ORCHESTRATOR_CONTEXT_TRANSPORT_FILE
+    transport_md_path = workspace_dest / "evidence" / ORCHESTRATOR_CONTEXT_TRANSPORT_MD_FILE
+
+    def _blocked(
+        state: str,
+        next_action: str,
+        *,
+        blocking_reasons: list[str] | None = None,
+        planning_workspace_status: str | None = None,
+        context_pack_status: str | None = None,
+        latest_decision_id: str | None = None,
+        latest_decision: str | None = None,
+        source_preflight_state: str | None = None,
+    ) -> LocalAgenticSpecDraftPreflightReport:
+        return _build_local_agentic_spec_preflight_report(
+            plan_id=plan_id,
+            intake_id=intake_id,
+            planning_workspace_status=planning_workspace_status,
+            context_pack_status=context_pack_status,
+            context_pack_path=context_pack_path,
+            context_pack_provenance_path=context_pack_provenance_path,
+            local_agentic_spec_path=local_agentic_spec_path,
+            implementation_plan_path=implementation_plan_path,
+            planning_audit_path=planning_audit_path,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            preflight_state=state,
+            next_required_action=next_action,
+            blocking_reasons=blocking_reasons or [],
+            checked_at=checked_at,
+            non_authority=non_authority,
+        )
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        return _blocked(
+            "BLOCKED_MISSING_WORKSPACE",
+            "FIX_PLANNING_WORKSPACE_STRUCTURE",
+            blocking_reasons=["no workspace found (run `agent-os init` first)"],
+        )
+
+    intake_path = _goal_intake_artifact_path(project, intake_id)
+    if not intake_path.is_file():
+        return _blocked(
+            "BLOCKED_INVALID_INTAKE",
+            "FIX_GOAL_INTAKE_STRUCTURE",
+            blocking_reasons=[f"goal intake artifact not found: {intake_id}"],
+        )
+
+    readiness_report = review_goal_intake_readiness(project, intake_id)
+    if not readiness_report.goal_intake_valid:
+        return _blocked(
+            "BLOCKED_INVALID_INTAKE",
+            "FIX_GOAL_INTAKE_STRUCTURE",
+            blocking_reasons=list(readiness_report.blocking_reasons),
+        )
+
+    if not workspace_dest.is_dir():
+        return _blocked(
+            "BLOCKED_MISSING_PLANNING_WORKSPACE",
+            "FIX_PLANNING_WORKSPACE_STRUCTURE",
+            blocking_reasons=[f"planning workspace not found: {plan_id}"],
+        )
+
+    try:
+        workspace_status = _load_planning_workspace_status(workspace_dest, plan_id)
+    except (FileNotFoundError, ValueError) as exc:
+        return _blocked(
+            "BLOCKED_UNEXPECTED_STRUCTURE",
+            "FIX_PLANNING_WORKSPACE_STRUCTURE",
+            blocking_reasons=[str(exc)],
+        )
+
+    if workspace_status != "DRAFT":
+        return _blocked(
+            "BLOCKED_WORKSPACE_NOT_DRAFT",
+            "FIX_PLANNING_WORKSPACE_STRUCTURE",
+            planning_workspace_status=workspace_status,
+            blocking_reasons=[
+                f"planning workspace must be DRAFT for local-agentic-spec draft "
+                f"preflight, found: {workspace_status!r}"
+            ],
+        )
+
+    draft_preflight_report = preflight_draft_preparation(project, intake_id)
+    latest_decision_id = draft_preflight_report.latest_decision_id
+    latest_decision = draft_preflight_report.latest_decision
+    source_preflight_state = draft_preflight_report.preflight_state
+
+    if latest_decision == "REQUEST_MORE_CLARIFICATION":
+        return _blocked(
+            "BLOCKED_LATEST_DECISION_REQUESTS_CLARIFICATION",
+            "ADD_OWNER_CLARIFICATION",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+        )
+    if latest_decision == "BLOCK_INTAKE":
+        return _blocked(
+            "BLOCKED_LATEST_DECISION_BLOCKS_INTAKE",
+            "STOP_INTAKE",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+        )
+    if (
+        draft_preflight_report.preflight_state
+        != DRAFT_PREPARATION_PREFLIGHT_CONFIRMED_STATE
+        or latest_decision != "AUTHORIZE_DRAFT_PREPARATION"
+    ):
+        return _blocked(
+            "BLOCKED_AUTHORIZATION_STALE_OR_INCOHERENT",
+            "RESOLVE_OR_REPLACE_READINESS_DECISION",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=list(draft_preflight_report.blocking_reasons),
+        )
+
+    if not provenance_path.is_file():
+        return _blocked(
+            "BLOCKED_MISSING_ORCHESTRATOR_PROVENANCE",
+            "FIX_PLANNING_WORKSPACE_STRUCTURE",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+        )
+
+    try:
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return _blocked(
+            "BLOCKED_UNEXPECTED_STRUCTURE",
+            "FIX_PLANNING_WORKSPACE_STRUCTURE",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[
+                f"invalid orchestrator provenance for planning workspace {plan_id}: "
+                f"{exc.msg}"
+            ],
+        )
+
+    if not isinstance(provenance, dict):
+        return _blocked(
+            "BLOCKED_UNEXPECTED_STRUCTURE",
+            "FIX_PLANNING_WORKSPACE_STRUCTURE",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[
+                f"invalid orchestrator provenance for planning workspace {plan_id}: "
+                "expected object"
+            ],
+        )
+
+    provenance_plan_id = provenance.get("plan_id")
+    if provenance_plan_id != plan_id:
+        return _blocked(
+            "BLOCKED_AUTHORIZATION_STALE_OR_INCOHERENT",
+            "RESOLVE_OR_REPLACE_READINESS_DECISION",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[
+                f"orchestrator provenance plan_id mismatch: "
+                f"expected {plan_id!r}, found {provenance_plan_id!r}"
+            ],
+        )
+
+    provenance_intake_id = provenance.get("intake_id")
+    if provenance_intake_id != intake_id:
+        return _blocked(
+            "BLOCKED_AUTHORIZATION_STALE_OR_INCOHERENT",
+            "RESOLVE_OR_REPLACE_READINESS_DECISION",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[
+                f"orchestrator provenance intake_id mismatch: "
+                f"expected {intake_id!r}, found {provenance_intake_id!r}"
+            ],
+        )
+
+    try:
+        _require_orchestrator_provenance_for_transport(
+            provenance_path,
+            plan_id=plan_id,
+            intake_id=intake_id,
+            preflight_report=draft_preflight_report,
+        )
+    except ValueError as exc:
+        return _blocked(
+            "BLOCKED_AUTHORIZATION_STALE_OR_INCOHERENT",
+            "RESOLVE_OR_REPLACE_READINESS_DECISION",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[str(exc)],
+        )
+
+    if not transport_json_path.is_file():
+        return _blocked(
+            "BLOCKED_MISSING_CONTEXT_TRANSPORT",
+            "FIX_OR_RECREATE_CONTEXT_PACK_DRAFT",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[
+                f"context transport json not found for planning workspace: {plan_id}"
+            ],
+        )
+
+    if not transport_md_path.is_file():
+        return _blocked(
+            "BLOCKED_MISSING_CONTEXT_TRANSPORT",
+            "FIX_OR_RECREATE_CONTEXT_PACK_DRAFT",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[
+                f"context transport markdown not found for planning workspace: {plan_id}"
+            ],
+        )
+
+    try:
+        transport = _require_context_transport_for_draft(
+            transport_json_path,
+            plan_id=plan_id,
+            intake_id=intake_id,
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        return _blocked(
+            "BLOCKED_UNEXPECTED_STRUCTURE",
+            "FIX_OR_RECREATE_CONTEXT_PACK_DRAFT",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[str(exc)],
+        )
+
+    if not context_pack_provenance_path.is_file():
+        return _blocked(
+            "BLOCKED_MISSING_CONTEXT_PACK_DRAFT_PROVENANCE",
+            "FIX_OR_RECREATE_CONTEXT_PACK_DRAFT",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+        )
+
+    try:
+        draft_provenance = json.loads(
+            context_pack_provenance_path.read_text(encoding="utf-8")
+        )
+    except json.JSONDecodeError as exc:
+        return _blocked(
+            "BLOCKED_UNEXPECTED_STRUCTURE",
+            "FIX_OR_RECREATE_CONTEXT_PACK_DRAFT",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[
+                f"invalid context pack draft provenance for planning workspace "
+                f"{plan_id}: {exc.msg}"
+            ],
+        )
+
+    if not isinstance(draft_provenance, dict):
+        return _blocked(
+            "BLOCKED_UNEXPECTED_STRUCTURE",
+            "FIX_OR_RECREATE_CONTEXT_PACK_DRAFT",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[
+                f"invalid context pack draft provenance for planning workspace "
+                f"{plan_id}: expected object"
+            ],
+        )
+
+    provenance_error = _validate_context_pack_draft_provenance(
+        draft_provenance,
+        plan_id=plan_id,
+        intake_id=intake_id,
+    )
+    if provenance_error is not None:
+        mismatch = "mismatch" in provenance_error
+        return _blocked(
+            "BLOCKED_CONTEXT_PACK_PROVENANCE_MISMATCH"
+            if mismatch
+            else "BLOCKED_UNEXPECTED_STRUCTURE",
+            "FIX_OR_RECREATE_CONTEXT_PACK_DRAFT",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[provenance_error],
+        )
+
+    if not context_pack_path.is_file():
+        return _blocked(
+            "BLOCKED_UNEXPECTED_STRUCTURE",
+            "FIX_OR_RECREATE_CONTEXT_PACK_DRAFT",
+            planning_workspace_status=workspace_status,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[f"context-pack.md missing in planning workspace: {plan_id}"],
+        )
+
+    context_pack_content = context_pack_path.read_text(encoding="utf-8")
+    if not _is_context_pack_draft_non_authority(context_pack_content, plan_id):
+        return _blocked(
+            "BLOCKED_CONTEXT_PACK_NOT_DRAFT_NON_AUTHORITY",
+            "FIX_OR_RECREATE_CONTEXT_PACK_DRAFT",
+            planning_workspace_status=workspace_status,
+            context_pack_status=None,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+        )
+
+    if not _context_pack_boundary_notes_present(context_pack_content):
+        return _blocked(
+            "BLOCKED_CONTEXT_PACK_BOUNDARY_NOTES_MISSING",
+            "FIX_OR_RECREATE_CONTEXT_PACK_DRAFT",
+            planning_workspace_status=workspace_status,
+            context_pack_status=CONTEXT_PACK_DRAFT_STATUS,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+        )
+
+    if not local_agentic_spec_path.is_file():
+        return _blocked(
+            "BLOCKED_UNEXPECTED_STRUCTURE",
+            "RESTORE_PLANNING_INIT_PLACEHOLDERS",
+            planning_workspace_status=workspace_status,
+            context_pack_status=CONTEXT_PACK_DRAFT_STATUS,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[
+                f"local-agentic-spec.md missing in planning workspace: {plan_id}"
+            ],
+        )
+
+    if not _is_planning_artifact_init_placeholder(
+        local_agentic_spec_path.read_text(encoding="utf-8"),
+        plan_id,
+        "local-agentic-spec.md",
+        artifact_type="LOCAL_AGENTIC_SPEC",
+    ):
+        return _blocked(
+            "BLOCKED_LOCAL_AGENTIC_SPEC_ALREADY_MODIFIED",
+            "RESTORE_PLANNING_INIT_PLACEHOLDERS",
+            planning_workspace_status=workspace_status,
+            context_pack_status=CONTEXT_PACK_DRAFT_STATUS,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+        )
+
+    if not implementation_plan_path.is_file():
+        return _blocked(
+            "BLOCKED_UNEXPECTED_STRUCTURE",
+            "RESTORE_PLANNING_INIT_PLACEHOLDERS",
+            planning_workspace_status=workspace_status,
+            context_pack_status=CONTEXT_PACK_DRAFT_STATUS,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[
+                f"implementation-plan.md missing in planning workspace: {plan_id}"
+            ],
+        )
+
+    if not _is_planning_artifact_init_placeholder(
+        implementation_plan_path.read_text(encoding="utf-8"),
+        plan_id,
+        "implementation-plan.md",
+        artifact_type="IMPLEMENTATION_PLAN",
+    ):
+        return _blocked(
+            "BLOCKED_IMPLEMENTATION_PLAN_ALREADY_MODIFIED",
+            "RESTORE_PLANNING_INIT_PLACEHOLDERS",
+            planning_workspace_status=workspace_status,
+            context_pack_status=CONTEXT_PACK_DRAFT_STATUS,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+        )
+
+    if not planning_audit_path.is_file():
+        return _blocked(
+            "BLOCKED_UNEXPECTED_STRUCTURE",
+            "RESTORE_PLANNING_INIT_PLACEHOLDERS",
+            planning_workspace_status=workspace_status,
+            context_pack_status=CONTEXT_PACK_DRAFT_STATUS,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+            blocking_reasons=[
+                f"planning-audit.md missing in planning workspace: {plan_id}"
+            ],
+        )
+
+    if not _is_planning_artifact_init_placeholder(
+        planning_audit_path.read_text(encoding="utf-8"),
+        plan_id,
+        "planning-audit.md",
+        artifact_type="PLANNING_AUDIT",
+        identity_field="auditor",
+    ):
+        return _blocked(
+            "BLOCKED_PLANNING_AUDIT_ALREADY_MODIFIED",
+            "RESTORE_PLANNING_INIT_PLACEHOLDERS",
+            planning_workspace_status=workspace_status,
+            context_pack_status=CONTEXT_PACK_DRAFT_STATUS,
+            latest_decision_id=latest_decision_id,
+            latest_decision=latest_decision,
+            source_preflight_state=source_preflight_state,
+        )
+
+    return _build_local_agentic_spec_preflight_report(
+        plan_id=plan_id,
+        intake_id=intake_id,
+        planning_workspace_status=workspace_status,
+        context_pack_status=CONTEXT_PACK_DRAFT_STATUS,
+        context_pack_path=context_pack_path,
+        context_pack_provenance_path=context_pack_provenance_path,
+        local_agentic_spec_path=local_agentic_spec_path,
+        implementation_plan_path=implementation_plan_path,
+        planning_audit_path=planning_audit_path,
+        latest_decision_id=latest_decision_id,
+        latest_decision=latest_decision,
+        source_preflight_state=source_preflight_state,
+        preflight_state=LOCAL_AGENTIC_SPEC_DRAFT_PREFLIGHT_CONFIRMED_STATE,
+        next_required_action=LOCAL_AGENTIC_SPEC_DRAFT_PREFLIGHT_CONFIRMED_NEXT_ACTION,
+        blocking_reasons=[],
+        checked_at=checked_at,
         non_authority=non_authority,
     )
 

@@ -279,6 +279,14 @@ Requires an existing DRAFT scaffold with matching orchestrator provenance and co
 
 The context pack draft copies transported source context only; it does **not** generate architecture, local agentic spec, implementation plan, or `PLANNING_RUN_SLICE`; does **not** validate or approve the workspace; does **not** transition status; does **not** create runner proposals, runs, or executor invocations; and does **not** mutate orchestrator intake artifacts, transport artifacts, orchestrator provenance, or other planning templates. **Context pack draft is source-context only** — not architecture decision, not approved context pack, not local agentic spec, not implementation plan. The planning workspace remains **`DRAFT`** — it is **not validated or approved**. Future architecture decision, local agentic spec, implementation plan, independent validation, and owner approval remain required. Runner proposal generation remains future/separate work.
 
+After a coherent context-pack draft exists, run read-only local-agentic-spec draft eligibility preflight:
+
+```bash
+agent-os orchestrator local-agentic-spec-preflight <intake-id> --plan-id <plan-id> [PATH]
+```
+
+Requires an existing DRAFT scaffold with matching orchestrator provenance, context transport artifacts, and context-pack draft provenance for the same intake/plan pair; confirmed draft-preflight; `context-pack.md` labeled `DRAFT_NON_AUTHORITY` with required boundary notes; and `local-agentic-spec.md`, `implementation-plan.md`, and `planning-audit.md` still in planning init placeholder shape. **Does not write any artifact** — read-only gate only. Local-agentic-spec preflight does **not** generate or mutate `local-agentic-spec.md`; does **not** generate architecture decisions, implementation plans, or `PLANNING_RUN_SLICE`; does **not** validate or approve the workspace; does **not** transition status; does **not** create runner proposals, runs, or executor invocations; and does **not** mutate orchestrator intake artifacts, transport artifacts, context-pack draft provenance, or `context-pack.md`. **Successful preflight is not local agentic spec generation** — not architecture decision, not implementation planning, not validation or approval. A separate future local-agentic-spec draft command remains required. Future architecture decision, implementation plan, independent validation, and owner approval remain required.
+
 Inspect an existing planning workspace (read-only):
 
 ```bash

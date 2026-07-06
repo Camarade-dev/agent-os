@@ -15,6 +15,7 @@ from agent_os.orchestrator import (
     draft_context_pack_from_transport,
     goal_intake_status,
     preflight_draft_preparation,
+    preflight_local_agentic_spec_draft,
     prepare_planning_workspace_draft,
     review_goal_intake_readiness,
     transport_planning_context,
@@ -397,6 +398,25 @@ def cmd_orchestrator_draft_context_pack(args: argparse.Namespace) -> int:
         return 1
     print(report.output)
     return 0
+
+
+def cmd_orchestrator_local_agentic_spec_preflight(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        report = preflight_local_agentic_spec_draft(
+            project,
+            args.intake_id,
+            args.plan_id,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(report.output)
+    confirmed = (
+        report.preflight_state
+        == "LOCAL_AGENTIC_SPEC_DRAFT_PREFLIGHT_CONFIRMED_NO_SPEC_GENERATED"
+    )
+    return 0 if confirmed else 1
 
 
 def cmd_orchestrator_clarify(args: argparse.Namespace) -> int:
@@ -944,6 +964,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     orchestrator_draft_context_pack_parser.set_defaults(
         func=cmd_orchestrator_draft_context_pack
+    )
+
+    orchestrator_local_agentic_spec_preflight_parser = orchestrator_sub.add_parser(
+        "local-agentic-spec-preflight",
+        help="read-only local-agentic-spec draft eligibility preflight (no spec)",
+        description=(
+            "Read-only preflight for whether a future local-agentic-spec draft "
+            "command may be allowed in a DRAFT planning workspace with a coherent "
+            "DRAFT_NON_AUTHORITY context-pack draft. Verifies authorization, "
+            "provenance, transport, context-pack boundaries, and planning init "
+            "placeholders only. Does not call an LLM, generate local agentic spec, "
+            "generate architecture decisions, generate an implementation plan, "
+            "generate PLANNING_RUN_SLICE, validate or approve the workspace, "
+            "transition status, create runner proposals, create runs, or invoke "
+            "an executor."
+        ),
+    )
+    orchestrator_local_agentic_spec_preflight_parser.add_argument(
+        "intake_id",
+        help="intake identifier (filesystem-safe slug)",
+    )
+    orchestrator_local_agentic_spec_preflight_parser.add_argument(
+        "path",
+        nargs="?",
+        help="target project directory",
+    )
+    orchestrator_local_agentic_spec_preflight_parser.add_argument(
+        "--plan-id",
+        required=True,
+        help="planning workspace identifier (filesystem-safe slug)",
+    )
+    orchestrator_local_agentic_spec_preflight_parser.set_defaults(
+        func=cmd_orchestrator_local_agentic_spec_preflight
     )
 
     return parser
