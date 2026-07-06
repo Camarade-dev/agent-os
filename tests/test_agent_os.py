@@ -3790,5 +3790,124 @@ class PlanningDocsHygieneTests(unittest.TestCase):
         )
 
 
+class OrchestratorDocsGuardTests(unittest.TestCase):
+    """Guard doctrine for CORE_ORCHESTRATOR_001 goal-to-planning workspace contract."""
+
+    _ORCHESTRATOR_DOCS: tuple[str, ...] = (
+        "docs/orchestrator/goal-to-planning-workspace-contract.md",
+        "docs/orchestrator/architecture-decision-boundary.md",
+        "docs/orchestrator/slither-like-demo-contract.md",
+    )
+
+    _REQUIRED_BOUNDARY_PHRASES: tuple[str, ...] = (
+        "goal intake is not planning approval",
+        "planning draft is not a validated workspace",
+        "architecture recommendation is not owner decision",
+        "implementation plan is not runner proposal",
+        "PLANNING_RUN_SLICE is not an approved run",
+        "generated Markdown prose is not machine authority",
+        "runner import remains explicit",
+        "executor invocation remains separate",
+    )
+
+    _INDEPENDENT_VALIDATION_MARKERS: tuple[str, ...] = (
+        "independent",
+        "audit",
+    )
+
+    _FORBIDDEN_RUNNER_MODIFICATION_PHRASES: tuple[str, ...] = (
+        "modify agent-os-runner",
+        "modified agent-os-runner",
+        "requires modifying the runner",
+        "runner files are modified",
+        "must modify runner",
+    )
+
+    _FUTURE_CLI_COMMANDS: tuple[str, ...] = (
+        "agent-os orchestrator intake",
+        "agent-os orchestrator draft-export",
+    )
+
+    @classmethod
+    def _repo_root(cls) -> Path:
+        return Path(__file__).resolve().parent.parent
+
+    @classmethod
+    def _orchestrator_docs_text(cls) -> str:
+        repo_root = cls._repo_root()
+        parts: list[str] = []
+        for rel in cls._ORCHESTRATOR_DOCS:
+            path = repo_root / rel
+            parts.append(path.read_text(encoding="utf-8"))
+        return "\n".join(parts)
+
+    def test_orchestrator_contract_docs_exist(self) -> None:
+        repo_root = self._repo_root()
+        missing = [
+            rel
+            for rel in self._ORCHESTRATOR_DOCS
+            if not (repo_root / rel).is_file()
+        ]
+        self.assertEqual(missing, [], f"missing orchestrator docs: {missing}")
+
+    def test_slither_like_demo_contract_exists(self) -> None:
+        path = self._repo_root() / "docs/orchestrator/slither-like-demo-contract.md"
+        self.assertTrue(path.is_file(), "slither-like demo contract doc must exist")
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("Build me an online slither.io-like game", text)
+
+    def test_orchestrator_docs_contain_required_boundary_phrases(self) -> None:
+        combined = self._orchestrator_docs_text().lower()
+        missing = [
+            phrase
+            for phrase in self._REQUIRED_BOUNDARY_PHRASES
+            if phrase.lower() not in combined
+        ]
+        self.assertEqual(
+            missing,
+            [],
+            "orchestrator docs missing required boundary phrases:\n"
+            + "\n".join(missing),
+        )
+
+    def test_independent_validation_doctrine_documented(self) -> None:
+        combined = self._orchestrator_docs_text().lower()
+        self.assertIn("independent validation", combined)
+        self.assertTrue(
+            all(marker in combined for marker in self._INDEPENDENT_VALIDATION_MARKERS),
+            "independent validation doctrine must mention audit independence",
+        )
+        self.assertIn("owner decision remains", combined)
+
+    def test_orchestrator_docs_do_not_require_runner_modification(self) -> None:
+        combined = self._orchestrator_docs_text().lower()
+        violations = [
+            phrase
+            for phrase in self._FORBIDDEN_RUNNER_MODIFICATION_PHRASES
+            if phrase in combined
+        ]
+        self.assertEqual(
+            violations,
+            [],
+            "orchestrator docs must not require runner modification:\n"
+            + "\n".join(violations),
+        )
+
+    def test_future_orchestrator_cli_marked_not_implemented(self) -> None:
+        repo_root = self._repo_root()
+        contract = (
+            repo_root / "docs/orchestrator/goal-to-planning-workspace-contract.md"
+        ).read_text(encoding="utf-8")
+        lowered = contract.lower()
+        for command in self._FUTURE_CLI_COMMANDS:
+            if command in lowered:
+                idx = lowered.index(command)
+                window = lowered[max(0, idx - 200) : idx + len(command) + 200]
+                self.assertTrue(
+                    "not implemented" in window or "future work" in window,
+                    f"{command!r} must be marked as not implemented or future work",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
