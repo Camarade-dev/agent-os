@@ -20,6 +20,9 @@ ORCHESTRATOR_CONTEXT_TRANSPORT_MD_FILE = "orchestrator-context-transport.md"
 ORCHESTRATOR_CONTEXT_PACK_DRAFT_PROVENANCE_FILE = (
     "orchestrator-context-pack-draft-provenance.json"
 )
+ORCHESTRATOR_LOCAL_AGENTIC_SPEC_SCAFFOLD_PROVENANCE_FILE = (
+    "orchestrator-local-agentic-spec-scaffold-provenance.json"
+)
 META_FILE = "run.json"
 
 PLACEHOLDER_VALUES = frozenset(

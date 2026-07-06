@@ -18,6 +18,7 @@ from agent_os.orchestrator import (
     preflight_local_agentic_spec_draft,
     prepare_planning_workspace_draft,
     review_goal_intake_readiness,
+    scaffold_local_agentic_spec_from_context_pack,
     transport_planning_context,
     validate_goal_intake,
 )
@@ -417,6 +418,21 @@ def cmd_orchestrator_local_agentic_spec_preflight(args: argparse.Namespace) -> i
         == "LOCAL_AGENTIC_SPEC_DRAFT_PREFLIGHT_CONFIRMED_NO_SPEC_GENERATED"
     )
     return 0 if confirmed else 1
+
+
+def cmd_orchestrator_scaffold_local_agentic_spec(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        report = scaffold_local_agentic_spec_from_context_pack(
+            project,
+            args.intake_id,
+            args.plan_id,
+        )
+    except (FileNotFoundError, FileExistsError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(report.output)
+    return 0
 
 
 def cmd_orchestrator_clarify(args: argparse.Namespace) -> int:
@@ -997,6 +1013,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     orchestrator_local_agentic_spec_preflight_parser.set_defaults(
         func=cmd_orchestrator_local_agentic_spec_preflight
+    )
+
+    orchestrator_scaffold_local_agentic_spec_parser = orchestrator_sub.add_parser(
+        "scaffold-local-agentic-spec",
+        help="scaffold local-agentic-spec.md structure only (no requirements)",
+        description=(
+            "Replace planning init local-agentic-spec.md placeholder with a "
+            "SCAFFOLD_DRAFT_NON_AUTHORITY structure in a DRAFT planning workspace "
+            "after successful local-agentic-spec-preflight. Writes scaffold provenance "
+            "under evidence/ only. Does not call an LLM, extract requirements, generate "
+            "architecture decisions, generate an implementation plan, generate "
+            "PLANNING_RUN_SLICE, validate or approve the workspace, transition status, "
+            "create runner proposals, create runs, or invoke an executor."
+        ),
+    )
+    orchestrator_scaffold_local_agentic_spec_parser.add_argument(
+        "intake_id",
+        help="intake identifier (filesystem-safe slug)",
+    )
+    orchestrator_scaffold_local_agentic_spec_parser.add_argument(
+        "path",
+        nargs="?",
+        help="target project directory",
+    )
+    orchestrator_scaffold_local_agentic_spec_parser.add_argument(
+        "--plan-id",
+        required=True,
+        help="planning workspace identifier (filesystem-safe slug)",
+    )
+    orchestrator_scaffold_local_agentic_spec_parser.set_defaults(
+        func=cmd_orchestrator_scaffold_local_agentic_spec
     )
 
     return parser

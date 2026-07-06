@@ -11058,6 +11058,1064 @@ class OrchestratorLocalAgenticSpecPreflightTests(unittest.TestCase):
         self.assertIn("not architecture decision", lowered)
 
 
+class OrchestratorLocalAgenticSpecScaffoldTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self._tmp.name)
+        init_workspace(self.project)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _artifact_path(self, intake_id: str) -> Path:
+        return orchestrator_intake_path(self.project, intake_id) / GOAL_INTAKE_FILE
+
+    def _clarification_path(self, intake_id: str, clarification_id: str) -> Path:
+        return orchestrator_clarification_path(
+            self.project,
+            intake_id,
+            clarification_id,
+        )
+
+    def _decision_path(self, intake_id: str, decision_id: str) -> Path:
+        return orchestrator_readiness_decision_path(
+            self.project,
+            intake_id,
+            decision_id,
+        )
+
+    def _create_slither_intake(self, intake_id: str = "slither-demo") -> Path:
+        return create_goal_intake(
+            self.project,
+            intake_id,
+            "Build me an online slither.io-like game",
+        )
+
+    def _project_files(self) -> set[str]:
+        return {
+            path.relative_to(self.project).as_posix()
+            for path in self.project.rglob("*")
+            if path.is_file()
+        }
+
+    def _slither_with_clarification(self, intake_id: str = "slither-demo") -> None:
+        self._create_slither_intake(intake_id)
+        create_owner_clarification(
+            self.project,
+            intake_id,
+            "scope-v1",
+            "Browser-only demo with 10 players max; no persistence.",
+        )
+
+    def _authorize_slither(self, intake_id: str = "slither-demo") -> None:
+        self._slither_with_clarification(intake_id)
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "AUTHORIZE_DRAFT_PREPARATION",
+            "Scope clarified; authorize future draft prep only.",
+        )
+
+    def _prepare(
+        self,
+        intake_id: str = "slither-demo",
+        plan_id: str = "slither-plan-v1",
+    ) -> tuple[int, str]:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "prepare-planning-draft",
+                    intake_id,
+                    str(self.project),
+                    "--plan-id",
+                    plan_id,
+                ]
+            )
+        return code, buf.getvalue()
+
+    def _transport(
+        self,
+        intake_id: str = "slither-demo",
+        plan_id: str = "slither-plan-v1",
+    ) -> tuple[int, str]:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "transport-planning-context",
+                    intake_id,
+                    str(self.project),
+                    "--plan-id",
+                    plan_id,
+                ]
+            )
+        return code, buf.getvalue()
+
+    def _draft_context_pack(
+        self,
+        intake_id: str = "slither-demo",
+        plan_id: str = "slither-plan-v1",
+    ) -> tuple[int, str]:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "draft-context-pack",
+                    intake_id,
+                    str(self.project),
+                    "--plan-id",
+                    plan_id,
+                ]
+            )
+        return code, buf.getvalue()
+
+    def _preflight(
+        self,
+        intake_id: str = "slither-demo",
+        plan_id: str = "slither-plan-v1",
+    ) -> tuple[int, str]:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "local-agentic-spec-preflight",
+                    intake_id,
+                    str(self.project),
+                    "--plan-id",
+                    plan_id,
+                ]
+            )
+        return code, buf.getvalue()
+
+    def _scaffold(
+        self,
+        intake_id: str = "slither-demo",
+        plan_id: str = "slither-plan-v1",
+    ) -> tuple[int, str]:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "scaffold-local-agentic-spec",
+                    intake_id,
+                    str(self.project),
+                    "--plan-id",
+                    plan_id,
+                ]
+            )
+        return code, buf.getvalue()
+
+    def _workspace(self, plan_id: str = "slither-plan-v1") -> Path:
+        return planning_path(self.project, plan_id)
+
+    def _context_pack_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return self._workspace(plan_id) / "context-pack.md"
+
+    def _draft_provenance_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return (
+            self._workspace(plan_id)
+            / "evidence"
+            / "orchestrator-context-pack-draft-provenance.json"
+        )
+
+    def _scaffold_provenance_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return (
+            self._workspace(plan_id)
+            / "evidence"
+            / "orchestrator-local-agentic-spec-scaffold-provenance.json"
+        )
+
+    def _transport_json_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return (
+            self._workspace(plan_id)
+            / "evidence"
+            / "orchestrator-context-transport.json"
+        )
+
+    def _transport_md_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return (
+            self._workspace(plan_id)
+            / "evidence"
+            / "orchestrator-context-transport.md"
+        )
+
+    def _provenance_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return (
+            self._workspace(plan_id)
+            / "evidence"
+            / "orchestrator-provenance.json"
+        )
+
+    def _local_spec_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return self._workspace(plan_id) / "local-agentic-spec.md"
+
+    def _implementation_plan_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return self._workspace(plan_id) / "implementation-plan.md"
+
+    def _planning_audit_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return self._workspace(plan_id) / "planning-audit.md"
+
+    def _setup_ready_for_scaffold(
+        self,
+        intake_id: str = "slither-demo",
+        plan_id: str = "slither-plan-v1",
+    ) -> None:
+        self._authorize_slither(intake_id)
+        self.assertEqual(self._prepare(intake_id, plan_id)[0], 0)
+        self.assertEqual(self._transport(intake_id, plan_id)[0], 0)
+        self.assertEqual(self._draft_context_pack(intake_id, plan_id)[0], 0)
+        self.assertEqual(self._preflight(intake_id, plan_id)[0], 0)
+
+    def _tracked_artifact_paths(
+        self,
+        intake_id: str = "slither-demo",
+        plan_id: str = "slither-plan-v1",
+    ) -> dict[Path, bytes]:
+        workspace = self._workspace(plan_id)
+        paths = [
+            self._artifact_path(intake_id),
+            self._clarification_path(intake_id, "scope-v1"),
+            self._decision_path(intake_id, "owner-v1"),
+            self._provenance_path(plan_id),
+            workspace / "evidence" / "orchestrator-draft-scaffold-notes.md",
+            self._transport_json_path(plan_id),
+            self._transport_md_path(plan_id),
+            self._draft_provenance_path(plan_id),
+            self._context_pack_path(plan_id),
+            self._implementation_plan_path(plan_id),
+            self._planning_audit_path(plan_id),
+        ]
+        return {path: path.read_bytes() for path in paths if path.is_file()}
+
+    def test_succeeds_only_after_successful_preflight(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._authorize_slither(intake_id)
+        self._prepare(intake_id, plan_id)
+        self._transport(intake_id, plan_id)
+
+        code, _ = self._scaffold(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+        self._draft_context_pack(intake_id, plan_id)
+        self.assertEqual(self._preflight(intake_id, plan_id)[0], 0)
+        code, output = self._scaffold(intake_id, plan_id)
+        self.assertEqual(code, 0)
+        self.assertIn("orchestrator local-agentic-spec scaffold created:", output)
+
+    def test_local_agentic_spec_replaced_with_scaffold(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        before = self._local_spec_path(plan_id).read_bytes()
+
+        self._scaffold(plan_id=plan_id)
+
+        after = self._local_spec_path(plan_id).read_text(encoding="utf-8")
+        self.assertNotEqual(before, after.encode("utf-8"))
+        self.assertIn("SCAFFOLD_DRAFT_NON_AUTHORITY", after)
+
+    def test_scaffold_provenance_created(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        self._scaffold(plan_id=plan_id)
+        self.assertTrue(self._scaffold_provenance_path(plan_id).is_file())
+
+    def test_provenance_contains_required_fields(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(intake_id, plan_id)
+        self._scaffold(intake_id, plan_id)
+
+        artifact = json.loads(
+            self._scaffold_provenance_path(plan_id).read_text(encoding="utf-8")
+        )
+        required_fields = (
+            "artifact_type",
+            "schema_version",
+            "plan_id",
+            "intake_id",
+            "source_context_pack_path",
+            "source_context_pack_draft_provenance_path",
+            "source_preflight_state",
+            "source_preflight_next_action",
+            "source_authorize_decision_id",
+            "local_agentic_spec_path",
+            "local_agentic_spec_status",
+            "planning_workspace_status_at_scaffold",
+            "created_at",
+            "non_authority",
+        )
+        for field in required_fields:
+            self.assertIn(field, artifact, f"missing field: {field}")
+        self.assertEqual(
+            artifact["artifact_type"],
+            "ORCHESTRATOR_LOCAL_AGENTIC_SPEC_SCAFFOLD_PROVENANCE",
+        )
+        self.assertEqual(artifact["schema_version"], "0.1")
+
+    def test_provenance_non_authority_flags_all_true(self) -> None:
+        from agent_os.orchestrator import (
+            ORCHESTRATOR_LOCAL_AGENTIC_SPEC_SCAFFOLD_NON_AUTHORITY_FLAGS,
+        )
+
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        self._scaffold(plan_id=plan_id)
+
+        artifact = json.loads(
+            self._scaffold_provenance_path(plan_id).read_text(encoding="utf-8")
+        )
+        non_authority = artifact["non_authority"]
+        for flag in ORCHESTRATOR_LOCAL_AGENTIC_SPEC_SCAFFOLD_NON_AUTHORITY_FLAGS:
+            self.assertIn(flag, non_authority)
+            self.assertTrue(non_authority[flag])
+
+    def test_scaffold_labels_scaffold_draft_non_authority(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        self._scaffold(plan_id=plan_id)
+
+        spec = self._local_spec_path(plan_id).read_text(encoding="utf-8")
+        self.assertIn("SCAFFOLD_DRAFT_NON_AUTHORITY", spec)
+
+    def test_scaffold_contains_source_context_pack_paths(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        self._scaffold(plan_id=plan_id)
+
+        spec = self._local_spec_path(plan_id).read_text(encoding="utf-8")
+        self.assertIn("context-pack", spec.lower())
+        self.assertIn("orchestrator-context-pack-draft-provenance.json", spec)
+
+    def test_scaffold_states_requirements_extraction_not_performed(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        self._scaffold(plan_id=plan_id)
+
+        spec = self._local_spec_path(plan_id).read_text(encoding="utf-8").lower()
+        self.assertIn("requirements extraction", spec)
+        self.assertIn("not performed", spec)
+        self.assertIn("pending_future_requirements_extraction", spec)
+
+    def test_scaffold_states_architecture_undecided(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        self._scaffold(plan_id=plan_id)
+
+        spec = self._local_spec_path(plan_id).read_text(encoding="utf-8")
+        self.assertIn("UNDECIDED_NOT_GENERATED", spec)
+        self.assertIn("architecture", spec.lower())
+
+    def test_scaffold_states_implementation_plan_not_generated(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        self._scaffold(plan_id=plan_id)
+
+        spec = self._local_spec_path(plan_id).read_text(encoding="utf-8")
+        self.assertIn("Implementation Plan", spec)
+        self.assertIn("NOT_GENERATED", spec)
+
+    def test_scaffold_states_planning_run_slice_not_generated(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        self._scaffold(plan_id=plan_id)
+
+        spec = self._local_spec_path(plan_id).read_text(encoding="utf-8")
+        self.assertIn("PLANNING_RUN_SLICE", spec)
+        self.assertIn("NOT_GENERATED", spec)
+
+    def test_scaffold_contains_only_pending_substantive_sections(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        self._scaffold(plan_id=plan_id)
+
+        spec = self._local_spec_path(plan_id).read_text(encoding="utf-8")
+        self.assertIn("PENDING_FUTURE_REQUIREMENTS_EXTRACTION", spec)
+        self.assertNotIn("PLACEHOLDER — one-paragraph summary", spec)
+
+    def test_scaffold_does_not_copy_raw_goal(self) -> None:
+        plan_id = "slither-plan-v1"
+        raw_goal = "Build me an online slither.io-like game"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        self._scaffold(plan_id=plan_id)
+
+        spec = self._local_spec_path(plan_id).read_text(encoding="utf-8")
+        self.assertNotIn(raw_goal, spec)
+
+    def test_scaffold_does_not_copy_normalized_goal_into_substantive_sections(
+        self,
+    ) -> None:
+        intake_id = "norm-goal-demo"
+        plan_id = "norm-goal-plan"
+        raw_goal = "Build  me   an online slither.io-like game"
+        create_goal_intake(self.project, intake_id, raw_goal)
+        artifact = json.loads(self._artifact_path(intake_id).read_text(encoding="utf-8"))
+        normalized_goal = artifact["normalized_goal"]
+        self.assertNotEqual(raw_goal, normalized_goal)
+        create_owner_clarification(
+            self.project,
+            intake_id,
+            "scope-v1",
+            "Browser-only demo with 10 players max; no persistence.",
+        )
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "AUTHORIZE_DRAFT_PREPARATION",
+            "Scope clarified; authorize future draft prep only.",
+        )
+        self.assertEqual(self._prepare(intake_id, plan_id)[0], 0)
+        self.assertEqual(self._transport(intake_id, plan_id)[0], 0)
+        self.assertEqual(self._draft_context_pack(intake_id, plan_id)[0], 0)
+        self.assertEqual(self._preflight(intake_id, plan_id)[0], 0)
+        self._scaffold(intake_id, plan_id)
+
+        spec = self._local_spec_path(plan_id).read_text(encoding="utf-8")
+        self.assertNotIn(normalized_goal, spec)
+        substantive_start = spec.index("## Spec sections")
+        substantive_body = spec[substantive_start:]
+        self.assertNotIn(normalized_goal, substantive_body)
+
+    def test_scaffold_does_not_copy_clarification_answers(self) -> None:
+        plan_id = "slither-plan-v1"
+        answer = "Browser-only demo with 10 players max; no persistence."
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        self._scaffold(plan_id=plan_id)
+
+        spec = self._local_spec_path(plan_id).read_text(encoding="utf-8")
+        self.assertNotIn(answer, spec)
+
+    def test_scaffold_does_not_generate_functional_requirements(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        self._scaffold(plan_id=plan_id)
+
+        spec = self._local_spec_path(plan_id).read_text(encoding="utf-8").lower()
+        self.assertNotIn("the system shall", spec)
+        self.assertNotIn("user story", spec)
+
+    def test_scaffold_does_not_generate_user_stories(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        self._scaffold(plan_id=plan_id)
+
+        spec = self._local_spec_path(plan_id).read_text(encoding="utf-8").lower()
+        self.assertNotIn("as a user", spec)
+        self.assertNotIn("user stories", spec)
+
+    def test_scaffold_does_not_generate_acceptance_criteria(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        self._scaffold(plan_id=plan_id)
+
+        spec = self._local_spec_path(plan_id).read_text(encoding="utf-8")
+        self.assertIn("Acceptance Criteria", spec)
+        self.assertIn("| Acceptance Criteria | NOT_GENERATED |", spec)
+
+    def test_refuses_missing_workspace(self) -> None:
+        bare = self.project / "bare"
+        bare.mkdir()
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "scaffold-local-agentic-spec",
+                    "slither-demo",
+                    str(bare),
+                    "--plan-id",
+                    "slither-plan-v1",
+                ]
+            )
+
+        self.assertEqual(code, 1)
+
+    def test_refuses_missing_intake(self) -> None:
+        plan_id = "orphan-plan"
+        self._authorize_slither()
+        self._prepare(plan_id=plan_id)
+        self._transport(plan_id=plan_id)
+        self._draft_context_pack(plan_id=plan_id)
+        self._preflight(plan_id=plan_id)
+
+        code, _ = self._scaffold("missing-intake", plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_invalid_intake(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(intake_id, plan_id)
+        path = self._artifact_path(intake_id)
+        artifact = json.loads(path.read_text(encoding="utf-8"))
+        artifact["artifact_type"] = "WRONG_TYPE"
+        path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+
+        code, _ = self._scaffold(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_missing_planning_workspace(self) -> None:
+        self._authorize_slither()
+        code, _ = self._scaffold(plan_id="missing-plan")
+        self.assertEqual(code, 1)
+
+    def test_refuses_non_draft_planning_workspace(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(intake_id, plan_id)
+        manifest_path = self._workspace(plan_id) / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["status"] = "CONTEXT_READY"
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+        code, _ = self._scaffold(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_failed_local_agentic_spec_preflight(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._authorize_slither(intake_id)
+        self._prepare(intake_id, plan_id)
+        self._transport(intake_id, plan_id)
+
+        code, _ = self._scaffold(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_when_local_agentic_spec_preflight_no_longer_confirmed_at_scaffold_time(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(intake_id, plan_id)
+        self.assertEqual(self._preflight(intake_id, plan_id)[0], 0)
+
+        before = self._tracked_artifact_paths(intake_id, plan_id)
+        local_spec = self._local_spec_path(plan_id)
+        local_spec.write_text(
+            local_spec.read_text(encoding="utf-8").replace("PLACEHOLDER", "CUSTOMIZED", 1),
+            encoding="utf-8",
+        )
+        local_spec_bytes = local_spec.read_bytes()
+
+        code, _ = self._scaffold(intake_id, plan_id)
+        self.assertEqual(code, 1)
+        self.assertFalse(self._scaffold_provenance_path(plan_id).exists())
+        self.assertEqual(local_spec_bytes, local_spec.read_bytes())
+        after = self._tracked_artifact_paths(intake_id, plan_id)
+        self.assertEqual(before, after)
+
+    def test_refuses_when_context_pack_mutated_after_local_agentic_spec_preflight(
+        self,
+    ) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(intake_id, plan_id)
+        self.assertEqual(self._preflight(intake_id, plan_id)[0], 0)
+
+        context_pack = self._context_pack_path(plan_id)
+        context_pack.write_text(
+            context_pack.read_text(encoding="utf-8").replace(
+                "DRAFT_NON_AUTHORITY",
+                "APPROVED",
+            ),
+            encoding="utf-8",
+        )
+        mutated_context_pack = context_pack.read_bytes()
+        implementation_plan_before = self._implementation_plan_path(plan_id).read_bytes()
+        planning_audit_before = self._planning_audit_path(plan_id).read_bytes()
+        local_spec_before = self._local_spec_path(plan_id).read_bytes()
+
+        code, _ = self._scaffold(intake_id, plan_id)
+        self.assertEqual(code, 1)
+        self.assertFalse(self._scaffold_provenance_path(plan_id).exists())
+        self.assertEqual(mutated_context_pack, context_pack.read_bytes())
+        self.assertEqual(
+            implementation_plan_before,
+            self._implementation_plan_path(plan_id).read_bytes(),
+        )
+        self.assertEqual(
+            planning_audit_before,
+            self._planning_audit_path(plan_id).read_bytes(),
+        )
+        self.assertEqual(local_spec_before, self._local_spec_path(plan_id).read_bytes())
+
+    def test_refuses_stale_incoherent_authorization(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(intake_id, plan_id)
+        provenance = json.loads(
+            self._provenance_path(plan_id).read_text(encoding="utf-8")
+        )
+        provenance["source_authorize_decision_id"] = "stale-decision"
+        self._provenance_path(plan_id).write_text(
+            json.dumps(provenance, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        code, _ = self._scaffold(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_latest_request_more_clarification_after_authorize(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(intake_id, plan_id)
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v2",
+            "REQUEST_MORE_CLARIFICATION",
+            "Need more detail on multiplayer scope.",
+        )
+
+        code, _ = self._scaffold(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_latest_block_intake_after_authorize(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(intake_id, plan_id)
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v2",
+            "BLOCK_INTAKE",
+            "Scope too broad; stop intake.",
+        )
+
+        code, _ = self._scaffold(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_missing_context_pack_md(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(intake_id, plan_id)
+        self._context_pack_path(plan_id).unlink()
+
+        code, _ = self._scaffold(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_missing_context_pack_draft_provenance(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(intake_id, plan_id)
+        self._draft_provenance_path(plan_id).unlink()
+
+        code, _ = self._scaffold(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_missing_local_agentic_spec_md(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(intake_id, plan_id)
+        self._local_spec_path(plan_id).unlink()
+
+        code, _ = self._scaffold(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_modified_local_agentic_spec_md(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(intake_id, plan_id)
+        path = self._local_spec_path(plan_id)
+        path.write_text(path.read_text(encoding="utf-8") + "\nmodified\n", encoding="utf-8")
+
+        code, _ = self._scaffold(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_modified_implementation_plan_md(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(intake_id, plan_id)
+        path = self._implementation_plan_path(plan_id)
+        path.write_text(path.read_text(encoding="utf-8") + "\nmodified\n", encoding="utf-8")
+
+        code, _ = self._scaffold(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_modified_planning_audit_md(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(intake_id, plan_id)
+        path = self._planning_audit_path(plan_id)
+        path.write_text(path.read_text(encoding="utf-8") + "\nmodified\n", encoding="utf-8")
+
+        code, _ = self._scaffold(intake_id, plan_id)
+        self.assertEqual(code, 1)
+
+    def test_refuses_existing_scaffold_provenance(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(intake_id, plan_id)
+        self._scaffold(intake_id, plan_id)
+        local_spec_bytes = self._local_spec_path(plan_id).read_bytes()
+        provenance_bytes = self._scaffold_provenance_path(plan_id).read_bytes()
+
+        code, _ = self._scaffold(intake_id, plan_id)
+        self.assertEqual(code, 1)
+        self.assertEqual(local_spec_bytes, self._local_spec_path(plan_id).read_bytes())
+        self.assertEqual(
+            provenance_bytes,
+            self._scaffold_provenance_path(plan_id).read_bytes(),
+        )
+
+    def test_refuses_invalid_plan_id(self) -> None:
+        self._setup_ready_for_scaffold()
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "scaffold-local-agentic-spec",
+                    "slither-demo",
+                    str(self.project),
+                    "--plan-id",
+                    "../escape",
+                ]
+            )
+        self.assertEqual(code, 1)
+
+    def test_refuses_path_escape_intake_id(self) -> None:
+        self._setup_ready_for_scaffold()
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = main(
+                [
+                    "orchestrator",
+                    "scaffold-local-agentic-spec",
+                    "../escape",
+                    str(self.project),
+                    "--plan-id",
+                    "slither-plan-v1",
+                ]
+            )
+        self.assertEqual(code, 1)
+
+    def test_preserves_goal_intake_byte_for_byte(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(intake_id, plan_id)
+        artifact_path = self._artifact_path(intake_id)
+        original = artifact_path.read_bytes()
+
+        self._scaffold(intake_id, plan_id)
+
+        self.assertEqual(original, artifact_path.read_bytes())
+
+    def test_preserves_clarification_artifacts_byte_for_byte(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(intake_id, plan_id)
+        clarification_path = self._clarification_path(intake_id, "scope-v1")
+        original = clarification_path.read_bytes()
+
+        self._scaffold(intake_id, plan_id)
+
+        self.assertEqual(original, clarification_path.read_bytes())
+
+    def test_preserves_readiness_decision_artifacts_byte_for_byte(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(intake_id, plan_id)
+        decision_path = self._decision_path(intake_id, "owner-v1")
+        original = decision_path.read_bytes()
+
+        self._scaffold(intake_id, plan_id)
+
+        self.assertEqual(original, decision_path.read_bytes())
+
+    def test_preserves_orchestrator_provenance_byte_for_byte(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        provenance_path = self._provenance_path(plan_id)
+        original = provenance_path.read_bytes()
+
+        self._scaffold(plan_id=plan_id)
+
+        self.assertEqual(original, provenance_path.read_bytes())
+
+    def test_preserves_scaffold_notes_byte_for_byte(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        notes_path = self._workspace(plan_id) / "evidence" / "orchestrator-draft-scaffold-notes.md"
+        original = notes_path.read_bytes()
+
+        self._scaffold(plan_id=plan_id)
+
+        self.assertEqual(original, notes_path.read_bytes())
+
+    def test_preserves_context_transport_json_byte_for_byte(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        transport_path = self._transport_json_path(plan_id)
+        original = transport_path.read_bytes()
+
+        self._scaffold(plan_id=plan_id)
+
+        self.assertEqual(original, transport_path.read_bytes())
+
+    def test_preserves_context_transport_markdown_byte_for_byte(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        transport_path = self._transport_md_path(plan_id)
+        original = transport_path.read_bytes()
+
+        self._scaffold(plan_id=plan_id)
+
+        self.assertEqual(original, transport_path.read_bytes())
+
+    def test_preserves_context_pack_draft_provenance_byte_for_byte(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        provenance_path = self._draft_provenance_path(plan_id)
+        original = provenance_path.read_bytes()
+
+        self._scaffold(plan_id=plan_id)
+
+        self.assertEqual(original, provenance_path.read_bytes())
+
+    def test_preserves_context_pack_md_byte_for_byte(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        context_pack_path = self._context_pack_path(plan_id)
+        original = context_pack_path.read_bytes()
+
+        self._scaffold(plan_id=plan_id)
+
+        self.assertEqual(original, context_pack_path.read_bytes())
+
+    def test_preserves_implementation_plan_md_byte_for_byte(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        plan_path = self._implementation_plan_path(plan_id)
+        original = plan_path.read_bytes()
+
+        self._scaffold(plan_id=plan_id)
+
+        self.assertEqual(original, plan_path.read_bytes())
+
+    def test_preserves_planning_audit_md_byte_for_byte(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        audit_path = self._planning_audit_path(plan_id)
+        original = audit_path.read_bytes()
+
+        self._scaffold(plan_id=plan_id)
+
+        self.assertEqual(original, audit_path.read_bytes())
+
+    def test_does_not_change_planning_workspace_status(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        manifest_path = self._workspace(plan_id) / "manifest.json"
+        before = manifest_path.read_bytes()
+
+        self._scaffold(plan_id=plan_id)
+
+        self.assertEqual(before, manifest_path.read_bytes())
+
+    def test_does_not_generate_architecture_choices(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        self._scaffold(plan_id=plan_id)
+
+        spec = self._local_spec_path(plan_id).read_text(encoding="utf-8").lower()
+        for forbidden in ("postgresql", "react", "kubernetes", "mongodb", "redis"):
+            self.assertNotIn(forbidden, spec)
+
+    def test_does_not_generate_implementation_tasks(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        self._scaffold(plan_id=plan_id)
+
+        spec = self._local_spec_path(plan_id).read_text(encoding="utf-8")
+        self.assertNotIn("allowed_paths", spec)
+        self.assertNotIn("check_command", spec)
+
+    def test_does_not_generate_planning_run_slice(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        self._scaffold(plan_id=plan_id)
+
+        implementation_plan = self._implementation_plan_path(plan_id).read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"artifact_type": "PLANNING_RUN_SLICE"', implementation_plan)
+
+    def test_does_not_create_runner_proposals(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        workspace = self.project / ".agent-os"
+        before = list((workspace / "runs").iterdir())
+
+        self._scaffold(plan_id=plan_id)
+
+        after = list((workspace / "runs").iterdir())
+        self.assertEqual(before, after)
+
+    def test_does_not_create_runs(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        workspace = self.project / ".agent-os"
+        before_runs = list((workspace / "runs").iterdir())
+        self._scaffold(plan_id=plan_id)
+        after_runs = list((workspace / "runs").iterdir())
+        self.assertEqual(before_runs, after_runs)
+
+    def test_does_not_invoke_external_subprocess(self) -> None:
+        self._setup_ready_for_scaffold()
+        with patch("subprocess.run", side_effect=AssertionError("subprocess invoked")):
+            code = main(
+                [
+                    "orchestrator",
+                    "scaffold-local-agentic-spec",
+                    "slither-demo",
+                    str(self.project),
+                    "--plan-id",
+                    "slither-plan-v1",
+                ]
+            )
+        self.assertEqual(code, 0)
+
+    def test_does_not_call_planning_progress_transition_decide(self) -> None:
+        self._setup_ready_for_scaffold()
+        with (
+            patch.object(planning_module, "progress_planning_workspace") as progress,
+            patch.object(planning_module, "transition_planning_workspace") as transition,
+            patch.object(planning_module, "record_planning_owner_decision") as decide,
+        ):
+            self._scaffold()
+        progress.assert_not_called()
+        transition.assert_not_called()
+        decide.assert_not_called()
+
+    def test_restores_local_spec_when_provenance_write_fails(self) -> None:
+        from agent_os.orchestrator import scaffold_local_agentic_spec_from_context_pack
+
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(intake_id, plan_id)
+        local_spec = self._local_spec_path(plan_id)
+        original = local_spec.read_bytes()
+        provenance_path = self._scaffold_provenance_path(plan_id)
+
+        from agent_os import orchestrator as orchestrator_module
+
+        original_write_json = orchestrator_module._write_json
+
+        def failing_provenance_write(path: Path, data: dict) -> None:
+            if path == provenance_path:
+                raise OSError("simulated provenance write failure")
+            original_write_json(path, data)
+
+        with patch.object(orchestrator_module, "_write_json", failing_provenance_write):
+            with self.assertRaises(OSError) as ctx:
+                scaffold_local_agentic_spec_from_context_pack(
+                    self.project,
+                    intake_id,
+                    plan_id,
+                )
+            self.assertIn("simulated provenance write failure", str(ctx.exception))
+
+        self.assertEqual(original, local_spec.read_bytes())
+        self.assertFalse(provenance_path.exists())
+
+    def test_cli_help_states_scaffold_boundaries(self) -> None:
+        parser = build_parser()
+        orchestrator_parser = next(
+            action
+            for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+            and "orchestrator" in action.choices
+        )
+        orchestrator_sub = next(
+            action
+            for action in orchestrator_parser.choices["orchestrator"]._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        help_text = orchestrator_sub.choices[
+            "scaffold-local-agentic-spec"
+        ].format_help()
+        compact = re.sub(r"\s+", " ", help_text)
+        self.assertIn("scaffold", compact.lower())
+        self.assertIn("requirements", compact.lower())
+        self.assertIn("architecture", compact.lower())
+        self.assertIn("implementation plan", compact.lower())
+        self.assertIn("PLANNING_RUN_SLICE", compact)
+        self.assertIn("validate", compact.lower())
+        self.assertIn("executor", compact.lower())
+
+    def test_cli_output_includes_paths_status_and_boundary_notes(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        code, output = self._scaffold(plan_id=plan_id)
+        self.assertEqual(code, 0)
+        self.assertIn("local agentic spec:", output)
+        self.assertIn("local agentic spec scaffold provenance:", output)
+        self.assertIn("workspace_status: DRAFT", output)
+        self.assertIn("no requirements extraction", output.lower())
+
+    def test_existing_commands_unchanged(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._authorize_slither(intake_id)
+        self._prepare(intake_id, plan_id)
+        self._transport(intake_id, plan_id)
+        self._draft_context_pack(intake_id, plan_id)
+        before = self._project_files()
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            preflight_code = main(
+                [
+                    "orchestrator",
+                    "local-agentic-spec-preflight",
+                    intake_id,
+                    str(self.project),
+                    "--plan-id",
+                    plan_id,
+                ]
+            )
+        self.assertEqual(preflight_code, 0)
+        self.assertIn("local-agentic-spec draft preflight", buf.getvalue())
+
+        after = self._project_files()
+        self.assertEqual(before, after)
+
+    def test_scaffold_not_confusable_with_spec_approval(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        self._scaffold(plan_id=plan_id)
+
+        spec = self._local_spec_path(plan_id).read_text(encoding="utf-8").lower()
+        provenance = json.loads(
+            self._scaffold_provenance_path(plan_id).read_text(encoding="utf-8")
+        )
+        self.assertIn("scaffold", spec)
+        self.assertIn("not validated or approved", spec)
+        self.assertNotIn("approved", provenance.get("non_authority", {}))
+        validation = validate_planning_workspace(self.project, plan_id)
+        self.assertFalse(validation.valid)
+
+    def test_no_artifact_claims_local_agentic_spec_approval(self) -> None:
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_scaffold(plan_id=plan_id)
+        self._scaffold(plan_id=plan_id)
+
+        provenance = self._scaffold_provenance_path(plan_id).read_text(encoding="utf-8").lower()
+        spec = self._local_spec_path(plan_id).read_text(encoding="utf-8").lower()
+        self.assertNotIn("local agentic spec approved", provenance)
+        self.assertNotIn("spec approved", spec)
+        self.assertIn("does_not_approve_plan", provenance)
+
+
 class OrchestratorDocsGuardTests(unittest.TestCase):
     """Guard doctrine for CORE_ORCHESTRATOR_001 goal-to-planning workspace contract."""
 

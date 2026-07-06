@@ -287,6 +287,18 @@ agent-os orchestrator local-agentic-spec-preflight <intake-id> --plan-id <plan-i
 
 Requires an existing DRAFT scaffold with matching orchestrator provenance, context transport artifacts, and context-pack draft provenance for the same intake/plan pair; confirmed draft-preflight; `context-pack.md` labeled `DRAFT_NON_AUTHORITY` with required boundary notes; and `local-agentic-spec.md`, `implementation-plan.md`, and `planning-audit.md` still in planning init placeholder shape. **Does not write any artifact** — read-only gate only. Local-agentic-spec preflight does **not** generate or mutate `local-agentic-spec.md`; does **not** generate architecture decisions, implementation plans, or `PLANNING_RUN_SLICE`; does **not** validate or approve the workspace; does **not** transition status; does **not** create runner proposals, runs, or executor invocations; and does **not** mutate orchestrator intake artifacts, transport artifacts, context-pack draft provenance, or `context-pack.md`. **Successful preflight is not local agentic spec generation** — not architecture decision, not implementation planning, not validation or approval. A separate future local-agentic-spec draft command remains required. Future architecture decision, implementation plan, independent validation, and owner approval remain required.
 
+After successful local-agentic-spec-preflight, scaffold the planning workspace `local-agentic-spec.md` structure:
+
+```bash
+agent-os orchestrator scaffold-local-agentic-spec <intake-id> --plan-id <plan-id> [PATH]
+```
+
+Requires an existing DRAFT scaffold with matching orchestrator provenance, context-pack draft provenance, and confirmed local-agentic-spec-preflight for the same intake/plan pair; `local-agentic-spec.md` still in planning init placeholder shape; and `implementation-plan.md` and `planning-audit.md` still in planning init placeholder shape. Writes a bounded `SCAFFOLD_DRAFT_NON_AUTHORITY` structure to `local-agentic-spec.md` and provenance under `evidence/`:
+
+- `evidence/orchestrator-local-agentic-spec-scaffold-provenance.json` — links the scaffold to context-pack draft provenance and preflight state; **provenance is traceability only, not authority**
+
+The local-agentic-spec scaffold provides structure, provenance references, and explicit boundaries only; it does **not** extract or infer requirements, generate user stories or acceptance criteria, generate architecture, implementation plan, or `PLANNING_RUN_SLICE`; does **not** validate or approve the workspace; does **not** transition status; does **not** create runner proposals, runs, or executor invocations; and does **not** mutate orchestrator intake artifacts, transport artifacts, context-pack draft provenance, `context-pack.md`, `implementation-plan.md`, or `planning-audit.md`. **Local-agentic-spec scaffold is not requirements extraction** — not spec approval, not architecture decision, not implementation planning. The planning workspace remains **`DRAFT`** — it is **not validated or approved**. Future requirements extraction, architecture decision, implementation plan, independent validation, and owner approval remain required. Runner proposal generation remains future/separate work.
+
 Inspect an existing planning workspace (read-only):
 
 ```bash

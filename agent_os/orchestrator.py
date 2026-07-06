@@ -13,6 +13,7 @@ from agent_os.paths import (
     CLARIFICATIONS_DIR,
     GOAL_INTAKE_FILE,
     ORCHESTRATOR_CONTEXT_PACK_DRAFT_PROVENANCE_FILE,
+    ORCHESTRATOR_LOCAL_AGENTIC_SPEC_SCAFFOLD_PROVENANCE_FILE,
     ORCHESTRATOR_CONTEXT_TRANSPORT_FILE,
     ORCHESTRATOR_CONTEXT_TRANSPORT_MD_FILE,
     ORCHESTRATOR_DRAFT_SCAFFOLD_NOTES_FILE,
@@ -290,6 +291,37 @@ LOCAL_AGENTIC_SPEC_DRAFT_PREFLIGHT_NON_AUTHORITY_FLAGS = (
     "does_not_invoke_executor",
     "preflight_is_read_only",
     "future_spec_draft_requires_separate_command",
+    "requires_future_independent_validation",
+    "requires_future_owner_approval",
+)
+
+ORCHESTRATOR_LOCAL_AGENTIC_SPEC_SCAFFOLD_PROVENANCE_ARTIFACT_TYPE = (
+    "ORCHESTRATOR_LOCAL_AGENTIC_SPEC_SCAFFOLD_PROVENANCE"
+)
+ORCHESTRATOR_LOCAL_AGENTIC_SPEC_SCAFFOLD_PROVENANCE_SCHEMA_VERSION = "0.1"
+LOCAL_AGENTIC_SPEC_SCAFFOLD_STATUS = "SCAFFOLD_DRAFT_NON_AUTHORITY"
+
+ORCHESTRATOR_LOCAL_AGENTIC_SPEC_SCAFFOLD_NON_AUTHORITY_FLAGS = (
+    "does_not_extract_requirements",
+    "does_not_infer_requirements",
+    "does_not_generate_user_stories",
+    "does_not_generate_acceptance_criteria",
+    "does_not_generate_architecture",
+    "does_not_choose_stack",
+    "does_not_choose_database",
+    "does_not_choose_networking",
+    "does_not_generate_implementation_plan",
+    "does_not_generate_planning_run_slice",
+    "does_not_validate_planning_workspace",
+    "does_not_approve_plan",
+    "does_not_transition_workspace",
+    "does_not_create_runner_proposal",
+    "does_not_create_run",
+    "does_not_invoke_executor",
+    "local_agentic_spec_is_scaffold_only",
+    "future_requirements_extraction_requires_separate_command",
+    "future_architecture_decision_requires_separate_command",
+    "future_implementation_plan_requires_separate_command",
     "requires_future_independent_validation",
     "requires_future_owner_approval",
 )
@@ -3788,6 +3820,356 @@ def preflight_local_agentic_spec_draft(
         next_required_action=LOCAL_AGENTIC_SPEC_DRAFT_PREFLIGHT_CONFIRMED_NEXT_ACTION,
         blocking_reasons=[],
         checked_at=checked_at,
+        non_authority=non_authority,
+    )
+
+
+def _build_local_agentic_spec_scaffold_markdown(
+    *,
+    plan_id: str,
+    intake_id: str,
+    context_pack_path: Path,
+    context_pack_provenance_path: Path,
+    source_preflight_state: str,
+    source_preflight_next_action: str,
+    created_at: str,
+) -> str:
+    lines = [
+        "---",
+        f"plan_id: {plan_id}",
+        "artifact_type: LOCAL_AGENTIC_SPEC",
+        f"local_agentic_spec_status: {LOCAL_AGENTIC_SPEC_SCAFFOLD_STATUS}",
+        f"intake_id: {intake_id}",
+        f"created_at: {created_at}",
+        "author: ORCHESTRATOR_SCAFFOLD_NON_AUTHORITY",
+        "version: 1",
+        "---",
+        "",
+        "# Local Agentic Spec (SCAFFOLD — DRAFT_NON_AUTHORITY)",
+        "",
+        "> **Planning artifact type:** `LOCAL_AGENTIC_SPEC`",
+        "> **Status:** `SCAFFOLD_DRAFT_NON_AUTHORITY` — structure, provenance, and "
+        "boundaries only; not functional requirements, not architecture, not "
+        "implementation plan.",
+        "",
+        "## Source identifiers",
+        "",
+        f"- **plan_id:** `{plan_id}`",
+        f"- **intake_id:** `{intake_id}`",
+        f"- **source context-pack:** `{context_pack_path}`",
+        (
+            "- **source context-pack draft provenance:** "
+            f"`{context_pack_provenance_path}`"
+        ),
+        "",
+        "## Preflight reference",
+        "",
+        f"- **source_preflight_state:** `{source_preflight_state}`",
+        f"- **source_preflight_next_action:** `{source_preflight_next_action}`",
+        "",
+        "## Explicit boundaries",
+        "",
+        "- **requirements extraction:** not performed",
+        "- **architecture:** undecided — `UNDECIDED_NOT_GENERATED`",
+        "- **implementation plan:** not generated — `NOT_GENERATED`",
+        "- **PLANNING_RUN_SLICE:** not generated — `NOT_GENERATED`",
+        "- **planning workspace:** not validated or approved",
+        "- **runner proposals / runs / executor:** not created or invoked",
+        "- **future independent validation:** required",
+        "- **future owner approval:** required",
+        "",
+        "## Spec sections (pending future owner-authorized extraction)",
+        "",
+        "| Section | Status |",
+        "|---------|--------|",
+        "| Functional Requirements | PENDING_FUTURE_REQUIREMENTS_EXTRACTION |",
+        "| Non-Functional Requirements | PENDING_FUTURE_REQUIREMENTS_EXTRACTION |",
+        "| Constraints | PENDING_FUTURE_REQUIREMENTS_EXTRACTION |",
+        "| Out of Scope | PENDING_FUTURE_REQUIREMENTS_EXTRACTION |",
+        "| Interfaces | PENDING_FUTURE_REQUIREMENTS_EXTRACTION |",
+        "| Acceptance Criteria | NOT_GENERATED |",
+        "| Architecture | UNDECIDED_NOT_GENERATED |",
+        "| Implementation Plan | NOT_GENERATED |",
+        "| PLANNING_RUN_SLICE | NOT_GENERATED |",
+        "",
+        "This scaffold provides structure, provenance references, and boundaries only. "
+        "It does not extract requirements, infer product scope, define architecture, or "
+        "generate implementation tasks. Source artifacts are referenced by path only — "
+        "no requirement content was copied from context-pack or intake material.",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _build_local_agentic_spec_scaffold_provenance_artifact(
+    *,
+    plan_id: str,
+    intake_id: str,
+    context_pack_path: Path,
+    context_pack_provenance_path: Path,
+    local_agentic_spec_path: Path,
+    preflight_report: LocalAgenticSpecDraftPreflightReport,
+    draft_preflight_report: DraftPreparationPreflightReport,
+    workspace_status: str,
+    created_at: str,
+) -> dict:
+    return {
+        "artifact_type": ORCHESTRATOR_LOCAL_AGENTIC_SPEC_SCAFFOLD_PROVENANCE_ARTIFACT_TYPE,
+        "schema_version": ORCHESTRATOR_LOCAL_AGENTIC_SPEC_SCAFFOLD_PROVENANCE_SCHEMA_VERSION,
+        "plan_id": plan_id,
+        "intake_id": intake_id,
+        "source_context_pack_path": str(context_pack_path),
+        "source_context_pack_draft_provenance_path": str(context_pack_provenance_path),
+        "source_preflight_state": preflight_report.preflight_state,
+        "source_preflight_next_action": preflight_report.next_required_action,
+        "source_authorize_decision_id": draft_preflight_report.latest_decision_id,
+        "local_agentic_spec_path": str(local_agentic_spec_path),
+        "local_agentic_spec_status": LOCAL_AGENTIC_SPEC_SCAFFOLD_STATUS,
+        "planning_workspace_status_at_scaffold": workspace_status,
+        "created_at": created_at,
+        "non_authority": {
+            key: True for key in ORCHESTRATOR_LOCAL_AGENTIC_SPEC_SCAFFOLD_NON_AUTHORITY_FLAGS
+        },
+    }
+
+
+def _format_scaffolded_local_agentic_spec(
+    *,
+    local_agentic_spec_path: Path,
+    provenance_path: Path,
+    plan_id: str,
+    intake_id: str,
+    workspace_status: str,
+) -> str:
+    lines = [
+        (
+            "orchestrator local-agentic-spec scaffold created: "
+            f"{local_agentic_spec_path.parent.parent}"
+        ),
+        f"local agentic spec: {local_agentic_spec_path}",
+        f"local agentic spec scaffold provenance: {provenance_path}",
+        f"plan_id: {plan_id}",
+        f"intake_id: {intake_id}",
+        f"local_agentic_spec_status: {LOCAL_AGENTIC_SPEC_SCAFFOLD_STATUS}",
+        f"workspace_status: {workspace_status}",
+        "note: local-agentic-spec scaffold only; structure, provenance, and boundaries",
+        "note: no requirements extraction, no architecture generation, "
+        "no implementation plan generation, no PLANNING_RUN_SLICE",
+        "note: planning workspace not validated or approved; "
+        "no runner proposals, runs, or executor invocation",
+        "note: orchestrator intake artifacts, transport artifacts, context-pack draft "
+        "provenance, and context-pack.md were not modified; future requirements "
+        "extraction, architecture decision, independent validation, and owner "
+        "approval remain required",
+    ]
+    return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class ScaffoldedLocalAgenticSpecReport:
+    output: str
+    plan_id: str
+    intake_id: str
+    local_agentic_spec_path: Path
+    provenance_path: Path
+    local_agentic_spec_status: str
+    workspace_status: str
+    non_authority: dict[str, bool]
+
+
+def scaffold_local_agentic_spec_from_context_pack(
+    project: Path,
+    intake_id: str,
+    plan_id: str,
+) -> ScaffoldedLocalAgenticSpecReport:
+    """Scaffold local-agentic-spec.md with structure/boundaries only (no requirements)."""
+    validate_intake_id(intake_id)
+    validate_plan_id(plan_id)
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        raise FileNotFoundError("no workspace found (run `agent-os init` first)")
+
+    _require_valid_goal_intake(project, intake_id)
+
+    workspace_dest = planning_path(project, plan_id)
+    if not workspace_dest.is_dir():
+        raise FileNotFoundError(f"planning workspace not found: {plan_id}")
+
+    workspace_status = _load_planning_workspace_status(workspace_dest, plan_id)
+    if workspace_status != "DRAFT":
+        raise ValueError(
+            f"planning workspace must be DRAFT for local-agentic-spec scaffold, found: "
+            f"{workspace_status!r}"
+        )
+
+    preflight_report = preflight_local_agentic_spec_draft(project, intake_id, plan_id)
+    if (
+        preflight_report.preflight_state
+        != LOCAL_AGENTIC_SPEC_DRAFT_PREFLIGHT_CONFIRMED_STATE
+    ):
+        reasons = "; ".join(preflight_report.blocking_reasons)
+        detail = f": {reasons}" if reasons else ""
+        raise ValueError(
+            "local-agentic-spec draft preflight not confirmed: "
+            f"{preflight_report.preflight_state}{detail}"
+        )
+    if (
+        preflight_report.next_required_action
+        != LOCAL_AGENTIC_SPEC_DRAFT_PREFLIGHT_CONFIRMED_NEXT_ACTION
+    ):
+        raise ValueError(
+            "local-agentic-spec draft preflight next action not expected: "
+            f"{preflight_report.next_required_action!r} "
+            f"(expected {LOCAL_AGENTIC_SPEC_DRAFT_PREFLIGHT_CONFIRMED_NEXT_ACTION!r})"
+        )
+
+    draft_preflight_report = preflight_draft_preparation(project, intake_id)
+    if (
+        draft_preflight_report.preflight_state
+        != DRAFT_PREPARATION_PREFLIGHT_CONFIRMED_STATE
+    ):
+        raise ValueError(
+            "draft-preparation preflight not confirmed: "
+            f"{draft_preflight_report.preflight_state}"
+        )
+    if draft_preflight_report.latest_decision != "AUTHORIZE_DRAFT_PREPARATION":
+        raise ValueError(
+            "latest readiness decision is not AUTHORIZE_DRAFT_PREPARATION"
+        )
+    if draft_preflight_report.latest_decision_id is None:
+        raise ValueError("missing authorize decision id in preflight report")
+
+    context_pack_path = workspace_dest / "context-pack.md"
+    context_pack_provenance_path = (
+        workspace_dest / "evidence" / ORCHESTRATOR_CONTEXT_PACK_DRAFT_PROVENANCE_FILE
+    )
+    local_agentic_spec_path = workspace_dest / "local-agentic-spec.md"
+    implementation_plan_path = workspace_dest / "implementation-plan.md"
+    planning_audit_path = workspace_dest / "planning-audit.md"
+
+    if not context_pack_path.is_file():
+        raise FileNotFoundError(
+            f"context-pack.md missing in planning workspace: {plan_id}"
+        )
+    if not context_pack_provenance_path.is_file():
+        raise FileNotFoundError(
+            f"context pack draft provenance not found for planning workspace: {plan_id}"
+        )
+    if not local_agentic_spec_path.is_file():
+        raise FileNotFoundError(
+            f"local-agentic-spec.md missing in planning workspace: {plan_id}"
+        )
+    if not implementation_plan_path.is_file():
+        raise FileNotFoundError(
+            f"implementation-plan.md missing in planning workspace: {plan_id}"
+        )
+    if not planning_audit_path.is_file():
+        raise FileNotFoundError(
+            f"planning-audit.md missing in planning workspace: {plan_id}"
+        )
+
+    original_local_spec = local_agentic_spec_path.read_bytes()
+    if not _is_planning_artifact_init_placeholder(
+        original_local_spec.decode("utf-8"),
+        plan_id,
+        "local-agentic-spec.md",
+        artifact_type="LOCAL_AGENTIC_SPEC",
+    ):
+        raise FileExistsError(
+            f"local-agentic-spec.md already drafted or modified for plan: {plan_id}"
+        )
+
+    if not _is_planning_artifact_init_placeholder(
+        implementation_plan_path.read_text(encoding="utf-8"),
+        plan_id,
+        "implementation-plan.md",
+        artifact_type="IMPLEMENTATION_PLAN",
+    ):
+        raise FileExistsError(
+            f"implementation-plan.md already modified for plan: {plan_id}"
+        )
+
+    if not _is_planning_artifact_init_placeholder(
+        planning_audit_path.read_text(encoding="utf-8"),
+        plan_id,
+        "planning-audit.md",
+        artifact_type="PLANNING_AUDIT",
+        identity_field="auditor",
+    ):
+        raise FileExistsError(
+            f"planning-audit.md already modified for plan: {plan_id}"
+        )
+
+    scaffold_provenance_path = (
+        workspace_dest
+        / "evidence"
+        / ORCHESTRATOR_LOCAL_AGENTIC_SPEC_SCAFFOLD_PROVENANCE_FILE
+    )
+    if scaffold_provenance_path.exists():
+        raise FileExistsError(
+            f"local-agentic-spec scaffold provenance already exists for plan: {plan_id}"
+        )
+
+    created_at = _utc_now()
+    scaffold_markdown = _build_local_agentic_spec_scaffold_markdown(
+        plan_id=plan_id,
+        intake_id=intake_id,
+        context_pack_path=context_pack_path,
+        context_pack_provenance_path=context_pack_provenance_path,
+        source_preflight_state=preflight_report.preflight_state,
+        source_preflight_next_action=preflight_report.next_required_action,
+        created_at=created_at,
+    )
+    provenance_artifact = _build_local_agentic_spec_scaffold_provenance_artifact(
+        plan_id=plan_id,
+        intake_id=intake_id,
+        context_pack_path=context_pack_path,
+        context_pack_provenance_path=context_pack_provenance_path,
+        local_agentic_spec_path=local_agentic_spec_path,
+        preflight_report=preflight_report,
+        draft_preflight_report=draft_preflight_report,
+        workspace_status=workspace_status,
+        created_at=created_at,
+    )
+
+    temp_local_spec = local_agentic_spec_path.with_suffix(".md.tmp")
+    try:
+        temp_local_spec.write_text(scaffold_markdown, encoding="utf-8")
+        temp_local_spec.replace(local_agentic_spec_path)
+        try:
+            _write_json(scaffold_provenance_path, provenance_artifact)
+        except Exception:
+            local_agentic_spec_path.write_bytes(original_local_spec)
+            if scaffold_provenance_path.is_file():
+                scaffold_provenance_path.unlink()
+            raise
+    except Exception:
+        if temp_local_spec.is_file():
+            temp_local_spec.unlink()
+        if local_agentic_spec_path.read_bytes() != original_local_spec:
+            local_agentic_spec_path.write_bytes(original_local_spec)
+        if scaffold_provenance_path.is_file():
+            scaffold_provenance_path.unlink()
+        raise
+
+    non_authority = {
+        key: True for key in ORCHESTRATOR_LOCAL_AGENTIC_SPEC_SCAFFOLD_NON_AUTHORITY_FLAGS
+    }
+    output = _format_scaffolded_local_agentic_spec(
+        local_agentic_spec_path=local_agentic_spec_path,
+        provenance_path=scaffold_provenance_path,
+        plan_id=plan_id,
+        intake_id=intake_id,
+        workspace_status=workspace_status,
+    )
+    return ScaffoldedLocalAgenticSpecReport(
+        output=output,
+        plan_id=plan_id,
+        intake_id=intake_id,
+        local_agentic_spec_path=local_agentic_spec_path,
+        provenance_path=scaffold_provenance_path,
+        local_agentic_spec_status=LOCAL_AGENTIC_SPEC_SCAFFOLD_STATUS,
+        workspace_status=workspace_status,
         non_authority=non_authority,
     )
 
