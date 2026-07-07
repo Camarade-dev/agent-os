@@ -37,6 +37,7 @@ from typing import Any, Protocol
 
 from admissible.runner.model_clients import (
     FixedResponseModelClient,
+    build_huggingface_model_client_from_env,
     build_model_client_from_env,
 )
 
@@ -304,7 +305,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     provider_group.add_argument(
         "--provider",
-        choices=["env-http"],
+        choices=["env-http", "hf"],
         help="Use a live model provider configured via environment variables.",
     )
     parser.add_argument(
@@ -324,6 +325,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.mock_response is not None:
         response_text = Path(args.mock_response).read_text(encoding="utf-8")
         model_client = FixedResponseModelClient(response_text)
+    elif args.provider == "hf":
+        model_client = build_huggingface_model_client_from_env()
     else:
         model_client = build_model_client_from_env()
 

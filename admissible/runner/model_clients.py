@@ -121,6 +121,105 @@ class EnvConfiguredHttpModelClient:
         return text
 
 
+HF_TOKEN_ENV = "ADMISSIBLE_HF_TOKEN"
+HF_MODEL_ENV = "ADMISSIBLE_HF_MODEL"
+HF_BASE_URL_ENV = "ADMISSIBLE_HF_BASE_URL"
+HF_TIMEOUT_ENV = "ADMISSIBLE_HF_TIMEOUT_SECONDS"
+
+HF_REQUIRED_ENV_VARS: tuple[str, ...] = (HF_TOKEN_ENV, HF_MODEL_ENV)
+DEFAULT_HF_BASE_URL = "https://router.huggingface.co/v1"
+DEFAULT_HF_TIMEOUT_SECONDS = 60.0
+
+
+def _parse_hf_timeout_seconds(raw: str | None) -> float:
+    if raw is None or not str(raw).strip():
+        return DEFAULT_HF_TIMEOUT_SECONDS
+    try:
+        value = float(str(raw).strip())
+    except ValueError:
+        return DEFAULT_HF_TIMEOUT_SECONDS
+    if value <= 0:
+        return DEFAULT_HF_TIMEOUT_SECONDS
+    return value
+
+
+class HuggingFaceChatCompletionsModelClient:
+    """OpenAI-compatible chat completions client for Hugging Face Inference Providers."""
+
+    def __init__(
+        self,
+        *,
+        token: str,
+        model: str,
+        base_url: str = DEFAULT_HF_BASE_URL,
+        timeout_seconds: float = DEFAULT_HF_TIMEOUT_SECONDS,
+    ):
+        self._token = token
+        self._model = model
+        self._base_url = base_url.rstrip("/")
+        self._timeout_seconds = timeout_seconds
+
+    def complete(self, prompt: str) -> str:
+        url = f"{self._base_url}/chat/completions"
+        payload = json.dumps({
+            "model": self._model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+            "max_tokens": 1000,
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {self._token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout_seconds) as response:
+                body = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"Hugging Face API request failed with HTTP {exc.code}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError("Hugging Face API request failed: network error") from exc
+
+        try:
+            parsed = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Hugging Face API response is not valid JSON: {exc}") from exc
+
+        text = _extract_text_from_response(parsed)
+        if text is None:
+            raise ValueError(
+                "Hugging Face API response has unsupported shape; "
+                "expected text, output, or choices[0].message.content"
+            )
+        return text
+
+
+def build_huggingface_model_client_from_env() -> HuggingFaceChatCompletionsModelClient:
+    """Build a HuggingFaceChatCompletionsModelClient from environment variables.
+
+    Raises ValueError naming any missing required variables. Never includes
+    secrets in error messages.
+    """
+    missing = [name for name in HF_REQUIRED_ENV_VARS if not os.environ.get(name, "").strip()]
+    if missing:
+        raise ValueError(
+            "missing required environment variable(s): " + ", ".join(missing)
+        )
+
+    base_url = os.environ.get(HF_BASE_URL_ENV, DEFAULT_HF_BASE_URL).strip() or DEFAULT_HF_BASE_URL
+
+    return HuggingFaceChatCompletionsModelClient(
+        token=os.environ[HF_TOKEN_ENV].strip(),
+        model=os.environ[HF_MODEL_ENV].strip(),
+        base_url=base_url,
+        timeout_seconds=_parse_hf_timeout_seconds(os.environ.get(HF_TIMEOUT_ENV)),
+    )
+
+
 def build_model_client_from_env() -> EnvConfiguredHttpModelClient:
     """Build an EnvConfiguredHttpModelClient from process environment variables.
 

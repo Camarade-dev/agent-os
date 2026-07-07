@@ -36,6 +36,12 @@ _SYSTEM_DESCRIPTOR_TEMPLATES: dict[str, dict[str, str]] = {
         "system_type": "frontier_direct_live",
         "description": "Frontier-direct baseline with a live model provider.",
     },
+    "frontier_direct_hf": {
+        "system_type": "frontier_direct_hf",
+        "description": (
+            "Frontier-direct baseline with Hugging Face Inference Providers."
+        ),
+    },
     "admissible_model_assisted": {
         "system_type": "admissible_model_assisted",
         "description": "Admissible model-assisted evaluator.",

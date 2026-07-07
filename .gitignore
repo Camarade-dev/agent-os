@@ -20,3 +20,14 @@ Thumbs.db
 
 # Local demo workspaces created during development
 .agent-os/
+
+# Local Admissible provider settings (may contain secrets)
+.admissible/
+
+# Generated demo trace artifacts (not committed)
+benchmark/reports/demo_trace.json
+benchmark/reports/demo_trace.html
+benchmark/reports/live_demo_trace.json
+benchmark/reports/live_demo_trace.html
+benchmark/reports/hf_demo_trace.json
+benchmark/reports/hf_demo_trace.html

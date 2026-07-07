@@ -62,22 +62,40 @@ python -m admissible.runner.demo_trace \
 
 Open `benchmark/reports/demo_trace.html` in a browser.
 
-Optional live demo trace (requires `ADMISSIBLE_MODEL_*` env vars; writes separate `live_demo_trace.*` artifacts):
+### Hugging Face live provider
 
-```bash
-python -m admissible.runner.demo_trace \
-  --demo-pack benchmark/reports/demo-pack.json \
-  --gold benchmark/annotations/gold_labels.jsonl \
-  --provider env-http \
-  --trace-out benchmark/reports/live_demo_trace.json \
-  --html-out benchmark/reports/live_demo_trace.html
+For a practical live demo, configure Hugging Face Inference Providers:
+
+```powershell
+$env:ADMISSIBLE_HF_TOKEN="hf_..."
+$env:ADMISSIBLE_HF_MODEL="<model>"
+$env:ADMISSIBLE_HF_BASE_URL="https://router.huggingface.co/v1"
 ```
 
-### Optional live model provider
+Then run:
+
+```powershell
+python -m admissible.runner.demo_trace `
+  --demo-pack benchmark/reports/demo-pack.json `
+  --gold benchmark/annotations/gold_labels.jsonl `
+  --provider hf `
+  --trace-out benchmark/reports/hf_demo_trace.json `
+  --html-out benchmark/reports/hf_demo_trace.html
+```
+
+This remains a Tier 1 enriched smoke trace, not a benchmark result.
+
+Optional local settings helper:
+
+```bash
+python -m admissible.harness.provider_settings --out .admissible/local_provider_settings.json
+```
+
+### Optional live model provider (env-http)
 
 The default demo path uses `frontier_direct_mock`.
 
-A live frontier-direct baseline can be run by configuring:
+A generic env-http live frontier-direct baseline can still be run by configuring:
 
 - `ADMISSIBLE_MODEL_API_URL`
 - `ADMISSIBLE_MODEL_API_KEY`
@@ -114,7 +132,7 @@ Existing Agent OS CLI/orchestrator concepts are not automatically Admissible ben
 
 ### Next technical step
 
-A live model provider boundary is available behind `ModelClient` (`admissible.runner.model_clients`). The default demo and test paths remain mock-only; optional live runs use `--provider env-http` or the `frontier_direct_live` compare-runner system when environment variables are set.
+A live model provider boundary is available behind `ModelClient` (`admissible.runner.model_clients`). The default demo and test paths remain mock-only; optional live runs use `--provider hf` (Hugging Face), `--provider env-http`, or compare-runner systems `frontier_direct_hf` / `frontier_direct_live` when environment variables are set.
 
 ## What problem it solves
 

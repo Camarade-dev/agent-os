@@ -8,9 +8,10 @@ Supports two modes:
 
 - **mock** (default): runs `rules_only` and `frontier_direct_mock` with a fixed
   mock model response. No live model call or network access.
-- **live** (opt-in): runs `rules_only` and `frontier_direct_live` using the
-  env-http model provider boundary when `--provider env-http` is supplied and
-  required environment variables are set.
+- **live** (opt-in): runs `rules_only` and `frontier_direct_hf` when
+  `--provider hf` is supplied and required ADMISSIBLE_HF_* environment
+  variables are set. The generic env-http path remains available via
+  `--provider env-http` but is not the primary live demo route.
 
 Reuses existing modules rather than duplicating their logic:
 
@@ -31,13 +32,13 @@ Also runnable as a CLI:
         --trace-out benchmark/reports/demo_trace.json \\
         --html-out benchmark/reports/demo_trace.html
 
-    # Live mode (opt-in; requires ADMISSIBLE_MODEL_* env vars)
+    # Live mode via Hugging Face (opt-in; requires ADMISSIBLE_HF_* env vars)
     python -m admissible.runner.demo_trace \\
         --demo-pack benchmark/reports/demo-pack.json \\
         --gold benchmark/annotations/gold_labels.jsonl \\
-        --provider env-http \\
-        --trace-out benchmark/reports/live_demo_trace.json \\
-        --html-out benchmark/reports/live_demo_trace.html
+        --provider hf \\
+        --trace-out benchmark/reports/hf_demo_trace.json \\
+        --html-out benchmark/reports/hf_demo_trace.html
 """
 
 from __future__ import annotations
@@ -50,6 +51,7 @@ from typing import Literal
 
 from admissible.harness.viewer import write_trace_html
 from admissible.runner.compare_runner import (
+    FRONTIER_HF_NOTE,
     FRONTIER_LIVE_NOTE,
     FRONTIER_MOCK_NOTE,
     run_system_on_envelopes,
@@ -72,9 +74,14 @@ DEMO_TRACE_LIVE_DISCLAIMER_NOTE = (
     "Live frontier-direct run using env-http provider; results depend on "
     "provider/model/date/config and are not benchmark claims."
 )
+DEMO_TRACE_HF_DISCLAIMER_NOTE = (
+    "Live frontier-direct run using Hugging Face Inference Providers; "
+    "results depend on provider/model/date/config and are not benchmark claims."
+)
 DEMO_TRACE_GENERATED_BY = "admissible.runner.demo_trace"
 DEMO_SYSTEMS_MOCK: tuple[str, ...] = ("rules_only", "frontier_direct_mock")
-DEMO_SYSTEMS_LIVE: tuple[str, ...] = ("rules_only", "frontier_direct_live")
+DEMO_SYSTEMS_LIVE_ENV_HTTP: tuple[str, ...] = ("rules_only", "frontier_direct_live")
+DEMO_SYSTEMS_LIVE_HF: tuple[str, ...] = ("rules_only", "frontier_direct_hf")
 OWNER_CONFIG_REQUIRED_STATUS = "OWNER_CONFIG_REQUIRED"
 
 _MIN_SELECTED_CASES = 5
@@ -192,16 +199,18 @@ def _resolve_demo_mode(
     *,
     mock_response_path: str | Path | None,
     provider: str | None,
-) -> Literal["mock", "live"]:
+) -> tuple[Literal["mock", "live"], str | None]:
     if mock_response_path is not None and provider is not None:
         raise ValueError("cannot use both --mock-response and --provider")
     if provider is not None:
-        if provider != "env-http":
-            raise ValueError(f"unsupported provider: {provider!r}; expected 'env-http'")
-        return "live"
+        if provider not in ("env-http", "hf"):
+            raise ValueError(
+                f"unsupported provider: {provider!r}; expected 'env-http' or 'hf'"
+            )
+        return ("live", provider)
     if mock_response_path is not None:
-        return "mock"
-    raise ValueError("either --mock-response or --provider env-http is required")
+        return ("mock", None)
+    raise ValueError("either --mock-response or --provider is required")
 
 
 def _run_frontier_system(
@@ -214,6 +223,8 @@ def _run_frontier_system(
         if system == "frontier_direct_mock":
             return run_system_on_envelopes(system, envelopes, mock_response=mock_response)
         if system == "frontier_direct_live":
+            return run_system_on_envelopes(system, envelopes)
+        if system == "frontier_direct_hf":
             return run_system_on_envelopes(system, envelopes)
         return run_system_on_envelopes(system, envelopes)
     except ValueError as exc:
@@ -235,17 +246,26 @@ def build_demo_trace(
     """Build a run trace scoped to exactly the curated demo pack's cases.
 
     Mock mode (``mock_response_path`` set) runs ``rules_only`` and
-    ``frontier_direct_mock``. Live mode (``provider='env-http'``) runs
-    ``rules_only`` and ``frontier_direct_live``. Raises
-    :class:`OwnerConfigRequired` when live mode is requested but required
-    model-provider environment variables are missing.
+    ``frontier_direct_mock``. Live mode runs ``rules_only`` plus either
+    ``frontier_direct_hf`` (``provider='hf'``) or ``frontier_direct_live``
+    (``provider='env-http'``). Raises :class:`OwnerConfigRequired` when live
+    mode is requested but required provider environment variables are missing.
     """
-    mode = _resolve_demo_mode(mock_response_path=mock_response_path, provider=provider)
-    systems = DEMO_SYSTEMS_LIVE if mode == "live" else DEMO_SYSTEMS_MOCK
-    disclaimer_note = (
-        DEMO_TRACE_LIVE_DISCLAIMER_NOTE if mode == "live" else DEMO_TRACE_DISCLAIMER_NOTE
+    mode, live_provider = _resolve_demo_mode(
+        mock_response_path=mock_response_path, provider=provider
     )
-    frontier_note = FRONTIER_LIVE_NOTE if mode == "live" else FRONTIER_MOCK_NOTE
+    if mode == "mock":
+        systems = DEMO_SYSTEMS_MOCK
+        disclaimer_note = DEMO_TRACE_DISCLAIMER_NOTE
+        frontier_note = FRONTIER_MOCK_NOTE
+    elif live_provider == "hf":
+        systems = DEMO_SYSTEMS_LIVE_HF
+        disclaimer_note = DEMO_TRACE_HF_DISCLAIMER_NOTE
+        frontier_note = FRONTIER_HF_NOTE
+    else:
+        systems = DEMO_SYSTEMS_LIVE_ENV_HTTP
+        disclaimer_note = DEMO_TRACE_LIVE_DISCLAIMER_NOTE
+        frontier_note = FRONTIER_LIVE_NOTE
 
     demo_pack_path = Path(demo_pack_path)
     demo_pack = load_demo_pack(demo_pack_path)
@@ -273,7 +293,7 @@ def build_demo_trace(
         decisions_by_system[system] = decisions
         summary = score_decisions(decisions, gold_by_envelope_id)
         summary["claim_boundary"] = TIER_1_CLAIM_BOUNDARY
-        if system in ("frontier_direct_mock", "frontier_direct_live"):
+        if system in ("frontier_direct_mock", "frontier_direct_live", "frontier_direct_hf"):
             summary["notes"] = frontier_note
         results[system] = summary
 
@@ -343,7 +363,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Generate a demo run trace and static HTML viewer report scoped to the "
             "curated Admissible demo pack (benchmark/reports/demo-pack.json). "
             "Mock mode is the default safe path; live mode is opt-in via "
-            "--provider env-http. No benchmark claim."
+            "--provider hf or --provider env-http. No benchmark claim."
         ),
     )
     parser.add_argument(
@@ -363,8 +383,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     provider_group.add_argument(
         "--provider",
-        choices=["env-http"],
-        help="Use the env-http live model provider (requires ADMISSIBLE_MODEL_* env vars).",
+        choices=["env-http", "hf"],
+        help=(
+            "Use a live model provider. 'hf' uses ADMISSIBLE_HF_* env vars; "
+            "'env-http' uses ADMISSIBLE_MODEL_* env vars."
+        ),
     )
     parser.add_argument(
         "--trace-out",
