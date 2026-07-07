@@ -35,6 +35,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
+from admissible.runner.model_clients import (
+    FixedResponseModelClient,
+    build_model_client_from_env,
+)
+
 CANONICAL_LABELS: tuple[str, ...] = (
     "ALLOW",
     "ALLOW_WITH_LIMITS",
@@ -276,17 +281,11 @@ def run_frontier_direct_baseline(
 
     prompt = build_frontier_direct_prompt(envelope)
     response_text = model_client.complete(prompt)
-    return parse_frontier_response(response_text, envelope_id=envelope_id, system_id=system_id)
-
-
-class _FixedResponseModelClient:
-    """Returns a fixed response regardless of prompt. CLI --mock-response only; not for tests."""
-
-    def __init__(self, response_text: str):
-        self._response_text = response_text
-
-    def complete(self, prompt: str) -> str:
-        return self._response_text
+    decision = parse_frontier_response(response_text, envelope_id=envelope_id, system_id=system_id)
+    metadata = decision.get("metadata")
+    if isinstance(metadata, dict):
+        metadata["raw_provider_response_text"] = response_text
+    return decision
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -295,14 +294,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Run the Admissible frontier-direct baseline on one action envelope.",
     )
     parser.add_argument("--case", required=True, help="Path to one *.envelope.json action envelope.")
-    parser.add_argument(
+    provider_group = parser.add_mutually_exclusive_group(required=True)
+    provider_group.add_argument(
         "--mock-response",
-        required=True,
         help=(
             "Path to a JSON file containing a mock frontier response text "
-            "(the partial decision fields the prompt asks for). This slice "
-            "supports only mock responses; no live model call is made."
+            "(the partial decision fields the prompt asks for). No live model call."
         ),
+    )
+    provider_group.add_argument(
+        "--provider",
+        choices=["env-http"],
+        help="Use a live model provider configured via environment variables.",
     )
     parser.add_argument(
         "--system-id",
@@ -318,8 +321,11 @@ def main(argv: list[str] | None = None) -> int:
     with Path(args.case).open(encoding="utf-8") as f:
         envelope = json.load(f)
 
-    response_text = Path(args.mock_response).read_text(encoding="utf-8")
-    model_client = _FixedResponseModelClient(response_text)
+    if args.mock_response is not None:
+        response_text = Path(args.mock_response).read_text(encoding="utf-8")
+        model_client = FixedResponseModelClient(response_text)
+    else:
+        model_client = build_model_client_from_env()
 
     decision = run_frontier_direct_baseline(envelope, model_client=model_client, system_id=args.system_id)
     print(json.dumps(decision, indent=2, sort_keys=True))

@@ -201,7 +201,7 @@ class TestNoGoldOrRulesOnlyLeakageIntoBaselinePrompt(unittest.TestCase):
                 return self._response_text
 
         with mock.patch(
-            "admissible.runner.compare_runner._FixedResponseModelClient", _SpyModelClient
+            "admissible.runner.compare_runner.FixedResponseModelClient", _SpyModelClient
         ):
             run_system_on_envelopes(
                 "frontier_direct_mock", envelopes, mock_response=mock_response

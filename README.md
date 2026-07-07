@@ -62,6 +62,21 @@ python -m admissible.runner.demo_trace \
 
 Open `benchmark/reports/demo_trace.html` in a browser.
 
+### Optional live model provider
+
+The default demo path uses `frontier_direct_mock`.
+
+A live frontier-direct baseline can be run by configuring:
+
+- `ADMISSIBLE_MODEL_API_URL`
+- `ADMISSIBLE_MODEL_API_KEY`
+- `ADMISSIBLE_MODEL_NAME`
+- optionally `ADMISSIBLE_MODEL_TIMEOUT_SECONDS`
+
+Live model execution is optional and is not required for tests.
+
+Live runs remain Tier 1 enriched smoke tests, not benchmark results.
+
 ### Documentation
 
 - [`docs/Admissible_THESIS.md`](docs/Admissible_THESIS.md) — thesis and design rationale
@@ -88,7 +103,7 @@ Existing Agent OS CLI/orchestrator concepts are not automatically Admissible ben
 
 ### Next technical step
 
-The next technical step is to add a live model provider behind the existing ModelClient boundary, so the same trace/scoring/viewer pipeline can compare a real frontier-direct baseline against Admissible outputs without changing the benchmark objects.
+A live model provider boundary is available behind `ModelClient` (`admissible.runner.model_clients`). The default demo and test paths remain mock-only; optional live runs use `--provider env-http` or the `frontier_direct_live` compare-runner system when environment variables are set.
 
 ## What problem it solves
 

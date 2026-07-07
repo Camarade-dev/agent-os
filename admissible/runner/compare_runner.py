@@ -16,6 +16,9 @@ Supported systems:
   for every case. This is a plumbing/mock baseline for exercising the
   comparison harness, not a measurement of any real frontier model's
   performance.
+- frontier_direct_live: admissible.runner.baseline_runner
+  .run_frontier_direct_baseline, called with a live model client built from
+  environment variables. Opt-in only; not used by default or in tests.
 
 Also runnable as a CLI:
 
@@ -36,24 +39,20 @@ from pathlib import Path
 
 from admissible.evaluator.rules_only import evaluate_envelope
 from admissible.runner.baseline_runner import ModelClient, run_frontier_direct_baseline
+from admissible.runner.model_clients import FixedResponseModelClient, build_model_client_from_env
 from admissible.trace import build_run_trace
 from benchmark.scoring.score_decisions import TIER_1_CLAIM_BOUNDARY, load_gold_annotations, score_decisions
 
-SUPPORTED_SYSTEMS: tuple[str, ...] = ("rules_only", "frontier_direct_mock")
+SUPPORTED_SYSTEMS: tuple[str, ...] = ("rules_only", "frontier_direct_mock", "frontier_direct_live")
 
 FRONTIER_MOCK_NOTE = "frontier_direct_mock is a plumbing/mock baseline, not a model-performance result."
+FRONTIER_LIVE_NOTE = (
+    "frontier_direct_live uses an externally configured model provider; "
+    "results are not stable benchmark claims."
+)
 
 DEFAULT_FRONTIER_MOCK_SYSTEM_ID = "frontier_direct_mock_v0"
-
-
-class _FixedResponseModelClient:
-    """Returns the same fixed response text for every prompt. Mock-only; no network access."""
-
-    def __init__(self, response_text: str):
-        self._response_text = response_text
-
-    def complete(self, prompt: str) -> str:  # noqa: ARG002 - ModelClient protocol
-        return self._response_text
+DEFAULT_FRONTIER_LIVE_SYSTEM_ID = "frontier_direct_live_v0"
 
 
 def _envelope_sort_key(envelope: dict) -> str:
@@ -102,11 +101,27 @@ def _run_frontier_direct_mock(
             raise ValueError(
                 "system 'frontier_direct_mock' requires a mock_response (dict or JSON string)"
             )
-        model_client = _FixedResponseModelClient(_mock_response_text(mock_response))
+        model_client = FixedResponseModelClient(_mock_response_text(mock_response))
 
     return [
         run_frontier_direct_baseline(
             envelope, model_client=model_client, system_id=DEFAULT_FRONTIER_MOCK_SYSTEM_ID
+        )
+        for envelope in envelopes
+    ]
+
+
+def _run_frontier_direct_live(
+    envelopes: list[dict],
+    *,
+    model_client: ModelClient | None = None,
+) -> list[dict]:
+    if model_client is None:
+        model_client = build_model_client_from_env()
+
+    return [
+        run_frontier_direct_baseline(
+            envelope, model_client=model_client, system_id=DEFAULT_FRONTIER_LIVE_SYSTEM_ID
         )
         for envelope in envelopes
     ]
@@ -124,13 +139,16 @@ def run_system_on_envelopes(
     directly; it takes no mock_response. `frontier_direct_mock` calls
     admissible.runner.baseline_runner.run_frontier_direct_baseline with a
     single fixed mock response reused for every envelope; mock_response is
-    required for it and raises ValueError if omitted. Raises ValueError
-    for any other system name.
+    required for it and raises ValueError if omitted. `frontier_direct_live`
+    calls the same baseline runner with a live model client from environment
+    variables. Raises ValueError for any other system name.
     """
     if system == "rules_only":
         return [evaluate_envelope(envelope) for envelope in envelopes]
     if system == "frontier_direct_mock":
         return _run_frontier_direct_mock(envelopes, mock_response=mock_response)
+    if system == "frontier_direct_live":
+        return _run_frontier_direct_live(envelopes)
     raise ValueError(
         f"unknown system: {system!r}; supported systems: {SUPPORTED_SYSTEMS}"
     )
@@ -164,6 +182,8 @@ def gather_comparison_data(
         summary["claim_boundary"] = TIER_1_CLAIM_BOUNDARY
         if system == "frontier_direct_mock":
             summary["notes"] = FRONTIER_MOCK_NOTE
+        if system == "frontier_direct_live":
+            summary["notes"] = FRONTIER_LIVE_NOTE
         results[system] = summary
 
     comparison = {
@@ -173,8 +193,13 @@ def gather_comparison_data(
         "results": results,
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    comparison_notes: list[str] = []
     if "frontier_direct_mock" in systems:
-        comparison["notes"] = FRONTIER_MOCK_NOTE
+        comparison_notes.append(FRONTIER_MOCK_NOTE)
+    if "frontier_direct_live" in systems:
+        comparison_notes.append(FRONTIER_LIVE_NOTE)
+    if comparison_notes:
+        comparison["notes"] = " ".join(comparison_notes)
     return comparison, envelopes, gold_by_envelope_id, decisions_by_system
 
 
