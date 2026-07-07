@@ -252,8 +252,18 @@ def build_run_trace(
     envelopes: list[dict],
     gold_by_envelope_id: dict[str, dict],
     decisions_by_system: dict[str, list[dict]],
+    metadata_generated_by: str | None = None,
+    metadata_notes: list[str] | None = None,
 ) -> dict:
-    """Build a complete run trace dict from comparison inputs and outputs."""
+    """Build a complete run trace dict from comparison inputs and outputs.
+
+    `metadata_generated_by` and `metadata_notes` let callers (e.g.
+    admissible.runner.demo_trace) identify themselves as the trace's
+    generator and attach scope disclaimers, instead of every caller
+    always being attributed to this module. Both default to this
+    module's own prior fixed behavior (TRACE_GENERATED_BY, no notes)
+    when omitted.
+    """
     created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     trace_id = make_trace_id(
         cases_path=str(cases_path),
@@ -277,7 +287,7 @@ def build_run_trace(
         "aggregate_results": comparison,
         "final_verdict": derive_final_verdict(comparison),
         "metadata": {
-            "generated_by": TRACE_GENERATED_BY,
-            "notes": [],
+            "generated_by": metadata_generated_by or TRACE_GENERATED_BY,
+            "notes": list(metadata_notes) if metadata_notes is not None else [],
         },
     }

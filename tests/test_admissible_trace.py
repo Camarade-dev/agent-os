@@ -17,6 +17,7 @@ from admissible.runner.compare_runner import (
     run_system_on_envelopes,
 )
 from admissible.trace import (
+    TRACE_GENERATED_BY,
     build_run_trace,
     derive_final_verdict,
     make_trace_id,
@@ -81,6 +82,29 @@ class TestBuildRunTraceBasics(unittest.TestCase):
         trace = _build_trace()
         self.assertEqual(trace["claim_boundary"], _EXACT_CLAIM_BOUNDARY)
         self.assertEqual(trace["claim_boundary"], SCORING_CLAIM_BOUNDARY)
+
+
+class TestMetadataOverrides(unittest.TestCase):
+    def test_defaults_are_unchanged_when_overrides_omitted(self) -> None:
+        trace = _build_trace()
+        self.assertEqual(trace["metadata"]["generated_by"], TRACE_GENERATED_BY)
+        self.assertEqual(trace["metadata"]["notes"], [])
+
+    def test_metadata_generated_by_and_notes_can_be_overridden(self) -> None:
+        comparison, envelopes, gold_by_envelope_id, decisions_by_system = _full_comparison()
+        trace = build_run_trace(
+            cases_path=CASES_DIR,
+            gold_path=GOLD_LABELS_PATH,
+            systems=["rules_only", "frontier_direct_mock"],
+            comparison=comparison,
+            envelopes=envelopes,
+            gold_by_envelope_id=gold_by_envelope_id,
+            decisions_by_system=decisions_by_system,
+            metadata_generated_by="admissible.runner.demo_trace",
+            metadata_notes=["note one", "note two"],
+        )
+        self.assertEqual(trace["metadata"]["generated_by"], "admissible.runner.demo_trace")
+        self.assertEqual(trace["metadata"]["notes"], ["note one", "note two"])
 
 
 class TestCaseSet(unittest.TestCase):
