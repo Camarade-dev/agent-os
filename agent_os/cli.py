@@ -14,11 +14,13 @@ from agent_os.orchestrator import (
     REQUIREMENTS_DRAFT_VALIDATION_REPORT_CREATED_STATE,
     REQUIREMENTS_APPROVAL_PREFLIGHT_CONFIRMED_STATE,
     REQUIREMENTS_VALIDATION_OWNER_DECISION_VALUES,
+    REQUIREMENTS_APPROVAL_OWNER_DECISION_VALUES,
     create_goal_intake,
     create_owner_clarification,
     create_owner_readiness_decision,
     create_requirements_extraction_owner_decision,
     create_requirements_validation_owner_decision,
+    create_requirements_approval_owner_decision,
     check_requirements_extraction_execution_authorization,
     requirements_validation_execution_check,
     validate_requirements_draft,
@@ -633,6 +635,24 @@ def cmd_orchestrator_requirements_approval_preflight(
         == REQUIREMENTS_APPROVAL_PREFLIGHT_CONFIRMED_STATE
     )
     return 0 if confirmed else 1
+
+
+def cmd_orchestrator_decide_requirements_approval(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        report = create_requirements_approval_owner_decision(
+            project,
+            args.intake_id,
+            args.plan_id,
+            args.decision_id,
+            args.decision,
+            args.summary,
+        )
+    except (FileNotFoundError, FileExistsError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(report.output)
+    return 0
 
 
 def cmd_orchestrator_clarify(args: argparse.Namespace) -> int:
@@ -1606,6 +1626,54 @@ def build_parser() -> argparse.ArgumentParser:
     )
     orchestrator_requirements_approval_preflight_parser.set_defaults(
         func=cmd_orchestrator_requirements_approval_preflight
+    )
+
+    orchestrator_decide_requirements_approval_parser = orchestrator_sub.add_parser(
+        "decide-requirements-approval",
+        help="record owner requirements-approval decision only (not approval)",
+        description=(
+            "Record an owner-provided requirements approval decision for an existing "
+            "GOAL_INTAKE and DRAFT planning workspace after a requirements draft "
+            "validation report exists. Does not call an LLM, approve requirements, "
+            "promote draft requirements, assign REQ-* ids, generate user stories or "
+            "acceptance criteria, generate architecture decisions, generate an "
+            "implementation plan, generate PLANNING_RUN_SLICE, create approved "
+            "requirements artifacts, validate or approve the workspace, transition "
+            "status, create runner proposals, create runs, or invoke an executor."
+        ),
+    )
+    orchestrator_decide_requirements_approval_parser.add_argument(
+        "intake_id",
+        help="intake identifier (filesystem-safe slug)",
+    )
+    orchestrator_decide_requirements_approval_parser.add_argument(
+        "path",
+        nargs="?",
+        help="target project directory",
+    )
+    orchestrator_decide_requirements_approval_parser.add_argument(
+        "--plan-id",
+        required=True,
+        help="planning workspace identifier (filesystem-safe slug)",
+    )
+    orchestrator_decide_requirements_approval_parser.add_argument(
+        "--decision",
+        required=True,
+        choices=sorted(REQUIREMENTS_APPROVAL_OWNER_DECISION_VALUES),
+        help="owner requirements approval decision value",
+    )
+    orchestrator_decide_requirements_approval_parser.add_argument(
+        "--decision-id",
+        required=True,
+        help="filesystem-safe decision identifier (append-only; must not exist)",
+    )
+    orchestrator_decide_requirements_approval_parser.add_argument(
+        "--summary",
+        required=True,
+        help="owner summary preserved verbatim in the decision artifact",
+    )
+    orchestrator_decide_requirements_approval_parser.set_defaults(
+        func=cmd_orchestrator_decide_requirements_approval
     )
 
     return parser

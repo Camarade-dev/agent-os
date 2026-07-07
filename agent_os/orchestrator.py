@@ -24,11 +24,13 @@ from agent_os.paths import (
     READINESS_DECISIONS_DIR,
     REQUIREMENTS_EXTRACTION_DECISIONS_DIR,
     REQUIREMENTS_VALIDATION_DECISIONS_DIR,
+    REQUIREMENTS_APPROVAL_DECISIONS_DIR,
     orchestrator_clarification_path,
     orchestrator_intake_path,
     orchestrator_readiness_decision_path,
     orchestrator_requirements_extraction_decision_path,
     orchestrator_requirements_validation_decision_path,
+    orchestrator_requirements_approval_decision_path,
     parse_frontmatter,
     planning_path,
     section_body,
@@ -679,6 +681,79 @@ REQUIREMENTS_APPROVAL_PREFLIGHT_NON_AUTHORITY_FLAGS = (
     "does_not_write_artifacts",
 )
 
+REQUIREMENTS_APPROVAL_OWNER_DECISION_ARTIFACT_TYPE = (
+    "REQUIREMENTS_APPROVAL_OWNER_DECISION"
+)
+REQUIREMENTS_APPROVAL_OWNER_DECISION_SCHEMA_VERSION = "0.1"
+REQUIREMENTS_APPROVAL_OWNER_DECISION_SOURCE_COMMAND = (
+    "agent-os orchestrator decide-requirements-approval"
+)
+REQUIREMENTS_APPROVAL_OWNER_DECISION_RECORDED_STATE = (
+    "REQUIREMENTS_APPROVAL_OWNER_DECISION_RECORDED_NO_APPROVAL_NO_PROMOTION"
+)
+REQUIREMENTS_APPROVAL_AUTHORIZE_NEXT_ACTION = (
+    "FUTURE_REQUIREMENTS_APPROVAL_EXECUTION_CHECK_REQUIRES_SEPARATE_COMMAND"
+)
+REQUIREMENTS_APPROVAL_REQUEST_NEXT_ACTION = (
+    "FUTURE_REQUIREMENTS_APPROVAL_REVISION_REQUIRES_SEPARATE_ACTION"
+)
+REQUIREMENTS_APPROVAL_BLOCK_NEXT_ACTION = (
+    "REQUIREMENTS_APPROVAL_BLOCKED_BY_OWNER_DECISION"
+)
+REQUIREMENTS_APPROVAL_PREFLIGHT_NOT_REQUIRED_STATE = (
+    "REQUIREMENTS_APPROVAL_PREFLIGHT_NOT_REQUIRED_FOR_OWNER_DECISION"
+)
+REQUIREMENTS_APPROVAL_PREFLIGHT_NOT_REQUIRED_NEXT_ACTION = (
+    "NO_FUTURE_REQUIREMENTS_APPROVAL_AUTHORIZED_BY_THIS_DECISION"
+)
+
+REQUIREMENTS_APPROVAL_OWNER_DECISION_VALUES = frozenset(
+    {
+        "REQUEST_REQUIREMENTS_APPROVAL_REVISION",
+        "BLOCK_REQUIREMENTS_APPROVAL",
+        "AUTHORIZE_REQUIREMENTS_APPROVAL",
+    }
+)
+
+REQUIREMENTS_APPROVAL_OWNER_DECISION_REQUIRED_FIELDS = (
+    "artifact_type",
+    "schema_version",
+    "intake_id",
+    "plan_id",
+    "decision_id",
+    "decision",
+    "owner_summary",
+    "created_at",
+    "source_command",
+    "status",
+    "next_required_action",
+    "source_requirements_approval_preflight_state",
+    "source_requirements_approval_preflight_next_action",
+    "source_requirements_validation_report_path",
+    "source_requirements_validation_report_status",
+    "source_requirements_validation_report_next_action",
+    "planning_workspace_status_at_decision",
+    "non_authority",
+)
+
+REQUIREMENTS_APPROVAL_OWNER_DECISION_NON_AUTHORITY_FLAGS = (
+    "owner_decision_is_not_approval",
+    "authorizes_future_approval_only_when_decision_is_authorize",
+    "owner_decision_does_not_promote_requirements",
+    "approval_authorization_is_not_promotion",
+    "validation_report_is_not_approval",
+    "validation_pass_is_not_approval",
+    "does_not_approve_requirements",
+    "does_not_promote_draft_requirements",
+    "does_not_assign_approved_requirement_ids",
+    "does_not_generate_architecture",
+    "does_not_generate_implementation_plan",
+    "does_not_generate_planning_run_slice",
+    "does_not_create_runner_proposal",
+    "does_not_create_run",
+    "does_not_invoke_executor",
+)
+
 REQUIREMENTS_DRAFT_NON_AUTHORITY_FLAGS = (
     "requirements_are_draft",
     "requirements_are_not_approved",
@@ -902,6 +977,11 @@ def validate_requirements_extraction_decision_id(decision_id: str) -> None:
 
 def validate_requirements_validation_decision_id(decision_id: str) -> None:
     """Reject unsafe or invalid requirements-validation decision identifiers."""
+    validate_readiness_decision_id(decision_id)
+
+
+def validate_requirements_approval_decision_id(decision_id: str) -> None:
+    """Reject unsafe or invalid requirements-approval decision identifiers."""
     validate_readiness_decision_id(decision_id)
 
 
@@ -11609,6 +11689,624 @@ def requirements_approval_preflight(
         checked_at=checked_at,
         non_authority=non_authority,
     )
+
+
+@dataclass(frozen=True)
+class RequirementsApprovalOwnerDecisionRecord:
+    decision_id: str
+    decision: str
+    created_at: str
+    path: Path
+
+
+@dataclass(frozen=True)
+class RequirementsApprovalOwnerDecisionValidationReport:
+    output: str
+    valid: bool
+    errors: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RequirementsApprovalOwnerDecisionReport:
+    output: str
+    decision_path: Path
+    plan_id: str
+    intake_id: str
+    decision_id: str
+    decision: str
+    status: str
+    next_required_action: str
+    workspace_status: str
+    latest_decision_id: str | None
+    latest_decision: str | None
+    non_authority: dict[str, bool]
+
+
+def _requirements_approval_owner_decision_next_action(decision: str) -> str:
+    if decision == "AUTHORIZE_REQUIREMENTS_APPROVAL":
+        return REQUIREMENTS_APPROVAL_AUTHORIZE_NEXT_ACTION
+    if decision == "REQUEST_REQUIREMENTS_APPROVAL_REVISION":
+        return REQUIREMENTS_APPROVAL_REQUEST_NEXT_ACTION
+    return REQUIREMENTS_APPROVAL_BLOCK_NEXT_ACTION
+
+
+def build_requirements_approval_owner_decision_artifact(
+    intake_id: str,
+    plan_id: str,
+    decision_id: str,
+    decision: str,
+    owner_summary: str,
+    *,
+    source_requirements_approval_preflight_state: str,
+    source_requirements_approval_preflight_next_action: str,
+    source_requirements_validation_report_path: str,
+    source_requirements_validation_report_status: str,
+    source_requirements_validation_report_next_action: str,
+    planning_workspace_status_at_decision: str,
+    created_at: str | None = None,
+) -> dict:
+    """Build the deterministic REQUIREMENTS_APPROVAL_OWNER_DECISION artifact payload."""
+    validate_intake_id(intake_id)
+    validate_plan_id(plan_id)
+    validate_requirements_approval_decision_id(decision_id)
+    if decision not in REQUIREMENTS_APPROVAL_OWNER_DECISION_VALUES:
+        raise ValueError(f"unsupported decision value: {decision!r}")
+    if not owner_summary:
+        raise ValueError("owner summary must not be empty")
+
+    return {
+        "artifact_type": REQUIREMENTS_APPROVAL_OWNER_DECISION_ARTIFACT_TYPE,
+        "schema_version": REQUIREMENTS_APPROVAL_OWNER_DECISION_SCHEMA_VERSION,
+        "intake_id": intake_id,
+        "plan_id": plan_id,
+        "decision_id": decision_id,
+        "decision": decision,
+        "owner_summary": owner_summary,
+        "created_at": created_at or _utc_now(),
+        "source_command": REQUIREMENTS_APPROVAL_OWNER_DECISION_SOURCE_COMMAND,
+        "status": REQUIREMENTS_APPROVAL_OWNER_DECISION_RECORDED_STATE,
+        "next_required_action": _requirements_approval_owner_decision_next_action(
+            decision
+        ),
+        "source_requirements_approval_preflight_state": (
+            source_requirements_approval_preflight_state
+        ),
+        "source_requirements_approval_preflight_next_action": (
+            source_requirements_approval_preflight_next_action
+        ),
+        "source_requirements_validation_report_path": (
+            source_requirements_validation_report_path
+        ),
+        "source_requirements_validation_report_status": (
+            source_requirements_validation_report_status
+        ),
+        "source_requirements_validation_report_next_action": (
+            source_requirements_validation_report_next_action
+        ),
+        "planning_workspace_status_at_decision": planning_workspace_status_at_decision,
+        "non_authority": {
+            key: True
+            for key in REQUIREMENTS_APPROVAL_OWNER_DECISION_NON_AUTHORITY_FLAGS
+        },
+    }
+
+
+def _validate_requirements_approval_owner_decision_payload(
+    artifact: object,
+    intake_id: str,
+    plan_id: str,
+    decision_id: str,
+) -> list[str]:
+    """Return structural validation errors for REQUIREMENTS_APPROVAL_OWNER_DECISION."""
+    errors: list[str] = []
+
+    if not isinstance(artifact, dict):
+        return ["requirements approval owner decision artifact must be a JSON object"]
+
+    for field in REQUIREMENTS_APPROVAL_OWNER_DECISION_REQUIRED_FIELDS:
+        if field not in artifact:
+            errors.append(f"missing required field: {field}")
+
+    artifact_type = artifact.get("artifact_type")
+    if (
+        artifact_type is not None
+        and artifact_type != REQUIREMENTS_APPROVAL_OWNER_DECISION_ARTIFACT_TYPE
+    ):
+        errors.append(
+            f"wrong artifact_type: expected "
+            f"{REQUIREMENTS_APPROVAL_OWNER_DECISION_ARTIFACT_TYPE!r}, "
+            f"found {artifact_type!r}"
+        )
+
+    schema_version = artifact.get("schema_version")
+    if (
+        schema_version is not None
+        and schema_version != REQUIREMENTS_APPROVAL_OWNER_DECISION_SCHEMA_VERSION
+    ):
+        errors.append(
+            f"unsupported schema_version: expected "
+            f"{REQUIREMENTS_APPROVAL_OWNER_DECISION_SCHEMA_VERSION!r}, "
+            f"found {schema_version!r}"
+        )
+
+    artifact_intake_id = artifact.get("intake_id")
+    if isinstance(artifact_intake_id, str) and artifact_intake_id != intake_id:
+        errors.append(
+            "intake_id mismatch: "
+            f"path {intake_id!r}, artifact {artifact_intake_id!r}"
+        )
+
+    artifact_plan_id = artifact.get("plan_id")
+    if isinstance(artifact_plan_id, str) and artifact_plan_id != plan_id:
+        errors.append(
+            f"plan_id mismatch: path {plan_id!r}, artifact {artifact_plan_id!r}"
+        )
+
+    artifact_decision_id = artifact.get("decision_id")
+    if isinstance(artifact_decision_id, str) and artifact_decision_id != decision_id:
+        errors.append(
+            "decision_id mismatch: "
+            f"path {decision_id!r}, artifact {artifact_decision_id!r}"
+        )
+
+    decision = artifact.get("decision")
+    if decision is not None and decision not in REQUIREMENTS_APPROVAL_OWNER_DECISION_VALUES:
+        errors.append(f"invalid decision value: {decision!r}")
+
+    owner_summary = artifact.get("owner_summary")
+    if owner_summary is not None:
+        error = _non_empty_string(owner_summary, "owner_summary")
+        if error:
+            errors.append(error)
+
+    created_at = artifact.get("created_at")
+    if created_at is not None and not _parse_created_at(created_at):
+        errors.append("created_at must be a parseable ISO-8601 timestamp")
+
+    if artifact.get("status") != REQUIREMENTS_APPROVAL_OWNER_DECISION_RECORDED_STATE:
+        errors.append(
+            "status must be "
+            f"{REQUIREMENTS_APPROVAL_OWNER_DECISION_RECORDED_STATE!r}"
+        )
+
+    non_authority = artifact.get("non_authority")
+    if non_authority is None:
+        errors.append("missing required field: non_authority")
+    elif not isinstance(non_authority, dict):
+        errors.append("non_authority must be an object")
+    else:
+        for flag in REQUIREMENTS_APPROVAL_OWNER_DECISION_NON_AUTHORITY_FLAGS:
+            if flag not in non_authority:
+                errors.append(f"missing non_authority flag: {flag}")
+            elif non_authority[flag] is not True:
+                errors.append(f"non_authority flag must be true: {flag}")
+
+    return errors
+
+
+def _format_requirements_approval_owner_decision(
+    *,
+    decision_path: Path,
+    plan_id: str,
+    intake_id: str,
+    decision_id: str,
+    decision: str,
+    status: str,
+    next_required_action: str,
+    workspace_status: str,
+    latest_decision_id: str | None,
+    latest_decision: str | None,
+) -> str:
+    lines = [
+        f"created requirements approval owner decision artifact: {decision_path}",
+        f"artifact_type: {REQUIREMENTS_APPROVAL_OWNER_DECISION_ARTIFACT_TYPE}",
+        f"status: {status}",
+        f"next_required_action: {next_required_action}",
+        f"decision_id: {decision_id}",
+        f"decision: {decision}",
+        f"plan_id: {plan_id}",
+        f"intake_id: {intake_id}",
+        f"planning_workspace_status: {workspace_status}",
+    ]
+    if latest_decision_id is not None:
+        lines.append(f"latest_requirements_approval_decision_id: {latest_decision_id}")
+    if latest_decision is not None:
+        lines.append(f"latest_requirements_approval_decision: {latest_decision}")
+    lines.extend(
+        [
+            "mode: owner-provided requirements approval decision only",
+            "note: no LLM, no requirements approval, no draft promotion, "
+            "no architecture decision, no implementation plan, "
+            "no PLANNING_RUN_SLICE, no approved requirements artifact, "
+            "no runner proposals, no runs, no executor invocation",
+            "note: does not mutate local-agentic-spec.md, validation reports, "
+            "context-pack.md, implementation-plan.md, planning-audit.md, "
+            "or evidence artifacts other than the decision artifact",
+        ]
+    )
+    if decision == "AUTHORIZE_REQUIREMENTS_APPROVAL":
+        lines.append(
+            "note: AUTHORIZE_REQUIREMENTS_APPROVAL authorizes only a future "
+            "separate requirements approval execution check; authorization is not "
+            "approval and is not promotion"
+        )
+    elif decision == "REQUEST_REQUIREMENTS_APPROVAL_REVISION":
+        lines.append(
+            "note: REQUEST_REQUIREMENTS_APPROVAL_REVISION does not revise anything; "
+            "future revision requires separate action"
+        )
+    elif decision == "BLOCK_REQUIREMENTS_APPROVAL":
+        lines.append(
+            "note: BLOCK_REQUIREMENTS_APPROVAL blocks future approval authorization "
+            "only; it does not delete, rewrite, approve, promote, or mutate anything"
+        )
+    return "\n".join(lines)
+
+
+def _load_requirements_validation_report_snapshot_for_owner_decision(
+    workspace_dest: Path,
+) -> tuple[str, str, str]:
+    """Return validation report path, status, and next action when present."""
+    report_path = (
+        workspace_dest
+        / "evidence"
+        / ORCHESTRATOR_REQUIREMENTS_DRAFT_VALIDATION_REPORT_FILE
+    )
+    if not report_path.is_file():
+        return "", "NOT_PRESENT", ""
+
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return str(report_path), "MALFORMED", ""
+
+    if not isinstance(report, dict):
+        return str(report_path), "MALFORMED", ""
+
+    next_action = report.get("next_required_action")
+    return (
+        str(report_path),
+        str(report.get("status", "")),
+        next_action if isinstance(next_action, str) else "",
+    )
+
+
+def create_requirements_approval_owner_decision(
+    project: Path,
+    intake_id: str,
+    plan_id: str,
+    decision_id: str,
+    decision: str,
+    summary: str,
+) -> RequirementsApprovalOwnerDecisionReport:
+    """Record a REQUIREMENTS_APPROVAL_OWNER_DECISION without mutating planning artifacts."""
+    validate_intake_id(intake_id)
+    validate_plan_id(plan_id)
+    validate_requirements_approval_decision_id(decision_id)
+    if decision not in REQUIREMENTS_APPROVAL_OWNER_DECISION_VALUES:
+        raise ValueError(f"unsupported decision value: {decision!r}")
+    if not summary:
+        raise ValueError("owner summary must not be empty")
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        raise FileNotFoundError("no workspace found (run `agent-os init` first)")
+
+    _require_valid_goal_intake(project, intake_id)
+
+    workspace_dest = planning_path(project, plan_id)
+    if not workspace_dest.is_dir():
+        raise FileNotFoundError(f"planning workspace not found: {plan_id}")
+
+    workspace_status = _load_planning_workspace_status(workspace_dest, plan_id)
+    if workspace_status != "DRAFT":
+        raise ValueError(
+            f"planning workspace must be DRAFT for requirements approval owner "
+            f"decision, found: {workspace_status!r}"
+        )
+
+    orchestrator_provenance_path = workspace_dest / "evidence" / ORCHESTRATOR_PROVENANCE_FILE
+    provenance_error = _validate_orchestrator_provenance_binds_intake(
+        orchestrator_provenance_path,
+        plan_id=plan_id,
+        intake_id=intake_id,
+    )
+    if provenance_error is not None:
+        raise ValueError(provenance_error)
+
+    report_path, report_status, report_next_action = (
+        _load_requirements_validation_report_snapshot_for_owner_decision(workspace_dest)
+    )
+
+    if decision == "AUTHORIZE_REQUIREMENTS_APPROVAL":
+        preflight = requirements_approval_preflight(project, intake_id, plan_id)
+        if preflight.approval_preflight_state != REQUIREMENTS_APPROVAL_PREFLIGHT_CONFIRMED_STATE:
+            if preflight.blocking_reasons:
+                reason_text = "; ".join(preflight.blocking_reasons)
+            else:
+                reason_text = preflight.approval_preflight_state
+            raise ValueError(
+                "requirements approval preflight not confirmed for "
+                f"AUTHORIZE_REQUIREMENTS_APPROVAL: {reason_text}"
+            )
+        preflight_state = preflight.approval_preflight_state
+        preflight_next_action = preflight.next_required_action
+        if preflight.source_requirements_validation_report_path is not None:
+            report_path = str(preflight.source_requirements_validation_report_path)
+        if preflight.source_requirements_validation_report_status is not None:
+            report_status = preflight.source_requirements_validation_report_status
+        if preflight.source_requirements_validation_report_next_action is not None:
+            report_next_action = preflight.source_requirements_validation_report_next_action
+    else:
+        preflight_state = REQUIREMENTS_APPROVAL_PREFLIGHT_NOT_REQUIRED_STATE
+        preflight_next_action = REQUIREMENTS_APPROVAL_PREFLIGHT_NOT_REQUIRED_NEXT_ACTION
+
+    dest = orchestrator_requirements_approval_decision_path(
+        project,
+        intake_id,
+        plan_id,
+        decision_id,
+    )
+    if dest.exists():
+        raise FileExistsError(
+            f"requirements approval owner decision artifact already exists: {decision_id}"
+        )
+
+    artifact = build_requirements_approval_owner_decision_artifact(
+        intake_id,
+        plan_id,
+        decision_id,
+        decision,
+        summary,
+        source_requirements_approval_preflight_state=preflight_state,
+        source_requirements_approval_preflight_next_action=preflight_next_action,
+        source_requirements_validation_report_path=report_path,
+        source_requirements_validation_report_status=report_status,
+        source_requirements_validation_report_next_action=report_next_action,
+        planning_workspace_status_at_decision=workspace_status,
+    )
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(dest, artifact)
+
+    decisions = list_requirements_approval_owner_decisions(
+        project,
+        intake_id,
+        plan_id,
+    )
+    latest_decision_id = decisions[-1].decision_id if decisions else None
+    latest_decision = decisions[-1].decision if decisions else None
+
+    non_authority = {
+        key: True for key in REQUIREMENTS_APPROVAL_OWNER_DECISION_NON_AUTHORITY_FLAGS
+    }
+    next_required_action = _requirements_approval_owner_decision_next_action(decision)
+    output = _format_requirements_approval_owner_decision(
+        decision_path=dest,
+        plan_id=plan_id,
+        intake_id=intake_id,
+        decision_id=decision_id,
+        decision=decision,
+        status=REQUIREMENTS_APPROVAL_OWNER_DECISION_RECORDED_STATE,
+        next_required_action=next_required_action,
+        workspace_status=workspace_status,
+        latest_decision_id=latest_decision_id,
+        latest_decision=latest_decision,
+    )
+    return RequirementsApprovalOwnerDecisionReport(
+        output=output,
+        decision_path=dest,
+        plan_id=plan_id,
+        intake_id=intake_id,
+        decision_id=decision_id,
+        decision=decision,
+        status=REQUIREMENTS_APPROVAL_OWNER_DECISION_RECORDED_STATE,
+        next_required_action=next_required_action,
+        workspace_status=workspace_status,
+        latest_decision_id=latest_decision_id,
+        latest_decision=latest_decision,
+        non_authority=non_authority,
+    )
+
+
+def load_requirements_approval_owner_decision(
+    project: Path,
+    intake_id: str,
+    plan_id: str,
+    decision_id: str,
+) -> dict:
+    """Load a REQUIREMENTS_APPROVAL_OWNER_DECISION artifact from disk (read-only)."""
+    validate_intake_id(intake_id)
+    validate_plan_id(plan_id)
+    validate_requirements_approval_decision_id(decision_id)
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        raise FileNotFoundError("no workspace found (run `agent-os init` first)")
+
+    path = orchestrator_requirements_approval_decision_path(
+        project,
+        intake_id,
+        plan_id,
+        decision_id,
+    )
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"requirements approval owner decision artifact not found: {decision_id}"
+        )
+
+    try:
+        artifact = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"invalid requirements approval decision artifact for {decision_id}: "
+            f"{exc.msg}"
+        ) from exc
+
+    if not isinstance(artifact, dict):
+        raise ValueError(
+            f"invalid requirements approval decision artifact for {decision_id}: "
+            "expected object"
+        )
+
+    return artifact
+
+
+def list_requirements_approval_owner_decisions(
+    project: Path,
+    intake_id: str,
+    plan_id: str,
+) -> tuple[RequirementsApprovalOwnerDecisionRecord, ...]:
+    """List requirements approval owner decisions for an intake/plan (read-only)."""
+    validate_intake_id(intake_id)
+    validate_plan_id(plan_id)
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        raise FileNotFoundError("no workspace found (run `agent-os init` first)")
+
+    decisions_dir = (
+        orchestrator_intake_path(project, intake_id)
+        / REQUIREMENTS_APPROVAL_DECISIONS_DIR
+        / plan_id
+    )
+    if not decisions_dir.is_dir():
+        return ()
+
+    records: list[RequirementsApprovalOwnerDecisionRecord] = []
+    for path in sorted(decisions_dir.glob("*.json")):
+        decision_id = path.stem
+        try:
+            artifact = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(artifact, dict):
+            continue
+        created_at = artifact.get("created_at")
+        if not isinstance(created_at, str):
+            created_at = ""
+        decision = artifact.get("decision")
+        if not isinstance(decision, str):
+            decision = ""
+        records.append(
+            RequirementsApprovalOwnerDecisionRecord(
+                decision_id=decision_id,
+                decision=decision,
+                created_at=created_at,
+                path=path,
+            )
+        )
+
+    records.sort(key=lambda record: (record.created_at, record.decision_id))
+    return tuple(records)
+
+
+def validate_requirements_approval_owner_decision(
+    project: Path,
+    intake_id: str,
+    plan_id: str,
+    decision_id: str,
+) -> RequirementsApprovalOwnerDecisionValidationReport:
+    """Strict read-only validation of a REQUIREMENTS_APPROVAL_OWNER_DECISION artifact."""
+    validate_intake_id(intake_id)
+    validate_plan_id(plan_id)
+    validate_requirements_approval_decision_id(decision_id)
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        raise FileNotFoundError("no workspace found (run `agent-os init` first)")
+
+    path = orchestrator_requirements_approval_decision_path(
+        project,
+        intake_id,
+        plan_id,
+        decision_id,
+    )
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"requirements approval owner decision artifact not found: {decision_id}"
+        )
+
+    raw_text = path.read_text(encoding="utf-8")
+    errors: list[str] = []
+    try:
+        artifact = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        errors = [f"malformed JSON: {exc.msg}"]
+    else:
+        errors = _validate_requirements_approval_owner_decision_payload(
+            artifact,
+            intake_id,
+            plan_id,
+            decision_id,
+        )
+
+    output_lines = [
+        f"requirements approval owner decision validation: {path}",
+        f"valid: {not errors}",
+    ]
+    if errors:
+        output_lines.append("errors:")
+        for error in errors:
+            output_lines.append(f"  - {error}")
+
+    return RequirementsApprovalOwnerDecisionValidationReport(
+        output="\n".join(output_lines),
+        valid=not errors,
+        errors=tuple(errors),
+    )
+
+
+def _load_validated_requirements_approval_owner_decisions(
+    project: Path,
+    intake_id: str,
+    plan_id: str,
+) -> tuple[tuple[RequirementsApprovalOwnerDecisionRecord, ...], list[str]]:
+    """Load and validate all plan-scoped requirements-approval owner decisions."""
+    decisions_dir = (
+        orchestrator_intake_path(project, intake_id)
+        / REQUIREMENTS_APPROVAL_DECISIONS_DIR
+        / plan_id
+    )
+    if not decisions_dir.is_dir():
+        return (), []
+
+    records: list[RequirementsApprovalOwnerDecisionRecord] = []
+    errors: list[str] = []
+    for path in sorted(decisions_dir.glob("*.json")):
+        decision_id = path.stem
+        try:
+            artifact = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            errors.append(f"malformed decision artifact {decision_id}: {exc.msg}")
+            continue
+        if not isinstance(artifact, dict):
+            errors.append(
+                f"malformed decision artifact {decision_id}: expected object"
+            )
+            continue
+        payload_errors = _validate_requirements_approval_owner_decision_payload(
+            artifact,
+            intake_id,
+            plan_id,
+            decision_id,
+        )
+        if payload_errors:
+            errors.extend(
+                f"decision artifact {decision_id}: {error}" for error in payload_errors
+            )
+            continue
+        records.append(
+            RequirementsApprovalOwnerDecisionRecord(
+                decision_id=artifact["decision_id"],
+                decision=artifact["decision"],
+                created_at=artifact["created_at"],
+                path=path,
+            )
+        )
+
+    records.sort(key=lambda record: (record.created_at, record.decision_id))
+    return tuple(records), errors
 
 
 def create_goal_intake(project: Path, intake_id: str, raw_goal: str) -> Path:

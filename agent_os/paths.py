@@ -15,6 +15,7 @@ CLARIFICATIONS_DIR = "clarifications"
 READINESS_DECISIONS_DIR = "readiness-decisions"
 REQUIREMENTS_EXTRACTION_DECISIONS_DIR = "requirements-extraction-decisions"
 REQUIREMENTS_VALIDATION_DECISIONS_DIR = "requirements-validation-decisions"
+REQUIREMENTS_APPROVAL_DECISIONS_DIR = "requirements-approval-decisions"
 ORCHESTRATOR_PROVENANCE_FILE = "orchestrator-provenance.json"
 ORCHESTRATOR_DRAFT_SCAFFOLD_NOTES_FILE = "orchestrator-draft-scaffold-notes.md"
 ORCHESTRATOR_CONTEXT_TRANSPORT_FILE = "orchestrator-context-transport.json"
@@ -122,6 +123,20 @@ def orchestrator_requirements_validation_decision_path(
     return (
         orchestrator_intake_path(project, intake_id)
         / REQUIREMENTS_VALIDATION_DECISIONS_DIR
+        / plan_id
+        / f"{decision_id}.json"
+    )
+
+
+def orchestrator_requirements_approval_decision_path(
+    project: Path,
+    intake_id: str,
+    plan_id: str,
+    decision_id: str,
+) -> Path:
+    return (
+        orchestrator_intake_path(project, intake_id)
+        / REQUIREMENTS_APPROVAL_DECISIONS_DIR
         / plan_id
         / f"{decision_id}.json"
     )
