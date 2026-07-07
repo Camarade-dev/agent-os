@@ -591,6 +591,36 @@ REQUIREMENTS_VALIDATION_OWNER_DECISION_NON_AUTHORITY_FLAGS = (
     "requires_future_owner_approval",
 )
 
+REQUIREMENTS_VALIDATION_EXECUTION_CHECK_CONFIRMED_STATE = (
+    "REQUIREMENTS_VALIDATION_EXECUTION_CHECK_CONFIRMED_NO_VALIDATION_PERFORMED"
+)
+REQUIREMENTS_VALIDATION_EXECUTION_CHECK_CONFIRMED_NEXT_ACTION = (
+    "FUTURE_REQUIREMENTS_VALIDATION_COMMAND_MAY_BE_RUN_SEPARATELY"
+)
+
+REQUIREMENTS_VALIDATION_EXECUTION_CHECK_NON_AUTHORITY_FLAGS = (
+    "execution_check_is_not_validation",
+    "owner_authorization_is_not_validation",
+    "owner_authorization_is_not_approval",
+    "does_not_validate_requirements",
+    "does_not_approve_requirements",
+    "does_not_promote_draft_requirements",
+    "does_not_generate_architecture",
+    "does_not_generate_implementation_plan",
+    "does_not_generate_planning_run_slice",
+    "does_not_create_runner_proposal",
+    "does_not_create_run",
+    "does_not_invoke_executor",
+    "does_not_write_artifacts",
+    "pre_execution_check_only",
+    "latest_owner_authorization_required",
+    "future_requirements_validation_requires_separate_command",
+    "future_architecture_decision_requires_separate_command",
+    "future_implementation_plan_requires_separate_command",
+    "requires_future_independent_validation",
+    "requires_future_owner_approval",
+)
+
 REQUIREMENTS_DRAFT_NON_AUTHORITY_FLAGS = (
     "requirements_are_draft",
     "requirements_are_not_approved",
@@ -9886,6 +9916,537 @@ def _load_validated_requirements_validation_owner_decisions(
 
     records.sort(key=lambda record: (record.created_at, record.decision_id))
     return tuple(records), errors
+
+
+def _validate_requirements_validation_owner_decision_coherence(
+    artifact: dict,
+    *,
+    preflight: RequirementsDraftValidationPreflightReport,
+    draft_provenance_path: Path,
+) -> str | None:
+    """Return a blocking reason when an owner decision references stale draft metadata."""
+    expected_path = str(draft_provenance_path)
+    artifact_path = artifact.get("source_requirements_draft_provenance_path")
+    if artifact_path != expected_path:
+        return (
+            "requirements validation owner decision references stale draft "
+            f"provenance path: expected {expected_path!r}, found {artifact_path!r}"
+        )
+
+    expected_status = REQUIREMENTS_DRAFT_STATUS
+    artifact_status = artifact.get("source_requirements_draft_status")
+    if artifact_status != expected_status:
+        return (
+            "requirements validation owner decision references stale draft "
+            f"status: expected {expected_status!r}, found {artifact_status!r}"
+        )
+
+    try:
+        provenance = json.loads(draft_provenance_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return (
+            "requirements validation owner decision references draft with "
+            "malformed provenance"
+        )
+    if not isinstance(provenance, dict):
+        return (
+            "requirements validation owner decision references draft with "
+            "malformed provenance: expected object"
+        )
+
+    expected_created_at = provenance.get("created_at")
+    artifact_created_at = artifact.get("source_requirements_draft_created_at")
+    if artifact_created_at != expected_created_at:
+        return (
+            "requirements validation owner decision references stale draft "
+            f"created_at: expected {expected_created_at!r}, found {artifact_created_at!r}"
+        )
+
+    if (
+        artifact.get("source_requirements_draft_validation_preflight_state")
+        != REQUIREMENTS_DRAFT_VALIDATION_PREFLIGHT_CONFIRMED_STATE
+    ):
+        return (
+            "requirements validation owner decision references stale preflight state: "
+            f"expected {REQUIREMENTS_DRAFT_VALIDATION_PREFLIGHT_CONFIRMED_STATE!r}, "
+            f"found {artifact.get('source_requirements_draft_validation_preflight_state')!r}"
+        )
+
+    if (
+        artifact.get("source_requirements_draft_validation_preflight_next_action")
+        != REQUIREMENTS_DRAFT_VALIDATION_PREFLIGHT_CONFIRMED_NEXT_ACTION
+    ):
+        return (
+            "requirements validation owner decision references stale preflight next "
+            "action: "
+            f"expected {REQUIREMENTS_DRAFT_VALIDATION_PREFLIGHT_CONFIRMED_NEXT_ACTION!r}, "
+            f"found {artifact.get('source_requirements_draft_validation_preflight_next_action')!r}"
+        )
+
+    if (
+        artifact.get("source_requirements_draft_validation_preflight_state")
+        != preflight.preflight_state
+    ):
+        return (
+            "requirements validation owner decision preflight snapshot no longer "
+            "matches current preflight state: "
+            f"artifact={artifact.get('source_requirements_draft_validation_preflight_state')!r}, "
+            f"current={preflight.preflight_state!r}"
+        )
+
+    if (
+        artifact.get("source_requirements_draft_validation_preflight_next_action")
+        != preflight.next_required_action
+    ):
+        return (
+            "requirements validation owner decision preflight snapshot no longer "
+            "matches current preflight next action: "
+            f"artifact={artifact.get('source_requirements_draft_validation_preflight_next_action')!r}, "
+            f"current={preflight.next_required_action!r}"
+        )
+
+    if artifact.get("planning_workspace_status_at_decision") != "DRAFT":
+        return (
+            "requirements validation owner decision planning_workspace_status_at_decision "
+            f"is not DRAFT: found {artifact.get('planning_workspace_status_at_decision')!r}"
+        )
+
+    artifact_next_action = artifact.get("next_required_action")
+    if artifact_next_action != REQUIREMENTS_VALIDATION_AUTHORIZE_NEXT_ACTION:
+        return (
+            "requirements validation owner decision has stale or incoherent "
+            f"next_required_action: expected {REQUIREMENTS_VALIDATION_AUTHORIZE_NEXT_ACTION!r}, "
+            f"found {artifact_next_action!r}"
+        )
+
+    return None
+
+
+def _format_requirements_validation_execution_check(
+    *,
+    plan_id: str,
+    intake_id: str,
+    planning_workspace_status: str | None,
+    local_agentic_spec_status: str | None,
+    local_agentic_spec_path: Path | None,
+    requirements_draft_provenance_path: Path | None,
+    latest_requirements_validation_owner_decision_id: str | None,
+    latest_requirements_validation_owner_decision: str | None,
+    latest_requirements_validation_owner_decision_created_at: str | None,
+    latest_requirements_validation_owner_decision_path: Path | None,
+    source_requirements_draft_validation_preflight_state: str | None,
+    source_requirements_draft_validation_preflight_next_action: str | None,
+    execution_check_state: str,
+    next_required_action: str,
+    blocking_reasons: list[str],
+    checked_at: str,
+    non_authority: dict[str, bool],
+) -> str:
+    lines = [
+        "requirements validation execution check",
+        f"plan_id: {plan_id}",
+        f"intake_id: {intake_id}",
+    ]
+    if planning_workspace_status is not None:
+        lines.append(f"planning_workspace_status: {planning_workspace_status}")
+    if local_agentic_spec_status is not None:
+        lines.append(f"local_agentic_spec_status: {local_agentic_spec_status}")
+    if local_agentic_spec_path is not None:
+        lines.append(f"local_agentic_spec_path: {local_agentic_spec_path}")
+    if requirements_draft_provenance_path is not None:
+        lines.append(
+            "requirements_draft_provenance_path: "
+            f"{requirements_draft_provenance_path}"
+        )
+    if latest_requirements_validation_owner_decision_id is not None:
+        lines.append(
+            "latest_requirements_validation_owner_decision_id: "
+            f"{latest_requirements_validation_owner_decision_id}"
+        )
+    if latest_requirements_validation_owner_decision is not None:
+        lines.append(
+            "latest_requirements_validation_owner_decision: "
+            f"{latest_requirements_validation_owner_decision}"
+        )
+    if latest_requirements_validation_owner_decision_created_at is not None:
+        lines.append(
+            "latest_requirements_validation_owner_decision_created_at: "
+            f"{latest_requirements_validation_owner_decision_created_at}"
+        )
+    if latest_requirements_validation_owner_decision_path is not None:
+        lines.append(
+            "latest_requirements_validation_owner_decision_path: "
+            f"{latest_requirements_validation_owner_decision_path}"
+        )
+    if source_requirements_draft_validation_preflight_state is not None:
+        lines.append(
+            "source_requirements_draft_validation_preflight_state: "
+            f"{source_requirements_draft_validation_preflight_state}"
+        )
+    if source_requirements_draft_validation_preflight_next_action is not None:
+        lines.append(
+            "source_requirements_draft_validation_preflight_next_action: "
+            f"{source_requirements_draft_validation_preflight_next_action}"
+        )
+    lines.append(f"execution_check_state: {execution_check_state}")
+    lines.append(f"next_required_action: {next_required_action}")
+    lines.append(f"checked_at: {checked_at}")
+    if blocking_reasons:
+        lines.append("blocking_reasons:")
+        for reason in blocking_reasons:
+            lines.append(f"  - {reason}")
+    lines.append("non_authority:")
+    for flag in REQUIREMENTS_VALIDATION_EXECUTION_CHECK_NON_AUTHORITY_FLAGS:
+        lines.append(f"  {flag}: {str(non_authority.get(flag, False)).lower()}")
+    lines.append(
+        "note: requirements validation execution check is read-only; "
+        "not requirements validation, not requirements approval, "
+        "not architecture decision, not implementation planning, "
+        "and no files were modified"
+    )
+    if execution_check_state == REQUIREMENTS_VALIDATION_EXECUTION_CHECK_CONFIRMED_STATE:
+        lines.append(
+            "note: execution check confirmed for a future requirements validation "
+            "command only; no requirements were validated or approved"
+        )
+        lines.append(
+            "note: successful check is not validation, not requirements approval, "
+            "not architecture decision, not implementation plan, not workspace "
+            "validation or approval, and does not authorize runner or executor"
+        )
+    return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class RequirementsValidationExecutionCheckReport:
+    output: str
+    execution_check_state: str
+    next_required_action: str
+    plan_id: str
+    intake_id: str
+    planning_workspace_status: str | None
+    local_agentic_spec_status: str | None
+    local_agentic_spec_path: Path | None
+    requirements_draft_provenance_path: Path | None
+    latest_requirements_validation_owner_decision_id: str | None
+    latest_requirements_validation_owner_decision: str | None
+    latest_requirements_validation_owner_decision_created_at: str | None
+    latest_requirements_validation_owner_decision_path: Path | None
+    source_requirements_draft_validation_preflight_state: str | None
+    source_requirements_draft_validation_preflight_next_action: str | None
+    checked_at: str
+    blocking_reasons: tuple[str, ...]
+    non_authority: dict[str, bool]
+
+
+def _build_requirements_validation_execution_check_report(
+    *,
+    plan_id: str,
+    intake_id: str,
+    planning_workspace_status: str | None = None,
+    local_agentic_spec_status: str | None = None,
+    local_agentic_spec_path: Path | None = None,
+    requirements_draft_provenance_path: Path | None = None,
+    latest_requirements_validation_owner_decision_id: str | None = None,
+    latest_requirements_validation_owner_decision: str | None = None,
+    latest_requirements_validation_owner_decision_created_at: str | None = None,
+    latest_requirements_validation_owner_decision_path: Path | None = None,
+    source_requirements_draft_validation_preflight_state: str | None = None,
+    source_requirements_draft_validation_preflight_next_action: str | None = None,
+    execution_check_state: str,
+    next_required_action: str,
+    blocking_reasons: list[str],
+    checked_at: str,
+    non_authority: dict[str, bool],
+) -> RequirementsValidationExecutionCheckReport:
+    output = _format_requirements_validation_execution_check(
+        plan_id=plan_id,
+        intake_id=intake_id,
+        planning_workspace_status=planning_workspace_status,
+        local_agentic_spec_status=local_agentic_spec_status,
+        local_agentic_spec_path=local_agentic_spec_path,
+        requirements_draft_provenance_path=requirements_draft_provenance_path,
+        latest_requirements_validation_owner_decision_id=(
+            latest_requirements_validation_owner_decision_id
+        ),
+        latest_requirements_validation_owner_decision=(
+            latest_requirements_validation_owner_decision
+        ),
+        latest_requirements_validation_owner_decision_created_at=(
+            latest_requirements_validation_owner_decision_created_at
+        ),
+        latest_requirements_validation_owner_decision_path=(
+            latest_requirements_validation_owner_decision_path
+        ),
+        source_requirements_draft_validation_preflight_state=(
+            source_requirements_draft_validation_preflight_state
+        ),
+        source_requirements_draft_validation_preflight_next_action=(
+            source_requirements_draft_validation_preflight_next_action
+        ),
+        execution_check_state=execution_check_state,
+        next_required_action=next_required_action,
+        blocking_reasons=blocking_reasons,
+        checked_at=checked_at,
+        non_authority=non_authority,
+    )
+    return RequirementsValidationExecutionCheckReport(
+        output=output,
+        execution_check_state=execution_check_state,
+        next_required_action=next_required_action,
+        plan_id=plan_id,
+        intake_id=intake_id,
+        planning_workspace_status=planning_workspace_status,
+        local_agentic_spec_status=local_agentic_spec_status,
+        local_agentic_spec_path=local_agentic_spec_path,
+        requirements_draft_provenance_path=requirements_draft_provenance_path,
+        latest_requirements_validation_owner_decision_id=(
+            latest_requirements_validation_owner_decision_id
+        ),
+        latest_requirements_validation_owner_decision=(
+            latest_requirements_validation_owner_decision
+        ),
+        latest_requirements_validation_owner_decision_created_at=(
+            latest_requirements_validation_owner_decision_created_at
+        ),
+        latest_requirements_validation_owner_decision_path=(
+            latest_requirements_validation_owner_decision_path
+        ),
+        source_requirements_draft_validation_preflight_state=(
+            source_requirements_draft_validation_preflight_state
+        ),
+        source_requirements_draft_validation_preflight_next_action=(
+            source_requirements_draft_validation_preflight_next_action
+        ),
+        checked_at=checked_at,
+        blocking_reasons=tuple(blocking_reasons),
+        non_authority=non_authority,
+    )
+
+
+def requirements_validation_execution_check(
+    project: Path,
+    intake_id: str,
+    plan_id: str,
+) -> RequirementsValidationExecutionCheckReport:
+    """Read-only pre-execution check for future requirements validation authorization."""
+    validate_intake_id(intake_id)
+    validate_plan_id(plan_id)
+
+    checked_at = _utc_now()
+    non_authority = {
+        key: True for key in REQUIREMENTS_VALIDATION_EXECUTION_CHECK_NON_AUTHORITY_FLAGS
+    }
+    workspace_dest = planning_path(project, plan_id)
+    local_agentic_spec_path = workspace_dest / "local-agentic-spec.md"
+    draft_provenance_path = (
+        workspace_dest / "evidence" / ORCHESTRATOR_REQUIREMENTS_DRAFT_PROVENANCE_FILE
+    )
+
+    def _blocked(
+        state: str,
+        next_action: str,
+        *,
+        blocking_reasons: list[str] | None = None,
+        planning_workspace_status: str | None = None,
+        local_agentic_spec_status: str | None = None,
+        latest_requirements_validation_owner_decision_id: str | None = None,
+        latest_requirements_validation_owner_decision: str | None = None,
+        latest_requirements_validation_owner_decision_created_at: str | None = None,
+        latest_requirements_validation_owner_decision_path: Path | None = None,
+        source_requirements_draft_validation_preflight_state: str | None = None,
+        source_requirements_draft_validation_preflight_next_action: str | None = None,
+    ) -> RequirementsValidationExecutionCheckReport:
+        return _build_requirements_validation_execution_check_report(
+            plan_id=plan_id,
+            intake_id=intake_id,
+            planning_workspace_status=planning_workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            local_agentic_spec_path=(
+                local_agentic_spec_path if local_agentic_spec_path.is_file() else None
+            ),
+            requirements_draft_provenance_path=(
+                draft_provenance_path if draft_provenance_path.is_file() else None
+            ),
+            latest_requirements_validation_owner_decision_id=(
+                latest_requirements_validation_owner_decision_id
+            ),
+            latest_requirements_validation_owner_decision=(
+                latest_requirements_validation_owner_decision
+            ),
+            latest_requirements_validation_owner_decision_created_at=(
+                latest_requirements_validation_owner_decision_created_at
+            ),
+            latest_requirements_validation_owner_decision_path=(
+                latest_requirements_validation_owner_decision_path
+            ),
+            source_requirements_draft_validation_preflight_state=(
+                source_requirements_draft_validation_preflight_state
+            ),
+            source_requirements_draft_validation_preflight_next_action=(
+                source_requirements_draft_validation_preflight_next_action
+            ),
+            execution_check_state=state,
+            next_required_action=next_action,
+            blocking_reasons=blocking_reasons or [],
+            checked_at=checked_at,
+            non_authority=non_authority,
+        )
+
+    preflight = requirements_draft_validation_preflight(project, intake_id, plan_id)
+    preflight_state = preflight.preflight_state
+    preflight_next_action = preflight.next_required_action
+    planning_workspace_status = preflight.planning_workspace_status
+    local_agentic_spec_status = preflight.local_agentic_spec_status
+    draft_provenance_report_path = preflight.requirements_draft_provenance_path
+
+    if preflight_state != REQUIREMENTS_DRAFT_VALIDATION_PREFLIGHT_CONFIRMED_STATE:
+        return _blocked(
+            preflight_state,
+            preflight_next_action,
+            planning_workspace_status=planning_workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            source_requirements_draft_validation_preflight_state=preflight_state,
+            source_requirements_draft_validation_preflight_next_action=preflight_next_action,
+            blocking_reasons=list(preflight.blocking_reasons),
+        )
+
+    decision_records, decision_errors = _load_validated_requirements_validation_owner_decisions(
+        project,
+        intake_id,
+        plan_id,
+    )
+    if decision_errors:
+        return _blocked(
+            "BLOCKED_MALFORMED_REQUIREMENTS_VALIDATION_OWNER_DECISION",
+            "FIX_REQUIREMENTS_VALIDATION_OWNER_DECISION_ARTIFACTS",
+            planning_workspace_status=planning_workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            source_requirements_draft_validation_preflight_state=preflight_state,
+            source_requirements_draft_validation_preflight_next_action=preflight_next_action,
+            blocking_reasons=decision_errors,
+        )
+
+    if not decision_records:
+        return _blocked(
+            "BLOCKED_NO_REQUIREMENTS_VALIDATION_OWNER_DECISION",
+            "CREATE_REQUIREMENTS_VALIDATION_OWNER_DECISION",
+            planning_workspace_status=planning_workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            source_requirements_draft_validation_preflight_state=preflight_state,
+            source_requirements_draft_validation_preflight_next_action=preflight_next_action,
+            blocking_reasons=[
+                "no requirements validation owner decision artifacts found "
+                f"for intake {intake_id!r} and plan {plan_id!r}"
+            ],
+        )
+
+    latest_record = decision_records[-1]
+    latest_decision_id = latest_record.decision_id
+    latest_decision = latest_record.decision
+    latest_decision_created_at = latest_record.created_at
+    latest_decision_path = latest_record.path
+
+    if latest_decision == "REQUEST_REQUIREMENTS_DRAFT_REVISION":
+        return _blocked(
+            "BLOCKED_LATEST_REQUIREMENTS_VALIDATION_DECISION_REQUESTS_REVISION",
+            "REVISE_REQUIREMENTS_DRAFT_BEFORE_VALIDATION",
+            planning_workspace_status=planning_workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            latest_requirements_validation_owner_decision_id=latest_decision_id,
+            latest_requirements_validation_owner_decision=latest_decision,
+            latest_requirements_validation_owner_decision_created_at=latest_decision_created_at,
+            latest_requirements_validation_owner_decision_path=latest_decision_path,
+            source_requirements_draft_validation_preflight_state=preflight_state,
+            source_requirements_draft_validation_preflight_next_action=preflight_next_action,
+        )
+
+    if latest_decision == "BLOCK_REQUIREMENTS_VALIDATION":
+        return _blocked(
+            "BLOCKED_LATEST_REQUIREMENTS_VALIDATION_DECISION_BLOCKS_VALIDATION",
+            "STOP_REQUIREMENTS_VALIDATION",
+            planning_workspace_status=planning_workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            latest_requirements_validation_owner_decision_id=latest_decision_id,
+            latest_requirements_validation_owner_decision=latest_decision,
+            latest_requirements_validation_owner_decision_created_at=latest_decision_created_at,
+            latest_requirements_validation_owner_decision_path=latest_decision_path,
+            source_requirements_draft_validation_preflight_state=preflight_state,
+            source_requirements_draft_validation_preflight_next_action=preflight_next_action,
+        )
+
+    if latest_decision != "AUTHORIZE_REQUIREMENTS_VALIDATION":
+        return _blocked(
+            "BLOCKED_LATEST_REQUIREMENTS_VALIDATION_DECISION_NOT_AUTHORIZE",
+            "AUTHORIZE_REQUIREMENTS_VALIDATION_WITH_OWNER_DECISION",
+            planning_workspace_status=planning_workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            latest_requirements_validation_owner_decision_id=latest_decision_id,
+            latest_requirements_validation_owner_decision=latest_decision,
+            latest_requirements_validation_owner_decision_created_at=latest_decision_created_at,
+            latest_requirements_validation_owner_decision_path=latest_decision_path,
+            source_requirements_draft_validation_preflight_state=preflight_state,
+            source_requirements_draft_validation_preflight_next_action=preflight_next_action,
+            blocking_reasons=[f"unsupported latest decision value: {latest_decision!r}"],
+        )
+
+    if draft_provenance_report_path is None or not draft_provenance_report_path.is_file():
+        return _blocked(
+            "BLOCKED_MISSING_REQUIREMENTS_DRAFT_PROVENANCE",
+            "RESTORE_OR_GENERATE_REQUIREMENTS_DRAFT",
+            planning_workspace_status=planning_workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            latest_requirements_validation_owner_decision_id=latest_decision_id,
+            latest_requirements_validation_owner_decision=latest_decision,
+            latest_requirements_validation_owner_decision_created_at=latest_decision_created_at,
+            latest_requirements_validation_owner_decision_path=latest_decision_path,
+            source_requirements_draft_validation_preflight_state=preflight_state,
+            source_requirements_draft_validation_preflight_next_action=preflight_next_action,
+            blocking_reasons=[
+                "requirements draft provenance missing for coherence check"
+            ],
+        )
+
+    latest_artifact = json.loads(latest_decision_path.read_text(encoding="utf-8"))
+    coherence_error = _validate_requirements_validation_owner_decision_coherence(
+        latest_artifact,
+        preflight=preflight,
+        draft_provenance_path=draft_provenance_report_path,
+    )
+    if coherence_error is not None:
+        return _blocked(
+            "BLOCKED_REQUIREMENTS_VALIDATION_OWNER_DECISION_STALE_OR_INCOHERENT",
+            "FIX_REQUIREMENTS_VALIDATION_OWNER_DECISION_ARTIFACTS",
+            planning_workspace_status=planning_workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            latest_requirements_validation_owner_decision_id=latest_decision_id,
+            latest_requirements_validation_owner_decision=latest_decision,
+            latest_requirements_validation_owner_decision_created_at=latest_decision_created_at,
+            latest_requirements_validation_owner_decision_path=latest_decision_path,
+            source_requirements_draft_validation_preflight_state=preflight_state,
+            source_requirements_draft_validation_preflight_next_action=preflight_next_action,
+            blocking_reasons=[coherence_error],
+        )
+
+    return _build_requirements_validation_execution_check_report(
+        plan_id=plan_id,
+        intake_id=intake_id,
+        planning_workspace_status=planning_workspace_status,
+        local_agentic_spec_status=local_agentic_spec_status,
+        local_agentic_spec_path=local_agentic_spec_path,
+        requirements_draft_provenance_path=draft_provenance_report_path,
+        latest_requirements_validation_owner_decision_id=latest_decision_id,
+        latest_requirements_validation_owner_decision=latest_decision,
+        latest_requirements_validation_owner_decision_created_at=latest_decision_created_at,
+        latest_requirements_validation_owner_decision_path=latest_decision_path,
+        source_requirements_draft_validation_preflight_state=preflight_state,
+        source_requirements_draft_validation_preflight_next_action=preflight_next_action,
+        execution_check_state=REQUIREMENTS_VALIDATION_EXECUTION_CHECK_CONFIRMED_STATE,
+        next_required_action=REQUIREMENTS_VALIDATION_EXECUTION_CHECK_CONFIRMED_NEXT_ACTION,
+        blocking_reasons=[],
+        checked_at=checked_at,
+        non_authority=non_authority,
+    )
 
 
 def create_goal_intake(project: Path, intake_id: str, raw_goal: str) -> Path:

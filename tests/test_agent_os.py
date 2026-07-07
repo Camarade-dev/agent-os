@@ -32,6 +32,7 @@ from agent_os.orchestrator import (
     create_requirements_extraction_owner_decision,
     create_requirements_validation_owner_decision,
     check_requirements_extraction_execution_authorization,
+    requirements_validation_execution_check,
     extract_requirements_draft,
     requirements_draft_validation_preflight,
     build_requirements_extraction_owner_decision_artifact,
@@ -59,6 +60,9 @@ from agent_os.orchestrator import (
     REQUIREMENTS_VALIDATION_BLOCK_NEXT_ACTION,
     REQUIREMENTS_VALIDATION_PREFLIGHT_NOT_REQUIRED_STATE,
     REQUIREMENTS_VALIDATION_PREFLIGHT_NOT_REQUIRED_NEXT_ACTION,
+    REQUIREMENTS_VALIDATION_EXECUTION_CHECK_NON_AUTHORITY_FLAGS,
+    REQUIREMENTS_VALIDATION_EXECUTION_CHECK_CONFIRMED_STATE,
+    REQUIREMENTS_VALIDATION_EXECUTION_CHECK_CONFIRMED_NEXT_ACTION,
     DRAFT_REQUIREMENT_CANDIDATE_STATUS,
     DRAFT_REQUIREMENT_SOURCE_BOUNDED_MARKER,
     goal_intake_status,
@@ -20183,6 +20187,730 @@ class OrchestratorRequirementsValidationOwnerDecisionTests(unittest.TestCase):
                 for error in errors
             )
         )
+
+
+class OrchestratorRequirementsValidationExecutionCheckTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self._tmp.name)
+        init_workspace(self.project)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _artifact_path(self, intake_id: str) -> Path:
+        return orchestrator_intake_path(self.project, intake_id) / GOAL_INTAKE_FILE
+
+    def _requirements_validation_decision_path(
+        self, intake_id: str, plan_id: str, decision_id: str
+    ) -> Path:
+        return orchestrator_requirements_validation_decision_path(
+            self.project, intake_id, plan_id, decision_id
+        )
+
+    def _requirements_extraction_decision_path(
+        self, intake_id: str, plan_id: str, decision_id: str
+    ) -> Path:
+        return orchestrator_requirements_extraction_decision_path(
+            self.project, intake_id, plan_id, decision_id
+        )
+
+    def _create_slither_intake(self, intake_id: str = "slither-demo") -> Path:
+        return create_goal_intake(
+            self.project, intake_id, "Build me an online slither.io-like game"
+        )
+
+    def _authorize_slither(self, intake_id: str = "slither-demo") -> None:
+        self._create_slither_intake(intake_id)
+        create_owner_clarification(
+            self.project, intake_id, "scope-v1", "Browser-only demo with 10 players max."
+        )
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "AUTHORIZE_DRAFT_PREPARATION",
+            "Scope clarified; authorize future draft prep only.",
+        )
+
+    def _run(self, argv: list[str]) -> tuple[int, str]:
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        with redirect_stdout(out_buf), redirect_stderr(err_buf):
+            code = main(argv)
+        return code, out_buf.getvalue() + err_buf.getvalue()
+
+    def _prepare(self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1") -> tuple[int, str]:
+        return self._run(
+            ["orchestrator", "prepare-planning-draft", intake_id, str(self.project), "--plan-id", plan_id]
+        )
+
+    def _transport(self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1") -> tuple[int, str]:
+        return self._run(
+            ["orchestrator", "transport-planning-context", intake_id, str(self.project), "--plan-id", plan_id]
+        )
+
+    def _draft_context_pack(self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1") -> tuple[int, str]:
+        return self._run(
+            ["orchestrator", "draft-context-pack", intake_id, str(self.project), "--plan-id", plan_id]
+        )
+
+    def _local_spec_preflight(self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1") -> tuple[int, str]:
+        return self._run(
+            ["orchestrator", "local-agentic-spec-preflight", intake_id, str(self.project), "--plan-id", plan_id]
+        )
+
+    def _scaffold_local_spec(self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1") -> tuple[int, str]:
+        return self._run(
+            ["orchestrator", "scaffold-local-agentic-spec", intake_id, str(self.project), "--plan-id", plan_id]
+        )
+
+    def _preflight(self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1") -> tuple[int, str]:
+        return self._run(
+            ["orchestrator", "requirements-extraction-preflight", intake_id, str(self.project), "--plan-id", plan_id]
+        )
+
+    def _scaffold(self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1") -> tuple[int, str]:
+        return self._run(
+            ["orchestrator", "scaffold-requirements-extraction", intake_id, str(self.project), "--plan-id", plan_id]
+        )
+
+    def _decide_extraction(
+        self,
+        intake_id: str = "slither-demo",
+        plan_id: str = "slither-plan-v1",
+        decision: str = "AUTHORIZE_REQUIREMENTS_EXTRACTION",
+        decision_id: str = "req-ext-owner-v1",
+        summary: str = "Authorize future extraction only.",
+    ) -> tuple[int, str]:
+        return self._run(
+            [
+                "orchestrator",
+                "decide-requirements-extraction",
+                intake_id,
+                str(self.project),
+                "--plan-id",
+                plan_id,
+                "--decision",
+                decision,
+                "--decision-id",
+                decision_id,
+                "--summary",
+                summary,
+            ]
+        )
+
+    def _extraction_execution_check(
+        self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1"
+    ) -> tuple[int, str]:
+        return self._run(
+            [
+                "orchestrator",
+                "requirements-extraction-execution-check",
+                intake_id,
+                str(self.project),
+                "--plan-id",
+                plan_id,
+            ]
+        )
+
+    def _extract(
+        self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1"
+    ) -> tuple[int, str]:
+        return self._run(
+            [
+                "orchestrator",
+                "extract-requirements-draft",
+                intake_id,
+                str(self.project),
+                "--plan-id",
+                plan_id,
+            ]
+        )
+
+    def _decide(
+        self,
+        intake_id: str = "slither-demo",
+        plan_id: str = "slither-plan-v1",
+        decision: str = "AUTHORIZE_REQUIREMENTS_VALIDATION",
+        decision_id: str = "req-val-owner-v1",
+        summary: str = "Authorize future validation only.",
+    ) -> tuple[int, str]:
+        return self._run(
+            [
+                "orchestrator",
+                "decide-requirements-validation",
+                intake_id,
+                str(self.project),
+                "--plan-id",
+                plan_id,
+                "--decision",
+                decision,
+                "--decision-id",
+                decision_id,
+                "--summary",
+                summary,
+            ]
+        )
+
+    def _execution_check(self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1") -> tuple[int, str]:
+        return self._run(
+            [
+                "orchestrator",
+                "requirements-validation-execution-check",
+                intake_id,
+                str(self.project),
+                "--plan-id",
+                plan_id,
+            ]
+        )
+
+    def _project_files(self) -> set[str]:
+        return {
+            path.relative_to(self.project).as_posix()
+            for path in self.project.rglob("*")
+            if path.is_file()
+        }
+
+    def _workspace(self, plan_id: str = "slither-plan-v1") -> Path:
+        return planning_path(self.project, plan_id)
+
+    def _requirements_draft_provenance_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return self._workspace(plan_id) / "evidence" / "orchestrator-requirements-draft-provenance.json"
+
+    def _local_spec_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return self._workspace(plan_id) / "local-agentic-spec.md"
+
+    def _implementation_plan_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return self._workspace(plan_id) / "implementation-plan.md"
+
+    def _planning_audit_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return self._workspace(plan_id) / "planning-audit.md"
+
+    def _setup_ready_for_scaffold(self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1") -> None:
+        self._authorize_slither(intake_id)
+        self.assertEqual(self._prepare(intake_id, plan_id)[0], 0)
+        self.assertEqual(self._transport(intake_id, plan_id)[0], 0)
+        self.assertEqual(self._draft_context_pack(intake_id, plan_id)[0], 0)
+        self.assertEqual(self._local_spec_preflight(intake_id, plan_id)[0], 0)
+        self.assertEqual(self._scaffold_local_spec(intake_id, plan_id)[0], 0)
+        self.assertEqual(self._preflight(intake_id, plan_id)[0], 0)
+
+    def _setup_ready_for_decision(self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1") -> None:
+        self._setup_ready_for_scaffold(intake_id, plan_id)
+        self.assertEqual(self._scaffold(intake_id, plan_id)[0], 0)
+
+    def _setup_ready_for_extraction_check(
+        self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1"
+    ) -> None:
+        self._setup_ready_for_decision(intake_id, plan_id)
+        self.assertEqual(self._decide_extraction(intake_id, plan_id)[0], 0)
+
+    def _setup_ready_for_extract(
+        self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1"
+    ) -> None:
+        self._setup_ready_for_extraction_check(intake_id, plan_id)
+        self.assertEqual(self._extraction_execution_check(intake_id, plan_id)[0], 0)
+        self.assertEqual(self._extract(intake_id, plan_id)[0], 0)
+
+    def _setup_ready_for_execution_check(
+        self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1"
+    ) -> None:
+        self._setup_ready_for_extract(intake_id, plan_id)
+        self.assertEqual(self._decide(intake_id, plan_id)[0], 0)
+
+    def _tracked_artifact_paths(
+        self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1"
+    ) -> dict[Path, bytes]:
+        workspace = self._workspace(plan_id)
+        paths = [
+            self._artifact_path(intake_id),
+            self._requirements_draft_provenance_path(plan_id),
+            self._local_spec_path(plan_id),
+            self._implementation_plan_path(plan_id),
+            self._planning_audit_path(plan_id),
+            self._requirements_extraction_decision_path(intake_id, plan_id, "req-ext-owner-v1"),
+            self._requirements_validation_decision_path(intake_id, plan_id, "req-val-owner-v1"),
+        ]
+        return {path: path.read_bytes() for path in paths if path.is_file()}
+
+    def _write_validation_decision_artifact(
+        self, intake_id: str, plan_id: str, decision_id: str, artifact: dict
+    ) -> Path:
+        path = self._requirements_validation_decision_path(intake_id, plan_id, decision_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+        return path
+
+    def _valid_validation_decision_artifact(
+        self,
+        *,
+        decision_id: str = "req-val-owner-v1",
+        decision: str = "AUTHORIZE_REQUIREMENTS_VALIDATION",
+        created_at: str = "2026-07-06T10:00:00+00:00",
+        preflight_state: str = REQUIREMENTS_DRAFT_VALIDATION_PREFLIGHT_CONFIRMED_STATE,
+        preflight_next_action: str = REQUIREMENTS_DRAFT_VALIDATION_PREFLIGHT_CONFIRMED_NEXT_ACTION,
+    ) -> dict:
+        plan_id = "slither-plan-v1"
+        draft_provenance = str(self._requirements_draft_provenance_path(plan_id))
+        draft_created_at = "2026-07-06T10:00:00+00:00"
+        if self._requirements_draft_provenance_path(plan_id).is_file():
+            provenance = json.loads(
+                self._requirements_draft_provenance_path(plan_id).read_text(encoding="utf-8")
+            )
+            if isinstance(provenance, dict) and isinstance(provenance.get("created_at"), str):
+                draft_created_at = provenance["created_at"]
+        return build_requirements_validation_owner_decision_artifact(
+            "slither-demo",
+            plan_id,
+            decision_id,
+            decision,
+            "Owner decision summary.",
+            source_requirements_draft_validation_preflight_state=preflight_state,
+            source_requirements_draft_validation_preflight_next_action=preflight_next_action,
+            source_requirements_draft_provenance_path=draft_provenance,
+            source_requirements_draft_status=REQUIREMENTS_DRAFT_STATUS,
+            source_requirements_draft_created_at=draft_created_at,
+            planning_workspace_status_at_decision="DRAFT",
+            created_at=created_at,
+        )
+
+    def test_successful_execution_check_after_authorize(self) -> None:
+        self._setup_ready_for_execution_check()
+        report = requirements_validation_execution_check(
+            self.project, "slither-demo", "slither-plan-v1"
+        )
+        self.assertEqual(report.execution_check_state, REQUIREMENTS_VALIDATION_EXECUTION_CHECK_CONFIRMED_STATE)
+        self.assertEqual(
+            report.next_required_action,
+            REQUIREMENTS_VALIDATION_EXECUTION_CHECK_CONFIRMED_NEXT_ACTION,
+        )
+        self.assertEqual(report.latest_requirements_validation_owner_decision, "AUTHORIZE_REQUIREMENTS_VALIDATION")
+
+    def test_read_only_preserves_files_byte_for_byte(self) -> None:
+        self._setup_ready_for_execution_check()
+        before = self._tracked_artifact_paths()
+        self._execution_check()
+        after = self._tracked_artifact_paths()
+        self.assertEqual(before, after)
+
+    def test_does_not_create_execution_check_artifact(self) -> None:
+        self._setup_ready_for_execution_check()
+        before = self._project_files()
+        self._execution_check()
+        after = self._project_files()
+        new_files = after - before
+        self.assertEqual(new_files, set())
+
+    def test_fails_closed_when_no_owner_decision(self) -> None:
+        self._setup_ready_for_extract()
+        code, output = self._execution_check()
+        self.assertEqual(code, 1)
+        self.assertIn("BLOCKED_NO_REQUIREMENTS_VALIDATION_OWNER_DECISION", output)
+
+    def test_fails_closed_when_latest_is_request_revision(self) -> None:
+        self._setup_ready_for_extract()
+        self._decide(decision="REQUEST_REQUIREMENTS_DRAFT_REVISION", summary="Revise draft.")
+        code, output = self._execution_check()
+        self.assertEqual(code, 1)
+        self.assertIn("BLOCKED_LATEST_REQUIREMENTS_VALIDATION_DECISION_REQUESTS_REVISION", output)
+
+    def test_fails_closed_when_latest_is_block(self) -> None:
+        self._setup_ready_for_extract()
+        self._decide(decision="BLOCK_REQUIREMENTS_VALIDATION", summary="Block validation.")
+        code, output = self._execution_check()
+        self.assertEqual(code, 1)
+        self.assertIn("BLOCKED_LATEST_REQUIREMENTS_VALIDATION_DECISION_BLOCKS_VALIDATION", output)
+
+    def test_fails_closed_when_later_request_supersedes_authorize(self) -> None:
+        self._setup_ready_for_extract()
+        self._write_validation_decision_artifact(
+            "slither-demo",
+            "slither-plan-v1",
+            "req-val-auth",
+            self._valid_validation_decision_artifact(
+                decision_id="req-val-auth",
+                created_at="2026-07-06T10:00:00+00:00",
+            ),
+        )
+        self._write_validation_decision_artifact(
+            "slither-demo",
+            "slither-plan-v1",
+            "req-val-req",
+            self._valid_validation_decision_artifact(
+                decision_id="req-val-req",
+                decision="REQUEST_REQUIREMENTS_DRAFT_REVISION",
+                created_at="2026-07-06T11:00:00+00:00",
+                preflight_state=REQUIREMENTS_VALIDATION_PREFLIGHT_NOT_REQUIRED_STATE,
+                preflight_next_action=REQUIREMENTS_VALIDATION_PREFLIGHT_NOT_REQUIRED_NEXT_ACTION,
+            ),
+        )
+        code, output = self._execution_check()
+        self.assertEqual(code, 1)
+        self.assertIn("BLOCKED_LATEST_REQUIREMENTS_VALIDATION_DECISION_REQUESTS_REVISION", output)
+
+    def test_fails_closed_when_later_block_supersedes_authorize(self) -> None:
+        self._setup_ready_for_extract()
+        self._write_validation_decision_artifact(
+            "slither-demo",
+            "slither-plan-v1",
+            "req-val-auth",
+            self._valid_validation_decision_artifact(
+                decision_id="req-val-auth",
+                created_at="2026-07-06T10:00:00+00:00",
+            ),
+        )
+        self._write_validation_decision_artifact(
+            "slither-demo",
+            "slither-plan-v1",
+            "req-val-block",
+            self._valid_validation_decision_artifact(
+                decision_id="req-val-block",
+                decision="BLOCK_REQUIREMENTS_VALIDATION",
+                created_at="2026-07-06T11:00:00+00:00",
+                preflight_state=REQUIREMENTS_VALIDATION_PREFLIGHT_NOT_REQUIRED_STATE,
+                preflight_next_action=REQUIREMENTS_VALIDATION_PREFLIGHT_NOT_REQUIRED_NEXT_ACTION,
+            ),
+        )
+        code, output = self._execution_check()
+        self.assertEqual(code, 1)
+        self.assertIn("BLOCKED_LATEST_REQUIREMENTS_VALIDATION_DECISION_BLOCKS_VALIDATION", output)
+
+    def test_deterministic_latest_ordering_by_created_at_then_decision_id(self) -> None:
+        self._setup_ready_for_extract()
+        self._write_validation_decision_artifact(
+            "slither-demo",
+            "slither-plan-v1",
+            "req-val-b",
+            self._valid_validation_decision_artifact(
+                decision_id="req-val-b",
+                decision="REQUEST_REQUIREMENTS_DRAFT_REVISION",
+                created_at="2026-07-06T10:00:00+00:00",
+                preflight_state=REQUIREMENTS_VALIDATION_PREFLIGHT_NOT_REQUIRED_STATE,
+                preflight_next_action=REQUIREMENTS_VALIDATION_PREFLIGHT_NOT_REQUIRED_NEXT_ACTION,
+            ),
+        )
+        self._write_validation_decision_artifact(
+            "slither-demo",
+            "slither-plan-v1",
+            "req-val-a",
+            self._valid_validation_decision_artifact(
+                decision_id="req-val-a",
+                decision="BLOCK_REQUIREMENTS_VALIDATION",
+                created_at="2026-07-06T10:00:00+00:00",
+                preflight_state=REQUIREMENTS_VALIDATION_PREFLIGHT_NOT_REQUIRED_STATE,
+                preflight_next_action=REQUIREMENTS_VALIDATION_PREFLIGHT_NOT_REQUIRED_NEXT_ACTION,
+            ),
+        )
+        self._write_validation_decision_artifact(
+            "slither-demo",
+            "slither-plan-v1",
+            "req-val-c",
+            self._valid_validation_decision_artifact(
+                decision_id="req-val-c",
+                created_at="2026-07-06T11:00:00+00:00",
+            ),
+        )
+        code, output = self._execution_check()
+        self.assertEqual(code, 0)
+        self.assertIn("latest_requirements_validation_owner_decision_id: req-val-c", output)
+
+    def test_fails_closed_on_malformed_owner_decision_artifact(self) -> None:
+        self._setup_ready_for_extract()
+        path = self._requirements_validation_decision_path(
+            "slither-demo", "slither-plan-v1", "req-val-owner-v1"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{bad", encoding="utf-8")
+        code, output = self._execution_check()
+        self.assertEqual(code, 1)
+        self.assertIn("BLOCKED_MALFORMED_REQUIREMENTS_VALIDATION_OWNER_DECISION", output)
+
+    def test_fails_closed_on_wrong_intake_id_in_decision_artifact(self) -> None:
+        self._setup_ready_for_execution_check()
+        artifact = load_requirements_validation_owner_decision(
+            self.project, "slither-demo", "slither-plan-v1", "req-val-owner-v1"
+        )
+        artifact["intake_id"] = "wrong-intake"
+        self._write_validation_decision_artifact(
+            "slither-demo", "slither-plan-v1", "req-val-owner-v1", artifact
+        )
+        code, output = self._execution_check()
+        self.assertEqual(code, 1)
+        self.assertIn("BLOCKED_MALFORMED_REQUIREMENTS_VALIDATION_OWNER_DECISION", output)
+
+    def test_fails_closed_on_wrong_plan_id_in_decision_artifact(self) -> None:
+        self._setup_ready_for_execution_check()
+        artifact = load_requirements_validation_owner_decision(
+            self.project, "slither-demo", "slither-plan-v1", "req-val-owner-v1"
+        )
+        artifact["plan_id"] = "wrong-plan"
+        self._write_validation_decision_artifact(
+            "slither-demo", "slither-plan-v1", "req-val-owner-v1", artifact
+        )
+        code, output = self._execution_check()
+        self.assertEqual(code, 1)
+        self.assertIn("BLOCKED_MALFORMED_REQUIREMENTS_VALIDATION_OWNER_DECISION", output)
+
+    def test_fails_closed_on_wrong_artifact_type_in_decision_artifact(self) -> None:
+        self._setup_ready_for_execution_check()
+        artifact = load_requirements_validation_owner_decision(
+            self.project, "slither-demo", "slither-plan-v1", "req-val-owner-v1"
+        )
+        artifact["artifact_type"] = "WRONG_TYPE"
+        self._write_validation_decision_artifact(
+            "slither-demo", "slither-plan-v1", "req-val-owner-v1", artifact
+        )
+        code, output = self._execution_check()
+        self.assertEqual(code, 1)
+        self.assertIn("BLOCKED_MALFORMED_REQUIREMENTS_VALIDATION_OWNER_DECISION", output)
+
+    def test_fails_closed_when_preflight_would_now_fail(self) -> None:
+        self._setup_ready_for_execution_check()
+        spec = self._local_spec_path()
+        spec.write_text(
+            spec.read_text(encoding="utf-8").replace(
+                REQUIREMENTS_DRAFT_STATUS, "REQUIREMENTS_EXTRACTION_SCAFFOLD_NON_AUTHORITY"
+            ),
+            encoding="utf-8",
+        )
+        code, output = self._execution_check()
+        self.assertEqual(code, 1)
+        self.assertIn("BLOCKED_WRONG_LOCAL_AGENTIC_SPEC_STATUS", output)
+
+    def test_fails_closed_when_local_agentic_spec_missing(self) -> None:
+        self._setup_ready_for_execution_check()
+        self._local_spec_path().unlink()
+        code, output = self._execution_check()
+        self.assertEqual(code, 1)
+        self.assertIn("BLOCKED_MISSING_LOCAL_AGENTIC_SPEC", output)
+
+    def test_fails_closed_when_requirements_draft_provenance_missing(self) -> None:
+        self._setup_ready_for_execution_check()
+        self._requirements_draft_provenance_path().unlink()
+        code, output = self._execution_check()
+        self.assertEqual(code, 1)
+        self.assertIn("BLOCKED_MISSING_REQUIREMENTS_DRAFT_PROVENANCE", output)
+
+    def test_fails_closed_when_requirements_draft_status_no_longer_draft(self) -> None:
+        self._setup_ready_for_execution_check()
+        spec = self._local_spec_path()
+        spec.write_text(
+            spec.read_text(encoding="utf-8").replace(
+                REQUIREMENTS_DRAFT_STATUS, "APPROVED_REQUIREMENTS"
+            ),
+            encoding="utf-8",
+        )
+        code, output = self._execution_check()
+        self.assertEqual(code, 1)
+        self.assertIn("BLOCKED_WRONG_LOCAL_AGENTIC_SPEC_STATUS", output)
+
+    def test_fails_closed_when_draft_req_markers_invalid(self) -> None:
+        self._setup_ready_for_execution_check()
+        spec = self._local_spec_path()
+        spec.write_text(
+            spec.read_text(encoding="utf-8").replace(
+                DRAFT_REQUIREMENT_CANDIDATE_STATUS, "APPROVED_REQUIREMENT"
+            ),
+            encoding="utf-8",
+        )
+        code, output = self._execution_check()
+        self.assertEqual(code, 1)
+        self.assertIn("BLOCKED_CANDIDATE_NOT_DRAFT_NON_AUTHORITY", output)
+
+    def test_fails_closed_when_promoted_req_identifier_appears(self) -> None:
+        self._setup_ready_for_execution_check()
+        spec = self._local_spec_path()
+        spec.write_text(spec.read_text(encoding="utf-8") + "\n### REQ-001\n", encoding="utf-8")
+        code, output = self._execution_check()
+        self.assertEqual(code, 1)
+        self.assertIn("BLOCKED_PROMOTED_REQUIREMENT_IDENTIFIER", output)
+
+    def test_fails_closed_when_forbidden_downstream_content_appears(self) -> None:
+        self._setup_ready_for_execution_check()
+        spec = self._local_spec_path()
+        spec.write_text(
+            spec.read_text(encoding="utf-8") + "\n## User Stories\n\nAs a user I want to play.\n",
+            encoding="utf-8",
+        )
+        code, output = self._execution_check()
+        self.assertEqual(code, 1)
+        self.assertIn("BLOCKED_REQUIREMENTS_DRAFT_HAS_USER_STORIES", output)
+
+    def test_does_not_validate_requirements(self) -> None:
+        self._setup_ready_for_execution_check()
+        before = self._local_spec_path().read_bytes()
+        self._execution_check()
+        self.assertEqual(before, self._local_spec_path().read_bytes())
+        self.assertNotIn("VALIDATED_REQUIREMENTS", self._local_spec_path().read_text())
+
+    def test_does_not_approve_requirements(self) -> None:
+        self._setup_ready_for_execution_check()
+        _, output = self._execution_check()
+        self.assertIn("not requirements approval", output.lower())
+
+    def test_does_not_promote_draft_req_to_req(self) -> None:
+        self._setup_ready_for_execution_check()
+        spec_text = self._local_spec_path().read_text(encoding="utf-8")
+        self._execution_check()
+        after = self._local_spec_path().read_text(encoding="utf-8")
+        self.assertIn("DRAFT-REQ-", after)
+        self.assertNotRegex(after, r"(?<!DRAFT-)REQ-\d{3}\b")
+        self.assertEqual(spec_text, after)
+
+    def test_does_not_create_validation_report(self) -> None:
+        self._setup_ready_for_execution_check()
+        before = self._project_files()
+        self._execution_check()
+        after = self._project_files()
+        new_files = after - before
+        self.assertTrue(all("validation-report" not in path for path in new_files))
+
+    def test_does_not_create_architecture_implementation_plan_or_slice(self) -> None:
+        self._setup_ready_for_execution_check()
+        before_impl = self._implementation_plan_path().read_bytes()
+        before_audit = self._planning_audit_path().read_bytes()
+        self._execution_check()
+        self.assertEqual(before_impl, self._implementation_plan_path().read_bytes())
+        self.assertEqual(before_audit, self._planning_audit_path().read_bytes())
+        self.assertNotIn('{"artifact_type": "PLANNING_RUN_SLICE"}', self._local_spec_path().read_text())
+
+    def test_does_not_invoke_subprocess_runner_or_executor(self) -> None:
+        self._setup_ready_for_execution_check()
+        with patch("subprocess.run", side_effect=AssertionError("subprocess invoked")):
+            code, _ = self._execution_check()
+        self.assertEqual(code, 0)
+
+    def test_cli_success_path(self) -> None:
+        self._setup_ready_for_execution_check()
+        code, output = self._execution_check()
+        self.assertEqual(code, 0)
+        self.assertIn(REQUIREMENTS_VALIDATION_EXECUTION_CHECK_CONFIRMED_STATE, output)
+
+    def test_cli_failure_path(self) -> None:
+        self._setup_ready_for_extract()
+        code, output = self._execution_check()
+        self.assertEqual(code, 1)
+        self.assertIn("BLOCKED_NO_REQUIREMENTS_VALIDATION_OWNER_DECISION", output)
+
+    def test_report_contains_required_fields_and_non_authority_flags(self) -> None:
+        self._setup_ready_for_execution_check()
+        report = requirements_validation_execution_check(
+            self.project, "slither-demo", "slither-plan-v1"
+        )
+        for field in (
+            "execution_check_state",
+            "next_required_action",
+            "plan_id",
+            "intake_id",
+            "latest_requirements_validation_owner_decision_id",
+            "latest_requirements_validation_owner_decision",
+            "source_requirements_draft_validation_preflight_state",
+            "source_requirements_draft_validation_preflight_next_action",
+        ):
+            self.assertIsNotNone(getattr(report, field), field)
+            self.assertIn(f"{field}:", report.output)
+        for flag in REQUIREMENTS_VALIDATION_EXECUTION_CHECK_NON_AUTHORITY_FLAGS:
+            self.assertIn(flag, report.non_authority)
+            self.assertTrue(report.non_authority[flag])
+
+    def test_fails_closed_on_stale_authorize_decision_metadata(self) -> None:
+        self._setup_ready_for_execution_check()
+        artifact = load_requirements_validation_owner_decision(
+            self.project, "slither-demo", "slither-plan-v1", "req-val-owner-v1"
+        )
+        artifact["source_requirements_draft_created_at"] = "stale-time"
+        self._write_validation_decision_artifact(
+            "slither-demo", "slither-plan-v1", "req-val-owner-v1", artifact
+        )
+        code, output = self._execution_check()
+        self.assertEqual(code, 1)
+        self.assertIn("BLOCKED_REQUIREMENTS_VALIDATION_OWNER_DECISION_STALE_OR_INCOHERENT", output)
+
+    def test_fails_closed_on_stale_preflight_state_in_authorize_decision(self) -> None:
+        self._setup_ready_for_execution_check()
+        artifact = load_requirements_validation_owner_decision(
+            self.project, "slither-demo", "slither-plan-v1", "req-val-owner-v1"
+        )
+        artifact["source_requirements_draft_validation_preflight_state"] = (
+            "STALE_PREFLIGHT_STATE"
+        )
+        self._write_validation_decision_artifact(
+            "slither-demo", "slither-plan-v1", "req-val-owner-v1", artifact
+        )
+        code, output = self._execution_check()
+        self.assertEqual(code, 1)
+        self.assertIn("BLOCKED_REQUIREMENTS_VALIDATION_OWNER_DECISION_STALE_OR_INCOHERENT", output)
+        self.assertIn("stale preflight state", output)
+
+    def test_fails_closed_on_wrong_authorize_next_required_action(self) -> None:
+        self._setup_ready_for_execution_check()
+        artifact = load_requirements_validation_owner_decision(
+            self.project, "slither-demo", "slither-plan-v1", "req-val-owner-v1"
+        )
+        artifact["next_required_action"] = "WRONG_NEXT_ACTION"
+        self._write_validation_decision_artifact(
+            "slither-demo", "slither-plan-v1", "req-val-owner-v1", artifact
+        )
+        code, output = self._execution_check()
+        self.assertEqual(code, 1)
+        self.assertIn("BLOCKED_REQUIREMENTS_VALIDATION_OWNER_DECISION_STALE_OR_INCOHERENT", output)
+        self.assertIn("next_required_action", output)
+
+    def test_fails_closed_on_false_non_authority_in_owner_decision_artifact(self) -> None:
+        self._setup_ready_for_execution_check()
+        artifact = load_requirements_validation_owner_decision(
+            self.project, "slither-demo", "slither-plan-v1", "req-val-owner-v1"
+        )
+        artifact["non_authority"]["does_not_validate_requirements"] = False
+        self._write_validation_decision_artifact(
+            "slither-demo", "slither-plan-v1", "req-val-owner-v1", artifact
+        )
+        code, output = self._execution_check()
+        self.assertEqual(code, 1)
+        self.assertIn("BLOCKED_MALFORMED_REQUIREMENTS_VALIDATION_OWNER_DECISION", output)
+        self.assertIn("non_authority flag must be true", output)
+
+    def test_formatter_uses_passed_non_authority_dict(self) -> None:
+        from agent_os.orchestrator import _format_requirements_validation_execution_check
+
+        non_authority = {
+            key: True for key in REQUIREMENTS_VALIDATION_EXECUTION_CHECK_NON_AUTHORITY_FLAGS
+        }
+        non_authority["does_not_write_artifacts"] = False
+        output = _format_requirements_validation_execution_check(
+            plan_id="plan-a",
+            intake_id="intake-a",
+            planning_workspace_status="DRAFT",
+            local_agentic_spec_status=None,
+            local_agentic_spec_path=None,
+            requirements_draft_provenance_path=None,
+            latest_requirements_validation_owner_decision_id=None,
+            latest_requirements_validation_owner_decision=None,
+            latest_requirements_validation_owner_decision_created_at=None,
+            latest_requirements_validation_owner_decision_path=None,
+            source_requirements_draft_validation_preflight_state=None,
+            source_requirements_draft_validation_preflight_next_action=None,
+            execution_check_state="BLOCKED_TEST",
+            next_required_action="FIX_TEST",
+            blocking_reasons=["test reason"],
+            checked_at="2026-07-06T10:00:00+00:00",
+            non_authority=non_authority,
+        )
+        self.assertIn("does_not_write_artifacts: false", output)
+        self.assertIn("execution_check_is_not_validation: true", output)
+
+    def test_docs_state_execution_check_is_not_validation_and_not_approval(self) -> None:
+        repo_root = Path(__file__).resolve().parent.parent
+        for rel in (
+            "docs/orchestrator/goal-intake-artifact.md",
+            "docs/orchestrator/goal-to-planning-workspace-contract.md",
+            "docs/planning-workspace-layout.md",
+        ):
+            text = (repo_root / rel).read_text(encoding="utf-8").lower()
+            self.assertIn("requirements-validation-execution-check", text)
+            self.assertIn("not validation", text)
+            self.assertIn("not approval", text)
 
 
 class OrchestratorDocsGuardTests(unittest.TestCase):
