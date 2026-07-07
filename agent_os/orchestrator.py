@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from agent_os.paths import (
+    APPROVED_REQUIREMENTS_FILE,
     CLARIFICATIONS_DIR,
     GOAL_INTAKE_FILE,
     ORCHESTRATOR_CONTEXT_PACK_DRAFT_PROVENANCE_FILE,
@@ -778,6 +779,31 @@ REQUIREMENTS_APPROVAL_EXECUTION_CHECK_NON_AUTHORITY_FLAGS = (
     "does_not_create_run",
     "does_not_invoke_executor",
     "does_not_write_artifacts",
+)
+
+APPROVED_REQUIREMENTS_ARTIFACT_TYPE = "APPROVED_REQUIREMENTS"
+APPROVED_REQUIREMENTS_SCHEMA_VERSION = "0.1"
+APPROVED_REQUIREMENTS_SOURCE_COMMAND = "create-approved-requirements"
+APPROVED_REQUIREMENTS_CREATED_STATE = (
+    "APPROVED_REQUIREMENTS_ARTIFACT_CREATED_NO_ARCHITECTURE_NO_PLANNING"
+)
+APPROVED_REQUIREMENTS_CREATED_NEXT_ACTION = (
+    "FUTURE_ARCHITECTURE_PREFLIGHT_REQUIRES_SEPARATE_COMMAND"
+)
+
+APPROVED_REQUIREMENTS_NON_AUTHORITY_FLAGS = (
+    "approved_requirements_artifact_is_not_architecture",
+    "approved_requirements_artifact_is_not_implementation_plan",
+    "approved_requirements_artifact_is_not_planning_run_slice",
+    "approved_requirements_artifact_is_not_runner_authority",
+    "does_not_modify_local_agentic_spec",
+    "does_not_modify_validation_report",
+    "does_not_generate_architecture",
+    "does_not_generate_implementation_plan",
+    "does_not_generate_planning_run_slice",
+    "does_not_create_runner_proposal",
+    "does_not_create_run",
+    "does_not_invoke_executor",
 )
 
 REQUIREMENTS_DRAFT_NON_AUTHORITY_FLAGS = (
@@ -12848,6 +12874,564 @@ def requirements_approval_execution_check(
         candidate_validation_results_summary=candidate_summary,
         blocking_reasons=[],
         checked_at=checked_at,
+        non_authority=non_authority,
+    )
+
+
+def _draft_requirement_id_to_approved_requirement_id(draft_id: str) -> str:
+    match = _DRAFT_REQUIREMENT_ID_STRICT_PATTERN.match(draft_id)
+    if not match:
+        raise ValueError(
+            f"invalid draft requirement id for promotion: {draft_id!r}"
+        )
+    return f"REQ-{draft_id.rsplit('-', 1)[-1]}"
+
+
+def _format_approved_requirements_report(
+    *,
+    plan_id: str,
+    intake_id: str,
+    approved_requirements_path: Path,
+    status: str,
+    next_required_action: str,
+    source_requirements_approval_execution_check_state: str,
+    source_requirements_approval_execution_check_next_action: str,
+    source_requirements_validation_report_path: Path,
+    source_requirements_validation_report_status: str,
+    source_requirements_validation_report_next_action: str,
+    source_requirements_approval_owner_decision_id: str,
+    source_requirements_approval_owner_decision: str,
+    source_requirements_approval_owner_decision_path: Path,
+    source_local_agentic_spec_path: Path,
+    source_requirements_draft_provenance_path: Path,
+    approved_requirement_count: int,
+    promotion_map: tuple[dict[str, str], ...],
+    created_at: str,
+    non_authority: dict[str, bool],
+) -> str:
+    lines = [
+        "approved requirements artifact",
+        f"plan_id: {plan_id}",
+        f"intake_id: {intake_id}",
+        f"status: {status}",
+        f"next_required_action: {next_required_action}",
+        f"approved_requirements_path: {approved_requirements_path}",
+        (
+            "source_requirements_approval_execution_check_state: "
+            f"{source_requirements_approval_execution_check_state}"
+        ),
+        (
+            "source_requirements_approval_execution_check_next_action: "
+            f"{source_requirements_approval_execution_check_next_action}"
+        ),
+        (
+            "source_requirements_validation_report_path: "
+            f"{source_requirements_validation_report_path}"
+        ),
+        (
+            "source_requirements_validation_report_status: "
+            f"{source_requirements_validation_report_status}"
+        ),
+        (
+            "source_requirements_validation_report_next_action: "
+            f"{source_requirements_validation_report_next_action}"
+        ),
+        (
+            "source_requirements_approval_owner_decision_id: "
+            f"{source_requirements_approval_owner_decision_id}"
+        ),
+        (
+            "source_requirements_approval_owner_decision: "
+            f"{source_requirements_approval_owner_decision}"
+        ),
+        (
+            "source_requirements_approval_owner_decision_path: "
+            f"{source_requirements_approval_owner_decision_path}"
+        ),
+        f"source_local_agentic_spec_path: {source_local_agentic_spec_path}",
+        (
+            "source_requirements_draft_provenance_path: "
+            f"{source_requirements_draft_provenance_path}"
+        ),
+        f"approved_requirement_count: {approved_requirement_count}",
+        "promotion_map:",
+    ]
+    for entry in promotion_map:
+        lines.append(
+            "  - "
+            f"source_draft_requirement_id: {entry['source_draft_requirement_id']}; "
+            f"approved_requirement_id: {entry['approved_requirement_id']}"
+        )
+    lines.append(f"created_at: {created_at}")
+    lines.append("non_authority:")
+    for flag in APPROVED_REQUIREMENTS_NON_AUTHORITY_FLAGS:
+        lines.append(f"  {flag}: {str(non_authority.get(flag, False)).lower()}")
+    lines.append(
+        "note: approved requirements artifact promotes DRAFT-REQ-* to REQ-* only "
+        "inside this artifact; local-agentic-spec.md remains draft/non-authority"
+    )
+    lines.append(
+        "note: approved requirements artifact is not architecture, not "
+        "implementation plan, not PLANNING_RUN_SLICE, and does not authorize "
+        "runner or executor"
+    )
+    lines.append(
+        "note: future architecture decision requires a separate command"
+    )
+    return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class ApprovedRequirementEntry:
+    approved_requirement_id: str
+    source_draft_requirement_id: str
+    approval_status: str
+    promotion_status: str
+    source_validation_result: str
+    source_bounded_status: str
+    source_non_authority_status: str
+    source_approval_status_before_promotion: str
+    source_promotion_status_before_promotion: str
+    architecture_status: str
+    implementation_status: str
+    requirement_text: str
+    source_quote_or_reference: str
+    source_type: str
+    source_path: str
+    source_field: str
+
+
+@dataclass(frozen=True)
+class ApprovedRequirementsReport:
+    output: str
+    status: str
+    next_required_action: str
+    plan_id: str
+    intake_id: str
+    approved_requirements_path: Path
+    source_requirements_approval_execution_check_state: str
+    source_requirements_approval_execution_check_next_action: str
+    source_requirements_validation_report_path: Path
+    source_requirements_validation_report_status: str
+    source_requirements_validation_report_next_action: str
+    source_requirements_approval_owner_decision_id: str
+    source_requirements_approval_owner_decision: str
+    source_requirements_approval_owner_decision_path: Path
+    source_local_agentic_spec_path: Path
+    source_requirements_draft_provenance_path: Path
+    approved_requirements: tuple[ApprovedRequirementEntry, ...]
+    promotion_map: tuple[dict[str, str], ...]
+    created_at: str
+    non_authority: dict[str, bool]
+
+
+def _build_approved_requirements_artifact(
+    *,
+    plan_id: str,
+    intake_id: str,
+    approved_requirements_path: Path,
+    source_requirements_approval_execution_check_state: str,
+    source_requirements_approval_execution_check_next_action: str,
+    source_requirements_validation_report_path: Path,
+    source_requirements_validation_report_status: str,
+    source_requirements_validation_report_next_action: str,
+    source_requirements_approval_owner_decision_id: str,
+    source_requirements_approval_owner_decision: str,
+    source_requirements_approval_owner_decision_path: Path,
+    source_local_agentic_spec_path: Path,
+    source_requirements_draft_provenance_path: Path,
+    approved_requirements: tuple[ApprovedRequirementEntry, ...],
+    promotion_map: tuple[dict[str, str], ...],
+    created_at: str,
+    non_authority: dict[str, bool],
+) -> dict:
+    return {
+        "artifact_type": APPROVED_REQUIREMENTS_ARTIFACT_TYPE,
+        "schema_version": APPROVED_REQUIREMENTS_SCHEMA_VERSION,
+        "intake_id": intake_id,
+        "plan_id": plan_id,
+        "created_at": created_at,
+        "source_command": APPROVED_REQUIREMENTS_SOURCE_COMMAND,
+        "status": APPROVED_REQUIREMENTS_CREATED_STATE,
+        "next_required_action": APPROVED_REQUIREMENTS_CREATED_NEXT_ACTION,
+        "approved_requirements_path": str(approved_requirements_path),
+        "source_requirements_approval_execution_check_state": (
+            source_requirements_approval_execution_check_state
+        ),
+        "source_requirements_approval_execution_check_next_action": (
+            source_requirements_approval_execution_check_next_action
+        ),
+        "source_requirements_validation_report_path": str(
+            source_requirements_validation_report_path
+        ),
+        "source_requirements_validation_report_status": (
+            source_requirements_validation_report_status
+        ),
+        "source_requirements_validation_report_next_action": (
+            source_requirements_validation_report_next_action
+        ),
+        "source_requirements_approval_owner_decision_id": (
+            source_requirements_approval_owner_decision_id
+        ),
+        "source_requirements_approval_owner_decision": (
+            source_requirements_approval_owner_decision
+        ),
+        "source_requirements_approval_owner_decision_path": str(
+            source_requirements_approval_owner_decision_path
+        ),
+        "source_local_agentic_spec_path": str(source_local_agentic_spec_path),
+        "source_requirements_draft_provenance_path": str(
+            source_requirements_draft_provenance_path
+        ),
+        "approved_requirements": [
+            {
+                "approved_requirement_id": entry.approved_requirement_id,
+                "source_draft_requirement_id": entry.source_draft_requirement_id,
+                "approval_status": entry.approval_status,
+                "promotion_status": entry.promotion_status,
+                "source_validation_result": entry.source_validation_result,
+                "source_bounded_status": entry.source_bounded_status,
+                "source_non_authority_status": entry.source_non_authority_status,
+                "source_approval_status_before_promotion": (
+                    entry.source_approval_status_before_promotion
+                ),
+                "source_promotion_status_before_promotion": (
+                    entry.source_promotion_status_before_promotion
+                ),
+                "architecture_status": entry.architecture_status,
+                "implementation_status": entry.implementation_status,
+                "requirement_text": entry.requirement_text,
+                "source_quote_or_reference": entry.source_quote_or_reference,
+                "source_type": entry.source_type,
+                "source_path": entry.source_path,
+                "source_field": entry.source_field,
+            }
+            for entry in approved_requirements
+        ],
+        "promotion_map": [dict(entry) for entry in promotion_map],
+        "non_authority": non_authority,
+    }
+
+
+def create_approved_requirements(
+    project: Path,
+    intake_id: str,
+    plan_id: str,
+) -> ApprovedRequirementsReport:
+    """Create the approved requirements artifact after execution check confirmation."""
+    validate_intake_id(intake_id)
+    validate_plan_id(plan_id)
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        raise FileNotFoundError("no workspace found (run `agent-os init` first)")
+
+    _require_valid_goal_intake(project, intake_id)
+
+    workspace_dest = planning_path(project, plan_id)
+    if not workspace_dest.is_dir():
+        raise FileNotFoundError(f"planning workspace not found: {plan_id}")
+
+    workspace_status = _load_planning_workspace_status(workspace_dest, plan_id)
+    if workspace_status != "DRAFT":
+        raise ValueError(
+            f"planning workspace must be DRAFT for approved requirements creation, "
+            f"found: {workspace_status!r}"
+        )
+
+    orchestrator_provenance_path = (
+        workspace_dest / "evidence" / ORCHESTRATOR_PROVENANCE_FILE
+    )
+    provenance_error = _validate_orchestrator_provenance_binds_intake(
+        orchestrator_provenance_path,
+        plan_id=plan_id,
+        intake_id=intake_id,
+    )
+    if provenance_error is not None:
+        raise ValueError(provenance_error)
+
+    approved_requirements_path = workspace_dest / APPROVED_REQUIREMENTS_FILE
+    if approved_requirements_path.exists():
+        raise FileExistsError(
+            f"approved requirements artifact already exists for plan: {plan_id}"
+        )
+
+    execution_report = requirements_approval_execution_check(
+        project,
+        intake_id,
+        plan_id,
+    )
+    if (
+        execution_report.execution_check_state
+        != REQUIREMENTS_APPROVAL_EXECUTION_CHECK_CONFIRMED_STATE
+    ):
+        reasons = (
+            "; ".join(execution_report.blocking_reasons)
+            or execution_report.execution_check_state
+        )
+        raise ValueError(
+            "requirements approval execution check not confirmed: "
+            f"{reasons}"
+        )
+
+    decision_records, decision_errors = (
+        _load_validated_requirements_approval_owner_decisions(
+            project,
+            intake_id,
+            plan_id,
+        )
+    )
+    if decision_errors:
+        raise ValueError(
+            "requirements approval owner decision artifacts invalid: "
+            + "; ".join(decision_errors)
+        )
+    if not decision_records:
+        raise ValueError(
+            "missing latest requirements approval owner decision for promotion"
+        )
+    latest_record = decision_records[-1]
+    latest_decision_path = latest_record.path
+
+    validation_report_path = (
+        workspace_dest
+        / "evidence"
+        / ORCHESTRATOR_REQUIREMENTS_DRAFT_VALIDATION_REPORT_FILE
+    )
+    if not validation_report_path.is_file():
+        raise FileNotFoundError(
+            "requirements draft validation report missing: "
+            f"{ORCHESTRATOR_REQUIREMENTS_DRAFT_VALIDATION_REPORT_FILE}"
+        )
+
+    try:
+        validation_artifact = json.loads(
+            validation_report_path.read_text(encoding="utf-8")
+        )
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"malformed requirements draft validation report: {exc.msg}"
+        ) from exc
+    if not isinstance(validation_artifact, dict):
+        raise ValueError(
+            "malformed requirements draft validation report: expected object"
+        )
+
+    local_agentic_spec_path = workspace_dest / "local-agentic-spec.md"
+    draft_provenance_path = (
+        workspace_dest / "evidence" / ORCHESTRATOR_REQUIREMENTS_DRAFT_PROVENANCE_FILE
+    )
+    if not local_agentic_spec_path.is_file():
+        raise FileNotFoundError(
+            f"local-agentic-spec.md missing in planning workspace: {plan_id}"
+        )
+    if not draft_provenance_path.is_file():
+        raise FileNotFoundError(
+            "requirements draft provenance missing: "
+            f"{ORCHESTRATOR_REQUIREMENTS_DRAFT_PROVENANCE_FILE}"
+        )
+
+    local_spec_content = local_agentic_spec_path.read_text(encoding="utf-8")
+    parsed_candidates = _parse_requirements_draft_candidates_from_spec(
+        local_spec_content
+    )
+    if isinstance(parsed_candidates, str):
+        raise ValueError(parsed_candidates)
+    current_candidate_ids = tuple(candidate.id for candidate in parsed_candidates)
+    candidates_by_id = {candidate.id: candidate for candidate in parsed_candidates}
+
+    validation_execution_report = requirements_validation_execution_check(
+        project,
+        intake_id,
+        plan_id,
+    )
+    block_state, report_blocking_reasons = (
+        _validate_requirements_draft_validation_report_for_approval_preflight(
+            validation_artifact,
+            plan_id=plan_id,
+            intake_id=intake_id,
+            validation_report_path=validation_report_path,
+            local_agentic_spec_path=local_agentic_spec_path,
+            draft_provenance_path=draft_provenance_path,
+            current_candidate_ids=current_candidate_ids,
+            current_execution_check_state=(
+                validation_execution_report.execution_check_state
+            ),
+            current_execution_check_next_action=(
+                validation_execution_report.next_required_action
+            ),
+        )
+    )
+    if block_state:
+        raise ValueError(
+            "requirements draft validation report not admissible for promotion: "
+            + "; ".join(report_blocking_reasons or [block_state])
+        )
+
+    candidate_results = validation_artifact.get("candidate_results")
+    if not isinstance(candidate_results, list):
+        raise ValueError(
+            "malformed requirements draft validation report: "
+            "candidate_results must be a list"
+        )
+
+    approved_entries: list[ApprovedRequirementEntry] = []
+    promotion_map: list[dict[str, str]] = []
+    for entry in candidate_results:
+        if not isinstance(entry, dict):
+            raise ValueError(
+                "malformed requirements draft validation report: "
+                "candidate_results entry must be object"
+            )
+        draft_id = entry.get("draft_requirement_id")
+        if not isinstance(draft_id, str):
+            raise ValueError(
+                "malformed requirements draft validation report: "
+                "missing draft_requirement_id"
+            )
+        candidate = candidates_by_id.get(draft_id)
+        if candidate is None:
+            raise ValueError(
+                f"validation report candidate {draft_id!r} not found in current draft"
+            )
+        validation_result = entry.get("validation_result")
+        if validation_result != REQUIREMENTS_DRAFT_VALIDATION_RESULT_PASS:
+            raise ValueError(
+                "requirements draft validation report not admissible for promotion: "
+                f"candidate {draft_id!r} validation_result is not PASS"
+            )
+        approved_id = _draft_requirement_id_to_approved_requirement_id(draft_id)
+        approved_entries.append(
+            ApprovedRequirementEntry(
+                approved_requirement_id=approved_id,
+                source_draft_requirement_id=draft_id,
+                approval_status="APPROVED",
+                promotion_status="PROMOTED_TO_APPROVED_REQUIREMENT_ARTIFACT",
+                source_validation_result=str(
+                    entry.get("validation_result", "")
+                ),
+                source_bounded_status=str(
+                    entry.get("source_bounded_status", candidate.source_bounded)
+                ),
+                source_non_authority_status=str(
+                    entry.get("non_authority_status", candidate.status)
+                ),
+                source_approval_status_before_promotion="NOT_APPROVED",
+                source_promotion_status_before_promotion="NOT_PROMOTED",
+                architecture_status="NOT_DECIDED",
+                implementation_status="NOT_PLANNED",
+                requirement_text=candidate.candidate_text,
+                source_quote_or_reference=candidate.source_quote_or_reference,
+                source_type=candidate.source_type,
+                source_path=candidate.source_path,
+                source_field=candidate.source_field,
+            )
+        )
+        promotion_map.append(
+            {
+                "source_draft_requirement_id": draft_id,
+                "approved_requirement_id": approved_id,
+            }
+        )
+
+    created_at = _utc_now()
+    non_authority = {
+        key: True for key in APPROVED_REQUIREMENTS_NON_AUTHORITY_FLAGS
+    }
+    artifact = _build_approved_requirements_artifact(
+        plan_id=plan_id,
+        intake_id=intake_id,
+        approved_requirements_path=approved_requirements_path,
+        source_requirements_approval_execution_check_state=(
+            execution_report.execution_check_state
+        ),
+        source_requirements_approval_execution_check_next_action=(
+            execution_report.next_required_action
+        ),
+        source_requirements_validation_report_path=validation_report_path,
+        source_requirements_validation_report_status=str(
+            validation_artifact.get("status", "")
+        ),
+        source_requirements_validation_report_next_action=str(
+            validation_artifact.get("next_required_action", "")
+        ),
+        source_requirements_approval_owner_decision_id=latest_record.decision_id,
+        source_requirements_approval_owner_decision=latest_record.decision,
+        source_requirements_approval_owner_decision_path=latest_decision_path,
+        source_local_agentic_spec_path=local_agentic_spec_path,
+        source_requirements_draft_provenance_path=draft_provenance_path,
+        approved_requirements=tuple(approved_entries),
+        promotion_map=tuple(promotion_map),
+        created_at=created_at,
+        non_authority=non_authority,
+    )
+
+    temp_approved_path = approved_requirements_path.with_suffix(".json.tmp")
+    try:
+        _write_json(temp_approved_path, artifact)
+        temp_approved_path.replace(approved_requirements_path)
+    except Exception:
+        if temp_approved_path.is_file():
+            temp_approved_path.unlink()
+        raise
+
+    output = _format_approved_requirements_report(
+        plan_id=plan_id,
+        intake_id=intake_id,
+        approved_requirements_path=approved_requirements_path,
+        status=APPROVED_REQUIREMENTS_CREATED_STATE,
+        next_required_action=APPROVED_REQUIREMENTS_CREATED_NEXT_ACTION,
+        source_requirements_approval_execution_check_state=(
+            execution_report.execution_check_state
+        ),
+        source_requirements_approval_execution_check_next_action=(
+            execution_report.next_required_action
+        ),
+        source_requirements_validation_report_path=validation_report_path,
+        source_requirements_validation_report_status=str(
+            validation_artifact.get("status", "")
+        ),
+        source_requirements_validation_report_next_action=str(
+            validation_artifact.get("next_required_action", "")
+        ),
+        source_requirements_approval_owner_decision_id=latest_record.decision_id,
+        source_requirements_approval_owner_decision=latest_record.decision,
+        source_requirements_approval_owner_decision_path=latest_decision_path,
+        source_local_agentic_spec_path=local_agentic_spec_path,
+        source_requirements_draft_provenance_path=draft_provenance_path,
+        approved_requirement_count=len(approved_entries),
+        promotion_map=tuple(promotion_map),
+        created_at=created_at,
+        non_authority=non_authority,
+    )
+    return ApprovedRequirementsReport(
+        output=output,
+        status=APPROVED_REQUIREMENTS_CREATED_STATE,
+        next_required_action=APPROVED_REQUIREMENTS_CREATED_NEXT_ACTION,
+        plan_id=plan_id,
+        intake_id=intake_id,
+        approved_requirements_path=approved_requirements_path,
+        source_requirements_approval_execution_check_state=(
+            execution_report.execution_check_state
+        ),
+        source_requirements_approval_execution_check_next_action=(
+            execution_report.next_required_action
+        ),
+        source_requirements_validation_report_path=validation_report_path,
+        source_requirements_validation_report_status=str(
+            validation_artifact.get("status", "")
+        ),
+        source_requirements_validation_report_next_action=str(
+            validation_artifact.get("next_required_action", "")
+        ),
+        source_requirements_approval_owner_decision_id=latest_record.decision_id,
+        source_requirements_approval_owner_decision=latest_record.decision,
+        source_requirements_approval_owner_decision_path=latest_decision_path,
+        source_local_agentic_spec_path=local_agentic_spec_path,
+        source_requirements_draft_provenance_path=draft_provenance_path,
+        approved_requirements=tuple(approved_entries),
+        promotion_map=tuple(promotion_map),
+        created_at=created_at,
         non_authority=non_authority,
     )
 

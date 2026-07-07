@@ -16,6 +16,8 @@ from agent_os.orchestrator import (
     REQUIREMENTS_APPROVAL_EXECUTION_CHECK_CONFIRMED_STATE,
     REQUIREMENTS_VALIDATION_OWNER_DECISION_VALUES,
     REQUIREMENTS_APPROVAL_OWNER_DECISION_VALUES,
+    APPROVED_REQUIREMENTS_CREATED_STATE,
+    create_approved_requirements,
     create_goal_intake,
     create_owner_clarification,
     create_owner_readiness_decision,
@@ -676,6 +678,24 @@ def cmd_orchestrator_requirements_approval_execution_check(
         == REQUIREMENTS_APPROVAL_EXECUTION_CHECK_CONFIRMED_STATE
     )
     return 0 if confirmed else 1
+
+
+def cmd_orchestrator_create_approved_requirements(
+    args: argparse.Namespace,
+) -> int:
+    project = _project_path(args.path)
+    try:
+        report = create_approved_requirements(
+            project,
+            args.intake_id,
+            args.plan_id,
+        )
+    except (FileNotFoundError, FileExistsError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(report.output)
+    created = report.status == APPROVED_REQUIREMENTS_CREATED_STATE
+    return 0 if created else 1
 
 
 def cmd_orchestrator_clarify(args: argparse.Namespace) -> int:
@@ -1733,6 +1753,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     orchestrator_requirements_approval_execution_check_parser.set_defaults(
         func=cmd_orchestrator_requirements_approval_execution_check
+    )
+
+    orchestrator_create_approved_requirements_parser = orchestrator_sub.add_parser(
+        "create-approved-requirements",
+        help="create approved requirements artifact (not architecture)",
+        description=(
+            "Create the approved requirements artifact after successful "
+            "requirements approval execution check. Promotes validated "
+            "DRAFT-REQ-* candidates to REQ-* ids inside "
+            "approved-requirements.json only. Does not call an LLM, modify "
+            "local-agentic-spec.md, modify validation reports, generate "
+            "architecture decisions, generate an implementation plan, "
+            "generate PLANNING_RUN_SLICE, create runner proposals, create "
+            "runs, invoke an executor, or write any artifact other than "
+            "approved-requirements.json."
+        ),
+    )
+    orchestrator_create_approved_requirements_parser.add_argument(
+        "intake_id",
+        help="intake identifier (filesystem-safe slug)",
+    )
+    orchestrator_create_approved_requirements_parser.add_argument(
+        "path",
+        nargs="?",
+        help="target project directory",
+    )
+    orchestrator_create_approved_requirements_parser.add_argument(
+        "--plan-id",
+        required=True,
+        help="planning workspace identifier (filesystem-safe slug)",
+    )
+    orchestrator_create_approved_requirements_parser.set_defaults(
+        func=cmd_orchestrator_create_approved_requirements
     )
 
     return parser

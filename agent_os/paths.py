@@ -35,6 +35,7 @@ ORCHESTRATOR_REQUIREMENTS_DRAFT_PROVENANCE_FILE = (
 ORCHESTRATOR_REQUIREMENTS_DRAFT_VALIDATION_REPORT_FILE = (
     "orchestrator-requirements-draft-validation-report.json"
 )
+APPROVED_REQUIREMENTS_FILE = "approved-requirements.json"
 META_FILE = "run.json"
 
 PLACEHOLDER_VALUES = frozenset(

@@ -37,6 +37,7 @@ Multiple plans may coexist. Only one plan version is **active** per `<plan-id>` 
   local-agentic-spec.md
   implementation-plan.md
   planning-audit.md
+  approved-requirements.json
   evidence/
   decisions/
   revisions/
@@ -402,6 +403,14 @@ agent-os orchestrator requirements-approval-execution-check <intake-id> --plan-i
 ```
 
 Requires successful requirements approval preflight; a latest plan-scoped `AUTHORIZE_REQUIREMENTS_APPROVAL` owner decision whose preflight and validation-report metadata matches current state; and all validation report candidates still `PASS` with `approval_status: NOT_APPROVED`, `promotion_status: NOT_PROMOTED`, and `approved_requirement_id: NOT_ASSIGNED`. **Does not write any artifact** — read-only gate only. Approval execution check does **not** approve requirements; does **not** promote `DRAFT-REQ-*` to approved requirement IDs; does **not** assign `REQ-*` ids; does **not** rewrite `local-agentic-spec.md`; does **not** modify validation reports; does **not** generate user stories or acceptance criteria; does **not** generate architecture decisions, implementation plans, or `PLANNING_RUN_SLICE`; does **not** validate or approve the workspace; does **not** transition status; does **not** create runner proposals, runs, or executor invocations; and does **not** mutate orchestrator intake artifacts, transport artifacts, requirements draft provenance, validation reports, owner decision artifacts, `context-pack.md`, `local-agentic-spec.md`, `implementation-plan.md`, or `planning-audit.md`. **Requirements approval execution check is not requirements approval and not promotion** — owner authorization is not approval; validation report `PASS` is not approval; `DRAFT-REQ-*` remains draft-only. Successful check means only that a separate future requirements approval command may be run separately. Future requirements approval, architecture decision, implementation plan, independent validation, and runner proposal generation remain future/separate work.
+
+After successful requirements approval execution check, create the approved requirements artifact:
+
+```bash
+agent-os orchestrator create-approved-requirements <intake-id> --plan-id <plan-id> [PATH]
+```
+
+Requires successful requirements approval execution check (`REQUIREMENTS_APPROVAL_EXECUTION_CHECK_CONFIRMED_NO_APPROVAL_NO_PROMOTION`); a DRAFT planning workspace with orchestrator provenance binding the plan to the intake; coherent validation report and draft state with all candidates `PASS`; and no existing `approved-requirements.json`. Writes `approved-requirements.json` at the planning workspace root with deterministic promotion mapping (`DRAFT-REQ-001` → `REQ-001`, etc.) inside the artifact only. **Does not rewrite `local-agentic-spec.md`**; does **not** modify validation reports; does **not** modify owner decision artifacts; does **not** generate user stories or acceptance criteria; does **not** generate architecture decisions, implementation plans, or `PLANNING_RUN_SLICE`; does **not** validate or approve the workspace; does **not** transition status; does **not** create runner proposals, runs, or executor invocations; and does **not** write any artifact other than `approved-requirements.json`. **Approved requirements artifact is not architecture, not implementation plan, not `PLANNING_RUN_SLICE`, and not runner authority** — `REQ-*` ids exist only inside `approved-requirements.json` at this stage; `DRAFT-REQ-*` remains in `local-agentic-spec.md`. Future architecture decision requires a separate command. Architecture decision, implementation plan, independent validation, and runner proposal generation remain future/separate work.
 
 Inspect an existing planning workspace (read-only):
 
