@@ -6,15 +6,89 @@
 
 Agent OS is a **local filesystem protocol and CLI** for governed delegation to fallible coding and research agents. It is not a dashboard, SaaS, runtime, orchestrator, benchmark, or agent panel.
 
-## Admissible V0 research direction
+## Admissible
 
-This repository also hosts **Admissible**, a benchmark/spec/prototype direction for model-agnostic execution-boundary action admission in organizational AI agents — separate from the Agent OS v0 CLI surface above.
+This repository also hosts **Admissible** — a benchmark/spec/prototype direction for evaluating whether proposed side-effecting AI-agent actions should be admitted at the execution boundary. It is separate from the Agent OS v0 CLI surface below.
 
-- [`docs/Admissible_THESIS.md`](docs/Admissible_THESIS.md) — the thesis: the model decides what could be done, Admissible decides what may be done
-- [`docs/Admissible_ACTION_ENVELOPE.md`](docs/Admissible_ACTION_ENVELOPE.md) — the structured action envelope Admissible evaluates at the execution boundary
-- [`docs/Admissible_BENCHMARK_SPEC.md`](docs/Admissible_BENCHMARK_SPEC.md) — the benchmark design: cases, gold annotations, baselines, and scoring
+**Core distinction:** The model may propose what could be done. Admissible evaluates what may be done.
 
-Admissible V0 work is currently benchmark-first: action envelopes, admission decisions, gold annotations, run traces, scoring, and fair baselines — not a product UI or SaaS platform. See [`docs/admissible-agent-os-lineage.md`](docs/admissible-agent-os-lineage.md) for how Admissible relates to (and differs from) the Agent OS vocabulary below.
+Canonical objects in the current harness:
+
+- **action envelope** — one proposed side-effecting action at the execution boundary;
+- **admission decision** — ALLOW, ALLOW_WITH_LIMITS, REQUEST_MORE_EVIDENCE, REQUIRE_HUMAN_APPROVAL, or REFUSE;
+- **gold annotation** — benchmark ground truth, stored separately from the envelope;
+- **scoring result** — comparison of a system's decision against gold;
+- **run trace** — structured record of a benchmark run;
+- **visual trace viewer** — static HTML report over a run trace;
+- **demo scenario pack** — curated subset of seed cases for walkthroughs.
+
+### Current status
+
+The repo currently contains:
+
+- canonical Admissible docs;
+- JSON schemas;
+- 25 Tier 1 enriched seed cases;
+- gold annotations;
+- rules-only reference evaluator;
+- frontier-direct mock baseline runner;
+- scoring harness;
+- comparison runner;
+- run trace schema/generator;
+- static trace viewer;
+- curated 8-case demo pack;
+- demo script narrative.
+
+This is a smoke-tested internal harness, not a public benchmark result.
+
+### Admissible quickstart
+
+**Focused tests:**
+
+```bash
+python -m unittest tests.test_admissible_decision tests.test_admissible_rules_only tests.test_admissible_scoring tests.test_admissible_baseline_runner tests.test_admissible_compare_runner tests.test_admissible_trace tests.test_admissible_visual_trace_viewer tests.test_admissible_demo_pack tests.test_admissible_demo_trace tests.test_admissible_demo_script -v
+```
+
+**Generate demo trace and HTML:**
+
+```bash
+python -m admissible.runner.demo_trace \
+  --demo-pack benchmark/reports/demo-pack.json \
+  --gold benchmark/annotations/gold_labels.jsonl \
+  --mock-response benchmark/examples/mock_frontier_response.json \
+  --trace-out benchmark/reports/demo_trace.json \
+  --html-out benchmark/reports/demo_trace.html
+```
+
+Open `benchmark/reports/demo_trace.html` in a browser.
+
+### Documentation
+
+- [`docs/Admissible_THESIS.md`](docs/Admissible_THESIS.md) — thesis and design rationale
+- [`docs/Admissible_ACTION_ENVELOPE.md`](docs/Admissible_ACTION_ENVELOPE.md) — action envelope specification
+- [`docs/Admissible_BENCHMARK_SPEC.md`](docs/Admissible_BENCHMARK_SPEC.md) — benchmark design: cases, gold, baselines, scoring
+- [`docs/admissible-agent-os-lineage.md`](docs/admissible-agent-os-lineage.md) — how Admissible relates to Agent OS
+- [`benchmark/reports/demo-pack.md`](benchmark/reports/demo-pack.md) — curated demo scenario pack
+- [`benchmark/reports/demo-script.md`](benchmark/reports/demo-script.md) — narrated demo walkthrough
+
+### Agent OS boundary
+
+**Agent OS** is the prior/internal governed-delegation substrate (mission, scope, evidence, audit, owner decision, closure). **Admissible** is the current benchmark/prototype direction for execution-boundary action admission.
+
+Existing Agent OS CLI/orchestrator concepts are not automatically Admissible benchmark semantics. Agent OS "admissible for promotion" (a planning artifact ready for owner review) is not Admissible action admissibility (whether a side-effecting action may execute).
+
+### Non-claims
+
+- This is not a benchmark result.
+- The current frontier baseline in the demo path is a mock plumbing baseline, not a live frontier model.
+- The rules-only evaluator is designed for Tier 1 enriched cases.
+- The current seed set is small, hand-authored, and single-author annotated.
+- The project does not yet show generalization to raw or adversarial cases.
+- The project is not production-ready infrastructure.
+
+### Next technical step
+
+The next technical step is to add a live model provider behind the existing ModelClient boundary, so the same trace/scoring/viewer pipeline can compare a real frontier-direct baseline against Admissible outputs without changing the benchmark objects.
 
 ## What problem it solves
 

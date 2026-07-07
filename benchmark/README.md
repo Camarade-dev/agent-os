@@ -6,7 +6,7 @@ See `docs/Admissible_THESIS.md`, `docs/Admissible_ACTION_ENVELOPE.md`, and `docs
 
 ## Status
 
-Schemas are the first implementation layer. No benchmark cases, baselines, or results exist yet. **No public claims should be made from schemas alone** — a schema only defines shape, not empirical findings.
+The benchmark directory now contains schemas, 25 Tier 1 enriched seed cases, gold annotations, a rules-only reference evaluator, a frontier-direct mock baseline runner, scoring, comparison and trace tooling, and a curated demo pack. This is a smoke-tested internal harness — **not a public benchmark result**. No empirical performance claims should be made from this seed set.
 
 ## One envelope, one action
 
@@ -43,6 +43,6 @@ Benchmark tier is currently represented only by directory structure (e.g. `bench
 
 `examples/refund_email.envelope.json`, `examples/refund_email.decision.json`, and `examples/refund_email.gold.json` are schema-conformance examples only, adapted from the refund-email scenario in `docs/Admissible_ACTION_ENVELOPE.md`. They are not a benchmark case set and carry no empirical claim.
 
-## Non-goals for this slice
+## Harness scope
 
-This directory does not yet include a runner, an evaluator, a scoring script, or a visual harness. Those are separate future slices (see the Admissible implementation plan). Schemas alone do not validate reasoning quality — they only constrain shape.
+The rules-only evaluator targets Tier 1 enriched cases. The frontier-direct baseline in the demo path uses mock plumbing, not a live frontier model. The seed set is small, hand-authored, and single-author annotated. See the top-level README "Non-claims" section for full claim boundaries.

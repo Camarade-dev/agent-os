@@ -66,12 +66,14 @@ Admissible V0 is not:
 - a renamed Agent OS orchestrator;
 - a full enterprise dashboard.
 
-Admissible V0 is currently:
+Admissible V0 currently includes:
 
-- a thesis;
-- an action-envelope specification;
+- a thesis and action-envelope specification;
 - a benchmark specification;
-- a future schema/case/scoring/runner harness.
+- JSON schemas, 25 Tier 1 enriched seed cases, and gold annotations;
+- a rules-only reference evaluator, mock frontier-direct baseline runner, scoring harness, comparison runner, run trace generator, static trace viewer, and curated demo pack.
+
+This is a smoke-tested internal harness, not a public benchmark result or production platform.
 
 `docs/v0-release-boundary.md` scopes the Agent OS CLI v0 surface specifically, including its explicit exclusion of a "benchmark framework." That exclusion does not apply to Admissible: Admissible is a separate, sibling initiative living in the same repository, not an extension of the Agent OS v0 CLI boundary.
 
