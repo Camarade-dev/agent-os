@@ -11,6 +11,7 @@ from agent_os.orchestrator import (
     OWNER_READINESS_DECISION_VALUES,
     REQUIREMENTS_EXTRACTION_OWNER_DECISION_VALUES,
     REQUIREMENTS_VALIDATION_EXECUTION_CHECK_CONFIRMED_STATE,
+    REQUIREMENTS_DRAFT_VALIDATION_REPORT_CREATED_STATE,
     REQUIREMENTS_VALIDATION_OWNER_DECISION_VALUES,
     create_goal_intake,
     create_owner_clarification,
@@ -19,6 +20,7 @@ from agent_os.orchestrator import (
     create_requirements_validation_owner_decision,
     check_requirements_extraction_execution_authorization,
     requirements_validation_execution_check,
+    validate_requirements_draft,
     draft_context_pack_from_transport,
     extract_requirements_draft,
     goal_intake_status,
@@ -592,6 +594,22 @@ def cmd_orchestrator_requirements_validation_execution_check(
         == REQUIREMENTS_VALIDATION_EXECUTION_CHECK_CONFIRMED_STATE
     )
     return 0 if confirmed else 1
+
+
+def cmd_orchestrator_validate_requirements_draft(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        report = validate_requirements_draft(
+            project,
+            args.intake_id,
+            args.plan_id,
+        )
+    except (FileNotFoundError, FileExistsError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(report.output)
+    created = report.status == REQUIREMENTS_DRAFT_VALIDATION_REPORT_CREATED_STATE
+    return 0 if created else 1
 
 
 def cmd_orchestrator_clarify(args: argparse.Namespace) -> int:
@@ -1499,6 +1517,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     orchestrator_requirements_validation_execution_check_parser.set_defaults(
         func=cmd_orchestrator_requirements_validation_execution_check
+    )
+
+    orchestrator_validate_requirements_draft_parser = orchestrator_sub.add_parser(
+        "validate-requirements-draft",
+        help="write requirements draft validation report (not approval)",
+        description=(
+            "Perform deterministic requirements draft validation checks and write "
+            "a non-authoritative validation report. Requires successful "
+            "requirements validation execution check. Does not call an LLM, "
+            "approve requirements, promote draft requirements, assign REQ-* ids, "
+            "rewrite local-agentic-spec.md, generate user stories or acceptance "
+            "criteria, generate architecture decisions, generate an implementation "
+            "plan, generate PLANNING_RUN_SLICE, create runner proposals, create "
+            "runs, invoke an executor, or write owner decision artifacts."
+        ),
+    )
+    orchestrator_validate_requirements_draft_parser.add_argument(
+        "intake_id",
+        help="intake identifier (filesystem-safe slug)",
+    )
+    orchestrator_validate_requirements_draft_parser.add_argument(
+        "path",
+        nargs="?",
+        help="target project directory",
+    )
+    orchestrator_validate_requirements_draft_parser.add_argument(
+        "--plan-id",
+        required=True,
+        help="planning workspace identifier (filesystem-safe slug)",
+    )
+    orchestrator_validate_requirements_draft_parser.set_defaults(
+        func=cmd_orchestrator_validate_requirements_draft
     )
 
     return parser

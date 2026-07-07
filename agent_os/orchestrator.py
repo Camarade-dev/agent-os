@@ -15,6 +15,7 @@ from agent_os.paths import (
     ORCHESTRATOR_CONTEXT_PACK_DRAFT_PROVENANCE_FILE,
     ORCHESTRATOR_LOCAL_AGENTIC_SPEC_SCAFFOLD_PROVENANCE_FILE,
     ORCHESTRATOR_REQUIREMENTS_DRAFT_PROVENANCE_FILE,
+    ORCHESTRATOR_REQUIREMENTS_DRAFT_VALIDATION_REPORT_FILE,
     ORCHESTRATOR_REQUIREMENTS_EXTRACTION_SCAFFOLD_PROVENANCE_FILE,
     ORCHESTRATOR_CONTEXT_TRANSPORT_FILE,
     ORCHESTRATOR_CONTEXT_TRANSPORT_MD_FILE,
@@ -621,6 +622,38 @@ REQUIREMENTS_VALIDATION_EXECUTION_CHECK_NON_AUTHORITY_FLAGS = (
     "requires_future_owner_approval",
 )
 
+ORCHESTRATOR_REQUIREMENTS_DRAFT_VALIDATION_REPORT_ARTIFACT_TYPE = (
+    "ORCHESTRATOR_REQUIREMENTS_DRAFT_VALIDATION_REPORT"
+)
+ORCHESTRATOR_REQUIREMENTS_DRAFT_VALIDATION_REPORT_SCHEMA_VERSION = "0.1"
+ORCHESTRATOR_REQUIREMENTS_DRAFT_VALIDATION_REPORT_SOURCE_COMMAND = (
+    "validate-requirements-draft"
+)
+REQUIREMENTS_DRAFT_VALIDATION_REPORT_CREATED_STATE = (
+    "REQUIREMENTS_DRAFT_VALIDATION_REPORT_CREATED_NO_APPROVAL_NO_PROMOTION"
+)
+REQUIREMENTS_DRAFT_VALIDATION_REPORT_CREATED_NEXT_ACTION = (
+    "FUTURE_REQUIREMENTS_APPROVAL_REQUIRES_OWNER_DECISION"
+)
+REQUIREMENTS_DRAFT_VALIDATION_RESULT_PASS = "PASS"
+REQUIREMENTS_DRAFT_VALIDATION_RESULT_NEEDS_REVISION = "NEEDS_REVISION"
+REQUIREMENTS_DRAFT_VALIDATION_RESULT_BLOCKED = "BLOCKED"
+
+REQUIREMENTS_DRAFT_VALIDATION_REPORT_NON_AUTHORITY_FLAGS = (
+    "validation_report_is_not_approval",
+    "validation_report_is_not_owner_decision",
+    "validation_pass_is_not_approval",
+    "does_not_approve_requirements",
+    "does_not_promote_draft_requirements",
+    "does_not_assign_approved_requirement_ids",
+    "does_not_generate_architecture",
+    "does_not_generate_implementation_plan",
+    "does_not_generate_planning_run_slice",
+    "does_not_create_runner_proposal",
+    "does_not_create_run",
+    "does_not_invoke_executor",
+)
+
 REQUIREMENTS_DRAFT_NON_AUTHORITY_FLAGS = (
     "requirements_are_draft",
     "requirements_are_not_approved",
@@ -716,6 +749,7 @@ _DRAFT_REQUIREMENT_HEADING_PATTERN = re.compile(
     r"^### (DRAFT-REQ-\d{3})\s*$",
     re.MULTILINE,
 )
+_DRAFT_REQUIREMENT_ID_STRICT_PATTERN = re.compile(r"^DRAFT-REQ-\d{3}$", re.IGNORECASE)
 _REQUIREMENTS_DRAFT_CANDIDATES_HEADING = "## Draft requirement candidates"
 _CANDIDATE_BACKTICK_FIELD_PATTERN = re.compile(
     r"- \*\*(?P<field>[a-z_]+):\*\* `(?P<value>[^`]+)`"
@@ -10445,6 +10479,484 @@ def requirements_validation_execution_check(
         next_required_action=REQUIREMENTS_VALIDATION_EXECUTION_CHECK_CONFIRMED_NEXT_ACTION,
         blocking_reasons=[],
         checked_at=checked_at,
+        non_authority=non_authority,
+    )
+
+
+@dataclass(frozen=True)
+class DraftRequirementValidationResult:
+    draft_requirement_id: str
+    validation_result: str
+    blocking_reasons: tuple[str, ...]
+    source_bounded_status: str
+    non_authority_status: str
+    approval_status: str
+    promotion_status: str
+    approved_requirement_id: str
+    architecture_status: str
+    implementation_status: str
+
+
+@dataclass(frozen=True)
+class RequirementsDraftValidationReport:
+    output: str
+    status: str
+    next_required_action: str
+    plan_id: str
+    intake_id: str
+    validation_report_path: Path
+    local_agentic_spec_path: Path
+    requirements_draft_provenance_path: Path
+    source_requirements_validation_execution_check_state: str
+    source_requirements_validation_execution_check_next_action: str
+    latest_requirements_validation_owner_decision_id: str | None
+    latest_requirements_validation_owner_decision: str | None
+    requirement_candidate_count: int
+    candidate_results: tuple[DraftRequirementValidationResult, ...]
+    created_at: str
+    non_authority: dict[str, bool]
+
+
+def _candidate_has_inferred_unsourced_details(
+    candidate: DraftRequirementCandidate,
+) -> bool:
+    combined_candidate = candidate.candidate_text.lower()
+    source_combined = candidate.source_quote_or_reference.lower()
+    for term in _INFERRED_SLITHER_FEATURE_TERMS:
+        if term not in source_combined and term in combined_candidate:
+            return True
+    return False
+
+
+def _candidate_text_forbidden_content_reasons(
+    candidate: DraftRequirementCandidate,
+) -> list[str]:
+    text = candidate.candidate_text
+    reasons: list[str] = []
+    if _USER_STORY_PATTERN.search(text):
+        reasons.append("candidate contains user story form")
+    if _ACCEPTANCE_CRITERIA_GWT_PATTERN.search(text):
+        reasons.append("candidate contains acceptance criteria language")
+    if _ACCEPTANCE_CRITERIA_ID_PATTERN.search(text):
+        reasons.append("candidate contains acceptance criteria identifiers")
+    if _ARCHITECTURE_DECISION_PATTERN.search(text):
+        reasons.append("candidate contains architecture decision language")
+    if _STACK_CHOICE_PATTERN.search(text):
+        reasons.append("candidate contains stack or deployment choices")
+    if "allowed_paths" in text:
+        reasons.append("candidate contains implementation task language")
+    if _FUNCTIONAL_REQUIREMENT_PATTERN.search(text):
+        reasons.append("candidate contains formal requirement language (shall)")
+    if _PROMOTED_REQUIREMENT_ID_PATTERN.search(text):
+        reasons.append("candidate text contains promoted requirement identifiers")
+    if _FUNCTIONAL_REQUIREMENT_ID_PATTERN.search(text):
+        reasons.append("candidate text contains FR-* identifiers")
+    if _NON_FUNCTIONAL_REQUIREMENT_ID_PATTERN.search(text):
+        reasons.append("candidate text contains NFR-* identifiers")
+    return reasons
+
+
+def _validate_single_draft_requirement_candidate(
+    candidate: DraftRequirementCandidate,
+    *,
+    provenance_ids: list[str],
+    spec_content: str,
+) -> DraftRequirementValidationResult:
+    blocked_reasons: list[str] = []
+    revision_reasons: list[str] = []
+
+    if not _DRAFT_REQUIREMENT_ID_STRICT_PATTERN.match(candidate.id):
+        blocked_reasons.append(f"invalid DRAFT-REQ id format: {candidate.id!r}")
+
+    if re.match(r"^(REQ|FR|NFR)-\d+$", candidate.id, re.IGNORECASE):
+        blocked_reasons.append(
+            f"candidate uses promoted identifier as current id: {candidate.id!r}"
+        )
+
+    if candidate.status != DRAFT_REQUIREMENT_CANDIDATE_STATUS:
+        blocked_reasons.append(
+            "candidate status is not DRAFT_REQUIREMENT_CANDIDATE_NON_AUTHORITY"
+        )
+
+    if candidate.source_bounded != DRAFT_REQUIREMENT_SOURCE_BOUNDED_MARKER:
+        revision_reasons.append("candidate is not SOURCE_BOUNDED")
+
+    if candidate.validation_status != "NOT_VALIDATED":
+        blocked_reasons.append("candidate validation_status is not NOT_VALIDATED")
+
+    if candidate.approval_status != "NOT_APPROVED":
+        blocked_reasons.append("candidate approval_status is not NOT_APPROVED")
+
+    if candidate.architecture_status != "NOT_DECIDED":
+        blocked_reasons.append("candidate architecture_status is not NOT_DECIDED")
+
+    if candidate.implementation_status != "NOT_PLANNED":
+        blocked_reasons.append("candidate implementation_status is not NOT_PLANNED")
+
+    if not candidate.source_quote_or_reference.strip():
+        revision_reasons.append("candidate source quote or evidence is missing")
+
+    if _candidate_has_inferred_unsourced_details(candidate):
+        revision_reasons.append("candidate contains forbidden inferred details")
+
+    blocked_reasons.extend(_candidate_text_forbidden_content_reasons(candidate))
+
+    if candidate.id not in provenance_ids:
+        revision_reasons.append(
+            f"candidate {candidate.id!r} missing from requirements draft provenance"
+        )
+
+    if candidate.id not in spec_content:
+        revision_reasons.append(
+            f"candidate {candidate.id!r} missing from local-agentic-spec.md"
+        )
+
+    if blocked_reasons:
+        validation_result = REQUIREMENTS_DRAFT_VALIDATION_RESULT_BLOCKED
+        all_reasons = blocked_reasons + revision_reasons
+    elif revision_reasons:
+        validation_result = REQUIREMENTS_DRAFT_VALIDATION_RESULT_NEEDS_REVISION
+        all_reasons = revision_reasons
+    else:
+        validation_result = REQUIREMENTS_DRAFT_VALIDATION_RESULT_PASS
+        all_reasons = []
+
+    return DraftRequirementValidationResult(
+        draft_requirement_id=candidate.id,
+        validation_result=validation_result,
+        blocking_reasons=tuple(all_reasons),
+        source_bounded_status=candidate.source_bounded or "UNKNOWN",
+        non_authority_status=candidate.status or "UNKNOWN",
+        approval_status="NOT_APPROVED",
+        promotion_status="NOT_PROMOTED",
+        approved_requirement_id="NOT_ASSIGNED",
+        architecture_status=candidate.architecture_status or "UNKNOWN",
+        implementation_status=candidate.implementation_status or "UNKNOWN",
+    )
+
+
+def _format_requirements_draft_validation_report(
+    *,
+    plan_id: str,
+    intake_id: str,
+    validation_report_path: Path,
+    local_agentic_spec_path: Path,
+    requirements_draft_provenance_path: Path,
+    source_requirements_validation_execution_check_state: str,
+    source_requirements_validation_execution_check_next_action: str,
+    latest_requirements_validation_owner_decision_id: str | None,
+    latest_requirements_validation_owner_decision: str | None,
+    status: str,
+    next_required_action: str,
+    requirement_candidate_count: int,
+    candidate_results: tuple[DraftRequirementValidationResult, ...],
+    created_at: str,
+    non_authority: dict[str, bool],
+) -> str:
+    lines = [
+        "requirements draft validation report",
+        f"validation_report_path: {validation_report_path}",
+        f"local_agentic_spec_path: {local_agentic_spec_path}",
+        f"requirements_draft_provenance_path: {requirements_draft_provenance_path}",
+        f"plan_id: {plan_id}",
+        f"intake_id: {intake_id}",
+        f"status: {status}",
+        f"next_required_action: {next_required_action}",
+        (
+            "source_requirements_validation_execution_check_state: "
+            f"{source_requirements_validation_execution_check_state}"
+        ),
+        (
+            "source_requirements_validation_execution_check_next_action: "
+            f"{source_requirements_validation_execution_check_next_action}"
+        ),
+    ]
+    if latest_requirements_validation_owner_decision_id is not None:
+        lines.append(
+            "latest_requirements_validation_owner_decision_id: "
+            f"{latest_requirements_validation_owner_decision_id}"
+        )
+    if latest_requirements_validation_owner_decision is not None:
+        lines.append(
+            "latest_requirements_validation_owner_decision: "
+            f"{latest_requirements_validation_owner_decision}"
+        )
+    lines.append(f"requirement_candidate_count: {requirement_candidate_count}")
+    lines.append(f"created_at: {created_at}")
+    lines.append("candidate_results:")
+    for result in candidate_results:
+        lines.append(f"  - draft_requirement_id: {result.draft_requirement_id}")
+        lines.append(f"    validation_result: {result.validation_result}")
+        lines.append(f"    approval_status: {result.approval_status}")
+        lines.append(f"    promotion_status: {result.promotion_status}")
+        lines.append(f"    approved_requirement_id: {result.approved_requirement_id}")
+        if result.blocking_reasons:
+            lines.append("    blocking_reasons:")
+            for reason in result.blocking_reasons:
+                lines.append(f"      - {reason}")
+    lines.append("non_authority:")
+    for flag in REQUIREMENTS_DRAFT_VALIDATION_REPORT_NON_AUTHORITY_FLAGS:
+        lines.append(f"  {flag}: true")
+    lines.append(
+        "note: validation report is evidence only; not requirements approval, "
+        "not promotion, not architecture decision, not implementation planning, "
+        "and local-agentic-spec.md was not modified"
+    )
+    if status == REQUIREMENTS_DRAFT_VALIDATION_REPORT_CREATED_STATE:
+        lines.append(
+            "note: PASS does not approve requirements and does not assign REQ-* ids; "
+            "DRAFT-REQ-* remains draft-only pending future owner approval"
+        )
+        lines.append(
+            "note: future requirements approval requires a separate owner decision"
+        )
+    return "\n".join(lines)
+
+
+def _build_requirements_draft_validation_report_artifact(
+    *,
+    plan_id: str,
+    intake_id: str,
+    validation_report_path: Path,
+    local_agentic_spec_path: Path,
+    requirements_draft_provenance_path: Path,
+    source_requirements_validation_execution_check_state: str,
+    source_requirements_validation_execution_check_next_action: str,
+    latest_requirements_validation_owner_decision_id: str | None,
+    latest_requirements_validation_owner_decision_path: Path | None,
+    latest_requirements_validation_owner_decision: str | None,
+    requirement_candidate_count: int,
+    candidate_results: tuple[DraftRequirementValidationResult, ...],
+    created_at: str,
+    non_authority: dict[str, bool],
+) -> dict:
+    return {
+        "artifact_type": ORCHESTRATOR_REQUIREMENTS_DRAFT_VALIDATION_REPORT_ARTIFACT_TYPE,
+        "schema_version": ORCHESTRATOR_REQUIREMENTS_DRAFT_VALIDATION_REPORT_SCHEMA_VERSION,
+        "plan_id": plan_id,
+        "intake_id": intake_id,
+        "source_command": ORCHESTRATOR_REQUIREMENTS_DRAFT_VALIDATION_REPORT_SOURCE_COMMAND,
+        "status": REQUIREMENTS_DRAFT_VALIDATION_REPORT_CREATED_STATE,
+        "next_required_action": REQUIREMENTS_DRAFT_VALIDATION_REPORT_CREATED_NEXT_ACTION,
+        "validation_report_path": str(validation_report_path),
+        "local_agentic_spec_path": str(local_agentic_spec_path),
+        "requirements_draft_provenance_path": str(requirements_draft_provenance_path),
+        "source_requirements_validation_execution_check_state": (
+            source_requirements_validation_execution_check_state
+        ),
+        "source_requirements_validation_execution_check_next_action": (
+            source_requirements_validation_execution_check_next_action
+        ),
+        "latest_requirements_validation_owner_decision_id": (
+            latest_requirements_validation_owner_decision_id
+        ),
+        "latest_requirements_validation_owner_decision_path": (
+            str(latest_requirements_validation_owner_decision_path)
+            if latest_requirements_validation_owner_decision_path is not None
+            else None
+        ),
+        "latest_requirements_validation_owner_decision": (
+            latest_requirements_validation_owner_decision
+        ),
+        "requirement_candidate_count": requirement_candidate_count,
+        "candidate_results": [
+            {
+                "draft_requirement_id": result.draft_requirement_id,
+                "validation_result": result.validation_result,
+                "blocking_reasons": list(result.blocking_reasons),
+                "source_bounded_status": result.source_bounded_status,
+                "non_authority_status": result.non_authority_status,
+                "approval_status": result.approval_status,
+                "promotion_status": result.promotion_status,
+                "approved_requirement_id": result.approved_requirement_id,
+                "architecture_status": result.architecture_status,
+                "implementation_status": result.implementation_status,
+            }
+            for result in candidate_results
+        ],
+        "created_at": created_at,
+        "non_authority": non_authority,
+    }
+
+
+def validate_requirements_draft(
+    project: Path,
+    intake_id: str,
+    plan_id: str,
+) -> RequirementsDraftValidationReport:
+    """Write a deterministic requirements draft validation report only."""
+    validate_intake_id(intake_id)
+    validate_plan_id(plan_id)
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        raise FileNotFoundError("no workspace found (run `agent-os init` first)")
+
+    _require_valid_goal_intake(project, intake_id)
+
+    workspace_dest = planning_path(project, plan_id)
+    if not workspace_dest.is_dir():
+        raise FileNotFoundError(f"planning workspace not found: {plan_id}")
+
+    validation_report_path = (
+        workspace_dest
+        / "evidence"
+        / ORCHESTRATOR_REQUIREMENTS_DRAFT_VALIDATION_REPORT_FILE
+    )
+    if validation_report_path.exists():
+        raise FileExistsError(
+            f"requirements draft validation report already exists for plan: {plan_id}"
+        )
+
+    execution_report = requirements_validation_execution_check(
+        project,
+        intake_id,
+        plan_id,
+    )
+    if (
+        execution_report.execution_check_state
+        != REQUIREMENTS_VALIDATION_EXECUTION_CHECK_CONFIRMED_STATE
+    ):
+        reasons = (
+            "; ".join(execution_report.blocking_reasons)
+            or execution_report.execution_check_state
+        )
+        raise ValueError(
+            "requirements validation execution check not confirmed: "
+            f"{reasons}"
+        )
+
+    local_agentic_spec_path = workspace_dest / "local-agentic-spec.md"
+    draft_provenance_path = (
+        workspace_dest / "evidence" / ORCHESTRATOR_REQUIREMENTS_DRAFT_PROVENANCE_FILE
+    )
+    if not local_agentic_spec_path.is_file():
+        raise FileNotFoundError(
+            f"local-agentic-spec.md missing in planning workspace: {plan_id}"
+        )
+    if not draft_provenance_path.is_file():
+        raise FileNotFoundError(
+            "requirements draft provenance missing: "
+            f"{ORCHESTRATOR_REQUIREMENTS_DRAFT_PROVENANCE_FILE}"
+        )
+
+    local_spec_content = local_agentic_spec_path.read_text(encoding="utf-8")
+    try:
+        provenance = json.loads(draft_provenance_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"malformed requirements draft provenance: {exc.msg}") from exc
+    if not isinstance(provenance, dict):
+        raise ValueError("malformed requirements draft provenance: expected object")
+
+    parsed_candidates = _parse_requirements_draft_candidates_from_spec(local_spec_content)
+    if isinstance(parsed_candidates, str):
+        raise ValueError(parsed_candidates)
+
+    provenance_ids = provenance.get("requirement_candidate_ids")
+    if not isinstance(provenance_ids, list):
+        raise ValueError(
+            "malformed requirements draft provenance: requirement_candidate_ids missing"
+        )
+
+    candidate_results = tuple(
+        _validate_single_draft_requirement_candidate(
+            candidate,
+            provenance_ids=provenance_ids,
+            spec_content=local_spec_content,
+        )
+        for candidate in parsed_candidates
+    )
+
+    created_at = _utc_now()
+    non_authority = {
+        key: True for key in REQUIREMENTS_DRAFT_VALIDATION_REPORT_NON_AUTHORITY_FLAGS
+    }
+    artifact = _build_requirements_draft_validation_report_artifact(
+        plan_id=plan_id,
+        intake_id=intake_id,
+        validation_report_path=validation_report_path,
+        local_agentic_spec_path=local_agentic_spec_path,
+        requirements_draft_provenance_path=draft_provenance_path,
+        source_requirements_validation_execution_check_state=(
+            execution_report.execution_check_state
+        ),
+        source_requirements_validation_execution_check_next_action=(
+            execution_report.next_required_action
+        ),
+        latest_requirements_validation_owner_decision_id=(
+            execution_report.latest_requirements_validation_owner_decision_id
+        ),
+        latest_requirements_validation_owner_decision_path=(
+            execution_report.latest_requirements_validation_owner_decision_path
+        ),
+        latest_requirements_validation_owner_decision=(
+            execution_report.latest_requirements_validation_owner_decision
+        ),
+        requirement_candidate_count=len(candidate_results),
+        candidate_results=candidate_results,
+        created_at=created_at,
+        non_authority=non_authority,
+    )
+
+    validation_report_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_report_path = validation_report_path.with_suffix(".json.tmp")
+    try:
+        _write_json(temp_report_path, artifact)
+        temp_report_path.replace(validation_report_path)
+    except Exception:
+        if temp_report_path.is_file():
+            temp_report_path.unlink()
+        raise
+
+    output = _format_requirements_draft_validation_report(
+        plan_id=plan_id,
+        intake_id=intake_id,
+        validation_report_path=validation_report_path,
+        local_agentic_spec_path=local_agentic_spec_path,
+        requirements_draft_provenance_path=draft_provenance_path,
+        source_requirements_validation_execution_check_state=(
+            execution_report.execution_check_state
+        ),
+        source_requirements_validation_execution_check_next_action=(
+            execution_report.next_required_action
+        ),
+        latest_requirements_validation_owner_decision_id=(
+            execution_report.latest_requirements_validation_owner_decision_id
+        ),
+        latest_requirements_validation_owner_decision=(
+            execution_report.latest_requirements_validation_owner_decision
+        ),
+        status=REQUIREMENTS_DRAFT_VALIDATION_REPORT_CREATED_STATE,
+        next_required_action=REQUIREMENTS_DRAFT_VALIDATION_REPORT_CREATED_NEXT_ACTION,
+        requirement_candidate_count=len(candidate_results),
+        candidate_results=candidate_results,
+        created_at=created_at,
+        non_authority=non_authority,
+    )
+    return RequirementsDraftValidationReport(
+        output=output,
+        status=REQUIREMENTS_DRAFT_VALIDATION_REPORT_CREATED_STATE,
+        next_required_action=REQUIREMENTS_DRAFT_VALIDATION_REPORT_CREATED_NEXT_ACTION,
+        plan_id=plan_id,
+        intake_id=intake_id,
+        validation_report_path=validation_report_path,
+        local_agentic_spec_path=local_agentic_spec_path,
+        requirements_draft_provenance_path=draft_provenance_path,
+        source_requirements_validation_execution_check_state=(
+            execution_report.execution_check_state
+        ),
+        source_requirements_validation_execution_check_next_action=(
+            execution_report.next_required_action
+        ),
+        latest_requirements_validation_owner_decision_id=(
+            execution_report.latest_requirements_validation_owner_decision_id
+        ),
+        latest_requirements_validation_owner_decision=(
+            execution_report.latest_requirements_validation_owner_decision
+        ),
+        requirement_candidate_count=len(candidate_results),
+        candidate_results=candidate_results,
+        created_at=created_at,
         non_authority=non_authority,
     )
 
