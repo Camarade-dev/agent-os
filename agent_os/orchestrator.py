@@ -754,6 +754,32 @@ REQUIREMENTS_APPROVAL_OWNER_DECISION_NON_AUTHORITY_FLAGS = (
     "does_not_invoke_executor",
 )
 
+REQUIREMENTS_APPROVAL_EXECUTION_CHECK_CONFIRMED_STATE = (
+    "REQUIREMENTS_APPROVAL_EXECUTION_CHECK_CONFIRMED_NO_APPROVAL_NO_PROMOTION"
+)
+REQUIREMENTS_APPROVAL_EXECUTION_CHECK_CONFIRMED_NEXT_ACTION = (
+    "FUTURE_REQUIREMENTS_APPROVAL_COMMAND_MAY_BE_RUN_SEPARATELY"
+)
+
+REQUIREMENTS_APPROVAL_EXECUTION_CHECK_NON_AUTHORITY_FLAGS = (
+    "approval_execution_check_is_not_approval",
+    "approval_execution_check_is_not_promotion",
+    "owner_authorization_is_not_approval",
+    "owner_authorization_is_not_promotion",
+    "validation_report_is_not_approval",
+    "validation_pass_is_not_approval",
+    "does_not_approve_requirements",
+    "does_not_promote_draft_requirements",
+    "does_not_assign_approved_requirement_ids",
+    "does_not_generate_architecture",
+    "does_not_generate_implementation_plan",
+    "does_not_generate_planning_run_slice",
+    "does_not_create_runner_proposal",
+    "does_not_create_run",
+    "does_not_invoke_executor",
+    "does_not_write_artifacts",
+)
+
 REQUIREMENTS_DRAFT_NON_AUTHORITY_FLAGS = (
     "requirements_are_draft",
     "requirements_are_not_approved",
@@ -12307,6 +12333,523 @@ def _load_validated_requirements_approval_owner_decisions(
 
     records.sort(key=lambda record: (record.created_at, record.decision_id))
     return tuple(records), errors
+
+
+def _validate_requirements_approval_owner_decision_coherence(
+    artifact: dict,
+    *,
+    preflight: RequirementsApprovalPreflightReport,
+) -> str | None:
+    """Return a blocking reason when an owner decision references stale approval metadata."""
+    if (
+        artifact.get("source_requirements_approval_preflight_state")
+        != REQUIREMENTS_APPROVAL_PREFLIGHT_CONFIRMED_STATE
+    ):
+        return (
+            "requirements approval owner decision references stale preflight state: "
+            f"expected {REQUIREMENTS_APPROVAL_PREFLIGHT_CONFIRMED_STATE!r}, "
+            f"found {artifact.get('source_requirements_approval_preflight_state')!r}"
+        )
+
+    if (
+        artifact.get("source_requirements_approval_preflight_next_action")
+        != REQUIREMENTS_APPROVAL_PREFLIGHT_CONFIRMED_NEXT_ACTION
+    ):
+        return (
+            "requirements approval owner decision references stale preflight next "
+            "action: "
+            f"expected {REQUIREMENTS_APPROVAL_PREFLIGHT_CONFIRMED_NEXT_ACTION!r}, "
+            f"found {artifact.get('source_requirements_approval_preflight_next_action')!r}"
+        )
+
+    if (
+        artifact.get("source_requirements_approval_preflight_state")
+        != preflight.approval_preflight_state
+    ):
+        return (
+            "requirements approval owner decision preflight snapshot no longer "
+            "matches current preflight state: "
+            f"artifact={artifact.get('source_requirements_approval_preflight_state')!r}, "
+            f"current={preflight.approval_preflight_state!r}"
+        )
+
+    if (
+        artifact.get("source_requirements_approval_preflight_next_action")
+        != preflight.next_required_action
+    ):
+        return (
+            "requirements approval owner decision preflight snapshot no longer "
+            "matches current preflight next action: "
+            f"artifact={artifact.get('source_requirements_approval_preflight_next_action')!r}, "
+            f"current={preflight.next_required_action!r}"
+        )
+
+    expected_report_path = (
+        str(preflight.source_requirements_validation_report_path)
+        if preflight.source_requirements_validation_report_path is not None
+        else ""
+    )
+    artifact_report_path = artifact.get("source_requirements_validation_report_path")
+    if artifact_report_path != expected_report_path:
+        return (
+            "requirements approval owner decision references stale validation report "
+            f"path: expected {expected_report_path!r}, found {artifact_report_path!r}"
+        )
+
+    expected_report_status = preflight.source_requirements_validation_report_status or ""
+    artifact_report_status = artifact.get("source_requirements_validation_report_status")
+    if artifact_report_status != expected_report_status:
+        return (
+            "requirements approval owner decision references stale validation report "
+            f"status: expected {expected_report_status!r}, found {artifact_report_status!r}"
+        )
+
+    expected_report_next_action = (
+        preflight.source_requirements_validation_report_next_action or ""
+    )
+    artifact_report_next_action = artifact.get(
+        "source_requirements_validation_report_next_action"
+    )
+    if artifact_report_next_action != expected_report_next_action:
+        return (
+            "requirements approval owner decision references stale validation report "
+            "next action: "
+            f"expected {expected_report_next_action!r}, "
+            f"found {artifact_report_next_action!r}"
+        )
+
+    if artifact.get("planning_workspace_status_at_decision") != "DRAFT":
+        return (
+            "requirements approval owner decision planning_workspace_status_at_decision "
+            f"is not DRAFT: found {artifact.get('planning_workspace_status_at_decision')!r}"
+        )
+
+    artifact_next_action = artifact.get("next_required_action")
+    if artifact_next_action != REQUIREMENTS_APPROVAL_AUTHORIZE_NEXT_ACTION:
+        return (
+            "requirements approval owner decision has stale or incoherent "
+            f"next_required_action: expected {REQUIREMENTS_APPROVAL_AUTHORIZE_NEXT_ACTION!r}, "
+            f"found {artifact_next_action!r}"
+        )
+
+    return None
+
+
+def _format_requirements_approval_execution_check(
+    *,
+    plan_id: str,
+    intake_id: str,
+    execution_check_state: str,
+    next_required_action: str,
+    latest_requirements_approval_owner_decision_id: str | None,
+    latest_requirements_approval_owner_decision: str | None,
+    source_requirements_approval_preflight_state: str | None,
+    source_requirements_approval_preflight_next_action: str | None,
+    source_requirements_validation_report_path: Path | None,
+    source_requirements_validation_report_status: str | None,
+    source_requirements_validation_report_next_action: str | None,
+    candidate_count: int | None,
+    candidate_validation_results_summary: dict[str, int] | None,
+    blocking_reasons: list[str],
+    checked_at: str,
+    non_authority: dict[str, bool],
+) -> str:
+    lines = [
+        "requirements approval execution check",
+        f"plan_id: {plan_id}",
+        f"intake_id: {intake_id}",
+        f"execution_check_state: {execution_check_state}",
+        f"next_required_action: {next_required_action}",
+    ]
+    if latest_requirements_approval_owner_decision_id is not None:
+        lines.append(
+            "latest_requirements_approval_owner_decision_id: "
+            f"{latest_requirements_approval_owner_decision_id}"
+        )
+    if latest_requirements_approval_owner_decision is not None:
+        lines.append(
+            "latest_requirements_approval_owner_decision: "
+            f"{latest_requirements_approval_owner_decision}"
+        )
+    if source_requirements_approval_preflight_state is not None:
+        lines.append(
+            "source_requirements_approval_preflight_state: "
+            f"{source_requirements_approval_preflight_state}"
+        )
+    if source_requirements_approval_preflight_next_action is not None:
+        lines.append(
+            "source_requirements_approval_preflight_next_action: "
+            f"{source_requirements_approval_preflight_next_action}"
+        )
+    if source_requirements_validation_report_path is not None:
+        lines.append(
+            "source_requirements_validation_report_path: "
+            f"{source_requirements_validation_report_path}"
+        )
+    if source_requirements_validation_report_status is not None:
+        lines.append(
+            "source_requirements_validation_report_status: "
+            f"{source_requirements_validation_report_status}"
+        )
+    if source_requirements_validation_report_next_action is not None:
+        lines.append(
+            "source_requirements_validation_report_next_action: "
+            f"{source_requirements_validation_report_next_action}"
+        )
+    if candidate_count is not None:
+        lines.append(f"candidate_count: {candidate_count}")
+    if candidate_validation_results_summary is not None:
+        lines.append("candidate_validation_results_summary:")
+        for key in (
+            REQUIREMENTS_DRAFT_VALIDATION_RESULT_PASS,
+            REQUIREMENTS_DRAFT_VALIDATION_RESULT_NEEDS_REVISION,
+            REQUIREMENTS_DRAFT_VALIDATION_RESULT_BLOCKED,
+        ):
+            lines.append(f"  {key}: {candidate_validation_results_summary.get(key, 0)}")
+    lines.append(f"checked_at: {checked_at}")
+    if blocking_reasons:
+        lines.append("blocking_reasons:")
+        for reason in blocking_reasons:
+            lines.append(f"  - {reason}")
+    lines.append("non_authority:")
+    for flag in REQUIREMENTS_APPROVAL_EXECUTION_CHECK_NON_AUTHORITY_FLAGS:
+        lines.append(f"  {flag}: {str(non_authority.get(flag, False)).lower()}")
+    lines.append(
+        "note: requirements approval execution check is read-only; "
+        "not requirements approval, not promotion, not architecture decision, "
+        "not implementation planning, and no files were modified"
+    )
+    if execution_check_state == REQUIREMENTS_APPROVAL_EXECUTION_CHECK_CONFIRMED_STATE:
+        lines.append(
+            "note: execution check confirmed for a future requirements approval "
+            "command only; no requirements were approved or promoted"
+        )
+        lines.append(
+            "note: successful check is not approval, not promotion, not architecture "
+            "decision, not implementation plan, and does not authorize runner or "
+            "executor"
+        )
+    return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class RequirementsApprovalExecutionCheckReport:
+    output: str
+    execution_check_state: str
+    next_required_action: str
+    plan_id: str
+    intake_id: str
+    latest_requirements_approval_owner_decision_id: str | None
+    latest_requirements_approval_owner_decision: str | None
+    source_requirements_approval_preflight_state: str | None
+    source_requirements_approval_preflight_next_action: str | None
+    source_requirements_validation_report_path: Path | None
+    source_requirements_validation_report_status: str | None
+    source_requirements_validation_report_next_action: str | None
+    candidate_count: int | None
+    candidate_validation_results_summary: dict[str, int] | None
+    checked_at: str
+    blocking_reasons: tuple[str, ...]
+    non_authority: dict[str, bool]
+
+
+def _build_requirements_approval_execution_check_report(
+    *,
+    plan_id: str,
+    intake_id: str,
+    execution_check_state: str,
+    next_required_action: str,
+    latest_requirements_approval_owner_decision_id: str | None = None,
+    latest_requirements_approval_owner_decision: str | None = None,
+    source_requirements_approval_preflight_state: str | None = None,
+    source_requirements_approval_preflight_next_action: str | None = None,
+    source_requirements_validation_report_path: Path | None = None,
+    source_requirements_validation_report_status: str | None = None,
+    source_requirements_validation_report_next_action: str | None = None,
+    candidate_count: int | None = None,
+    candidate_validation_results_summary: dict[str, int] | None = None,
+    blocking_reasons: list[str],
+    checked_at: str,
+    non_authority: dict[str, bool],
+) -> RequirementsApprovalExecutionCheckReport:
+    output = _format_requirements_approval_execution_check(
+        plan_id=plan_id,
+        intake_id=intake_id,
+        execution_check_state=execution_check_state,
+        next_required_action=next_required_action,
+        latest_requirements_approval_owner_decision_id=(
+            latest_requirements_approval_owner_decision_id
+        ),
+        latest_requirements_approval_owner_decision=(
+            latest_requirements_approval_owner_decision
+        ),
+        source_requirements_approval_preflight_state=(
+            source_requirements_approval_preflight_state
+        ),
+        source_requirements_approval_preflight_next_action=(
+            source_requirements_approval_preflight_next_action
+        ),
+        source_requirements_validation_report_path=(
+            source_requirements_validation_report_path
+        ),
+        source_requirements_validation_report_status=(
+            source_requirements_validation_report_status
+        ),
+        source_requirements_validation_report_next_action=(
+            source_requirements_validation_report_next_action
+        ),
+        candidate_count=candidate_count,
+        candidate_validation_results_summary=candidate_validation_results_summary,
+        blocking_reasons=blocking_reasons,
+        checked_at=checked_at,
+        non_authority=non_authority,
+    )
+    return RequirementsApprovalExecutionCheckReport(
+        output=output,
+        execution_check_state=execution_check_state,
+        next_required_action=next_required_action,
+        plan_id=plan_id,
+        intake_id=intake_id,
+        latest_requirements_approval_owner_decision_id=(
+            latest_requirements_approval_owner_decision_id
+        ),
+        latest_requirements_approval_owner_decision=(
+            latest_requirements_approval_owner_decision
+        ),
+        source_requirements_approval_preflight_state=(
+            source_requirements_approval_preflight_state
+        ),
+        source_requirements_approval_preflight_next_action=(
+            source_requirements_approval_preflight_next_action
+        ),
+        source_requirements_validation_report_path=(
+            source_requirements_validation_report_path
+        ),
+        source_requirements_validation_report_status=(
+            source_requirements_validation_report_status
+        ),
+        source_requirements_validation_report_next_action=(
+            source_requirements_validation_report_next_action
+        ),
+        candidate_count=candidate_count,
+        candidate_validation_results_summary=candidate_validation_results_summary,
+        checked_at=checked_at,
+        blocking_reasons=tuple(blocking_reasons),
+        non_authority=non_authority,
+    )
+
+
+def requirements_approval_execution_check(
+    project: Path,
+    intake_id: str,
+    plan_id: str,
+) -> RequirementsApprovalExecutionCheckReport:
+    """Read-only pre-execution check for future requirements approval authorization."""
+    validate_intake_id(intake_id)
+    validate_plan_id(plan_id)
+
+    checked_at = _utc_now()
+    non_authority = {
+        key: True for key in REQUIREMENTS_APPROVAL_EXECUTION_CHECK_NON_AUTHORITY_FLAGS
+    }
+
+    def _blocked(
+        state: str,
+        next_action: str,
+        *,
+        blocking_reasons: list[str] | None = None,
+        latest_requirements_approval_owner_decision_id: str | None = None,
+        latest_requirements_approval_owner_decision: str | None = None,
+        source_requirements_approval_preflight_state: str | None = None,
+        source_requirements_approval_preflight_next_action: str | None = None,
+        source_requirements_validation_report_path: Path | None = None,
+        source_requirements_validation_report_status: str | None = None,
+        source_requirements_validation_report_next_action: str | None = None,
+        candidate_count: int | None = None,
+        candidate_validation_results_summary: dict[str, int] | None = None,
+    ) -> RequirementsApprovalExecutionCheckReport:
+        return _build_requirements_approval_execution_check_report(
+            plan_id=plan_id,
+            intake_id=intake_id,
+            execution_check_state=state,
+            next_required_action=next_action,
+            latest_requirements_approval_owner_decision_id=(
+                latest_requirements_approval_owner_decision_id
+            ),
+            latest_requirements_approval_owner_decision=(
+                latest_requirements_approval_owner_decision
+            ),
+            source_requirements_approval_preflight_state=(
+                source_requirements_approval_preflight_state
+            ),
+            source_requirements_approval_preflight_next_action=(
+                source_requirements_approval_preflight_next_action
+            ),
+            source_requirements_validation_report_path=(
+                source_requirements_validation_report_path
+            ),
+            source_requirements_validation_report_status=(
+                source_requirements_validation_report_status
+            ),
+            source_requirements_validation_report_next_action=(
+                source_requirements_validation_report_next_action
+            ),
+            candidate_count=candidate_count,
+            candidate_validation_results_summary=candidate_validation_results_summary,
+            blocking_reasons=blocking_reasons or [],
+            checked_at=checked_at,
+            non_authority=non_authority,
+        )
+
+    preflight = requirements_approval_preflight(project, intake_id, plan_id)
+    preflight_state = preflight.approval_preflight_state
+    preflight_next_action = preflight.next_required_action
+    report_path = preflight.source_requirements_validation_report_path
+    report_status = preflight.source_requirements_validation_report_status
+    report_next_action = preflight.source_requirements_validation_report_next_action
+    candidate_count = preflight.candidate_count
+    candidate_summary = preflight.candidate_validation_results_summary
+
+    if preflight_state != REQUIREMENTS_APPROVAL_PREFLIGHT_CONFIRMED_STATE:
+        return _blocked(
+            preflight_state,
+            preflight_next_action,
+            blocking_reasons=list(preflight.blocking_reasons),
+            source_requirements_approval_preflight_state=preflight_state,
+            source_requirements_approval_preflight_next_action=preflight_next_action,
+            source_requirements_validation_report_path=report_path,
+            source_requirements_validation_report_status=report_status,
+            source_requirements_validation_report_next_action=report_next_action,
+            candidate_count=candidate_count,
+            candidate_validation_results_summary=candidate_summary,
+        )
+
+    decision_records, decision_errors = _load_validated_requirements_approval_owner_decisions(
+        project,
+        intake_id,
+        plan_id,
+    )
+    if decision_errors:
+        return _blocked(
+            "BLOCKED_MALFORMED_REQUIREMENTS_APPROVAL_OWNER_DECISION",
+            "FIX_REQUIREMENTS_APPROVAL_OWNER_DECISION_ARTIFACTS",
+            blocking_reasons=decision_errors,
+            source_requirements_approval_preflight_state=preflight_state,
+            source_requirements_approval_preflight_next_action=preflight_next_action,
+            source_requirements_validation_report_path=report_path,
+            source_requirements_validation_report_status=report_status,
+            source_requirements_validation_report_next_action=report_next_action,
+            candidate_count=candidate_count,
+            candidate_validation_results_summary=candidate_summary,
+        )
+
+    if not decision_records:
+        return _blocked(
+            "BLOCKED_NO_REQUIREMENTS_APPROVAL_OWNER_DECISION",
+            "CREATE_REQUIREMENTS_APPROVAL_OWNER_DECISION",
+            blocking_reasons=[
+                "no requirements approval owner decision artifacts found "
+                f"for intake {intake_id!r} and plan {plan_id!r}"
+            ],
+            source_requirements_approval_preflight_state=preflight_state,
+            source_requirements_approval_preflight_next_action=preflight_next_action,
+            source_requirements_validation_report_path=report_path,
+            source_requirements_validation_report_status=report_status,
+            source_requirements_validation_report_next_action=report_next_action,
+            candidate_count=candidate_count,
+            candidate_validation_results_summary=candidate_summary,
+        )
+
+    latest_record = decision_records[-1]
+    latest_decision_id = latest_record.decision_id
+    latest_decision = latest_record.decision
+    latest_decision_path = latest_record.path
+
+    if latest_decision == "REQUEST_REQUIREMENTS_APPROVAL_REVISION":
+        return _blocked(
+            "BLOCKED_LATEST_REQUIREMENTS_APPROVAL_DECISION_REQUESTS_REVISION",
+            "REVISE_REQUIREMENTS_BEFORE_APPROVAL",
+            latest_requirements_approval_owner_decision_id=latest_decision_id,
+            latest_requirements_approval_owner_decision=latest_decision,
+            source_requirements_approval_preflight_state=preflight_state,
+            source_requirements_approval_preflight_next_action=preflight_next_action,
+            source_requirements_validation_report_path=report_path,
+            source_requirements_validation_report_status=report_status,
+            source_requirements_validation_report_next_action=report_next_action,
+            candidate_count=candidate_count,
+            candidate_validation_results_summary=candidate_summary,
+        )
+
+    if latest_decision == "BLOCK_REQUIREMENTS_APPROVAL":
+        return _blocked(
+            "BLOCKED_LATEST_REQUIREMENTS_APPROVAL_DECISION_BLOCKS_APPROVAL",
+            "STOP_REQUIREMENTS_APPROVAL",
+            latest_requirements_approval_owner_decision_id=latest_decision_id,
+            latest_requirements_approval_owner_decision=latest_decision,
+            source_requirements_approval_preflight_state=preflight_state,
+            source_requirements_approval_preflight_next_action=preflight_next_action,
+            source_requirements_validation_report_path=report_path,
+            source_requirements_validation_report_status=report_status,
+            source_requirements_validation_report_next_action=report_next_action,
+            candidate_count=candidate_count,
+            candidate_validation_results_summary=candidate_summary,
+        )
+
+    if latest_decision != "AUTHORIZE_REQUIREMENTS_APPROVAL":
+        return _blocked(
+            "BLOCKED_LATEST_REQUIREMENTS_APPROVAL_DECISION_NOT_AUTHORIZE",
+            "AUTHORIZE_REQUIREMENTS_APPROVAL_WITH_OWNER_DECISION",
+            latest_requirements_approval_owner_decision_id=latest_decision_id,
+            latest_requirements_approval_owner_decision=latest_decision,
+            source_requirements_approval_preflight_state=preflight_state,
+            source_requirements_approval_preflight_next_action=preflight_next_action,
+            source_requirements_validation_report_path=report_path,
+            source_requirements_validation_report_status=report_status,
+            source_requirements_validation_report_next_action=report_next_action,
+            candidate_count=candidate_count,
+            candidate_validation_results_summary=candidate_summary,
+            blocking_reasons=[f"unsupported latest decision value: {latest_decision!r}"],
+        )
+
+    latest_artifact = json.loads(latest_decision_path.read_text(encoding="utf-8"))
+    coherence_error = _validate_requirements_approval_owner_decision_coherence(
+        latest_artifact,
+        preflight=preflight,
+    )
+    if coherence_error is not None:
+        return _blocked(
+            "BLOCKED_REQUIREMENTS_APPROVAL_OWNER_DECISION_STALE_OR_INCOHERENT",
+            "FIX_REQUIREMENTS_APPROVAL_OWNER_DECISION_ARTIFACTS",
+            latest_requirements_approval_owner_decision_id=latest_decision_id,
+            latest_requirements_approval_owner_decision=latest_decision,
+            source_requirements_approval_preflight_state=preflight_state,
+            source_requirements_approval_preflight_next_action=preflight_next_action,
+            source_requirements_validation_report_path=report_path,
+            source_requirements_validation_report_status=report_status,
+            source_requirements_validation_report_next_action=report_next_action,
+            candidate_count=candidate_count,
+            candidate_validation_results_summary=candidate_summary,
+            blocking_reasons=[coherence_error],
+        )
+
+    return _build_requirements_approval_execution_check_report(
+        plan_id=plan_id,
+        intake_id=intake_id,
+        execution_check_state=REQUIREMENTS_APPROVAL_EXECUTION_CHECK_CONFIRMED_STATE,
+        next_required_action=REQUIREMENTS_APPROVAL_EXECUTION_CHECK_CONFIRMED_NEXT_ACTION,
+        latest_requirements_approval_owner_decision_id=latest_decision_id,
+        latest_requirements_approval_owner_decision=latest_decision,
+        source_requirements_approval_preflight_state=preflight_state,
+        source_requirements_approval_preflight_next_action=preflight_next_action,
+        source_requirements_validation_report_path=report_path,
+        source_requirements_validation_report_status=report_status,
+        source_requirements_validation_report_next_action=report_next_action,
+        candidate_count=candidate_count,
+        candidate_validation_results_summary=candidate_summary,
+        blocking_reasons=[],
+        checked_at=checked_at,
+        non_authority=non_authority,
+    )
 
 
 def create_goal_intake(project: Path, intake_id: str, raw_goal: str) -> Path:

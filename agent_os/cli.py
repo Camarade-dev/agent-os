@@ -13,6 +13,7 @@ from agent_os.orchestrator import (
     REQUIREMENTS_VALIDATION_EXECUTION_CHECK_CONFIRMED_STATE,
     REQUIREMENTS_DRAFT_VALIDATION_REPORT_CREATED_STATE,
     REQUIREMENTS_APPROVAL_PREFLIGHT_CONFIRMED_STATE,
+    REQUIREMENTS_APPROVAL_EXECUTION_CHECK_CONFIRMED_STATE,
     REQUIREMENTS_VALIDATION_OWNER_DECISION_VALUES,
     REQUIREMENTS_APPROVAL_OWNER_DECISION_VALUES,
     create_goal_intake,
@@ -25,6 +26,7 @@ from agent_os.orchestrator import (
     requirements_validation_execution_check,
     validate_requirements_draft,
     requirements_approval_preflight,
+    requirements_approval_execution_check,
     draft_context_pack_from_transport,
     extract_requirements_draft,
     goal_intake_status,
@@ -653,6 +655,27 @@ def cmd_orchestrator_decide_requirements_approval(args: argparse.Namespace) -> i
         return 1
     print(report.output)
     return 0
+
+
+def cmd_orchestrator_requirements_approval_execution_check(
+    args: argparse.Namespace,
+) -> int:
+    project = _project_path(args.path)
+    try:
+        report = requirements_approval_execution_check(
+            project,
+            args.intake_id,
+            args.plan_id,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(report.output)
+    confirmed = (
+        report.execution_check_state
+        == REQUIREMENTS_APPROVAL_EXECUTION_CHECK_CONFIRMED_STATE
+    )
+    return 0 if confirmed else 1
 
 
 def cmd_orchestrator_clarify(args: argparse.Namespace) -> int:
@@ -1674,6 +1697,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     orchestrator_decide_requirements_approval_parser.set_defaults(
         func=cmd_orchestrator_decide_requirements_approval
+    )
+
+    orchestrator_requirements_approval_execution_check_parser = (
+        orchestrator_sub.add_parser(
+            "requirements-approval-execution-check",
+            help="read-only requirements approval execution check (not approval)",
+            description=(
+                "Read-only pre-execution check before any future requirements "
+                "approval command may run. Requires successful requirements "
+                "approval preflight, a latest plan-scoped "
+                "AUTHORIZE_REQUIREMENTS_APPROVAL owner decision, and coherent "
+                "validation report metadata. Does not call an LLM, approve "
+                "requirements, promote draft requirements, assign REQ-* ids, "
+                "rewrite local-agentic-spec.md, modify validation reports, "
+                "generate architecture decisions, generate an implementation plan, "
+                "generate PLANNING_RUN_SLICE, create runner proposals, create "
+                "runs, invoke an executor, or write any artifact."
+            ),
+        )
+    )
+    orchestrator_requirements_approval_execution_check_parser.add_argument(
+        "intake_id",
+        help="intake identifier (filesystem-safe slug)",
+    )
+    orchestrator_requirements_approval_execution_check_parser.add_argument(
+        "path",
+        nargs="?",
+        help="target project directory",
+    )
+    orchestrator_requirements_approval_execution_check_parser.add_argument(
+        "--plan-id",
+        required=True,
+        help="planning workspace identifier (filesystem-safe slug)",
+    )
+    orchestrator_requirements_approval_execution_check_parser.set_defaults(
+        func=cmd_orchestrator_requirements_approval_execution_check
     )
 
     return parser
