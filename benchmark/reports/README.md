@@ -13,7 +13,10 @@ way unless an owner explicitly decides to keep a specific snapshot.
 
 **Curated, committed reports** — e.g. `demo-pack.json` and `demo-pack.md`,
 a hand-selected demo scenario pack built from the Tier 1 enriched seed
-cases. These are checked into git deliberately because they are authored,
-reviewed artifacts, not run output. Like everything else in `benchmark/reports/`,
-they are explicitly not benchmark results (see each file's own claim
-boundary).
+cases; and `demo-script.json` and `demo-script.md`, a narrated walkthrough
+script that turns the demo pack and its generated `demo_trace.html` into a
+presentable sequence for a mentor, reviewer, recruiter, or investor
+conversation. These are checked into git deliberately because they are
+authored, reviewed artifacts, not run output. Like everything else in
+`benchmark/reports/`, they are explicitly not benchmark results (see each
+file's own claim boundary).
