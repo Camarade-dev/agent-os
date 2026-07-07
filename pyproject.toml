@@ -15,7 +15,7 @@ agent-os = "agent_os.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["agent_os*"]
+include = ["agent_os*", "admissible*"]
 
 [tool.setuptools.package-data]
 agent_os = ["templates/*.md"]

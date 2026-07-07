@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://admissible.dev/schemas/gold_annotation.schema.json",
+  "title": "Admissible Gold Annotation",
+  "description": "Benchmark ground truth for one case. Gold annotations are stored separately from the action envelope and must never be embedded in envelope input fields (see action_envelope.schema.json).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "annotation_id",
+    "schema_version",
+    "benchmark_case_id",
+    "envelope_id",
+    "gold_decision",
+    "gold_risk_level",
+    "gold_failure_modes_if_incorrectly_allowed",
+    "gold_required_missing_evidence",
+    "gold_required_approval",
+    "gold_safer_next_step",
+    "rubric",
+    "annotator_metadata",
+    "quality_flags"
+  ],
+  "properties": {
+    "annotation_id": { "type": "string", "minLength": 1 },
+    "schema_version": { "type": "string", "minLength": 1 },
+    "benchmark_case_id": { "type": "string", "minLength": 1 },
+    "envelope_id": {
+      "description": "The action_envelope.envelope_id this gold annotation targets.",
+      "type": "string",
+      "minLength": 1
+    },
+    "gold_decision": {
+      "type": "string",
+      "enum": ["ALLOW", "ALLOW_WITH_LIMITS", "REQUEST_MORE_EVIDENCE", "REQUIRE_HUMAN_APPROVAL", "REFUSE"]
+    },
+    "gold_risk_level": { "type": "string", "enum": ["low", "medium", "high", "critical", "unknown"] },
+    "gold_failure_modes_if_incorrectly_allowed": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "false_allow",
+          "missing_escalation",
+          "missing_evidence",
+          "false_refuse",
+          "overblock",
+          "wrong_safer_next_step",
+          "poor_auditability",
+          "authority_laundering",
+          "evidence_laundering",
+          "approval_mismatch",
+          "scope_creep",
+          "reversibility_hallucination",
+          "composite_harm",
+          "policy_conflict",
+          "stale_context",
+          "ambiguous_principal",
+          "other"
+        ]
+      }
+    },
+    "gold_required_missing_evidence": { "type": "array", "items": { "type": "string" } },
+    "gold_required_approval": {
+      "type": "string",
+      "enum": ["none", "human", "manager", "owner", "admin", "legal", "finance", "domain_expert", "unknown"]
+    },
+    "gold_safer_next_step": { "type": ["string", "null"] },
+    "rubric": {
+      "description": "Per-label rationale explaining why each of the five decision labels is correct or incorrect for this case.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allow", "allow_with_limits", "request_more_evidence", "require_human_approval", "refuse"],
+      "properties": {
+        "allow": { "type": "string" },
+        "allow_with_limits": { "type": "string" },
+        "request_more_evidence": { "type": "string" },
+        "require_human_approval": { "type": "string" },
+        "refuse": { "type": "string" }
+      }
+    },
+    "annotator_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["annotator_id", "annotation_mode", "confidence", "adjudication_status", "notes"],
+      "properties": {
+        "annotator_id": { "type": ["string", "null"] },
+        "annotation_mode": {
+          "type": "string",
+          "enum": ["single_author", "independent_annotator", "adjudicated", "synthetic_draft", "unknown"]
+        },
+        "confidence": { "type": "string", "enum": ["low", "medium", "high", "unknown"] },
+        "adjudication_status": {
+          "type": "string",
+          "enum": ["not_required", "pending", "adjudicated", "disputed", "unknown"]
+        },
+        "notes": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "quality_flags": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ambiguous", "policy_insufficient", "leakage_risk", "near_miss_case", "excluded_from_headline_metrics"],
+      "properties": {
+        "ambiguous": { "type": "boolean" },
+        "policy_insufficient": { "type": "boolean" },
+        "leakage_risk": { "type": "boolean" },
+        "near_miss_case": { "type": "boolean" },
+        "excluded_from_headline_metrics": { "type": "boolean" }
+      }
+    }
+  }
+}

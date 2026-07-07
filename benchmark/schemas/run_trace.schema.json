@@ -1,0 +1,219 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://admissible.dev/schemas/run_trace.schema.json",
+  "title": "Admissible Run Trace",
+  "description": "Durable record of one complete Admissible comparison run: case envelopes, per-system decisions, per-case scores, aggregate comparison results, and a smoke-test final verdict. This is a benchmark/demo artifact, not Agent OS closure or a product workflow object.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "trace_id",
+    "schema_version",
+    "created_at",
+    "claim_boundary",
+    "case_set",
+    "systems",
+    "case_traces",
+    "aggregate_results",
+    "final_verdict",
+    "metadata"
+  ],
+  "properties": {
+    "trace_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Unique identifier for this run trace."
+    },
+    "schema_version": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Version of the run_trace schema."
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC timestamp when the trace was generated."
+    },
+    "claim_boundary": {
+      "type": "string",
+      "const": "Tier 1 enriched seed smoke test only; not a benchmark result.",
+      "description": "Mandatory scope disclaimer. Every run trace must carry exactly this string."
+    },
+    "case_set": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cases_path",
+        "gold_path",
+        "case_count",
+        "benchmark_tier",
+        "envelope_tier"
+      ],
+      "properties": {
+        "cases_path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Filesystem path to the benchmark case envelope directory."
+        },
+        "gold_path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Filesystem path to the gold annotations JSONL file."
+        },
+        "case_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of action envelopes in this run."
+        },
+        "benchmark_tier": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Benchmark dataset tier, e.g. tier_1_enriched. Distinct from envelope_tier."
+        },
+        "envelope_tier": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Enrichment level of the action envelopes, e.g. fully_enriched. Distinct from benchmark_tier."
+        }
+      }
+    },
+    "systems": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/systemDescriptor" },
+      "description": "Descriptors for each system evaluated in this run."
+    },
+    "case_traces": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/caseTrace" },
+      "description": "Per-case trace records in deterministic order."
+    },
+    "aggregate_results": {
+      "type": "object",
+      "description": "Comparison output from compare_runner.compare_systems, or a schema-compatible subset.",
+      "required": ["systems", "case_count", "claim_boundary", "results"],
+      "properties": {
+        "systems": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "case_count": { "type": "integer", "minimum": 0 },
+        "claim_boundary": { "type": "string" },
+        "results": { "type": "object" },
+        "generated_at": { "type": "string" },
+        "notes": { "type": "string" }
+      }
+    },
+    "final_verdict": {
+      "$ref": "#/$defs/finalVerdict"
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["generated_by", "notes"],
+      "properties": {
+        "generated_by": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Component that produced this trace, e.g. admissible.trace.build_run_trace."
+        },
+        "notes": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Free-form notes about trace generation."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "systemType": {
+      "type": "string",
+      "enum": [
+        "rules_only",
+        "frontier_direct_mock",
+        "frontier_direct_live",
+        "admissible_model_assisted",
+        "unknown"
+      ]
+    },
+    "systemDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["system_id", "system_type", "description", "claim_boundary"],
+      "properties": {
+        "system_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable identifier for this system instance, as recorded on decision outputs."
+        },
+        "system_type": { "$ref": "#/$defs/systemType" },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Human-readable description of the system."
+        },
+        "claim_boundary": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Scope disclaimer for this system's results."
+        }
+      }
+    },
+    "caseTrace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "benchmark_case_id",
+        "envelope_id",
+        "envelope",
+        "gold_annotation",
+        "decisions",
+        "scores",
+        "notes"
+      ],
+      "properties": {
+        "benchmark_case_id": { "type": "string", "minLength": 1 },
+        "envelope_id": { "type": "string", "minLength": 1 },
+        "envelope": {
+          "type": "object",
+          "description": "The action envelope input for this case."
+        },
+        "gold_annotation": {
+          "description": "Gold annotation for scoring/audit. Never included in model prompts.",
+          "type": ["object", "null"]
+        },
+        "decisions": {
+          "type": "object",
+          "description": "Maps system_id to decision_output for this case.",
+          "additionalProperties": { "type": "object" }
+        },
+        "scores": {
+          "type": "object",
+          "description": "Maps system_id to per-case score output from score_case.",
+          "additionalProperties": { "type": "object" }
+        },
+        "notes": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "finalVerdictStatus": {
+      "type": "string",
+      "enum": ["SMOKE_PASS", "SMOKE_FAIL", "INCONCLUSIVE"]
+    },
+    "finalVerdict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "summary", "limitations", "recommended_next_step"],
+      "properties": {
+        "status": { "$ref": "#/$defs/finalVerdictStatus" },
+        "summary": { "type": "string" },
+        "limitations": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "recommended_next_step": { "type": "string" }
+      }
+    }
+  }
+}

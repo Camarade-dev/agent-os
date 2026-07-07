@@ -6,6 +6,16 @@
 
 Agent OS is a **local filesystem protocol and CLI** for governed delegation to fallible coding and research agents. It is not a dashboard, SaaS, runtime, orchestrator, benchmark, or agent panel.
 
+## Admissible V0 research direction
+
+This repository also hosts **Admissible**, a benchmark/spec/prototype direction for model-agnostic execution-boundary action admission in organizational AI agents — separate from the Agent OS v0 CLI surface above.
+
+- [`docs/Admissible_THESIS.md`](docs/Admissible_THESIS.md) — the thesis: the model decides what could be done, Admissible decides what may be done
+- [`docs/Admissible_ACTION_ENVELOPE.md`](docs/Admissible_ACTION_ENVELOPE.md) — the structured action envelope Admissible evaluates at the execution boundary
+- [`docs/Admissible_BENCHMARK_SPEC.md`](docs/Admissible_BENCHMARK_SPEC.md) — the benchmark design: cases, gold annotations, baselines, and scoring
+
+Admissible V0 work is currently benchmark-first: action envelopes, admission decisions, gold annotations, run traces, scoring, and fair baselines — not a product UI or SaaS platform. See [`docs/admissible-agent-os-lineage.md`](docs/admissible-agent-os-lineage.md) for how Admissible relates to (and differs from) the Agent OS vocabulary below.
+
 ## What problem it solves
 
 Coding and research agents are useful but fallible. Ad-hoc prompts and chat threads do not reliably preserve mission, authority, evidence, audit, owner decision, or closure. Agent OS structures those concerns as inspectable markdown artifacts so delegation stays bounded and reviewable. It does **not** make agents reliable by itself, execute agents, or replace owner judgment.

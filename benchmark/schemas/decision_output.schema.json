@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://admissible.dev/schemas/decision_output.schema.json",
+  "title": "Admissible Decision Output",
+  "description": "The decision object a system (a frontier-model baseline or an Admissible evaluator) returns after evaluating one action envelope. This is always a system output. It is never an input and never a gold label — see gold_annotation.schema.json for ground truth.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "decision_id",
+    "schema_version",
+    "envelope_id",
+    "system_id",
+    "created_at",
+    "decision",
+    "risk_level",
+    "reasons",
+    "missing_evidence",
+    "required_approval",
+    "safer_next_step",
+    "audit_trace",
+    "confidence",
+    "metadata"
+  ],
+  "properties": {
+    "decision_id": { "type": "string", "minLength": 1 },
+    "schema_version": { "type": "string", "minLength": 1 },
+    "envelope_id": {
+      "description": "The action_envelope.envelope_id this decision was produced for.",
+      "type": "string",
+      "minLength": 1
+    },
+    "system_id": {
+      "description": "Identifies which system produced this decision, e.g. frontier_direct, frontier_structured_prompt, rules_only_evaluator, policy_engine_evaluator, admissible_reference_v0.",
+      "type": "string",
+      "minLength": 1
+    },
+    "created_at": { "type": "string", "format": "date-time" },
+    "decision": { "$ref": "#/$defs/decisionLabel" },
+    "risk_level": { "type": "string", "enum": ["low", "medium", "high", "critical", "unknown"] },
+    "reasons": { "type": "array", "items": { "$ref": "#/$defs/reason" } },
+    "missing_evidence": { "type": "array", "items": { "type": "string" } },
+    "required_approval": {
+      "type": "string",
+      "enum": ["none", "human", "manager", "owner", "admin", "legal", "finance", "domain_expert", "unknown"]
+    },
+    "safer_next_step": { "$ref": "#/$defs/saferNextStep" },
+    "audit_trace": { "$ref": "#/$defs/auditTrace" },
+    "confidence": {
+      "description": "System-reported confidence in this decision, 0.0-1.0, or null if the system does not report one.",
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 1
+    },
+    "metadata": {
+      "description": "System-specific extension data (e.g. prompt version, model name). Not standardized in V0.",
+      "type": "object"
+    }
+  },
+  "$defs": {
+    "decisionLabel": {
+      "type": "string",
+      "enum": ["ALLOW", "ALLOW_WITH_LIMITS", "REQUEST_MORE_EVIDENCE", "REQUIRE_HUMAN_APPROVAL", "REFUSE"]
+    },
+    "reason": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dimension", "summary", "severity"],
+      "properties": {
+        "dimension": {
+          "type": "string",
+          "enum": [
+            "authority",
+            "evidence",
+            "reversibility",
+            "blast_radius",
+            "provenance",
+            "auditability",
+            "human_responsibility",
+            "policy",
+            "other"
+          ]
+        },
+        "summary": { "type": "string", "minLength": 1 },
+        "severity": { "type": "string", "enum": ["info", "low", "medium", "high", "critical", "unknown"] }
+      }
+    },
+    "saferNextStep": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["action_type", "description", "limits", "requires_human"],
+      "properties": {
+        "action_type": { "type": ["string", "null"] },
+        "description": { "type": "string" },
+        "limits": { "type": "array", "items": { "type": "string" } },
+        "requires_human": { "type": "boolean" }
+      }
+    },
+    "auditTrace": {
+      "description": "Structured summaries a reviewer can use to reconstruct why the decision was made, one per admissibility dimension.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["authority", "evidence", "reversibility", "blast_radius", "provenance", "policy", "human_responsibility"],
+      "properties": {
+        "authority": { "type": "string" },
+        "evidence": { "type": "string" },
+        "reversibility": { "type": "string" },
+        "blast_radius": { "type": "string" },
+        "provenance": { "type": "string" },
+        "policy": { "type": "string" },
+        "human_responsibility": { "type": "string" }
+      }
+    }
+  }
+}

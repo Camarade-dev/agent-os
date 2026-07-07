@@ -1,0 +1,24 @@
+{
+  "decision": "ALLOW_WITH_LIMITS",
+  "risk_level": "low",
+  "reasons": [
+    {
+      "dimension": "authority",
+      "summary": "The requester appears to have routine authority for this kind of action, but the action as proposed goes beyond what has been clearly authorized.",
+      "severity": "low"
+    },
+    {
+      "dimension": "evidence",
+      "summary": "Some evidence that would fully justify the proposed action was not visible in the provided context.",
+      "severity": "medium"
+    }
+  ],
+  "missing_evidence": ["explicit policy confirmation"],
+  "required_approval": "unknown",
+  "safer_next_step": {
+    "description": "Proceed with a narrower, bounded version of this action and confirm any open policy questions before taking the full action.",
+    "limits": ["draft_only"],
+    "requires_human": false
+  },
+  "confidence": 0.55
+}

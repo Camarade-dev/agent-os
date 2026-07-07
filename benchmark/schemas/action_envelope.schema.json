@@ -1,0 +1,371 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://admissible.dev/schemas/action_envelope.schema.json",
+  "title": "Admissible Action Envelope",
+  "description": "One action envelope represents one proposed side-effecting action at the execution boundary. It is the input Admissible evaluates. It must never contain a gold decision, rubric, or scoring result — those belong only in gold_annotation.schema.json.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "envelope_id",
+    "schema_version",
+    "envelope_tier",
+    "construction_mode",
+    "created_at",
+    "actor",
+    "principal",
+    "user_request",
+    "proposed_action",
+    "workflow_context",
+    "evidence",
+    "policy_context",
+    "authority_context",
+    "risk_context",
+    "provenance",
+    "expected_side_effect",
+    "metadata"
+  ],
+  "properties": {
+    "envelope_id": { "type": "string", "minLength": 1 },
+    "schema_version": { "type": "string", "minLength": 1 },
+    "envelope_tier": {
+      "description": "Benchmark reporting requirement: which enrichment tier this envelope belongs to. See BENCHMARK_SPEC.md raw/partially implicit/enriched tiers.",
+      "type": "string",
+      "enum": ["raw", "partially_enriched", "fully_enriched"]
+    },
+    "construction_mode": {
+      "type": "string",
+      "enum": ["hand_authored_benchmark", "model_generated", "system_assembled", "hybrid"]
+    },
+    "created_at": { "type": "string", "format": "date-time" },
+    "actor": { "$ref": "#/$defs/actor" },
+    "principal": { "$ref": "#/$defs/principal" },
+    "user_request": { "$ref": "#/$defs/userRequest" },
+    "proposed_action": { "$ref": "#/$defs/proposedAction" },
+    "workflow_context": { "$ref": "#/$defs/workflowContext" },
+    "evidence": { "$ref": "#/$defs/evidence" },
+    "policy_context": { "$ref": "#/$defs/policyContext" },
+    "authority_context": { "$ref": "#/$defs/authorityContext" },
+    "risk_context": { "$ref": "#/$defs/riskContext" },
+    "provenance": { "$ref": "#/$defs/provenance" },
+    "expected_side_effect": { "$ref": "#/$defs/expectedSideEffect" },
+    "metadata": { "$ref": "#/$defs/metadata" },
+    "candidate_safer_next_steps": {
+      "description": "LEAKAGE-SENSITIVE. Candidate safer next steps may reveal part of the expected admission reasoning. Benchmark cases must state whether this field was included in the input envelope or withheld to the gold annotation layer only (see benchmark/README.md).",
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "$defs": {
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "role", "technical_authority_level", "organization_unit"],
+      "properties": {
+        "type": { "type": "string", "enum": ["human", "agent", "system", "unknown"] },
+        "id": { "type": ["string", "null"] },
+        "role": { "type": ["string", "null"] },
+        "technical_authority_level": {
+          "description": "Distinguishes technical/tool authority from business authority; see authority_context.business_authority for organizational authority.",
+          "type": ["string", "null"]
+        },
+        "organization_unit": { "type": ["string", "null"] }
+      }
+    },
+    "principal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "role", "authority_basis"],
+      "properties": {
+        "type": { "type": "string", "enum": ["human", "team", "organization", "unknown"] },
+        "id": { "type": ["string", "null"] },
+        "role": { "type": ["string", "null"] },
+        "authority_basis": { "type": ["string", "null"] }
+      }
+    },
+    "userRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["raw", "interpreted_intent"],
+      "properties": {
+        "raw": { "type": "string", "minLength": 1 },
+        "interpreted_intent": { "type": "string" }
+      }
+    },
+    "proposedAction": {
+      "description": "One action envelope represents one proposed side-effecting action. Multi-step plans must be split into one envelope per side-effecting step; this schema does not model sequences.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action_type", "tool", "target", "arguments", "side_effect_type"],
+      "properties": {
+        "action_type": { "type": "string", "minLength": 1 },
+        "tool": { "type": "string" },
+        "target": { "type": "string" },
+        "arguments": { "type": "object" },
+        "side_effect_type": {
+          "type": "string",
+          "enum": [
+            "internal_state_change",
+            "external_communication",
+            "financial_commitment",
+            "data_access",
+            "data_mutation",
+            "code_change",
+            "deployment",
+            "scheduling",
+            "physical_world_recommendation",
+            "other",
+            "unknown"
+          ]
+        }
+      }
+    },
+    "workflowContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["domain", "environment", "organization_context", "stakeholders", "workflow_stage"],
+      "properties": {
+        "domain": { "type": ["string", "null"] },
+        "environment": {
+          "type": "string",
+          "enum": ["dev", "staging", "production", "internal", "external", "physical", "unknown"]
+        },
+        "organization_context": { "type": ["string", "null"] },
+        "stakeholders": { "type": "array", "items": { "type": "string" } },
+        "workflow_stage": {
+          "type": "string",
+          "enum": ["draft", "review", "execution", "post_execution", "unknown"]
+        }
+      }
+    },
+    "evidenceItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "summary", "source", "freshness", "confidence"],
+      "properties": {
+        "type": { "type": ["string", "null"] },
+        "summary": { "type": "string", "minLength": 1 },
+        "source": { "type": ["string", "null"] },
+        "freshness": { "type": "string", "enum": ["current", "recent", "stale", "unknown"] },
+        "confidence": { "type": "string", "enum": ["low", "medium", "high", "unknown"] }
+      }
+    },
+    "evidenceNote": {
+      "description": "A missing-evidence, assumption, or conflict entry. Plain strings are accepted for brevity; structured objects allow an optional source pointer.",
+      "anyOf": [
+        { "type": "string" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["summary"],
+          "properties": {
+            "summary": { "type": "string", "minLength": 1 },
+            "source": { "type": ["string", "null"] }
+          }
+        }
+      ]
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["available", "missing", "assumptions", "conflicts"],
+      "properties": {
+        "available": { "type": "array", "items": { "$ref": "#/$defs/evidenceItem" } },
+        "missing": { "type": "array", "items": { "$ref": "#/$defs/evidenceNote" } },
+        "assumptions": { "type": "array", "items": { "$ref": "#/$defs/evidenceNote" } },
+        "conflicts": { "type": "array", "items": { "$ref": "#/$defs/evidenceNote" } }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy_id", "version", "summary", "source", "effective_from", "effective_until", "authority"],
+      "properties": {
+        "policy_id": { "type": "string", "minLength": 1 },
+        "version": { "type": ["string", "null"] },
+        "summary": { "type": "string", "minLength": 1 },
+        "source": { "type": ["string", "null"] },
+        "effective_from": { "type": ["string", "null"] },
+        "effective_until": { "type": ["string", "null"] },
+        "authority": { "type": ["string", "null"] }
+      }
+    },
+    "policyContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["applicable_policies", "policy_gaps", "policy_conflicts"],
+      "properties": {
+        "applicable_policies": { "type": "array", "items": { "$ref": "#/$defs/policy" } },
+        "policy_gaps": { "type": "array", "items": { "type": "string" } },
+        "policy_conflicts": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "approvalScope": {
+      "type": "string",
+      "enum": ["none", "draft_only", "execute_once", "execute_with_limits", "broad", "unknown"]
+    },
+    "requiredApproval": {
+      "type": "string",
+      "enum": ["none", "human", "manager", "owner", "admin", "legal", "finance", "domain_expert", "unknown"]
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approval_id",
+        "approved_by",
+        "approver_role",
+        "approval_scope",
+        "approved_action_type",
+        "approved_target",
+        "issued_at",
+        "expires_at",
+        "source",
+        "status"
+      ],
+      "properties": {
+        "approval_id": { "type": ["string", "null"] },
+        "approved_by": { "type": ["string", "null"] },
+        "approver_role": { "type": ["string", "null"] },
+        "approval_scope": { "$ref": "#/$defs/approvalScope" },
+        "approved_action_type": { "type": ["string", "null"] },
+        "approved_target": { "type": ["string", "null"] },
+        "issued_at": { "type": ["string", "null"] },
+        "expires_at": { "type": ["string", "null"] },
+        "source": { "type": ["string", "null"] },
+        "status": { "type": "string", "enum": ["active", "expired", "revoked", "unknown"] }
+      }
+    },
+    "toolAuthority": {
+      "description": "Technical/tool capability to perform the action. Distinct from business_authority.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["has_tool_access", "summary"],
+      "properties": {
+        "has_tool_access": { "type": "string", "enum": ["yes", "no", "unknown"] },
+        "summary": { "type": ["string", "null"] }
+      }
+    },
+    "businessAuthority": {
+      "description": "Organizational authority to make the underlying business decision. Distinct from tool_authority.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["has_business_authority", "summary"],
+      "properties": {
+        "has_business_authority": { "type": "string", "enum": ["yes", "no", "unknown"] },
+        "summary": { "type": ["string", "null"] }
+      }
+    },
+    "authorityContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requested_by",
+        "approved_by",
+        "approval_scope",
+        "required_approval",
+        "authority_notes",
+        "approvals",
+        "tool_authority",
+        "business_authority"
+      ],
+      "properties": {
+        "requested_by": { "type": ["string", "null"] },
+        "approved_by": { "type": ["string", "null"] },
+        "approval_scope": { "$ref": "#/$defs/approvalScope" },
+        "required_approval": { "$ref": "#/$defs/requiredApproval" },
+        "authority_notes": { "type": "array", "items": { "type": "string" } },
+        "approvals": { "type": "array", "items": { "$ref": "#/$defs/approval" } },
+        "tool_authority": { "$ref": "#/$defs/toolAuthority" },
+        "business_authority": { "$ref": "#/$defs/businessAuthority" }
+      }
+    },
+    "financialImpact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["amount", "currency", "impact_known"],
+      "properties": {
+        "amount": { "type": ["number", "null"] },
+        "currency": { "type": ["string", "null"] },
+        "impact_known": { "type": "string", "enum": ["yes", "no", "unknown"] }
+      }
+    },
+    "riskContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reversibility",
+        "rollback_available",
+        "blast_radius",
+        "external_visibility",
+        "financial_impact",
+        "data_sensitivity",
+        "safety_impact",
+        "reputation_impact"
+      ],
+      "properties": {
+        "reversibility": { "type": "string", "enum": ["reversible", "partially_reversible", "irreversible", "unknown"] },
+        "rollback_available": { "type": "string", "enum": ["yes", "no", "unknown"] },
+        "blast_radius": { "type": "string", "enum": ["low", "medium", "high", "critical", "unknown"] },
+        "external_visibility": { "type": "string", "enum": ["none", "internal_only", "external", "public", "unknown"] },
+        "financial_impact": { "$ref": "#/$defs/financialImpact" },
+        "data_sensitivity": { "type": "string", "enum": ["none", "internal", "confidential", "regulated", "unknown"] },
+        "safety_impact": { "type": "string", "enum": ["none", "low", "medium", "high", "unknown"] },
+        "reputation_impact": { "type": "string", "enum": ["none", "low", "medium", "high", "unknown"] }
+      }
+    },
+    "sourceRef": {
+      "description": "A provenance source pointer. Plain strings are accepted for brevity; structured objects carry source type and freshness.",
+      "anyOf": [
+        { "type": "string" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["source_id", "source_type", "summary", "freshness"],
+          "properties": {
+            "source_id": { "type": ["string", "null"] },
+            "source_type": { "type": ["string", "null"] },
+            "summary": { "type": ["string", "null"] },
+            "freshness": { "type": "string", "enum": ["current", "recent", "stale", "unknown"] }
+          }
+        }
+      ]
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["instruction_source", "evidence_sources", "tool_sources", "memory_sources", "retrieval_sources"],
+      "properties": {
+        "instruction_source": { "type": ["string", "null"] },
+        "evidence_sources": { "type": "array", "items": { "$ref": "#/$defs/sourceRef" } },
+        "tool_sources": { "type": "array", "items": { "$ref": "#/$defs/sourceRef" } },
+        "memory_sources": { "type": "array", "items": { "$ref": "#/$defs/sourceRef" } },
+        "retrieval_sources": { "type": "array", "items": { "$ref": "#/$defs/sourceRef" } }
+      }
+    },
+    "expectedSideEffect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["description", "affected_systems", "affected_people", "persistence"],
+      "properties": {
+        "description": { "type": "string", "minLength": 1 },
+        "affected_systems": { "type": "array", "items": { "type": "string" } },
+        "affected_people": { "type": "array", "items": { "type": "string" } },
+        "persistence": {
+          "type": "string",
+          "enum": ["temporary", "persistent", "permanent", "externally_binding", "legally_binding", "unknown"]
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scenario_domain", "benchmark_case_id", "near_miss_family_id", "notes"],
+      "properties": {
+        "scenario_domain": { "type": ["string", "null"] },
+        "benchmark_case_id": { "type": ["string", "null"] },
+        "near_miss_family_id": { "type": ["string", "null"] },
+        "notes": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}
