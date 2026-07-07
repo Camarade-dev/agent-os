@@ -654,6 +654,31 @@ REQUIREMENTS_DRAFT_VALIDATION_REPORT_NON_AUTHORITY_FLAGS = (
     "does_not_invoke_executor",
 )
 
+REQUIREMENTS_APPROVAL_PREFLIGHT_CONFIRMED_STATE = (
+    "REQUIREMENTS_APPROVAL_PREFLIGHT_CONFIRMED_NO_OWNER_DECISION_NO_PROMOTION"
+)
+REQUIREMENTS_APPROVAL_PREFLIGHT_CONFIRMED_NEXT_ACTION = (
+    "FUTURE_REQUIREMENTS_APPROVAL_OWNER_DECISION_REQUIRES_SEPARATE_COMMAND"
+)
+
+REQUIREMENTS_APPROVAL_PREFLIGHT_NON_AUTHORITY_FLAGS = (
+    "approval_preflight_is_not_owner_decision",
+    "approval_preflight_is_not_approval",
+    "approval_preflight_is_not_promotion",
+    "validation_report_is_not_approval",
+    "validation_pass_is_not_approval",
+    "does_not_approve_requirements",
+    "does_not_promote_draft_requirements",
+    "does_not_assign_approved_requirement_ids",
+    "does_not_generate_architecture",
+    "does_not_generate_implementation_plan",
+    "does_not_generate_planning_run_slice",
+    "does_not_create_runner_proposal",
+    "does_not_create_run",
+    "does_not_invoke_executor",
+    "does_not_write_artifacts",
+)
+
 REQUIREMENTS_DRAFT_NON_AUTHORITY_FLAGS = (
     "requirements_are_draft",
     "requirements_are_not_approved",
@@ -10957,6 +10982,631 @@ def validate_requirements_draft(
         requirement_candidate_count=len(candidate_results),
         candidate_results=candidate_results,
         created_at=created_at,
+        non_authority=non_authority,
+    )
+
+
+def _summarize_candidate_validation_results(
+    candidate_results: list[dict],
+) -> dict[str, int]:
+    summary = {
+        REQUIREMENTS_DRAFT_VALIDATION_RESULT_PASS: 0,
+        REQUIREMENTS_DRAFT_VALIDATION_RESULT_NEEDS_REVISION: 0,
+        REQUIREMENTS_DRAFT_VALIDATION_RESULT_BLOCKED: 0,
+    }
+    for entry in candidate_results:
+        result = entry.get("validation_result")
+        if result in summary:
+            summary[result] += 1
+    return summary
+
+
+def _validate_requirements_draft_validation_report_for_approval_preflight(
+    artifact: dict,
+    *,
+    plan_id: str,
+    intake_id: str,
+    validation_report_path: Path,
+    local_agentic_spec_path: Path,
+    draft_provenance_path: Path,
+    current_candidate_ids: tuple[str, ...],
+    current_execution_check_state: str,
+    current_execution_check_next_action: str,
+) -> tuple[str, list[str]]:
+    blocking_reasons: list[str] = []
+
+    if (
+        artifact.get("artifact_type")
+        != ORCHESTRATOR_REQUIREMENTS_DRAFT_VALIDATION_REPORT_ARTIFACT_TYPE
+    ):
+        blocking_reasons.append(
+            "validation report artifact_type is not "
+            f"{ORCHESTRATOR_REQUIREMENTS_DRAFT_VALIDATION_REPORT_ARTIFACT_TYPE!r}"
+        )
+        return "BLOCKED_REQUIREMENTS_VALIDATION_REPORT_MALFORMED", blocking_reasons
+
+    if artifact.get("status") != REQUIREMENTS_DRAFT_VALIDATION_REPORT_CREATED_STATE:
+        blocking_reasons.append(
+            "validation report status is not "
+            f"{REQUIREMENTS_DRAFT_VALIDATION_REPORT_CREATED_STATE!r}"
+        )
+        return "BLOCKED_REQUIREMENTS_VALIDATION_REPORT_MALFORMED", blocking_reasons
+
+    if (
+        artifact.get("next_required_action")
+        != REQUIREMENTS_DRAFT_VALIDATION_REPORT_CREATED_NEXT_ACTION
+    ):
+        blocking_reasons.append(
+            "validation report next_required_action is not "
+            f"{REQUIREMENTS_DRAFT_VALIDATION_REPORT_CREATED_NEXT_ACTION!r}"
+        )
+        return "BLOCKED_REQUIREMENTS_VALIDATION_REPORT_MALFORMED", blocking_reasons
+
+    if artifact.get("intake_id") != intake_id:
+        blocking_reasons.append(
+            f"validation report intake_id mismatch: "
+            f"expected {intake_id!r}, found {artifact.get('intake_id')!r}"
+        )
+        return "BLOCKED_REQUIREMENTS_VALIDATION_REPORT_SCOPE_MISMATCH", blocking_reasons
+
+    if artifact.get("plan_id") != plan_id:
+        blocking_reasons.append(
+            f"validation report plan_id mismatch: "
+            f"expected {plan_id!r}, found {artifact.get('plan_id')!r}"
+        )
+        return "BLOCKED_REQUIREMENTS_VALIDATION_REPORT_SCOPE_MISMATCH", blocking_reasons
+
+    non_authority = artifact.get("non_authority")
+    if not isinstance(non_authority, dict):
+        blocking_reasons.append("validation report non_authority must be an object")
+        return "BLOCKED_REQUIREMENTS_VALIDATION_REPORT_MALFORMED", blocking_reasons
+    for flag in REQUIREMENTS_DRAFT_VALIDATION_REPORT_NON_AUTHORITY_FLAGS:
+        if non_authority.get(flag) is not True:
+            blocking_reasons.append(
+                f"validation report non_authority flag must be true: {flag!r}"
+            )
+    if blocking_reasons:
+        return "BLOCKED_REQUIREMENTS_VALIDATION_REPORT_MALFORMED", blocking_reasons
+
+    artifact_report_path = artifact.get("validation_report_path")
+    if artifact_report_path != str(validation_report_path):
+        blocking_reasons.append(
+            "validation report validation_report_path does not match current path"
+        )
+
+    artifact_spec_path = artifact.get("local_agentic_spec_path")
+    if artifact_spec_path != str(local_agentic_spec_path):
+        blocking_reasons.append(
+            "validation report local_agentic_spec_path does not match current path"
+        )
+
+    artifact_provenance_path = artifact.get("requirements_draft_provenance_path")
+    if artifact_provenance_path != str(draft_provenance_path):
+        blocking_reasons.append(
+            "validation report requirements_draft_provenance_path "
+            "does not match current path"
+        )
+
+    artifact_execution_state = artifact.get(
+        "source_requirements_validation_execution_check_state"
+    )
+    if artifact_execution_state != current_execution_check_state:
+        blocking_reasons.append(
+            "validation report source_requirements_validation_execution_check_state "
+            f"does not match current execution check state: "
+            f"expected {current_execution_check_state!r}, found {artifact_execution_state!r}"
+        )
+
+    artifact_execution_next_action = artifact.get(
+        "source_requirements_validation_execution_check_next_action"
+    )
+    if artifact_execution_next_action != current_execution_check_next_action:
+        blocking_reasons.append(
+            "validation report source_requirements_validation_execution_check_next_action "
+            f"does not match current execution check next action: "
+            f"expected {current_execution_check_next_action!r}, "
+            f"found {artifact_execution_next_action!r}"
+        )
+
+    candidate_results = artifact.get("candidate_results")
+    if not isinstance(candidate_results, list):
+        blocking_reasons.append("validation report candidate_results must be a list")
+        return "BLOCKED_REQUIREMENTS_VALIDATION_REPORT_MALFORMED", blocking_reasons
+
+    report_candidate_count = artifact.get("requirement_candidate_count")
+    if report_candidate_count != len(candidate_results):
+        blocking_reasons.append(
+            "validation report requirement_candidate_count does not match "
+            "candidate_results length"
+        )
+
+    report_candidate_ids = tuple(
+        entry.get("draft_requirement_id")
+        for entry in candidate_results
+        if isinstance(entry, dict)
+    )
+    if report_candidate_ids != current_candidate_ids:
+        blocking_reasons.append(
+            "validation report candidate IDs do not match current draft candidates"
+        )
+    if len(report_candidate_ids) != len(current_candidate_ids):
+        blocking_reasons.append(
+            "validation report candidate count does not match current draft candidates"
+        )
+
+    if blocking_reasons:
+        return "BLOCKED_REQUIREMENTS_VALIDATION_REPORT_STALE_OR_INCOHERENT", blocking_reasons
+
+    has_non_pass = False
+    has_leakage = False
+    for entry in candidate_results:
+        if not isinstance(entry, dict):
+            blocking_reasons.append("validation report candidate_results entry must be object")
+            return "BLOCKED_REQUIREMENTS_VALIDATION_REPORT_MALFORMED", blocking_reasons
+
+        draft_id = entry.get("draft_requirement_id")
+        if not isinstance(draft_id, str) or not _DRAFT_REQUIREMENT_ID_STRICT_PATTERN.match(
+            draft_id
+        ):
+            blocking_reasons.append(
+                f"validation report candidate id is not DRAFT-REQ-*: {draft_id!r}"
+            )
+            has_leakage = True
+
+        if entry.get("approval_status") != "NOT_APPROVED":
+            blocking_reasons.append(
+                f"candidate {draft_id!r} approval_status is not NOT_APPROVED"
+            )
+            has_leakage = True
+
+        if entry.get("promotion_status") != "NOT_PROMOTED":
+            blocking_reasons.append(
+                f"candidate {draft_id!r} promotion_status is not NOT_PROMOTED"
+            )
+            has_leakage = True
+
+        approved_id = entry.get("approved_requirement_id")
+        if approved_id != "NOT_ASSIGNED":
+            blocking_reasons.append(
+                f"candidate {draft_id!r} approved_requirement_id is not NOT_ASSIGNED"
+            )
+            has_leakage = True
+
+        if entry.get("architecture_status") != "NOT_DECIDED":
+            blocking_reasons.append(
+                f"candidate {draft_id!r} architecture_status is not NOT_DECIDED"
+            )
+            has_leakage = True
+
+        if entry.get("implementation_status") != "NOT_PLANNED":
+            blocking_reasons.append(
+                f"candidate {draft_id!r} implementation_status is not NOT_PLANNED"
+            )
+            has_leakage = True
+
+        validation_result = entry.get("validation_result")
+        if validation_result == REQUIREMENTS_DRAFT_VALIDATION_RESULT_NEEDS_REVISION:
+            blocking_reasons.append(
+                f"candidate {draft_id!r} validation_result is NEEDS_REVISION"
+            )
+            has_non_pass = True
+        elif validation_result == REQUIREMENTS_DRAFT_VALIDATION_RESULT_BLOCKED:
+            blocking_reasons.append(
+                f"candidate {draft_id!r} validation_result is BLOCKED"
+            )
+            has_non_pass = True
+        elif validation_result != REQUIREMENTS_DRAFT_VALIDATION_RESULT_PASS:
+            blocking_reasons.append(
+                f"candidate {draft_id!r} has unsupported validation_result: "
+                f"{validation_result!r}"
+            )
+            has_non_pass = True
+
+    if has_leakage:
+        return (
+            "BLOCKED_REQUIREMENTS_VALIDATION_REPORT_HAS_APPROVAL_OR_PROMOTION_LEAKAGE",
+            blocking_reasons,
+        )
+    if has_non_pass:
+        return (
+            "BLOCKED_REQUIREMENTS_VALIDATION_REPORT_HAS_NON_PASS_CANDIDATES",
+            blocking_reasons,
+        )
+    if blocking_reasons:
+        return "BLOCKED_REQUIREMENTS_VALIDATION_REPORT_MALFORMED", blocking_reasons
+
+    return "", []
+
+
+def _format_requirements_approval_preflight(
+    *,
+    plan_id: str,
+    intake_id: str,
+    approval_preflight_state: str,
+    next_required_action: str,
+    source_requirements_validation_execution_check_state: str | None,
+    source_requirements_validation_execution_check_next_action: str | None,
+    source_requirements_validation_report_path: Path | None,
+    source_requirements_validation_report_status: str | None,
+    source_requirements_validation_report_next_action: str | None,
+    candidate_count: int | None,
+    candidate_validation_results_summary: dict[str, int] | None,
+    blocking_reasons: list[str],
+    checked_at: str,
+    non_authority: dict[str, bool],
+) -> str:
+    lines = [
+        "requirements approval preflight",
+        f"plan_id: {plan_id}",
+        f"intake_id: {intake_id}",
+        f"approval_preflight_state: {approval_preflight_state}",
+        f"next_required_action: {next_required_action}",
+    ]
+    if source_requirements_validation_execution_check_state is not None:
+        lines.append(
+            "source_requirements_validation_execution_check_state: "
+            f"{source_requirements_validation_execution_check_state}"
+        )
+    if source_requirements_validation_execution_check_next_action is not None:
+        lines.append(
+            "source_requirements_validation_execution_check_next_action: "
+            f"{source_requirements_validation_execution_check_next_action}"
+        )
+    if source_requirements_validation_report_path is not None:
+        lines.append(
+            "source_requirements_validation_report_path: "
+            f"{source_requirements_validation_report_path}"
+        )
+    if source_requirements_validation_report_status is not None:
+        lines.append(
+            "source_requirements_validation_report_status: "
+            f"{source_requirements_validation_report_status}"
+        )
+    if source_requirements_validation_report_next_action is not None:
+        lines.append(
+            "source_requirements_validation_report_next_action: "
+            f"{source_requirements_validation_report_next_action}"
+        )
+    if candidate_count is not None:
+        lines.append(f"candidate_count: {candidate_count}")
+    if candidate_validation_results_summary is not None:
+        lines.append("candidate_validation_results_summary:")
+        for key in (
+            REQUIREMENTS_DRAFT_VALIDATION_RESULT_PASS,
+            REQUIREMENTS_DRAFT_VALIDATION_RESULT_NEEDS_REVISION,
+            REQUIREMENTS_DRAFT_VALIDATION_RESULT_BLOCKED,
+        ):
+            lines.append(f"  {key}: {candidate_validation_results_summary.get(key, 0)}")
+    lines.append(f"checked_at: {checked_at}")
+    if blocking_reasons:
+        lines.append("blocking_reasons:")
+        for reason in blocking_reasons:
+            lines.append(f"  - {reason}")
+    lines.append("non_authority:")
+    for flag in REQUIREMENTS_APPROVAL_PREFLIGHT_NON_AUTHORITY_FLAGS:
+        lines.append(f"  {flag}: true")
+    lines.append(
+        "note: requirements approval preflight is read-only; "
+        "not owner approval, not requirements approval, not promotion, "
+        "not architecture decision, not implementation planning, "
+        "and no files were modified"
+    )
+    if approval_preflight_state == REQUIREMENTS_APPROVAL_PREFLIGHT_CONFIRMED_STATE:
+        lines.append(
+            "note: preflight confirmed for a future requirements approval owner "
+            "decision only; no requirements were approved or promoted"
+        )
+        lines.append(
+            "note: validation report PASS does not approve requirements; "
+            "DRAFT-REQ-* remains draft-only pending separate owner approval"
+        )
+        lines.append(
+            "note: future requirements approval requires a separate owner decision command"
+        )
+    return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class RequirementsApprovalPreflightReport:
+    output: str
+    approval_preflight_state: str
+    next_required_action: str
+    plan_id: str
+    intake_id: str
+    source_requirements_validation_execution_check_state: str | None
+    source_requirements_validation_execution_check_next_action: str | None
+    source_requirements_validation_report_path: Path | None
+    source_requirements_validation_report_status: str | None
+    source_requirements_validation_report_next_action: str | None
+    candidate_count: int | None
+    candidate_validation_results_summary: dict[str, int] | None
+    checked_at: str
+    blocking_reasons: tuple[str, ...]
+    non_authority: dict[str, bool]
+
+
+def _build_requirements_approval_preflight_report(
+    *,
+    plan_id: str,
+    intake_id: str,
+    approval_preflight_state: str,
+    next_required_action: str,
+    source_requirements_validation_execution_check_state: str | None = None,
+    source_requirements_validation_execution_check_next_action: str | None = None,
+    source_requirements_validation_report_path: Path | None = None,
+    source_requirements_validation_report_status: str | None = None,
+    source_requirements_validation_report_next_action: str | None = None,
+    candidate_count: int | None = None,
+    candidate_validation_results_summary: dict[str, int] | None = None,
+    blocking_reasons: list[str],
+    checked_at: str,
+    non_authority: dict[str, bool],
+) -> RequirementsApprovalPreflightReport:
+    output = _format_requirements_approval_preflight(
+        plan_id=plan_id,
+        intake_id=intake_id,
+        approval_preflight_state=approval_preflight_state,
+        next_required_action=next_required_action,
+        source_requirements_validation_execution_check_state=(
+            source_requirements_validation_execution_check_state
+        ),
+        source_requirements_validation_execution_check_next_action=(
+            source_requirements_validation_execution_check_next_action
+        ),
+        source_requirements_validation_report_path=source_requirements_validation_report_path,
+        source_requirements_validation_report_status=(
+            source_requirements_validation_report_status
+        ),
+        source_requirements_validation_report_next_action=(
+            source_requirements_validation_report_next_action
+        ),
+        candidate_count=candidate_count,
+        candidate_validation_results_summary=candidate_validation_results_summary,
+        blocking_reasons=blocking_reasons,
+        checked_at=checked_at,
+        non_authority=non_authority,
+    )
+    return RequirementsApprovalPreflightReport(
+        output=output,
+        approval_preflight_state=approval_preflight_state,
+        next_required_action=next_required_action,
+        plan_id=plan_id,
+        intake_id=intake_id,
+        source_requirements_validation_execution_check_state=(
+            source_requirements_validation_execution_check_state
+        ),
+        source_requirements_validation_execution_check_next_action=(
+            source_requirements_validation_execution_check_next_action
+        ),
+        source_requirements_validation_report_path=source_requirements_validation_report_path,
+        source_requirements_validation_report_status=(
+            source_requirements_validation_report_status
+        ),
+        source_requirements_validation_report_next_action=(
+            source_requirements_validation_report_next_action
+        ),
+        candidate_count=candidate_count,
+        candidate_validation_results_summary=candidate_validation_results_summary,
+        checked_at=checked_at,
+        blocking_reasons=tuple(blocking_reasons),
+        non_authority=non_authority,
+    )
+
+
+def requirements_approval_preflight(
+    project: Path,
+    intake_id: str,
+    plan_id: str,
+) -> RequirementsApprovalPreflightReport:
+    """Read-only preflight for future requirements approval owner decision eligibility."""
+    validate_intake_id(intake_id)
+    validate_plan_id(plan_id)
+
+    checked_at = _utc_now()
+    non_authority = {
+        key: True for key in REQUIREMENTS_APPROVAL_PREFLIGHT_NON_AUTHORITY_FLAGS
+    }
+    workspace_dest = planning_path(project, plan_id)
+    validation_report_path = (
+        workspace_dest
+        / "evidence"
+        / ORCHESTRATOR_REQUIREMENTS_DRAFT_VALIDATION_REPORT_FILE
+    )
+    local_agentic_spec_path = workspace_dest / "local-agentic-spec.md"
+    draft_provenance_path = (
+        workspace_dest / "evidence" / ORCHESTRATOR_REQUIREMENTS_DRAFT_PROVENANCE_FILE
+    )
+
+    def _blocked(
+        state: str,
+        next_action: str,
+        *,
+        blocking_reasons: list[str] | None = None,
+        source_requirements_validation_execution_check_state: str | None = None,
+        source_requirements_validation_execution_check_next_action: str | None = None,
+        source_requirements_validation_report_status: str | None = None,
+        source_requirements_validation_report_next_action: str | None = None,
+        candidate_count: int | None = None,
+        candidate_validation_results_summary: dict[str, int] | None = None,
+    ) -> RequirementsApprovalPreflightReport:
+        return _build_requirements_approval_preflight_report(
+            plan_id=plan_id,
+            intake_id=intake_id,
+            approval_preflight_state=state,
+            next_required_action=next_action,
+            source_requirements_validation_execution_check_state=(
+                source_requirements_validation_execution_check_state
+            ),
+            source_requirements_validation_execution_check_next_action=(
+                source_requirements_validation_execution_check_next_action
+            ),
+            source_requirements_validation_report_path=(
+                validation_report_path if validation_report_path.is_file() else None
+            ),
+            source_requirements_validation_report_status=(
+                source_requirements_validation_report_status
+            ),
+            source_requirements_validation_report_next_action=(
+                source_requirements_validation_report_next_action
+            ),
+            candidate_count=candidate_count,
+            candidate_validation_results_summary=candidate_validation_results_summary,
+            blocking_reasons=blocking_reasons or [],
+            checked_at=checked_at,
+            non_authority=non_authority,
+        )
+
+    execution_report = requirements_validation_execution_check(
+        project,
+        intake_id,
+        plan_id,
+    )
+    execution_state = execution_report.execution_check_state
+    execution_next_action = execution_report.next_required_action
+
+    if execution_state != REQUIREMENTS_VALIDATION_EXECUTION_CHECK_CONFIRMED_STATE:
+        return _blocked(
+            execution_state,
+            execution_next_action,
+            blocking_reasons=list(execution_report.blocking_reasons),
+            source_requirements_validation_execution_check_state=execution_state,
+            source_requirements_validation_execution_check_next_action=execution_next_action,
+        )
+
+    if not validation_report_path.is_file():
+        return _blocked(
+            "BLOCKED_REQUIREMENTS_VALIDATION_REPORT_MISSING",
+            "CREATE_REQUIREMENTS_DRAFT_VALIDATION_REPORT",
+            blocking_reasons=[
+                "requirements draft validation report missing: "
+                f"{ORCHESTRATOR_REQUIREMENTS_DRAFT_VALIDATION_REPORT_FILE}"
+            ],
+            source_requirements_validation_execution_check_state=execution_state,
+            source_requirements_validation_execution_check_next_action=execution_next_action,
+        )
+
+    try:
+        artifact = json.loads(validation_report_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return _blocked(
+            "BLOCKED_REQUIREMENTS_VALIDATION_REPORT_MALFORMED",
+            "FIX_REQUIREMENTS_DRAFT_VALIDATION_REPORT",
+            blocking_reasons=[f"malformed requirements draft validation report: {exc.msg}"],
+            source_requirements_validation_execution_check_state=execution_state,
+            source_requirements_validation_execution_check_next_action=execution_next_action,
+        )
+    if not isinstance(artifact, dict):
+        return _blocked(
+            "BLOCKED_REQUIREMENTS_VALIDATION_REPORT_MALFORMED",
+            "FIX_REQUIREMENTS_DRAFT_VALIDATION_REPORT",
+            blocking_reasons=[
+                "malformed requirements draft validation report: expected object"
+            ],
+            source_requirements_validation_execution_check_state=execution_state,
+            source_requirements_validation_execution_check_next_action=execution_next_action,
+        )
+
+    if not local_agentic_spec_path.is_file():
+        return _blocked(
+            "BLOCKED_REQUIREMENTS_VALIDATION_REPORT_STALE_OR_INCOHERENT",
+            "RESTORE_OR_REGENERATE_REQUIREMENTS_DRAFT",
+            blocking_reasons=[
+                f"local-agentic-spec.md missing in planning workspace: {plan_id}"
+            ],
+            source_requirements_validation_execution_check_state=execution_state,
+            source_requirements_validation_execution_check_next_action=execution_next_action,
+            source_requirements_validation_report_status=artifact.get("status"),
+            source_requirements_validation_report_next_action=artifact.get(
+                "next_required_action"
+            ),
+        )
+
+    local_spec_content = local_agentic_spec_path.read_text(encoding="utf-8")
+    parsed_candidates = _parse_requirements_draft_candidates_from_spec(local_spec_content)
+    if isinstance(parsed_candidates, str):
+        return _blocked(
+            "BLOCKED_REQUIREMENTS_VALIDATION_REPORT_STALE_OR_INCOHERENT",
+            "FIX_OR_REGENERATE_REQUIREMENTS_DRAFT",
+            blocking_reasons=[parsed_candidates],
+            source_requirements_validation_execution_check_state=execution_state,
+            source_requirements_validation_execution_check_next_action=execution_next_action,
+            source_requirements_validation_report_status=artifact.get("status"),
+            source_requirements_validation_report_next_action=artifact.get(
+                "next_required_action"
+            ),
+        )
+    current_candidate_ids = tuple(candidate.id for candidate in parsed_candidates)
+
+    block_state, report_blocking_reasons = (
+        _validate_requirements_draft_validation_report_for_approval_preflight(
+            artifact,
+            plan_id=plan_id,
+            intake_id=intake_id,
+            validation_report_path=validation_report_path,
+            local_agentic_spec_path=local_agentic_spec_path,
+            draft_provenance_path=draft_provenance_path,
+            current_candidate_ids=current_candidate_ids,
+            current_execution_check_state=execution_state,
+            current_execution_check_next_action=execution_next_action,
+        )
+    )
+    candidate_results = artifact.get("candidate_results")
+    summary = (
+        _summarize_candidate_validation_results(candidate_results)
+        if isinstance(candidate_results, list)
+        else None
+    )
+    if block_state:
+        next_action_map = {
+            "BLOCKED_REQUIREMENTS_VALIDATION_REPORT_MISSING": (
+                "CREATE_REQUIREMENTS_DRAFT_VALIDATION_REPORT"
+            ),
+            "BLOCKED_REQUIREMENTS_VALIDATION_REPORT_MALFORMED": (
+                "FIX_REQUIREMENTS_DRAFT_VALIDATION_REPORT"
+            ),
+            "BLOCKED_REQUIREMENTS_VALIDATION_REPORT_SCOPE_MISMATCH": (
+                "FIX_REQUIREMENTS_DRAFT_VALIDATION_REPORT_SCOPE"
+            ),
+            "BLOCKED_REQUIREMENTS_VALIDATION_REPORT_STALE_OR_INCOHERENT": (
+                "REGENERATE_REQUIREMENTS_DRAFT_VALIDATION_REPORT"
+            ),
+            "BLOCKED_REQUIREMENTS_VALIDATION_REPORT_HAS_NON_PASS_CANDIDATES": (
+                "REVISE_REQUIREMENTS_DRAFT_OR_REGENERATE_VALIDATION_REPORT"
+            ),
+            "BLOCKED_REQUIREMENTS_VALIDATION_REPORT_HAS_APPROVAL_OR_PROMOTION_LEAKAGE": (
+                "FIX_REQUIREMENTS_DRAFT_VALIDATION_REPORT"
+            ),
+        }
+        return _blocked(
+            block_state,
+            next_action_map.get(block_state, "FIX_REQUIREMENTS_DRAFT_VALIDATION_REPORT"),
+            blocking_reasons=report_blocking_reasons,
+            source_requirements_validation_execution_check_state=execution_state,
+            source_requirements_validation_execution_check_next_action=execution_next_action,
+            source_requirements_validation_report_status=artifact.get("status"),
+            source_requirements_validation_report_next_action=artifact.get(
+                "next_required_action"
+            ),
+            candidate_count=len(current_candidate_ids),
+            candidate_validation_results_summary=summary,
+        )
+
+    return _build_requirements_approval_preflight_report(
+        plan_id=plan_id,
+        intake_id=intake_id,
+        approval_preflight_state=REQUIREMENTS_APPROVAL_PREFLIGHT_CONFIRMED_STATE,
+        next_required_action=REQUIREMENTS_APPROVAL_PREFLIGHT_CONFIRMED_NEXT_ACTION,
+        source_requirements_validation_execution_check_state=execution_state,
+        source_requirements_validation_execution_check_next_action=execution_next_action,
+        source_requirements_validation_report_path=validation_report_path,
+        source_requirements_validation_report_status=artifact.get("status"),
+        source_requirements_validation_report_next_action=artifact.get(
+            "next_required_action"
+        ),
+        candidate_count=len(current_candidate_ids),
+        candidate_validation_results_summary=summary,
+        blocking_reasons=[],
+        checked_at=checked_at,
         non_authority=non_authority,
     )
 

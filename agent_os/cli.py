@@ -12,6 +12,7 @@ from agent_os.orchestrator import (
     REQUIREMENTS_EXTRACTION_OWNER_DECISION_VALUES,
     REQUIREMENTS_VALIDATION_EXECUTION_CHECK_CONFIRMED_STATE,
     REQUIREMENTS_DRAFT_VALIDATION_REPORT_CREATED_STATE,
+    REQUIREMENTS_APPROVAL_PREFLIGHT_CONFIRMED_STATE,
     REQUIREMENTS_VALIDATION_OWNER_DECISION_VALUES,
     create_goal_intake,
     create_owner_clarification,
@@ -21,6 +22,7 @@ from agent_os.orchestrator import (
     check_requirements_extraction_execution_authorization,
     requirements_validation_execution_check,
     validate_requirements_draft,
+    requirements_approval_preflight,
     draft_context_pack_from_transport,
     extract_requirements_draft,
     goal_intake_status,
@@ -610,6 +612,27 @@ def cmd_orchestrator_validate_requirements_draft(args: argparse.Namespace) -> in
     print(report.output)
     created = report.status == REQUIREMENTS_DRAFT_VALIDATION_REPORT_CREATED_STATE
     return 0 if created else 1
+
+
+def cmd_orchestrator_requirements_approval_preflight(
+    args: argparse.Namespace,
+) -> int:
+    project = _project_path(args.path)
+    try:
+        report = requirements_approval_preflight(
+            project,
+            args.intake_id,
+            args.plan_id,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(report.output)
+    confirmed = (
+        report.approval_preflight_state
+        == REQUIREMENTS_APPROVAL_PREFLIGHT_CONFIRMED_STATE
+    )
+    return 0 if confirmed else 1
 
 
 def cmd_orchestrator_clarify(args: argparse.Namespace) -> int:
@@ -1549,6 +1572,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     orchestrator_validate_requirements_draft_parser.set_defaults(
         func=cmd_orchestrator_validate_requirements_draft
+    )
+
+    orchestrator_requirements_approval_preflight_parser = orchestrator_sub.add_parser(
+        "requirements-approval-preflight",
+        help="read-only requirements approval eligibility preflight (not approval)",
+        description=(
+            "Read-only preflight for whether the current requirements draft "
+            "validation report is structurally admissible to a future owner "
+            "approval decision. Requires successful requirements validation "
+            "execution check and an existing validation report with all "
+            "candidates PASS. Does not call an LLM, record owner decisions, "
+            "approve requirements, promote draft requirements, assign REQ-* ids, "
+            "rewrite local-agentic-spec.md, modify validation reports, generate "
+            "architecture decisions, generate an implementation plan, generate "
+            "PLANNING_RUN_SLICE, create runner proposals, create runs, invoke "
+            "an executor, or write any artifact."
+        ),
+    )
+    orchestrator_requirements_approval_preflight_parser.add_argument(
+        "intake_id",
+        help="intake identifier (filesystem-safe slug)",
+    )
+    orchestrator_requirements_approval_preflight_parser.add_argument(
+        "path",
+        nargs="?",
+        help="target project directory",
+    )
+    orchestrator_requirements_approval_preflight_parser.add_argument(
+        "--plan-id",
+        required=True,
+        help="planning workspace identifier (filesystem-safe slug)",
+    )
+    orchestrator_requirements_approval_preflight_parser.set_defaults(
+        func=cmd_orchestrator_requirements_approval_preflight
     )
 
     return parser
