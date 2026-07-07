@@ -2,10 +2,15 @@
 
 Takes the curated 8-case demo scenario pack (benchmark/reports/demo-pack.json,
 see Slice K) and produces a run trace + static HTML viewer artifact scoped to
-exactly those selected cases. This is still a mock/plumbing demo layer: it
-runs only `rules_only` and `frontier_direct_mock` (the latter using a fixed
-mock model response, see benchmark/examples/mock_frontier_response.json), it
-never calls a live model or network, and it makes no benchmark claims.
+exactly those selected cases.
+
+Supports two modes:
+
+- **mock** (default): runs `rules_only` and `frontier_direct_mock` with a fixed
+  mock model response. No live model call or network access.
+- **live** (opt-in): runs `rules_only` and `frontier_direct_live` using the
+  env-http model provider boundary when `--provider env-http` is supplied and
+  required environment variables are set.
 
 Reuses existing modules rather than duplicating their logic:
 
@@ -18,12 +23,21 @@ Reuses existing modules rather than duplicating their logic:
 
 Also runnable as a CLI:
 
+    # Mock mode (default safe path)
     python -m admissible.runner.demo_trace \\
         --demo-pack benchmark/reports/demo-pack.json \\
         --gold benchmark/annotations/gold_labels.jsonl \\
         --mock-response benchmark/examples/mock_frontier_response.json \\
         --trace-out benchmark/reports/demo_trace.json \\
         --html-out benchmark/reports/demo_trace.html
+
+    # Live mode (opt-in; requires ADMISSIBLE_MODEL_* env vars)
+    python -m admissible.runner.demo_trace \\
+        --demo-pack benchmark/reports/demo-pack.json \\
+        --gold benchmark/annotations/gold_labels.jsonl \\
+        --provider env-http \\
+        --trace-out benchmark/reports/live_demo_trace.json \\
+        --html-out benchmark/reports/live_demo_trace.html
 """
 
 from __future__ import annotations
@@ -32,9 +46,14 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Literal
 
 from admissible.harness.viewer import write_trace_html
-from admissible.runner.compare_runner import FRONTIER_MOCK_NOTE, run_system_on_envelopes
+from admissible.runner.compare_runner import (
+    FRONTIER_LIVE_NOTE,
+    FRONTIER_MOCK_NOTE,
+    run_system_on_envelopes,
+)
 from admissible.trace import build_run_trace
 from benchmark.scoring.score_decisions import (
     TIER_1_CLAIM_BOUNDARY,
@@ -49,11 +68,21 @@ DEMO_PACK_CLAIM_BOUNDARY = "Curated Tier 1 enriched demo pack; not a benchmark r
 DEMO_TRACE_DISCLAIMER_NOTE = (
     "Curated demo trace using frontier_direct_mock; not a live frontier-model result."
 )
+DEMO_TRACE_LIVE_DISCLAIMER_NOTE = (
+    "Live frontier-direct run using env-http provider; results depend on "
+    "provider/model/date/config and are not benchmark claims."
+)
 DEMO_TRACE_GENERATED_BY = "admissible.runner.demo_trace"
-DEMO_SYSTEMS: tuple[str, ...] = ("rules_only", "frontier_direct_mock")
+DEMO_SYSTEMS_MOCK: tuple[str, ...] = ("rules_only", "frontier_direct_mock")
+DEMO_SYSTEMS_LIVE: tuple[str, ...] = ("rules_only", "frontier_direct_live")
+OWNER_CONFIG_REQUIRED_STATUS = "OWNER_CONFIG_REQUIRED"
 
 _MIN_SELECTED_CASES = 5
 _MAX_SELECTED_CASES = 8
+
+
+class OwnerConfigRequired(ValueError):
+    """Live demo trace requested but required model provider env is missing."""
 
 
 def load_demo_pack(path: str | Path) -> dict:
@@ -159,20 +188,65 @@ def _relative_note_path(path: Path) -> str:
         return path.as_posix()
 
 
+def _resolve_demo_mode(
+    *,
+    mock_response_path: str | Path | None,
+    provider: str | None,
+) -> Literal["mock", "live"]:
+    if mock_response_path is not None and provider is not None:
+        raise ValueError("cannot use both --mock-response and --provider")
+    if provider is not None:
+        if provider != "env-http":
+            raise ValueError(f"unsupported provider: {provider!r}; expected 'env-http'")
+        return "live"
+    if mock_response_path is not None:
+        return "mock"
+    raise ValueError("either --mock-response or --provider env-http is required")
+
+
+def _run_frontier_system(
+    system: str,
+    envelopes: list[dict],
+    *,
+    mock_response: dict | str | None,
+) -> list[dict]:
+    try:
+        if system == "frontier_direct_mock":
+            return run_system_on_envelopes(system, envelopes, mock_response=mock_response)
+        if system == "frontier_direct_live":
+            return run_system_on_envelopes(system, envelopes)
+        return run_system_on_envelopes(system, envelopes)
+    except ValueError as exc:
+        message = str(exc)
+        if "missing required environment variable" in message:
+            raise OwnerConfigRequired(
+                f"{OWNER_CONFIG_REQUIRED_STATUS}: {message}"
+            ) from exc
+        raise
+
+
 def build_demo_trace(
     *,
     demo_pack_path: str | Path,
     gold_path: str | Path,
-    mock_response_path: str | Path,
+    mock_response_path: str | Path | None = None,
+    provider: str | None = None,
 ) -> dict:
     """Build a run trace scoped to exactly the curated demo pack's cases.
 
-    Runs `rules_only` and `frontier_direct_mock` over the selected case
-    envelopes only, scores both against gold, and returns a run trace via
-    admissible.trace.build_run_trace. Raises ValueError if selection
-    integrity checks fail (see load_demo_pack / load_demo_envelopes) or if
-    any selected case has no matching gold annotation by envelope_id.
+    Mock mode (``mock_response_path`` set) runs ``rules_only`` and
+    ``frontier_direct_mock``. Live mode (``provider='env-http'``) runs
+    ``rules_only`` and ``frontier_direct_live``. Raises
+    :class:`OwnerConfigRequired` when live mode is requested but required
+    model-provider environment variables are missing.
     """
+    mode = _resolve_demo_mode(mock_response_path=mock_response_path, provider=provider)
+    systems = DEMO_SYSTEMS_LIVE if mode == "live" else DEMO_SYSTEMS_MOCK
+    disclaimer_note = (
+        DEMO_TRACE_LIVE_DISCLAIMER_NOTE if mode == "live" else DEMO_TRACE_DISCLAIMER_NOTE
+    )
+    frontier_note = FRONTIER_LIVE_NOTE if mode == "live" else FRONTIER_MOCK_NOTE
+
     demo_pack_path = Path(demo_pack_path)
     demo_pack = load_demo_pack(demo_pack_path)
     envelopes = load_demo_envelopes(demo_pack)
@@ -187,26 +261,28 @@ def build_demo_trace(
                 f"(benchmark_case_id={benchmark_case_id!r})"
             )
 
-    with Path(mock_response_path).open(encoding="utf-8") as f:
-        mock_response = json.load(f)
+    mock_response: dict | str | None = None
+    if mode == "mock":
+        with Path(mock_response_path).open(encoding="utf-8") as f:
+            mock_response = json.load(f)
 
     decisions_by_system: dict[str, list[dict]] = {}
     results: dict[str, dict] = {}
-    for system in DEMO_SYSTEMS:
-        decisions = run_system_on_envelopes(system, envelopes, mock_response=mock_response)
+    for system in systems:
+        decisions = _run_frontier_system(system, envelopes, mock_response=mock_response)
         decisions_by_system[system] = decisions
         summary = score_decisions(decisions, gold_by_envelope_id)
         summary["claim_boundary"] = TIER_1_CLAIM_BOUNDARY
-        if system == "frontier_direct_mock":
-            summary["notes"] = FRONTIER_MOCK_NOTE
+        if system in ("frontier_direct_mock", "frontier_direct_live"):
+            summary["notes"] = frontier_note
         results[system] = summary
 
     comparison = {
-        "systems": list(DEMO_SYSTEMS),
+        "systems": list(systems),
         "case_count": len(envelopes),
         "claim_boundary": TIER_1_CLAIM_BOUNDARY,
         "results": results,
-        "notes": FRONTIER_MOCK_NOTE,
+        "notes": frontier_note,
     }
 
     cases_path = demo_pack.get("source_case_set") or str(CASES_ROOT)
@@ -214,14 +290,14 @@ def build_demo_trace(
     return build_run_trace(
         cases_path=cases_path,
         gold_path=gold_path,
-        systems=list(DEMO_SYSTEMS),
+        systems=list(systems),
         comparison=comparison,
         envelopes=envelopes,
         gold_by_envelope_id=gold_by_envelope_id,
         decisions_by_system=decisions_by_system,
         metadata_generated_by=DEMO_TRACE_GENERATED_BY,
         metadata_notes=[
-            DEMO_TRACE_DISCLAIMER_NOTE,
+            disclaimer_note,
             f"Selected from {_relative_note_path(demo_pack_path)}.",
         ],
     )
@@ -231,9 +307,10 @@ def write_demo_trace_and_html(
     *,
     demo_pack_path: str | Path,
     gold_path: str | Path,
-    mock_response_path: str | Path,
     trace_out: str | Path,
     html_out: str | Path,
+    mock_response_path: str | Path | None = None,
+    provider: str | None = None,
 ) -> dict:
     """Build a demo trace and write both the trace JSON and rendered HTML.
 
@@ -245,6 +322,7 @@ def write_demo_trace_and_html(
         demo_pack_path=demo_pack_path,
         gold_path=gold_path,
         mock_response_path=mock_response_path,
+        provider=provider,
     )
 
     trace_out = Path(trace_out)
@@ -262,10 +340,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m admissible.runner.demo_trace",
         description=(
-            "Generate a deterministic demo run trace and static HTML viewer report "
-            "scoped to the curated Admissible demo pack (benchmark/reports/demo-pack.json). "
-            "Mock/plumbing demo only: no live model call, no live model provider, no "
-            "network access, no benchmark claim."
+            "Generate a demo run trace and static HTML viewer report scoped to the "
+            "curated Admissible demo pack (benchmark/reports/demo-pack.json). "
+            "Mock mode is the default safe path; live mode is opt-in via "
+            "--provider env-http. No benchmark claim."
         ),
     )
     parser.add_argument(
@@ -278,10 +356,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         required=True,
         help="Path to a gold_labels.jsonl file.",
     )
-    parser.add_argument(
+    provider_group = parser.add_mutually_exclusive_group(required=True)
+    provider_group.add_argument(
         "--mock-response",
-        required=True,
         help="Path to a JSON file containing a fixed mock frontier response.",
+    )
+    provider_group.add_argument(
+        "--provider",
+        choices=["env-http"],
+        help="Use the env-http live model provider (requires ADMISSIBLE_MODEL_* env vars).",
     )
     parser.add_argument(
         "--trace-out",
@@ -299,13 +382,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
 
-    trace = write_demo_trace_and_html(
-        demo_pack_path=args.demo_pack,
-        gold_path=args.gold,
-        mock_response_path=args.mock_response,
-        trace_out=args.trace_out,
-        html_out=args.html_out,
-    )
+    try:
+        trace = write_demo_trace_and_html(
+            demo_pack_path=args.demo_pack,
+            gold_path=args.gold,
+            mock_response_path=args.mock_response,
+            provider=args.provider,
+            trace_out=args.trace_out,
+            html_out=args.html_out,
+        )
+    except OwnerConfigRequired as exc:
+        print(
+            json.dumps(
+                {
+                    "status": OWNER_CONFIG_REQUIRED_STATUS,
+                    "message": str(exc),
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 1
 
     summary = {
         "trace_id": trace["trace_id"],

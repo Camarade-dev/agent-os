@@ -62,6 +62,17 @@ python -m admissible.runner.demo_trace \
 
 Open `benchmark/reports/demo_trace.html` in a browser.
 
+Optional live demo trace (requires `ADMISSIBLE_MODEL_*` env vars; writes separate `live_demo_trace.*` artifacts):
+
+```bash
+python -m admissible.runner.demo_trace \
+  --demo-pack benchmark/reports/demo-pack.json \
+  --gold benchmark/annotations/gold_labels.jsonl \
+  --provider env-http \
+  --trace-out benchmark/reports/live_demo_trace.json \
+  --html-out benchmark/reports/live_demo_trace.html
+```
+
 ### Optional live model provider
 
 The default demo path uses `frontier_direct_mock`.

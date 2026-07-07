@@ -5,11 +5,12 @@ This directory holds two different kinds of files. Do not confuse them.
 **Generated, untracked run artifacts** — e.g. `latest_trace.json` from
 `admissible.runner.compare_runner --trace-out`, and `latest_trace.html`
 from `admissible.harness.viewer`; also `demo_trace.json` and
-`demo_trace.html` from `admissible.runner.demo_trace`, which regenerates
-a run trace + HTML report scoped to the curated demo pack's cases (see
-`demo-pack.json` below). All of these are generated smoke-run artifacts,
-not committed benchmark results. They are untracked and should stay that
-way unless an owner explicitly decides to keep a specific snapshot.
+`demo_trace.html` from `admissible.runner.demo_trace` (mock mode), and
+`live_demo_trace.json` / `live_demo_trace.html` from
+`admissible.runner.demo_trace --provider env-http` (live mode, opt-in).
+All of these are generated smoke-run artifacts, not committed benchmark
+results. They are untracked and should stay that way unless an owner
+explicitly decides to keep a specific snapshot.
 
 **Curated, committed reports** — e.g. `demo-pack.json` and `demo-pack.md`,
 a hand-selected demo scenario pack built from the Tier 1 enriched seed
