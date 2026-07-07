@@ -475,6 +475,43 @@ ORCHESTRATOR_REQUIREMENTS_DRAFT_PROVENANCE_ARTIFACT_TYPE = (
 )
 ORCHESTRATOR_REQUIREMENTS_DRAFT_PROVENANCE_SCHEMA_VERSION = "0.1"
 
+REQUIREMENTS_DRAFT_VALIDATION_PREFLIGHT_CONFIRMED_STATE = (
+    "REQUIREMENTS_DRAFT_VALIDATION_PREFLIGHT_CONFIRMED_NO_VALIDATION_PERFORMED"
+)
+REQUIREMENTS_DRAFT_VALIDATION_PREFLIGHT_CONFIRMED_NEXT_ACTION = (
+    "FUTURE_REQUIREMENTS_VALIDATION_REQUIRES_SEPARATE_COMMAND"
+)
+
+REQUIREMENTS_DRAFT_VALIDATION_PREFLIGHT_NON_AUTHORITY_FLAGS = (
+    "does_not_validate_requirements",
+    "does_not_approve_requirements",
+    "does_not_rewrite_requirements_draft",
+    "does_not_promote_requirements_draft",
+    "does_not_normalize_requirements_draft",
+    "does_not_mutate_requirements_draft",
+    "does_not_generate_user_stories",
+    "does_not_generate_acceptance_criteria",
+    "does_not_generate_architecture",
+    "does_not_choose_stack",
+    "does_not_choose_database",
+    "does_not_choose_networking",
+    "does_not_generate_implementation_plan",
+    "does_not_generate_planning_run_slice",
+    "does_not_validate_planning_workspace",
+    "does_not_approve_plan",
+    "does_not_transition_workspace",
+    "does_not_create_runner_proposal",
+    "does_not_create_run",
+    "does_not_invoke_executor",
+    "preflight_only",
+    "validation_preflight_is_not_validation",
+    "future_requirements_validation_requires_separate_command",
+    "future_architecture_decision_requires_separate_command",
+    "future_implementation_plan_requires_separate_command",
+    "requires_future_independent_validation",
+    "requires_future_owner_approval",
+)
+
 REQUIREMENTS_DRAFT_NON_AUTHORITY_FLAGS = (
     "requirements_are_draft",
     "requirements_are_not_approved",
@@ -564,7 +601,33 @@ _FUNCTIONAL_REQUIREMENT_PATTERN = re.compile(r"\bthe system shall\b", re.IGNOREC
 _FUNCTIONAL_REQUIREMENT_ID_PATTERN = re.compile(r"\bFR-\d+\b", re.IGNORECASE)
 _NON_FUNCTIONAL_REQUIREMENT_ID_PATTERN = re.compile(r"\bNFR-\d+\b", re.IGNORECASE)
 _REQUIREMENT_ID_PATTERN = re.compile(r"\bREQ-\d+\b", re.IGNORECASE)
+_PROMOTED_REQUIREMENT_ID_PATTERN = re.compile(r"(?<!DRAFT-)REQ-\d+\b", re.IGNORECASE)
 _DRAFT_REQUIREMENT_ID_PATTERN = re.compile(r"\bDRAFT-REQ-\d+\b", re.IGNORECASE)
+_DRAFT_REQUIREMENT_HEADING_PATTERN = re.compile(
+    r"^### (DRAFT-REQ-\d{3})\s*$",
+    re.MULTILINE,
+)
+_REQUIREMENTS_DRAFT_CANDIDATES_HEADING = "## Draft requirement candidates"
+_CANDIDATE_BACKTICK_FIELD_PATTERN = re.compile(
+    r"- \*\*(?P<field>[a-z_]+):\*\* `(?P<value>[^`]+)`"
+)
+_CANDIDATE_TEXT_LINE_PATTERN = re.compile(
+    r"- \*\*candidate_text:\*\* (?P<value>.+)"
+)
+_CANDIDATE_SOURCE_QUOTE_LINE_PATTERN = re.compile(
+    r"- \*\*source_quote_or_reference:\*\* (?P<value>.+)"
+)
+_INFERRED_SLITHER_FEATURE_TERMS = (
+    "websocket",
+    "leaderboard",
+    "accounts",
+    "physics",
+    "deployment",
+    "rendering engine",
+    "database",
+    "realtime multiplayer",
+    "multiplayer",
+)
 _USER_STORY_PATTERN = re.compile(r"\bas a user\b", re.IGNORECASE)
 _USER_STORIES_HEADING_PATTERN = re.compile(r"^##\s+User Stories\s*$", re.MULTILINE)
 _ACCEPTANCE_CRITERIA_GWT_PATTERN = re.compile(
@@ -8127,6 +8190,995 @@ def extract_requirements_draft(
         requirement_candidate_count=len(candidates),
         requirement_candidate_ids=candidate_ids,
         candidates=candidates,
+        non_authority=non_authority,
+    )
+
+
+def _requirements_draft_candidate_region(content: str) -> str:
+    marker = _REQUIREMENTS_DRAFT_CANDIDATES_HEADING
+    start = content.find(marker)
+    if start == -1:
+        return ""
+    after = content[start + len(marker) :]
+    match = re.search(r"\n## (?!#)", after)
+    if match:
+        return after[: match.start()]
+    return after
+
+
+def _parse_requirements_draft_candidates_from_spec(
+    content: str,
+) -> tuple[DraftRequirementCandidate, ...] | str:
+    region = _requirements_draft_candidate_region(content)
+    headings = list(_DRAFT_REQUIREMENT_HEADING_PATTERN.finditer(region))
+    if not headings:
+        if "(no explicit source material produced candidates)" in region:
+            return ()
+        return "requirements draft contains no parseable DRAFT-REQ candidates"
+
+    candidates: list[DraftRequirementCandidate] = []
+    for index, heading in enumerate(headings):
+        candidate_id = heading.group(1)
+        section_start = heading.end()
+        section_end = (
+            headings[index + 1].start() if index + 1 < len(headings) else len(region)
+        )
+        section = region[section_start:section_end]
+        fields: dict[str, str] = {}
+        for match in _CANDIDATE_BACKTICK_FIELD_PATTERN.finditer(section):
+            fields[match.group("field")] = match.group("value")
+        text_match = _CANDIDATE_TEXT_LINE_PATTERN.search(section)
+        quote_match = _CANDIDATE_SOURCE_QUOTE_LINE_PATTERN.search(section)
+        candidate_text = text_match.group("value").strip() if text_match else ""
+        source_quote = quote_match.group("value").strip() if quote_match else ""
+        candidates.append(
+            DraftRequirementCandidate(
+                id=candidate_id,
+                status=fields.get("status", ""),
+                source_bounded=fields.get("source_bounded", ""),
+                source_type=fields.get("source_type", ""),
+                source_path=fields.get("source_path", ""),
+                source_field=fields.get("source_field", ""),
+                source_quote_or_reference=source_quote,
+                candidate_text=candidate_text,
+                validation_status=fields.get("validation_status", ""),
+                approval_status=fields.get("approval_status", ""),
+                architecture_status=fields.get("architecture_status", ""),
+                implementation_status=fields.get("implementation_status", ""),
+            )
+        )
+    return tuple(candidates)
+
+
+def _is_local_agentic_spec_requirements_draft_non_authority(
+    content: str,
+    plan_id: str,
+) -> bool:
+    normalized_content = content.replace("\r\n", "\n").replace("\r", "\n")
+    meta, _body = parse_frontmatter(normalized_content)
+    if meta.get("artifact_type") != "LOCAL_AGENTIC_SPEC":
+        return False
+    if meta.get("local_agentic_spec_status") != REQUIREMENTS_DRAFT_STATUS:
+        return False
+    if meta.get("plan_id") != plan_id:
+        return False
+    if REQUIREMENTS_DRAFT_STATUS not in normalized_content:
+        return False
+    return True
+
+
+def _local_agentic_spec_has_promoted_requirements_status(content: str) -> bool:
+    promoted_markers = (
+        "APPROVED_REQUIREMENTS",
+        "VALIDATED_REQUIREMENTS",
+        "REQUIREMENTS_APPROVED",
+        "REQUIREMENTS_VALIDATED",
+    )
+    normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+    for marker in promoted_markers:
+        if marker in normalized:
+            return True
+    return False
+
+
+def _requirements_draft_has_promoted_candidate_headings(content: str) -> bool:
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("### "):
+            heading = stripped[4:].strip()
+            if re.match(r"^(REQ|FR|NFR)-\d+$", heading, re.IGNORECASE):
+                return True
+    return False
+
+
+def _requirements_draft_candidate_region_has_promoted_ids(region: str) -> bool:
+    if _PROMOTED_REQUIREMENT_ID_PATTERN.search(region):
+        return True
+    if _FUNCTIONAL_REQUIREMENT_ID_PATTERN.search(region):
+        return True
+    if _NON_FUNCTIONAL_REQUIREMENT_ID_PATTERN.search(region):
+        return True
+    return False
+
+
+def _requirements_draft_has_promoted_requirement_identifiers(content: str) -> bool:
+    if _requirements_draft_has_promoted_candidate_headings(content):
+        return True
+    return _requirements_draft_candidate_region_has_promoted_ids(
+        _requirements_draft_candidate_region(content)
+    )
+
+
+def _requirements_draft_has_forbidden_user_stories(content: str) -> bool:
+    if _USER_STORY_PATTERN.search(content):
+        return True
+    section = section_body(content, "## User Stories").strip()
+    if section and section != "NOT_GENERATED":
+        return True
+    return False
+
+
+def _requirements_draft_has_forbidden_acceptance_criteria(content: str) -> bool:
+    if _ACCEPTANCE_CRITERIA_GWT_PATTERN.search(content):
+        return True
+    if _ACCEPTANCE_CRITERIA_ID_PATTERN.search(content):
+        return True
+    section = section_body(content, "## Acceptance Criteria").strip()
+    if section and section != "NOT_GENERATED":
+        return True
+    return False
+
+
+def _requirements_draft_has_forbidden_architecture(content: str) -> bool:
+    if _ARCHITECTURE_DECISION_PATTERN.search(content):
+        return True
+    if _STACK_CHOICE_PATTERN.search(content):
+        return True
+    section = section_body(content, "## Architecture").strip()
+    if section and section != "UNDECIDED_NOT_GENERATED":
+        return True
+    return False
+
+
+def _requirements_draft_has_forbidden_implementation_plan(content: str) -> bool:
+    if _IMPLEMENTATION_TASK_HEADING_PATTERN.search(content):
+        section = section_body(content, "## Implementation Tasks")
+        if section.strip():
+            return True
+    if "allowed_paths" in content:
+        return True
+    section = section_body(content, "## Implementation Plan").strip()
+    if section and section != "NOT_GENERATED":
+        return True
+    return False
+
+
+def _requirements_draft_has_forbidden_planning_run_slice(content: str) -> bool:
+    if '"artifact_type": "PLANNING_RUN_SLICE"' in content:
+        return True
+    section = section_body(content, "## PLANNING_RUN_SLICE").strip()
+    if not section:
+        return False
+    if section == "NOT_GENERATED":
+        return False
+    if section.startswith("NOT_GENERATED\n") or section.startswith("NOT_GENERATED\r\n"):
+        return False
+    return True
+
+
+def _requirements_draft_has_inferred_unsourced_details(
+    candidates: tuple[DraftRequirementCandidate, ...],
+) -> bool:
+    for candidate in candidates:
+        combined_candidate = candidate.candidate_text.lower()
+        source_combined = candidate.source_quote_or_reference.lower()
+        for term in _INFERRED_SLITHER_FEATURE_TERMS:
+            if term not in source_combined and term in combined_candidate:
+                return True
+    return False
+
+
+def _validate_requirements_draft_provenance_artifact(
+    provenance: dict,
+    *,
+    plan_id: str,
+    intake_id: str,
+    candidates: tuple[DraftRequirementCandidate, ...],
+    spec_content: str,
+) -> list[str]:
+    errors: list[str] = []
+    artifact_type = provenance.get("artifact_type")
+    if artifact_type != ORCHESTRATOR_REQUIREMENTS_DRAFT_PROVENANCE_ARTIFACT_TYPE:
+        errors.append(
+            "requirements draft provenance artifact_type mismatch: "
+            f"expected {ORCHESTRATOR_REQUIREMENTS_DRAFT_PROVENANCE_ARTIFACT_TYPE!r}, "
+            f"found {artifact_type!r}"
+        )
+
+    if provenance.get("plan_id") != plan_id:
+        errors.append(
+            f"requirements draft provenance plan_id mismatch: "
+            f"expected {plan_id!r}, found {provenance.get('plan_id')!r}"
+        )
+
+    if provenance.get("intake_id") != intake_id:
+        errors.append(
+            f"requirements draft provenance intake_id mismatch: "
+            f"expected {intake_id!r}, found {provenance.get('intake_id')!r}"
+        )
+
+    if provenance.get("local_agentic_spec_status") != REQUIREMENTS_DRAFT_STATUS:
+        errors.append(
+            "requirements draft provenance local_agentic_spec_status is not "
+            "REQUIREMENTS_DRAFT_NON_AUTHORITY"
+        )
+
+    if (
+        provenance.get("source_requirements_extraction_execution_check_state")
+        != REQUIREMENTS_EXTRACTION_EXECUTION_CHECK_CONFIRMED_STATE
+    ):
+        errors.append(
+            "requirements draft provenance source_requirements_extraction_execution_check_state "
+            "is not REQUIREMENTS_EXTRACTION_EXECUTION_CHECK_CONFIRMED_NO_EXTRACTION_PERFORMED"
+        )
+
+    if (
+        provenance.get("source_requirements_extraction_execution_check_next_action")
+        != REQUIREMENTS_EXTRACTION_EXECUTION_CHECK_CONFIRMED_NEXT_ACTION
+    ):
+        errors.append(
+            "requirements draft provenance source_requirements_extraction_execution_check_next_action "
+            "is not FUTURE_REQUIREMENTS_EXTRACTION_COMMAND_MAY_BE_RUN_SEPARATELY"
+        )
+
+    provenance_count = provenance.get("requirement_candidate_count")
+    if provenance_count != len(candidates):
+        errors.append(
+            "requirements draft provenance candidate count mismatch: "
+            f"provenance={provenance_count!r}, spec={len(candidates)}"
+        )
+
+    provenance_ids = provenance.get("requirement_candidate_ids")
+    spec_ids = [candidate.id for candidate in candidates]
+    if provenance_ids != spec_ids:
+        errors.append(
+            "requirements draft provenance candidate id mismatch: "
+            f"provenance={provenance_ids!r}, spec={spec_ids!r}"
+        )
+
+    for candidate_id in spec_ids:
+        if candidate_id not in spec_content:
+            errors.append(
+                f"requirements draft provenance candidate {candidate_id!r} "
+                "missing from local-agentic-spec.md"
+            )
+
+    non_authority = provenance.get("non_authority")
+    if not isinstance(non_authority, dict):
+        errors.append("requirements draft provenance non_authority must be an object")
+    else:
+        for flag in REQUIREMENTS_DRAFT_NON_AUTHORITY_FLAGS:
+            if non_authority.get(flag) is not True:
+                errors.append(
+                    f"requirements draft provenance non_authority.{flag} must be true"
+                )
+
+    if provenance.get("planning_workspace_status_at_draft") != "DRAFT":
+        errors.append(
+            "requirements draft provenance planning_workspace_status_at_draft is not DRAFT"
+        )
+
+    return errors
+
+
+def _validate_orchestrator_provenance_binds_intake(
+    provenance_path: Path,
+    *,
+    plan_id: str,
+    intake_id: str,
+) -> str | None:
+    if not provenance_path.is_file():
+        return f"orchestrator provenance not found for planning workspace: {plan_id}"
+    try:
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return f"invalid orchestrator provenance for planning workspace {plan_id}: {exc.msg}"
+    if not isinstance(provenance, dict):
+        return (
+            f"invalid orchestrator provenance for planning workspace {plan_id}: "
+            "expected object"
+        )
+    if provenance.get("plan_id") != plan_id:
+        return (
+            f"orchestrator provenance plan_id mismatch: expected {plan_id!r}, "
+            f"found {provenance.get('plan_id')!r}"
+        )
+    if provenance.get("intake_id") != intake_id:
+        return (
+            f"orchestrator provenance intake_id mismatch: expected {intake_id!r}, "
+            f"found {provenance.get('intake_id')!r}"
+        )
+    return None
+
+
+def _format_requirements_draft_validation_preflight(
+    *,
+    plan_id: str,
+    intake_id: str,
+    planning_workspace_status: str | None,
+    local_agentic_spec_status: str | None,
+    local_agentic_spec_path: Path | None,
+    requirements_draft_provenance_path: Path | None,
+    requirement_candidate_count: int | None,
+    requirement_candidate_ids: tuple[str, ...] | None,
+    latest_requirements_extraction_decision_id: str | None,
+    latest_requirements_extraction_decision: str | None,
+    preflight_state: str,
+    next_required_action: str,
+    blocking_reasons: list[str],
+    checked_at: str,
+    non_authority: dict[str, bool],
+) -> str:
+    lines = [
+        "requirements draft validation preflight",
+        f"plan_id: {plan_id}",
+        f"intake_id: {intake_id}",
+    ]
+    if planning_workspace_status is not None:
+        lines.append(f"planning_workspace_status: {planning_workspace_status}")
+    if local_agentic_spec_status is not None:
+        lines.append(f"local_agentic_spec_status: {local_agentic_spec_status}")
+    if local_agentic_spec_path is not None:
+        lines.append(f"local_agentic_spec_path: {local_agentic_spec_path}")
+    if requirements_draft_provenance_path is not None:
+        lines.append(
+            "requirements_draft_provenance_path: "
+            f"{requirements_draft_provenance_path}"
+        )
+    if requirement_candidate_count is not None:
+        lines.append(f"requirement_candidate_count: {requirement_candidate_count}")
+    if requirement_candidate_ids is not None:
+        ids_text = ", ".join(requirement_candidate_ids) if requirement_candidate_ids else "(none)"
+        lines.append(f"requirement_candidate_ids: {ids_text}")
+    if latest_requirements_extraction_decision_id is not None:
+        lines.append(
+            "latest_requirements_extraction_decision_id: "
+            f"{latest_requirements_extraction_decision_id}"
+        )
+    if latest_requirements_extraction_decision is not None:
+        lines.append(
+            "latest_requirements_extraction_decision: "
+            f"{latest_requirements_extraction_decision}"
+        )
+    lines.append(f"preflight_state: {preflight_state}")
+    lines.append(f"next_required_action: {next_required_action}")
+    lines.append(f"checked_at: {checked_at}")
+    if blocking_reasons:
+        lines.append("blocking_reasons:")
+        for reason in blocking_reasons:
+            lines.append(f"  - {reason}")
+    lines.append("non_authority:")
+    for flag in REQUIREMENTS_DRAFT_VALIDATION_PREFLIGHT_NON_AUTHORITY_FLAGS:
+        lines.append(f"  {flag}: true")
+    lines.append(
+        "note: requirements draft validation preflight is read-only; "
+        "not requirements validation, not requirements approval, "
+        "not architecture decision, not implementation planning, "
+        "and no files were modified"
+    )
+    if preflight_state == REQUIREMENTS_DRAFT_VALIDATION_PREFLIGHT_CONFIRMED_STATE:
+        lines.append(
+            "note: preflight confirmed for a future requirements validation command "
+            "only; no requirements were validated or approved"
+        )
+        lines.append(
+            "note: requirements draft remains DRAFT_NON_AUTHORITY; "
+            "architecture undecided; implementation plan not generated; "
+            "PLANNING_RUN_SLICE not generated; workspace not validated or approved"
+        )
+    return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class RequirementsDraftValidationPreflightReport:
+    output: str
+    preflight_state: str
+    next_required_action: str
+    plan_id: str
+    intake_id: str
+    planning_workspace_status: str | None
+    local_agentic_spec_status: str | None
+    local_agentic_spec_path: Path | None
+    requirements_draft_provenance_path: Path | None
+    requirement_candidate_count: int | None
+    requirement_candidate_ids: tuple[str, ...] | None
+    latest_requirements_extraction_decision_id: str | None
+    latest_requirements_extraction_decision: str | None
+    checked_at: str
+    blocking_reasons: tuple[str, ...]
+    non_authority: dict[str, bool]
+
+
+def _build_requirements_draft_validation_preflight_report(
+    *,
+    plan_id: str,
+    intake_id: str,
+    planning_workspace_status: str | None = None,
+    local_agentic_spec_status: str | None = None,
+    local_agentic_spec_path: Path | None = None,
+    requirements_draft_provenance_path: Path | None = None,
+    requirement_candidate_count: int | None = None,
+    requirement_candidate_ids: tuple[str, ...] | None = None,
+    latest_requirements_extraction_decision_id: str | None = None,
+    latest_requirements_extraction_decision: str | None = None,
+    preflight_state: str,
+    next_required_action: str,
+    blocking_reasons: list[str],
+    checked_at: str,
+    non_authority: dict[str, bool],
+) -> RequirementsDraftValidationPreflightReport:
+    output = _format_requirements_draft_validation_preflight(
+        plan_id=plan_id,
+        intake_id=intake_id,
+        planning_workspace_status=planning_workspace_status,
+        local_agentic_spec_status=local_agentic_spec_status,
+        local_agentic_spec_path=local_agentic_spec_path,
+        requirements_draft_provenance_path=requirements_draft_provenance_path,
+        requirement_candidate_count=requirement_candidate_count,
+        requirement_candidate_ids=requirement_candidate_ids,
+        latest_requirements_extraction_decision_id=latest_requirements_extraction_decision_id,
+        latest_requirements_extraction_decision=latest_requirements_extraction_decision,
+        preflight_state=preflight_state,
+        next_required_action=next_required_action,
+        blocking_reasons=blocking_reasons,
+        checked_at=checked_at,
+        non_authority=non_authority,
+    )
+    return RequirementsDraftValidationPreflightReport(
+        output=output,
+        preflight_state=preflight_state,
+        next_required_action=next_required_action,
+        plan_id=plan_id,
+        intake_id=intake_id,
+        planning_workspace_status=planning_workspace_status,
+        local_agentic_spec_status=local_agentic_spec_status,
+        local_agentic_spec_path=local_agentic_spec_path,
+        requirements_draft_provenance_path=requirements_draft_provenance_path,
+        requirement_candidate_count=requirement_candidate_count,
+        requirement_candidate_ids=requirement_candidate_ids,
+        latest_requirements_extraction_decision_id=latest_requirements_extraction_decision_id,
+        latest_requirements_extraction_decision=latest_requirements_extraction_decision,
+        checked_at=checked_at,
+        blocking_reasons=tuple(blocking_reasons),
+        non_authority=non_authority,
+    )
+
+
+def requirements_draft_validation_preflight(
+    project: Path,
+    intake_id: str,
+    plan_id: str,
+) -> RequirementsDraftValidationPreflightReport:
+    """Read-only requirements draft validation eligibility preflight."""
+    validate_intake_id(intake_id)
+    validate_plan_id(plan_id)
+
+    checked_at = _utc_now()
+    non_authority = {
+        key: True for key in REQUIREMENTS_DRAFT_VALIDATION_PREFLIGHT_NON_AUTHORITY_FLAGS
+    }
+    workspace_dest = planning_path(project, plan_id)
+    local_agentic_spec_path = workspace_dest / "local-agentic-spec.md"
+    draft_provenance_path = (
+        workspace_dest / "evidence" / ORCHESTRATOR_REQUIREMENTS_DRAFT_PROVENANCE_FILE
+    )
+    orchestrator_provenance_path = (
+        workspace_dest / "evidence" / ORCHESTRATOR_PROVENANCE_FILE
+    )
+
+    def _blocked(
+        state: str,
+        next_action: str,
+        *,
+        blocking_reasons: list[str] | None = None,
+        planning_workspace_status: str | None = None,
+        local_agentic_spec_status: str | None = None,
+        requirement_candidate_count: int | None = None,
+        requirement_candidate_ids: tuple[str, ...] | None = None,
+        latest_requirements_extraction_decision_id: str | None = None,
+        latest_requirements_extraction_decision: str | None = None,
+    ) -> RequirementsDraftValidationPreflightReport:
+        return _build_requirements_draft_validation_preflight_report(
+            plan_id=plan_id,
+            intake_id=intake_id,
+            planning_workspace_status=planning_workspace_status,
+            local_agentic_spec_status=local_agentic_spec_status,
+            local_agentic_spec_path=local_agentic_spec_path,
+            requirements_draft_provenance_path=draft_provenance_path,
+            requirement_candidate_count=requirement_candidate_count,
+            requirement_candidate_ids=requirement_candidate_ids,
+            latest_requirements_extraction_decision_id=(
+                latest_requirements_extraction_decision_id
+            ),
+            latest_requirements_extraction_decision=latest_requirements_extraction_decision,
+            preflight_state=state,
+            next_required_action=next_action,
+            blocking_reasons=blocking_reasons or [],
+            checked_at=checked_at,
+            non_authority=non_authority,
+        )
+
+    workspace = workspace_path(project)
+    if not workspace.is_dir():
+        return _blocked(
+            "BLOCKED_MISSING_WORKSPACE",
+            "FIX_PLANNING_WORKSPACE_STRUCTURE",
+            blocking_reasons=["no workspace found (run `agent-os init` first)"],
+        )
+
+    intake_path = _goal_intake_artifact_path(project, intake_id)
+    if not intake_path.is_file():
+        return _blocked(
+            "BLOCKED_INVALID_INTAKE",
+            "FIX_GOAL_INTAKE_STRUCTURE",
+            blocking_reasons=[f"goal intake artifact not found: {intake_id}"],
+        )
+
+    readiness_report = review_goal_intake_readiness(project, intake_id)
+    if not readiness_report.goal_intake_valid:
+        return _blocked(
+            "BLOCKED_INVALID_INTAKE",
+            "FIX_GOAL_INTAKE_STRUCTURE",
+            blocking_reasons=list(readiness_report.blocking_reasons),
+        )
+
+    if not workspace_dest.is_dir():
+        return _blocked(
+            "BLOCKED_MISSING_PLANNING_WORKSPACE",
+            "FIX_PLANNING_WORKSPACE_STRUCTURE",
+            blocking_reasons=[f"planning workspace not found: {plan_id}"],
+        )
+
+    workspace_status = _load_planning_workspace_status(workspace_dest, plan_id)
+    if workspace_status != "DRAFT":
+        return _blocked(
+            "BLOCKED_PLANNING_WORKSPACE_NOT_DRAFT",
+            "RESTORE_DRAFT_PLANNING_WORKSPACE",
+            planning_workspace_status=workspace_status,
+            blocking_reasons=[
+                f"planning workspace must be DRAFT for requirements draft validation "
+                f"preflight, found: {workspace_status!r}"
+            ],
+        )
+
+    provenance_error = _validate_orchestrator_provenance_binds_intake(
+        orchestrator_provenance_path,
+        plan_id=plan_id,
+        intake_id=intake_id,
+    )
+    if provenance_error is not None:
+        return _blocked(
+            "BLOCKED_MISSING_ORCHESTRATOR_PROVENANCE",
+            "RESTORE_ORCHESTRATOR_PROVENANCE",
+            planning_workspace_status=workspace_status,
+            blocking_reasons=[provenance_error],
+        )
+
+    if not local_agentic_spec_path.is_file():
+        return _blocked(
+            "BLOCKED_MISSING_LOCAL_AGENTIC_SPEC",
+            "RESTORE_OR_GENERATE_REQUIREMENTS_DRAFT",
+            planning_workspace_status=workspace_status,
+            blocking_reasons=[
+                f"local-agentic-spec.md missing in planning workspace: {plan_id}"
+            ],
+        )
+
+    if not draft_provenance_path.is_file():
+        return _blocked(
+            "BLOCKED_MISSING_REQUIREMENTS_DRAFT_PROVENANCE",
+            "RESTORE_OR_GENERATE_REQUIREMENTS_DRAFT",
+            planning_workspace_status=workspace_status,
+            blocking_reasons=[
+                "requirements draft provenance missing: "
+                f"{ORCHESTRATOR_REQUIREMENTS_DRAFT_PROVENANCE_FILE}"
+            ],
+        )
+
+    try:
+        provenance = json.loads(draft_provenance_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return _blocked(
+            "BLOCKED_MALFORMED_REQUIREMENTS_DRAFT_PROVENANCE",
+            "FIX_REQUIREMENTS_DRAFT_PROVENANCE",
+            planning_workspace_status=workspace_status,
+            blocking_reasons=[f"malformed requirements draft provenance: {exc.msg}"],
+        )
+    if not isinstance(provenance, dict):
+        return _blocked(
+            "BLOCKED_MALFORMED_REQUIREMENTS_DRAFT_PROVENANCE",
+            "FIX_REQUIREMENTS_DRAFT_PROVENANCE",
+            planning_workspace_status=workspace_status,
+            blocking_reasons=["malformed requirements draft provenance: expected object"],
+        )
+
+    local_spec_content = local_agentic_spec_path.read_text(encoding="utf-8")
+    meta, _body = parse_frontmatter(local_spec_content.replace("\r\n", "\n").replace("\r", "\n"))
+    local_agentic_spec_status = meta.get("local_agentic_spec_status")
+
+    if not _is_local_agentic_spec_requirements_draft_non_authority(
+        local_spec_content,
+        plan_id,
+    ):
+        return _blocked(
+            "BLOCKED_WRONG_LOCAL_AGENTIC_SPEC_STATUS",
+            "RESTORE_OR_REGENERATE_REQUIREMENTS_DRAFT",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=str(local_agentic_spec_status or ""),
+            blocking_reasons=[
+                "local-agentic-spec.md must be REQUIREMENTS_DRAFT_NON_AUTHORITY "
+                f"for validation preflight, found: {local_agentic_spec_status!r}"
+            ],
+        )
+
+    if _local_agentic_spec_has_promoted_requirements_status(local_spec_content):
+        return _blocked(
+            "BLOCKED_WRONG_LOCAL_AGENTIC_SPEC_STATUS",
+            "RESTORE_OR_REGENERATE_REQUIREMENTS_DRAFT",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=str(local_agentic_spec_status or ""),
+            blocking_reasons=[
+                "local-agentic-spec.md indicates promoted or approved requirements status"
+            ],
+        )
+
+    parsed_candidates = _parse_requirements_draft_candidates_from_spec(local_spec_content)
+    if isinstance(parsed_candidates, str):
+        return _blocked(
+            "BLOCKED_REQUIREMENTS_DRAFT_NOT_COHERENT",
+            "FIX_OR_REGENERATE_REQUIREMENTS_DRAFT",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=REQUIREMENTS_DRAFT_STATUS,
+            blocking_reasons=[parsed_candidates],
+        )
+    candidates = parsed_candidates
+    candidate_ids = tuple(candidate.id for candidate in candidates)
+
+    if _requirements_draft_has_promoted_requirement_identifiers(local_spec_content):
+        return _blocked(
+            "BLOCKED_PROMOTED_REQUIREMENT_IDENTIFIER",
+            "FIX_OR_REGENERATE_REQUIREMENTS_DRAFT",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=REQUIREMENTS_DRAFT_STATUS,
+            requirement_candidate_count=len(candidates),
+            requirement_candidate_ids=candidate_ids,
+            blocking_reasons=[
+                "requirements draft contains promoted requirement identifiers "
+                "(REQ-/FR-/NFR-); only DRAFT-REQ-* allowed"
+            ],
+        )
+
+    for candidate in candidates:
+        if candidate.status != DRAFT_REQUIREMENT_CANDIDATE_STATUS:
+            return _blocked(
+                "BLOCKED_CANDIDATE_NOT_DRAFT_NON_AUTHORITY",
+                "FIX_OR_REGENERATE_REQUIREMENTS_DRAFT",
+                planning_workspace_status=workspace_status,
+                local_agentic_spec_status=REQUIREMENTS_DRAFT_STATUS,
+                requirement_candidate_count=len(candidates),
+                requirement_candidate_ids=candidate_ids,
+                blocking_reasons=[
+                    f"candidate {candidate.id} status is not "
+                    "DRAFT_REQUIREMENT_CANDIDATE_NON_AUTHORITY"
+                ],
+            )
+        if candidate.source_bounded != DRAFT_REQUIREMENT_SOURCE_BOUNDED_MARKER:
+            return _blocked(
+                "BLOCKED_CANDIDATE_NOT_SOURCE_BOUNDED",
+                "FIX_OR_REGENERATE_REQUIREMENTS_DRAFT",
+                planning_workspace_status=workspace_status,
+                local_agentic_spec_status=REQUIREMENTS_DRAFT_STATUS,
+                requirement_candidate_count=len(candidates),
+                requirement_candidate_ids=candidate_ids,
+                blocking_reasons=[
+                    f"candidate {candidate.id} is missing SOURCE_BOUNDED marker"
+                ],
+            )
+        if candidate.validation_status != "NOT_VALIDATED":
+            return _blocked(
+                "BLOCKED_CANDIDATE_NOT_VALIDATED",
+                "FIX_OR_REGENERATE_REQUIREMENTS_DRAFT",
+                planning_workspace_status=workspace_status,
+                local_agentic_spec_status=REQUIREMENTS_DRAFT_STATUS,
+                requirement_candidate_count=len(candidates),
+                requirement_candidate_ids=candidate_ids,
+                blocking_reasons=[
+                    f"candidate {candidate.id} validation_status is not NOT_VALIDATED"
+                ],
+            )
+        if candidate.approval_status != "NOT_APPROVED":
+            return _blocked(
+                "BLOCKED_CANDIDATE_NOT_APPROVED",
+                "FIX_OR_REGENERATE_REQUIREMENTS_DRAFT",
+                planning_workspace_status=workspace_status,
+                local_agentic_spec_status=REQUIREMENTS_DRAFT_STATUS,
+                requirement_candidate_count=len(candidates),
+                requirement_candidate_ids=candidate_ids,
+                blocking_reasons=[
+                    f"candidate {candidate.id} approval_status is not NOT_APPROVED"
+                ],
+            )
+        if candidate.architecture_status != "NOT_DECIDED":
+            return _blocked(
+                "BLOCKED_CANDIDATE_ARCHITECTURE_STATUS_NOT_UNDECIDED",
+                "FIX_OR_REGENERATE_REQUIREMENTS_DRAFT",
+                planning_workspace_status=workspace_status,
+                local_agentic_spec_status=REQUIREMENTS_DRAFT_STATUS,
+                requirement_candidate_count=len(candidates),
+                requirement_candidate_ids=candidate_ids,
+                blocking_reasons=[
+                    f"candidate {candidate.id} architecture_status is not NOT_DECIDED"
+                ],
+            )
+        if candidate.implementation_status != "NOT_PLANNED":
+            return _blocked(
+                "BLOCKED_CANDIDATE_IMPLEMENTATION_STATUS_NOT_UNPLANNED",
+                "FIX_OR_REGENERATE_REQUIREMENTS_DRAFT",
+                planning_workspace_status=workspace_status,
+                local_agentic_spec_status=REQUIREMENTS_DRAFT_STATUS,
+                requirement_candidate_count=len(candidates),
+                requirement_candidate_ids=candidate_ids,
+                blocking_reasons=[
+                    f"candidate {candidate.id} implementation_status is not NOT_PLANNED"
+                ],
+            )
+
+    provenance_errors = _validate_requirements_draft_provenance_artifact(
+        provenance,
+        plan_id=plan_id,
+        intake_id=intake_id,
+        candidates=candidates,
+        spec_content=local_spec_content,
+    )
+    if provenance_errors:
+        first_error = provenance_errors[0]
+        if "candidate count mismatch" in first_error:
+            state = "BLOCKED_PROVENANCE_CANDIDATE_COUNT_MISMATCH"
+        elif "candidate id mismatch" in first_error:
+            state = "BLOCKED_PROVENANCE_CANDIDATE_ID_MISMATCH"
+        elif "plan_id mismatch" in first_error:
+            state = "BLOCKED_PROVENANCE_PLAN_ID_MISMATCH"
+        elif "intake_id mismatch" in first_error:
+            state = "BLOCKED_PROVENANCE_INTAKE_ID_MISMATCH"
+        else:
+            state = "BLOCKED_MALFORMED_REQUIREMENTS_DRAFT_PROVENANCE"
+        return _blocked(
+            state,
+            "FIX_REQUIREMENTS_DRAFT_PROVENANCE",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=REQUIREMENTS_DRAFT_STATUS,
+            requirement_candidate_count=len(candidates),
+            requirement_candidate_ids=candidate_ids,
+            blocking_reasons=provenance_errors,
+        )
+
+    if _requirements_draft_has_forbidden_user_stories(local_spec_content):
+        return _blocked(
+            "BLOCKED_REQUIREMENTS_DRAFT_HAS_USER_STORIES",
+            "FIX_OR_REGENERATE_REQUIREMENTS_DRAFT",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=REQUIREMENTS_DRAFT_STATUS,
+            requirement_candidate_count=len(candidates),
+            requirement_candidate_ids=candidate_ids,
+            blocking_reasons=["requirements draft contains forbidden user story content"],
+        )
+
+    if _requirements_draft_has_forbidden_acceptance_criteria(local_spec_content):
+        return _blocked(
+            "BLOCKED_REQUIREMENTS_DRAFT_HAS_ACCEPTANCE_CRITERIA",
+            "FIX_OR_REGENERATE_REQUIREMENTS_DRAFT",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=REQUIREMENTS_DRAFT_STATUS,
+            requirement_candidate_count=len(candidates),
+            requirement_candidate_ids=candidate_ids,
+            blocking_reasons=[
+                "requirements draft contains forbidden acceptance criteria content"
+            ],
+        )
+
+    if _requirements_draft_has_forbidden_architecture(local_spec_content):
+        return _blocked(
+            "BLOCKED_REQUIREMENTS_DRAFT_HAS_ARCHITECTURE",
+            "FIX_OR_REGENERATE_REQUIREMENTS_DRAFT",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=REQUIREMENTS_DRAFT_STATUS,
+            requirement_candidate_count=len(candidates),
+            requirement_candidate_ids=candidate_ids,
+            blocking_reasons=["requirements draft contains forbidden architecture content"],
+        )
+
+    if _requirements_draft_has_forbidden_implementation_plan(local_spec_content):
+        return _blocked(
+            "BLOCKED_REQUIREMENTS_DRAFT_HAS_IMPLEMENTATION_PLAN",
+            "FIX_OR_REGENERATE_REQUIREMENTS_DRAFT",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=REQUIREMENTS_DRAFT_STATUS,
+            requirement_candidate_count=len(candidates),
+            requirement_candidate_ids=candidate_ids,
+            blocking_reasons=[
+                "requirements draft contains forbidden implementation plan content"
+            ],
+        )
+
+    if _requirements_draft_has_forbidden_planning_run_slice(local_spec_content):
+        return _blocked(
+            "BLOCKED_REQUIREMENTS_DRAFT_HAS_PLANNING_RUN_SLICE",
+            "FIX_OR_REGENERATE_REQUIREMENTS_DRAFT",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=REQUIREMENTS_DRAFT_STATUS,
+            requirement_candidate_count=len(candidates),
+            requirement_candidate_ids=candidate_ids,
+            blocking_reasons=[
+                "requirements draft contains forbidden PLANNING_RUN_SLICE content"
+            ],
+        )
+
+    if _requirements_draft_has_inferred_unsourced_details(candidates):
+        return _blocked(
+            "BLOCKED_REQUIREMENTS_DRAFT_HAS_INFERRED_UNSOURCED_DETAILS",
+            "FIX_OR_REGENERATE_REQUIREMENTS_DRAFT",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=REQUIREMENTS_DRAFT_STATUS,
+            requirement_candidate_count=len(candidates),
+            requirement_candidate_ids=candidate_ids,
+            blocking_reasons=[
+                "requirements draft candidate text contains inferred unsourced product details"
+            ],
+        )
+
+    decision_records, decision_errors = _load_validated_requirements_extraction_owner_decisions(
+        project,
+        intake_id,
+        plan_id,
+    )
+    if decision_errors:
+        return _blocked(
+            "BLOCKED_MALFORMED_REQUIREMENTS_EXTRACTION_OWNER_DECISION",
+            "FIX_REQUIREMENTS_EXTRACTION_OWNER_DECISION_ARTIFACTS",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=REQUIREMENTS_DRAFT_STATUS,
+            requirement_candidate_count=len(candidates),
+            requirement_candidate_ids=candidate_ids,
+            blocking_reasons=decision_errors,
+        )
+
+    if not decision_records:
+        return _blocked(
+            "BLOCKED_NO_REQUIREMENTS_EXTRACTION_OWNER_DECISION",
+            "CREATE_REQUIREMENTS_EXTRACTION_OWNER_DECISION",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=REQUIREMENTS_DRAFT_STATUS,
+            requirement_candidate_count=len(candidates),
+            requirement_candidate_ids=candidate_ids,
+            blocking_reasons=[
+                "no requirements extraction owner decision artifacts found "
+                f"for intake {intake_id!r} and plan {plan_id!r}"
+            ],
+        )
+
+    latest_record = decision_records[-1]
+    latest_decision_id = latest_record.decision_id
+    latest_decision = latest_record.decision
+
+    if latest_decision == "REQUEST_MORE_CONTEXT":
+        return _blocked(
+            "BLOCKED_LATEST_REQUIREMENTS_EXTRACTION_DECISION_REQUESTS_MORE_CONTEXT",
+            "ADD_MORE_CONTEXT_BEFORE_VALIDATION",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=REQUIREMENTS_DRAFT_STATUS,
+            requirement_candidate_count=len(candidates),
+            requirement_candidate_ids=candidate_ids,
+            latest_requirements_extraction_decision_id=latest_decision_id,
+            latest_requirements_extraction_decision=latest_decision,
+            blocking_reasons=[
+                "latest requirements extraction owner decision is REQUEST_MORE_CONTEXT"
+            ],
+        )
+
+    if latest_decision == "BLOCK_REQUIREMENTS_EXTRACTION":
+        return _blocked(
+            "BLOCKED_LATEST_REQUIREMENTS_EXTRACTION_DECISION_BLOCKS_EXTRACTION",
+            "STOP_REQUIREMENTS_DRAFT_VALIDATION",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=REQUIREMENTS_DRAFT_STATUS,
+            requirement_candidate_count=len(candidates),
+            requirement_candidate_ids=candidate_ids,
+            latest_requirements_extraction_decision_id=latest_decision_id,
+            latest_requirements_extraction_decision=latest_decision,
+            blocking_reasons=[
+                "latest requirements extraction owner decision is BLOCK_REQUIREMENTS_EXTRACTION"
+            ],
+        )
+
+    if latest_decision != "AUTHORIZE_REQUIREMENTS_EXTRACTION":
+        return _blocked(
+            "BLOCKED_LATEST_REQUIREMENTS_EXTRACTION_DECISION_NOT_AUTHORIZE",
+            "AUTHORIZE_REQUIREMENTS_EXTRACTION_WITH_OWNER_DECISION",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=REQUIREMENTS_DRAFT_STATUS,
+            requirement_candidate_count=len(candidates),
+            requirement_candidate_ids=candidate_ids,
+            latest_requirements_extraction_decision_id=latest_decision_id,
+            latest_requirements_extraction_decision=latest_decision,
+            blocking_reasons=[f"unsupported latest decision value: {latest_decision!r}"],
+        )
+
+    provenance_decision_id = provenance.get("source_requirements_extraction_owner_decision_id")
+    if provenance_decision_id != latest_decision_id:
+        return _blocked(
+            "BLOCKED_REQUIREMENTS_DRAFT_DECISION_CHAIN_INCOHERENT",
+            "FIX_REQUIREMENTS_EXTRACTION_OWNER_DECISION_ARTIFACTS",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=REQUIREMENTS_DRAFT_STATUS,
+            requirement_candidate_count=len(candidates),
+            requirement_candidate_ids=candidate_ids,
+            latest_requirements_extraction_decision_id=latest_decision_id,
+            latest_requirements_extraction_decision=latest_decision,
+            blocking_reasons=[
+                "requirements draft provenance owner decision id does not match "
+                f"latest authorize decision: provenance={provenance_decision_id!r}, "
+                f"latest={latest_decision_id!r}"
+            ],
+        )
+
+    provenance_decision_path_value = provenance.get(
+        "source_requirements_extraction_owner_decision_path"
+    )
+    if not isinstance(provenance_decision_path_value, str) or not provenance_decision_path_value:
+        return _blocked(
+            "BLOCKED_MALFORMED_REQUIREMENTS_DRAFT_PROVENANCE",
+            "FIX_REQUIREMENTS_DRAFT_PROVENANCE",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=REQUIREMENTS_DRAFT_STATUS,
+            requirement_candidate_count=len(candidates),
+            requirement_candidate_ids=candidate_ids,
+            blocking_reasons=[
+                "requirements draft provenance missing "
+                "source_requirements_extraction_owner_decision_path"
+            ],
+        )
+
+    provenance_decision_path = Path(provenance_decision_path_value)
+    if not provenance_decision_path.is_file():
+        return _blocked(
+            "BLOCKED_REQUIREMENTS_DRAFT_DECISION_CHAIN_INCOHERENT",
+            "FIX_REQUIREMENTS_EXTRACTION_OWNER_DECISION_ARTIFACTS",
+            planning_workspace_status=workspace_status,
+            local_agentic_spec_status=REQUIREMENTS_DRAFT_STATUS,
+            requirement_candidate_count=len(candidates),
+            requirement_candidate_ids=candidate_ids,
+            latest_requirements_extraction_decision_id=latest_decision_id,
+            latest_requirements_extraction_decision=latest_decision,
+            blocking_reasons=[
+                "requirements draft provenance owner decision path is missing on disk"
+            ],
+        )
+
+    return _build_requirements_draft_validation_preflight_report(
+        plan_id=plan_id,
+        intake_id=intake_id,
+        planning_workspace_status=workspace_status,
+        local_agentic_spec_status=REQUIREMENTS_DRAFT_STATUS,
+        local_agentic_spec_path=local_agentic_spec_path,
+        requirements_draft_provenance_path=draft_provenance_path,
+        requirement_candidate_count=len(candidates),
+        requirement_candidate_ids=candidate_ids,
+        latest_requirements_extraction_decision_id=latest_decision_id,
+        latest_requirements_extraction_decision=latest_decision,
+        preflight_state=REQUIREMENTS_DRAFT_VALIDATION_PREFLIGHT_CONFIRMED_STATE,
+        next_required_action=REQUIREMENTS_DRAFT_VALIDATION_PREFLIGHT_CONFIRMED_NEXT_ACTION,
+        blocking_reasons=[],
+        checked_at=checked_at,
         non_authority=non_authority,
     )
 

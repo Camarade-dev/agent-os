@@ -22,6 +22,7 @@ from agent_os.orchestrator import (
     preflight_local_agentic_spec_draft,
     preflight_requirements_extraction,
     prepare_planning_workspace_draft,
+    requirements_draft_validation_preflight,
     review_goal_intake_readiness,
     scaffold_local_agentic_spec_from_context_pack,
     scaffold_requirements_extraction,
@@ -527,6 +528,27 @@ def cmd_orchestrator_extract_requirements_draft(args: argparse.Namespace) -> int
         return 1
     print(report.output)
     return 0
+
+
+def cmd_orchestrator_requirements_draft_validation_preflight(
+    args: argparse.Namespace,
+) -> int:
+    project = _project_path(args.path)
+    try:
+        report = requirements_draft_validation_preflight(
+            project,
+            args.intake_id,
+            args.plan_id,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(report.output)
+    confirmed = (
+        report.preflight_state
+        == "REQUIREMENTS_DRAFT_VALIDATION_PREFLIGHT_CONFIRMED_NO_VALIDATION_PERFORMED"
+    )
+    return 0 if confirmed else 1
 
 
 def cmd_orchestrator_clarify(args: argparse.Namespace) -> int:
@@ -1321,6 +1343,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     orchestrator_extract_requirements_draft_parser.set_defaults(
         func=cmd_orchestrator_extract_requirements_draft
+    )
+
+    orchestrator_requirements_draft_validation_preflight_parser = orchestrator_sub.add_parser(
+        "requirements-draft-validation-preflight",
+        help="read-only requirements draft validation preflight (no validation)",
+        description=(
+            "Perform a read-only requirements draft validation eligibility preflight "
+            "over an existing requirements draft. Does not call an LLM, validate or "
+            "approve requirements, rewrite or promote the draft, generate user stories "
+            "or acceptance criteria, generate architecture decisions, generate an "
+            "implementation plan, generate PLANNING_RUN_SLICE, validate or approve the "
+            "workspace, transition status, create runner proposals, create runs, invoke "
+            "an executor, or write any artifact."
+        ),
+    )
+    orchestrator_requirements_draft_validation_preflight_parser.add_argument(
+        "intake_id",
+        help="intake identifier (filesystem-safe slug)",
+    )
+    orchestrator_requirements_draft_validation_preflight_parser.add_argument(
+        "path",
+        nargs="?",
+        help="target project directory",
+    )
+    orchestrator_requirements_draft_validation_preflight_parser.add_argument(
+        "--plan-id",
+        required=True,
+        help="planning workspace identifier (filesystem-safe slug)",
+    )
+    orchestrator_requirements_draft_validation_preflight_parser.set_defaults(
+        func=cmd_orchestrator_requirements_draft_validation_preflight
     )
 
     return parser
