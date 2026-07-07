@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{TITLE}}</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    margin: 0;
+    padding: 2rem;
+    line-height: 1.5;
+    max-width: 1100px;
+    margin-inline: auto;
+  }
+  h1, h2, h3, h4 { line-height: 1.25; }
+  code { font-family: "SFMono-Regular", Consolas, monospace; }
+  .claim-boundary {
+    background: #fff3cd;
+    color: #664d03;
+    border: 2px solid #ffca2c;
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    font-size: 1.1rem;
+    margin: 1rem 0;
+  }
+  .final-verdict {
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    margin: 1rem 0;
+    border: 2px solid;
+  }
+  .verdict-pass { background: #d1e7dd; color: #0a3622; border-color: #75b798; }
+  .verdict-fail { background: #f8d7da; color: #58151c; border-color: #ea868f; }
+  .verdict-inconclusive { background: #fff3cd; color: #664d03; border-color: #ffca2c; }
+  .verdict-unknown { background: #e2e3e5; color: #41464b; border-color: #adb5bd; }
+  .verdict-status { font-weight: bold; font-size: 1.1rem; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+  th, td {
+    border: 1px solid #999;
+    padding: 0.4rem 0.6rem;
+    text-align: left;
+    vertical-align: top;
+  }
+  thead th { background: #eee; }
+  .match-yes { background: #d1e7dd; }
+  .match-no { background: #f8d7da; }
+  .decision-label { font-weight: bold; }
+  .reason-summary { font-size: 0.85rem; color: #333; }
+  details.case-detail {
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    margin: 0.5rem 0;
+    padding: 0.5rem 0.75rem;
+  }
+  summary { font-weight: bold; cursor: pointer; }
+  .system-decision {
+    border-top: 1px solid #ddd;
+    margin-top: 0.5rem;
+    padding-top: 0.5rem;
+  }
+  ul.reasons { margin: 0.25rem 0; padding-left: 1.25rem; }
+  ul.system-list { padding-left: 1.25rem; }
+  dl.header-grid, dl.case-set-grid {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 0.25rem 1rem;
+  }
+  dl.header-grid dt, dl.case-set-grid dt { font-weight: bold; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #1e1e1e; color: #e0e0e0; }
+    th, td { border-color: #555; }
+    thead th { background: #2a2a2a; }
+    .match-yes { background: #103c25; }
+    .match-no { background: #4a1116; }
+    .reason-summary { color: #ccc; }
+    details.case-detail { border-color: #444; }
+    .system-decision { border-top-color: #444; }
+  }
+</style>
+</head>
+<body>
+{{CONTENT}}
+</body>
+</html>
