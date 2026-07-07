@@ -31,6 +31,7 @@ from agent_os.orchestrator import (
     create_owner_readiness_decision,
     create_requirements_extraction_owner_decision,
     check_requirements_extraction_execution_authorization,
+    extract_requirements_draft,
     build_requirements_extraction_owner_decision_artifact,
     load_requirements_extraction_owner_decision,
     list_requirements_extraction_owner_decisions,
@@ -40,6 +41,10 @@ from agent_os.orchestrator import (
     REQUIREMENTS_EXTRACTION_EXECUTION_CHECK_NON_AUTHORITY_FLAGS,
     REQUIREMENTS_EXTRACTION_EXECUTION_CHECK_CONFIRMED_STATE,
     REQUIREMENTS_EXTRACTION_EXECUTION_CHECK_CONFIRMED_NEXT_ACTION,
+    REQUIREMENTS_DRAFT_STATUS,
+    REQUIREMENTS_DRAFT_NON_AUTHORITY_FLAGS,
+    DRAFT_REQUIREMENT_CANDIDATE_STATUS,
+    DRAFT_REQUIREMENT_SOURCE_BOUNDED_MARKER,
     goal_intake_status,
     list_owner_clarifications,
     list_owner_readiness_decisions,
@@ -17559,6 +17564,995 @@ class OrchestratorRequirementsExtractionExecutionCheckTests(unittest.TestCase):
         self._setup_ready_for_execution_check()
         _, output = self._execution_check()
         self.assertNotIn("requirements approved", output.lower())
+
+class OrchestratorExtractRequirementsDraftTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self._tmp.name)
+        init_workspace(self.project)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _artifact_path(self, intake_id: str) -> Path:
+        return orchestrator_intake_path(self.project, intake_id) / GOAL_INTAKE_FILE
+
+    def _clarification_path(self, intake_id: str, clarification_id: str) -> Path:
+        return orchestrator_clarification_path(self.project, intake_id, clarification_id)
+
+    def _readiness_decision_path(self, intake_id: str, decision_id: str) -> Path:
+        return orchestrator_readiness_decision_path(self.project, intake_id, decision_id)
+
+    def _requirements_extraction_decision_path(
+        self, intake_id: str, plan_id: str, decision_id: str
+    ) -> Path:
+        return orchestrator_requirements_extraction_decision_path(
+            self.project, intake_id, plan_id, decision_id
+        )
+
+    def _create_slither_intake(self, intake_id: str = "slither-demo") -> Path:
+        return create_goal_intake(
+            self.project, intake_id, "Build me an online slither.io-like game"
+        )
+
+    def _project_files(self) -> set[str]:
+        return {
+            path.relative_to(self.project).as_posix()
+            for path in self.project.rglob("*")
+            if path.is_file()
+        }
+
+    def _authorize_slither(self, intake_id: str = "slither-demo") -> None:
+        self._create_slither_intake(intake_id)
+        create_owner_clarification(
+            self.project, intake_id, "scope-v1", "Browser-only demo with 10 players max."
+        )
+        create_owner_readiness_decision(
+            self.project,
+            intake_id,
+            "owner-v1",
+            "AUTHORIZE_DRAFT_PREPARATION",
+            "Scope clarified; authorize future draft prep only.",
+        )
+
+    def _run(self, argv: list[str]) -> tuple[int, str]:
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        with redirect_stdout(out_buf), redirect_stderr(err_buf):
+            code = main(argv)
+        return code, out_buf.getvalue() + err_buf.getvalue()
+
+    def _prepare(self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1") -> tuple[int, str]:
+        return self._run(
+            ["orchestrator", "prepare-planning-draft", intake_id, str(self.project), "--plan-id", plan_id]
+        )
+
+    def _transport(self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1") -> tuple[int, str]:
+        return self._run(
+            ["orchestrator", "transport-planning-context", intake_id, str(self.project), "--plan-id", plan_id]
+        )
+
+    def _draft_context_pack(self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1") -> tuple[int, str]:
+        return self._run(
+            ["orchestrator", "draft-context-pack", intake_id, str(self.project), "--plan-id", plan_id]
+        )
+
+    def _local_spec_preflight(self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1") -> tuple[int, str]:
+        return self._run(
+            ["orchestrator", "local-agentic-spec-preflight", intake_id, str(self.project), "--plan-id", plan_id]
+        )
+
+    def _scaffold_local_spec(self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1") -> tuple[int, str]:
+        return self._run(
+            ["orchestrator", "scaffold-local-agentic-spec", intake_id, str(self.project), "--plan-id", plan_id]
+        )
+
+    def _preflight(self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1") -> tuple[int, str]:
+        return self._run(
+            ["orchestrator", "requirements-extraction-preflight", intake_id, str(self.project), "--plan-id", plan_id]
+        )
+
+    def _scaffold(self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1") -> tuple[int, str]:
+        return self._run(
+            ["orchestrator", "scaffold-requirements-extraction", intake_id, str(self.project), "--plan-id", plan_id]
+        )
+
+    def _decide(
+        self,
+        intake_id: str = "slither-demo",
+        plan_id: str = "slither-plan-v1",
+        decision: str = "AUTHORIZE_REQUIREMENTS_EXTRACTION",
+        decision_id: str = "req-ext-owner-v1",
+        summary: str = "Authorize future extraction only.",
+    ) -> tuple[int, str]:
+        return self._run(
+            [
+                "orchestrator",
+                "decide-requirements-extraction",
+                intake_id,
+                str(self.project),
+                "--plan-id",
+                plan_id,
+                "--decision",
+                decision,
+                "--decision-id",
+                decision_id,
+                "--summary",
+                summary,
+            ]
+        )
+
+    def _execution_check(self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1") -> tuple[int, str]:
+        return self._run(
+            [
+                "orchestrator",
+                "requirements-extraction-execution-check",
+                intake_id,
+                str(self.project),
+                "--plan-id",
+                plan_id,
+            ]
+        )
+
+    def _extract(
+        self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1"
+    ) -> tuple[int, str]:
+        return self._run(
+            [
+                "orchestrator",
+                "extract-requirements-draft",
+                intake_id,
+                str(self.project),
+                "--plan-id",
+                plan_id,
+            ]
+        )
+
+    def _workspace(self, plan_id: str = "slither-plan-v1") -> Path:
+        return planning_path(self.project, plan_id)
+
+    def _context_pack_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return self._workspace(plan_id) / "context-pack.md"
+
+    def _draft_provenance_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return self._workspace(plan_id) / "evidence" / "orchestrator-context-pack-draft-provenance.json"
+
+    def _scaffold_provenance_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return self._workspace(plan_id) / "evidence" / "orchestrator-local-agentic-spec-scaffold-provenance.json"
+
+    def _requirements_scaffold_provenance_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return (
+            self._workspace(plan_id)
+            / "evidence"
+            / "orchestrator-requirements-extraction-scaffold-provenance.json"
+        )
+
+    def _requirements_draft_provenance_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return self._workspace(plan_id) / "evidence" / "orchestrator-requirements-draft-provenance.json"
+
+    def _transport_json_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return self._workspace(plan_id) / "evidence" / "orchestrator-context-transport.json"
+
+    def _transport_md_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return self._workspace(plan_id) / "evidence" / "orchestrator-context-transport.md"
+
+    def _provenance_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return self._workspace(plan_id) / "evidence" / "orchestrator-provenance.json"
+
+    def _local_spec_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return self._workspace(plan_id) / "local-agentic-spec.md"
+
+    def _implementation_plan_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return self._workspace(plan_id) / "implementation-plan.md"
+
+    def _planning_audit_path(self, plan_id: str = "slither-plan-v1") -> Path:
+        return self._workspace(plan_id) / "planning-audit.md"
+
+    def _setup_ready_for_scaffold(self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1") -> None:
+        self._authorize_slither(intake_id)
+        self.assertEqual(self._prepare(intake_id, plan_id)[0], 0)
+        self.assertEqual(self._transport(intake_id, plan_id)[0], 0)
+        self.assertEqual(self._draft_context_pack(intake_id, plan_id)[0], 0)
+        self.assertEqual(self._local_spec_preflight(intake_id, plan_id)[0], 0)
+        self.assertEqual(self._scaffold_local_spec(intake_id, plan_id)[0], 0)
+        self.assertEqual(self._preflight(intake_id, plan_id)[0], 0)
+
+    def _setup_ready_for_decision(self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1") -> None:
+        self._setup_ready_for_scaffold(intake_id, plan_id)
+        self.assertEqual(self._scaffold(intake_id, plan_id)[0], 0)
+
+    def _setup_ready_for_execution_check(
+        self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1"
+    ) -> None:
+        self._setup_ready_for_decision(intake_id, plan_id)
+        self.assertEqual(self._decide(intake_id, plan_id)[0], 0)
+
+    def _setup_ready_for_extract(
+        self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1"
+    ) -> None:
+        self._setup_ready_for_execution_check(intake_id, plan_id)
+        self.assertEqual(self._execution_check(intake_id, plan_id)[0], 0)
+
+    def _tracked_artifact_paths(
+        self, intake_id: str = "slither-demo", plan_id: str = "slither-plan-v1"
+    ) -> dict[Path, bytes]:
+        workspace = self._workspace(plan_id)
+        paths = [
+            self._artifact_path(intake_id),
+            self._clarification_path(intake_id, "scope-v1"),
+            self._readiness_decision_path(intake_id, "owner-v1"),
+            self._provenance_path(plan_id),
+            workspace / "evidence" / "orchestrator-draft-scaffold-notes.md",
+            self._transport_json_path(plan_id),
+            self._transport_md_path(plan_id),
+            self._draft_provenance_path(plan_id),
+            self._scaffold_provenance_path(plan_id),
+            self._requirements_scaffold_provenance_path(plan_id),
+            self._context_pack_path(plan_id),
+            self._implementation_plan_path(plan_id),
+            self._planning_audit_path(plan_id),
+            self._requirements_extraction_decision_path(intake_id, plan_id, "req-ext-owner-v1"),
+        ]
+        return {path: path.read_bytes() for path in paths if path.is_file()}
+
+    def _candidate_texts(self, plan_id: str = "slither-plan-v1") -> list[str]:
+        spec = self._local_spec_path(plan_id).read_text(encoding="utf-8")
+        return re.findall(r"candidate_text:\s*(.+)", spec)
+
+    def test_succeeds_only_after_successful_execution_check(self) -> None:
+        self._setup_ready_for_decision()
+        code, output = self._extract()
+        self.assertEqual(code, 1)
+        self.assertIn("execution check not confirmed", output.lower())
+        self._decide()
+        self.assertEqual(self._execution_check()[0], 0)
+        self.assertEqual(self._extract()[0], 0)
+
+    def test_local_agentic_spec_replaced_with_requirements_draft_non_authority(self) -> None:
+        self._setup_ready_for_extract()
+        self._extract()
+        spec = self._local_spec_path().read_text(encoding="utf-8")
+        self.assertIn(REQUIREMENTS_DRAFT_STATUS, spec)
+        self.assertNotIn("REQUIREMENTS_EXTRACTION_SCAFFOLD_NON_AUTHORITY", spec)
+
+    def test_requirements_draft_provenance_created_at_expected_path(self) -> None:
+        self._setup_ready_for_extract()
+        self._extract()
+        self.assertTrue(self._requirements_draft_provenance_path().is_file())
+
+    def test_provenance_contains_required_fields(self) -> None:
+        self._setup_ready_for_extract()
+        self._extract()
+        provenance = json.loads(self._requirements_draft_provenance_path().read_text())
+        for field in (
+            "artifact_type", "schema_version", "plan_id", "intake_id",
+            "source_context_transport_path", "source_context_pack_path",
+            "source_requirements_extraction_scaffold_provenance_path",
+            "source_requirements_extraction_owner_decision_id",
+            "source_requirements_extraction_owner_decision_path",
+            "source_requirements_extraction_execution_check_state",
+            "source_requirements_extraction_execution_check_next_action",
+            "local_agentic_spec_path", "local_agentic_spec_status",
+            "requirement_candidate_count", "requirement_candidate_ids",
+            "planning_workspace_status_at_draft", "created_at", "non_authority",
+        ):
+            self.assertIn(field, provenance, field)
+
+    def test_provenance_contains_all_non_authority_flags_true(self) -> None:
+        self._setup_ready_for_extract()
+        report = extract_requirements_draft(self.project, "slither-demo", "slither-plan-v1")
+        for flag in REQUIREMENTS_DRAFT_NON_AUTHORITY_FLAGS:
+            self.assertIn(flag, report.non_authority)
+            self.assertTrue(report.non_authority[flag])
+        provenance = json.loads(self._requirements_draft_provenance_path().read_text())
+        for flag in REQUIREMENTS_DRAFT_NON_AUTHORITY_FLAGS:
+            self.assertTrue(provenance["non_authority"][flag])
+
+    def test_provenance_candidate_count_matches_local_agentic_spec(self) -> None:
+        self._setup_ready_for_extract()
+        report = extract_requirements_draft(self.project, "slither-demo", "slither-plan-v1")
+        provenance = json.loads(self._requirements_draft_provenance_path().read_text())
+        spec = self._local_spec_path().read_text(encoding="utf-8")
+        self.assertEqual(provenance["requirement_candidate_count"], report.requirement_candidate_count)
+        self.assertEqual(spec.count("DRAFT-REQ-"), report.requirement_candidate_count)
+        self.assertEqual(
+            tuple(provenance["requirement_candidate_ids"]),
+            report.requirement_candidate_ids,
+        )
+        for candidate_id in report.requirement_candidate_ids:
+            self.assertIn(candidate_id, spec)
+
+    def test_candidate_ids_are_deterministic_draft_ids(self) -> None:
+        self._setup_ready_for_extract()
+        report = extract_requirements_draft(self.project, "slither-demo", "slither-plan-v1")
+        self.assertGreater(len(report.requirement_candidate_ids), 0)
+        self.assertEqual(report.requirement_candidate_ids[0], "DRAFT-REQ-001")
+
+    def test_candidate_ids_are_not_approved_style_ids(self) -> None:
+        self._setup_ready_for_extract()
+        report = extract_requirements_draft(self.project, "slither-demo", "slither-plan-v1")
+        for candidate_id in report.requirement_candidate_ids:
+            self.assertRegex(candidate_id, r"^DRAFT-REQ-\d{3}$")
+            self.assertNotRegex(candidate_id, r"^(REQ|FR|NFR)-\d+$")
+
+    def test_each_candidate_is_draft_requirement_candidate_non_authority(self) -> None:
+        self._setup_ready_for_extract()
+        report = extract_requirements_draft(self.project, "slither-demo", "slither-plan-v1")
+        for candidate in report.candidates:
+            self.assertEqual(candidate.status, DRAFT_REQUIREMENT_CANDIDATE_STATUS)
+
+    def test_each_candidate_is_source_bounded(self) -> None:
+        self._setup_ready_for_extract()
+        report = extract_requirements_draft(self.project, "slither-demo", "slither-plan-v1")
+        spec = self._local_spec_path().read_text(encoding="utf-8")
+        for candidate in report.candidates:
+            self.assertEqual(candidate.source_bounded, DRAFT_REQUIREMENT_SOURCE_BOUNDED_MARKER)
+            self.assertTrue(candidate.source_path)
+            self.assertTrue(candidate.source_field)
+            self.assertTrue(candidate.source_quote_or_reference)
+            self.assertIn("Draft candidate derived from source", candidate.candidate_text)
+            self.assertIn(
+                f"**source_bounded:** `{DRAFT_REQUIREMENT_SOURCE_BOUNDED_MARKER}`",
+                spec,
+            )
+        self.assertEqual(
+            spec.count(f"**source_bounded:** `{DRAFT_REQUIREMENT_SOURCE_BOUNDED_MARKER}`"),
+            len(report.candidates),
+        )
+
+    def test_each_candidate_is_not_validated(self) -> None:
+        self._setup_ready_for_extract()
+        report = extract_requirements_draft(self.project, "slither-demo", "slither-plan-v1")
+        for candidate in report.candidates:
+            self.assertEqual(candidate.validation_status, "NOT_VALIDATED")
+
+    def test_each_candidate_is_not_approved(self) -> None:
+        self._setup_ready_for_extract()
+        report = extract_requirements_draft(self.project, "slither-demo", "slither-plan-v1")
+        for candidate in report.candidates:
+            self.assertEqual(candidate.approval_status, "NOT_APPROVED")
+
+    def test_each_candidate_has_architecture_status_not_decided(self) -> None:
+        self._setup_ready_for_extract()
+        report = extract_requirements_draft(self.project, "slither-demo", "slither-plan-v1")
+        for candidate in report.candidates:
+            self.assertEqual(candidate.architecture_status, "NOT_DECIDED")
+
+    def test_each_candidate_has_implementation_status_not_planned(self) -> None:
+        self._setup_ready_for_extract()
+        report = extract_requirements_draft(self.project, "slither-demo", "slither-plan-v1")
+        for candidate in report.candidates:
+            self.assertEqual(candidate.implementation_status, "NOT_PLANNED")
+
+    def test_candidate_text_derived_from_explicit_source_material(self) -> None:
+        self._setup_ready_for_extract()
+        report = extract_requirements_draft(self.project, "slither-demo", "slither-plan-v1")
+        goal_candidate = next(
+            c for c in report.candidates if "slither.io-like game" in c.candidate_text.lower()
+        )
+        self.assertIn("Build me an online slither.io-like game", goal_candidate.source_quote_or_reference)
+
+    def test_broad_slither_goal_stays_broad_without_inferred_subrequirements(self) -> None:
+        self._setup_ready_for_extract()
+        report = extract_requirements_draft(self.project, "slither-demo", "slither-plan-v1")
+        combined = "\n".join(c.candidate_text.lower() for c in report.candidates)
+        source_combined = "\n".join(c.source_quote_or_reference.lower() for c in report.candidates)
+        for term in (
+            "websocket",
+            "leaderboard",
+            "accounts",
+            "physics",
+            "deployment",
+            "rendering engine",
+            "database",
+            "realtime multiplayer",
+            "multiplayer",
+        ):
+            if term not in source_combined:
+                self.assertNotIn(term, combined)
+
+    def test_candidate_text_does_not_use_shall_or_must_unless_quoted(self) -> None:
+        self._setup_ready_for_extract()
+        report = extract_requirements_draft(self.project, "slither-demo", "slither-plan-v1")
+        for candidate in report.candidates:
+            lowered = candidate.candidate_text.lower()
+            if "shall" in lowered and "shall" not in candidate.source_quote_or_reference.lower():
+                self.fail(candidate.candidate_text)
+            if " must " in f" {lowered} " and "must" not in candidate.source_quote_or_reference.lower():
+                self.fail(candidate.candidate_text)
+
+    def test_candidate_text_does_not_include_user_story_form(self) -> None:
+        self._setup_ready_for_extract()
+        report = extract_requirements_draft(self.project, "slither-demo", "slither-plan-v1")
+        combined = "\n".join(c.candidate_text for c in report.candidates)
+        self.assertNotIn("As a user", combined)
+
+    def test_candidate_text_does_not_include_acceptance_criteria_language(self) -> None:
+        self._setup_ready_for_extract()
+        report = extract_requirements_draft(self.project, "slither-demo", "slither-plan-v1")
+        combined = "\n".join(c.candidate_text for c in report.candidates)
+        self.assertNotIn("Given a", combined)
+
+    def test_candidate_text_does_not_include_architecture_choices(self) -> None:
+        self._setup_ready_for_extract()
+        report = extract_requirements_draft(self.project, "slither-demo", "slither-plan-v1")
+        combined = "\n".join(c.candidate_text.lower() for c in report.candidates)
+        self.assertNotIn("selected backend", combined)
+        self.assertNotIn("database", combined)
+
+    def test_candidate_text_does_not_include_implementation_tasks(self) -> None:
+        self._setup_ready_for_extract()
+        report = extract_requirements_draft(self.project, "slither-demo", "slither-plan-v1")
+        combined = "\n".join(c.candidate_text for c in report.candidates)
+        self.assertNotIn("allowed_paths", combined)
+
+    def test_local_agentic_spec_states_draft_non_authority_unvalidated_unapproved(self) -> None:
+        self._setup_ready_for_extract()
+        self._extract()
+        spec = self._local_spec_path().read_text(encoding="utf-8").lower()
+        self.assertIn("draft", spec)
+        self.assertIn("non-authority", spec)
+        self.assertIn("unvalidated", spec)
+        self.assertIn("unapproved", spec)
+
+    def test_local_agentic_spec_states_future_validation_requires_separate_command(self) -> None:
+        self._setup_ready_for_extract()
+        self._extract()
+        spec = self._local_spec_path().read_text(encoding="utf-8").lower()
+        self.assertIn("requirements validation", spec)
+        self.assertIn("separate command", spec)
+
+    def test_local_agentic_spec_states_architecture_not_generated(self) -> None:
+        self._setup_ready_for_extract()
+        self._extract()
+        spec = self._local_spec_path().read_text(encoding="utf-8")
+        self.assertIn("UNDECIDED_NOT_GENERATED", spec)
+
+    def test_local_agentic_spec_states_implementation_plan_not_generated(self) -> None:
+        self._setup_ready_for_extract()
+        self._extract()
+        spec = self._local_spec_path().read_text(encoding="utf-8")
+        self.assertIn("## Implementation Plan", spec)
+        self.assertIn("NOT_GENERATED", spec)
+
+    def test_local_agentic_spec_states_planning_run_slice_not_generated(self) -> None:
+        self._setup_ready_for_extract()
+        self._extract()
+        spec = self._local_spec_path().read_text(encoding="utf-8")
+        self.assertIn("## PLANNING_RUN_SLICE", spec)
+        self.assertIn("NOT_GENERATED", spec)
+
+    def test_local_agentic_spec_states_workspace_not_validated_or_approved(self) -> None:
+        self._setup_ready_for_extract()
+        self._extract()
+        spec = self._local_spec_path().read_text(encoding="utf-8").lower()
+        self.assertIn("not validated or approved", spec)
+
+    def test_local_agentic_spec_states_runner_executor_not_invoked(self) -> None:
+        self._setup_ready_for_extract()
+        self._extract()
+        spec = self._local_spec_path().read_text(encoding="utf-8").lower()
+        self.assertIn("not created or invoked", spec)
+
+    def test_refuses_missing_workspace(self) -> None:
+        bare = Path(tempfile.mkdtemp())
+        try:
+            code, output = self._run(
+                ["orchestrator", "extract-requirements-draft", "slither-demo", str(bare), "--plan-id", "slither-plan-v1"]
+            )
+            self.assertEqual(code, 1)
+            self.assertIn("no workspace found", output.lower())
+        finally:
+            import shutil
+            shutil.rmtree(bare)
+
+    def test_refuses_missing_intake(self) -> None:
+        code, output = self._run(
+            ["orchestrator", "extract-requirements-draft", "missing", str(self.project), "--plan-id", "slither-plan-v1"]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("goal intake artifact not found", output.lower())
+
+    def test_refuses_invalid_intake(self) -> None:
+        path = self._artifact_path("bad-intake")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{", encoding="utf-8")
+        code, output = self._extract("bad-intake")
+        self.assertEqual(code, 1)
+
+    def test_refuses_missing_planning_workspace(self) -> None:
+        self._authorize_slither()
+        code, output = self._extract()
+        self.assertEqual(code, 1)
+        self.assertIn("planning workspace not found", output.lower())
+
+    def test_refuses_non_draft_planning_workspace(self) -> None:
+        self._setup_ready_for_extract()
+        manifest = self._workspace() / "manifest.json"
+        data = json.loads(manifest.read_text())
+        data["status"] = "APPROVED"
+        manifest.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        code, output = self._extract()
+        self.assertEqual(code, 1)
+        self.assertIn("must be DRAFT", output)
+
+    def test_refuses_failed_requirements_extraction_execution_check(self) -> None:
+        self._setup_ready_for_decision()
+        code, output = self._extract()
+        self.assertEqual(code, 1)
+        self.assertIn("execution check not confirmed", output.lower())
+
+    def test_refuses_latest_owner_request_more_context(self) -> None:
+        self._setup_ready_for_decision()
+        self._decide(decision="REQUEST_MORE_CONTEXT", decision_id="req-ext-a", summary="Need context.")
+        code, output = self._extract()
+        self.assertEqual(code, 1)
+        self.assertIn("execution check not confirmed", output.lower())
+
+    def test_refuses_latest_owner_block_requirements_extraction(self) -> None:
+        self._setup_ready_for_decision()
+        self._decide(decision="BLOCK_REQUIREMENTS_EXTRACTION", decision_id="req-ext-b", summary="Blocked.")
+        code, output = self._extract()
+        self.assertEqual(code, 1)
+        self.assertIn("execution check not confirmed", output.lower())
+
+    def test_refuses_stale_incoherent_owner_authorize(self) -> None:
+        self._setup_ready_for_extract()
+        path = self._requirements_extraction_decision_path("slither-demo", "slither-plan-v1", "req-ext-owner-v1")
+        artifact = json.loads(path.read_text())
+        artifact["source_requirements_extraction_scaffold_status"] = "WRONG"
+        path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
+        code, output = self._extract()
+        self.assertEqual(code, 1)
+        self.assertIn("execution check not confirmed", output.lower())
+
+    def test_refuses_incoherent_requirements_extraction_scaffold(self) -> None:
+        self._setup_ready_for_extract()
+        self._local_spec_path().write_text(
+            self._local_spec_path().read_text(encoding="utf-8").replace("not performed", "REMOVED"),
+            encoding="utf-8",
+        )
+        code, output = self._extract()
+        self.assertEqual(code, 1)
+        self.assertIn("execution check not confirmed", output.lower())
+
+    def test_refuses_missing_local_agentic_spec_md(self) -> None:
+        self._setup_ready_for_extract()
+        self._local_spec_path().unlink()
+        code, output = self._extract()
+        self.assertEqual(code, 1)
+        self.assertIn("execution check not confirmed", output.lower())
+
+    def test_refuses_local_agentic_spec_not_requirements_extraction_scaffold(self) -> None:
+        self._setup_ready_for_extract()
+        local_spec = self._local_spec_path()
+        local_spec.write_text(
+            local_spec.read_text(encoding="utf-8").replace(
+                "REQUIREMENTS_EXTRACTION_SCAFFOLD_NON_AUTHORITY", "APPROVED"
+            ),
+            encoding="utf-8",
+        )
+        code, output = self._extract()
+        self.assertEqual(code, 1)
+        self.assertIn("execution check not confirmed", output.lower())
+
+    def test_refuses_local_agentic_spec_already_containing_requirements(self) -> None:
+        self._setup_ready_for_extract()
+        local_spec = self._local_spec_path()
+        local_spec.write_text(
+            local_spec.read_text(encoding="utf-8") + "\nThe system shall handle login.\n",
+            encoding="utf-8",
+        )
+        code, output = self._extract()
+        self.assertEqual(code, 1)
+        self.assertIn("execution check not confirmed", output.lower())
+
+    def test_refuses_local_agentic_spec_already_containing_draft_req(self) -> None:
+        self._setup_ready_for_extract()
+        local_spec = self._local_spec_path()
+        local_spec.write_text(local_spec.read_text(encoding="utf-8") + "\nDRAFT-REQ-999\n", encoding="utf-8")
+        code, output = self._extract()
+        self.assertEqual(code, 1)
+        lowered = output.lower()
+        self.assertTrue(
+            "already contains requirements draft" in lowered
+            or "execution check not confirmed" in lowered
+        )
+
+    def test_refuses_local_agentic_spec_already_containing_req_001(self) -> None:
+        self._setup_ready_for_extract()
+        local_spec = self._local_spec_path()
+        local_spec.write_text(local_spec.read_text(encoding="utf-8") + "\nREQ-001\n", encoding="utf-8")
+        code, output = self._extract()
+        self.assertEqual(code, 1)
+        self.assertIn("execution check not confirmed", output.lower())
+
+    def test_refuses_local_agentic_spec_already_containing_nfr_001(self) -> None:
+        self._setup_ready_for_extract()
+        before_tracked = self._tracked_artifact_paths()
+        local_spec = self._local_spec_path()
+        local_spec.write_text(local_spec.read_text(encoding="utf-8") + "\nNFR-001\n", encoding="utf-8")
+        after_append = local_spec.read_bytes()
+        code, output = self._extract()
+        self.assertEqual(code, 1)
+        self.assertIn("execution check not confirmed", output.lower())
+        self.assertEqual(after_append, local_spec.read_bytes())
+        self.assertFalse(self._requirements_draft_provenance_path().exists())
+        for path, content in before_tracked.items():
+            self.assertEqual(content, path.read_bytes())
+
+    def test_refuses_local_agentic_spec_already_containing_user_stories(self) -> None:
+        self._setup_ready_for_extract()
+        local_spec = self._local_spec_path()
+        local_spec.write_text(local_spec.read_text(encoding="utf-8") + "\nAs a user I want login.\n", encoding="utf-8")
+        code, output = self._extract()
+        self.assertEqual(code, 1)
+        self.assertIn("execution check not confirmed", output.lower())
+
+    def test_refuses_local_agentic_spec_already_containing_acceptance_criteria(self) -> None:
+        self._setup_ready_for_extract()
+        local_spec = self._local_spec_path()
+        local_spec.write_text(local_spec.read_text(encoding="utf-8") + "\nGiven a user When login Then success.\n", encoding="utf-8")
+        code, output = self._extract()
+        self.assertEqual(code, 1)
+        self.assertIn("execution check not confirmed", output.lower())
+
+    def test_refuses_local_agentic_spec_already_containing_architecture_decision_language(self) -> None:
+        self._setup_ready_for_extract()
+        local_spec = self._local_spec_path()
+        local_spec.write_text(local_spec.read_text(encoding="utf-8") + "\nSelected backend: Node.js\n", encoding="utf-8")
+        code, output = self._extract()
+        self.assertEqual(code, 1)
+        self.assertIn("execution check not confirmed", output.lower())
+
+    def test_refuses_local_agentic_spec_already_containing_implementation_tasks(self) -> None:
+        self._setup_ready_for_extract()
+        local_spec = self._local_spec_path()
+        local_spec.write_text(
+            local_spec.read_text(encoding="utf-8") + "\n## Implementation Tasks\n\n- Task one\n",
+            encoding="utf-8",
+        )
+        code, output = self._extract()
+        self.assertEqual(code, 1)
+        self.assertIn("execution check not confirmed", output.lower())
+
+    def test_refuses_local_agentic_spec_already_containing_planning_run_slice_content(self) -> None:
+        self._setup_ready_for_extract()
+        local_spec = self._local_spec_path()
+        local_spec.write_text(
+            local_spec.read_text(encoding="utf-8") + '\n"artifact_type": "PLANNING_RUN_SLICE"\n',
+            encoding="utf-8",
+        )
+        code, output = self._extract()
+        self.assertEqual(code, 1)
+        self.assertIn("execution check not confirmed", output.lower())
+
+    def test_refuses_modified_implementation_plan(self) -> None:
+        self._setup_ready_for_extract()
+        self._implementation_plan_path().write_text("# modified\n", encoding="utf-8")
+        code, output = self._extract()
+        self.assertEqual(code, 1)
+        self.assertIn("execution check not confirmed", output.lower())
+
+    def test_refuses_modified_planning_audit(self) -> None:
+        self._setup_ready_for_extract()
+        self._planning_audit_path().write_text("# modified\n", encoding="utf-8")
+        code, output = self._extract()
+        self.assertEqual(code, 1)
+        self.assertIn("execution check not confirmed", output.lower())
+
+    def test_refuses_missing_context_transport_json(self) -> None:
+        self._setup_ready_for_extract()
+        self._transport_json_path().unlink()
+        code, output = self._extract()
+        self.assertEqual(code, 1)
+        self.assertIn("context transport json not found", output.lower())
+
+    def test_refuses_malformed_context_transport_json(self) -> None:
+        self._setup_ready_for_extract()
+        self._transport_json_path().write_text("{bad", encoding="utf-8")
+        code, output = self._extract()
+        self.assertEqual(code, 1)
+        self.assertIn("invalid context transport json", output.lower())
+
+    def test_refuses_missing_context_pack_md(self) -> None:
+        self._setup_ready_for_extract()
+        self._context_pack_path().unlink()
+        code, output = self._extract()
+        self.assertEqual(code, 1)
+        self.assertIn("context-pack.md missing", output.lower())
+
+    def test_refuses_existing_requirements_draft_provenance_and_does_not_overwrite(self) -> None:
+        self._setup_ready_for_extract()
+        self._extract()
+        before = self._requirements_draft_provenance_path().read_bytes()
+        code, output = self._extract()
+        self.assertEqual(code, 1)
+        self.assertIn("requirements draft provenance already exists", output.lower())
+        self.assertEqual(before, self._requirements_draft_provenance_path().read_bytes())
+
+    def test_refuses_invalid_plan_id(self) -> None:
+        self._setup_ready_for_extract()
+        code, output = self._run(
+            ["orchestrator", "extract-requirements-draft", "slither-demo", str(self.project), "--plan-id", "bad plan"]
+        )
+        self.assertEqual(code, 1)
+
+    def test_refuses_path_escape_intake_id(self) -> None:
+        code, output = self._run(
+            ["orchestrator", "extract-requirements-draft", "../evil", str(self.project), "--plan-id", "slither-plan-v1"]
+        )
+        self.assertEqual(code, 1)
+
+    def test_preserves_goal_intake_byte_for_byte(self) -> None:
+        self._setup_ready_for_extract()
+        before = self._tracked_artifact_paths()
+        self._extract()
+        self.assertEqual(before[self._artifact_path("slither-demo")], self._artifact_path("slither-demo").read_bytes())
+
+    def test_preserves_clarification_artifacts_byte_for_byte(self) -> None:
+        self._setup_ready_for_extract()
+        before = self._tracked_artifact_paths()
+        self._extract()
+        path = self._clarification_path("slither-demo", "scope-v1")
+        self.assertEqual(before[path], path.read_bytes())
+
+    def test_preserves_readiness_decision_artifacts_byte_for_byte(self) -> None:
+        self._setup_ready_for_extract()
+        before = self._tracked_artifact_paths()
+        self._extract()
+        path = self._readiness_decision_path("slither-demo", "owner-v1")
+        self.assertEqual(before[path], path.read_bytes())
+
+    def test_preserves_orchestrator_provenance_byte_for_byte(self) -> None:
+        self._setup_ready_for_extract()
+        before = self._tracked_artifact_paths()
+        self._extract()
+        path = self._provenance_path()
+        self.assertEqual(before[path], path.read_bytes())
+
+    def test_preserves_context_transport_json_byte_for_byte(self) -> None:
+        self._setup_ready_for_extract()
+        before = self._tracked_artifact_paths()
+        self._extract()
+        path = self._transport_json_path()
+        self.assertEqual(before[path], path.read_bytes())
+
+    def test_preserves_context_transport_markdown_byte_for_byte(self) -> None:
+        self._setup_ready_for_extract()
+        before = self._tracked_artifact_paths()
+        self._extract()
+        path = self._transport_md_path()
+        self.assertEqual(before[path], path.read_bytes())
+
+    def test_preserves_context_pack_draft_provenance_byte_for_byte(self) -> None:
+        self._setup_ready_for_extract()
+        before = self._tracked_artifact_paths()
+        self._extract()
+        path = self._draft_provenance_path()
+        self.assertEqual(before[path], path.read_bytes())
+
+    def test_preserves_local_agentic_spec_scaffold_provenance_byte_for_byte(self) -> None:
+        self._setup_ready_for_extract()
+        before = self._tracked_artifact_paths()
+        self._extract()
+        path = self._scaffold_provenance_path()
+        self.assertEqual(before[path], path.read_bytes())
+
+    def test_preserves_requirements_extraction_scaffold_provenance_byte_for_byte(self) -> None:
+        self._setup_ready_for_extract()
+        before = self._tracked_artifact_paths()
+        self._extract()
+        path = self._requirements_scaffold_provenance_path()
+        self.assertEqual(before[path], path.read_bytes())
+
+    def test_preserves_requirements_extraction_owner_decision_artifacts_byte_for_byte(self) -> None:
+        self._setup_ready_for_extract()
+        before = self._tracked_artifact_paths()
+        self._extract()
+        path = self._requirements_extraction_decision_path("slither-demo", "slither-plan-v1", "req-ext-owner-v1")
+        self.assertEqual(before[path], path.read_bytes())
+
+    def test_preserves_context_pack_md_byte_for_byte(self) -> None:
+        self._setup_ready_for_extract()
+        before = self._tracked_artifact_paths()
+        self._extract()
+        path = self._context_pack_path()
+        self.assertEqual(before[path], path.read_bytes())
+
+    def test_preserves_implementation_plan_md_byte_for_byte(self) -> None:
+        self._setup_ready_for_extract()
+        before = self._tracked_artifact_paths()
+        self._extract()
+        path = self._implementation_plan_path()
+        self.assertEqual(before[path], path.read_bytes())
+
+    def test_preserves_planning_audit_md_byte_for_byte(self) -> None:
+        self._setup_ready_for_extract()
+        before = self._tracked_artifact_paths()
+        self._extract()
+        path = self._planning_audit_path()
+        self.assertEqual(before[path], path.read_bytes())
+
+    def test_does_not_change_planning_workspace_status(self) -> None:
+        self._setup_ready_for_extract()
+        manifest = self._workspace() / "manifest.json"
+        before = manifest.read_bytes()
+        self._extract()
+        self.assertEqual(before, manifest.read_bytes())
+
+    def test_does_not_approve_requirements(self) -> None:
+        self._setup_ready_for_extract()
+        _, output = self._extract()
+        self.assertIn("no requirements approval", output.lower())
+        self.assertNotIn("requirements approved", output.lower())
+
+    def test_does_not_validate_requirements(self) -> None:
+        self._setup_ready_for_extract()
+        _, output = self._extract()
+        self.assertIn("not validated", output.lower())
+
+    def test_does_not_generate_user_stories(self) -> None:
+        self._setup_ready_for_extract()
+        self._extract()
+        spec = self._local_spec_path().read_text(encoding="utf-8")
+        self.assertIn("## User Stories", spec)
+        self.assertIn("NOT_GENERATED", spec)
+        self.assertNotIn("As a user", spec)
+
+    def test_does_not_generate_acceptance_criteria(self) -> None:
+        self._setup_ready_for_extract()
+        self._extract()
+        spec = self._local_spec_path().read_text(encoding="utf-8")
+        self.assertIn("## Acceptance Criteria", spec)
+        self.assertIn("NOT_GENERATED", spec)
+        self.assertNotIn("Given a", spec)
+
+    def test_does_not_generate_architecture_choices(self) -> None:
+        self._setup_ready_for_extract()
+        self._extract()
+        spec = self._local_spec_path().read_text(encoding="utf-8").lower()
+        self.assertIn("undecided", spec)
+        self.assertNotIn("selected backend", spec)
+
+    def test_does_not_generate_implementation_tasks(self) -> None:
+        self._setup_ready_for_extract()
+        self._extract()
+        spec = self._local_spec_path().read_text(encoding="utf-8")
+        self.assertNotIn("allowed_paths", spec)
+
+    def test_does_not_generate_planning_run_slice(self) -> None:
+        self._setup_ready_for_extract()
+        self._extract()
+        spec = self._local_spec_path().read_text(encoding="utf-8")
+        self.assertIn("## PLANNING_RUN_SLICE", spec)
+        self.assertIn("NOT_GENERATED", spec)
+
+    def test_does_not_create_runner_proposals(self) -> None:
+        self._setup_ready_for_extract()
+        runs = self.project / ".agent-os" / "runs"
+        before = list(runs.iterdir())
+        self._extract()
+        self.assertEqual(before, list(runs.iterdir()))
+
+    def test_does_not_create_runs(self) -> None:
+        self._setup_ready_for_extract()
+        runs = self.project / ".agent-os" / "runs"
+        before = list(runs.iterdir())
+        self._extract()
+        self.assertEqual(before, list(runs.iterdir()))
+
+    def test_does_not_invoke_subprocess_executor(self) -> None:
+        self._setup_ready_for_extract()
+        with patch("subprocess.run", side_effect=AssertionError("subprocess invoked")):
+            code, _ = self._extract()
+        self.assertEqual(code, 0)
+
+    def test_does_not_call_planning_progress_transition_decide(self) -> None:
+        self._setup_ready_for_extract()
+        with (
+            patch.object(planning_module, "progress_planning_workspace") as progress,
+            patch.object(planning_module, "transition_planning_workspace") as transition,
+            patch.object(planning_module, "record_planning_owner_decision") as decide,
+        ):
+            self._extract()
+        progress.assert_not_called()
+        transition.assert_not_called()
+        decide.assert_not_called()
+
+    def test_does_not_validate_or_approve_workspace(self) -> None:
+        self._setup_ready_for_extract()
+        before = validate_planning_workspace(self.project, "slither-plan-v1")
+        self._extract()
+        after = validate_planning_workspace(self.project, "slither-plan-v1")
+        self.assertFalse(before.valid)
+        self.assertEqual(before.output, after.output)
+
+    def test_restores_local_agentic_spec_when_provenance_write_fails(self) -> None:
+        self._setup_ready_for_extract()
+        original = self._local_spec_path().read_bytes()
+        with patch("agent_os.orchestrator._write_json", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                extract_requirements_draft(self.project, "slither-demo", "slither-plan-v1")
+        self.assertEqual(original, self._local_spec_path().read_bytes())
+        self.assertFalse(self._requirements_draft_provenance_path().exists())
+
+    def test_cli_help_states_draft_extraction_boundaries(self) -> None:
+        parser = build_parser()
+        orchestrator_parser = next(
+            action for action in parser._actions
+            if isinstance(action, argparse._SubParsersAction) and "orchestrator" in action.choices
+        )
+        orchestrator_sub = next(
+            action for action in orchestrator_parser.choices["orchestrator"]._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        help_text = orchestrator_sub.choices["extract-requirements-draft"].format_help()
+        compact = re.sub(r"\s+", " ", help_text)
+        for phrase in (
+            "draft", "approve", "validate requirements", "user stories",
+            "acceptance criteria", "architecture", "implementation plan", "executor",
+        ):
+            self.assertIn(phrase, compact.lower())
+
+    def test_cli_output_includes_paths_count_status_and_boundary_notes(self) -> None:
+        self._setup_ready_for_extract()
+        code, output = self._extract()
+        self.assertEqual(code, 0)
+        self.assertIn("local agentic spec:", output)
+        self.assertIn("requirements draft provenance:", output)
+        self.assertIn("requirement_candidate_count:", output)
+        self.assertIn(REQUIREMENTS_DRAFT_STATUS, output)
+
+    def test_cli_output_states_draft_non_authority_not_validated_not_approved(self) -> None:
+        self._setup_ready_for_extract()
+        _, output = self._extract()
+        lowered = output.lower()
+        self.assertIn("draft", lowered)
+        self.assertIn("non-authority", lowered)
+        self.assertIn("not validated", lowered)
+        self.assertIn("not approved", lowered)
+
+    def test_existing_commands_unchanged(self) -> None:
+        intake_id = "slither-demo"
+        plan_id = "slither-plan-v1"
+        self._setup_ready_for_extract(intake_id, plan_id)
+        before = self._project_files()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            check_code = main([
+                "orchestrator", "requirements-extraction-execution-check", intake_id, str(self.project),
+                "--plan-id", plan_id,
+            ])
+            preflight_code = main([
+                "orchestrator", "requirements-extraction-preflight", intake_id, str(self.project),
+                "--plan-id", plan_id,
+            ])
+        self.assertEqual(check_code, 0)
+        self.assertEqual(preflight_code, 1)
+        self.assertEqual(
+            before | {p for p in self._project_files() if "requirements-draft" in p},
+            self._project_files(),
+        )
+
+    def test_created_draft_not_confusable_with_approval_architecture_or_runner(self) -> None:
+        self._setup_ready_for_extract()
+        _, output = self._extract()
+        lowered = output.lower()
+        self.assertIn("no requirements approval", lowered)
+        self.assertIn("no architecture generation", lowered)
+        self.assertIn("no runner proposals", lowered)
+
+    def test_no_artifact_claims_requirements_approval(self) -> None:
+        self._setup_ready_for_extract()
+        self._extract()
+        combined = "\n".join(
+            p.read_text(encoding="utf-8").lower()
+            for p in self.project.rglob("*")
+            if p.is_file() and p.suffix in {".md", ".json"}
+        )
+        self.assertNotIn("requirements approved", combined)
+
 
 class OrchestratorDocsGuardTests(unittest.TestCase):
     """Guard doctrine for CORE_ORCHESTRATOR_001 goal-to-planning workspace contract."""

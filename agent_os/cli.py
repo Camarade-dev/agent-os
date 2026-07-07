@@ -16,6 +16,7 @@ from agent_os.orchestrator import (
     create_requirements_extraction_owner_decision,
     check_requirements_extraction_execution_authorization,
     draft_context_pack_from_transport,
+    extract_requirements_draft,
     goal_intake_status,
     preflight_draft_preparation,
     preflight_local_agentic_spec_draft,
@@ -511,6 +512,21 @@ def cmd_orchestrator_requirements_extraction_execution_check(
         == "REQUIREMENTS_EXTRACTION_EXECUTION_CHECK_CONFIRMED_NO_EXTRACTION_PERFORMED"
     )
     return 0 if confirmed else 1
+
+
+def cmd_orchestrator_extract_requirements_draft(args: argparse.Namespace) -> int:
+    project = _project_path(args.path)
+    try:
+        report = extract_requirements_draft(
+            project,
+            args.intake_id,
+            args.plan_id,
+        )
+    except (FileNotFoundError, FileExistsError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(report.output)
+    return 0
 
 
 def cmd_orchestrator_clarify(args: argparse.Namespace) -> int:
@@ -1274,6 +1290,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     orchestrator_requirements_extraction_execution_check_parser.set_defaults(
         func=cmd_orchestrator_requirements_extraction_execution_check
+    )
+
+    orchestrator_extract_requirements_draft_parser = orchestrator_sub.add_parser(
+        "extract-requirements-draft",
+        help="deterministic requirements extraction draft (no approval)",
+        description=(
+            "Write deterministic source-bounded requirement draft candidates into "
+            "local-agentic-spec.md after successful requirements-extraction execution "
+            "check. Does not call an LLM, approve or validate requirements, generate "
+            "user stories or acceptance criteria, generate architecture decisions, "
+            "generate an implementation plan, generate PLANNING_RUN_SLICE, validate "
+            "or approve the workspace, transition status, create runner proposals, "
+            "create runs, or invoke an executor."
+        ),
+    )
+    orchestrator_extract_requirements_draft_parser.add_argument(
+        "intake_id",
+        help="intake identifier (filesystem-safe slug)",
+    )
+    orchestrator_extract_requirements_draft_parser.add_argument(
+        "path",
+        nargs="?",
+        help="target project directory",
+    )
+    orchestrator_extract_requirements_draft_parser.add_argument(
+        "--plan-id",
+        required=True,
+        help="planning workspace identifier (filesystem-safe slug)",
+    )
+    orchestrator_extract_requirements_draft_parser.set_defaults(
+        func=cmd_orchestrator_extract_requirements_draft
     )
 
     return parser
