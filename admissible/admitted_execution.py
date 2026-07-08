@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -196,6 +197,45 @@ def validate_executed_after_admission_record(
         )
 
     _validate_execution_basis(record.get("execution_basis"), decision=decision, action_id=action_id)
+    validate_execution_evidence_traceability(record, candidate)
+
+
+def _significant_terms_from_tool_or_command(tool_or_command: str) -> list[str]:
+    terms: list[str] = []
+    for part in re.split(r"[\s/.,;:()]+", tool_or_command.lower()):
+        part = part.strip()
+        if not part:
+            continue
+        if part.startswith(".") or "." in part:
+            terms.append(part)
+        elif len(part) >= 4:
+            terms.append(part)
+    return terms
+
+
+def validate_execution_evidence_traceability(
+    record: dict[str, Any],
+    candidate: dict[str, Any],
+) -> None:
+    """Require execution evidence to refer to the same operation as the action candidate."""
+    action_id = record.get("action_id") or candidate.get("action_id") or "?"
+    tool_or_command = str(candidate.get("tool_or_command") or "")
+    terms = _significant_terms_from_tool_or_command(tool_or_command)
+    if not terms:
+        return
+
+    evidence = record.get("execution_evidence") or {}
+    evidence_text = " ".join(
+        str(evidence.get(key) or "") for key in ("notes", "verification")
+    ).lower()
+
+    matched = sum(1 for term in terms if term in evidence_text)
+    required_matches = min(2, len(terms))
+    if matched < required_matches:
+        raise AdmittedExecutionValidationError(
+            f"{action_id}: execution evidence does not trace to action candidate "
+            f"{tool_or_command!r} (matched {matched}/{len(terms)} significant terms)"
+        )
 
 
 def validate_attestation_fixture(
