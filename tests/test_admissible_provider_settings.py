@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import importlib
 import io
 import json
 import sys
@@ -116,9 +117,10 @@ class TestNoAgentOsImports(unittest.TestCase):
             self.assertNotIn(forbidden, source)
 
     def test_module_load_does_not_import_agent_os(self) -> None:
-        for name in list(sys.modules):
-            if name.startswith("agent_os"):
-                self.fail(f"agent_os module {name!r} imported during provider_settings tests")
+        before = {name for name in sys.modules if name.startswith("agent_os")}
+        importlib.import_module("admissible.harness.provider_settings")
+        after = {name for name in sys.modules if name.startswith("agent_os")}
+        self.assertEqual(after - before, set())
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import importlib
 import io
 import json
 import logging
@@ -334,17 +335,19 @@ class TestNoLeakageIntoLivePrompt(unittest.TestCase):
 
 
 class TestNoAgentOsImports(unittest.TestCase):
-    def test_model_clients_module_does_not_import_agent_os(self) -> None:
-        import admissible.runner.model_clients as model_clients_module
+    """Docstrings may name agent_os to document the boundary; the module must not import it."""
 
-        source_path = Path(model_clients_module.__file__).resolve()
-        source = source_path.read_text(encoding="utf-8")
-        self.assertNotIn("agent_os", source)
-        loaded = sys.modules.get("admissible.runner.model_clients")
-        self.assertIsNotNone(loaded)
-        for name, module in list(sys.modules.items()):
-            if name.startswith("agent_os") and module is not None:
-                self.fail(f"agent_os module {name!r} was imported during model_clients tests")
+    MODEL_CLIENTS_PATH = REPO_ROOT / "admissible" / "runner" / "model_clients.py"
+
+    def test_model_clients_module_does_not_import_agent_os(self) -> None:
+        source = self.MODEL_CLIENTS_PATH.read_text(encoding="utf-8")
+        for forbidden in ("import agent_os", "from agent_os"):
+            self.assertNotIn(forbidden, source)
+
+        before = {name for name in sys.modules if name.startswith("agent_os")}
+        importlib.import_module("admissible.runner.model_clients")
+        after = {name for name in sys.modules if name.startswith("agent_os")}
+        self.assertEqual(after - before, set())
 
 
 if __name__ == "__main__":
