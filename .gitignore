@@ -31,3 +31,5 @@ benchmark/reports/live_demo_trace.json
 benchmark/reports/live_demo_trace.html
 benchmark/reports/hf_demo_trace.json
 benchmark/reports/hf_demo_trace.html
+benchmark/reports/gemini_demo_trace.json
+benchmark/reports/gemini_demo_trace.html

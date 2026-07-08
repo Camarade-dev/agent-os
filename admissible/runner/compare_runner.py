@@ -22,6 +22,9 @@ Supported systems:
 - frontier_direct_hf: admissible.runner.baseline_runner
   .run_frontier_direct_baseline, called with a Hugging Face Inference Providers
   client built from ADMISSIBLE_HF_* environment variables. Opt-in only.
+- frontier_direct_gemini: admissible.runner.baseline_runner
+  .run_frontier_direct_baseline, called with a Google Gemini generateContent
+  client built from ADMISSIBLE_GEMINI_* environment variables. Opt-in only.
 
 Also runnable as a CLI:
 
@@ -44,6 +47,7 @@ from admissible.evaluator.rules_only import evaluate_envelope
 from admissible.runner.baseline_runner import ModelClient, run_frontier_direct_baseline
 from admissible.runner.model_clients import (
     FixedResponseModelClient,
+    build_gemini_model_client_from_env,
     build_huggingface_model_client_from_env,
     build_model_client_from_env,
 )
@@ -55,6 +59,7 @@ SUPPORTED_SYSTEMS: tuple[str, ...] = (
     "frontier_direct_mock",
     "frontier_direct_live",
     "frontier_direct_hf",
+    "frontier_direct_gemini",
 )
 
 FRONTIER_MOCK_NOTE = "frontier_direct_mock is a plumbing/mock baseline, not a model-performance result."
@@ -66,10 +71,15 @@ FRONTIER_HF_NOTE = (
     "frontier_direct_hf uses Hugging Face Inference Providers; "
     "results are not stable benchmark claims."
 )
+FRONTIER_GEMINI_NOTE = (
+    "frontier_direct_gemini uses Google Gemini generateContent; "
+    "results are not stable benchmark claims."
+)
 
 DEFAULT_FRONTIER_MOCK_SYSTEM_ID = "frontier_direct_mock_v0"
 DEFAULT_FRONTIER_LIVE_SYSTEM_ID = "frontier_direct_live_v0"
 DEFAULT_FRONTIER_HF_SYSTEM_ID = "frontier_direct_hf_v0"
+DEFAULT_FRONTIER_GEMINI_SYSTEM_ID = "frontier_direct_gemini_v0"
 
 
 def _envelope_id(envelope: dict) -> str:
@@ -195,6 +205,27 @@ def _run_frontier_direct_hf(
     ]
 
 
+def _run_frontier_direct_gemini(
+    envelopes: list[dict],
+    *,
+    model_client: ModelClient | None = None,
+) -> list[dict]:
+    if model_client is None:
+        model_client = build_gemini_model_client_from_env()
+
+    return [
+        _run_with_envelope_context(
+            "frontier_direct_gemini",
+            case_index,
+            envelope,
+            lambda env, mc=model_client: run_frontier_direct_baseline(
+                env, model_client=mc, system_id=DEFAULT_FRONTIER_GEMINI_SYSTEM_ID
+            ),
+        )
+        for case_index, envelope in enumerate(envelopes)
+    ]
+
+
 def run_system_on_envelopes(
     system: str,
     envelopes: list[dict],
@@ -222,6 +253,8 @@ def run_system_on_envelopes(
         return _run_frontier_direct_live(envelopes)
     if system == "frontier_direct_hf":
         return _run_frontier_direct_hf(envelopes)
+    if system == "frontier_direct_gemini":
+        return _run_frontier_direct_gemini(envelopes)
     raise ValueError(
         f"unknown system: {system!r}; supported systems: {SUPPORTED_SYSTEMS}"
     )
@@ -259,6 +292,8 @@ def gather_comparison_data(
             summary["notes"] = FRONTIER_LIVE_NOTE
         if system == "frontier_direct_hf":
             summary["notes"] = FRONTIER_HF_NOTE
+        if system == "frontier_direct_gemini":
+            summary["notes"] = FRONTIER_GEMINI_NOTE
         results[system] = summary
 
     comparison = {
@@ -275,6 +310,8 @@ def gather_comparison_data(
         comparison_notes.append(FRONTIER_LIVE_NOTE)
     if "frontier_direct_hf" in systems:
         comparison_notes.append(FRONTIER_HF_NOTE)
+    if "frontier_direct_gemini" in systems:
+        comparison_notes.append(FRONTIER_GEMINI_NOTE)
     if comparison_notes:
         comparison["notes"] = " ".join(comparison_notes)
     return comparison, envelopes, gold_by_envelope_id, decisions_by_system

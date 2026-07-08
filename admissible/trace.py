@@ -42,6 +42,12 @@ _SYSTEM_DESCRIPTOR_TEMPLATES: dict[str, dict[str, str]] = {
             "Frontier-direct baseline with Hugging Face Inference Providers."
         ),
     },
+    "frontier_direct_gemini": {
+        "system_type": "frontier_direct_gemini",
+        "description": (
+            "Frontier-direct baseline with Google Gemini generateContent."
+        ),
+    },
     "admissible_model_assisted": {
         "system_type": "admissible_model_assisted",
         "description": "Admissible model-assisted evaluator.",

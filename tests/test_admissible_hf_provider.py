@@ -138,6 +138,7 @@ class TestHuggingFaceChatCompletionsModelClient(unittest.TestCase):
         self.assertEqual(body["messages"][1], {"role": "user", "content": "hello world"})
         self.assertEqual(body["temperature"], 0)
         self.assertEqual(body["max_tokens"], DEFAULT_HF_MAX_TOKENS)
+        self.assertEqual(body["reasoning_effort"], "low")
         self.assertEqual(body["response_format"], ADMISSIBLE_DECISION_OUTPUT_RESPONSE_FORMAT)
 
     def test_request_payload_uses_configurable_max_tokens(self) -> None:
@@ -386,6 +387,34 @@ class TestHuggingFaceChatCompletionsModelClient(unittest.TestCase):
         self.assertIn("reasoning_content_present", message)
         self.assertNotIn("ALLOW", message)
 
+    def test_length_finish_with_reasoning_only_suggests_increasing_max_tokens(self) -> None:
+        client = self._client()
+        payload = {
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {
+                        "content": None,
+                        "reasoning_content": "x" * 100,
+                    },
+                }
+            ],
+            "usage": {"completion_tokens": 1500, "prompt_tokens": 2000, "total_tokens": 3500},
+        }
+        with mock.patch(
+            "urllib.request.urlopen",
+            return_value=mock.Mock(
+                __enter__=lambda self: self,
+                __exit__=lambda *args: None,
+                read=lambda: json.dumps(payload).encode("utf-8"),
+            ),
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                client.complete("p")
+        message = str(ctx.exception)
+        self.assertIn("ADMISSIBLE_HF_MAX_TOKENS", message)
+        self.assertIn("reasoning before producing", message)
+
     def test_trailing_nuls_stripped_from_choices_content(self) -> None:
         client = self._client()
         payload = {
@@ -444,6 +473,26 @@ class TestHuggingFaceChatCompletionsModelClient(unittest.TestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 client.complete("p")
         self.assertNotIn(SECRET_TOKEN, str(ctx.exception))
+        self.assertIn("ADMISSIBLE_HF_TOKEN", str(ctx.exception))
+
+    def test_http_402_includes_billing_hint(self) -> None:
+        import urllib.error
+
+        client = self._client()
+        http_error = urllib.error.HTTPError(
+            url=DEFAULT_HF_BASE_URL,
+            code=402,
+            msg="Payment Required",
+            hdrs=mock.Mock(),
+            fp=io.BytesIO(b'{"error":"insufficient credits"}'),
+        )
+        with mock.patch("urllib.request.urlopen", side_effect=http_error):
+            with self.assertRaises(RuntimeError) as ctx:
+                client.complete("p")
+        message = str(ctx.exception)
+        self.assertIn("HTTP 402", message)
+        self.assertIn("billing", message.lower())
+        self.assertNotIn("insufficient credits", message)
 
     def test_timeout_env_var_parses(self) -> None:
         self.assertEqual(_parse_hf_timeout_seconds("90"), 90.0)

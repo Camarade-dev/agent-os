@@ -39,6 +39,7 @@ from typing import Any, Protocol
 
 from admissible.runner.model_clients import (
     FixedResponseModelClient,
+    build_gemini_model_client_from_env,
     build_huggingface_model_client_from_env,
     build_model_client_from_env,
 )
@@ -458,7 +459,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     provider_group.add_argument(
         "--provider",
-        choices=["env-http", "hf"],
+        choices=["env-http", "hf", "gemini"],
         help="Use a live model provider configured via environment variables.",
     )
     parser.add_argument(
@@ -480,6 +481,8 @@ def main(argv: list[str] | None = None) -> int:
         model_client = FixedResponseModelClient(response_text)
     elif args.provider == "hf":
         model_client = build_huggingface_model_client_from_env()
+    elif args.provider == "gemini":
+        model_client = build_gemini_model_client_from_env()
     else:
         model_client = build_model_client_from_env()
 

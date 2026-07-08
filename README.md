@@ -86,6 +86,61 @@ python -m admissible.runner.demo_trace `
 
 This remains a Tier 1 enriched smoke trace, not a benchmark result.
 
+### Gemini live provider
+
+For a free-tier Google Gemini auxiliary baseline (extractor/parser-style frontier
+direct), configure:
+
+```powershell
+$env:ADMISSIBLE_GEMINI_API_KEY="AIza..."
+$env:ADMISSIBLE_GEMINI_MODEL="gemini-2.5-flash"
+$env:ADMISSIBLE_GEMINI_MAX_OUTPUT_TOKENS="4096"
+$env:ADMISSIBLE_GEMINI_THINKING_BUDGET="0"
+$env:ADMISSIBLE_GEMINI_REQUEST_DELAY_SECONDS="6"
+```
+
+`gemini-2.5-flash` spends internal thinking tokens inside the same
+`maxOutputTokens` budget. Keep `ADMISSIBLE_GEMINI_THINKING_BUDGET=0` for
+structured JSON demos, and use 4096+ output tokens for longer envelopes.
+
+`ADMISSIBLE_GEMINI_API_KEY` is preferred. `GEMINI_API_KEY` is accepted as an
+optional fallback if you already export it in your shell. Do not commit keys;
+`.admissible/` is gitignored for local settings only.
+
+Then run:
+
+```powershell
+python -m admissible.runner.demo_trace `
+  --demo-pack benchmark/reports/demo-pack.json `
+  --gold benchmark/annotations/gold_labels.jsonl `
+  --provider gemini `
+  --trace-out benchmark/reports/gemini_demo_trace.json `
+  --html-out benchmark/reports/gemini_demo_trace.html
+```
+
+macOS/Linux/Git Bash equivalent:
+
+```bash
+export ADMISSIBLE_GEMINI_API_KEY="AIza..."
+export ADMISSIBLE_GEMINI_MODEL="gemini-2.5-flash"
+python -m admissible.runner.demo_trace \
+  --demo-pack benchmark/reports/demo-pack.json \
+  --gold benchmark/annotations/gold_labels.jsonl \
+  --provider gemini \
+  --trace-out benchmark/reports/gemini_demo_trace.json \
+  --html-out benchmark/reports/gemini_demo_trace.html
+```
+
+Single-case smoke test:
+
+```powershell
+python -m admissible.runner.baseline_runner `
+  --case benchmark/cases/tier_1_enriched/customer_communication/customer_refund_draft_allowed.envelope.json `
+  --provider gemini
+```
+
+This remains a Tier 1 enriched smoke trace, not a benchmark result.
+
 Optional local settings helper:
 
 ```bash
@@ -133,7 +188,7 @@ Existing Agent OS CLI/orchestrator concepts are not automatically Admissible ben
 
 ### Next technical step
 
-A live model provider boundary is available behind `ModelClient` (`admissible.runner.model_clients`). The default demo and test paths remain mock-only; optional live runs use `--provider hf` (Hugging Face), `--provider env-http`, or compare-runner systems `frontier_direct_hf` / `frontier_direct_live` when environment variables are set.
+A live model provider boundary is available behind `ModelClient` (`admissible.runner.model_clients`). The default demo and test paths remain mock-only; optional live runs use `--provider hf` (Hugging Face), `--provider gemini` (Google Gemini), `--provider env-http`, or compare-runner systems `frontier_direct_hf` / `frontier_direct_gemini` / `frontier_direct_live` when environment variables are set.
 
 ## What problem it solves
 
