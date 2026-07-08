@@ -133,6 +133,7 @@ def _render_timeline(trace: dict) -> str:
     <section class="timeline-section">
       <h2>Admission Timeline</h2>
       <p>Action candidates encountered during the long run (fixture-backed in v0):</p>
+      <div class="timeline-wrapper">
       <table class="timeline">
         <thead>
           <tr>
@@ -147,6 +148,7 @@ def _render_timeline(trace: dict) -> str:
         </thead>
         <tbody>{''.join(rows)}</tbody>
       </table>
+      </div>
     </section>
     """
 

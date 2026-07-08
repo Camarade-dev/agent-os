@@ -30,6 +30,7 @@ DEMO_PACK_PATH = REPO_ROOT / "benchmark" / "terminal_agent_dry_run" / "demo-pack
 BUILDER_FIXTURES_DIR = (
     REPO_ROOT / "benchmark" / "long_run_scenarios" / "cursor_slither_demo" / "fixtures"
 )
+REAL_CAPTURE_FIXTURES_DIR = BUILDER_FIXTURES_DIR / "real_captures"
 
 
 class TestOperationalMapping(unittest.TestCase):
@@ -107,6 +108,7 @@ class TestTruthConsoleHtml(unittest.TestCase):
         self.assertIn("No side effect executed", self.html)
         self.assertIn("Raw agent output is unverified", self.html)
         self.assertIn("Agent output is not authority", self.html)
+        self.assertIn("high-contrast-light", self.html)
 
     def test_contains_all_three_actions(self) -> None:
         self.assertIn("deploy.production", self.html)
@@ -166,10 +168,18 @@ class TestBuilderBackedTruthConsole(unittest.TestCase):
 
     def test_builder_trace_has_actions_and_raw_output(self) -> None:
         self.assertGreaterEqual(len(self.trace["action_candidates"]), 4)
-        self.assertEqual(len(self.trace["action_candidates"]), len(self.trace["agent_steps"]))
+        self.assertGreaterEqual(
+            len(self.trace["action_candidates"]),
+            len(self.trace["agent_steps"]),
+        )
         self.assertIn("Raw agent output is unverified", self.html)
         # A sample raw fixture line should appear in HTML.
         self.assertIn("npm install", self.html)
+
+    def test_high_contrast_styling_markers(self) -> None:
+        self.assertIn('class="truth-console-v0 high-contrast-light"', self.html)
+        self.assertIn("timeline-wrapper", self.html)
+        self.assertIn("--tc-text", self.html)
 
     def test_builder_extraction_metadata_present(self) -> None:
         for candidate in self.trace["action_candidates"]:
@@ -202,6 +212,27 @@ class TestBuilderBackedTruthConsole(unittest.TestCase):
             self.assertTrue(trace_out.is_file())
             loaded = json.loads(trace_out.read_text(encoding="utf-8"))
             self.assertEqual(loaded["long_run"]["run_id"], trace["long_run"]["run_id"])
+
+
+class TestRealCaptureBuilderTruthConsole(unittest.TestCase):
+    def setUp(self) -> None:
+        self.assertTrue(REAL_CAPTURE_FIXTURES_DIR.is_dir())
+        self.trace = build_truth_trace_from_raw_output_fixtures(
+            fixtures_dir=str(REAL_CAPTURE_FIXTURES_DIR),
+            repo_root=str(REPO_ROOT),
+        )
+        self.html = render_truth_console_html(self.trace)
+
+    def test_real_capture_yields_multiple_actions_in_console(self) -> None:
+        self.assertGreater(len(self.trace["action_candidates"]), 1)
+        self.assertGreaterEqual(len(self.trace["action_candidates"]), 20)
+        self.assertIn("No side effect executed", self.html)
+        self.assertIn("Raw agent output is unverified", self.html)
+        self.assertIn("Fix input state on tab/window blur", self.html)
+
+    def test_real_capture_console_high_contrast(self) -> None:
+        self.assertIn("high-contrast-light", self.html)
+        self.assertIn("timeline-wrapper", self.html)
 
 
 class TestTerminalDryRunStillWorks(unittest.TestCase):

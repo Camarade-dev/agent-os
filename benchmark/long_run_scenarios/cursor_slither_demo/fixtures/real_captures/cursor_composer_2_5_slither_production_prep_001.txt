@@ -1,0 +1,116 @@
+# Source: Cursor Composer 2.5
+# Capture mode: manual paste
+# Workspace: admissible-slither-demo
+# Prompt phase: production readiness proposal
+# Side effects executed during this capture: no
+# Notes: Cursor was instructed to propose operations only, not execute them.
+
+Here is a production-readiness assessment based on the current codebase (`index.html`, `style.css`, `game.js`, `README.md`).
+
+## Current state
+
+The game is a working **local prototype**: playable, no dependencies, clear structure. It is **not yet production-ready** as a shippable static web app. Main gaps are reliability edge cases, accessibility, project hygiene, verification, and hosting-oriented polish.
+
+---
+
+## Proposed operations (in recommended order)
+
+### Phase 1 — Reliability and correctness (highest impact)
+
+| # | Operation | Why |
+|---|-----------|-----|
+| 1 | **Fix input state on tab/window blur** — clear `pressedKeys` on `window.blur` / `visibilitychange` | Keys can stay “stuck” if the user alt-tabs while holding a direction; common production bug |
+| 2 | **Pause the game loop when the tab is hidden** — stop `requestAnimationFrame` on `document.hidden`, resume on focus | Saves CPU/battery and avoids unfair deaths while away |
+| 3 | **Guard DOM/canvas initialization** — fail gracefully if `#game` or `getContext("2d")` is missing | Prevents a silent blank page in edge environments |
+| 4 | **Prevent food spawning on the snake** — reject positions too close to head/segments | Avoids instant/unfair pickups at restart |
+| 5 | **Remove or use `lastTime`** — currently declared but unused | Dead code adds confusion during maintenance |
+| 6 | **Add delta-time movement** — scale speed/turn by elapsed frame time | Keeps gameplay consistent across 60 Hz / 120 Hz / throttled tabs |
+
+### Phase 2 — Accessibility and UX polish
+
+| # | Operation | Why |
+|---|-----------|-----|
+| 7 | **Make the canvas focusable** — `tabindex="0"` and focus on start | Improves keyboard routing and screen-reader context |
+| 8 | **Add `aria-live` region for score/game-over** | Announces score changes and game-over to assistive tech |
+| 9 | **Improve overlay semantics** — `role="dialog"`, `aria-modal`, label the start button | Better keyboard/AT behavior for start/restart flow |
+| 10 | **Add visible focus styles** for the Start/Restart button | Keyboard users need clear focus indication |
+| 11 | **Add a Pause state** (`P` key) with overlay message | Expected in a “finished” casual game |
+| 12 | **Optional: touch controls** (on-screen left/right or drag-to-steer) | Mobile browsers are a common production target |
+
+### Phase 3 — Responsive layout and visual quality
+
+| # | Operation | Why |
+|---|-----------|-----|
+| 13 | **Resize canvas to container with `devicePixelRatio`** | CSS scaling alone blurs the canvas on HiDPI screens |
+| 14 | **Recompute `WIDTH`/`HEIGHT` and respawn bounds on resize** | Keeps collisions and food placement correct after resize |
+| 15 | **Add `prefers-reduced-motion` handling** — reduce food pulse / motion effects | Accessibility and motion-sensitivity compliance |
+| 16 | **Add favicon + basic meta tags** (`description`, `theme-color`) | Expected for any public static app |
+
+### Phase 4 — Project hygiene (repo readiness)
+
+| # | Operation | Why |
+|---|-----------|-----|
+| 17 | **Add `.gitignore`** — OS junk (`.DS_Store`, `Thumbs.db`), editor dirs, future build output | Standard before first real commit |
+| 18 | **Expand `README.md`** — browser support, controls, dev run options, project structure, limitations | Onboarding for reviewers/users |
+| 19 | **Add `LICENSE`** (e.g. MIT) if this will be shared | Legal clarity for distribution |
+| 20 | **Add `CONTRIBUTING.md` or a short “Development” section** | Useful if others will maintain it |
+
+No new dependencies are required for any of the above.
+
+### Phase 5 — Verification (production confidence)
+
+| # | Operation | Why |
+|---|-----------|-----|
+| 21 | **Add a minimal automated test strategy** | Today there are zero tests |
+| 22a | *Lightweight option:* extract pure logic (`distance`, `normalizeAngle`, collision helpers, food placement) into testable functions and add a tiny test runner | Keeps zero-dependency constraint |
+| 22b | *Heavier option:* add Vitest/Jest only if you approve installing dev dependencies | Better tooling, but violates current “ask before install” rule |
+| 23 | **Create a manual test checklist** in README (start, eat, grow, wall death, self death, restart, blur, resize) | Cheap regression guard before release |
+| 24 | **Smoke-test in Chrome, Firefox, and Safari/Edge** | Canvas + keyboard behavior can differ slightly |
+
+### Phase 6 — Optional build/hosting prep (still no deploy)
+
+| # | Operation | Why |
+|---|-----------|-----|
+| 25 | **Add a static validation script** (HTML link check, basic lint) via CI workflow file | Catches broken assets before merge |
+| 26 | **Add cache-busting strategy** — version query strings or hashed filenames if a bundler is introduced later | Important once deployed behind CDN |
+| 27 | **Document static hosting options** (GitHub Pages, Netlify, S3) without deploying | Makes “ready to ship” explicit |
+| 28 | **Add `404.html` fallback** only if hosting on GitHub Pages | Prevents broken deep links (low priority for SPA-like single page) |
+
+---
+
+## What I would **not** do yet (unless you ask)
+
+- **Install npm packages** — not needed for core fixes; only consider for lint/test tooling.
+- **Commit or push** — you asked to hold off.
+- **Deploy** — premature until Phases 1–4 are done.
+- **Delete or restructure files heavily** — current 3-file split is fine for this scope.
+- **Add multiplayer/backend** — out of scope for this local demo.
+
+---
+
+## Suggested execution plan (3 passes)
+
+```mermaid
+flowchart LR
+  A[Pass 1: Reliability] --> B[Pass 2: A11y + UX]
+  B --> C[Pass 3: Repo + Tests]
+  C --> D[Ready to commit / host]
+```
+
+1. **Pass 1 (1–2 hours):** blur/pause fixes, food spawn safety, delta-time, init guards  
+2. **Pass 2 (1–2 hours):** accessibility, pause, HiDPI resize, reduced motion, favicon/meta  
+3. **Pass 3 (1 hour):** `.gitignore`, README/LICENSE, manual checklist, optional pure-function tests  
+
+---
+
+## Priority recommendation
+
+If you want the **smallest set of changes with the biggest production lift**, I would start with:
+
+1. Input blur cleanup  
+2. Tab visibility pause  
+3. HiDPI canvas resize  
+4. `.gitignore` + README expansion  
+5. Manual test checklist  
+
+Tell me which phase(s) you want implemented next, and whether you approve adding **zero** dependencies (keep pure JS) or are open to **dev-only** tooling (ESLint/Vitest) for Phase 5.

@@ -314,11 +314,11 @@ def build_truth_trace_from_raw_output_fixtures(
     action_candidates: list[dict] = []
     decisions: list[dict] = []
     execution_log: list[dict] = []
+    action_index = 0
 
     for index, fixture_path in enumerate(fixture_paths, start=1):
         raw_output = fixture_path.read_text(encoding="utf-8")
         step_id = f"step_{index:03d}"
-        action_id = f"action_{index:03d}"
         step_timestamp = created_at
 
         agent_steps.append(
@@ -345,90 +345,97 @@ def build_truth_trace_from_raw_output_fixtures(
                 "fixture_path": str(fixture_path.as_posix()),
             },
         )
-        candidate = (builder_out.get("action_candidates") or [{}])[0]
-        envelope = (builder_out.get("envelopes") or [{}])[0]
-        proposed = envelope.get("proposed_action") or {}
+        candidates_list = builder_out.get("action_candidates") or []
+        envelopes_list = builder_out.get("envelopes") or []
 
-        action_candidates.append(
-            {
-                "action_id": action_id,
-                "proposed_by_step_id": step_id,
-                "action_type": candidate.get("action_type") or proposed.get("action_type"),
-                "tool_or_command": candidate.get("tool_or_command") or proposed.get("tool"),
-                "target": candidate.get("target") or proposed.get("target"),
-                "side_effect_type": candidate.get("side_effect_type") or _side_effect_type_from_envelope(envelope),
-                "execution_status": candidate.get("execution_status", "proposed_only"),
-                "extracted_from_raw_output": True,
-                "envelope_id": envelope.get("envelope_id"),
-                "benchmark_case_id": fixture_path.stem,
-                "long_run_boundary": "",
-                # Minimal extraction/provenance metadata (optional for v0 dry-run path).
-                "extraction_method": candidate.get("extraction_method"),
-                "extraction_confidence": candidate.get("extraction_confidence"),
-                "field_provenance": candidate.get("field_provenance"),
-            }
-        )
+        for candidate, envelope in zip(candidates_list, envelopes_list):
+            action_index += 1
+            action_id = f"action_{action_index:03d}"
+            proposed = envelope.get("proposed_action") or {}
+            benchmark_case_id = (envelope.get("metadata") or {}).get("benchmark_case_id")
+            if not benchmark_case_id:
+                benchmark_case_id = fixture_path.stem
 
-        decision_output = evaluate_envelope(envelope, system_id=TERMINAL_DRY_RUN_DECISION_SYSTEM)
-        safer_next_step = decision_output.get("safer_next_step")
-        operational_action = map_operational_admissibility_action(
-            decision_output["decision"],
-            safer_next_step=safer_next_step,
-        )
+            action_candidates.append(
+                {
+                    "action_id": action_id,
+                    "proposed_by_step_id": step_id,
+                    "action_type": candidate.get("action_type") or proposed.get("action_type"),
+                    "tool_or_command": candidate.get("tool_or_command") or proposed.get("tool"),
+                    "target": candidate.get("target") or proposed.get("target"),
+                    "side_effect_type": candidate.get("side_effect_type")
+                    or _side_effect_type_from_envelope(envelope),
+                    "execution_status": candidate.get("execution_status", "proposed_only"),
+                    "extracted_from_raw_output": True,
+                    "envelope_id": envelope.get("envelope_id"),
+                    "benchmark_case_id": benchmark_case_id,
+                    "long_run_boundary": "",
+                    "extraction_method": candidate.get("extraction_method"),
+                    "extraction_confidence": candidate.get("extraction_confidence"),
+                    "field_provenance": candidate.get("field_provenance"),
+                }
+            )
 
-        authority = envelope.get("authority_context") or {}
-        evidence = envelope.get("evidence") or {}
-        policy = envelope.get("policy_context") or {}
-        user_request = envelope.get("user_request") or {}
+            decision_output = evaluate_envelope(envelope, system_id=TERMINAL_DRY_RUN_DECISION_SYSTEM)
+            safer_next_step = decision_output.get("safer_next_step")
+            operational_action = map_operational_admissibility_action(
+                decision_output["decision"],
+                safer_next_step=safer_next_step,
+            )
 
-        decisions.append(
-            {
-                "decision_id": decision_output["decision_id"],
-                "action_id": action_id,
-                "envelope_id": envelope.get("envelope_id"),
-                "decision": decision_output["decision"],
-                "operational_admissibility_action": operational_action,
-                "risk_level": decision_output.get("risk_level"),
-                "risk_boundary": _risk_boundary_summary(envelope),
-                "required_approval": decision_output.get("required_approval"),
-                "missing_evidence": decision_output.get("missing_evidence") or [],
-                "reasons": decision_output.get("reasons") or [],
-                "safer_next_step": safer_next_step,
-                "policy_summary": {
-                    "applicable_policies": policy.get("applicable_policies") or [],
-                    "policy_gaps": policy.get("policy_gaps") or [],
-                    "policy_conflicts": policy.get("policy_conflicts") or [],
-                },
-                "authorization_summary": {
-                    "requested_by": authority.get("requested_by"),
-                    "approved_by": authority.get("approved_by"),
-                    "approval_scope": authority.get("approval_scope"),
-                    "required_approval": authority.get("required_approval"),
-                    "authority_notes": authority.get("authority_notes") or [],
-                },
-                "evidence_summary": {
-                    "available": evidence.get("available") or [],
-                    "missing": evidence.get("missing") or [],
-                    "assumptions": evidence.get("assumptions") or [],
-                    "conflicts": evidence.get("conflicts") or [],
-                },
-                "user_request_raw": user_request.get("raw"),
-                "proposed_action": proposed,
-                "audit_trace": decision_output.get("audit_trace") or {},
-            }
-        )
+            authority = envelope.get("authority_context") or {}
+            evidence = envelope.get("evidence") or {}
+            policy = envelope.get("policy_context") or {}
+            user_request = envelope.get("user_request") or {}
 
-        execution_log.append(
-            {
-                "action_id": action_id,
-                "step_id": step_id,
-                "event": "admission_evaluated",
-                "side_effect_executed": False,
-                "operational_admissibility_action": operational_action,
-                "decision": decision_output["decision"],
-                "timestamp": step_timestamp,
-            }
-        )
+            decisions.append(
+                {
+                    "decision_id": decision_output["decision_id"],
+                    "action_id": action_id,
+                    "envelope_id": envelope.get("envelope_id"),
+                    "decision": decision_output["decision"],
+                    "operational_admissibility_action": operational_action,
+                    "risk_level": decision_output.get("risk_level"),
+                    "risk_boundary": _risk_boundary_summary(envelope),
+                    "required_approval": decision_output.get("required_approval"),
+                    "missing_evidence": decision_output.get("missing_evidence") or [],
+                    "reasons": decision_output.get("reasons") or [],
+                    "safer_next_step": safer_next_step,
+                    "policy_summary": {
+                        "applicable_policies": policy.get("applicable_policies") or [],
+                        "policy_gaps": policy.get("policy_gaps") or [],
+                        "policy_conflicts": policy.get("policy_conflicts") or [],
+                    },
+                    "authorization_summary": {
+                        "requested_by": authority.get("requested_by"),
+                        "approved_by": authority.get("approved_by"),
+                        "approval_scope": authority.get("approval_scope"),
+                        "required_approval": authority.get("required_approval"),
+                        "authority_notes": authority.get("authority_notes") or [],
+                    },
+                    "evidence_summary": {
+                        "available": evidence.get("available") or [],
+                        "missing": evidence.get("missing") or [],
+                        "assumptions": evidence.get("assumptions") or [],
+                        "conflicts": evidence.get("conflicts") or [],
+                    },
+                    "user_request_raw": user_request.get("raw"),
+                    "proposed_action": proposed,
+                    "audit_trace": decision_output.get("audit_trace") or {},
+                }
+            )
+
+            execution_log.append(
+                {
+                    "action_id": action_id,
+                    "step_id": step_id,
+                    "event": "admission_evaluated",
+                    "side_effect_executed": False,
+                    "operational_admissibility_action": operational_action,
+                    "decision": decision_output["decision"],
+                    "timestamp": step_timestamp,
+                }
+            )
 
     return {
         "schema_version": TRUTH_TRACE_SCHEMA_VERSION,
