@@ -235,6 +235,81 @@ class TestRealCaptureBuilderTruthConsole(unittest.TestCase):
         self.assertIn("timeline-wrapper", self.html)
 
 
+class TestTruthConsoleErgonomics(unittest.TestCase):
+    """Truth Console Ergonomics v0 — display-only summary, highlights, filters."""
+
+    def setUp(self) -> None:
+        self.trace = build_truth_trace_from_raw_output_fixtures(
+            fixtures_dir=str(REAL_CAPTURE_FIXTURES_DIR),
+            repo_root=str(REPO_ROOT),
+        )
+        self.html = render_truth_console_html(self.trace)
+
+    def test_executive_summary_counts_present(self) -> None:
+        self.assertIn("Executive Summary", self.html)
+        self.assertIn('class="executive-summary"', self.html)
+        self.assertIn("Action candidates", self.html)
+        self.assertIn("By admission decision", self.html)
+        self.assertIn("By operational action", self.html)
+        self.assertIn("By action type", self.html)
+        self.assertIn("Side effects executed", self.html)
+        candidate_count = len(self.trace["action_candidates"])
+        self.assertIn(f'<p class="summary-stat">{candidate_count}</p>', self.html)
+        self.assertIn("ALLOW", self.html)
+        self.assertIn("REQUEST_MORE_EVIDENCE", self.html)
+        self.assertIn("ALLOW_WITH_LIMITS", self.html)
+
+    def test_demo_highlights_section_present(self) -> None:
+        self.assertIn("Demo Highlights", self.html)
+        self.assertIn('class="demo-highlights"', self.html)
+        self.assertIn('href="#action-', self.html)
+        self.assertIn("Local safe edit", self.html)
+        self.assertIn("Production-readiness claim", self.html)
+
+    def test_demo_highlights_cover_key_decisions(self) -> None:
+        self.assertIn('class="decision-ALLOW"', self.html)
+        self.assertIn('class="decision-REQUEST_MORE_EVIDENCE"', self.html)
+        self.assertIn('class="decision-ALLOW_WITH_LIMITS"', self.html)
+        self.assertIn("Verification / test strategy", self.html)
+        self.assertIn("Hosting / deployment-adjacent", self.html)
+
+    def test_truth_boundary_and_auditability_preserved(self) -> None:
+        self.assertIn("Truth boundaries:", self.html)
+        self.assertIn("Raw agent output is unverified", self.html)
+        self.assertIn("Agent output is not authority", self.html)
+        self.assertIn("Generated envelope is an interpretation", self.html)
+        self.assertIn("Field provenance", self.html)
+        self.assertIn("extraction_method", self.html)
+        self.assertIn("extraction_confidence", self.html)
+        self.assertIn("No side effect executed", self.html)
+        self.assertIn("raw-output-collapsible", self.html)
+        self.assertIn("Show raw agent output", self.html)
+
+    def test_badges_and_filters_present(self) -> None:
+        self.assertIn("badge-unverified", self.html)
+        self.assertIn("badge-generated-envelope", self.html)
+        self.assertIn("badge-proposed-only", self.html)
+        self.assertIn("badge-no-side-effect", self.html)
+        self.assertIn('id="filter-decision"', self.html)
+        self.assertIn('id="filter-action-type"', self.html)
+        self.assertIn('id="filter-operational"', self.html)
+
+    def test_no_agent_os_import_in_truth_console_module(self) -> None:
+        truth_console_path = REPO_ROOT / "admissible" / "harness" / "truth_console.py"
+        source = truth_console_path.read_text(encoding="utf-8")
+        self.assertNotIn("import agent_os", source)
+        self.assertNotIn("from agent_os", source)
+
+    def test_demo_pack_console_still_renders_summary(self) -> None:
+        trace = build_truth_trace(
+            demo_pack_path=str(DEMO_PACK_PATH),
+            repo_root=str(REPO_ROOT),
+        )
+        html = render_truth_console_html(trace)
+        self.assertIn("Executive Summary", html)
+        self.assertIn("No side effect executed", html)
+
+
 class TestTerminalDryRunStillWorks(unittest.TestCase):
     def test_dry_run_trace_unchanged(self) -> None:
         trace = build_terminal_dry_run_trace(demo_pack_path=DEMO_PACK_PATH)

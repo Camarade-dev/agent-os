@@ -179,6 +179,169 @@
     margin: 0.5rem 0;
     font-weight: 600;
   }
+  .badge {
+    display: inline-block;
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    padding: 0.15rem 0.45rem;
+    border-radius: 4px;
+    margin-right: 0.35rem;
+    vertical-align: middle;
+  }
+  .badge-unverified { background: #fef3c7; color: #92400e; border: 1px solid #d97706; }
+  .badge-generated-envelope { background: #ede9fe; color: #5b21b6; border: 1px solid #7c3aed; }
+  .badge-proposed-only { background: #e0e7ff; color: #3730a3; border: 1px solid #6366f1; }
+  .badge-no-side-effect { background: #dbeafe; color: #1e40af; border: 1px solid #2563eb; }
+  .badge-highlight { background: #ecfdf5; color: #047857; border: 1px solid #10b981; }
+  .executive-summary {
+    background: var(--tc-card-bg);
+    border: 1px solid var(--tc-border);
+    border-radius: 8px;
+    padding: 1rem 1.25rem;
+    margin: 1.5rem 0;
+  }
+  .summary-intro { color: var(--tc-muted); margin-top: 0; }
+  .summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 1rem;
+    margin-top: 1rem;
+  }
+  .summary-card {
+    background: var(--tc-bg);
+    border: 1px solid var(--tc-border);
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+  }
+  .summary-card-wide { grid-column: 1 / -1; }
+  .summary-card h3 {
+    margin: 0 0 0.5rem;
+    font-size: 0.85rem;
+    color: var(--tc-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .summary-stat {
+    font-size: 1.75rem;
+    font-weight: 700;
+    margin: 0;
+    line-height: 1.2;
+  }
+  .count-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    font-size: 0.9rem;
+  }
+  .count-list li {
+    display: flex;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 0.2rem 0;
+    border-bottom: 1px solid #e5e7eb;
+  }
+  .count-list li:last-child { border-bottom: none; }
+  .count-value { font-weight: 700; }
+  .demo-highlights {
+    background: #f0fdf4;
+    border: 1px solid #86efac;
+    border-radius: 8px;
+    padding: 1rem 1.25rem;
+    margin: 1.5rem 0;
+  }
+  .highlight-list {
+    list-style: none;
+    margin: 0.75rem 0 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 0.5rem;
+  }
+  .highlight-card { margin: 0; }
+  .highlight-link {
+    display: block;
+    padding: 0.6rem 0.75rem;
+    background: var(--tc-bg);
+    border: 1px solid var(--tc-border);
+    border-radius: 6px;
+    text-decoration: none;
+    color: var(--tc-text);
+  }
+  .highlight-link:hover { border-color: #10b981; background: #ecfdf5; }
+  .highlight-label { display: block; font-weight: 700; margin-bottom: 0.25rem; }
+  .highlight-action-id { display: block; font-size: 0.8rem; margin: 0.25rem 0; }
+  .highlight-tool { display: block; font-size: 0.85rem; color: var(--tc-muted); }
+  .filter-bar {
+    background: var(--tc-card-bg);
+    border: 1px solid var(--tc-border);
+    border-radius: 8px;
+    padding: 1rem 1.25rem;
+    margin: 1.5rem 0;
+  }
+  .filter-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1rem;
+    align-items: flex-end;
+  }
+  .filter-controls label {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--tc-muted);
+  }
+  .filter-controls select {
+    min-width: 180px;
+    padding: 0.35rem 0.5rem;
+    font-size: 0.9rem;
+    border: 1px solid var(--tc-border);
+    border-radius: 4px;
+    background: var(--tc-bg);
+    color: var(--tc-text);
+  }
+  .filter-reset {
+    padding: 0.4rem 0.75rem;
+    font-size: 0.85rem;
+    font-weight: 600;
+    border: 1px solid var(--tc-border);
+    border-radius: 4px;
+    background: var(--tc-bg);
+    cursor: pointer;
+  }
+  .filter-reset:hover { background: var(--tc-tab-inactive-bg); }
+  .filter-status { font-size: 0.85rem; color: var(--tc-muted); margin: 0.5rem 0 0; }
+  .timeline-row.filtered-out { display: none; }
+  .action-detail.filtered-out { display: none; }
+  .action-detail.action-highlight {
+    border-color: #10b981;
+    border-width: 2px;
+  }
+  .action-details-note {
+    color: var(--tc-muted);
+    font-size: 0.9rem;
+    margin-top: 0;
+  }
+  details.raw-output-collapsible {
+    margin: 0.5rem 0;
+    border: 1px solid var(--tc-border);
+    border-radius: 4px;
+  }
+  details.raw-output-collapsible > summary {
+    cursor: pointer;
+    padding: 0.5rem 0.75rem;
+    background: var(--tc-card-bg);
+    font-weight: 600;
+    font-size: 0.85rem;
+  }
+  details.raw-output-collapsible pre.raw-output {
+    margin: 0;
+    border-radius: 0 0 4px 4px;
+  }
+  .tool-cell { max-width: 280px; }
 </style>
 </head>
 <body class="truth-console-v0 high-contrast-light">
@@ -201,6 +364,54 @@
     });
     if (buttons.length) buttons[0].click();
   });
+
+  var filterDecision = document.getElementById("filter-decision");
+  var filterActionType = document.getElementById("filter-action-type");
+  var filterOperational = document.getElementById("filter-operational");
+  var filterReset = document.getElementById("filter-reset");
+  var filterStatus = document.getElementById("filter-status");
+
+  function applyFilters() {
+    if (!filterDecision) return;
+    var decision = filterDecision.value;
+    var actionType = filterActionType.value;
+    var operational = filterOperational.value;
+    var visible = 0;
+    var total = 0;
+
+    document.querySelectorAll(".timeline-row, .action-detail").forEach(function (el) {
+      total += 1;
+      var match =
+        (!decision || el.getAttribute("data-decision") === decision) &&
+        (!actionType || el.getAttribute("data-action-type") === actionType) &&
+        (!operational || el.getAttribute("data-operational-admissibility-action") === operational);
+      if (match) {
+        el.classList.remove("filtered-out");
+        visible += 1;
+      } else {
+        el.classList.add("filtered-out");
+      }
+    });
+
+    if (filterStatus) {
+      var active = decision || actionType || operational;
+      filterStatus.textContent = active
+        ? "Showing " + visible + " of " + total + " rows/blocks."
+        : "";
+    }
+  }
+
+  [filterDecision, filterActionType, filterOperational].forEach(function (sel) {
+    if (sel) sel.addEventListener("change", applyFilters);
+  });
+  if (filterReset) {
+    filterReset.addEventListener("click", function () {
+      if (filterDecision) filterDecision.value = "";
+      if (filterActionType) filterActionType.value = "";
+      if (filterOperational) filterOperational.value = "";
+      applyFilters();
+    });
+  }
 })();
 </script>
 </body>

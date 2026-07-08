@@ -58,6 +58,209 @@ def _fmt_list(items: Any) -> str:
     return ", ".join(_esc(item) for item in items)
 
 
+def _truncate(text: Any, max_len: int = 48) -> str:
+    if text is None:
+        return "—"
+    s = str(text)
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 1] + "…"
+
+
+def _count_by_key(items: list[dict], key: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in items:
+        value = str(item.get(key) or "—")
+        counts[value] = counts.get(value, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _action_type_for_candidate(candidate: dict, decision: dict) -> str:
+    proposed = decision.get("proposed_action") or {}
+    return str(candidate.get("action_type") or proposed.get("action_type") or "—")
+
+
+def _compute_summary(trace: dict) -> dict[str, Any]:
+    candidates = trace.get("action_candidates") or []
+    decisions = trace.get("decisions") or []
+    decisions_by_action = _decision_by_action_id(trace)
+    action_types: dict[str, int] = {}
+    for candidate in candidates:
+        action_id = candidate.get("action_id")
+        decision = decisions_by_action.get(action_id, {})
+        atype = _action_type_for_candidate(candidate, decision)
+        action_types[atype] = action_types.get(atype, 0) + 1
+    execution_log = trace.get("execution_log") or []
+    side_effects_in_log = sum(1 for e in execution_log if e.get("side_effect_executed"))
+    return {
+        "total_candidates": len(candidates),
+        "by_decision": _count_by_key(decisions, "decision"),
+        "by_operational_action": _count_by_key(decisions, "operational_admissibility_action"),
+        "by_action_type": dict(sorted(action_types.items())),
+        "side_effect_executed": bool(trace.get("side_effect_executed")),
+        "side_effects_in_log": side_effects_in_log,
+    }
+
+
+_DEMO_HIGHLIGHT_SPECS: tuple[tuple[str, str, str, str], ...] = (
+    ("local_safe_edit", "ALLOW", "local_code_change", "Local safe edit"),
+    ("create_file_doc", "ALLOW", "create_file", "Create file / documentation"),
+    ("verification_strategy", "REQUEST_MORE_EVIDENCE", "verification_plan", "Verification / test strategy"),
+    ("dependency_tooling", "REQUEST_MORE_EVIDENCE", "install_dependency", "Dependency / tooling"),
+    ("hosting_adjacent", "ALLOW_WITH_LIMITS", "document_hosting_options", "Hosting / deployment-adjacent"),
+    ("production_readiness_claim", "REQUEST_MORE_EVIDENCE", "claim_status", "Production-readiness claim"),
+)
+
+
+def _select_demo_highlights(trace: dict) -> list[dict[str, Any]]:
+    """Pick one representative action per demo category (deterministic, first match)."""
+    decisions_by_action = _decision_by_action_id(trace)
+    highlights: list[dict[str, Any]] = []
+    used_action_ids: set[str] = set()
+
+    for key, target_decision, target_action_type, label in _DEMO_HIGHLIGHT_SPECS:
+        for candidate in trace.get("action_candidates") or []:
+            action_id = candidate.get("action_id")
+            if not action_id or action_id in used_action_ids:
+                continue
+            decision = decisions_by_action.get(action_id, {})
+            if decision.get("decision") != target_decision:
+                continue
+            if _action_type_for_candidate(candidate, decision) != target_action_type:
+                continue
+            used_action_ids.add(action_id)
+            highlights.append(
+                {
+                    "key": key,
+                    "label": label,
+                    "action_id": action_id,
+                    "decision": target_decision,
+                    "action_type": target_action_type,
+                    "tool_or_command": candidate.get("tool_or_command"),
+                    "operational_admissibility_action": decision.get("operational_admissibility_action"),
+                }
+            )
+            break
+
+    return highlights
+
+
+def _render_count_list(counts: dict[str, int], *, css_class: str = "count-list") -> str:
+    if not counts:
+        return "<p>None</p>"
+    items = "".join(
+        f'<li><span class="count-label">{_esc(k)}</span> '
+        f'<span class="count-value">{v}</span></li>'
+        for k, v in counts.items()
+    )
+    return f'<ul class="{css_class}">{items}</ul>'
+
+
+def _render_executive_summary(trace: dict) -> str:
+    summary = _compute_summary(trace)
+    side_effect_label = "false" if not summary["side_effect_executed"] else "true"
+    return f"""
+    <section class="executive-summary" id="executive-summary">
+      <h2>Executive Summary</h2>
+      <p class="summary-intro">At-a-glance counts for this long-run trace (demo-friendly; full detail below).</p>
+      <div class="summary-grid">
+        <div class="summary-card">
+          <h3>Action candidates</h3>
+          <p class="summary-stat">{summary['total_candidates']}</p>
+        </div>
+        <div class="summary-card">
+          <h3>Side effects executed</h3>
+          <p class="summary-stat">{_esc(side_effect_label)} / {summary['side_effects_in_log']}</p>
+          <span class="badge badge-no-side-effect">No side effect executed</span>
+        </div>
+        <div class="summary-card">
+          <h3>By admission decision</h3>
+          {_render_count_list(summary["by_decision"])}
+        </div>
+        <div class="summary-card">
+          <h3>By operational action</h3>
+          {_render_count_list(summary["by_operational_action"])}
+        </div>
+        <div class="summary-card summary-card-wide">
+          <h3>By action type</h3>
+          {_render_count_list(summary["by_action_type"])}
+        </div>
+      </div>
+    </section>
+    """
+
+
+def _render_demo_highlights(trace: dict) -> str:
+    highlights = _select_demo_highlights(trace)
+    if not highlights:
+        return ""
+
+    cards = []
+    for h in highlights:
+        action_id = h["action_id"]
+        cards.append(
+            f'<li class="highlight-card">'
+            f'<a class="highlight-link" href="#action-{_esc(action_id)}">'
+            f'<span class="highlight-label">{_esc(h["label"])}</span>'
+            f'<span class="decision-{_esc(h["decision"])}">{_esc(h["decision"])}</span>'
+            f'<code class="highlight-action-id">{_esc(action_id)}</code>'
+            f'<span class="highlight-tool" title="{_esc(h.get("tool_or_command"))}">'
+            f'{_esc(_truncate(h.get("tool_or_command"), 56))}</span>'
+            f'</a></li>'
+        )
+
+    return f"""
+    <section class="demo-highlights" id="demo-highlights">
+      <h2>Demo Highlights</h2>
+      <p>Representative actions across admission outcomes — click to jump to full detail.</p>
+      <ul class="highlight-list">{''.join(cards)}</ul>
+    </section>
+    """
+
+
+def _render_filters(trace: dict) -> str:
+    summary = _compute_summary(trace)
+    decision_opts = "".join(
+        f'<option value="{_esc(d)}">{_esc(d)} ({c})</option>'
+        for d, c in summary["by_decision"].items()
+    )
+    op_opts = "".join(
+        f'<option value="{_esc(d)}">{_esc(d)} ({c})</option>'
+        for d, c in summary["by_operational_action"].items()
+    )
+    type_opts = "".join(
+        f'<option value="{_esc(d)}">{_esc(d)} ({c})</option>'
+        for d, c in summary["by_action_type"].items()
+    )
+    return f"""
+    <section class="filter-bar" id="filter-bar">
+      <h2>Filters</h2>
+      <div class="filter-controls">
+        <label>Decision
+          <select id="filter-decision" data-filter="decision">
+            <option value="">All</option>
+            {decision_opts}
+          </select>
+        </label>
+        <label>Action type
+          <select id="filter-action-type" data-filter="action_type">
+            <option value="">All</option>
+            {type_opts}
+          </select>
+        </label>
+        <label>Operational action
+          <select id="filter-operational" data-filter="operational_admissibility_action">
+            <option value="">All</option>
+            {op_opts}
+          </select>
+        </label>
+        <button type="button" id="filter-reset" class="filter-reset">Reset filters</button>
+      </div>
+      <p class="filter-status" id="filter-status" aria-live="polite"></p>
+    </section>
+    """
+
+
 def _step_by_id(trace: dict) -> dict[str, dict]:
     return {step["step_id"]: step for step in trace.get("agent_steps") or []}
 
@@ -118,19 +321,26 @@ def _render_timeline(trace: dict) -> str:
         decision = decisions_by_action.get(action_id, {})
         decision_label = decision.get("decision", "—")
         decision_class = f"decision-{decision_label}" if decision_label != "—" else ""
+        action_type = _action_type_for_candidate(candidate, decision)
+        tool_full = candidate.get("tool_or_command") or ""
+        tool_short = _truncate(tool_full, 48)
+        operational = decision.get("operational_admissibility_action", "—")
         rows.append(
-            f"<tr>"
-            f"<td><code>{_esc(action_id)}</code></td>"
+            f"<tr class=\"timeline-row\" data-action-id=\"{_esc(action_id)}\" "
+            f"data-decision=\"{_esc(decision_label)}\" "
+            f"data-action-type=\"{_esc(action_type)}\" "
+            f"data-operational-admissibility-action=\"{_esc(operational)}\">"
+            f"<td><a href=\"#action-{_esc(action_id)}\"><code>{_esc(action_id)}</code></a></td>"
             f"<td>{_esc(candidate.get('benchmark_case_id'))}</td>"
-            f"<td>{_esc(candidate.get('tool_or_command'))}</td>"
+            f"<td class=\"tool-cell\" title=\"{_esc(tool_full)}\">{_esc(tool_short)}</td>"
             f"<td class=\"{decision_class}\">{_esc(decision_label)}</td>"
             f"<td>{_esc(decision.get('risk_level'))}</td>"
-            f"<td><code>{_esc(decision.get('operational_admissibility_action'))}</code></td>"
+            f"<td><code>{_esc(operational)}</code></td>"
             f"<td><code>{_esc(candidate.get('execution_status'))}</code></td>"
             f"</tr>"
         )
     return f"""
-    <section class="timeline-section">
+    <section class="timeline-section" id="admission-timeline">
       <h2>Admission Timeline</h2>
       <p>Action candidates encountered during the long run (fixture-backed in v0):</p>
       <div class="timeline-wrapper">
@@ -170,6 +380,10 @@ def _render_action_detail(
     candidate: dict,
     step: dict | None,
     decision: dict,
+    *,
+    open_default: bool = False,
+    is_highlight: bool = False,
+    highlight_label: str | None = None,
 ) -> str:
     action_id = candidate.get("action_id")
     decision_label = decision.get("decision", "—")
@@ -181,6 +395,8 @@ def _render_action_detail(
     policy = decision.get("policy_summary") or {}
     audit = decision.get("audit_trace") or {}
     reasons = decision.get("reasons") or []
+    execution_status = candidate.get("execution_status") or "proposed_only"
+    action_type = _action_type_for_candidate(candidate, decision)
 
     reason_items = "".join(
         f"<li><strong>{_esc(r.get('dimension'))}</strong> "
@@ -209,23 +425,30 @@ def _render_action_detail(
       <p><strong>Decision:</strong> <span class="decision-{decision_label}">{_esc(decision_label)}</span></p>
       <p><strong>Operational admissibility action:</strong>
          <code>{_esc(decision.get('operational_admissibility_action'))}</code></p>
-      <p><strong>Execution status:</strong> <code>{_esc(candidate.get('execution_status'))}</code></p>
-      <p><strong>No side effect executed.</strong></p>
+      <p><strong>Execution status:</strong> <code>{_esc(execution_status)}</code>
+         <span class="badge badge-proposed-only">proposed_only</span></p>
+      <p><strong>No side effect executed.</strong>
+         <span class="badge badge-no-side-effect">no side effect executed</span></p>
     """
 
     raw_output = step.get("raw_output", "") if step else ""
     raw_panel = f"""
       <p class="unverified-note">
+        <span class="badge badge-unverified">unverified raw output</span>
         <strong>Raw agent output is unverified.</strong>
         Agent output is not authority. Source trust:
         <code>{_esc(step.get('source_trust') if step else None)}</code>;
         source type: <code>{_esc(step.get('source_type') if step else None)}</code>.
       </p>
-      <pre class="raw-output">{_esc(raw_output)}</pre>
+      <details class="raw-output-collapsible">
+        <summary>Show raw agent output ({len(raw_output)} chars)</summary>
+        <pre class="raw-output">{_esc(raw_output)}</pre>
+      </details>
     """
 
     proposed_panel = f"""
       <p class="unverified-note">
+        <span class="badge badge-generated-envelope">generated envelope</span>
         <strong>Generated envelope is an interpretation, not ground truth.</strong>
         The envelope below is constructed deterministically from unverified raw agent output.
         It may omit context or misclassify intent. Treat it as conservative, offline extraction.
@@ -330,13 +553,24 @@ def _render_action_detail(
     )
 
     summary = (
-        f"{_esc(action_id)} — {_esc(candidate.get('tool_or_command'))} → "
+        f"{_esc(action_id)} — {_esc(_truncate(candidate.get('tool_or_command'), 64))} → "
         f"{_esc(decision_label)} / {_esc(decision.get('operational_admissibility_action'))}"
     )
+    highlight_badge = (
+        f'<span class="badge badge-highlight">Demo: {_esc(highlight_label)}</span>'
+        if is_highlight and highlight_label
+        else ""
+    )
+    open_attr = " open" if open_default else ""
+    highlight_class = " action-highlight" if is_highlight else ""
 
     return f"""
-    <details class="action-detail" open>
-      <summary>{summary}</summary>
+    <details class="action-detail{highlight_class}" id="action-{_esc(action_id)}"{open_attr}
+             data-action-id="{_esc(action_id)}"
+             data-decision="{_esc(decision_label)}"
+             data-action-type="{_esc(action_type)}"
+             data-operational-admissibility-action="{_esc(decision.get('operational_admissibility_action'))}">
+      <summary>{highlight_badge}{summary}</summary>
       <div class="action-detail-body">
         {_render_tab_nav(tab_ids)}
         {panels}
@@ -348,20 +582,28 @@ def _render_action_detail(
 def _render_action_details(trace: dict) -> str:
     steps = _step_by_id(trace)
     decisions_by_action = _decision_by_action_id(trace)
+    highlights = _select_demo_highlights(trace)
+    highlight_by_action = {h["action_id"]: h["label"] for h in highlights}
+    highlight_ids = set(highlight_by_action)
     sections = []
     for candidate in trace.get("action_candidates") or []:
         action_id = candidate.get("action_id")
         step_id = candidate.get("proposed_by_step_id")
+        is_highlight = action_id in highlight_ids
         sections.append(
             _render_action_detail(
                 candidate,
                 steps.get(step_id),
                 decisions_by_action.get(action_id, {}),
+                open_default=is_highlight,
+                is_highlight=is_highlight,
+                highlight_label=highlight_by_action.get(action_id),
             )
         )
     return f"""
-    <section class="action-details">
+    <section class="action-details" id="action-details">
       <h2>Action Detail</h2>
+      <p class="action-details-note">Collapsed by default except demo highlights. Raw output and field provenance remain in each block.</p>
       {''.join(sections)}
     </section>
     """
@@ -373,6 +615,9 @@ def render_truth_console_html(trace: dict) -> str:
         [
             _render_header(trace),
             _render_prompt_panel(trace),
+            _render_executive_summary(trace),
+            _render_demo_highlights(trace),
+            _render_filters(trace),
             _render_timeline(trace),
             _render_action_details(trace),
         ]
