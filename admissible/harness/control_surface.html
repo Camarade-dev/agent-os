@@ -1,0 +1,1025 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admissible Control Surface v0</title>
+<style>
+  :root {
+    --cs-bg: #0b1120;
+    --cs-panel-bg: #111827;
+    --cs-card-bg: #1a2333;
+    --cs-border-strong: #2a3548;
+    --cs-text: #e5e7eb;
+    --cs-muted: #9ca3af;
+    --cs-accent: #60a5fa;
+    --cs-accent-strong: #2563eb;
+    --cs-warning-bg: #3f2d0b;
+    --cs-warning-text: #fcd34d;
+    --cs-warning-border: #b45309;
+    --cs-input-bg: #0f172a;
+    --cs-attn-bg: #3a1c10;
+    --cs-attn-text: #fdba74;
+    --cs-attn-border: #c2410c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: var(--cs-bg);
+    color: var(--cs-text);
+    line-height: 1.4;
+    font-size: 14px;
+  }
+  code, pre, .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; }
+  h1, h2, h3 { line-height: 1.2; color: var(--cs-text); margin: 0 0 .4rem; }
+  h2 { font-size: .82rem; text-transform: uppercase; letter-spacing: .04em; color: var(--cs-muted); }
+  a { color: var(--cs-accent); }
+  button, select, input, textarea {
+    font-family: inherit;
+    font-size: .85rem;
+    color: var(--cs-text);
+    background: var(--cs-input-bg);
+    border: 1px solid var(--cs-border-strong);
+    border-radius: 6px;
+    padding: .35rem .55rem;
+  }
+  button { cursor: pointer; background: var(--cs-accent-strong); border-color: var(--cs-accent-strong); color: #fff; }
+  button.secondary { background: var(--cs-input-bg); color: var(--cs-text); border-color: var(--cs-border-strong); }
+  button.tab-btn { background: var(--cs-input-bg); color: var(--cs-muted); border-color: var(--cs-border-strong); font-size: .78rem; padding: .3rem .6rem; }
+  button.tab-btn.active { background: var(--cs-accent-strong); color: #fff; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  textarea { width: 100%; resize: vertical; min-height: 2.6rem; }
+  summary { cursor: pointer; }
+  details > summary { color: var(--cs-muted); font-size: .8rem; }
+
+  header.app-header { padding: .65rem 1.1rem; border-bottom: 1px solid var(--cs-border-strong); background: var(--cs-panel-bg); }
+  .header-top { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; }
+  header.app-header h1 { font-size: 1.05rem; margin: 0; }
+  .status-pills { display: flex; flex-wrap: wrap; gap: .35rem; }
+  .pill { display: inline-block; padding: .12rem .5rem; border-radius: 999px; font-size: .68rem; background: var(--cs-card-bg); border: 1px solid var(--cs-border-strong); color: var(--cs-muted); }
+
+  #truth-boundary-details { margin-top: .5rem; }
+  #truth-boundary-details summary { font-weight: 600; }
+  .truth-boundary-banner {
+    margin-top: .4rem; padding: .55rem .7rem; background: var(--cs-warning-bg); color: var(--cs-warning-text);
+    border: 1px solid var(--cs-warning-border); border-radius: 6px; font-size: .8rem;
+  }
+  .truth-boundary-banner strong { color: #fff; }
+
+  .top-controls {
+    display: flex; flex-wrap: wrap; gap: .6rem 1rem; align-items: center;
+    padding: .55rem 1.1rem; background: var(--cs-panel-bg); border-bottom: 1px solid var(--cs-border-strong);
+    position: sticky; top: 0; z-index: 20;
+  }
+  .top-controls label.autonomy-label { font-size: .75rem; color: var(--cs-muted); display: flex; flex-direction: column; gap: .15rem; }
+  .autonomy-explanation { margin: 0; font-size: .78rem; color: var(--cs-accent); max-width: 26rem; }
+  #autonomy-details { font-size: .74rem; color: var(--cs-muted); }
+  .top-actions { display: flex; flex-wrap: wrap; gap: .4rem; margin-left: auto; }
+  .file-label { display: inline-block; background: var(--cs-input-bg); border: 1px solid var(--cs-border-strong); border-radius: 6px; padding: .35rem .55rem; cursor: pointer; font-size: .85rem; }
+
+  #app-main { max-width: 960px; margin: 0 auto; padding: .85rem 1.1rem 2.5rem; display: flex; flex-direction: column; gap: .85rem; }
+
+  section.panel { background: var(--cs-panel-bg); border: 1px solid var(--cs-border-strong); border-radius: 10px; padding: .8rem .9rem; }
+
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr)); gap: .5rem; }
+  .stat-tile { background: var(--cs-card-bg); border: 1px solid var(--cs-border-strong); border-radius: 8px; padding: .45rem .6rem; }
+  .stat-tile .stat-label { font-size: .66rem; text-transform: uppercase; letter-spacing: .03em; color: var(--cs-muted); display: block; }
+  .stat-tile .stat-value { font-size: 1.15rem; font-weight: 700; }
+  .stat-tile.attention { border-color: var(--cs-attn-border); background: var(--cs-attn-bg); }
+  .stat-tile.attention .stat-value { color: var(--cs-attn-text); }
+
+  .empty-state { text-align: center; padding: 1rem .5rem; color: var(--cs-muted); }
+  .phase-legend { display: flex; justify-content: center; gap: .5rem; margin-top: .6rem; flex-wrap: wrap; }
+  .phase-box { background: var(--cs-card-bg); border: 1px solid var(--cs-border-strong); border-radius: 8px; padding: .4rem .6rem; font-size: .76rem; max-width: 11rem; }
+  .phase-box strong { display: block; color: var(--cs-text); font-size: .8rem; }
+  .phase-arrow { align-self: center; color: var(--cs-muted); }
+
+  #goal-form { display: flex; flex-direction: column; gap: .4rem; }
+  #goal-form .hint { font-size: .74rem; color: var(--cs-muted); margin: 0; }
+
+  dl.kv-grid { display: grid; grid-template-columns: auto 1fr; gap: .12rem .6rem; font-size: .82rem; margin: 0; }
+  dl.kv-grid dt { color: var(--cs-muted); }
+  dl.kv-grid dd { margin: 0; }
+
+  .badge { display: inline-block; padding: .08rem .4rem; border-radius: 999px; font-size: .68rem; font-weight: 600; border: 1px solid transparent; }
+  .badge-proposed-only { background: #1e2a55; color: #a5b4fc; border-color: #4338ca; }
+  .badge-admitted-not-executed { background: #3f3308; color: #fde68a; border-color: #b45309; }
+  .badge-executed-after-admission { background: #06322a; color: #6ee7b7; border-color: #059669; }
+  .badge-blocked { background: #3a1010; color: #fca5a5; border-color: #dc2626; }
+  .badge-no-side-effect { background: #0f2f4a; color: #93c5fd; border-color: #2563eb; }
+
+  .decision-ALLOW { color: #34d399; font-weight: 700; }
+  .decision-ALLOW_WITH_LIMITS { color: #60a5fa; font-weight: 700; }
+  .decision-REQUEST_MORE_EVIDENCE { color: #a78bfa; font-weight: 700; }
+  .decision-REQUIRE_HUMAN_APPROVAL { color: #fbbf24; font-weight: 700; }
+  .decision-REFUSE { color: #f87171; font-weight: 700; }
+
+  /* Needs Attention */
+  .attention-row { display: flex; align-items: center; gap: .5rem; padding: .3rem 0; border-bottom: 1px dashed var(--cs-border-strong); font-size: .82rem; }
+  .attention-row:last-child { border-bottom: none; }
+  .attention-row .attn-tool { flex: 1; color: var(--cs-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .attention-gaps { margin-top: .5rem; font-size: .8rem; }
+  .attention-gaps ul { margin: .2rem 0 .4rem 1.1rem; padding: 0; }
+
+  /* Queue table */
+  .queue-tabs { display: flex; gap: .35rem; margin-bottom: .5rem; flex-wrap: wrap; align-items: center; }
+  .queue-count { font-size: .74rem; color: var(--cs-muted); margin-left: .3rem; }
+  table.queue-table { width: 100%; border-collapse: collapse; font-size: .8rem; }
+  table.queue-table th { text-align: left; color: var(--cs-muted); font-weight: 600; font-size: .68rem; text-transform: uppercase; padding: .3rem .45rem; border-bottom: 1px solid var(--cs-border-strong); }
+  table.queue-table td { padding: .3rem .45rem; border-bottom: 1px solid var(--cs-border-strong); vertical-align: middle; }
+  table.queue-table tr.queue-row:hover { background: var(--cs-card-bg); }
+  table.queue-table tr.queue-row.selected { background: #142338; }
+  .queue-op-cell { max-width: 18rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--cs-muted); }
+  .select-action-btn { font-size: .74rem; padding: .2rem .5rem; }
+
+  /* Selected action */
+  #selected-action-body .sel-header { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; margin-bottom: .4rem; }
+  .decide-form { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .55rem; align-items: flex-end; }
+  .decide-form .field { display: flex; flex-direction: column; gap: .15rem; font-size: .72rem; color: var(--cs-muted); flex: 1 1 8rem; }
+  .decide-form input, .decide-form select { width: 100%; }
+  .evidence-form { display: flex; flex-direction: column; gap: .4rem; margin-top: .55rem; padding: .55rem .65rem; background: var(--cs-card-bg); border: 1px solid var(--cs-border-strong); border-radius: 8px; }
+  .evidence-form .field { display: flex; flex-direction: column; gap: .15rem; font-size: .72rem; color: var(--cs-muted); }
+  .evidence-form textarea { min-height: 3.4rem; }
+  .lifecycle-note { font-size: .78rem; color: var(--cs-accent); margin-top: .3rem; }
+  .no-action-note { font-size: .8rem; color: var(--cs-muted); font-style: italic; }
+  .human-decisions-for-action { margin-top: .4rem; font-size: .76rem; color: var(--cs-muted); }
+  .human-decisions-for-action li { margin-bottom: .15rem; }
+
+  /* Run Loop */
+  #run-loop-panel .turn-line { font-size: .85rem; margin: 0 0 .5rem; }
+  #run-loop-panel .run-loop-actions { display: flex; flex-wrap: wrap; gap: .5rem; margin-bottom: .5rem; }
+  #run-loop-panel h3 { font-size: .78rem; text-transform: uppercase; letter-spacing: .03em; color: var(--cs-muted); margin: .6rem 0 .3rem; }
+  #instruction-packet-text { width: 100%; min-height: 14rem; font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; font-size: .74rem; }
+  #agent-response-input { min-height: 6rem; }
+  #last-ingestion-summary { font-size: .8rem; color: var(--cs-muted); margin-top: .4rem; }
+
+  /* Needs Attention categories */
+  .attn-category { margin-bottom: .6rem; }
+  .attn-category h3 { font-size: .74rem; text-transform: uppercase; letter-spacing: .03em; color: var(--cs-muted); margin: 0 0 .25rem; }
+  .attn-category .attn-empty { font-size: .78rem; color: var(--cs-muted); font-style: italic; }
+
+  .decision-record { border-bottom: 1px dashed var(--cs-border-strong); padding: .35rem 0; font-size: .78rem; }
+  .decision-record:last-child { border-bottom: none; }
+
+  #error-banner { display: none; margin: .6rem 1.1rem 0; padding: .5rem .7rem; background: #3a1010; color: #fca5a5; border: 1px solid #dc2626; border-radius: 6px; font-size: .82rem; }
+
+  .transcript-entry { border-radius: 8px; padding: .5rem .65rem; font-size: .82rem; border: 1px solid var(--cs-border-strong); background: var(--cs-card-bg); margin-bottom: .45rem; }
+  .transcript-entry.role-user { margin-left: 2rem; background: #16324a; border-color: #1e4a6b; }
+  .transcript-entry.role-admissible { margin-right: 2rem; }
+  .transcript-entry .entry-label { display: block; font-size: .68rem; text-transform: uppercase; letter-spacing: .03em; color: var(--cs-muted); margin-bottom: .25rem; }
+
+  footer.app-footer { max-width: 960px; margin: 0 auto; padding: .5rem 1.1rem 2rem; color: var(--cs-muted); font-size: .74rem; }
+  footer.app-footer .footer-note { margin-top: .6rem; }
+</style>
+</head>
+<body>
+
+<header class="app-header">
+  <div class="header-top">
+    <h1>Admissible Control Surface v0</h1>
+    <div class="status-pills">
+      <span class="pill">Local only</span>
+      <span class="pill">No provider calls</span>
+      <span class="pill">No executor</span>
+      <span class="pill">No side effect by Admissible</span>
+    </div>
+  </div>
+  <details id="truth-boundary-details">
+    <summary>Truth boundary -- what Admissible does and does not do</summary>
+    <div class="truth-boundary-banner">
+      Cursor / a frontier agent proposes. Admissible frames, audits, admits, limits, requests
+      evidence, requests approval, refuses, and records decisions -- it does not execute.
+      <strong>No side effect executed by Admissible.</strong> This surface does not call
+      Cursor, Claude Code, Codex, Gemini, OpenAI, or any network provider, and does not execute
+      shell commands. There is no automatic executor in this v0; "attest executed" only records
+      that an already-admitted local action was carried out by a human operator outside this tool.
+    </div>
+  </details>
+</header>
+
+<section class="top-controls" id="top-controls">
+  <label class="autonomy-label">
+    Autonomy level
+    <select id="autonomy-select"></select>
+  </label>
+  <div>
+    <p class="autonomy-explanation" id="autonomy-explanation"></p>
+    <details id="autonomy-details"><summary>More about this level</summary><div id="autonomy-description"></div></details>
+  </div>
+  <div class="top-actions">
+    <button type="button" id="btn-load-sample">Load sample Slither session</button>
+    <button type="button" id="btn-export" class="secondary">Export session JSON</button>
+    <label class="file-label" for="import-file">Import session JSON</label>
+    <input type="file" id="import-file" accept="application/json" hidden>
+    <button type="button" id="btn-reset" class="secondary">Reset local session</button>
+  </div>
+</section>
+
+<div id="error-banner" role="alert"></div>
+
+<main id="app-main">
+
+  <section class="panel" id="run-loop-panel">
+    <h2>Run Loop</h2>
+    <p class="turn-line">Turn: <strong id="run-loop-turn">0</strong></p>
+    <p class="hint" style="font-size:.78rem;color:var(--cs-muted);margin:0 0 .5rem;">
+      Generate a copyable instruction packet for Cursor/a frontier agent, paste its response back in, and
+      Admissible will extract and evaluate action candidates -- it never calls or executes anything itself.
+    </p>
+    <div class="run-loop-actions">
+      <button type="button" id="btn-generate-instruction">Generate next agent instruction</button>
+    </div>
+    <div id="instruction-packet-wrapper" style="display:none;">
+      <h3>Next instruction packet (copy into Cursor)</h3>
+      <textarea id="instruction-packet-text" readonly></textarea>
+      <div class="run-loop-actions">
+        <button type="button" id="btn-copy-packet" class="secondary">Copy to clipboard</button>
+      </div>
+    </div>
+    <h3>Paste agent response</h3>
+    <textarea id="agent-response-input" placeholder="Paste Cursor / frontier-agent response here..."></textarea>
+    <div class="run-loop-actions">
+      <button type="button" id="btn-ingest-response">Ingest response</button>
+    </div>
+    <div id="last-ingestion-summary"><p class="no-action-note">No agent response ingested yet.</p></div>
+  </section>
+
+  <section class="panel" id="mission-summary-panel">
+    <h2>Mission Summary</h2>
+    <div id="mission-summary-body"></div>
+  </section>
+
+  <section class="panel" id="needs-attention-panel">
+    <h2>Needs Attention</h2>
+    <div id="needs-attention-body"><p class="no-action-note">Nothing loaded yet.</p></div>
+  </section>
+
+  <section class="panel" id="admissible-queue-panel">
+    <h2>Admissible Action Admission Queue</h2>
+    <div class="queue-tabs" id="queue-tabs">
+      <button type="button" class="tab-btn active" data-filter="attention">Needs attention</button>
+      <button type="button" class="tab-btn" data-filter="allowed_local">Allowed local</button>
+      <button type="button" class="tab-btn" data-filter="executed">Executed</button>
+      <button type="button" class="tab-btn" data-filter="all">All</button>
+      <span class="queue-count" id="queue-count"></span>
+    </div>
+    <div id="queue-table-wrapper">
+      <table class="queue-table">
+        <thead>
+          <tr><th>Action</th><th>Operation</th><th>Decision</th><th>Execution</th><th>Type</th><th></th></tr>
+        </thead>
+        <tbody id="queue-table-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel" id="selected-action-panel">
+    <h2>Selected Action</h2>
+    <div id="selected-action-body">
+      <p class="no-action-note" id="selected-action-empty">Select an action from the queue above to review and decide.</p>
+    </div>
+  </section>
+
+  <section class="panel" id="goal-form-panel">
+    <h2>Send a Goal</h2>
+    <form id="goal-form">
+      <p class="hint">
+        Admissible will run offline goal intake and plan audit -- it will not build or execute anything.
+      </p>
+      <textarea id="goal-input" placeholder="e.g. Build a small browser-based Slither-like game..."></textarea>
+      <button type="submit">Send to Admissible</button>
+    </form>
+  </section>
+
+  <section class="panel" id="goal-intake-panel">
+    <h2>Goal Intake</h2>
+    <div id="goal-intake-body"><p id="goal-empty" class="no-action-note">No goal submitted yet.</p></div>
+  </section>
+
+  <section class="panel" id="plan-audit-panel">
+    <h2>Plan &amp; Independent Plan Audit</h2>
+    <div id="plan-audit-body"><p id="plan-empty" class="no-action-note">No plan generated yet.</p></div>
+  </section>
+
+  <section class="panel" id="decision-records-panel">
+    <h2>Decision Records</h2>
+    <div id="decision-records-body"><p id="decisions-empty" class="no-action-note">No human decisions recorded yet.</p></div>
+    <details id="decision-records-full-details">
+      <summary>Full decision history</summary>
+      <div id="decision-records-full-body"></div>
+    </details>
+  </section>
+
+</main>
+
+<footer class="app-footer">
+  <details id="advanced-transcript-details">
+    <summary>Advanced: session transcript</summary>
+    <div id="transcript-log"></div>
+  </details>
+  <p class="footer-note">
+    Admissible does not execute commands and implements no automatic executor. Autonomy level
+    changes default stopping points only -- it never overrides REFUSE, REQUIRE_HUMAN_APPROVAL, or
+    REQUEST_MORE_EVIDENCE. All state on this page is local JSON, read and written by a local
+    stdlib HTTP server; nothing here calls Cursor, Claude Code, Codex, Gemini, OpenAI, or any
+    network provider.
+  </p>
+</footer>
+
+<noscript>This control surface requires JavaScript to render session state. No network calls are
+  made beyond this local server.</noscript>
+
+<script>
+"use strict";
+
+// Human decision types this UI can send to /api/queue/{action_id}/decide.
+// Kept as one table so labels stay consistent everywhere they're used.
+const DECISION_LABELS = {
+  approve: "Approve (scoped)",
+  request_evidence: "Request evidence",
+  refuse: "Refuse",
+  limit_scope: "Limit scope",
+  attest_executed: "Attest executed after admission",
+};
+
+const AUTONOMY_LABEL_FALLBACK = {
+  L0_OBSERVE_ONLY: "Observe only",
+  L1_PROPOSE_ONLY: "Propose only",
+  L2_LOCAL_BATCH_APPROVAL: "Local batch approval",
+  L3_LOCAL_AUTO_ADMIT_WITH_INTERRUPTS: "Local auto-admit with interrupts",
+  L4_HIGH_AUTONOMY_HARD_GATES: "High autonomy, hard gates",
+};
+
+const ATTENTION_DECISIONS = new Set(["REQUEST_MORE_EVIDENCE", "REQUIRE_HUMAN_APPROVAL", "REFUSE", "ALLOW_WITH_LIMITS"]);
+
+let lastState = null;
+let selectedActionId = null;
+let queueFilter = "attention";
+
+function escapeHtml(value) {
+  if (value === null || value === undefined) return "—";
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function truncate(value, maxLen) {
+  const s = value === null || value === undefined ? "" : String(value);
+  if (s.length <= maxLen) return s;
+  return s.slice(0, maxLen - 1) + "…";
+}
+
+function fmtList(items) {
+  if (!Array.isArray(items) || items.length === 0) return "None";
+  return items.map(escapeHtml).join(", ");
+}
+
+function showError(message) {
+  const banner = document.getElementById("error-banner");
+  banner.textContent = "Admissible Control Surface error: " + message;
+  banner.style.display = "block";
+}
+
+function clearError() {
+  const banner = document.getElementById("error-banner");
+  banner.style.display = "none";
+  banner.textContent = "";
+}
+
+async function apiGet(url) {
+  const res = await fetch(url);
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || ("request failed: " + url));
+  return data;
+}
+
+async function apiPost(url, body) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || ("request failed: " + url));
+  return data;
+}
+
+async function refresh() {
+  try {
+    const state = await apiGet("/api/session");
+    clearError();
+    render(state);
+  } catch (err) {
+    showError(err.message);
+  }
+}
+
+async function runAction(fn) {
+  try {
+    const state = await fn();
+    clearError();
+    render(state);
+  } catch (err) {
+    showError(err.message);
+    await refresh();
+  }
+}
+
+function renderAutonomySelect(state) {
+  const select = document.getElementById("autonomy-select");
+  const levels = state.autonomy_levels || Object.keys(AUTONOMY_LABEL_FALLBACK);
+  select.innerHTML = levels
+    .map((level) => `<option value="${escapeHtml(level)}">${escapeHtml(AUTONOMY_LABEL_FALLBACK[level] || level)}</option>`)
+    .join("");
+  select.value = state.autonomy_level;
+
+  const profile = (state.autonomy_profiles || []).find((p) => p.level === state.autonomy_level);
+  const explanationEl = document.getElementById("autonomy-explanation");
+  const descriptionEl = document.getElementById("autonomy-description");
+  if (profile) {
+    explanationEl.textContent = profile.operational_explanation || profile.description;
+    descriptionEl.innerHTML = `${escapeHtml(profile.description)}<br>Default stopping points: ${fmtList(profile.default_stopping_points)}`;
+  } else {
+    explanationEl.textContent = "";
+    descriptionEl.textContent = "";
+  }
+}
+
+function renderMissionSummary(state) {
+  const body = document.getElementById("mission-summary-body");
+  const ms = state.mission_summary || {};
+  const hasContent = state.goal_intake || (state.queue || []).length > 0;
+
+  if (!hasContent) {
+    body.innerHTML = `
+      <div class="empty-state">
+        <p>Send a goal below, or load the sample Slither session above, to get started.</p>
+        <div class="phase-legend">
+          <div class="phase-box"><strong>Frame</strong>Goal intake turns your prompt into task type, risk, and complexity.</div>
+          <span class="phase-arrow">&rarr;</span>
+          <div class="phase-box"><strong>Audit</strong>A plan is proposed and independently audited for missing safety gates.</div>
+          <span class="phase-arrow">&rarr;</span>
+          <div class="phase-box"><strong>Admit</strong>Proposed actions are queued for Admissible's decision and your review.</div>
+        </div>
+      </div>
+    `;
+    return;
+  }
+
+  const d = ms.counts_by_decision || {};
+  const e = ms.counts_by_execution_status || {};
+  const attentionClass = (ms.needs_attention_count || 0) > 0 ? "stat-tile attention" : "stat-tile";
+
+  body.innerHTML = `
+    <div class="stat-grid">
+      <div class="stat-tile"><span class="stat-label">Task</span><span class="stat-value" style="font-size:.85rem;">${escapeHtml(ms.task_type)}</span></div>
+      <div class="stat-tile"><span class="stat-label">Risk / complexity</span><span class="stat-value" style="font-size:.85rem;">${escapeHtml(ms.global_risk)} / ${escapeHtml(ms.global_complexity)}</span></div>
+      <div class="stat-tile"><span class="stat-label">Autonomy (ceiling)</span><span class="stat-value" style="font-size:.85rem;">${escapeHtml(ms.autonomy_level)}<br><span style="font-weight:400;color:var(--cs-muted);">ceiling: ${escapeHtml(ms.recommended_autonomy_ceiling)}</span></span></div>
+      <div class="stat-tile"><span class="stat-label">Plan audit</span><span class="stat-value" style="font-size:.85rem;">${escapeHtml(ms.plan_audit_verdict)}</span></div>
+      <div class="stat-tile"><span class="stat-label">Total actions</span><span class="stat-value">${escapeHtml(ms.total_actions)}</span></div>
+      <div class="stat-tile"><span class="stat-label">Allowed</span><span class="stat-value">${escapeHtml(d.ALLOW || 0)}</span></div>
+      <div class="stat-tile"><span class="stat-label">Allowed w/ limits</span><span class="stat-value">${escapeHtml(d.ALLOW_WITH_LIMITS || 0)}</span></div>
+      <div class="stat-tile"><span class="stat-label">Needs evidence</span><span class="stat-value">${escapeHtml(d.REQUEST_MORE_EVIDENCE || 0)}</span></div>
+      <div class="stat-tile"><span class="stat-label">Needs approval</span><span class="stat-value">${escapeHtml(d.REQUIRE_HUMAN_APPROVAL || 0)}</span></div>
+      <div class="stat-tile"><span class="stat-label">Refused</span><span class="stat-value">${escapeHtml(d.REFUSE || 0)}</span></div>
+      <div class="stat-tile"><span class="stat-label">Executed after admission</span><span class="stat-value">${escapeHtml(e.executed_after_admission || 0)}</span></div>
+      <div class="stat-tile"><span class="stat-label">Admitted, not executed</span><span class="stat-value">${escapeHtml(e.admitted_not_executed || 0)}</span></div>
+      <div class="stat-tile"><span class="stat-label">Proposed only</span><span class="stat-value">${escapeHtml(e.proposed_only || 0)}</span></div>
+      <div class="${attentionClass}"><span class="stat-label">Needs you now</span><span class="stat-value">${escapeHtml(ms.needs_attention_count || 0)}</span></div>
+    </div>
+    <p style="margin-top:.5rem;font-size:.78rem;color:var(--cs-muted);">
+      Side effect executed by Admissible: <strong style="color:var(--cs-text);">${ms.side_effect_executed_by_admissible ? "true" : "false"}</strong>
+      (Admissible never executes; "executed after admission" above is a human/external attestation).
+    </p>
+  `;
+}
+
+function attentionActionRows(actions) {
+  if (!actions.length) return '<p class="attn-empty">None right now.</p>';
+  return actions
+    .map(
+      (a) => `<div class="attention-row">
+        <span class="decision-${escapeHtml(a.decision)}">${escapeHtml(a.decision)}</span>
+        <span class="attn-tool" title="${escapeHtml(a.tool_or_command)}">${escapeHtml(truncate(a.tool_or_command, 70))}</span>
+        <button type="button" class="secondary review-action-btn" data-action-id="${escapeHtml(a.action_id)}">Review</button>
+      </div>`
+    )
+    .join("");
+}
+
+function renderNeedsAttention(state) {
+  const body = document.getElementById("needs-attention-body");
+  const na = state.needs_attention || {};
+  const evidenceNeeded = na.evidence_needed || [];
+  const approvalNeeded = na.approval_needed || [];
+  const scopeLimitsNeeded = na.scope_limits_needed || [];
+  const planClarifications = na.plan_clarifications || [];
+  const readyToContinue = na.ready_to_continue || [];
+
+  const hasAnything =
+    evidenceNeeded.length || approvalNeeded.length || scopeLimitsNeeded.length ||
+    planClarifications.length || readyToContinue.length;
+
+  if (!hasAnything) {
+    body.innerHTML = '<p class="no-action-note">Nothing needs attention right now.</p>';
+    return;
+  }
+
+  body.innerHTML = `
+    <div class="attn-category">
+      <h3>Evidence needed (${evidenceNeeded.length})</h3>
+      ${attentionActionRows(evidenceNeeded)}
+    </div>
+    <div class="attn-category">
+      <h3>Approval needed (${approvalNeeded.length})</h3>
+      ${attentionActionRows(approvalNeeded)}
+    </div>
+    <div class="attn-category">
+      <h3>Scope limits needed (${scopeLimitsNeeded.length})</h3>
+      ${attentionActionRows(scopeLimitsNeeded)}
+    </div>
+    <div class="attn-category">
+      <h3>Plan clarifications (${planClarifications.length})</h3>
+      ${planClarifications.length ? `<ul>${planClarifications.map((q) => `<li>${escapeHtml(q)}</li>`).join("")}</ul>` : '<p class="attn-empty">None right now.</p>'}
+    </div>
+    <div class="attn-category">
+      <h3>Ready to continue (${readyToContinue.length})</h3>
+      ${attentionActionRows(readyToContinue)}
+    </div>
+  `;
+
+  body.querySelectorAll(".review-action-btn").forEach((btn) => {
+    btn.addEventListener("click", () => selectAction(btn.getAttribute("data-action-id")));
+  });
+}
+
+function filteredQueue(state) {
+  const queue = state.queue || [];
+  switch (queueFilter) {
+    case "attention":
+      return queue.filter((item) => ATTENTION_DECISIONS.has(item.decision));
+    case "allowed_local":
+      return queue.filter((item) => item.decision === "ALLOW");
+    case "executed":
+      return queue.filter((item) => item.execution_status === "executed_after_admission");
+    default:
+      return queue;
+  }
+}
+
+function renderQueueTable(state) {
+  const tbody = document.getElementById("queue-table-body");
+  const countEl = document.getElementById("queue-count");
+  const all = state.queue || [];
+  const rows = filteredQueue(state);
+  countEl.textContent = `(${rows.length} of ${all.length})`;
+
+  if (rows.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="6" class="no-action-note">No actions in this view.</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = rows
+    .map((item) => {
+      const selectedClass = item.action_id === selectedActionId ? " selected" : "";
+      return `<tr class="queue-row${selectedClass}" data-action-id="${escapeHtml(item.action_id)}">
+        <td class="mono">${escapeHtml(item.action_id)}</td>
+        <td class="queue-op-cell" title="${escapeHtml(item.tool_or_command)}">${escapeHtml(truncate(item.tool_or_command, 48))}</td>
+        <td><span class="decision-${escapeHtml(item.decision)}">${escapeHtml(item.decision)}</span></td>
+        <td><span class="badge badge-${escapeHtml((item.execution_status || "").replace(/_/g, "-"))}">${escapeHtml(item.execution_status)}</span></td>
+        <td>${escapeHtml(item.action_type)}</td>
+        <td><button type="button" class="secondary select-action-btn" data-action-id="${escapeHtml(item.action_id)}">Select</button></td>
+      </tr>`;
+    })
+    .join("");
+
+  tbody.querySelectorAll(".select-action-btn").forEach((btn) => {
+    btn.addEventListener("click", () => selectAction(btn.getAttribute("data-action-id")));
+  });
+  tbody.querySelectorAll("tr.queue-row").forEach((row) => {
+    row.addEventListener("click", (evt) => {
+      if (evt.target.closest("button")) return;
+      selectAction(row.getAttribute("data-action-id"));
+    });
+  });
+}
+
+function decisionsForAction(state, actionId) {
+  return (state.human_decisions || []).filter((d) => d.action_id === actionId);
+}
+
+function renderSelectedAction(state) {
+  const body = document.getElementById("selected-action-body");
+  const item = (state.queue || []).find((i) => i.action_id === selectedActionId);
+
+  if (!item) {
+    selectedActionId = null;
+    body.innerHTML = '<p class="no-action-note" id="selected-action-empty">Select an action from the queue above to review and decide.</p>';
+    return;
+  }
+
+  const decisions = decisionsForAction(state, item.action_id);
+  const decisionsHtml = decisions.length
+    ? `<ul class="human-decisions-for-action">${decisions
+        .map((d) => `<li><code>${escapeHtml(d.decision_type)}</code> by ${escapeHtml(d.actor)} at ${escapeHtml(d.timestamp)}${d.scope ? " -- scope: " + escapeHtml(d.scope) : ""}</li>`)
+        .join("")}</ul>`
+    : "";
+
+  const available = item.available_actions || [];
+  const isEvidenceCase = item.decision === "REQUEST_MORE_EVIDENCE";
+  // The dedicated evidence form (below) is the primary path for supplying
+  // evidence; the generic decide-form only keeps "refuse" for this case so
+  // it never shows an irrelevant scope/verification field alongside it.
+  const decideOptions = isEvidenceCase ? available.filter((a) => a !== "request_evidence") : available;
+  const showScope = decideOptions.includes("approve") || decideOptions.includes("limit_scope");
+  const showVerification = decideOptions.includes("attest_executed");
+
+  let formHtml;
+  if (decideOptions.length === 0) {
+    formHtml = isEvidenceCase
+      ? ""
+      : '<p class="no-action-note">No human action available for this decision in v0 (Admissible REFUSE is final).</p>';
+  } else {
+    const options = decideOptions.map((a) => `<option value="${escapeHtml(a)}">${escapeHtml(DECISION_LABELS[a] || a)}</option>`).join("");
+    const scopeField = showScope
+      ? `<div class="field"><label>Scope${decideOptions.includes("approve") ? " (required)" : ""}</label><input type="text" name="scope" placeholder="e.g. local_workspace_only, read-only preview"></div>`
+      : "";
+    const verificationField = showVerification
+      ? `<div class="field"><label>Verification</label><input type="text" name="verification" placeholder="How you verified this ran"></div>`
+      : "";
+    formHtml = `
+      <form class="decide-form" data-action-id="${escapeHtml(item.action_id)}">
+        <div class="field"><label>Decision</label><select name="decision_type">${options}</select></div>
+        ${scopeField}
+        <div class="field"><label>Rationale</label><input type="text" name="rationale" placeholder="Why / notes"></div>
+        ${verificationField}
+        <button type="submit">Record decision</button>
+      </form>
+    `;
+  }
+
+  const evidenceFormHtml = isEvidenceCase
+    ? `
+      <form class="evidence-form" data-action-id="${escapeHtml(item.action_id)}">
+        <div class="field"><label>Evidence type</label>
+          <select name="evidence_type">
+            <option value="document">Document / written confirmation</option>
+            <option value="test_results">Test results</option>
+            <option value="package_trust_review">Package / dependency trust review</option>
+            <option value="approval_confirmation">Approval confirmation</option>
+            <option value="policy_reference">Policy reference</option>
+            <option value="other">Other</option>
+          </select>
+        </div>
+        <div class="field"><label>Evidence</label><textarea name="evidence_text" placeholder="Paste or describe the evidence"></textarea></div>
+        <div class="field"><label>File path / note (optional)</label><input type="text" name="file_path_or_note" placeholder="e.g. docs/license-review.md"></div>
+        <div class="field"><label>Rationale</label><input type="text" name="rationale" placeholder="Why this resolves the gap"></div>
+        <button type="submit">Provide evidence</button>
+      </form>
+    `
+    : "";
+
+  const lifecycleNote = item.lifecycle_status
+    ? `<p class="lifecycle-note">Lifecycle: <code>${escapeHtml(item.lifecycle_status)}</code></p>`
+    : "";
+
+  body.innerHTML = `
+    <div class="sel-header">
+      <span class="mono">${escapeHtml(item.action_id)}</span>
+      <span class="decision-${escapeHtml(item.decision)}">${escapeHtml(item.decision)}</span>
+      <span class="badge badge-${escapeHtml((item.execution_status || "").replace(/_/g, "-"))}">${escapeHtml(item.execution_status)}</span>
+    </div>
+    <p><code>${escapeHtml(item.tool_or_command)}</code> (${escapeHtml(item.action_type)})</p>
+    <dl class="kv-grid">
+      <dt>Operational action</dt><dd><code>${escapeHtml(item.operational_admissibility_action)}</code></dd>
+      <dt>Risk level</dt><dd>${escapeHtml(item.risk_level)}</dd>
+      <dt>Required approval</dt><dd>${escapeHtml(item.required_approval)}</dd>
+      <dt>Missing evidence</dt><dd>${fmtList(item.missing_evidence)}</dd>
+    </dl>
+    ${lifecycleNote}
+    ${decisionsHtml}
+    ${evidenceFormHtml}
+    ${formHtml}
+  `;
+
+  const form = body.querySelector("form.decide-form");
+  if (form) form.addEventListener("submit", onDecideSubmit);
+  const evidenceForm = body.querySelector("form.evidence-form");
+  if (evidenceForm) evidenceForm.addEventListener("submit", onEvidenceSubmit);
+}
+
+function selectAction(actionId) {
+  selectedActionId = actionId;
+  if (lastState) render(lastState);
+  const panel = document.getElementById("selected-action-panel");
+  if (panel) panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+function renderGoalIntake(state) {
+  const body = document.getElementById("goal-intake-body");
+  const intake = state.goal_intake;
+  if (!intake) {
+    body.innerHTML = '<p id="goal-empty" class="no-action-note">No goal submitted yet.</p>';
+    return;
+  }
+  body.innerHTML = `
+    <dl class="kv-grid">
+      <dt>Task type</dt><dd><code>${escapeHtml(intake.task_type)}</code></dd>
+      <dt>Complexity</dt><dd>${escapeHtml(intake.global_complexity)}</dd>
+      <dt>Risk</dt><dd>${escapeHtml(intake.global_risk)} (scope: ${escapeHtml(intake.risk_scope)})</dd>
+      <dt>Architecture-choice burden</dt><dd>${escapeHtml(intake.architecture_choice_burden)}</dd>
+      <dt>Recommended autonomy ceiling</dt><dd><code>${escapeHtml(intake.recommended_autonomy_ceiling)}</code></dd>
+    </dl>
+    <details>
+      <summary>Full goal intake</summary>
+      <dl class="kv-grid" style="margin-top:.4rem;">
+        <dt>Deliverable</dt><dd>${escapeHtml(intake.deliverable)}</dd>
+        <dt>Project maturity</dt><dd><code>${escapeHtml(intake.project_maturity)}</code></dd>
+        <dt>Likely side effects</dt><dd>${fmtList(intake.likely_side_effect_classes)}</dd>
+        <dt>Missing context</dt><dd>${fmtList(intake.missing_context)}</dd>
+        <dt>Non-execution boundary</dt><dd>${escapeHtml(intake.initial_non_execution_boundary)}</dd>
+      </dl>
+      ${
+        (intake.clarifying_questions || []).length
+          ? `<p style="margin-top:.4rem;color:var(--cs-muted);">Clarifying questions:</p><ul>${intake.clarifying_questions.map((q) => `<li>${escapeHtml(q)}</li>`).join("")}</ul>`
+          : ""
+      }
+    </details>
+  `;
+}
+
+function renderPlanAudit(state) {
+  const body = document.getElementById("plan-audit-body");
+  const plan = state.plan_candidate;
+  const audit = state.plan_audit;
+  if (!plan || !audit) {
+    body.innerHTML = '<p id="plan-empty" class="no-action-note">No plan generated yet.</p>';
+    return;
+  }
+  const steps = (plan.steps || [])
+    .map(
+      (step) => `<li><strong>${escapeHtml(step.step_type)}</strong>: ${escapeHtml(step.description)}
+        ${step.requires_gate ? `<span class="badge badge-blocked">gated</span> <em>${escapeHtml(step.gate_reason)}</em>` : ""}</li>`
+    )
+    .join("");
+  body.innerHTML = `
+    <p><strong>Audit verdict:</strong> <span class="badge badge-blocked">${escapeHtml(audit.verdict)}</span></p>
+    <p style="color:var(--cs-muted);font-size:.8rem;">Required gates: ${fmtList(audit.required_gates)}</p>
+    <details>
+      <summary>Full plan (${escapeHtml((plan.steps || []).length)} steps) and audit reasons</summary>
+      <p style="margin-top:.4rem;"><strong>Plan candidate:</strong> ${escapeHtml(plan.goal_summary)}</p>
+      <ol>${steps}</ol>
+      <p style="color:var(--cs-muted);">Audit reasons:</p>
+      <ul>${(audit.reasons || []).map((r) => `<li>${escapeHtml(r)}</li>`).join("")}</ul>
+    </details>
+  `;
+}
+
+function renderDecisionRecordEntry(r) {
+  return `<div class="decision-record">
+    <div><strong>${escapeHtml(r.decision_type)}</strong> on <code>${escapeHtml(r.action_id)}</code> by ${escapeHtml(r.actor)}</div>
+    <div style="color:var(--cs-muted);">${escapeHtml(r.timestamp)}${r.scope ? " &middot; scope: " + escapeHtml(r.scope) : ""}</div>
+    ${r.rationale ? `<div>${escapeHtml(r.rationale)}</div>` : ""}
+    <div style="color:var(--cs-muted);font-size:.7rem;">linked decision_id=${escapeHtml(r.linked_decision_id)}, envelope_id=${escapeHtml(r.linked_envelope_id)}</div>
+  </div>`;
+}
+
+function renderDecisionRecords(state) {
+  const body = document.getElementById("decision-records-body");
+  const fullBody = document.getElementById("decision-records-full-body");
+  const records = state.human_decisions || [];
+  if (records.length === 0) {
+    body.innerHTML = '<p id="decisions-empty" class="no-action-note">No human decisions recorded yet.</p>';
+    fullBody.innerHTML = "";
+    return;
+  }
+  const latest = records.slice(-3).reverse();
+  body.innerHTML = latest.map(renderDecisionRecordEntry).join("");
+  fullBody.innerHTML = records.slice().reverse().map(renderDecisionRecordEntry).join("");
+}
+
+function renderTranscriptEntry(entry) {
+  const payload = entry.payload || {};
+  let roleClass = "role-admissible";
+  let label = entry.type;
+  let bodyHtml = "";
+
+  switch (entry.type) {
+    case "user_prompt":
+      roleClass = "role-user";
+      label = "You";
+      bodyHtml = `<p>${escapeHtml(payload.prompt)}</p>`;
+      break;
+    case "goal_intake":
+      label = "Admissible — Goal Intake";
+      bodyHtml = `<p>task_type=<code>${escapeHtml(payload.task_type)}</code>, deliverable=${escapeHtml(payload.deliverable)},
+        complexity=${escapeHtml(payload.global_complexity)}, risk=${escapeHtml(payload.global_risk)},
+        architecture_choice_burden=${escapeHtml(payload.architecture_choice_burden)}</p>`;
+      break;
+    case "plan_proposal":
+      label = "Admissible — Plan Proposal";
+      bodyHtml = `<p>${escapeHtml(payload.goal_summary)} (${(payload.steps || []).length} step(s))</p>`;
+      break;
+    case "plan_audit":
+      label = "Admissible — Plan Audit";
+      bodyHtml = `<p>Verdict: <strong>${escapeHtml(payload.verdict)}</strong></p>
+        <ul>${(payload.reasons || []).map((r) => `<li>${escapeHtml(r)}</li>`).join("")}</ul>`;
+      break;
+    case "admissible_message":
+      label = "Admissible";
+      bodyHtml = `<p>${escapeHtml(payload.message)}</p>`;
+      break;
+    case "autonomy_change":
+      label = "Autonomy changed";
+      bodyHtml = `<p>${escapeHtml(payload.previous_level)} &rarr; ${escapeHtml(payload.new_level)}</p><p>${escapeHtml(payload.note)}</p>`;
+      break;
+    case "human_decision":
+      label = "Human operator decision";
+      bodyHtml = `<p><code>${escapeHtml(payload.decision_type)}</code> on
+        <code>${escapeHtml(payload.action_id)}</code>${payload.scope ? " (scope: " + escapeHtml(payload.scope) + ")" : ""}</p>`;
+      break;
+    default:
+      bodyHtml = `<pre class="mono">${escapeHtml(JSON.stringify(payload))}</pre>`;
+  }
+
+  return `<div class="transcript-entry ${roleClass}">
+    <span class="entry-label">${escapeHtml(label)} &middot; ${escapeHtml(entry.timestamp)}</span>
+    ${bodyHtml}
+  </div>`;
+}
+
+function renderTranscript(state) {
+  const log = document.getElementById("transcript-log");
+  const entries = state.transcript || [];
+  log.innerHTML = entries.length
+    ? entries.map(renderTranscriptEntry).join("")
+    : '<p id="transcript-empty" class="no-action-note">No transcript yet.</p>';
+}
+
+function renderRunLoop(state) {
+  const runLoop = state.run_loop || {};
+  document.getElementById("run-loop-turn").textContent = runLoop.current_turn || 0;
+
+  const packets = runLoop.instruction_packets || [];
+  const latestPacket = packets.length ? packets[packets.length - 1] : null;
+  const wrapper = document.getElementById("instruction-packet-wrapper");
+  const textarea = document.getElementById("instruction-packet-text");
+  if (latestPacket) {
+    wrapper.style.display = "";
+    textarea.value = latestPacket.packet_text || "";
+  } else {
+    wrapper.style.display = "none";
+    textarea.value = "";
+  }
+
+  const responses = runLoop.response_records || [];
+  const latestResponse = responses.length ? responses[responses.length - 1] : null;
+  const summaryEl = document.getElementById("last-ingestion-summary");
+  if (latestResponse) {
+    summaryEl.innerHTML = `<p><strong>Last ingestion</strong> (turn ${escapeHtml(latestResponse.turn_number)}): ` +
+      `${escapeHtml((latestResponse.action_ids || []).length)} action candidate(s) extracted from a pasted, ` +
+      `<code>${escapeHtml(latestResponse.source_trust)}</code> response. Nothing was executed.</p>`;
+  } else {
+    summaryEl.innerHTML = '<p class="no-action-note">No agent response ingested yet.</p>';
+  }
+}
+
+function render(state) {
+  lastState = state;
+  renderAutonomySelect(state);
+  renderRunLoop(state);
+  renderMissionSummary(state);
+  renderNeedsAttention(state);
+  renderQueueTable(state);
+  renderSelectedAction(state);
+  renderGoalIntake(state);
+  renderPlanAudit(state);
+  renderDecisionRecords(state);
+  renderTranscript(state);
+}
+
+async function onDecideSubmit(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const actionId = form.getAttribute("data-action-id");
+  const formData = new FormData(form);
+  const body = {
+    decision_type: formData.get("decision_type"),
+    scope: formData.get("scope") || undefined,
+    rationale: formData.get("rationale") || "",
+    verification: formData.get("verification") || "",
+  };
+  await runAction(() => apiPost(`/api/queue/${encodeURIComponent(actionId)}/decide`, body));
+}
+
+async function onEvidenceSubmit(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const actionId = form.getAttribute("data-action-id");
+  const formData = new FormData(form);
+  const body = {
+    evidence_type: formData.get("evidence_type"),
+    evidence_text: formData.get("evidence_text") || "",
+    file_path_or_note: formData.get("file_path_or_note") || undefined,
+    rationale: formData.get("rationale") || "",
+  };
+  await runAction(() => apiPost(`/api/queue/${encodeURIComponent(actionId)}/evidence`, body));
+}
+
+document.getElementById("btn-generate-instruction").addEventListener("click", () => {
+  runAction(() => apiPost("/api/session/run_loop/generate_instruction", {}));
+});
+
+document.getElementById("btn-copy-packet").addEventListener("click", async () => {
+  const textarea = document.getElementById("instruction-packet-text");
+  textarea.select();
+  try {
+    await navigator.clipboard.writeText(textarea.value);
+  } catch (err) {
+    // Clipboard API may be unavailable (e.g. insecure context); the
+    // textarea is already selected so the user can copy manually.
+  }
+});
+
+document.getElementById("btn-ingest-response").addEventListener("click", () => {
+  const input = document.getElementById("agent-response-input");
+  const text = input.value.trim();
+  if (!text) return;
+  runAction(() => apiPost("/api/session/run_loop/ingest_response", { raw_response: text })).then(() => {
+    input.value = "";
+  });
+});
+
+document.getElementById("autonomy-select").addEventListener("change", (event) => {
+  runAction(() => apiPost("/api/session/autonomy", { level: event.target.value }));
+});
+
+document.getElementById("btn-load-sample").addEventListener("click", () => {
+  runAction(() => apiPost("/api/session/load_sample", {}));
+});
+
+document.getElementById("btn-reset").addEventListener("click", () => {
+  if (!window.confirm("Reset the local Admissible Control Surface session? This clears the transcript, queue, and decision records.")) return;
+  selectedActionId = null;
+  runAction(() => apiPost("/api/session/reset", {}));
+});
+
+document.getElementById("btn-export").addEventListener("click", async () => {
+  try {
+    const data = await apiGet("/api/session/export");
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `admissible_control_surface_session_${data.session_id || "export"}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    showError(err.message);
+  }
+});
+
+document.getElementById("import-file").addEventListener("change", (event) => {
+  const file = event.target.files && event.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const parsed = JSON.parse(String(reader.result));
+      runAction(() => apiPost("/api/session/import", parsed));
+    } catch (err) {
+      showError("Could not parse session JSON: " + err.message);
+    }
+  };
+  reader.readAsText(file);
+  event.target.value = "";
+});
+
+document.getElementById("goal-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const input = document.getElementById("goal-input");
+  const prompt = input.value.trim();
+  if (!prompt) return;
+  runAction(() => apiPost("/api/session/goal", { prompt })).then(() => {
+    input.value = "";
+  });
+});
+
+document.querySelectorAll("#queue-tabs .tab-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    queueFilter = btn.getAttribute("data-filter");
+    document.querySelectorAll("#queue-tabs .tab-btn").forEach((b) => b.classList.toggle("active", b === btn));
+    if (lastState) renderQueueTable(lastState);
+  });
+});
+
+refresh();
+</script>
+
+</body>
+</html>
