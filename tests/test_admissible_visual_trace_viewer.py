@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import html
 import io
 import json
 import tempfile
@@ -15,6 +16,7 @@ from admissible.harness.viewer import (
     render_trace_html,
     write_trace_html,
 )
+from admissible.runner.baseline_runner import run_frontier_direct_baseline
 from admissible.runner.compare_runner import gather_comparison_data
 from admissible.trace import build_run_trace
 
@@ -22,6 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CASES_DIR = REPO_ROOT / "benchmark" / "cases" / "tier_1_enriched"
 GOLD_LABELS_PATH = REPO_ROOT / "benchmark" / "annotations" / "gold_labels.jsonl"
 MOCK_RESPONSE_PATH = REPO_ROOT / "benchmark" / "examples" / "mock_frontier_response.json"
+SAMPLE_CASE_PATH = CASES_DIR / "customer_communication" / "customer_refund_draft_allowed.envelope.json"
 VIEWER_MODULE_PATH = REPO_ROOT / "admissible" / "harness" / "viewer.py"
 VIEWER_INIT_PATH = REPO_ROOT / "admissible" / "harness" / "__init__.py"
 
@@ -196,6 +199,49 @@ class TestNoNetworkDependencies(unittest.TestCase):
         template = (VIEWER_MODULE_PATH.parent / "viewer.html").read_text(encoding="utf-8")
         for forbidden in ("http://", "https://", "<script"):
             self.assertNotIn(forbidden, template)
+
+
+class TestProviderOutputViewerCleanup(unittest.TestCase):
+    def _build_trace_with_sanitized_frontier_decision(self) -> dict:
+        import json as json_mod
+
+        mock_response_text = MOCK_RESPONSE_PATH.read_text(encoding="utf-8")
+        clean_json = json_mod.dumps(json_mod.loads(mock_response_text))
+        note = "(Note: The assistant output is final.)"
+        dirty_response = clean_json + "\x00\x00\n" + note
+
+        class DirtyMockClient:
+            def complete(self, prompt: str) -> str:
+                return dirty_response
+
+        envelope = json_mod.loads(SAMPLE_CASE_PATH.read_text(encoding="utf-8"))
+        frontier_decision = run_frontier_direct_baseline(
+            envelope,
+            model_client=DirtyMockClient(),
+            system_id="frontier_direct_mock_v0",
+        )
+
+        trace = _build_trace()
+        for case_trace in trace["case_traces"]:
+            if case_trace.get("envelope", {}).get("envelope_id") == envelope.get("envelope_id"):
+                case_trace["decisions"]["frontier_direct_mock_v0"] = frontier_decision
+                break
+        return trace
+
+    def test_viewer_does_not_render_nul_padding_or_provider_note_spam(self) -> None:
+        trace = self._build_trace_with_sanitized_frontier_decision()
+        html = render_trace_html(trace)
+        self.assertNotIn("\x00", html)
+        self.assertNotIn("\\u0000", html)
+        self.assertNotIn("(Note: The assistant output is final.)" * 2, html)
+        self.assertIn("Provider output sanitized", html)
+        self.assertIn("Provider response (parsed JSON)", html)
+
+    def test_viewer_shows_clean_parsed_json_without_trailing_garbage(self) -> None:
+        trace = self._build_trace_with_sanitized_frontier_decision()
+        rendered_html = render_trace_html(trace)
+        clean_json = json.dumps(json.loads(MOCK_RESPONSE_PATH.read_text(encoding="utf-8")))
+        self.assertIn(html.escape(clean_json[:40]), rendered_html)
 
 
 class TestNoAgentOsImport(unittest.TestCase):

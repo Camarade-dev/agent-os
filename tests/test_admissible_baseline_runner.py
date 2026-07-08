@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import hashlib
 import io
 import json
 import unittest
@@ -244,6 +245,92 @@ class TestRunFrontierDirectBaseline(unittest.TestCase):
         client = FakeModelClient("not json")
         with self.assertRaises(ValueError):
             run_frontier_direct_baseline(self.envelope, model_client=client)
+
+
+class TestProviderOutputSanitization(unittest.TestCase):
+    def setUp(self) -> None:
+        self.envelope = _load_json(SAMPLE_CASE_PATH)
+
+    def test_pure_json_stores_clean_raw_provider_response_text_unchanged(self) -> None:
+        client = FakeModelClient(VALID_RESPONSE_JSON)
+        result = run_frontier_direct_baseline(self.envelope, model_client=client)
+        metadata = result["metadata"]
+        self.assertEqual(metadata["raw_provider_response_text"], VALID_RESPONSE_JSON)
+        self.assertFalse(metadata["provider_output_sanitized"])
+        self.assertIn("provider_output_sha256", metadata)
+
+    def test_json_followed_by_trailing_nuls_stores_clean_json_only(self) -> None:
+        dirty = VALID_RESPONSE_JSON + "\x00\x00\n\x00"
+        client = FakeModelClient(dirty)
+        result = run_frontier_direct_baseline(self.envelope, model_client=client)
+        metadata = result["metadata"]
+        self.assertEqual(metadata["raw_provider_response_text"], VALID_RESPONSE_JSON)
+        self.assertNotIn("\x00", metadata["raw_provider_response_text"])
+        self.assertTrue(metadata["provider_output_sanitized"])
+
+    def test_json_followed_by_provider_notes_stores_clean_json_only(self) -> None:
+        note = "(Note: The assistant output is final.)"
+        dirty = VALID_RESPONSE_JSON + "\n" + note
+        client = FakeModelClient(dirty)
+        result = run_frontier_direct_baseline(self.envelope, model_client=client)
+        metadata = result["metadata"]
+        self.assertEqual(metadata["raw_provider_response_text"], VALID_RESPONSE_JSON)
+        self.assertTrue(metadata["provider_output_sanitized"])
+        self.assertIn(note, metadata["provider_output_trailing_text_preview"])
+
+    def test_sanitization_metadata_lengths_present_when_sanitized(self) -> None:
+        dirty = VALID_RESPONSE_JSON + "\x00" * 100
+        client = FakeModelClient(dirty)
+        result = run_frontier_direct_baseline(self.envelope, model_client=client)
+        metadata = result["metadata"]
+        self.assertTrue(metadata["provider_output_sanitized"])
+        self.assertEqual(metadata["provider_output_original_length"], len(dirty))
+        self.assertEqual(metadata["provider_output_clean_length"], len(VALID_RESPONSE_JSON))
+
+    def test_provider_output_sha256_is_deterministic(self) -> None:
+        dirty = VALID_RESPONSE_JSON + "\x00garbage"
+        client = FakeModelClient(dirty)
+        result_a = run_frontier_direct_baseline(self.envelope, model_client=client)
+        result_b = run_frontier_direct_baseline(self.envelope, model_client=client)
+        expected = hashlib.sha256(dirty.encode("utf-8")).hexdigest()
+        self.assertEqual(result_a["metadata"]["provider_output_sha256"], expected)
+        self.assertEqual(result_a["metadata"]["provider_output_sha256"], result_b["metadata"]["provider_output_sha256"])
+
+    def test_trailing_text_preview_is_bounded(self) -> None:
+        long_trailing = "x" * 500
+        dirty = VALID_RESPONSE_JSON + long_trailing
+        client = FakeModelClient(dirty)
+        result = run_frontier_direct_baseline(self.envelope, model_client=client)
+        preview = result["metadata"]["provider_output_trailing_text_preview"]
+        self.assertLessEqual(len(preview), 300)
+
+    def test_sanitization_metadata_excludes_secrets(self) -> None:
+        secret_token = "hf_super-secret-token-do-not-leak"
+        prompt_leak = "SYSTEM PROMPT: classify this action"
+        dirty = VALID_RESPONSE_JSON + "\n" + secret_token
+        client = FakeModelClient(dirty)
+        result = run_frontier_direct_baseline(self.envelope, model_client=client)
+        metadata_json = json.dumps(result["metadata"])
+        self.assertNotIn(secret_token, metadata_json)
+        self.assertNotIn(prompt_leak, metadata_json)
+        for key in ("ADMISSIBLE_HF", "API_KEY", "token", "prompt"):
+            self.assertNotIn(key, metadata_json.lower())
+
+    def test_parser_still_rejects_unknown_decision_labels(self) -> None:
+        bad = json.dumps({"decision": "MAYBE_ALLOW"})
+        with self.assertRaises(ValueError):
+            parse_frontier_response(bad, envelope_id="env_x", system_id="sys_x")
+
+    def test_parser_still_rejects_missing_decision(self) -> None:
+        bad = json.dumps({"risk_level": "low"})
+        with self.assertRaises(ValueError):
+            parse_frontier_response(bad, envelope_id="env_x", system_id="sys_x")
+
+    def test_mock_path_still_works(self) -> None:
+        client = FakeModelClient(VALID_RESPONSE_JSON)
+        result = run_frontier_direct_baseline(self.envelope, model_client=client)
+        self.assertEqual(result["decision"], "REQUIRE_HUMAN_APPROVAL")
+        self.assertIn("raw_provider_response_text", result["metadata"])
 
 
 class TestAllTier1SeedCasesRunCleanly(unittest.TestCase):

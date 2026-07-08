@@ -29,6 +29,7 @@ Also runnable as a CLI:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -158,6 +159,41 @@ def _normalize_safer_next_step(raw: Any, decision_label: str) -> dict | None:
 
 
 _ERROR_PREVIEW_CHARS = 300
+_TRAILING_PREVIEW_MAX = 300
+
+
+def _normalize_response_text(response_text: str) -> str:
+    """Strip NUL bytes that HF and similar providers append after model output."""
+    return response_text.replace("\x00", "")
+
+
+def _safe_trailing_preview(trailing_text: str) -> str:
+    """Return a bounded trailing-text preview, omitting credential-like content."""
+    if not trailing_text:
+        return ""
+    lowered = trailing_text.lower()
+    suspicious_markers = ("hf_", "api_key", "api-key", "bearer ", "sk-", "token")
+    if any(marker in lowered for marker in suspicious_markers):
+        return "[trailing provider output omitted]"
+    return trailing_text[:_TRAILING_PREVIEW_MAX]
+
+
+def _build_provider_output_metadata(
+    original_text: str,
+    clean_json_text: str,
+    trailing_text: str,
+) -> dict[str, Any]:
+    """Bounded audit metadata for sanitized provider output."""
+    metadata: dict[str, Any] = {
+        "provider_output_sha256": hashlib.sha256(original_text.encode("utf-8")).hexdigest(),
+        "provider_output_sanitized": clean_json_text != original_text,
+    }
+    if metadata["provider_output_sanitized"]:
+        metadata["provider_output_original_length"] = len(original_text)
+        metadata["provider_output_clean_length"] = len(clean_json_text)
+        if trailing_text:
+            metadata["provider_output_trailing_text_preview"] = _safe_trailing_preview(trailing_text)
+    return metadata
 
 
 def _build_parse_error_context(
@@ -179,19 +215,27 @@ def _build_parse_error_context(
     )
 
 
-def _extract_json_text(response_text: str) -> str | None:
-    """Extract JSON object text from a model response using layered fallbacks."""
-    stripped = response_text.strip()
+def _extract_json_with_span(response_text: str) -> tuple[str, int, int] | None:
+    """Extract JSON object text and its span in normalized response text.
+
+    Returns (json_text, start, end) where start/end index into the
+    NUL-stripped normalized text, or None when no valid JSON object exists.
+    """
+    normalized = _normalize_response_text(response_text)
+    stripped = normalized.strip()
     if stripped:
         try:
             json.loads(stripped)
-            return stripped
+            start = normalized.find(stripped)
+            if start == -1:
+                start = 0
+            return stripped, start, start + len(stripped)
         except json.JSONDecodeError:
             pass
 
     fence_match = re.search(
         r"```(?:json)?\s*\n?(.*?)\n?```",
-        response_text,
+        normalized,
         re.DOTALL | re.IGNORECASE,
     )
     if fence_match:
@@ -199,16 +243,18 @@ def _extract_json_text(response_text: str) -> str | None:
         if candidate:
             try:
                 json.loads(candidate)
-                return candidate
+                start = fence_match.start(1)
+                end = fence_match.end(1)
+                return candidate, start, end
             except json.JSONDecodeError:
                 pass
 
-    start = response_text.find("{")
+    start = normalized.find("{")
     if start != -1:
         depth = 0
         in_string = False
         escape = False
-        for index, char in enumerate(response_text[start:], start=start):
+        for index, char in enumerate(normalized[start:], start=start):
             if escape:
                 escape = False
                 continue
@@ -225,14 +271,20 @@ def _extract_json_text(response_text: str) -> str | None:
             elif char == "}":
                 depth -= 1
                 if depth == 0:
-                    candidate = response_text[start : index + 1]
+                    candidate = normalized[start : index + 1]
                     try:
                         json.loads(candidate)
-                        return candidate
+                        return candidate, start, index + 1
                     except json.JSONDecodeError:
                         break
 
     return None
+
+
+def _extract_json_text(response_text: str) -> str | None:
+    """Extract JSON object text from a model response using layered fallbacks."""
+    result = _extract_json_with_span(response_text)
+    return result[0] if result is not None else None
 
 
 def parse_frontier_response(response_text: str, *, envelope_id: str, system_id: str) -> dict:
@@ -378,7 +430,15 @@ def run_frontier_direct_baseline(
     decision = parse_frontier_response(response_text, envelope_id=envelope_id, system_id=system_id)
     metadata = decision.get("metadata")
     if isinstance(metadata, dict):
-        metadata["raw_provider_response_text"] = response_text
+        extraction = _extract_json_with_span(response_text)
+        if extraction is not None:
+            clean_json_text, _start, end = extraction
+            normalized = _normalize_response_text(response_text)
+            trailing_text = normalized[end:].strip()
+            metadata["raw_provider_response_text"] = clean_json_text
+            metadata.update(
+                _build_provider_output_metadata(response_text, clean_json_text, trailing_text)
+            )
     return decision
 
 

@@ -332,6 +332,21 @@ def _render_system_decision_block(
         safer_next_step.get("description") if isinstance(safer_next_step, dict) else None
     )
 
+    metadata = decision.get("metadata") if isinstance(decision.get("metadata"), dict) else {}
+    raw_provider_text = metadata.get("raw_provider_response_text")
+    provider_response_block = ""
+    if isinstance(raw_provider_text, str) and raw_provider_text:
+        provider_response_block = (
+            f'<p class="provider-response-label"><strong>Provider response (parsed JSON):</strong></p>'
+            f'<pre class="provider-response">{_esc(raw_provider_text)}</pre>'
+        )
+        if metadata.get("provider_output_sanitized"):
+            provider_response_block += (
+                '<p class="provider-sanitized-note">'
+                "Provider output sanitized; original SHA-256 available in metadata."
+                "</p>"
+            )
+
     return f"""
     <div class="system-decision">
       <h4>{_esc(system_id)} &mdash; {_esc(decision.get('decision'))} ({_esc(correct_text)})</h4>
@@ -340,6 +355,7 @@ def _render_system_decision_block(
       <p>Missing evidence: {_fmt_list(decision.get('missing_evidence'))}</p>
       <p>Safer next step: {_esc(safer_desc)}</p>
       <ul class="reasons">{reason_items}</ul>
+      {provider_response_block}
     </div>
     """
 
