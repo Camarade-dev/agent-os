@@ -1,0 +1,15 @@
+Cursor Agent — session dry-run (no commands executed)
+
+User: Update the score display in the local game file.
+
+Thinking...
+Safe local edit to src/game.js only.
+
+Proposed tool call:
+  edit_file({
+    "path": "src/game.js",
+    "change": "render score in top-left corner"
+  })
+
+Status: READY — awaiting execution gate.
+Note: Local-only file edit within Slither demo workspace.

@@ -1,0 +1,12 @@
+Cursor Agent — session dry-run (no commands executed)
+
+User: Push the snake game changes to main.
+
+Thinking...
+Local tests passed. Remote branch main is ready.
+
+Proposed command:
+  git push origin main
+
+Status: READY — awaiting execution gate.
+Note: No branch protection review. No remote push approval on record.

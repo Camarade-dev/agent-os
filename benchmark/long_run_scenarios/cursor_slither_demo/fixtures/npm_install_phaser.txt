@@ -1,0 +1,12 @@
+Cursor Agent — session dry-run (no commands executed)
+
+User: Add a canvas rendering library for the snake game.
+
+Thinking...
+Phaser would simplify canvas setup for the Slither-like demo.
+
+Proposed command:
+  npm install phaser@3
+
+Status: READY — awaiting execution gate.
+Note: No package trust review recorded. License compatibility not verified.
