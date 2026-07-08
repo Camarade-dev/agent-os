@@ -51,15 +51,19 @@ def _parse_timeout_seconds(raw: str | None) -> float:
     return value
 
 
+def _sanitize_provider_text(text: str) -> str:
+    return text.strip().rstrip("\x00")
+
+
 def _extract_text_from_response(parsed: Any) -> str | None:
     if not isinstance(parsed, dict):
         return None
     text = parsed.get("text")
     if isinstance(text, str):
-        return text
+        return _sanitize_provider_text(text)
     output = parsed.get("output")
     if isinstance(output, str):
-        return output
+        return _sanitize_provider_text(output)
     choices = parsed.get("choices")
     if isinstance(choices, list) and choices:
         first = choices[0]
@@ -68,8 +72,60 @@ def _extract_text_from_response(parsed: Any) -> str | None:
             if isinstance(message, dict):
                 content = message.get("content")
                 if isinstance(content, str):
-                    return content
+                    return _sanitize_provider_text(content)
     return None
+
+
+def _build_hf_response_shape_diagnostics(parsed: Any) -> dict[str, Any]:
+    """Build safe diagnostic fields for an unsupported Hugging Face response shape."""
+    diagnostics: dict[str, Any] = {}
+    if not isinstance(parsed, dict):
+        diagnostics["top_level_keys"] = []
+        diagnostics["choices_type"] = type(parsed).__name__
+        return diagnostics
+
+    diagnostics["top_level_keys"] = sorted(parsed.keys())
+
+    usage = parsed.get("usage")
+    if isinstance(usage, dict):
+        diagnostics["usage"] = {key: usage[key] for key in sorted(usage.keys())}
+
+    choices = parsed.get("choices")
+    diagnostics["choices_type"] = type(choices).__name__
+    if isinstance(choices, list):
+        diagnostics["choices_count"] = len(choices)
+        if choices and isinstance(choices[0], dict):
+            first_choice = choices[0]
+            diagnostics["first_choice_keys"] = sorted(first_choice.keys())
+            finish_reason = first_choice.get("finish_reason")
+            if finish_reason is not None:
+                diagnostics["first_choice_finish_reason"] = finish_reason
+            message = first_choice.get("message")
+            diagnostics["first_message_type"] = type(message).__name__
+            if isinstance(message, dict):
+                diagnostics["first_message_keys"] = sorted(message.keys())
+                diagnostics["content_present"] = "content" in message
+                content = message.get("content")
+                diagnostics["content_is_none"] = content is None
+                if isinstance(content, str):
+                    diagnostics["content_length"] = len(content)
+                reasoning_content = message.get("reasoning_content")
+                diagnostics["reasoning_content_present"] = (
+                    isinstance(reasoning_content, str) and len(reasoning_content) > 0
+                )
+                if isinstance(reasoning_content, str):
+                    diagnostics["reasoning_content_length"] = len(reasoning_content)
+    return diagnostics
+
+
+def _format_hf_unsupported_shape_error(parsed: Any) -> str:
+    base = (
+        "Hugging Face API response has unsupported shape; "
+        "expected text, output, or choices[0].message.content"
+    )
+    diagnostics = _build_hf_response_shape_diagnostics(parsed)
+    detail = ", ".join(f"{key}={value!r}" for key, value in diagnostics.items())
+    return f"{base}; {detail}"
 
 
 class EnvConfiguredHttpModelClient:
@@ -284,10 +340,7 @@ class HuggingFaceChatCompletionsModelClient:
 
         text = _extract_text_from_response(parsed)
         if text is None:
-            raise ValueError(
-                "Hugging Face API response has unsupported shape; "
-                "expected text, output, or choices[0].message.content"
-            )
+            raise ValueError(_format_hf_unsupported_shape_error(parsed))
         return text
 
 

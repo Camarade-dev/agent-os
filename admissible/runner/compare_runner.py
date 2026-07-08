@@ -72,6 +72,26 @@ DEFAULT_FRONTIER_LIVE_SYSTEM_ID = "frontier_direct_live_v0"
 DEFAULT_FRONTIER_HF_SYSTEM_ID = "frontier_direct_hf_v0"
 
 
+def _envelope_id(envelope: dict) -> str:
+    envelope_id = envelope.get("envelope_id")
+    return envelope_id if isinstance(envelope_id, str) else "<unknown>"
+
+
+def _run_with_envelope_context(
+    system: str,
+    case_index: int,
+    envelope: dict,
+    run_fn,
+) -> dict:
+    try:
+        return run_fn(envelope)
+    except Exception as exc:
+        raise type(exc)(
+            f"{exc}; system_id={system!r}, envelope_id={_envelope_id(envelope)!r}, "
+            f"case_index={case_index}"
+        ) from exc
+
+
 def _envelope_sort_key(envelope: dict) -> str:
     metadata = envelope.get("metadata") or {}
     benchmark_case_id = metadata.get("benchmark_case_id")
@@ -121,10 +141,15 @@ def _run_frontier_direct_mock(
         model_client = FixedResponseModelClient(_mock_response_text(mock_response))
 
     return [
-        run_frontier_direct_baseline(
-            envelope, model_client=model_client, system_id=DEFAULT_FRONTIER_MOCK_SYSTEM_ID
+        _run_with_envelope_context(
+            "frontier_direct_mock",
+            case_index,
+            envelope,
+            lambda env, mc=model_client: run_frontier_direct_baseline(
+                env, model_client=mc, system_id=DEFAULT_FRONTIER_MOCK_SYSTEM_ID
+            ),
         )
-        for envelope in envelopes
+        for case_index, envelope in enumerate(envelopes)
     ]
 
 
@@ -137,10 +162,15 @@ def _run_frontier_direct_live(
         model_client = build_model_client_from_env()
 
     return [
-        run_frontier_direct_baseline(
-            envelope, model_client=model_client, system_id=DEFAULT_FRONTIER_LIVE_SYSTEM_ID
+        _run_with_envelope_context(
+            "frontier_direct_live",
+            case_index,
+            envelope,
+            lambda env, mc=model_client: run_frontier_direct_baseline(
+                env, model_client=mc, system_id=DEFAULT_FRONTIER_LIVE_SYSTEM_ID
+            ),
         )
-        for envelope in envelopes
+        for case_index, envelope in enumerate(envelopes)
     ]
 
 
@@ -153,10 +183,15 @@ def _run_frontier_direct_hf(
         model_client = build_huggingface_model_client_from_env()
 
     return [
-        run_frontier_direct_baseline(
-            envelope, model_client=model_client, system_id=DEFAULT_FRONTIER_HF_SYSTEM_ID
+        _run_with_envelope_context(
+            "frontier_direct_hf",
+            case_index,
+            envelope,
+            lambda env, mc=model_client: run_frontier_direct_baseline(
+                env, model_client=mc, system_id=DEFAULT_FRONTIER_HF_SYSTEM_ID
+            ),
         )
-        for envelope in envelopes
+        for case_index, envelope in enumerate(envelopes)
     ]
 
 
@@ -177,7 +212,10 @@ def run_system_on_envelopes(
     variables. Raises ValueError for any other system name.
     """
     if system == "rules_only":
-        return [evaluate_envelope(envelope) for envelope in envelopes]
+        return [
+            _run_with_envelope_context(system, case_index, envelope, evaluate_envelope)
+            for case_index, envelope in enumerate(envelopes)
+        ]
     if system == "frontier_direct_mock":
         return _run_frontier_direct_mock(envelopes, mock_response=mock_response)
     if system == "frontier_direct_live":

@@ -259,5 +259,41 @@ class TestSupportedSystemsConstant(unittest.TestCase):
         self.assertIn("frontier_direct_mock", SUPPORTED_SYSTEMS)
 
 
+class TestSequentialRunnerEnvelopeContext(unittest.TestCase):
+    def test_failure_includes_system_id_and_envelope_id(self) -> None:
+        envelopes = load_envelopes(CASES_DIR)[:2]
+        failing_envelope = envelopes[1]
+        envelope_id = failing_envelope["envelope_id"]
+
+        class _FailingClient:
+            def __init__(self, response=None) -> None:  # noqa: ARG002
+                self.calls = 0
+
+            def complete(self, prompt: str) -> str:  # noqa: ARG002
+                self.calls += 1
+                if self.calls == 2:
+                    raise ValueError("simulated provider failure")
+                return (
+                    '{"decision": "ALLOW", "risk_level": "low", "reasons": [], '
+                    '"missing_evidence": [], "required_approval": "", '
+                    '"safer_next_step": null, "confidence": 0.5}'
+                )
+
+        with mock.patch(
+            "admissible.runner.compare_runner.FixedResponseModelClient",
+            _FailingClient,
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                run_system_on_envelopes(
+                    "frontier_direct_mock",
+                    envelopes,
+                    mock_response={"decision": "ALLOW"},
+                )
+        message = str(ctx.exception)
+        self.assertIn("system_id='frontier_direct_mock'", message)
+        self.assertIn(f"envelope_id={envelope_id!r}", message)
+        self.assertIn("case_index=1", message)
+
+
 if __name__ == "__main__":
     unittest.main()

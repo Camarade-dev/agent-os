@@ -289,6 +289,145 @@ class TestHuggingFaceChatCompletionsModelClient(unittest.TestCase):
             with self.assertRaises(ValueError):
                 client.complete("p")
 
+    def test_unsupported_shape_diagnostic_includes_top_level_and_message_keys(self) -> None:
+        client = self._client()
+        payload = {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": None},
+                }
+            ],
+            "id": "resp-1",
+        }
+        with mock.patch(
+            "urllib.request.urlopen",
+            return_value=mock.Mock(
+                __enter__=lambda self: self,
+                __exit__=lambda *args: None,
+                read=lambda: json.dumps(payload).encode("utf-8"),
+            ),
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                client.complete("p")
+        message = str(ctx.exception)
+        self.assertIn("top_level_keys", message)
+        self.assertIn("first_message_keys", message)
+        self.assertIn("'choices'", message)
+        self.assertIn("'message'", message)
+
+    def test_unsupported_shape_diagnostic_includes_finish_reason_and_usage(self) -> None:
+        client = self._client()
+        payload = {
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {"content": None},
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 0, "total_tokens": 10},
+        }
+        with mock.patch(
+            "urllib.request.urlopen",
+            return_value=mock.Mock(
+                __enter__=lambda self: self,
+                __exit__=lambda *args: None,
+                read=lambda: json.dumps(payload).encode("utf-8"),
+            ),
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                client.complete("p")
+        message = str(ctx.exception)
+        self.assertIn("first_choice_finish_reason", message)
+        self.assertIn("'length'", message)
+        self.assertIn("usage", message)
+        self.assertIn("prompt_tokens", message)
+
+    def test_unsupported_shape_diagnostic_does_not_leak_token(self) -> None:
+        client = self._client()
+        with mock.patch(
+            "urllib.request.urlopen",
+            return_value=mock.Mock(
+                __enter__=lambda self: self,
+                __exit__=lambda *args: None,
+                read=lambda: json.dumps({"unexpected": "shape"}).encode("utf-8"),
+            ),
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                client.complete("p")
+        self.assertNotIn(SECRET_TOKEN, str(ctx.exception))
+
+    def test_content_none_with_reasoning_content_raises_diagnostic(self) -> None:
+        client = self._client()
+        payload = {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "content": None,
+                        "reasoning_content": '{"decision": "ALLOW"}',
+                    },
+                }
+            ],
+        }
+        with mock.patch(
+            "urllib.request.urlopen",
+            return_value=mock.Mock(
+                __enter__=lambda self: self,
+                __exit__=lambda *args: None,
+                read=lambda: json.dumps(payload).encode("utf-8"),
+            ),
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                client.complete("p")
+        message = str(ctx.exception)
+        self.assertIn("content_is_none", message)
+        self.assertIn("reasoning_content_present", message)
+        self.assertNotIn("ALLOW", message)
+
+    def test_trailing_nuls_stripped_from_choices_content(self) -> None:
+        client = self._client()
+        payload = {
+            "choices": [{"message": {"content": VALID_BASELINE_RESPONSE + "\x00\x00"}}],
+        }
+        with mock.patch(
+            "urllib.request.urlopen",
+            return_value=mock.Mock(
+                __enter__=lambda self: self,
+                __exit__=lambda *args: None,
+                read=lambda: json.dumps(payload).encode("utf-8"),
+            ),
+        ):
+            self.assertEqual(client.complete("p"), VALID_BASELINE_RESPONSE)
+
+    def test_trailing_nuls_stripped_from_text_shape(self) -> None:
+        client = self._client()
+        with mock.patch(
+            "urllib.request.urlopen",
+            return_value=mock.Mock(
+                __enter__=lambda self: self,
+                __exit__=lambda *args: None,
+                read=lambda: json.dumps(
+                    {"text": VALID_BASELINE_RESPONSE + "\x00"}
+                ).encode("utf-8"),
+            ),
+        ):
+            self.assertEqual(client.complete("p"), VALID_BASELINE_RESPONSE)
+
+    def test_trailing_nuls_stripped_from_output_shape(self) -> None:
+        client = self._client()
+        with mock.patch(
+            "urllib.request.urlopen",
+            return_value=mock.Mock(
+                __enter__=lambda self: self,
+                __exit__=lambda *args: None,
+                read=lambda: json.dumps(
+                    {"output": "  " + VALID_BASELINE_RESPONSE + "\x00  "}
+                ).encode("utf-8"),
+            ),
+        ):
+            self.assertEqual(client.complete("p"), VALID_BASELINE_RESPONSE)
+
     def test_http_errors_do_not_leak_token(self) -> None:
         import urllib.error
 
