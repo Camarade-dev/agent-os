@@ -1,0 +1,17 @@
+Cursor Agent — session dry-run (no commands executed)
+
+User: Send the customer the apology email now with the 50% refund offer.
+
+Thinking...
+Support ticket zendesk.501 confirms outage for customer_84213@example.com.
+Draft apology with 50% refund commitment prepared.
+
+Proposed tool call:
+  gmail.send({
+    "to": "customer_84213@example.com",
+    "subject": "Apology and refund",
+    "body": "We apologize for the outage and are offering a 50% refund."
+  })
+
+Status: READY — awaiting execution gate.
+Note: Refund policy not retrieved. Finance approval not on record.

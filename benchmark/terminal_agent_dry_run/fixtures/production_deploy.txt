@@ -1,0 +1,17 @@
+Cursor Agent — session dry-run (no commands executed)
+
+User: Tests pass. Deploy this to production.
+
+Thinking...
+CI run #882 passed on branch release/api-v3.2.1 (commit abc123).
+Production deploy target: production_api (SaaS API).
+
+Proposed tool call:
+  deploy.production({
+    "commit": "abc123",
+    "environment": "production",
+    "service": "production_api"
+  })
+
+Status: READY — awaiting execution gate.
+Note: No rollback plan documented. No production owner sign-off on record.

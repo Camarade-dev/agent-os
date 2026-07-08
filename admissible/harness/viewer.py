@@ -130,6 +130,29 @@ def _system_label(system_name: str, systems: list[dict]) -> str:
     return system_name
 
 
+def _is_terminal_dry_run_trace(trace: dict) -> bool:
+    metadata = trace.get("metadata") or {}
+    return metadata.get("demo_kind") == "terminal_agent_dry_run_v0"
+
+
+def _render_dry_run_banner(trace: dict) -> str:
+    if not _is_terminal_dry_run_trace(trace):
+        return ""
+
+    metadata = trace.get("metadata") or {}
+    return f"""
+    <div class="dry-run-banner">
+      <strong>No side effect executed.</strong>
+      This is a fixture-based terminal-agent dry-run demonstration only.
+      <dl class="dry-run-grid">
+        <dt>Source system</dt><dd><code>{_esc(metadata.get('source_system'))}</code></dd>
+        <dt>Decision system</dt><dd><code>{_esc(metadata.get('decision_system'))}</code></dd>
+        <dt>Side effect executed</dt><dd>{_esc(metadata.get('side_effect_executed'))}</dd>
+      </dl>
+    </div>
+    """
+
+
 def _render_header(trace: dict) -> str:
     final_verdict = trace.get("final_verdict") or {}
     status = final_verdict.get("status", "UNKNOWN")
@@ -139,9 +162,15 @@ def _render_header(trace: dict) -> str:
         "INCONCLUSIVE": "verdict-inconclusive",
     }.get(status, "verdict-unknown")
 
+    title = (
+        "Terminal Agent Dry-Run Trace"
+        if _is_terminal_dry_run_trace(trace)
+        else "Admissible Run Trace"
+    )
+
     return f"""
     <header class="trace-header">
-      <h1>Admissible Run Trace</h1>
+      <h1>{title}</h1>
       <dl class="header-grid">
         <dt>Trace ID</dt><dd><code>{_esc(trace.get('trace_id'))}</code></dd>
         <dt>Created at</dt><dd>{_esc(trace.get('created_at'))}</dd>
@@ -149,6 +178,7 @@ def _render_header(trace: dict) -> str:
       <div class="claim-boundary">
         <strong>Claim boundary:</strong> {_esc(trace.get('claim_boundary'))}
       </div>
+      {_render_dry_run_banner(trace)}
       <div class="final-verdict {status_class}">
         <div class="verdict-status">Final verdict: {_esc(status)}</div>
         <div class="verdict-summary">{_esc(final_verdict.get('summary'))}</div>
@@ -360,6 +390,26 @@ def _render_system_decision_block(
     """
 
 
+def _render_terminal_agent_block(case_trace: dict) -> str:
+    terminal_agent = case_trace.get("terminal_agent")
+    if not isinstance(terminal_agent, dict):
+        return ""
+
+    raw_output = terminal_agent.get("raw_output")
+    if not isinstance(raw_output, str) or not raw_output:
+        return ""
+
+    return f"""
+    <div class="terminal-agent-block">
+      <p><strong>Raw terminal-agent output</strong>
+         (source: <code>{_esc(terminal_agent.get('source_system'))}</code>;
+         fixture: <code>{_esc(terminal_agent.get('fixture_path'))}</code>)</p>
+      <p class="no-side-effect-note"><strong>No side effect executed.</strong></p>
+      <pre class="terminal-agent-output">{_esc(raw_output)}</pre>
+    </div>
+    """
+
+
 def _render_case_detail(case_trace: dict, systems: list[dict]) -> str:
     envelope = case_trace.get("envelope") or {}
     user_request = envelope.get("user_request") or {}
@@ -379,18 +429,21 @@ def _render_case_detail(case_trace: dict, systems: list[dict]) -> str:
     )
 
     benchmark_case_id = case_trace.get("benchmark_case_id")
+    terminal_block = _render_terminal_agent_block(case_trace)
 
     return f"""
     <details class="case-detail">
       <summary>{_esc(benchmark_case_id)}</summary>
       <div class="case-detail-body">
-        <p><strong>User request:</strong> {_esc(user_request.get('raw'))}</p>
+        {terminal_block}
+        <p><strong>User task:</strong> {_esc(user_request.get('raw'))}</p>
         <p><strong>Proposed action:</strong> {_esc(_proposed_action_summary(envelope))}</p>
         <p><strong>Risk summary:</strong> {_esc(_risk_summary(envelope))}</p>
         <p><strong>Evidence missing:</strong> {_fmt_list(evidence.get('missing'))}</p>
         <p><strong>Required approval:</strong> {_esc(authority_context.get('required_approval'))}</p>
         <p><strong>Candidate safer next steps:</strong> {_fmt_list(envelope.get('candidate_safer_next_steps'))}</p>
         <p><strong>Gold annotation:</strong> {_esc(_gold_summary(gold))}</p>
+        <h4>Admissible decision</h4>
         {system_blocks}
       </div>
     </details>
