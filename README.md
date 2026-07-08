@@ -1,4 +1,17 @@
-# Agent OS
+# agent-os (repository)
+
+This repository is **historically named `agent-os`** but hosts **two sibling systems** that do not share runtime authority:
+
+| System | Role | Active surface |
+|--------|------|----------------|
+| **Admissible** | Benchmarkable action-admission layer for side-effecting AI-agent actions | `admissible/`, `benchmark/`, Admissible docs/tests |
+| **Agent OS** | Historical governed-delegation substrate (CLI, planning, evidence registrar) | `agent_os/`, Agent OS docs/tests |
+
+**Admissible modules must not import `agent_os`.** See [`docs/admissible-agent-os-lineage.md`](docs/admissible-agent-os-lineage.md) and [`docs/admissible-agent-os-boundary-audit.md`](docs/admissible-agent-os-boundary-audit.md).
+
+---
+
+## Agent OS
 
 **v0.1.0** — local governed-delegation prototype · [release notes](docs/release-notes-v0.1.0.md) · [why Agent OS](docs/why-agent-os.md)
 
@@ -46,7 +59,7 @@ This is a smoke-tested internal harness, not a public benchmark result.
 **Focused tests:**
 
 ```bash
-python -m unittest tests.test_admissible_decision tests.test_admissible_rules_only tests.test_admissible_scoring tests.test_admissible_baseline_runner tests.test_admissible_compare_runner tests.test_admissible_trace tests.test_admissible_visual_trace_viewer tests.test_admissible_demo_pack tests.test_admissible_demo_trace tests.test_admissible_demo_script -v
+python -m unittest tests.test_admissible_decision tests.test_admissible_rules_only tests.test_admissible_scoring tests.test_admissible_baseline_runner tests.test_admissible_compare_runner tests.test_admissible_trace tests.test_admissible_visual_trace_viewer tests.test_admissible_demo_pack tests.test_admissible_demo_trace tests.test_admissible_demo_script tests.test_admissible_boundary -v
 ```
 
 **Generate demo trace and HTML:**
@@ -167,7 +180,8 @@ Live runs remain Tier 1 enriched smoke tests, not benchmark results.
 - [`docs/Admissible_THESIS.md`](docs/Admissible_THESIS.md) — thesis and design rationale
 - [`docs/Admissible_ACTION_ENVELOPE.md`](docs/Admissible_ACTION_ENVELOPE.md) — action envelope specification
 - [`docs/Admissible_BENCHMARK_SPEC.md`](docs/Admissible_BENCHMARK_SPEC.md) — benchmark design: cases, gold, baselines, scoring
-- [`docs/admissible-agent-os-lineage.md`](docs/admissible-agent-os-lineage.md) — how Admissible relates to Agent OS
+- [`docs/admissible-agent-os-lineage.md`](docs/admissible-agent-os-lineage.md) — canonical boundary between Admissible and Agent OS
+- [`docs/admissible-agent-os-boundary-audit.md`](docs/admissible-agent-os-boundary-audit.md) — repository boundary audit and file classification
 - [`benchmark/reports/demo-pack.md`](benchmark/reports/demo-pack.md) — curated demo scenario pack
 - [`benchmark/reports/demo-script.md`](benchmark/reports/demo-script.md) — narrated demo walkthrough
 
@@ -348,12 +362,14 @@ agent-os close RUN_ID [PATH]  # attempt fail-closed run closure
 ## Repository layout
 
 ```
-agent-os/
-  agent_os/           # Python package and CLI
-    templates/        # run artifact templates (packaged with install)
-  docs/               # protocol documentation
-  examples/           # manual workflow examples
-  tests/              # unittest suite
+agent-os/                 # historical repo name — two sibling systems, not a parent/child tree
+  admissible/             # ACTIVE: action-admission core, runners, harness (must not import agent_os)
+  benchmark/              # ACTIVE: schemas, cases, gold, scoring, demo artifacts
+  agent_os/               # LEGACY/SUBSTRATE: governed-delegation CLI and planning package
+    templates/            # run + planning artifact templates (packaged with install)
+  docs/                   # protocol + Admissible specification + boundary docs
+  examples/               # Agent OS planning workflow examples
+  tests/                  # unittest suite (test_admissible_* vs test_agent_os.py)
 ```
 
 ## Philosophy

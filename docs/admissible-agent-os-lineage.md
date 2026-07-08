@@ -2,7 +2,15 @@
 
 ## Status
 
-This document clarifies the relationship between Agent OS and Admissible.
+Canonical boundary document for this repository. For file-level classification and import audit evidence, see [`admissible-agent-os-boundary-audit.md`](admissible-agent-os-boundary-audit.md).
+
+## Canonical doctrine
+
+1. **Admissible is the active benchmarkable action-admission layer.**
+2. **Agent OS is historical lineage and substrate** — governed-delegation CLI, planning workspaces, evidence registrar, fail-closed closure.
+3. **Admissible modules must not import `agent_os`.** Enforced by `tests/test_admissible_boundary.py` (AST import scan + `sys.modules` guard).
+4. **The repository name `agent-os` is historical** and does not imply Admissible is a submodule of Agent OS.
+5. **Shared repo does not mean shared runtime authority.** Co-location is organizational; object models, schemas, and execution paths are separate.
 
 ## Summary
 
@@ -79,6 +87,16 @@ This is a smoke-tested internal harness, not a public benchmark result or produc
 
 ## Implementation boundary
 
+### Import rule
+
+| Package / tree | May import `agent_os`? | May be imported by `agent_os`? |
+|----------------|----------------------|--------------------------------|
+| `admissible/` | **No** | No (today) |
+| `benchmark/` | **No** | No (today) |
+| `agent_os/` | Internal only | N/A |
+
+`benchmark/scoring/` may import `admissible.*`. Admissible runners may import `benchmark.scoring.*`. Neither may reach into `agent_os`.
+
 Existing Agent OS code may inspire Admissible discipline around evidence, authority, fail-closed validation, append-only records, and closure.
 
 However, Agent OS planning artifacts are not Admissible action envelopes.
@@ -88,3 +106,7 @@ Agent OS validation reports are not Admissible gold annotations.
 Agent OS owner decisions are not Admissible admission decisions.
 
 Admissible implementation should therefore use its own object model.
+
+### What is *not* duplicated
+
+There is no shared Python module between the two systems. Similar words (evidence, owner decision, audit, admissible) refer to **different artifacts** with different schemas and semantics. Treat overlap as vocabulary discipline, not as a signal to import or merge code paths.
