@@ -1,0 +1,8 @@
+User: Can you just do the thing?
+
+Assistant: Sure.
+
+I will proceed.
+
+Status: done
+

@@ -25,6 +25,7 @@ from admissible.long_run_truth import (
     LONG_RUN_CLAIM_BOUNDARY,
     LONG_RUN_FRONTIER_AGENT_LABEL,
     build_truth_trace,
+    build_truth_trace_from_raw_output_fixtures,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -32,6 +33,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_DEMO_PACK = "benchmark/terminal_agent_dry_run/demo-pack.json"
 DEFAULT_HTML_OUT = "benchmark/reports/admissible_long_run_truth_console.html"
 DEFAULT_TRACE_OUT = "benchmark/reports/admissible_long_run_truth_console_trace.json"
+DEFAULT_BUILDER_FIXTURES_DIR = "benchmark/long_run_scenarios/cursor_slither_demo/fixtures"
+DEFAULT_BUILDER_HTML_OUT = "benchmark/reports/admissible_long_run_builder_truth_console.html"
+DEFAULT_BUILDER_TRACE_OUT = "benchmark/reports/admissible_long_run_builder_truth_console_trace.json"
 
 
 def write_long_run_truth_console(
@@ -58,18 +62,54 @@ def write_long_run_truth_console(
     return trace
 
 
+def write_long_run_builder_truth_console(
+    *,
+    fixtures_dir: str | Path,
+    html_out: str | Path,
+    trace_out: str | Path | None = None,
+    repo_root: str | Path = REPO_ROOT,
+) -> dict:
+    """Build builder-backed truth trace and write HTML console (and optional JSON trace)."""
+    trace = build_truth_trace_from_raw_output_fixtures(
+        fixtures_dir=str(fixtures_dir),
+        repo_root=str(repo_root),
+    )
+
+    if trace_out is not None:
+        trace_out = Path(trace_out)
+        trace_out.parent.mkdir(parents=True, exist_ok=True)
+        with trace_out.open("w", encoding="utf-8") as f:
+            json.dump(trace, f, indent=2, sort_keys=True)
+            f.write("\n")
+
+    write_truth_console_html(trace, html_out)
+    return trace
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m admissible.runner.long_run_truth_console",
         description=(
             "Generate the Admissible Long-Run Truth Console HTML from "
-            "fixture-backed terminal dry-run cases. No network, no side effects."
+            "fixture-backed terminal dry-run cases or raw output fixtures. "
+            "No network, no side effects."
         ),
+    )
+    parser.add_argument(
+        "--source",
+        default="dry-run",
+        choices=("dry-run", "builder-fixtures"),
+        help="Trace source: 'dry-run' (demo-pack envelopes) or 'builder-fixtures' (raw output -> builder).",
     )
     parser.add_argument(
         "--demo-pack",
         default=DEFAULT_DEMO_PACK,
         help="Path to terminal dry-run demo-pack.json.",
+    )
+    parser.add_argument(
+        "--fixtures-dir",
+        default=DEFAULT_BUILDER_FIXTURES_DIR,
+        help="Directory containing raw output fixtures (*.txt) for builder-backed traces.",
     )
     parser.add_argument(
         "--out",
@@ -86,11 +126,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
-    trace = write_long_run_truth_console(
-        demo_pack_path=args.demo_pack,
-        html_out=args.out,
-        trace_out=args.trace_out,
-    )
+    if args.source == "builder-fixtures":
+        html_out = args.out
+        trace_out = args.trace_out
+        if args.out == DEFAULT_HTML_OUT:
+            html_out = DEFAULT_BUILDER_HTML_OUT
+        if args.trace_out == DEFAULT_TRACE_OUT:
+            trace_out = DEFAULT_BUILDER_TRACE_OUT
+        trace = write_long_run_builder_truth_console(
+            fixtures_dir=args.fixtures_dir,
+            html_out=html_out,
+            trace_out=trace_out,
+        )
+    else:
+        trace = write_long_run_truth_console(
+            demo_pack_path=args.demo_pack,
+            html_out=args.out,
+            trace_out=args.trace_out,
+        )
 
     decisions = [d["decision"] for d in trace["decisions"]]
     operational = [d["operational_admissibility_action"] for d in trace["decisions"]]

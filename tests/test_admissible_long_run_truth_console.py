@@ -12,9 +12,14 @@ from admissible.long_run_truth import (
     LONG_RUN_CLAIM_BOUNDARY,
     LONG_RUN_PROMPT,
     build_truth_trace,
+    build_truth_trace_from_raw_output_fixtures,
     map_operational_admissibility_action,
 )
-from admissible.runner.long_run_truth_console import main, write_long_run_truth_console
+from admissible.runner.long_run_truth_console import (
+    main,
+    write_long_run_builder_truth_console,
+    write_long_run_truth_console,
+)
 from admissible.runner.terminal_dry_run_demo import (
     build_terminal_dry_run_trace,
     main as dry_run_main,
@@ -22,6 +27,9 @@ from admissible.runner.terminal_dry_run_demo import (
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEMO_PACK_PATH = REPO_ROOT / "benchmark" / "terminal_agent_dry_run" / "demo-pack.json"
+BUILDER_FIXTURES_DIR = (
+    REPO_ROOT / "benchmark" / "long_run_scenarios" / "cursor_slither_demo" / "fixtures"
+)
 
 
 class TestOperationalMapping(unittest.TestCase):
@@ -146,6 +154,54 @@ class TestTruthConsoleCli(unittest.TestCase):
             )
             self.assertEqual(exit_code, 0)
             self.assertTrue(html_out.is_file())
+
+
+class TestBuilderBackedTruthConsole(unittest.TestCase):
+    def setUp(self) -> None:
+        self.trace = build_truth_trace_from_raw_output_fixtures(
+            fixtures_dir=str(BUILDER_FIXTURES_DIR),
+            repo_root=str(REPO_ROOT),
+        )
+        self.html = render_truth_console_html(self.trace)
+
+    def test_builder_trace_has_actions_and_raw_output(self) -> None:
+        self.assertGreaterEqual(len(self.trace["action_candidates"]), 4)
+        self.assertEqual(len(self.trace["action_candidates"]), len(self.trace["agent_steps"]))
+        self.assertIn("Raw agent output is unverified", self.html)
+        # A sample raw fixture line should appear in HTML.
+        self.assertIn("npm install", self.html)
+
+    def test_builder_extraction_metadata_present(self) -> None:
+        for candidate in self.trace["action_candidates"]:
+            self.assertIn("extraction_method", candidate)
+            self.assertIn("extraction_confidence", candidate)
+            self.assertIn("field_provenance", candidate)
+        self.assertIn("extraction_method", self.html)
+        self.assertIn("Field provenance", self.html)
+        self.assertIn("Generated envelope is an interpretation", self.html)
+
+    def test_unknown_output_not_silently_allowed(self) -> None:
+        # The unknown fixture should not yield a plain ALLOW.
+        by_case = {c["benchmark_case_id"]: c for c in self.trace["action_candidates"]}
+        self.assertIn("unknown_output", by_case)
+        action_id = by_case["unknown_output"]["action_id"]
+        decision_by_action = {d["action_id"]: d["decision"] for d in self.trace["decisions"]}
+        self.assertIn(action_id, decision_by_action)
+        self.assertNotEqual(decision_by_action[action_id], "ALLOW")
+
+    def test_builder_console_writer_outputs_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            html_out = Path(tmpdir) / "builder_console.html"
+            trace_out = Path(tmpdir) / "builder_trace.json"
+            trace = write_long_run_builder_truth_console(
+                fixtures_dir=BUILDER_FIXTURES_DIR,
+                html_out=html_out,
+                trace_out=trace_out,
+            )
+            self.assertTrue(html_out.is_file())
+            self.assertTrue(trace_out.is_file())
+            loaded = json.loads(trace_out.read_text(encoding="utf-8"))
+            self.assertEqual(loaded["long_run"]["run_id"], trace["long_run"]["run_id"])
 
 
 class TestTerminalDryRunStillWorks(unittest.TestCase):

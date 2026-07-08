@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from admissible.evaluator.rules_only import evaluate_envelope
+from admissible.long_run_envelope_builder import build_from_raw_output
 from admissible.runner.terminal_dry_run_demo import (
     TERMINAL_DRY_RUN_DECISION_SYSTEM,
     TERMINAL_DRY_RUN_SOURCE_SYSTEM,
@@ -24,6 +25,9 @@ from admissible.runner.terminal_dry_run_demo import (
 
 TRUTH_TRACE_SCHEMA_VERSION = "0.1"
 TRUTH_TRACE_GENERATED_BY = "admissible.long_run_truth.build_truth_trace"
+TRUTH_TRACE_GENERATED_BY_BUILDER = (
+    "admissible.long_run_truth.build_truth_trace_from_raw_output_fixtures"
+)
 
 LONG_RUN_CLAIM_BOUNDARY = (
     "Local long-run dry-run demonstration only; not a benchmark result."
@@ -47,6 +51,9 @@ LONG_RUN_FRONTIER_AGENT_LABEL = (
 
 AGENT_STEP_SOURCE_TYPE = "fixture"
 AGENT_STEP_SOURCE_TRUST = "unverified_agent_output"
+
+# Cursor-like long-run output fixture source system label for builder-backed traces.
+BUILDER_FIXTURE_SOURCE_SYSTEM = "cursor_like_raw_output_fixture_v0"
 
 # Narrative placement of each dry-run boundary inside the long-run scenario.
 _LONG_RUN_BOUNDARY_CONTEXT: dict[str, str] = {
@@ -258,6 +265,186 @@ def build_truth_trace(
         "truth_boundary_notes": [
             "Raw agent output is unverified and is not authority.",
             "Admissible admission decision is derived from the action envelope and rules-only evaluator.",
+            "No side effect executed in this v0.",
+        ],
+    }
+
+
+def build_truth_trace_from_raw_output_fixtures(
+    *,
+    fixtures_dir: str,
+    repo_root: str,
+    fixture_glob: str = "*.txt",
+) -> dict:
+    """Build a TruthTrace from raw Cursor-like output fixtures (offline, deterministic).
+
+    Pipeline:
+      raw output fixture -> build_from_raw_output() -> candidate + envelope
+      -> evaluate_envelope() -> TruthTrace -> static HTML console
+
+    Hard constraints:
+      - no provider calls
+      - no command execution
+      - no agent_os imports
+      - rules-only semantics preserved (evaluation uses evaluate_envelope)
+    """
+    from pathlib import Path
+
+    created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    run_id = make_run_id(prompt=LONG_RUN_PROMPT, created_at=created_at)
+
+    long_run = {
+        "run_id": run_id,
+        "prompt": LONG_RUN_PROMPT,
+        "workspace_context": LONG_RUN_WORKSPACE_CONTEXT,
+        "frontier_agent_label": LONG_RUN_FRONTIER_AGENT_LABEL,
+        "claim_boundary": (
+            "Offline builder-backed truth console; generated envelopes are "
+            "conservative interpretations of unverified raw agent output."
+        ),
+        "created_at": created_at,
+    }
+
+    fixtures_path = Path(fixtures_dir)
+    fixture_paths = sorted(fixtures_path.glob(fixture_glob))
+    if not fixture_paths:
+        raise ValueError(f"No raw output fixtures found under {fixtures_path} (glob={fixture_glob})")
+
+    agent_steps: list[dict] = []
+    action_candidates: list[dict] = []
+    decisions: list[dict] = []
+    execution_log: list[dict] = []
+
+    for index, fixture_path in enumerate(fixture_paths, start=1):
+        raw_output = fixture_path.read_text(encoding="utf-8")
+        step_id = f"step_{index:03d}"
+        action_id = f"action_{index:03d}"
+        step_timestamp = created_at
+
+        agent_steps.append(
+            {
+                "step_id": step_id,
+                "raw_output": raw_output,
+                "source_type": AGENT_STEP_SOURCE_TYPE,
+                "source_trust": AGENT_STEP_SOURCE_TRUST,
+                "timestamp": step_timestamp,
+                "boundary_context": "",
+                "user_task_in_step": None,
+                "fixture_path": str(fixture_path.as_posix()),
+            }
+        )
+
+        builder_out = build_from_raw_output(
+            raw_output,
+            long_run_prompt=LONG_RUN_PROMPT,
+            source_metadata={
+                "source_type": AGENT_STEP_SOURCE_TYPE,
+                "workspace_context": LONG_RUN_WORKSPACE_CONTEXT,
+                "frontier_agent_label": LONG_RUN_FRONTIER_AGENT_LABEL,
+                "repo_root": str(repo_root),
+                "fixture_path": str(fixture_path.as_posix()),
+            },
+        )
+        candidate = (builder_out.get("action_candidates") or [{}])[0]
+        envelope = (builder_out.get("envelopes") or [{}])[0]
+        proposed = envelope.get("proposed_action") or {}
+
+        action_candidates.append(
+            {
+                "action_id": action_id,
+                "proposed_by_step_id": step_id,
+                "action_type": candidate.get("action_type") or proposed.get("action_type"),
+                "tool_or_command": candidate.get("tool_or_command") or proposed.get("tool"),
+                "target": candidate.get("target") or proposed.get("target"),
+                "side_effect_type": candidate.get("side_effect_type") or _side_effect_type_from_envelope(envelope),
+                "execution_status": candidate.get("execution_status", "proposed_only"),
+                "extracted_from_raw_output": True,
+                "envelope_id": envelope.get("envelope_id"),
+                "benchmark_case_id": fixture_path.stem,
+                "long_run_boundary": "",
+                # Minimal extraction/provenance metadata (optional for v0 dry-run path).
+                "extraction_method": candidate.get("extraction_method"),
+                "extraction_confidence": candidate.get("extraction_confidence"),
+                "field_provenance": candidate.get("field_provenance"),
+            }
+        )
+
+        decision_output = evaluate_envelope(envelope, system_id=TERMINAL_DRY_RUN_DECISION_SYSTEM)
+        safer_next_step = decision_output.get("safer_next_step")
+        operational_action = map_operational_admissibility_action(
+            decision_output["decision"],
+            safer_next_step=safer_next_step,
+        )
+
+        authority = envelope.get("authority_context") or {}
+        evidence = envelope.get("evidence") or {}
+        policy = envelope.get("policy_context") or {}
+        user_request = envelope.get("user_request") or {}
+
+        decisions.append(
+            {
+                "decision_id": decision_output["decision_id"],
+                "action_id": action_id,
+                "envelope_id": envelope.get("envelope_id"),
+                "decision": decision_output["decision"],
+                "operational_admissibility_action": operational_action,
+                "risk_level": decision_output.get("risk_level"),
+                "risk_boundary": _risk_boundary_summary(envelope),
+                "required_approval": decision_output.get("required_approval"),
+                "missing_evidence": decision_output.get("missing_evidence") or [],
+                "reasons": decision_output.get("reasons") or [],
+                "safer_next_step": safer_next_step,
+                "policy_summary": {
+                    "applicable_policies": policy.get("applicable_policies") or [],
+                    "policy_gaps": policy.get("policy_gaps") or [],
+                    "policy_conflicts": policy.get("policy_conflicts") or [],
+                },
+                "authorization_summary": {
+                    "requested_by": authority.get("requested_by"),
+                    "approved_by": authority.get("approved_by"),
+                    "approval_scope": authority.get("approval_scope"),
+                    "required_approval": authority.get("required_approval"),
+                    "authority_notes": authority.get("authority_notes") or [],
+                },
+                "evidence_summary": {
+                    "available": evidence.get("available") or [],
+                    "missing": evidence.get("missing") or [],
+                    "assumptions": evidence.get("assumptions") or [],
+                    "conflicts": evidence.get("conflicts") or [],
+                },
+                "user_request_raw": user_request.get("raw"),
+                "proposed_action": proposed,
+                "audit_trace": decision_output.get("audit_trace") or {},
+            }
+        )
+
+        execution_log.append(
+            {
+                "action_id": action_id,
+                "step_id": step_id,
+                "event": "admission_evaluated",
+                "side_effect_executed": False,
+                "operational_admissibility_action": operational_action,
+                "decision": decision_output["decision"],
+                "timestamp": step_timestamp,
+            }
+        )
+
+    return {
+        "schema_version": TRUTH_TRACE_SCHEMA_VERSION,
+        "generated_by": TRUTH_TRACE_GENERATED_BY_BUILDER,
+        "source_system": BUILDER_FIXTURE_SOURCE_SYSTEM,
+        "decision_system": TERMINAL_DRY_RUN_DECISION_SYSTEM,
+        "side_effect_executed": False,
+        "long_run": long_run,
+        "agent_steps": agent_steps,
+        "action_candidates": action_candidates,
+        "decisions": decisions,
+        "execution_log": execution_log,
+        "truth_boundary_notes": [
+            "Raw agent output is unverified and is not authority.",
+            "Generated envelopes are conservative interpretations, not ground truth.",
+            "Admissible admission decision is derived from the generated action envelope and rules-only evaluator.",
             "No side effect executed in this v0.",
         ],
     }

@@ -223,6 +223,11 @@ def _render_action_detail(
     """
 
     proposed_panel = f"""
+      <p class="unverified-note">
+        <strong>Generated envelope is an interpretation, not ground truth.</strong>
+        The envelope below is constructed deterministically from unverified raw agent output.
+        It may omit context or misclassify intent. Treat it as conservative, offline extraction.
+      </p>
       <p><strong>Admissible action candidate</strong> (extracted from raw output:
       {_esc(candidate.get('extracted_from_raw_output'))})</p>
       <dl class="meta-grid">
@@ -298,7 +303,11 @@ def _render_action_detail(
         <dt>benchmark_case_id</dt><dd><code>{_esc(candidate.get('benchmark_case_id'))}</code></dd>
         <dt>step timestamp</dt><dd>{_esc(step.get('timestamp') if step else None)}</dd>
         <dt>boundary context</dt><dd>{_esc(step.get('boundary_context') if step else None)}</dd>
+        <dt>extraction_method</dt><dd><code>{_esc(candidate.get('extraction_method'))}</code></dd>
+        <dt>extraction_confidence</dt><dd><code>{_esc(candidate.get('extraction_confidence'))}</code></dd>
       </dl>
+      <p><strong>Field provenance</strong> (observed vs inferred vs missing/defaulted):</p>
+      <pre class="raw-output">{_esc(json.dumps(candidate.get("field_provenance") or {}, indent=2, sort_keys=True))}</pre>
       <p><strong>Audit (provenance):</strong> {_esc(audit.get('provenance'))}</p>
     """
 
