@@ -35,3 +35,5 @@ benchmark/reports/gemini_demo_trace.json
 benchmark/reports/gemini_demo_trace.html
 benchmark/reports/terminal_agent_dry_run_trace.json
 benchmark/reports/terminal_agent_dry_run_trace.html
+benchmark/reports/admissible_long_run_truth_console.html
+benchmark/reports/admissible_long_run_truth_console_trace.json
