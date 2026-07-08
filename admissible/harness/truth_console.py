@@ -80,6 +80,26 @@ def _action_type_for_candidate(candidate: dict, decision: dict) -> str:
     return str(candidate.get("action_type") or proposed.get("action_type") or "—")
 
 
+def _execution_status_badge_html(status: str) -> str:
+    badge_class = {
+        "proposed_only": "badge-proposed-only",
+        "admitted_not_executed": "badge-admitted-not-executed",
+        "executed_after_admission": "badge-executed-after-admission",
+        "blocked": "badge-blocked",
+    }.get(status, "badge-proposed-only")
+    return f'<span class="badge {badge_class}">{_esc(status)}</span>'
+
+
+def _has_execution_attestation(trace: dict) -> bool:
+    attestation = trace.get("execution_attestation")
+    if isinstance(attestation, dict) and attestation.get("executed_after_admission_count", 0) > 0:
+        return True
+    for candidate in trace.get("action_candidates") or []:
+        if candidate.get("execution_status") == "executed_after_admission":
+            return True
+    return False
+
+
 def _compute_summary(trace: dict) -> dict[str, Any]:
     candidates = trace.get("action_candidates") or []
     decisions = trace.get("decisions") or []
@@ -92,13 +112,19 @@ def _compute_summary(trace: dict) -> dict[str, Any]:
         action_types[atype] = action_types.get(atype, 0) + 1
     execution_log = trace.get("execution_log") or []
     side_effects_in_log = sum(1 for e in execution_log if e.get("side_effect_executed"))
+    attested_external = sum(
+        1 for e in execution_log if e.get("attested_external_execution")
+    )
     return {
         "total_candidates": len(candidates),
         "by_decision": _count_by_key(decisions, "decision"),
         "by_operational_action": _count_by_key(decisions, "operational_admissibility_action"),
         "by_action_type": dict(sorted(action_types.items())),
+        "by_execution_status": _count_by_key(candidates, "execution_status"),
         "side_effect_executed": bool(trace.get("side_effect_executed")),
         "side_effects_in_log": side_effects_in_log,
+        "attested_external_execution_count": attested_external,
+        "has_execution_attestation": _has_execution_attestation(trace),
     }
 
 
@@ -159,6 +185,22 @@ def _render_count_list(counts: dict[str, int], *, css_class: str = "count-list")
 def _render_executive_summary(trace: dict) -> str:
     summary = _compute_summary(trace)
     side_effect_label = "false" if not summary["side_effect_executed"] else "true"
+    execution_status_card = ""
+    if summary["by_execution_status"]:
+        execution_status_card = f"""
+        <div class="summary-card">
+          <h3>By execution status</h3>
+          {_render_count_list(summary["by_execution_status"])}
+        </div>
+        """
+    attested_card = ""
+    if summary["has_execution_attestation"]:
+        attested_card = f"""
+        <div class="summary-card">
+          <h3>Attested external execution</h3>
+          <p class="summary-stat">{summary['attested_external_execution_count']}</p>
+        </div>
+        """
     return f"""
     <section class="executive-summary" id="executive-summary">
       <h2>Executive Summary</h2>
@@ -185,6 +227,8 @@ def _render_executive_summary(trace: dict) -> str:
           <h3>By action type</h3>
           {_render_count_list(summary["by_action_type"])}
         </div>
+        {execution_status_card}
+        {attested_card}
       </div>
     </section>
     """
@@ -232,6 +276,20 @@ def _render_filters(trace: dict) -> str:
         f'<option value="{_esc(d)}">{_esc(d)} ({c})</option>'
         for d, c in summary["by_action_type"].items()
     )
+    exec_opts = "".join(
+        f'<option value="{_esc(d)}">{_esc(d)} ({c})</option>'
+        for d, c in summary.get("by_execution_status", {}).items()
+    )
+    execution_filter = ""
+    if exec_opts:
+        execution_filter = f"""
+        <label>Execution status
+          <select id="filter-execution-status" data-filter="execution_status">
+            <option value="">All</option>
+            {exec_opts}
+          </select>
+        </label>
+        """
     return f"""
     <section class="filter-bar" id="filter-bar">
       <h2>Filters</h2>
@@ -254,6 +312,7 @@ def _render_filters(trace: dict) -> str:
             {op_opts}
           </select>
         </label>
+        {execution_filter}
         <button type="button" id="filter-reset" class="filter-reset">Reset filters</button>
       </div>
       <p class="filter-status" id="filter-status" aria-live="polite"></p>
@@ -271,13 +330,22 @@ def _decision_by_action_id(trace: dict) -> dict[str, dict]:
 
 def _render_header(trace: dict) -> str:
     long_run = trace.get("long_run") or {}
+    attestation_banner = ""
+    if _has_execution_attestation(trace):
+        attestation_banner = """
+      <div class="execution-attestation-banner">
+        Execution records are fixture-backed/manual attestations in this v0.
+        Admissible did not execute commands.
+      </div>
+        """
     return f"""
     <header class="truth-header">
       <h1>Admissible Long-Run Truth Console</h1>
       <div class="claim-boundary">
         <strong>Claim boundary:</strong> {_esc(long_run.get("claim_boundary"))}
       </div>
-      <div class="execution-banner">No side effect executed.</div>
+      {attestation_banner}
+      <div class="execution-banner">No side effect executed by Admissible.</div>
       <dl class="header-grid">
         <dt>Frontier agent</dt>
         <dd>{_esc(long_run.get("frontier_agent_label"))}</dd>
@@ -325,18 +393,21 @@ def _render_timeline(trace: dict) -> str:
         tool_full = candidate.get("tool_or_command") or ""
         tool_short = _truncate(tool_full, 48)
         operational = decision.get("operational_admissibility_action", "—")
+        execution_status = candidate.get("execution_status") or "proposed_only"
+        exec_badge = _execution_status_badge_html(execution_status)
         rows.append(
             f"<tr class=\"timeline-row\" data-action-id=\"{_esc(action_id)}\" "
             f"data-decision=\"{_esc(decision_label)}\" "
             f"data-action-type=\"{_esc(action_type)}\" "
-            f"data-operational-admissibility-action=\"{_esc(operational)}\">"
+            f"data-operational-admissibility-action=\"{_esc(operational)}\" "
+            f"data-execution-status=\"{_esc(execution_status)}\">"
             f"<td><a href=\"#action-{_esc(action_id)}\"><code>{_esc(action_id)}</code></a></td>"
             f"<td>{_esc(candidate.get('benchmark_case_id'))}</td>"
             f"<td class=\"tool-cell\" title=\"{_esc(tool_full)}\">{_esc(tool_short)}</td>"
             f"<td class=\"{decision_class}\">{_esc(decision_label)}</td>"
             f"<td>{_esc(decision.get('risk_level'))}</td>"
             f"<td><code>{_esc(operational)}</code></td>"
-            f"<td><code>{_esc(candidate.get('execution_status'))}</code></td>"
+            f"<td><code>{_esc(execution_status)}</code> {exec_badge}</td>"
             f"</tr>"
         )
     return f"""
@@ -396,7 +467,37 @@ def _render_action_detail(
     audit = decision.get("audit_trace") or {}
     reasons = decision.get("reasons") or []
     execution_status = candidate.get("execution_status") or "proposed_only"
+    execution_record = candidate.get("execution_record") or {}
     action_type = _action_type_for_candidate(candidate, decision)
+
+    execution_record_panel = ""
+    if execution_record:
+        basis = execution_record.get("execution_basis") or {}
+        evidence = execution_record.get("execution_evidence") or {}
+        execution_record_panel = f"""
+      <p><strong>Execution basis (decision id):</strong>
+         <code>{_esc(basis.get('decision_id'))}</code></p>
+      <p><strong>Execution basis (envelope id):</strong>
+         <code>{_esc(basis.get('envelope_id'))}</code></p>
+      <p><strong>Execution actor:</strong>
+         <code>{_esc(execution_record.get('execution_actor'))}</code></p>
+      <p><strong>Execution scope:</strong>
+         <code>{_esc(execution_record.get('execution_scope'))}</code></p>
+      <p><strong>Execution timestamp:</strong>
+         {_esc(execution_record.get('execution_timestamp'))}</p>
+      <p><strong>Execution evidence notes:</strong>
+         {_esc(evidence.get('notes'))}</p>
+      <p><strong>Verification:</strong>
+         {_esc(evidence.get('verification'))}</p>
+        """
+
+    side_effect_note = (
+        "<p><strong>Attested external execution after admission.</strong> "
+        f"{_execution_status_badge_html('executed_after_admission')}</p>"
+        if execution_status == "executed_after_admission"
+        else "<p><strong>No side effect executed by Admissible.</strong> "
+        '<span class="badge badge-no-side-effect">no side effect executed</span></p>'
+    )
 
     reason_items = "".join(
         f"<li><strong>{_esc(r.get('dimension'))}</strong> "
@@ -426,9 +527,9 @@ def _render_action_detail(
       <p><strong>Operational admissibility action:</strong>
          <code>{_esc(decision.get('operational_admissibility_action'))}</code></p>
       <p><strong>Execution status:</strong> <code>{_esc(execution_status)}</code>
-         <span class="badge badge-proposed-only">proposed_only</span></p>
-      <p><strong>No side effect executed.</strong>
-         <span class="badge badge-no-side-effect">no side effect executed</span></p>
+         {_execution_status_badge_html(execution_status)}</p>
+      {side_effect_note}
+      {execution_record_panel}
     """
 
     raw_output = step.get("raw_output", "") if step else ""
@@ -511,8 +612,10 @@ def _render_action_detail(
       <p>Mapping: ALLOW→execute; ALLOW_WITH_LIMITS→limit_scope or replace_with_safer_step;
          REQUEST_MORE_EVIDENCE→request_evidence; REQUIRE_HUMAN_APPROVAL→request_approval;
          REFUSE→block.</p>
-      <p><strong>Execution status:</strong> <code>{_esc(candidate.get('execution_status'))}</code></p>
-      <p><strong>No side effect executed.</strong></p>
+      <p><strong>Execution status:</strong> <code>{_esc(execution_status)}</code>
+         {_execution_status_badge_html(execution_status)}</p>
+      {side_effect_note}
+      {execution_record_panel}
     """
 
     safer_panel = f"""
@@ -569,7 +672,8 @@ def _render_action_detail(
              data-action-id="{_esc(action_id)}"
              data-decision="{_esc(decision_label)}"
              data-action-type="{_esc(action_type)}"
-             data-operational-admissibility-action="{_esc(decision.get('operational_admissibility_action'))}">
+             data-operational-admissibility-action="{_esc(decision.get('operational_admissibility_action'))}"
+             data-execution-status="{_esc(execution_status)}">
       <summary>{highlight_badge}{summary}</summary>
       <div class="action-detail-body">
         {_render_tab_nav(tab_ids)}
@@ -609,6 +713,51 @@ def _render_action_details(trace: dict) -> str:
     """
 
 
+def _render_execution_log(trace: dict) -> str:
+    events = [
+        e for e in (trace.get("execution_log") or [])
+        if e.get("event") in ("executed_after_admission", "admitted_not_executed")
+    ]
+    if not events:
+        return ""
+
+    rows = []
+    for event in events:
+        rows.append(
+            f"<tr>"
+            f"<td><code>{_esc(event.get('action_id'))}</code></td>"
+            f"<td><code>{_esc(event.get('event'))}</code></td>"
+            f"<td>{_esc(event.get('decision'))}</td>"
+            f"<td><code>{_esc(event.get('execution_actor'))}</code></td>"
+            f"<td>{_esc(event.get('execution_timestamp') or event.get('timestamp'))}</td>"
+            f"<td>{_esc((event.get('execution_evidence') or {}).get('notes'))}</td>"
+            f"</tr>"
+        )
+
+    return f"""
+    <section class="execution-log-section" id="execution-log">
+      <h2>Execution Log (attestations)</h2>
+      <p>Fixture-backed or manual attestations of external execution after admission.
+         Admissible did not run these commands.</p>
+      <div class="timeline-wrapper">
+      <table class="timeline">
+        <thead>
+          <tr>
+            <th>Action</th>
+            <th>Event</th>
+            <th>Decision</th>
+            <th>Actor</th>
+            <th>Timestamp</th>
+            <th>Evidence notes</th>
+          </tr>
+        </thead>
+        <tbody>{''.join(rows)}</tbody>
+      </table>
+      </div>
+    </section>
+    """
+
+
 def render_truth_console_html(trace: dict) -> str:
     """Render a TruthTrace dict as a static HTML truth console."""
     body = "".join(
@@ -619,6 +768,7 @@ def render_truth_console_html(trace: dict) -> str:
             _render_demo_highlights(trace),
             _render_filters(trace),
             _render_timeline(trace),
+            _render_execution_log(trace),
             _render_action_details(trace),
         ]
     )

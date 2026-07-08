@@ -20,6 +20,10 @@ import json
 import sys
 from pathlib import Path
 
+from admissible.admitted_execution import (
+    apply_execution_attestations,
+    load_execution_attestation,
+)
 from admissible.harness.truth_console import write_truth_console_html
 from admissible.long_run_truth import (
     LONG_RUN_CLAIM_BOUNDARY,
@@ -36,6 +40,25 @@ DEFAULT_TRACE_OUT = "benchmark/reports/admissible_long_run_truth_console_trace.j
 DEFAULT_BUILDER_FIXTURES_DIR = "benchmark/long_run_scenarios/cursor_slither_demo/fixtures"
 DEFAULT_BUILDER_HTML_OUT = "benchmark/reports/admissible_long_run_builder_truth_console.html"
 DEFAULT_BUILDER_TRACE_OUT = "benchmark/reports/admissible_long_run_builder_truth_console_trace.json"
+DEFAULT_REAL_CAPTURE_FIXTURES_DIR = (
+    "benchmark/long_run_scenarios/cursor_slither_demo/fixtures/real_captures"
+)
+DEFAULT_REAL_CAPTURE_HTML_OUT = (
+    "benchmark/reports/admissible_cursor_real_capture_truth_console.html"
+)
+DEFAULT_REAL_CAPTURE_TRACE_OUT = (
+    "benchmark/reports/admissible_cursor_real_capture_truth_console_trace.json"
+)
+DEFAULT_EXECUTION_LOG = (
+    "benchmark/long_run_scenarios/cursor_slither_demo/execution_logs/"
+    "admitted_local_actions_v0.json"
+)
+DEFAULT_ADMITTED_EXECUTION_HTML_OUT = (
+    "benchmark/reports/admissible_cursor_admitted_execution_truth_console.html"
+)
+DEFAULT_ADMITTED_EXECUTION_TRACE_OUT = (
+    "benchmark/reports/admissible_cursor_admitted_execution_truth_console_trace.json"
+)
 
 
 def write_long_run_truth_console(
@@ -68,12 +91,17 @@ def write_long_run_builder_truth_console(
     html_out: str | Path,
     trace_out: str | Path | None = None,
     repo_root: str | Path = REPO_ROOT,
+    execution_log: str | Path | None = None,
 ) -> dict:
     """Build builder-backed truth trace and write HTML console (and optional JSON trace)."""
     trace = build_truth_trace_from_raw_output_fixtures(
         fixtures_dir=str(fixtures_dir),
         repo_root=str(repo_root),
     )
+
+    if execution_log is not None:
+        attestation = load_execution_attestation(execution_log)
+        trace = apply_execution_attestations(trace, attestation)
 
     if trace_out is not None:
         trace_out = Path(trace_out)
@@ -121,6 +149,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_TRACE_OUT,
         help="Path to write the truth trace JSON (for inspection/reuse).",
     )
+    parser.add_argument(
+        "--execution-log",
+        default=None,
+        help=(
+            "Optional execution attestation fixture JSON. When set, applies "
+            "admitted execution records to the trace before rendering."
+        ),
+    )
     return parser
 
 
@@ -129,14 +165,27 @@ def main(argv: list[str] | None = None) -> int:
     if args.source == "builder-fixtures":
         html_out = args.out
         trace_out = args.trace_out
+        fixtures_dir = args.fixtures_dir
+        execution_log = args.execution_log
         if args.out == DEFAULT_HTML_OUT:
-            html_out = DEFAULT_BUILDER_HTML_OUT
+            if execution_log:
+                html_out = DEFAULT_ADMITTED_EXECUTION_HTML_OUT
+            elif args.fixtures_dir == DEFAULT_BUILDER_FIXTURES_DIR:
+                html_out = DEFAULT_BUILDER_HTML_OUT
+            elif str(args.fixtures_dir).replace("\\", "/").endswith("real_captures"):
+                html_out = DEFAULT_REAL_CAPTURE_HTML_OUT
         if args.trace_out == DEFAULT_TRACE_OUT:
-            trace_out = DEFAULT_BUILDER_TRACE_OUT
+            if execution_log:
+                trace_out = DEFAULT_ADMITTED_EXECUTION_TRACE_OUT
+            elif args.fixtures_dir == DEFAULT_BUILDER_FIXTURES_DIR:
+                trace_out = DEFAULT_BUILDER_TRACE_OUT
+            elif str(args.fixtures_dir).replace("\\", "/").endswith("real_captures"):
+                trace_out = DEFAULT_REAL_CAPTURE_TRACE_OUT
         trace = write_long_run_builder_truth_console(
-            fixtures_dir=args.fixtures_dir,
+            fixtures_dir=fixtures_dir,
             html_out=html_out,
             trace_out=trace_out,
+            execution_log=execution_log,
         )
     else:
         trace = write_long_run_truth_console(
@@ -156,8 +205,9 @@ def main(argv: list[str] | None = None) -> int:
         "decisions": decisions,
         "operational_admissibility_actions": operational,
         "side_effect_executed": False,
-        "html_out": str(Path(args.out)),
-        "trace_out": str(Path(args.trace_out)),
+        "execution_attestation_applied": bool(args.execution_log),
+        "html_out": str(Path(html_out if args.source == "builder-fixtures" else args.out)),
+        "trace_out": str(Path(trace_out if args.source == "builder-fixtures" else args.trace_out)),
     }
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0

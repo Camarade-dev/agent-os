@@ -1,0 +1,82 @@
+{
+  "schema_version": "admitted_execution_attestation_v0",
+  "generated_by": "manual_fixture_v0",
+  "attestation_note": "Offline manual attestation for Admitted Execution Protocol v0 demo. These five Phase-1 local ALLOW actions were applied in the admissible-slither-demo workspace by a human operator after rules-only admission. Admissible did not execute any commands.",
+  "records": [
+    {
+      "action_id": "action_001",
+      "execution_status": "executed_after_admission",
+      "execution_basis": {
+        "decision_id": "decision_env_lr_5d7ab092908b_admissible_rules_only_v0",
+        "envelope_id": "env_lr_5d7ab092908b"
+      },
+      "execution_actor": "human_operator",
+      "execution_evidence": {
+        "notes": "Added window blur and visibilitychange handlers to clear pressedKeys in game.js.",
+        "verification": "Manual test: switch tab away and return; snake no longer moves from stale keys."
+      },
+      "execution_scope": "local_workspace_only",
+      "execution_timestamp": "2026-07-08T19:30:00Z"
+    },
+    {
+      "action_id": "action_002",
+      "execution_status": "executed_after_admission",
+      "execution_basis": {
+        "decision_id": "decision_env_lr_60d9a2fa5377_admissible_rules_only_v0",
+        "envelope_id": "env_lr_60d9a2fa5377"
+      },
+      "execution_actor": "human_operator",
+      "execution_evidence": {
+        "notes": "Paused requestAnimationFrame loop when document.hidden is true.",
+        "verification": "Manual test: hide tab; game loop stops; resume on focus."
+      },
+      "execution_scope": "local_workspace_only",
+      "execution_timestamp": "2026-07-08T19:35:00Z"
+    },
+    {
+      "action_id": "action_003",
+      "execution_status": "executed_after_admission",
+      "execution_basis": {
+        "decision_id": "decision_env_lr_44ad1972cb02_admissible_rules_only_v0",
+        "envelope_id": "env_lr_44ad1972cb02"
+      },
+      "execution_actor": "human_operator",
+      "execution_evidence": {
+        "notes": "Resize canvas using container client dimensions and devicePixelRatio.",
+        "verification": "Manual test: resize browser window; canvas scales crisply."
+      },
+      "execution_scope": "local_workspace_only",
+      "execution_timestamp": "2026-07-08T19:40:00Z"
+    },
+    {
+      "action_id": "action_004",
+      "execution_status": "executed_after_admission",
+      "execution_basis": {
+        "decision_id": "decision_env_lr_ab9bdf2d4d18_admissible_rules_only_v0",
+        "envelope_id": "env_lr_ab9bdf2d4d18"
+      },
+      "execution_actor": "human_operator",
+      "execution_evidence": {
+        "notes": "Created .gitignore with OS and editor patterns.",
+        "verification": "File present at workspace root; git status ignores listed paths."
+      },
+      "execution_scope": "local_workspace_only",
+      "execution_timestamp": "2026-07-08T19:45:00Z"
+    },
+    {
+      "action_id": "action_005",
+      "execution_status": "executed_after_admission",
+      "execution_basis": {
+        "decision_id": "decision_env_lr_94430aeb8a6f_admissible_rules_only_v0",
+        "envelope_id": "env_lr_94430aeb8a6f"
+      },
+      "execution_actor": "human_operator",
+      "execution_evidence": {
+        "notes": "Expanded README.md with run instructions and controls.",
+        "verification": "README documents local serve steps and keyboard controls."
+      },
+      "execution_scope": "local_workspace_only",
+      "execution_timestamp": "2026-07-08T19:50:00Z"
+    }
+  ]
+}
