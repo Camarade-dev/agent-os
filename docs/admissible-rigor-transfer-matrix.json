@@ -1,0 +1,572 @@
+{
+  "audit_version": "0",
+  "audit_date": "2026-07-08",
+  "repo": "agent-os",
+  "executive_verdict": "SPLIT_LAYER_UNEVEN_TRANSFER",
+  "summary": "Admissible reformalized execution-boundary admission strongly; Agent OS long-run governance primitives remain in agent_os/ by intentional scope, creating gaps for live Cursor long-run demos.",
+  "diagnostics": {
+    "RIGOR_AUDIT_IMPORT_BOUNDARY_CLEAN": true,
+    "RIGOR_AUDIT_AGENT_OS_HAS_LONG_RUN_PRIMITIVES": true,
+    "RIGOR_AUDIT_ADMISSIBLE_HAS_REFORMALIZED_CORE": true,
+    "RIGOR_AUDIT_POSSIBLE_LONG_RUN_GAPS": true,
+    "RIGOR_AUDIT_SHOULD_NOT_PORT_RUNTIME_AGENT_OS": true,
+    "RIGOR_AUDIT_TOO_BROAD": false
+  },
+  "primitives": [
+    {
+      "id": "goal_intake",
+      "agent_os_primitive": "Goal intake",
+      "original_purpose": "Durable JSON from raw NL goal with ambiguity/readiness metadata; explicit non-authority",
+      "agent_os_artifacts": [
+        "agent_os/orchestrator.py",
+        "docs/orchestrator/goal-intake-artifact.md",
+        ".agent-os/orchestrator/intakes/<id>/goal-intake.json"
+      ],
+      "admissible_equivalent": "envelope.user_request; LONG_RUN_PROMPT in long_run_truth.py",
+      "reuse_type": "INTENTIONALLY_OUT_OF_SCOPE",
+      "rigor_status": "MISSING_ACCEPTABLE",
+      "long_run_relevance": "HIGH",
+      "thesis_alignment": "ALIGNED",
+      "gap": "No intake state machine or ambiguity classification in Admissible",
+      "recommendation": "KEEP_AS_LINEAGE"
+    },
+    {
+      "id": "source_bounded_requirement_extraction",
+      "agent_os_primitive": "Source-bounded requirement extraction",
+      "original_purpose": "Requirements derived only from explicit transported source; SOURCE_BOUNDED provenance",
+      "agent_os_artifacts": [
+        "agent_os/orchestrator.py",
+        "evidence/orchestrator-context-transport.json",
+        "REQUIREMENTS_DRAFT_NON_AUTHORITY"
+      ],
+      "admissible_equivalent": "envelope.evidence; REQUEST_MORE_EVIDENCE in rules_only evaluator",
+      "reuse_type": "CONCEPTUAL_TRANSFER",
+      "rigor_status": "WEAKER_IN_ADMISSIBLE",
+      "long_run_relevance": "MEDIUM",
+      "thesis_alignment": "ALIGNED",
+      "gap": "No extraction pipeline or SOURCE_BOUNDED flag on envelopes",
+      "recommendation": "PORT_AS_ADMISSIBLE_CONCEPT"
+    },
+    {
+      "id": "draft_requirements",
+      "agent_os_primitive": "Draft requirements",
+      "original_purpose": "DRAFT-REQ-* candidates never promoted without owner gate",
+      "agent_os_artifacts": [
+        "local-agentic-spec.md",
+        "orchestrator-requirements-draft-validation-report.json"
+      ],
+      "admissible_equivalent": null,
+      "reuse_type": "INTENTIONALLY_OUT_OF_SCOPE",
+      "rigor_status": "NOT_APPLICABLE",
+      "long_run_relevance": "MEDIUM",
+      "thesis_alignment": "ALIGNED",
+      "gap": "Planning artifact lifecycle out of admission scope",
+      "recommendation": "KEEP_AS_LINEAGE"
+    },
+    {
+      "id": "approved_requirements",
+      "agent_os_primitive": "Approved requirements",
+      "original_purpose": "REQ-* IDs only in approved-requirements.json after promotion gate",
+      "agent_os_artifacts": [
+        "approved-requirements.json",
+        "create_approved_requirements()"
+      ],
+      "admissible_equivalent": null,
+      "reuse_type": "INTENTIONALLY_OUT_OF_SCOPE",
+      "rigor_status": "NOT_APPLICABLE",
+      "long_run_relevance": "MEDIUM",
+      "thesis_alignment": "ALIGNED",
+      "gap": null,
+      "recommendation": "KEEP_AS_LINEAGE"
+    },
+    {
+      "id": "owner_decision_gates",
+      "agent_os_primitive": "Owner decision gates",
+      "original_purpose": "Append-only owner authorization records; evidence only, does not execute",
+      "agent_os_artifacts": [
+        "OWNER_READINESS_DECISION",
+        "PLANNING_OWNER_DECISION",
+        "AUTHORIZE_* constants in agent_os/orchestrator.py"
+      ],
+      "admissible_equivalent": "REQUIRE_HUMAN_APPROVAL; authority_context in envelope",
+      "reuse_type": "REFORMALIZED_WEAK",
+      "rigor_status": "WEAKER_IN_ADMISSIBLE",
+      "long_run_relevance": "HIGH",
+      "thesis_alignment": "PARTIALLY_ALIGNED",
+      "gap": "Multi-stage artifact gates vs per-action admission only",
+      "recommendation": "DOCUMENT_ONLY"
+    },
+    {
+      "id": "promotion_admissibility_gates",
+      "agent_os_primitive": "Promotion / admissibility gates",
+      "original_purpose": "Structural readiness for owner review before promotion",
+      "agent_os_artifacts": [
+        "preflight_draft_preparation()",
+        "requirements_*_preflight()",
+        "docs/orchestrator/goal-to-planning-workspace-contract.md"
+      ],
+      "admissible_equivalent": "resolve_precedence() on admission labels",
+      "reuse_type": "CONCEPTUAL_TRANSFER",
+      "rigor_status": "EQUIVALENT",
+      "long_run_relevance": "MEDIUM",
+      "thesis_alignment": "ALIGNED",
+      "gap": "Vocabulary homonym documented in lineage doc",
+      "recommendation": "DOCUMENT_ONLY"
+    },
+    {
+      "id": "planning_slices",
+      "agent_os_primitive": "Planning slices",
+      "original_purpose": "Ordered work breakdown for long-horizon delegation",
+      "agent_os_artifacts": [
+        "implementation-plan.md",
+        "agent_os/templates/"
+      ],
+      "admissible_equivalent": null,
+      "reuse_type": "INTENTIONALLY_OUT_OF_SCOPE",
+      "rigor_status": "MISSING_ACCEPTABLE",
+      "long_run_relevance": "HIGH",
+      "thesis_alignment": "ALIGNED",
+      "gap": "Orchestration artifact, not admission",
+      "recommendation": "KEEP_AS_LINEAGE"
+    },
+    {
+      "id": "structured_planning_slice_format",
+      "agent_os_primitive": "Structured planning slice format",
+      "original_purpose": "Machine-readable PLANNING_RUN_SLICE contract for future runner",
+      "agent_os_artifacts": [
+        "docs/planning-structured-slice-format.md",
+        "examples/planning-workspace-slither-like/implementation-plan.md"
+      ],
+      "admissible_equivalent": null,
+      "reuse_type": "NOT_TRANSFERRED",
+      "rigor_status": "MISSING_ACCEPTABLE",
+      "long_run_relevance": "MEDIUM",
+      "thesis_alignment": "ALIGNED",
+      "gap": "Schema/doctrine only; no parser in either active path",
+      "recommendation": "KEEP_AS_LINEAGE"
+    },
+    {
+      "id": "workspace_layout_boundaries",
+      "agent_os_primitive": "Workspace layout boundaries",
+      "original_purpose": "Separate .agent-os/planning, runs, orchestrator intakes",
+      "agent_os_artifacts": [
+        "docs/planning-workspace-layout.md",
+        "agent_os/paths.py",
+        "docs/primitives.md"
+      ],
+      "admissible_equivalent": "workspace_context in truth trace",
+      "reuse_type": "CONCEPTUAL_TRANSFER",
+      "rigor_status": "WEAKER_IN_ADMISSIBLE",
+      "long_run_relevance": "HIGH",
+      "thesis_alignment": "ALIGNED",
+      "gap": "No filesystem workspace discipline in Admissible",
+      "recommendation": "ADD_TRUTH_TRACE_FIELD"
+    },
+    {
+      "id": "execution_boundaries",
+      "agent_os_primitive": "Execution boundaries",
+      "original_purpose": "No execution without gates; planning no_execution flags",
+      "agent_os_artifacts": [
+        "agent_os/planning.py manifest authority",
+        "docs/v0-release-boundary.md"
+      ],
+      "admissible_equivalent": "Core thesis; side_effect_executed:false in traces and demos",
+      "reuse_type": "REFORMALIZED_STRONG",
+      "rigor_status": "STRONGER_IN_ADMISSIBLE",
+      "long_run_relevance": "HIGH",
+      "thesis_alignment": "ALIGNED",
+      "gap": null,
+      "recommendation": "ADD_TESTS"
+    },
+    {
+      "id": "closure_artifacts",
+      "agent_os_primitive": "Closure artifacts",
+      "original_purpose": "Fail-closed run end; placeholders treated as missing",
+      "agent_os_artifacts": [
+        "agent_os/validate.py",
+        "agent_os/workspace.py close_run()",
+        "closure.md template"
+      ],
+      "admissible_equivalent": "SMOKE_PASS/FAIL verdict; truth trace side_effect_executed",
+      "reuse_type": "CONCEPTUAL_TRANSFER",
+      "rigor_status": "WEAKER_IN_ADMISSIBLE",
+      "long_run_relevance": "MEDIUM",
+      "thesis_alignment": "PARTIALLY_ALIGNED",
+      "gap": "No mission/audit/owner closure chain in Admissible",
+      "recommendation": "DOCUMENT_ONLY"
+    },
+    {
+      "id": "audit_trails",
+      "agent_os_primitive": "Audit trails",
+      "original_purpose": "Append-only decisions, provenance chain, audit verdict",
+      "agent_os_artifacts": [
+        "decisions/*.json",
+        "audit.md",
+        "orchestrator *-provenance.json"
+      ],
+      "admissible_equivalent": "audit_trace in decision output; run_trace.schema.json; truth trace",
+      "reuse_type": "REFORMALIZED_STRONG",
+      "rigor_status": "EQUIVALENT",
+      "long_run_relevance": "HIGH",
+      "thesis_alignment": "ALIGNED",
+      "gap": "Weaker upstream artifact chain for full runs",
+      "recommendation": "ADD_TRUTH_TRACE_FIELD"
+    },
+    {
+      "id": "source_bounded_evidence",
+      "agent_os_primitive": "Source-bounded evidence",
+      "original_purpose": "Evidence from registrar/owner only; no LLM invention",
+      "agent_os_artifacts": [
+        "docs/evidence-capture-boundaries-v0.md",
+        "agent_os/workspace.py evidence registrar"
+      ],
+      "admissible_equivalent": "envelope.evidence; REQUEST_MORE_EVIDENCE",
+      "reuse_type": "REFORMALIZED_WEAK",
+      "rigor_status": "WEAKER_IN_ADMISSIBLE",
+      "long_run_relevance": "HIGH",
+      "thesis_alignment": "ALIGNED",
+      "gap": "Terminal dry-run uses fixture envelopes not live extraction",
+      "recommendation": "PORT_AS_ADMISSIBLE_CONCEPT"
+    },
+    {
+      "id": "human_responsibility",
+      "agent_os_primitive": "Human responsibility",
+      "original_purpose": "Owner remains responsible; closure does not certify truth",
+      "agent_os_artifacts": [
+        "docs/why-agent-os.md",
+        "owner-decision.md template"
+      ],
+      "admissible_equivalent": "human_responsibility in envelope spec/schema",
+      "reuse_type": "REFORMALIZED_WEAK",
+      "rigor_status": "EQUIVALENT",
+      "long_run_relevance": "HIGH",
+      "thesis_alignment": "ALIGNED",
+      "gap": "Doctrine in spec; limited runtime enforcement",
+      "recommendation": "ADD_SCHEMA_FIELD"
+    },
+    {
+      "id": "approval_scope",
+      "agent_os_primitive": "Approval scope",
+      "original_purpose": "AUTHORIZE_* scopes next command only",
+      "agent_os_artifacts": [
+        "agent_os/cli.py",
+        "orchestrator decision records"
+      ],
+      "admissible_equivalent": "authority_context.approval_scope",
+      "reuse_type": "REFORMALIZED_STRONG",
+      "rigor_status": "EQUIVALENT",
+      "long_run_relevance": "HIGH",
+      "thesis_alignment": "ALIGNED",
+      "gap": null,
+      "recommendation": "ADD_TESTS"
+    },
+    {
+      "id": "authority_vs_capability",
+      "agent_os_primitive": "Authority vs capability",
+      "original_purpose": "Planning disclaims execution; autonomy levels L0-L4",
+      "agent_os_artifacts": [
+        "docs/autonomy-levels.md",
+        "planning manifest authority object"
+      ],
+      "admissible_equivalent": "authority_context vs proposed_action in envelope + evaluator",
+      "reuse_type": "REFORMALIZED_STRONG",
+      "rigor_status": "STRONGER_IN_ADMISSIBLE",
+      "long_run_relevance": "HIGH",
+      "thesis_alignment": "ALIGNED",
+      "gap": null,
+      "recommendation": "ADD_TESTS"
+    },
+    {
+      "id": "reversibility",
+      "agent_os_primitive": "Reversibility",
+      "original_purpose": "ADR contract requires reversibility per architecture choice",
+      "agent_os_artifacts": [
+        "docs/orchestrator/architecture-decision-boundary.md"
+      ],
+      "admissible_equivalent": "risk_context.reversibility; rules_only checks",
+      "reuse_type": "REFORMALIZED_STRONG",
+      "rigor_status": "STRONGER_IN_ADMISSIBLE",
+      "long_run_relevance": "HIGH",
+      "thesis_alignment": "ALIGNED",
+      "gap": "Agent OS ADR not implemented at runtime",
+      "recommendation": "ADD_TESTS"
+    },
+    {
+      "id": "blast_radius",
+      "agent_os_primitive": "Blast radius",
+      "original_purpose": "Risk notes in planning artifacts",
+      "agent_os_artifacts": [
+        "planning templates",
+        "local-agentic-spec.md"
+      ],
+      "admissible_equivalent": "risk_context.blast_radius",
+      "reuse_type": "REFORMALIZED_STRONG",
+      "rigor_status": "STRONGER_IN_ADMISSIBLE",
+      "long_run_relevance": "HIGH",
+      "thesis_alignment": "ALIGNED",
+      "gap": null,
+      "recommendation": "ADD_TESTS"
+    },
+    {
+      "id": "evidence_sufficiency",
+      "agent_os_primitive": "Evidence missing / evidence sufficiency",
+      "original_purpose": "Closure checks presence; quality levels in doctrine",
+      "agent_os_artifacts": [
+        "agent_os/validate.py",
+        "orchestrator validation reports"
+      ],
+      "admissible_equivalent": "REQUEST_MORE_EVIDENCE; missing_evidence in decision output",
+      "reuse_type": "REFORMALIZED_STRONG",
+      "rigor_status": "STRONGER_IN_ADMISSIBLE",
+      "long_run_relevance": "HIGH",
+      "thesis_alignment": "ALIGNED",
+      "gap": null,
+      "recommendation": "ADD_TESTS"
+    },
+    {
+      "id": "policy_context",
+      "agent_os_primitive": "Policy context",
+      "original_purpose": "Planning constraints and non-goals",
+      "agent_os_artifacts": [
+        "local-agentic-spec.md",
+        "planning templates"
+      ],
+      "admissible_equivalent": "policy_context in envelope",
+      "reuse_type": "REFORMALIZED_STRONG",
+      "rigor_status": "STRONGER_IN_ADMISSIBLE",
+      "long_run_relevance": "HIGH",
+      "thesis_alignment": "ALIGNED",
+      "gap": null,
+      "recommendation": "ADD_TESTS"
+    },
+    {
+      "id": "side_effect_classification",
+      "agent_os_primitive": "Side-effect classification",
+      "original_purpose": "Implicit via planning no_execution flags",
+      "agent_os_artifacts": [
+        "planning manifest authority",
+        "docs/planning-layer-doctrine.md"
+      ],
+      "admissible_equivalent": "proposed_action.side_effect_type; expected_side_effect",
+      "reuse_type": "REFORMALIZED_STRONG",
+      "rigor_status": "STRONGER_IN_ADMISSIBLE",
+      "long_run_relevance": "HIGH",
+      "thesis_alignment": "ALIGNED",
+      "gap": null,
+      "recommendation": "KEEP_AS_LINEAGE"
+    },
+    {
+      "id": "safe_alternatives",
+      "agent_os_primitive": "Safe alternatives / safer next step",
+      "original_purpose": "Stop conditions and owner gates in planning slices",
+      "agent_os_artifacts": [
+        "implementation-plan.md",
+        "planning-structured-slice-format.md"
+      ],
+      "admissible_equivalent": "safer_next_step; candidate_safer_next_steps in envelope/decision",
+      "reuse_type": "REFORMALIZED_STRONG",
+      "rigor_status": "STRONGER_IN_ADMISSIBLE",
+      "long_run_relevance": "HIGH",
+      "thesis_alignment": "ALIGNED",
+      "gap": null,
+      "recommendation": "ADD_TESTS"
+    },
+    {
+      "id": "dry_run_discipline",
+      "agent_os_primitive": "No-side-effect dry-run discipline",
+      "original_purpose": "Orchestrator never invokes LLM or executor",
+      "agent_os_artifacts": [
+        "agent_os/orchestrator.py design",
+        "docs/planning-layer-doctrine.md"
+      ],
+      "admissible_equivalent": "terminal_dry_run_demo; long_run_truth_console; demo banners",
+      "reuse_type": "REFORMALIZED_STRONG",
+      "rigor_status": "EQUIVALENT",
+      "long_run_relevance": "HIGH",
+      "thesis_alignment": "ALIGNED",
+      "gap": "Live provider paths evaluate only; no mutation",
+      "recommendation": "ADD_LONG_RUN_DEMO_REQUIREMENT"
+    },
+    {
+      "id": "traceability",
+      "agent_os_primitive": "Traceability",
+      "original_purpose": "Provenance JSON chain and manifest transitions",
+      "agent_os_artifacts": [
+        "orchestrator evidence chain",
+        "planning transition records"
+      ],
+      "admissible_equivalent": "run_trace.json; truth trace; HTML viewers",
+      "reuse_type": "REFORMALIZED_STRONG",
+      "rigor_status": "EQUIVALENT",
+      "long_run_relevance": "HIGH",
+      "thesis_alignment": "ALIGNED",
+      "gap": "Multi-hour live session not traced",
+      "recommendation": "FUTURE_REPO_EXTRACTION"
+    },
+    {
+      "id": "benchmarkability",
+      "agent_os_primitive": "Benchmarkability",
+      "original_purpose": "Explicitly excluded from Agent OS v0 CLI",
+      "agent_os_artifacts": [
+        "docs/v0-release-boundary.md"
+      ],
+      "admissible_equivalent": "benchmark/ stack: cases, gold, scoring, compare runner",
+      "reuse_type": "REFORMALIZED_STRONG",
+      "rigor_status": "STRONGER_IN_ADMISSIBLE",
+      "long_run_relevance": "MEDIUM",
+      "thesis_alignment": "ALIGNED",
+      "gap": "Tier 1 seed only",
+      "recommendation": "DOCUMENT_ONLY"
+    },
+    {
+      "id": "demo_claim_boundaries",
+      "agent_os_primitive": "Demo claim boundaries",
+      "original_purpose": "v0 release boundary scopes CLI claims",
+      "agent_os_artifacts": [
+        "docs/v0-release-boundary.md"
+      ],
+      "admissible_equivalent": "TIER_1_CLAIM_BOUNDARY; LONG_RUN_CLAIM_BOUNDARY",
+      "reuse_type": "REFORMALIZED_STRONG",
+      "rigor_status": "STRONGER_IN_ADMISSIBLE",
+      "long_run_relevance": "MEDIUM",
+      "thesis_alignment": "ALIGNED",
+      "gap": null,
+      "recommendation": "DOCUMENT_ONLY"
+    },
+    {
+      "id": "long_run_orchestration",
+      "agent_os_primitive": "Long-run orchestration",
+      "original_purpose": "Anti-orchestration; manual CLI transitions between stages",
+      "agent_os_artifacts": [
+        "docs/planning-layer-doctrine.md",
+        "agent_os/cli.py"
+      ],
+      "admissible_equivalent": null,
+      "reuse_type": "INTENTIONALLY_OUT_OF_SCOPE",
+      "rigor_status": "NOT_APPLICABLE",
+      "long_run_relevance": "HIGH",
+      "thesis_alignment": "ALIGNED",
+      "gap": "By thesis Admissible is not orchestrator",
+      "recommendation": "DO_NOT_PORT"
+    },
+    {
+      "id": "frontier_separation",
+      "agent_os_primitive": "Separation from frontier model / agent",
+      "original_purpose": "External agent executes; OS structures delegation",
+      "agent_os_artifacts": [
+        "docs/why-agent-os.md",
+        "docs/thesis.md"
+      ],
+      "admissible_equivalent": "ModelClient protocol; frontier_direct baseline",
+      "reuse_type": "REFORMALIZED_STRONG",
+      "rigor_status": "EQUIVALENT",
+      "long_run_relevance": "HIGH",
+      "thesis_alignment": "ALIGNED",
+      "gap": null,
+      "recommendation": "DOCUMENT_ONLY"
+    },
+    {
+      "id": "hidden_progression_prevention",
+      "agent_os_primitive": "Prevention of hidden autonomous progression",
+      "original_purpose": "Owner gates between orchestrator and planning stages",
+      "agent_os_artifacts": [
+        "orchestrator preflights",
+        "planning transition doctrine"
+      ],
+      "admissible_equivalent": "Label precedence; no auto-execute in demos",
+      "reuse_type": "REFORMALIZED_WEAK",
+      "rigor_status": "WEAKER_IN_ADMISSIBLE",
+      "long_run_relevance": "HIGH",
+      "thesis_alignment": "ALIGNED",
+      "gap": "No multi-stage gates in Admissible",
+      "recommendation": "DOCUMENT_ONLY"
+    },
+    {
+      "id": "rollback_recovery",
+      "agent_os_primitive": "Rollback / recovery expectations",
+      "original_purpose": "ADR and slice stop conditions",
+      "agent_os_artifacts": [
+        "docs/orchestrator/architecture-decision-boundary.md",
+        "planning slices"
+      ],
+      "admissible_equivalent": "rollback_available in some envelopes",
+      "reuse_type": "CONCEPTUAL_TRANSFER",
+      "rigor_status": "WEAKER_IN_ADMISSIBLE",
+      "long_run_relevance": "MEDIUM",
+      "thesis_alignment": "ALIGNED",
+      "gap": "Weak implementation both sides",
+      "recommendation": "ADD_SCHEMA_FIELD"
+    },
+    {
+      "id": "command_workspace_mutation_tracking",
+      "agent_os_primitive": "Exact command/workspace mutation tracking",
+      "original_purpose": "Evidence registrar; git snapshot allowlist",
+      "agent_os_artifacts": [
+        "agent_os/workspace.py",
+        "evidence.md template"
+      ],
+      "admissible_equivalent": "truth trace execution_log; terminal dry-run fixtures",
+      "reuse_type": "REFORMALIZED_WEAK",
+      "rigor_status": "WEAKER_IN_ADMISSIBLE",
+      "long_run_relevance": "HIGH",
+      "thesis_alignment": "PARTIALLY_ALIGNED",
+      "gap": "No live command capture from Cursor",
+      "recommendation": "FUTURE_REPO_EXTRACTION"
+    },
+    {
+      "id": "proposed_admitted_blocked_executed",
+      "agent_os_primitive": "Proposed / admitted / blocked / executed distinction",
+      "original_purpose": "Draft vs approved; planning state machines",
+      "agent_os_artifacts": [
+        "orchestrator promotion",
+        "planning manifest statuses"
+      ],
+      "admissible_equivalent": "action_candidates.execution_status; operational_admissibility_action; side_effect_executed",
+      "reuse_type": "REFORMALIZED_STRONG",
+      "rigor_status": "EQUIVALENT",
+      "long_run_relevance": "HIGH",
+      "thesis_alignment": "ALIGNED",
+      "gap": "Executed path not implemented (dry-run only)",
+      "recommendation": "ADD_TRUTH_TRACE_FIELD"
+    }
+  ],
+  "stronger_in_admissible": [
+    "canonical_admission_labels_with_precedence",
+    "action_envelope_schema",
+    "deterministic_scoring_harness",
+    "gold_input_separation",
+    "frontier_provider_baselines",
+    "operational_admissibility_mapping",
+    "truth_trace_model",
+    "html_visual_inspection",
+    "embedded_claim_boundaries",
+    "ast_import_boundary_tests",
+    "side_effect_typing_at_evaluation"
+  ],
+  "thesis_conflicts_if_ported": [
+    "full_orchestrator_pipeline",
+    "planning_workspace_cli",
+    "fail_closed_run_closure_as_core",
+    "goal_intake_state_machine_in_evaluator",
+    "auto_chained_llm_invoke",
+    "agent_os_workspace_bootstrap_in_admissible",
+    "planning_run_slice_importer"
+  ],
+  "recommended_actions": {
+    "P0": [
+      "DOCUMENT_ONLY: cross-layer long-run composition (Cursor -> envelope -> Admissible)",
+      "ADD_TRUTH_TRACE_FIELD: source_type live vs fixture; admitted/blocked/executed",
+      "ADD_TESTS: maintain import boundary"
+    ],
+    "P1": [
+      "PORT_AS_ADMISSIBLE_CONCEPT: envelope builder adapter (no agent_os import)",
+      "ADD_LONG_RUN_DEMO_REQUIREMENT: Slither-relevant terminal dry-run cases",
+      "ADD_TESTS: approval_scope mismatch and unverified source_trust cases"
+    ],
+    "P2": [
+      "FUTURE_REPO_EXTRACTION: Cursor CLI recording adapter",
+      "Benchmark tier 2 per Admissible_BENCHMARK_SPEC.md",
+      "Model-assisted Admissible evaluator"
+    ]
+  }
+}
