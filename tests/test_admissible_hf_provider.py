@@ -23,14 +23,18 @@ from admissible.runner.compare_runner import (
 )
 from admissible.runner.demo_trace import build_demo_trace
 from admissible.runner.model_clients import (
+    ADMISSIBLE_DECISION_OUTPUT_RESPONSE_FORMAT,
     DEFAULT_HF_BASE_URL,
+    DEFAULT_HF_MAX_TOKENS,
     DEFAULT_HF_TIMEOUT_SECONDS,
     HF_BASE_URL_ENV,
+    HF_MAX_TOKENS_ENV,
     HF_MODEL_ENV,
     HF_TIMEOUT_ENV,
     HF_TOKEN_ENV,
     FixedResponseModelClient,
     HuggingFaceChatCompletionsModelClient,
+    _parse_hf_max_tokens,
     _parse_hf_timeout_seconds,
     build_huggingface_model_client_from_env,
 )
@@ -110,7 +114,7 @@ class TestHuggingFaceChatCompletionsModelClient(unittest.TestCase):
         self.assertIsInstance(request, Request)
         self.assertTrue(request.full_url.endswith("/chat/completions"))
 
-    def test_request_payload_uses_messages_with_user_prompt(self) -> None:
+    def test_request_payload_uses_system_and_user_messages(self) -> None:
         client = self._client()
         captured: list[object] = []
 
@@ -127,9 +131,84 @@ class TestHuggingFaceChatCompletionsModelClient(unittest.TestCase):
 
         body = json.loads(captured[0].data.decode("utf-8"))  # type: ignore[attr-defined]
         self.assertEqual(body["model"], "test-model")
-        self.assertEqual(body["messages"], [{"role": "user", "content": "hello world"}])
+        self.assertEqual(len(body["messages"]), 2)
+        self.assertEqual(body["messages"][0]["role"], "system")
+        self.assertIn("action-admission evaluator", body["messages"][0]["content"])
+        self.assertEqual(body["messages"][1], {"role": "user", "content": "hello world"})
         self.assertEqual(body["temperature"], 0)
-        self.assertEqual(body["max_tokens"], 1000)
+        self.assertEqual(body["max_tokens"], DEFAULT_HF_MAX_TOKENS)
+        self.assertEqual(body["response_format"], ADMISSIBLE_DECISION_OUTPUT_RESPONSE_FORMAT)
+
+    def test_request_payload_uses_configurable_max_tokens(self) -> None:
+        client = HuggingFaceChatCompletionsModelClient(
+            token=SECRET_TOKEN,
+            model="test-model",
+            max_tokens=4000,
+        )
+        captured: list[object] = []
+
+        def fake_urlopen(request, timeout=0):  # noqa: ARG001
+            captured.append(request)
+            return mock.Mock(
+                __enter__=lambda self: self,
+                __exit__=lambda *args: None,
+                read=lambda: json.dumps({"text": VALID_BASELINE_RESPONSE}).encode("utf-8"),
+            )
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            client.complete("hello world")
+
+        body = json.loads(captured[0].data.decode("utf-8"))  # type: ignore[attr-defined]
+        self.assertEqual(body["max_tokens"], 4000)
+
+        env = {
+            HF_TOKEN_ENV: SECRET_TOKEN,
+            HF_MODEL_ENV: "test-model",
+            HF_MAX_TOKENS_ENV: "4000",
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            built = build_huggingface_model_client_from_env()
+        self.assertEqual(built._max_tokens, 4000)
+
+    def test_invalid_max_tokens_env_raises_value_error(self) -> None:
+        env = {
+            HF_TOKEN_ENV: SECRET_TOKEN,
+            HF_MODEL_ENV: "test-model",
+            HF_MAX_TOKENS_ENV: "not-a-number",
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(ValueError) as ctx:
+                build_huggingface_model_client_from_env()
+        self.assertIn(HF_MAX_TOKENS_ENV, str(ctx.exception))
+
+        with self.assertRaises(ValueError):
+            _parse_hf_max_tokens("0")
+        with self.assertRaises(ValueError):
+            _parse_hf_max_tokens("-5")
+
+    def test_request_payload_includes_json_schema_response_format(self) -> None:
+        client = self._client()
+        captured: list[object] = []
+
+        def fake_urlopen(request, timeout=0):  # noqa: ARG001
+            captured.append(request)
+            return mock.Mock(
+                __enter__=lambda self: self,
+                __exit__=lambda *args: None,
+                read=lambda: json.dumps({"text": VALID_BASELINE_RESPONSE}).encode("utf-8"),
+            )
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            client.complete("hello world")
+
+        body = json.loads(captured[0].data.decode("utf-8"))  # type: ignore[attr-defined]
+        response_format = body["response_format"]
+        self.assertEqual(response_format["type"], "json_schema")
+        self.assertEqual(
+            response_format["json_schema"]["name"],
+            "admissible_decision_output",
+        )
+        self.assertIn("decision", response_format["json_schema"]["schema"]["properties"])
 
     def test_authorization_header_set_without_leaking_token_in_logs(self) -> None:
         client = self._client()

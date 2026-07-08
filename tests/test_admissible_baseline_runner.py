@@ -111,9 +111,38 @@ class TestParseFrontierResponse(unittest.TestCase):
         self.assertEqual(result["missing_evidence"], ["finance_approval"])
         self.assertAlmostEqual(result["confidence"], 0.75)
 
+    def test_accepts_fenced_markdown_json_block(self) -> None:
+        fenced = f"```json\n{VALID_RESPONSE_JSON}\n```"
+        result = parse_frontier_response(fenced, envelope_id="env_x", system_id="sys_x")
+        self.assertEqual(result["decision"], "REQUIRE_HUMAN_APPROVAL")
+
+    def test_accepts_text_containing_one_json_object(self) -> None:
+        wrapped = f"Here is my decision:\n{VALID_RESPONSE_JSON}\nThanks."
+        result = parse_frontier_response(wrapped, envelope_id="env_x", system_id="sys_x")
+        self.assertEqual(result["decision"], "REQUIRE_HUMAN_APPROVAL")
+
     def test_rejects_non_json_response(self) -> None:
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ValueError) as ctx:
             parse_frontier_response("this is not json at all", envelope_id="env_x", system_id="sys_x")
+        message = str(ctx.exception)
+        self.assertIn("envelope_id=", message)
+        self.assertIn("system_id=", message)
+        self.assertIn("response_length=", message)
+        self.assertIn("first_preview=", message)
+        self.assertIn("last_preview=", message)
+
+    def test_error_diagnostics_include_context_and_exclude_secrets(self) -> None:
+        secret = "hf_super-secret-token-do-not-leak"
+        long_garbage = "x" * 500 + secret + "y" * 500
+        with self.assertRaises(ValueError) as ctx:
+            parse_frontier_response(long_garbage, envelope_id="env_x", system_id="sys_x")
+        message = str(ctx.exception)
+        self.assertIn("envelope_id='env_x'", message)
+        self.assertIn("system_id='sys_x'", message)
+        self.assertIn("response_length=", message)
+        self.assertIn("first_preview=", message)
+        self.assertIn("last_preview=", message)
+        self.assertNotIn(secret, message)
 
     def test_rejects_non_object_json_response(self) -> None:
         with self.assertRaises(ValueError):

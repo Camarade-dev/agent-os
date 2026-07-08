@@ -69,6 +69,7 @@ For a practical live demo, configure Hugging Face Inference Providers:
 ```powershell
 $env:ADMISSIBLE_HF_TOKEN="hf_..."
 $env:ADMISSIBLE_HF_MODEL="<model>"
+$env:ADMISSIBLE_HF_MAX_TOKENS="4000"
 $env:ADMISSIBLE_HF_BASE_URL="https://router.huggingface.co/v1"
 ```
 

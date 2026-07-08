@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -156,12 +157,90 @@ def _normalize_safer_next_step(raw: Any, decision_label: str) -> dict | None:
     }
 
 
+_ERROR_PREVIEW_CHARS = 300
+
+
+def _build_parse_error_context(
+    response_text: str,
+    *,
+    envelope_id: str,
+    system_id: str,
+) -> str:
+    length = len(response_text)
+    first_preview = response_text[:_ERROR_PREVIEW_CHARS]
+    if length <= _ERROR_PREVIEW_CHARS:
+        last_preview = response_text
+    else:
+        last_preview = response_text[-_ERROR_PREVIEW_CHARS:]
+    return (
+        f"envelope_id={envelope_id!r}; system_id={system_id!r}; "
+        f"response_length={length}; "
+        f"first_preview={first_preview!r}; last_preview={last_preview!r}"
+    )
+
+
+def _extract_json_text(response_text: str) -> str | None:
+    """Extract JSON object text from a model response using layered fallbacks."""
+    stripped = response_text.strip()
+    if stripped:
+        try:
+            json.loads(stripped)
+            return stripped
+        except json.JSONDecodeError:
+            pass
+
+    fence_match = re.search(
+        r"```(?:json)?\s*\n?(.*?)\n?```",
+        response_text,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if fence_match:
+        candidate = fence_match.group(1).strip()
+        if candidate:
+            try:
+                json.loads(candidate)
+                return candidate
+            except json.JSONDecodeError:
+                pass
+
+    start = response_text.find("{")
+    if start != -1:
+        depth = 0
+        in_string = False
+        escape = False
+        for index, char in enumerate(response_text[start:], start=start):
+            if escape:
+                escape = False
+                continue
+            if char == "\\" and in_string:
+                escape = True
+                continue
+            if char == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = response_text[start : index + 1]
+                    try:
+                        json.loads(candidate)
+                        return candidate
+                    except json.JSONDecodeError:
+                        break
+
+    return None
+
+
 def parse_frontier_response(response_text: str, *, envelope_id: str, system_id: str) -> dict:
     """Parse a frontier model's raw text response into a full decision output.
 
     Strict on the fields that determine correctness:
 
-    - raises ValueError if response_text is not valid JSON;
+    - raises ValueError if no JSON object can be extracted from response_text;
     - raises ValueError if the parsed JSON is not an object;
     - raises ValueError if `decision` is missing or empty;
     - raises ValueError if `decision` is not one of the five canonical
@@ -172,10 +251,24 @@ def parse_frontier_response(response_text: str, *, envelope_id: str, system_id: 
     than raising, since a frontier model's formatting of secondary
     fields is not the thing under test here.
     """
+    json_text = _extract_json_text(response_text)
+    if json_text is None:
+        context = _build_parse_error_context(
+            response_text, envelope_id=envelope_id, system_id=system_id
+        )
+        raise ValueError(
+            "frontier response does not contain a valid JSON object; " + context
+        )
+
     try:
-        parsed = json.loads(response_text)
+        parsed = json.loads(json_text)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"frontier response is not valid JSON: {exc}") from exc
+        context = _build_parse_error_context(
+            response_text, envelope_id=envelope_id, system_id=system_id
+        )
+        raise ValueError(
+            f"frontier response is not valid JSON: {exc}; " + context
+        ) from exc
 
     if not isinstance(parsed, dict):
         raise ValueError(f"frontier response must be a JSON object, got {type(parsed).__name__}")

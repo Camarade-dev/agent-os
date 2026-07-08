@@ -125,10 +125,80 @@ HF_TOKEN_ENV = "ADMISSIBLE_HF_TOKEN"
 HF_MODEL_ENV = "ADMISSIBLE_HF_MODEL"
 HF_BASE_URL_ENV = "ADMISSIBLE_HF_BASE_URL"
 HF_TIMEOUT_ENV = "ADMISSIBLE_HF_TIMEOUT_SECONDS"
+HF_MAX_TOKENS_ENV = "ADMISSIBLE_HF_MAX_TOKENS"
 
 HF_REQUIRED_ENV_VARS: tuple[str, ...] = (HF_TOKEN_ENV, HF_MODEL_ENV)
 DEFAULT_HF_BASE_URL = "https://router.huggingface.co/v1"
 DEFAULT_HF_TIMEOUT_SECONDS = 60.0
+DEFAULT_HF_MAX_TOKENS = 2000
+
+HF_SYSTEM_MESSAGE = (
+    "You are an action-admission evaluator. Output only one compact valid JSON object "
+    "matching the requested schema. Do not output markdown, prose, tool calls, or extra "
+    "text. Keep reasons concise."
+)
+
+ADMISSIBLE_DECISION_OUTPUT_RESPONSE_FORMAT: dict[str, Any] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "admissible_decision_output",
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "decision": {
+                    "type": "string",
+                    "enum": [
+                        "ALLOW",
+                        "ALLOW_WITH_LIMITS",
+                        "REQUEST_MORE_EVIDENCE",
+                        "REQUIRE_HUMAN_APPROVAL",
+                        "REFUSE",
+                    ],
+                },
+                "risk_level": {"type": "string"},
+                "reasons": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "dimension": {"type": "string"},
+                            "summary": {"type": "string"},
+                            "severity": {"type": "string"},
+                        },
+                        "required": ["dimension", "summary", "severity"],
+                    },
+                },
+                "missing_evidence": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "required_approval": {"type": "string"},
+                "safer_next_step": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {
+                            "type": "object",
+                            "additionalProperties": True,
+                        },
+                        {"type": "null"},
+                    ],
+                },
+                "confidence": {"type": "number"},
+            },
+            "required": [
+                "decision",
+                "risk_level",
+                "reasons",
+                "missing_evidence",
+                "required_approval",
+                "safer_next_step",
+                "confidence",
+            ],
+        },
+    },
+}
 
 
 def _parse_hf_timeout_seconds(raw: str | None) -> float:
@@ -143,6 +213,23 @@ def _parse_hf_timeout_seconds(raw: str | None) -> float:
     return value
 
 
+def _parse_hf_max_tokens(raw: str | None) -> int:
+    if raw is None or not str(raw).strip():
+        return DEFAULT_HF_MAX_TOKENS
+    text = str(raw).strip()
+    try:
+        value = int(text)
+    except ValueError as exc:
+        raise ValueError(
+            f"{HF_MAX_TOKENS_ENV} must be a positive integer, got {text!r}"
+        ) from exc
+    if value <= 0:
+        raise ValueError(
+            f"{HF_MAX_TOKENS_ENV} must be a positive integer, got {text!r}"
+        )
+    return value
+
+
 class HuggingFaceChatCompletionsModelClient:
     """OpenAI-compatible chat completions client for Hugging Face Inference Providers."""
 
@@ -153,19 +240,25 @@ class HuggingFaceChatCompletionsModelClient:
         model: str,
         base_url: str = DEFAULT_HF_BASE_URL,
         timeout_seconds: float = DEFAULT_HF_TIMEOUT_SECONDS,
+        max_tokens: int = DEFAULT_HF_MAX_TOKENS,
     ):
         self._token = token
         self._model = model
         self._base_url = base_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
+        self._max_tokens = max_tokens
 
     def complete(self, prompt: str) -> str:
         url = f"{self._base_url}/chat/completions"
         payload = json.dumps({
             "model": self._model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [
+                {"role": "system", "content": HF_SYSTEM_MESSAGE},
+                {"role": "user", "content": prompt},
+            ],
             "temperature": 0,
-            "max_tokens": 1000,
+            "max_tokens": self._max_tokens,
+            "response_format": ADMISSIBLE_DECISION_OUTPUT_RESPONSE_FORMAT,
         }).encode("utf-8")
         request = urllib.request.Request(
             url,
@@ -217,6 +310,7 @@ def build_huggingface_model_client_from_env() -> HuggingFaceChatCompletionsModel
         model=os.environ[HF_MODEL_ENV].strip(),
         base_url=base_url,
         timeout_seconds=_parse_hf_timeout_seconds(os.environ.get(HF_TIMEOUT_ENV)),
+        max_tokens=_parse_hf_max_tokens(os.environ.get(HF_MAX_TOKENS_ENV)),
     )
 
 
