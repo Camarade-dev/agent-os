@@ -186,6 +186,37 @@ class TestControllerWithSampleSession(unittest.TestCase):
         self.assertEqual(attention["missing_context"], state["goal_intake"]["missing_context"])
         self.assertEqual(attention["unresolved_plan_gates"], state["plan_audit"]["required_gates"])
 
+    def test_needs_attention_buckets_are_populated_for_sample_session(self) -> None:
+        """Regression: the Needs Attention panel renders from the bucketed
+        fields (evidence_needed/approval_needed/scope_limits_needed/...),
+        not just the flat 'actions' list. If those buckets ever went empty
+        while mission_summary/queue still reported gated actions, the panel
+        would wrongly render "Nothing needs attention right now."."""
+        state = self.controller.load_sample_session()
+        summary = state["mission_summary"]
+        attention = state["needs_attention"]
+
+        self.assertEqual(summary["needs_attention_count"], 9)
+        self.assertEqual(len(attention["actions"]), 9)
+
+        bucket_action_count = (
+            len(attention["evidence_needed"])
+            + len(attention["approval_needed"])
+            + len(attention["scope_limits_needed"])
+        )
+        self.assertEqual(bucket_action_count, 9)
+        self.assertTrue(any(a["decision"] == "REQUEST_MORE_EVIDENCE" for a in attention["evidence_needed"]))
+
+        # Mirrors the UI's renderNeedsAttention() "hasAnything" check.
+        has_anything = bool(
+            attention["evidence_needed"]
+            or attention["approval_needed"]
+            or attention["scope_limits_needed"]
+            or attention["plan_clarifications"]
+            or attention["ready_to_continue"]
+        )
+        self.assertTrue(has_anything)
+
     def test_mission_summary_and_needs_attention_excluded_from_canonical_export(self) -> None:
         # These are derived UI-only views (not part of the round-trippable
         # session state) -- session_dict()/export must not carry them.

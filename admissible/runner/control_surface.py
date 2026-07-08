@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import socket
 import sys
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -38,6 +39,31 @@ _HTML_PATH = Path(__file__).resolve().parent.parent / "harness" / "control_surfa
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
+
+
+class _ControlSurfaceHTTPServer(ThreadingHTTPServer):
+    """Refuses to silently share a listening port with another instance.
+
+    ``http.server`` sets ``allow_reuse_address = True`` (SO_REUSEADDR),
+    which on Windows -- unlike POSIX -- lets a second process bind the
+    *same* host:port while an earlier instance is still listening, with no
+    error. Two control-surface processes then serve the same session
+    directory from independent in-memory state, so a browser's GET/POST
+    calls route unpredictably between them: a button click can appear to do
+    nothing if its response lands on a different process than the one that
+    rendered the page. On Windows, request SO_EXCLUSIVEADDRUSE instead so a
+    duplicate launch fails loudly with "address already in use"; POSIX
+    keeps the normal SO_REUSEADDR fast-restart behavior unchanged.
+    """
+
+    def server_bind(self) -> None:
+        if sys.platform == "win32":
+            # SO_EXCLUSIVEADDRUSE and SO_REUSEADDR are mutually exclusive on
+            # Windows -- skip the inherited SO_REUSEADDR call.
+            self.allow_reuse_address = False
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
 
 _STARTUP_BANNER = (
     "Admissible Control Surface v0 -- local only. Does not call Cursor, Claude Code, "
@@ -167,7 +193,7 @@ def make_server(
         (_ControlSurfaceRequestHandler,),
         {"controller": controller},
     )
-    return ThreadingHTTPServer((host, port), handler_cls)
+    return _ControlSurfaceHTTPServer((host, port), handler_cls)
 
 
 def run(

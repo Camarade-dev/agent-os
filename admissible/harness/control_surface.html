@@ -947,7 +947,11 @@ document.getElementById("btn-copy-packet").addEventListener("click", async () =>
 document.getElementById("btn-ingest-response").addEventListener("click", () => {
   const input = document.getElementById("agent-response-input");
   const text = input.value.trim();
-  if (!text) return;
+  if (!text) {
+    showError("Paste a non-empty agent response before clicking \"Ingest response\".");
+    return;
+  }
+  clearError();
   runAction(() => apiPost("/api/session/run_loop/ingest_response", { raw_response: text })).then(() => {
     input.value = "";
   });
