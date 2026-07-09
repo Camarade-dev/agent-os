@@ -28,6 +28,7 @@ from admissible.control_surface import ControlSurfaceController
 from admissible.runner import cursor_bridge
 from admissible.runner.cursor_bridge import (
     CURSOR_LAUNCHER_ENV_VAR,
+    BridgeSessionMismatchError,
     CursorBridgeError,
     DuplicateResponseError,
     InvalidSessionFileError,
@@ -41,10 +42,12 @@ from admissible.runner.cursor_bridge import (
     discover_cursor_launcher,
     ingest_response_file,
     ingest_response_file_with_controller,
+    invalidate_bridge_state_for_session_reset,
     main as cursor_bridge_main,
     open_workspace_in_cursor,
     read_bridge_state,
     render_instruction_file,
+    write_bridge_state,
     write_next_instruction,
     write_next_instruction_with_controller,
 )
@@ -902,6 +905,224 @@ class TestCursorBridgeHttpServer(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("older than the current instruction", body["error"])
         self.assertEqual(body["reason"], "stale_response")
+
+
+class TestBridgeSessionResetOverHttp(unittest.TestCase):
+    """HTTP reset must invalidate bridge binding for the workspace."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from admissible.runner.control_surface import build_controller as build_server_controller
+        from admissible.runner.control_surface import make_server
+
+        cls._tmpdir = tempfile.TemporaryDirectory()
+        cls.workspace = Path(cls._tmpdir.name) / "reset_ws"
+        cls.workspace.mkdir()
+        controller = build_server_controller(
+            session_dir=Path(cls._tmpdir.name) / "sessions",
+            sample_trace_path=SAMPLE_TRACE_PATH,
+        )
+        controller.submit_goal(BRIDGE_TEST_GOAL)
+        cls.server = make_server(controller, host="127.0.0.1", port=0)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.base_url = f"http://127.0.0.1:{cls.port}"
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls._tmpdir.cleanup()
+
+    def _post(self, path: str, body: dict):
+        data = json.dumps(body).encode("utf-8")
+        request = urllib.request.Request(
+            self.base_url + path,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read().decode("utf-8"))
+
+    def test_pre_reset_response_blocked_over_http_after_session_reset(self) -> None:
+        status, state = self._post(
+            "/api/session/run_loop/bridge/write_instruction",
+            {"workspace_path": str(self.workspace)},
+        )
+        self.assertEqual(status, 200)
+        response_path = self.workspace / ".admissible" / "agent-response.md"
+        response_path.write_text(RAW_INSTALL_DEPENDENCY_RESPONSE, encoding="utf-8")
+
+        status, state = self._post("/api/session/reset", {"workspace_path": str(self.workspace)})
+        self.assertEqual(status, 200)
+        self.assertFalse(state["session_diagnostics"]["bridge_awaiting_response"])
+
+        queue_len = len(state["queue"])
+        status, body = self._post(
+            "/api/session/run_loop/bridge/ingest_response",
+            {"workspace_path": str(self.workspace)},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(body["reason"], "bridge_session_mismatch")
+        self.assertEqual(len(body.get("queue") or state["queue"]), queue_len)
+
+
+class TestBridgeSessionBinding(unittest.TestCase):
+    """GAP-005: bridge ingest must be session-bound; turn=0 must not skip mismatch."""
+
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.controller = _make_controller(self._tmpdir.name)
+        self.workspace = Path(self._tmpdir.name) / "workspace"
+        self.workspace.mkdir()
+        self.bridge_dir = self.workspace / ".admissible"
+
+    def tearDown(self) -> None:
+        self._tmpdir.cleanup()
+
+    def _write_response(self, text: str = RAW_INSTALL_DEPENDENCY_RESPONSE) -> None:
+        self.bridge_dir.mkdir(parents=True, exist_ok=True)
+        (self.bridge_dir / "agent-response.md").write_text(text, encoding="utf-8")
+
+    def test_pre_reset_response_blocked_after_session_reset(self) -> None:
+        write_next_instruction_with_controller(self.controller, self.workspace)
+        self._write_response()
+        old_session_id = self.controller.state_view()["session_id"]
+
+        self.controller.reset_session()
+        new_session_id = self.controller.state_view()["session_id"]
+        self.assertNotEqual(old_session_id, new_session_id)
+
+        queue_before = len(self.controller.state_view()["queue"])
+        with self.assertRaises(BridgeSessionMismatchError) as ctx:
+            ingest_response_file_with_controller(self.controller, self.workspace)
+        self.assertEqual(ctx.exception.detail["reason"], "bridge_session_mismatch")
+        self.assertEqual(len(self.controller.state_view()["queue"]), queue_before)
+
+    def test_session_mismatch_creates_no_queue_items(self) -> None:
+        write_next_instruction_with_controller(self.controller, self.workspace)
+        self._write_response()
+        other = _make_controller(self._tmpdir.name, name="sessions_other")
+
+        with self.assertRaises(BridgeSessionMismatchError):
+            ingest_response_file_with_controller(other, self.workspace)
+        self.assertEqual(len(other.state_view()["queue"]), 0)
+
+    def test_session_mismatch_records_blocked_bridge_diagnostic(self) -> None:
+        write_next_instruction_with_controller(self.controller, self.workspace)
+        self._write_response()
+        other = _make_controller(self._tmpdir.name, name="sessions_other")
+
+        with self.assertRaises(BridgeSessionMismatchError):
+            ingest_response_file_with_controller(other, self.workspace)
+
+        blocked = [
+            entry
+            for entry in other.session_dict()["transcript"]
+            if entry["type"] == "bridge_ingest_blocked"
+        ]
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(blocked[0]["payload"]["reason"], "bridge_session_mismatch")
+
+    def test_turn_zero_mismatch_is_detected_not_skipped(self) -> None:
+        write_next_instruction_with_controller(self.controller, self.workspace)
+        self._write_response()
+        session_id = self.controller.state_view()["session_id"]
+        self.controller.reset_session()
+        self.assertEqual(self.controller.state_view()["run_loop"]["current_turn"], 0)
+
+        write_bridge_state(
+            self.workspace,
+            {
+                "session_id": self.controller.state_view()["session_id"],
+                "turn": 1,
+                "awaiting_response": True,
+            },
+        )
+
+        with self.assertRaises(StaleResponseError) as ctx:
+            ingest_response_file_with_controller(self.controller, self.workspace)
+        self.assertEqual(ctx.exception.detail["reason"], "instruction_turn_mismatch")
+        self.assertEqual(ctx.exception.detail["session_turn"], 0)
+        self.assertEqual(ctx.exception.detail["bridge_turn"], 1)
+        self.assertNotEqual(session_id, self.controller.state_view()["session_id"])
+
+    def test_reset_invalidates_bridge_state_when_workspace_provided(self) -> None:
+        write_next_instruction_with_controller(self.controller, self.workspace)
+        state = read_bridge_state(self.workspace)
+        self.assertTrue(state["awaiting_response"])
+
+        invalidate_bridge_state_for_session_reset(self.workspace)
+        state = read_bridge_state(self.workspace)
+        self.assertFalse(state["awaiting_response"])
+        self.assertIn("session_reset_invalidated_at", state)
+
+
+class TestBridgeAwaitingTurnCleanup(unittest.TestCase):
+    """GAP-004: only the latest instruction turn may be actively awaiting."""
+
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.controller = _make_controller(self._tmpdir.name)
+        self.workspace = Path(self._tmpdir.name) / "workspace"
+        self.workspace.mkdir()
+        self.bridge_dir = self.workspace / ".admissible"
+
+    def tearDown(self) -> None:
+        self._tmpdir.cleanup()
+
+    def _write_response(self, text: str = RAW_INSTALL_DEPENDENCY_RESPONSE) -> None:
+        self.bridge_dir.mkdir(parents=True, exist_ok=True)
+        (self.bridge_dir / "agent-response.md").write_text(text, encoding="utf-8")
+
+    def test_new_instruction_supersedes_prior_awaiting_turn(self) -> None:
+        write_next_instruction_with_controller(self.controller, self.workspace)
+        diag = self.controller.state_view()["session_diagnostics"]
+        self.assertEqual(diag["bridge_awaiting_turns"], [1])
+
+        write_next_instruction_with_controller(self.controller, self.workspace)
+        diag = self.controller.state_view()["session_diagnostics"]
+        self.assertEqual(diag["bridge_awaiting_turns"], [2])
+        self.assertTrue(diag["bridge_awaiting_response"])
+
+    def test_write_then_write_then_ingest_clears_all_awaiting_turns(self) -> None:
+        write_next_instruction_with_controller(self.controller, self.workspace)
+        write_next_instruction_with_controller(self.controller, self.workspace)
+        self._write_response()
+        ingest_response_file_with_controller(self.controller, self.workspace)
+
+        diag = self.controller.state_view()["session_diagnostics"]
+        self.assertFalse(diag["bridge_awaiting_response"])
+        self.assertEqual(diag["bridge_awaiting_turns"], [])
+
+    def test_successful_ingest_removes_current_turn_from_awaiting(self) -> None:
+        write_next_instruction_with_controller(self.controller, self.workspace)
+        self.assertEqual(
+            self.controller.state_view()["session_diagnostics"]["bridge_awaiting_turns"],
+            [1],
+        )
+        self._write_response()
+        ingest_response_file_with_controller(self.controller, self.workspace)
+
+        diag = self.controller.state_view()["session_diagnostics"]
+        self.assertFalse(diag["bridge_awaiting_response"])
+        self.assertEqual(diag["bridge_awaiting_turns"], [])
+
+    def test_reset_clears_awaiting_diagnostics(self) -> None:
+        write_next_instruction_with_controller(self.controller, self.workspace)
+        self.assertTrue(
+            self.controller.state_view()["session_diagnostics"]["bridge_awaiting_response"]
+        )
+
+        state = self.controller.reset_session()
+        diag = state["session_diagnostics"]
+        self.assertFalse(diag["bridge_awaiting_response"])
+        self.assertEqual(diag["bridge_awaiting_turns"], [])
 
 
 class TestBridgeFreshnessSessionExport(unittest.TestCase):

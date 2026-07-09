@@ -806,18 +806,19 @@ def _apply_evidence_attention_to_item(
 
 
 def _bridge_awaiting_response(run_loop: RunLoopState) -> tuple[bool, list[int]]:
-    """Return whether an instruction packet is outstanding without a matching response."""
+    """Return whether the latest instruction packet is outstanding without a response.
+
+    Only the most recent instruction turn can be actively awaiting a bridge
+    response. Older packets superseded by a later write are excluded so
+    diagnostics do not permanently claim an outstanding response.
+    """
     if not run_loop.instruction_packets:
         return False, []
+    latest_turn = run_loop.instruction_packets[-1].turn_number
     response_turns = {record.turn_number for record in run_loop.response_records}
-    awaiting_turns = sorted(
-        {
-            packet.turn_number
-            for packet in run_loop.instruction_packets
-            if packet.turn_number not in response_turns
-        }
-    )
-    return bool(awaiting_turns), awaiting_turns
+    if latest_turn in response_turns:
+        return False, []
+    return True, [latest_turn]
 
 
 def _session_diagnostics(

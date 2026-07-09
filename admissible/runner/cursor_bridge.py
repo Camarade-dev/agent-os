@@ -143,6 +143,10 @@ class NoAwaitingInstructionError(CursorBridgeError):
     """Raised when no instruction is awaiting a response for the current turn."""
 
 
+class BridgeSessionMismatchError(CursorBridgeError):
+    """Raised when bridge-state was written for a different Control Surface session."""
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -324,6 +328,25 @@ def _archive_stale_response_file(workspace: Path, *, turn: int) -> str | None:
     return str(archive_path)
 
 
+def invalidate_bridge_state_for_session_reset(workspace: Path) -> Path | None:
+    """Mark workspace bridge-state as invalid after a Control Surface session reset.
+
+    Clears the active awaiting flag so stale on-disk responses cannot be mistaken
+    for a current-session instruction. A fresh ``write_instruction`` re-binds
+    ``session_id`` and turn metadata for the new session.
+    """
+    bridge_state = read_bridge_state(workspace)
+    if bridge_state is None:
+        return None
+    return write_bridge_state(
+        workspace,
+        {
+            "awaiting_response": False,
+            "session_reset_invalidated_at": _now_iso(),
+        },
+    )
+
+
 def _validate_response_for_ingest(
     controller: ControlSurfaceController,
     workspace: Path,
@@ -333,9 +356,24 @@ def _validate_response_for_ingest(
     """Raise a clear `CursorBridgeError` when a response must not be ingested."""
     instruction_path = _instruction_path(workspace)
     bridge_state = read_bridge_state(workspace) or {}
-    session_turn = controller.state_view()["run_loop"]["current_turn"] or 0
+    state_view = controller.state_view()
+    session_id = state_view.get("session_id")
+    bridge_session_id = bridge_state.get("session_id")
+    raw_session_turn = state_view["run_loop"]["current_turn"]
+    session_turn = raw_session_turn if raw_session_turn is not None else 0
     bridge_turn = bridge_state.get("turn")
     response_sha256 = response_meta["sha256"]
+
+    if bridge_session_id is not None and bridge_session_id != session_id:
+        raise BridgeSessionMismatchError(
+            "Response file was written for a different Control Surface session.",
+            detail={
+                "reason": "bridge_session_mismatch",
+                "bridge_session_id": bridge_session_id,
+                "session_id": session_id,
+                "bridge_turn": bridge_turn,
+            },
+        )
 
     if not instruction_path.is_file():
         raise NoAwaitingInstructionError(
@@ -369,7 +407,7 @@ def _validate_response_for_ingest(
             },
         )
 
-    if bridge_turn is not None and session_turn and bridge_turn != session_turn:
+    if bridge_turn is not None and bridge_turn != session_turn:
         raise StaleResponseError(
             "Response does not match the latest instruction turn.",
             detail={

@@ -153,6 +153,11 @@ class _ControlSurfaceRequestHandler(BaseHTTPRequestHandler):
             body = self._read_json_body()
             if parsed.path == "/api/session/reset":
                 result = self.controller.reset_session()
+                workspace_path = body.get("workspace_path")
+                if workspace_path:
+                    cursor_bridge.invalidate_bridge_state_for_session_reset(
+                        Path(str(workspace_path))
+                    )
             elif parsed.path == "/api/session/import":
                 result = self.controller.import_session(body)
             elif parsed.path == "/api/session/autonomy":
