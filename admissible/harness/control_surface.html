@@ -243,6 +243,22 @@
       <button type="button" id="btn-ingest-response">Ingest response</button>
     </div>
     <div id="last-ingestion-summary"><p class="no-action-note">No agent response ingested yet.</p></div>
+
+    <h3>Cursor file bridge (optional)</h3>
+    <p class="hint" style="font-size:.78rem;color:var(--cs-muted);margin:0 0 .5rem;">
+      v0 file/clipboard bridge only -- writes/reads local files in the workspace below; never executes a
+      project command, a command proposed by Cursor, or a call to any model provider. See
+      docs/admissible-cursor-bridge.md.
+    </p>
+    <label class="autonomy-label" for="bridge-workspace-path">Workspace path
+      <input type="text" id="bridge-workspace-path" placeholder="e.g. C:\path\to\your\project">
+    </label>
+    <div class="run-loop-actions">
+      <button type="button" id="btn-bridge-write-instruction" class="secondary">Write packet file</button>
+      <button type="button" id="btn-bridge-ingest-response" class="secondary">Ingest response file</button>
+      <button type="button" id="btn-bridge-open-workspace" class="secondary">Open workspace in Cursor</button>
+    </div>
+    <div id="bridge-status"><p class="no-action-note">No bridge operation run yet this session.</p></div>
   </section>
 
   <section class="panel" id="mission-summary-panel">
@@ -887,10 +903,31 @@ function renderRunLoop(state) {
   }
 }
 
+let lastBridgeInfo = null;
+
+function renderBridgeStatus(state) {
+  const el = document.getElementById("bridge-status");
+  if (!el) return;
+  if (state.bridge) lastBridgeInfo = state.bridge;
+  if (!lastBridgeInfo) {
+    el.innerHTML = '<p class="no-action-note">No bridge operation run yet this session.</p>';
+    return;
+  }
+  const b = lastBridgeInfo;
+  if (b.operation === "open_workspace") {
+    el.innerHTML = `<p>${escapeHtml(b.message)}</p>`;
+  } else if (b.operation === "write_instruction") {
+    el.innerHTML = `<p>Wrote turn ${escapeHtml(b.turn_number)} instruction packet to <code>${escapeHtml(b.instruction_path)}</code>. Have Cursor write its response to <code>${escapeHtml(b.response_path)}</code>.</p>`;
+  } else if (b.operation === "ingest_response") {
+    el.innerHTML = `<p>Ingested turn ${escapeHtml(b.turn_number)} response from <code>${escapeHtml(b.response_path)}</code>: ${escapeHtml(b.action_count)} action candidate(s) extracted (${fmtList(b.decisions)}). Nothing was executed.</p>`;
+  }
+}
+
 function render(state) {
   lastState = state;
   renderAutonomySelect(state);
   renderRunLoop(state);
+  renderBridgeStatus(state);
   renderMissionSummary(state);
   renderNeedsAttention(state);
   renderQueueTable(state);
@@ -955,6 +992,40 @@ document.getElementById("btn-ingest-response").addEventListener("click", () => {
   runAction(() => apiPost("/api/session/run_loop/ingest_response", { raw_response: text })).then(() => {
     input.value = "";
   });
+});
+
+function bridgeWorkspacePath() {
+  return document.getElementById("bridge-workspace-path").value.trim();
+}
+
+document.getElementById("btn-bridge-write-instruction").addEventListener("click", () => {
+  const workspacePath = bridgeWorkspacePath();
+  if (!workspacePath) {
+    showError("Enter a workspace path before writing the instruction file.");
+    return;
+  }
+  clearError();
+  runAction(() => apiPost("/api/session/run_loop/bridge/write_instruction", { workspace_path: workspacePath }));
+});
+
+document.getElementById("btn-bridge-ingest-response").addEventListener("click", () => {
+  const workspacePath = bridgeWorkspacePath();
+  if (!workspacePath) {
+    showError("Enter a workspace path before ingesting the response file.");
+    return;
+  }
+  clearError();
+  runAction(() => apiPost("/api/session/run_loop/bridge/ingest_response", { workspace_path: workspacePath }));
+});
+
+document.getElementById("btn-bridge-open-workspace").addEventListener("click", () => {
+  const workspacePath = bridgeWorkspacePath();
+  if (!workspacePath) {
+    showError("Enter a workspace path before opening it in Cursor.");
+    return;
+  }
+  clearError();
+  runAction(() => apiPost("/api/session/run_loop/bridge/open_workspace", { workspace_path: workspacePath }));
 });
 
 document.getElementById("autonomy-select").addEventListener("change", (event) => {

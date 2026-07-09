@@ -617,6 +617,17 @@ class ControlSurfaceController:
 
     # -- persistence / raw session I/O --------------------------------
 
+    @property
+    def session_file(self) -> Path:
+        """Path this controller persists its session JSON to after every mutation.
+
+        Exposed so other local, offline tooling (e.g.
+        admissible.runner.cursor_bridge) can load the same on-disk session a
+        running Control Surface server is using, without duplicating the
+        session_dir/repo_root default-resolution logic in __init__.
+        """
+        return self._session_file
+
     def session_dict(self) -> dict[str, Any]:
         """Canonical, round-trippable session state (used for export/import)."""
         return self._session.to_dict()

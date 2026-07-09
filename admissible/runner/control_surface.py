@@ -4,12 +4,23 @@ Starts a local, stdlib-only HTTP server that serves the Control Surface
 UI (`admissible/harness/control_surface.html`) and a small same-origin
 JSON API backed by `admissible.control_surface.ControlSurfaceController`.
 
+Also exposes three routes (`/api/session/run_loop/bridge/*`) backed by
+`admissible.runner.cursor_bridge` -- a local file bridge that writes/reads
+`.admissible/next-agent-instruction.md` and `.admissible/agent-response.md`
+in a target workspace so a human does not have to copy/paste the packet and
+response by hand. See docs/admissible-cursor-bridge.md.
+
 Hard constraints:
 
 - Does not call Cursor, Claude Code, Codex, Gemini, OpenAI, or any
   network provider.
 - Does not execute shell commands from the UI or anywhere in this module
-  (no `subprocess`, no `os.system`, no `eval`/`exec` of request data).
+  (no `subprocess`, no `os.system`, no `eval`/`exec` of request data). The
+  one narrow exception is the bridge's optional "open workspace in Cursor"
+  helper (`cursor_bridge.open_workspace_in_cursor`), which only ever
+  launches a discovered/configured Cursor executable with `shell=False` and
+  a fixed argv -- never a shell string, never a workspace- or
+  agent-response-derived command.
 - Implements no automatic executor. "Attest executed" only records that
   an already-admitted local action was executed by a human/external
   actor; see admissible.admitted_execution.
@@ -33,6 +44,7 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from admissible.control_surface import ControlSurfaceController
+from admissible.runner import cursor_bridge
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _HTML_PATH = Path(__file__).resolve().parent.parent / "harness" / "control_surface.html"
@@ -150,6 +162,19 @@ class _ControlSurfaceRequestHandler(BaseHTTPRequestHandler):
                 result = self.controller.generate_next_instruction_packet()
             elif parsed.path == "/api/session/run_loop/ingest_response":
                 result = self.controller.ingest_agent_response(body.get("raw_response", ""))
+            elif parsed.path == "/api/session/run_loop/bridge/write_instruction":
+                result = cursor_bridge.write_next_instruction_with_controller(
+                    self.controller, body.get("workspace_path", "")
+                )
+            elif parsed.path == "/api/session/run_loop/bridge/ingest_response":
+                result = cursor_bridge.ingest_response_file_with_controller(
+                    self.controller, body.get("workspace_path", "")
+                )
+            elif parsed.path == "/api/session/run_loop/bridge/open_workspace":
+                result = {
+                    **self.controller.state_view(),
+                    "bridge": cursor_bridge.open_workspace_in_cursor(body.get("workspace_path", "")),
+                }
             elif parsed.path.startswith("/api/queue/") and parsed.path.endswith("/decide"):
                 action_id = unquote(parsed.path.split("/")[3])
                 result = self.controller.decide(action_id, body)
