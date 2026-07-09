@@ -67,6 +67,9 @@ from admissible.run_loop import (
     LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION,
     LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED,
     LIFECYCLE_EVIDENCE_SATISFIED_PENDING_HUMAN_DECISION,
+    LIFECYCLE_EVIDENCE_INSUFFICIENT_STILL_MISSING,
+    LIFECYCLE_BLOCKED_BY_NON_EVIDENCE_GATE,
+    EVIDENCE_SOURCES,
     LIFECYCLE_LIMITED_SCOPE_SELECTED,
     LIFECYCLE_NEEDS_HUMAN_INPUT,
     LIFECYCLE_NO_LONGER_NEEDS_ATTENTION,
@@ -82,8 +85,8 @@ from admissible.run_loop import (
     SupersedingAdmissionDecision,
     build_candidates_from_agent_response,
     default_lifecycle_status,
+    derive_evidence_attention_state,
     generate_instruction_packet,
-    lifecycle_status_after_evidence_reevaluation,
     queue_item_needs_attention,
     reevaluate_envelope_with_evidence,
     resolved_plan_gate_ids,
@@ -361,6 +364,11 @@ class DecisionQueueItem:
     attestation_eligible: bool
     execution_record: dict[str, Any] | None = None
     human_decision_ids: list[str] = field(default_factory=list)
+    # Structured evidence satisfaction (slice ADMISSIBLE_EVIDENCE_007).
+    satisfied_evidence_fields: list[str] = field(default_factory=list)
+    non_evidence_blockers: list[str] = field(default_factory=list)
+    evidence_attention_summary: str | None = None
+    latest_evidence_summary: str | None = None
     # Display-only run-loop lifecycle tracking (see admissible.run_loop).
     # Never a substitute for `decision`; it tracks what has happened to a
     # gated action across the supervised loop (evidence supplied, approval
@@ -671,7 +679,54 @@ def _attention_row(item: "DecisionQueueItem") -> dict[str, Any]:
         "execution_status": item.execution_status,
         "lifecycle_status": item.lifecycle_status,
         "missing_evidence": list(item.missing_evidence),
+        "satisfied_evidence_fields": list(item.satisfied_evidence_fields),
+        "non_evidence_blockers": list(item.non_evidence_blockers),
+        "evidence_attention_summary": item.evidence_attention_summary,
+        "latest_evidence_summary": item.latest_evidence_summary,
     }
+
+
+def _structured_evidence_payload(record: EvidenceRecord) -> dict[str, Any]:
+    return {
+        "evidence_type": record.evidence_type,
+        "evidence_text": record.evidence_text,
+        "satisfies": list(record.satisfies),
+        "source": record.source,
+        "sha256": record.sha256,
+    }
+
+
+def _apply_evidence_attention_to_item(
+    item: DecisionQueueItem,
+    envelope: RunEnvelope | None,
+    *,
+    evidence_records: list[EvidenceRecord],
+    latest_record: EvidenceRecord | None,
+    effective_decision: dict[str, Any] | None,
+) -> None:
+    """Project structured evidence satisfaction onto a queue item."""
+    if envelope is None or effective_decision is None:
+        return
+    original_missing = list(envelope.decision.get("missing_evidence") or [])
+    if envelope.envelope is not None:
+        original_missing = [
+            str(note) if not isinstance(note, dict) else str(note.get("field_id") or note.get("summary") or "")
+            for note in (envelope.envelope.get("evidence") or {}).get("missing") or []
+        ] or original_missing
+    action_records = [r for r in evidence_records if r.action_id == item.action_id]
+    attention = derive_evidence_attention_state(
+        effective_decision,
+        original_missing=original_missing,
+        evidence_records=action_records,
+        latest_record=latest_record,
+    )
+    item.satisfied_evidence_fields = list(attention["satisfied_evidence_fields"])
+    item.non_evidence_blockers = list(attention["non_evidence_blockers"])
+    item.evidence_attention_summary = attention["evidence_attention_summary"]
+    if latest_record is not None:
+        item.latest_evidence_summary = latest_record.evidence_text
+    if action_records:
+        item.lifecycle_status = attention["lifecycle_status"]
 
 
 def _bridge_awaiting_response(run_loop: RunLoopState) -> tuple[bool, list[int]]:
@@ -740,7 +795,14 @@ def _lifecycle_overview(session: "ControlSession") -> dict[str, Any]:
         or item.decision == "REFUSE"
     ]
     evidence_supplied_still_blocked = [
-        row(item) for item in queue if item.lifecycle_status == LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED
+        row(item)
+        for item in queue
+        if item.lifecycle_status
+        in (
+            LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED,
+            LIFECYCLE_EVIDENCE_INSUFFICIENT_STILL_MISSING,
+            LIFECYCLE_BLOCKED_BY_NON_EVIDENCE_GATE,
+        )
     ]
     evidence_satisfied_pending_human_decision = [
         row(item)
@@ -1315,6 +1377,17 @@ class ControlSurfaceController:
             raise ValueError("evidence_type and evidence_text are required")
         file_path_or_note = body.get("file_path_or_note") or None
         rationale = body.get("rationale") or ""
+        raw_satisfies = body.get("satisfies")
+        if raw_satisfies is None:
+            satisfies = [evidence_type] if evidence_type else []
+        elif isinstance(raw_satisfies, str):
+            satisfies = [raw_satisfies.strip()] if raw_satisfies.strip() else []
+        else:
+            satisfies = [str(f).strip() for f in raw_satisfies if str(f).strip()]
+        source = str(body.get("source") or "human").strip()
+        if source not in EVIDENCE_SOURCES:
+            source = "human"
+        sha256 = body.get("sha256") or None
 
         envelope = self._session.run_envelopes.get(action_id)
         record = EvidenceRecord(
@@ -1328,20 +1401,23 @@ class ControlSurfaceController:
             evidence_text=evidence_text,
             file_path_or_note=file_path_or_note,
             rationale=rationale,
+            source=source,
+            satisfies=satisfies,
+            sha256=sha256,
+            turn_number=self._session.run_loop.current_turn or None,
         )
         self._session.run_loop.evidence_records.append(record)
 
-        action_evidence_items = [
-            (r.evidence_type, r.evidence_text)
-            for r in self._session.run_loop.evidence_records
-            if r.action_id == action_id
+        action_evidence_records = [
+            r for r in self._session.run_loop.evidence_records if r.action_id == action_id
         ]
+        structured_evidence = [_structured_evidence_payload(r) for r in action_evidence_records]
 
         new_decision = None
         if envelope is not None and envelope.envelope is not None:
             new_decision = reevaluate_envelope_with_evidence(
                 envelope.envelope,
-                evidence_items=action_evidence_items,
+                structured_evidence=structured_evidence,
             )
 
         if new_decision is not None:
@@ -1362,9 +1438,20 @@ class ControlSurfaceController:
             item.required_approval = new_decision.get("required_approval")
             item.missing_evidence = list(new_decision.get("missing_evidence") or [])
             item.attestation_eligible = is_local_allow_without_missing_evidence(new_decision, envelope.candidate)
-            item.lifecycle_status = lifecycle_status_after_evidence_reevaluation(item.decision)
+            _apply_evidence_attention_to_item(
+                item,
+                envelope,
+                evidence_records=self._session.run_loop.evidence_records,
+                latest_record=record,
+                effective_decision=new_decision,
+            )
         else:
             item.lifecycle_status = LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION
+            item.latest_evidence_summary = record.evidence_text
+            item.evidence_attention_summary = (
+                "Evidence recorded; automatic re-evaluation is unavailable for this action "
+                "(no full envelope). A human must confirm next steps."
+            )
 
         self._session.transcript.append(
             _transcript_entry(

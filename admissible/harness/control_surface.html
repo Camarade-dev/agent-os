@@ -653,6 +653,8 @@ const LIFECYCLE_LABELS = {
   needs_human_input: "Needs human input",
   evidence_supplied_pending_reevaluation: "Evidence supplied — pending re-evaluation",
   evidence_supplied_still_blocked: "Evidence supplied — still blocked",
+  evidence_insufficient_still_missing: "Evidence insufficient — still missing",
+  blocked_by_non_evidence_gate: "Blocked by authority/reversibility/policy",
   evidence_satisfied_pending_human_decision: "Evidence satisfied — pending human decision",
   approval_supplied_pending_reevaluation: "Approval supplied — pending re-evaluation",
   limited_scope_selected: "Limited scope selected",
@@ -668,6 +670,32 @@ function lifecycleLabel(status) {
   return LIFECYCLE_LABELS[status] || status;
 }
 
+function buildEvidenceTypeOptions(item) {
+  const missing = Array.isArray(item.missing_evidence) ? item.missing_evidence : [];
+  const missingOpts = missing
+    .map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)} (missing)</option>`)
+    .join("");
+  const genericOpts = `
+    <option value="document">Document / written confirmation</option>
+    <option value="test_results">Test results</option>
+    <option value="approval_confirmation">Approval confirmation</option>
+    <option value="policy_reference">Policy reference</option>
+    <option value="other">Other (unrecognized)</option>
+  `;
+  if (missingOpts) {
+    return `<optgroup label="Target missing field">${missingOpts}</optgroup><optgroup label="Other">${genericOpts}</optgroup>`;
+  }
+  return genericOpts;
+}
+
+function buildSatisfiesOptions(item) {
+  const missing = Array.isArray(item.missing_evidence) ? item.missing_evidence : [];
+  const opts = missing
+    .map((m) => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`)
+    .join("");
+  return `<option value="">(same as evidence type)</option>${opts}`;
+}
+
 function bucketActionRows(actions, { showReview = false, note = "" } = {}) {
   if (!actions.length) return `<p class="bucket-empty">None.</p>`;
   return actions
@@ -679,6 +707,9 @@ function bucketActionRows(actions, { showReview = false, note = "" } = {}) {
         Array.isArray(a.missing_evidence) && a.missing_evidence.length
           ? `<div class="bucket-meta">Still missing: ${fmtList(a.missing_evidence)}</div>`
           : "";
+      const evidenceSummary = a.evidence_attention_summary
+        ? `<div class="bucket-meta">${escapeHtml(a.evidence_attention_summary)}</div>`
+        : "";
       const lifecycle = a.lifecycle_status
         ? `<div class="bucket-meta">Lifecycle: ${escapeHtml(lifecycleLabel(a.lifecycle_status))}</div>`
         : "";
@@ -689,6 +720,7 @@ function bucketActionRows(actions, { showReview = false, note = "" } = {}) {
             <span class="mono" style="margin-left:.35rem;">${escapeHtml(a.action_id)}</span></div>
           <div class="bucket-meta">${escapeHtml(truncate(displayToolOrCommand(a), 90))}</div>
           ${lifecycle}
+          ${evidenceSummary}
           ${missing}
           ${extraNote}
         </div>
@@ -943,23 +975,29 @@ function renderSelectedAction(state) {
   const evidenceFormHtml = isEvidenceCase
     ? `
       <form class="evidence-form" data-action-id="${escapeHtml(item.action_id)}">
-        <div class="field"><label>Evidence type</label>
-          <select name="evidence_type">
-            <option value="document">Document / written confirmation</option>
-            <option value="test_results">Test results</option>
-            <option value="package_trust_review">Package / dependency trust review</option>
-            <option value="approval_confirmation">Approval confirmation</option>
-            <option value="policy_reference">Policy reference</option>
-            <option value="other">Other</option>
-          </select>
+        <div class="field"><label>Evidence type / kind</label>
+          <select name="evidence_type">${buildEvidenceTypeOptions(item)}</select>
         </div>
-        <div class="field"><label>Evidence</label><textarea name="evidence_text" placeholder="Paste or describe the evidence"></textarea></div>
+        <div class="field"><label>Satisfies field</label>
+          <select name="satisfies">${buildSatisfiesOptions(item)}</select>
+        </div>
+        <div class="field"><label>Evidence summary</label><textarea name="evidence_text" placeholder="Paste or describe the evidence"></textarea></div>
         <div class="field"><label>File path / note (optional)</label><input type="text" name="file_path_or_note" placeholder="e.g. docs/license-review.md"></div>
         <div class="field"><label>Rationale</label><input type="text" name="rationale" placeholder="Why this resolves the gap"></div>
         <button type="submit">Provide evidence</button>
       </form>
     `
     : "";
+
+  const evidenceStateHtml =
+    isEvidenceCase || item.satisfied_evidence_fields?.length || item.evidence_attention_summary
+      ? `<dl class="kv-grid">
+      <dt>Satisfied evidence fields</dt><dd>${fmtList(item.satisfied_evidence_fields)}</dd>
+      <dt>Non-evidence blockers</dt><dd>${fmtList(item.non_evidence_blockers)}</dd>
+      <dt>Latest evidence</dt><dd>${escapeHtml(item.latest_evidence_summary || "—")}</dd>
+      <dt>Evidence status</dt><dd>${escapeHtml(item.evidence_attention_summary || "—")}</dd>
+    </dl>`
+      : "";
 
   const lifecycleNote = item.lifecycle_status
     ? `<p class="lifecycle-note">Lifecycle: <code>${escapeHtml(item.lifecycle_status)}</code> — ${escapeHtml(lifecycleLabel(item.lifecycle_status))}</p>`
@@ -986,6 +1024,7 @@ function renderSelectedAction(state) {
       <dt>Required approval</dt><dd>${escapeHtml(item.required_approval)}</dd>
       <dt>Missing evidence</dt><dd>${fmtList(item.missing_evidence)}</dd>
     </dl>
+    ${evidenceStateHtml}
     ${lifecycleNote}
     ${admittedNote}
     ${closedNote}
@@ -1337,6 +1376,8 @@ async function onEvidenceSubmit(event) {
     file_path_or_note: formData.get("file_path_or_note") || undefined,
     rationale: formData.get("rationale") || "",
   };
+  const satisfies = formData.get("satisfies");
+  if (satisfies) body.satisfies = satisfies;
   await runAction(() => apiPost(`/api/queue/${encodeURIComponent(actionId)}/evidence`, body));
 }
 

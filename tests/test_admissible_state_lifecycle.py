@@ -22,6 +22,7 @@ from admissible.admitted_execution import EXECUTION_STATUS_ADMITTED_NOT_EXECUTED
 from admissible.control_surface import ControlSurfaceController
 from admissible.run_loop import (
     LIFECYCLE_ADMITTED_NOT_EXECUTED,
+    LIFECYCLE_BLOCKED_BY_NON_EVIDENCE_GATE,
     LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION,
     LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED,
     LIFECYCLE_EVIDENCE_SATISFIED_PENDING_HUMAN_DECISION,
@@ -423,7 +424,7 @@ class TestEvidenceAccumulationLifecycle(unittest.TestCase):
         final = self.controller.state_view()
         item = next(i for i in final["queue"] if i["action_id"] == action_id)
         self.assertEqual(item["missing_evidence"], [])
-        self.assertEqual(item["lifecycle_status"], LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED)
+        self.assertEqual(item["lifecycle_status"], LIFECYCLE_BLOCKED_BY_NON_EVIDENCE_GATE)
         self.assertEqual(item["decision"], "REQUEST_MORE_EVIDENCE")
         self.assertNotEqual(item.get("execution_status"), EXECUTION_STATUS_ADMITTED_NOT_EXECUTED)
 

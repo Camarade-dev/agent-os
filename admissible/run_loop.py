@@ -59,6 +59,9 @@ LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION = "evidence_supplied_pending_re
 # (slice ADMISSIBLE_STATE_LIFECYCLE_002_EVIDENCE_ACCUMULATION_AND_REEVALUATION).
 LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED = "evidence_supplied_still_blocked"
 LIFECYCLE_EVIDENCE_SATISFIED_PENDING_HUMAN_DECISION = "evidence_satisfied_pending_human_decision"
+# Slice ADMISSIBLE_EVIDENCE_007_STRUCTURED_EVIDENCE_PACKETS — finer-grained evidence attention.
+LIFECYCLE_EVIDENCE_INSUFFICIENT_STILL_MISSING = "evidence_insufficient_still_missing"
+LIFECYCLE_BLOCKED_BY_NON_EVIDENCE_GATE = "blocked_by_non_evidence_gate"
 LIFECYCLE_APPROVAL_SUPPLIED_PENDING_REEVALUATION = "approval_supplied_pending_reevaluation"
 LIFECYCLE_LIMITED_SCOPE_SELECTED = "limited_scope_selected"
 LIFECYCLE_READY_FOR_NEXT_AGENT_INSTRUCTION = "ready_for_next_agent_instruction"
@@ -75,6 +78,8 @@ LIFECYCLE_STATUSES = frozenset(
         LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION,
         LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED,
         LIFECYCLE_EVIDENCE_SATISFIED_PENDING_HUMAN_DECISION,
+        LIFECYCLE_EVIDENCE_INSUFFICIENT_STILL_MISSING,
+        LIFECYCLE_BLOCKED_BY_NON_EVIDENCE_GATE,
         LIFECYCLE_APPROVAL_SUPPLIED_PENDING_REEVALUATION,
         LIFECYCLE_LIMITED_SCOPE_SELECTED,
         LIFECYCLE_READY_FOR_NEXT_AGENT_INSTRUCTION,
@@ -111,16 +116,30 @@ def default_lifecycle_status(decision_label: str) -> str:
     return _DEFAULT_LIFECYCLE_BY_DECISION.get(decision_label, LIFECYCLE_NEEDS_HUMAN_INPUT)
 
 
-def lifecycle_status_after_evidence_reevaluation(decision_label: str) -> str:
+def lifecycle_status_after_evidence_reevaluation(
+    decision_label: str,
+    *,
+    missing_evidence: list[str] | None = None,
+    non_evidence_blockers: list[str] | None = None,
+    latest_evidence_recognized: bool = True,
+) -> str:
     """Return the derived lifecycle status after cumulative evidence re-evaluation.
 
     Never claims approval or execution; only reflects what the rules-only
     evaluator returned after folding in all supplied evidence.
     """
-    if decision_label == "REQUEST_MORE_EVIDENCE":
-        return LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED
     if decision_label == "REQUIRE_HUMAN_APPROVAL":
         return LIFECYCLE_EVIDENCE_SATISFIED_PENDING_HUMAN_DECISION
+    if decision_label == "REQUEST_MORE_EVIDENCE":
+        remaining = list(missing_evidence or [])
+        blockers = list(non_evidence_blockers or [])
+        if remaining and not latest_evidence_recognized:
+            return LIFECYCLE_EVIDENCE_INSUFFICIENT_STILL_MISSING
+        if remaining:
+            return LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED
+        if blockers:
+            return LIFECYCLE_BLOCKED_BY_NON_EVIDENCE_GATE
+        return LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED
     return default_lifecycle_status(decision_label)
 
 
@@ -181,6 +200,172 @@ def _note_text(note: Any) -> str:
     if isinstance(note, dict):
         return str(note.get("summary") or note.get("type") or "")
     return str(note)
+
+
+def _missing_field_id(note: Any) -> str:
+    """Return the canonical missing-evidence field id from a note or string."""
+    if isinstance(note, dict):
+        field_id = note.get("field_id")
+        if field_id:
+            return str(field_id)
+        return _note_text(note)
+    return str(note)
+
+
+def _field_matches_missing(field_id: str, missing: list[Any]) -> bool:
+    """Return True when ``field_id`` targets one entry in ``missing``."""
+    fid = field_id.strip().lower()
+    if not fid:
+        return False
+    for note in missing:
+        note_id = _missing_field_id(note).strip().lower()
+        if fid == note_id or fid in note_id or note_id in fid:
+            return True
+    return False
+
+
+_EVIDENCE_SOURCE_HUMAN = "human"
+_EVIDENCE_SOURCE_AGENT = "agent"
+_EVIDENCE_SOURCE_BOUNDED_EXECUTOR = "bounded_executor"
+EVIDENCE_SOURCES = frozenset(
+    {_EVIDENCE_SOURCE_HUMAN, _EVIDENCE_SOURCE_AGENT, _EVIDENCE_SOURCE_BOUNDED_EXECUTOR}
+)
+
+_NON_EVIDENCE_BLOCKER_DIMENSIONS = frozenset({"policy", "reversibility", "authority"})
+
+
+def non_evidence_blockers_from_decision(decision: dict[str, Any]) -> list[str]:
+    """Return human-readable blockers that evidence cannot satisfy on its own."""
+    blockers: list[str] = []
+    missing = decision.get("missing_evidence") or []
+    for reason in decision.get("reasons") or []:
+        if not isinstance(reason, dict):
+            continue
+        dimension = str(reason.get("dimension") or "")
+        summary = str(reason.get("summary") or dimension)
+        if dimension in _NON_EVIDENCE_BLOCKER_DIMENSIONS:
+            blockers.append(summary)
+        elif dimension == "evidence" and not missing:
+            blockers.append(summary)
+    return blockers
+
+
+def _record_target_fields(record: "EvidenceRecord") -> list[str]:
+    if record.satisfies:
+        return [str(f) for f in record.satisfies if str(f).strip()]
+    if record.evidence_type:
+        return [record.evidence_type]
+    return []
+
+
+def fields_satisfied_by_record(
+    record: "EvidenceRecord",
+    *,
+    missing_before: list[Any],
+) -> list[str]:
+    """Return missing-field ids this record explicitly or implicitly satisfies."""
+    satisfied: list[str] = []
+    for field_id in _record_target_fields(record):
+        if _field_matches_missing(field_id, missing_before):
+            satisfied.append(_missing_field_id(field_id) if not record.satisfies else field_id)
+    return satisfied
+
+
+def cumulative_satisfied_evidence_fields(
+    records: list["EvidenceRecord"],
+    *,
+    original_missing: list[Any],
+) -> list[str]:
+    """Return all missing-field ids satisfied cumulatively across ``records``."""
+    satisfied: list[str] = []
+    seen: set[str] = set()
+    remaining = list(original_missing)
+    for record in records:
+        matched = fields_satisfied_by_record(record, missing_before=remaining)
+        for field_id in matched:
+            key = field_id.lower()
+            if key not in seen:
+                seen.add(key)
+                satisfied.append(field_id)
+        remaining = [
+            note
+            for note in remaining
+            if not any(_field_matches_missing(f, [note]) for f in matched)
+        ]
+    return satisfied
+
+
+def derive_evidence_attention_state(
+    decision: dict[str, Any],
+    *,
+    original_missing: list[Any],
+    evidence_records: list["EvidenceRecord"],
+    latest_record: "EvidenceRecord | None" = None,
+) -> dict[str, Any]:
+    """Compute structured evidence satisfaction and a demo-readable attention summary."""
+    cumulative = cumulative_satisfied_evidence_fields(
+        evidence_records, original_missing=original_missing
+    )
+    remaining = list(decision.get("missing_evidence") or [])
+    non_evidence = non_evidence_blockers_from_decision(decision)
+    decision_label = str(decision.get("decision") or "")
+
+    latest = latest_record
+    latest_fields: list[str] = []
+    latest_recognized = True
+    if latest is not None:
+        missing_before_latest = list(original_missing)
+        for prior in evidence_records:
+            if prior.record_id == latest.record_id:
+                break
+            prior_fields = fields_satisfied_by_record(prior, missing_before=missing_before_latest)
+            missing_before_latest = [
+                note
+                for note in missing_before_latest
+                if not any(_field_matches_missing(f, [note]) for f in prior_fields)
+            ]
+        latest_fields = fields_satisfied_by_record(latest, missing_before=missing_before_latest)
+        latest_recognized = bool(latest_fields) or not _record_target_fields(latest)
+
+    lifecycle = lifecycle_status_after_evidence_reevaluation(
+        decision_label,
+        missing_evidence=remaining,
+        non_evidence_blockers=non_evidence,
+        latest_evidence_recognized=latest_recognized,
+    )
+
+    if decision_label == "REQUIRE_HUMAN_APPROVAL":
+        summary = "Evidence satisfied; human approval required."
+    elif lifecycle == LIFECYCLE_EVIDENCE_INSUFFICIENT_STILL_MISSING:
+        summary = (
+            "Evidence insufficient or unrecognized; still missing: "
+            + (", ".join(remaining) if remaining else "(none listed)")
+        )
+    elif lifecycle == LIFECYCLE_BLOCKED_BY_NON_EVIDENCE_GATE:
+        summary = (
+            "Evidence accepted, but still blocked by authority/reversibility/policy: "
+            + "; ".join(non_evidence[:3])
+        )
+    elif remaining:
+        summary = "Evidence accepted, still missing: " + ", ".join(remaining)
+    elif non_evidence:
+        summary = (
+            "Evidence accepted, but still blocked by authority/reversibility/policy: "
+            + "; ".join(non_evidence[:3])
+        )
+    else:
+        summary = "Evidence supplied; awaiting further resolution."
+
+    return {
+        "previously_missing_evidence": [_missing_field_id(n) for n in original_missing],
+        "fields_satisfied_by_latest": latest_fields,
+        "satisfied_evidence_fields": cumulative,
+        "remaining_missing_evidence": remaining,
+        "non_evidence_blockers": non_evidence,
+        "evidence_attention_summary": summary,
+        "latest_evidence_recognized": latest_recognized,
+        "lifecycle_status": lifecycle,
+    }
 
 
 # -- instruction packet content (v0, deterministic, offline) -----------------
@@ -336,7 +521,7 @@ class AgentResponseRecord:
 
 @dataclass
 class EvidenceRecord:
-    """One piece of evidence a human operator supplied for one action."""
+    """One structured evidence packet a human operator (or agent) supplied for one action."""
 
     record_id: str
     action_id: str
@@ -348,6 +533,11 @@ class EvidenceRecord:
     evidence_text: str
     file_path_or_note: str | None
     rationale: str
+    # Structured packet fields (slice ADMISSIBLE_EVIDENCE_007; optional for backward compat).
+    source: str = _EVIDENCE_SOURCE_HUMAN
+    satisfies: list[str] = field(default_factory=list)
+    sha256: str | None = None
+    turn_number: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -530,19 +720,34 @@ def _evidence_needed(queue: list[dict[str, Any]]) -> list[str]:
                 "still treat as blocked until a human confirms."
             )
             continue
-        if status == LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED:
+        if status in (
+            LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED,
+            LIFECYCLE_EVIDENCE_INSUFFICIENT_STILL_MISSING,
+        ):
             missing = item.get("missing_evidence") or []
+            summary = item.get("evidence_attention_summary")
             if missing:
                 for entry in missing:
                     line = f"{item.get('action_id')}: {entry}"
                     if line not in items:
                         items.append(line)
+            elif summary:
+                items.append(f"{item.get('action_id')}: {summary}")
             else:
                 items.append(
                     f"{item.get('action_id')}: human-suppliable evidence fields are satisfied, "
                     "but the action remains blocked on non-evidence gates (e.g. authority or "
                     "policy); a human decision is still required."
                 )
+            continue
+        if status == LIFECYCLE_BLOCKED_BY_NON_EVIDENCE_GATE:
+            summary = item.get("evidence_attention_summary") or (
+                f"{item.get('action_id')}: human-suppliable evidence fields are satisfied, "
+                "but the action remains blocked on non-evidence gates (e.g. authority or "
+                "policy); a human decision is still required."
+            )
+            if summary not in items:
+                items.append(summary)
             continue
         if status != LIFECYCLE_NEEDS_HUMAN_INPUT:
             continue
@@ -693,16 +898,21 @@ def reevaluate_envelope_with_evidence(
     envelope: dict[str, Any] | None,
     *,
     evidence_items: list[tuple[str, str]] | None = None,
+    structured_evidence: list[dict[str, Any]] | None = None,
     evidence_type: str | None = None,
     evidence_text: str | None = None,
 ) -> dict[str, Any] | None:
     """Fold supplied evidence into a copy of `envelope` and re-run the
     unmodified rules-only evaluator.
 
-    Evidence is cumulative: pass every ``(evidence_type, evidence_text)``
-    pair previously supplied for this action via ``evidence_items``. A
-    single latest item may still be passed via ``evidence_type`` /
-    ``evidence_text`` for backward compatibility.
+    Evidence is cumulative: pass every prior record via ``structured_evidence``
+    (preferred) or legacy ``(evidence_type, evidence_text)`` tuples in
+    ``evidence_items``. A single latest item may still be passed via
+    ``evidence_type`` / ``evidence_text`` for backward compatibility.
+
+    When ``satisfies`` is present on a structured item, only those explicit
+    field ids are used to shrink ``evidence.missing``. Legacy items without
+    ``satisfies`` keep substring matching on ``evidence_type``.
 
     Returns the new decision dict, or None when no full schema envelope is
     available to reevaluate (e.g. actions loaded from a static trace file
@@ -713,31 +923,60 @@ def reevaluate_envelope_with_evidence(
     if not isinstance(envelope, dict):
         return None
 
-    items: list[tuple[str, str]] = list(evidence_items or [])
+    structured: list[dict[str, Any]] = list(structured_evidence or [])
+    if not structured and evidence_items:
+        structured = [
+            {"evidence_type": etype, "evidence_text": etext, "satisfies": []}
+            for etype, etext in evidence_items
+        ]
     if evidence_type and evidence_text:
-        items.append((evidence_type, evidence_text))
-    if not items:
+        structured.append(
+            {"evidence_type": evidence_type, "evidence_text": evidence_text, "satisfies": []}
+        )
+    if not structured:
         return None
 
     new_envelope = copy.deepcopy(envelope)
     evidence = new_envelope.setdefault("evidence", {})
     available = list(evidence.get("available") or [])
-    satisfied_types: set[str] = set()
-    for etype, etext in items:
+    explicit_satisfied: set[str] = set()
+    legacy_satisfied_types: set[str] = set()
+
+    for item in structured:
+        etype = str(item.get("evidence_type") or "").strip()
+        etext = str(item.get("evidence_text") or "").strip()
+        if not etype or not etext:
+            continue
+        satisfies = [str(f) for f in (item.get("satisfies") or []) if str(f).strip()]
         available.append(
             {
                 "type": etype,
                 "summary": etext,
+                "source": str(item.get("source") or _EVIDENCE_SOURCE_HUMAN),
                 "confidence": "human_provided",
             }
         )
-        satisfied_types.add(etype.lower())
+        if satisfies:
+            explicit_satisfied.update(f.lower() for f in satisfies)
+        else:
+            legacy_satisfied_types.add(etype.lower())
+
     evidence["available"] = available
-    evidence["missing"] = [
-        item
-        for item in (evidence.get("missing") or [])
-        if not any(st in _note_text(item).lower() for st in satisfied_types)
-    ]
+
+    def _still_missing(note: Any) -> bool:
+        note_id = _missing_field_id(note).lower()
+        note_text = _note_text(note).lower()
+        if explicit_satisfied:
+            if note_id in explicit_satisfied:
+                return False
+            if any(fid in note_text or note_text in fid for fid in explicit_satisfied):
+                return False
+        if legacy_satisfied_types:
+            if any(st in note_text for st in legacy_satisfied_types):
+                return False
+        return True
+
+    evidence["missing"] = [item for item in (evidence.get("missing") or []) if _still_missing(item)]
 
     decision = evaluate_envelope(new_envelope)
     decision["operational_admissibility_action"] = operational_action_for_decision(
@@ -755,6 +994,8 @@ __all__ = [
     "LIFECYCLE_CLOSED",
     "LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION",
     "LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED",
+    "LIFECYCLE_BLOCKED_BY_NON_EVIDENCE_GATE",
+    "LIFECYCLE_EVIDENCE_INSUFFICIENT_STILL_MISSING",
     "LIFECYCLE_EVIDENCE_SATISFIED_PENDING_HUMAN_DECISION",
     "LIFECYCLE_LIMITED_SCOPE_SELECTED",
     "LIFECYCLE_NEEDS_HUMAN_INPUT",
@@ -773,6 +1014,11 @@ __all__ = [
     "RunLoopState",
     "RunTurn",
     "SupersedingAdmissionDecision",
+    "EVIDENCE_SOURCES",
+    "cumulative_satisfied_evidence_fields",
+    "derive_evidence_attention_state",
+    "fields_satisfied_by_record",
+    "non_evidence_blockers_from_decision",
     "build_candidates_from_agent_response",
     "default_lifecycle_status",
     "generate_instruction_packet",
