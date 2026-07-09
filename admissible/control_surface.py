@@ -52,9 +52,15 @@ from admissible.admitted_execution import (
     validate_executed_after_admission_record,
 )
 from admissible.execution.bounded_local_executor import (
+    ALLOWED_BOUNDED_OPERATIONS,
+    DIAG_ALREADY_EXECUTED,
+    DIAG_FORBIDDEN_OPERATION_CATEGORY,
+    DIAG_NO_WORKSPACE_CONFIGURED,
+    DIAG_UNSUPPORTED_OPERATION,
     BoundedExecutionError,
     assess_bounded_execution_eligibility,
     execute_bounded_local_action,
+    validate_workspace_path,
 )
 from admissible.goal_intake import GoalIntake, analyze_goal
 from admissible.plan_audit import (
@@ -588,20 +594,127 @@ class ControlSession:
         )
 
 
+def _bounded_execution_operation_fields(operations: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+    """Derive display paths and operation kinds from structured operations."""
+    target_paths: list[str] = []
+    operation_types: list[str] = []
+    for operation in operations:
+        op_name = str(operation.get("operation") or "").strip()
+        if op_name:
+            operation_types.append(op_name)
+        path = str(operation.get("path") or "").strip()
+        if op_name in ("write_file", "read_file") and path:
+            target_paths.append(path)
+    return target_paths, operation_types
+
+
 def _bounded_execution_view(
     item: DecisionQueueItem,
     envelope: RunEnvelope | None,
     *,
     body: dict[str, Any] | None = None,
+    workspace_path: str | None = None,
 ) -> dict[str, Any]:
     """Display-only bounded executor eligibility for one queue item."""
     assessment = assess_bounded_execution_eligibility(item=item, envelope=envelope, body=body)
+    operations = list(assessment.get("operations") or [])
+    target_paths, operation_types = _bounded_execution_operation_fields(operations)
+    already_executed = item.execution_status in (
+        EXECUTION_STATUS_EXECUTED_BY_BOUNDED_EXECUTOR,
+        EXECUTION_STATUS_EXECUTED_AFTER_ADMISSION,
+    )
+    eligible = bool(assessment["eligible"])
+    diagnostic = assessment["diagnostic"]
+    message = assessment["message"]
+    for operation in operations:
+        op_name = str(operation.get("operation") or "").strip()
+        if op_name not in ALLOWED_BOUNDED_OPERATIONS:
+            eligible = False
+            diagnostic = (
+                DIAG_FORBIDDEN_OPERATION_CATEGORY
+                if op_name
+                in {
+                    "shell",
+                    "run_command",
+                    "execute_command",
+                    "npm",
+                    "pip",
+                    "install",
+                    "git_push",
+                    "git_commit",
+                    "deploy",
+                    "network",
+                    "delete_file",
+                    "delete",
+                    "remove_file",
+                }
+                else DIAG_UNSUPPORTED_OPERATION
+            )
+            message = (
+                f"Not executable by bounded executor: unsupported or forbidden operation {op_name!r}."
+            )
+            break
+    disabled_reason: str | None = None
+    if not eligible:
+        disabled_reason = diagnostic or message
+    elif already_executed:
+        disabled_reason = DIAG_ALREADY_EXECUTED
+    elif not workspace_path:
+        disabled_reason = DIAG_NO_WORKSPACE_CONFIGURED
+
+    bounded_execution_ready = (
+        eligible
+        and not already_executed
+        and bool(operations)
+        and bool(workspace_path)
+    )
     return {
-        "bounded_execution_eligible": assessment["eligible"],
-        "bounded_execution_diagnostic": assessment["diagnostic"],
-        "bounded_execution_message": assessment["message"],
-        "structured_operation_count": len(assessment.get("operations") or []),
+        "bounded_execution_eligible": eligible,
+        "bounded_execution_diagnostic": diagnostic,
+        "bounded_execution_message": message,
+        "structured_operation_count": len(operations),
+        "bounded_execution_target_paths": target_paths,
+        "bounded_execution_operation_types": operation_types,
+        "bounded_execution_ready": bounded_execution_ready,
+        "bounded_execution_disabled_reason": disabled_reason,
     }
+
+
+def _ready_to_execute_locally_entry(
+    item: DecisionQueueItem,
+    envelope: RunEnvelope | None,
+    *,
+    workspace_path: str | None,
+) -> dict[str, Any] | None:
+    """Build one ready-to-execute row when the item is eligible for batch review."""
+    view = _bounded_execution_view(item, envelope, workspace_path=workspace_path)
+    if not view["bounded_execution_ready"]:
+        return None
+    operations = view["bounded_execution_operation_types"]
+    primary_op = operations[0] if operations else "—"
+    primary_path = view["bounded_execution_target_paths"][0] if view["bounded_execution_target_paths"] else "—"
+    return {
+        "action_id": item.action_id,
+        "operation": primary_op,
+        "path": primary_path,
+        "decision": item.decision,
+        "execution_status": item.execution_status,
+        "structured_operation_count": view["structured_operation_count"],
+        "bounded_execution_operation_types": operations,
+        "bounded_execution_target_paths": view["bounded_execution_target_paths"],
+    }
+
+
+def _ready_to_execute_locally(session: ControlSession) -> list[dict[str, Any]]:
+    """Admitted bounded local file actions ready for explicit batch execution."""
+    workspace_path = session.bounded_executor_workspace
+    ready: list[dict[str, Any]] = []
+    for item in session.queue:
+        envelope = session.run_envelopes.get(item.action_id)
+        entry = _ready_to_execute_locally_entry(item, envelope, workspace_path=workspace_path)
+        if entry is not None:
+            ready.append(entry)
+    return ready
 
 
 def _transcript_entry(entry_type: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1118,6 +1231,7 @@ class ControlSurfaceController:
     def state_view(self) -> dict[str, Any]:
         """Session state plus derived, non-persisted UI fields."""
         view = self.session_dict()
+        workspace_path = self._session.bounded_executor_workspace
         view["queue"] = [
             {
                 **item.to_dict(),
@@ -1125,6 +1239,7 @@ class ControlSurfaceController:
                 **_bounded_execution_view(
                     item,
                     self._session.run_envelopes.get(item.action_id),
+                    workspace_path=workspace_path,
                 ),
             }
             for item in self._session.queue
@@ -1150,7 +1265,15 @@ class ControlSurfaceController:
         view["lifecycle_overview"] = _lifecycle_overview(self._session)
         view["session_file"] = str(self._session_file)
         view["session_loaded_from_disk"] = self._session_loaded_from_disk
+        view["ready_to_execute_locally"] = _ready_to_execute_locally(self._session)
         return view
+
+    def set_bounded_executor_workspace(self, workspace_path: str | Path) -> dict[str, Any]:
+        """Persist the validated local workspace used by bridge and bounded execution."""
+        validated = validate_workspace_path(workspace_path)
+        self._session.bounded_executor_workspace = str(validated)
+        self._persist()
+        return self.state_view()
 
     def _persist(self) -> None:
         self._session_dir.mkdir(parents=True, exist_ok=True)
@@ -1475,6 +1598,90 @@ class ControlSurfaceController:
         )
         self._persist()
         return self.state_view()
+
+    def execute_bounded_local_batch(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Execute all currently eligible admitted local file actions in queue order.
+
+        Explicit user action only; never called from ingest. Partial success is
+        preserved in v0: successful file writes are not rolled back when a later
+        action in the batch fails.
+        """
+        workspace_path = body.get("workspace_path") or self._session.bounded_executor_workspace
+        if body.get("workspace_path"):
+            self._session.bounded_executor_workspace = str(body["workspace_path"]).strip()
+            workspace_path = self._session.bounded_executor_workspace
+
+        if not workspace_path:
+            raise BoundedExecutionError(
+                "no workspace configured for bounded local batch execution",
+                diagnostic=DIAG_NO_WORKSPACE_CONFIGURED,
+            )
+
+        ready_before = _ready_to_execute_locally(self._session)
+        action_results: list[dict[str, Any]] = []
+        for entry in ready_before:
+            action_id = entry["action_id"]
+            try:
+                self.execute_bounded_local(action_id, {"workspace_path": workspace_path})
+                item = self._find_queue_item(action_id)
+                action_results.append(
+                    {
+                        "action_id": action_id,
+                        "success": True,
+                        "execution_status": item.execution_status if item else None,
+                        "path": entry.get("path"),
+                        "operation": entry.get("operation"),
+                    }
+                )
+            except BoundedExecutionError as exc:
+                action_results.append(
+                    {
+                        "action_id": action_id,
+                        "success": False,
+                        "message": str(exc),
+                        "diagnostic": exc.diagnostic,
+                        "path": entry.get("path"),
+                        "operation": entry.get("operation"),
+                    }
+                )
+
+        succeeded_count = sum(1 for result in action_results if result.get("success"))
+        failed_count = len(action_results) - succeeded_count
+        partial_success = succeeded_count > 0 and failed_count > 0
+
+        self._session.transcript.append(
+            _transcript_entry(
+                "bounded_local_batch_execution",
+                {
+                    "workspace_path": str(workspace_path),
+                    "action_count": len(action_results),
+                    "succeeded_count": succeeded_count,
+                    "failed_count": failed_count,
+                    "partial_success": partial_success,
+                    "action_results": action_results,
+                    "note": (
+                        "Explicit bounded local batch execution v0. Ingest never executes. "
+                        "Partial success does not roll back earlier successful file writes."
+                    ),
+                },
+            )
+        )
+        self._persist()
+        view = self.state_view()
+        view["bounded_local_batch_result"] = {
+            "workspace_path": str(workspace_path),
+            "action_results": action_results,
+            "succeeded_count": succeeded_count,
+            "failed_count": failed_count,
+            "partial_success": partial_success,
+            "note": (
+                "Partial batch success preserves earlier file writes in v0; "
+                "inspect per-action results below."
+                if partial_success
+                else None
+            ),
+        }
+        return view
 
     def _trace_view(self) -> dict[str, Any]:
         return {

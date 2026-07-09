@@ -175,13 +175,21 @@ class _ControlSurfaceRequestHandler(BaseHTTPRequestHandler):
                 result = self.controller.ingest_agent_response(body.get("raw_response", ""))
             elif parsed.path == "/api/session/run_loop/bridge/check_workspace":
                 result = cursor_bridge.check_workspace(body.get("workspace_path", ""))
+                if result.get("workspace_exists"):
+                    self.controller.set_bounded_executor_workspace(body.get("workspace_path", ""))
             elif parsed.path == "/api/session/run_loop/bridge/write_instruction":
+                workspace_path = body.get("workspace_path", "")
+                if workspace_path:
+                    self.controller.set_bounded_executor_workspace(workspace_path)
                 result = cursor_bridge.write_next_instruction_with_controller(
-                    self.controller, body.get("workspace_path", "")
+                    self.controller, workspace_path
                 )
             elif parsed.path == "/api/session/run_loop/bridge/ingest_response":
+                workspace_path = body.get("workspace_path", "")
+                if workspace_path:
+                    self.controller.set_bounded_executor_workspace(workspace_path)
                 result = cursor_bridge.ingest_response_file_with_controller(
-                    self.controller, body.get("workspace_path", "")
+                    self.controller, workspace_path
                 )
             elif parsed.path == "/api/session/run_loop/bridge/open_workspace":
                 result = {
@@ -197,6 +205,8 @@ class _ControlSurfaceRequestHandler(BaseHTTPRequestHandler):
             elif parsed.path.startswith("/api/queue/") and parsed.path.endswith("/execute_bounded_local"):
                 action_id = unquote(parsed.path.split("/")[3])
                 result = self.controller.execute_bounded_local(action_id, body)
+            elif parsed.path == "/api/queue/execute_bounded_local_batch":
+                result = self.controller.execute_bounded_local_batch(body)
             else:
                 self._send_json(404, {"error": f"not found: {parsed.path}"})
                 return

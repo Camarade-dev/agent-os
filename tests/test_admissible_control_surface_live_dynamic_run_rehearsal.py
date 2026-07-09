@@ -189,6 +189,8 @@ class TestControlSurfaceHtmlSupportsBoundedRehearsal(unittest.TestCase):
             "/api/session/run_loop/bridge/write_instruction",
             "/api/session/run_loop/bridge/ingest_response",
             "/execute_bounded_local",
+            "Ready to execute locally",
+            "/api/queue/execute_bounded_local_batch",
         ):
             self.assertIn(marker, html, f"missing UI marker: {marker}")
 

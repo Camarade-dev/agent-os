@@ -142,7 +142,18 @@
   table.queue-table tr.queue-row:hover { background: var(--cs-card-bg); }
   table.queue-table tr.queue-row.selected { background: #142338; }
   .queue-op-cell { max-width: 18rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--cs-muted); }
+  .queue-path-cell { max-width: 10rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--cs-accent); font-size: .76rem; }
   .select-action-btn { font-size: .74rem; padding: .2rem .5rem; }
+
+  /* Ready to execute locally */
+  #ready-to-execute-panel { border-color: #1d4ed8; }
+  .ready-exec-note { font-size: .76rem; color: var(--cs-muted); margin: 0 0 .55rem; }
+  .ready-exec-table { width: 100%; border-collapse: collapse; font-size: .8rem; margin-bottom: .55rem; }
+  .ready-exec-table th { text-align: left; color: var(--cs-muted); font-weight: 600; font-size: .68rem; text-transform: uppercase; padding: .3rem .45rem; border-bottom: 1px solid var(--cs-border-strong); }
+  .ready-exec-table td { padding: .3rem .45rem; border-bottom: 1px solid var(--cs-border-strong); vertical-align: middle; }
+  .ready-exec-actions { display: flex; flex-wrap: wrap; gap: .45rem; align-items: center; }
+  .batch-result-summary { margin-top: .45rem; font-size: .78rem; color: var(--cs-muted); }
+  .batch-result-failure { color: #fca5a5; }
 
   /* Selected action */
   #selected-action-body .sel-header { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; margin-bottom: .4rem; }
@@ -414,6 +425,21 @@
     <div id="needs-attention-body"><p class="no-action-note">Nothing loaded yet.</p></div>
   </section>
 
+  <section class="panel" id="ready-to-execute-panel">
+    <h2>Ready to execute locally</h2>
+    <p class="ready-exec-note">
+      Admitted bounded local file operations for the current workspace. Review here, then execute
+      individually or in batch. Ingesting a Cursor response never executes files — execution is
+      always an explicit step after admission.
+    </p>
+    <div id="ready-to-execute-body"><p class="no-action-note">No admitted local file operations are ready.</p></div>
+    <div class="ready-exec-actions">
+      <button type="button" id="btn-execute-bounded-batch" disabled>Execute all ready locally</button>
+      <span id="ready-exec-workspace-hint" class="ready-exec-note"></span>
+    </div>
+    <div id="batch-execution-result" class="batch-result-summary"></div>
+  </section>
+
   <section class="panel" id="admissible-queue-panel">
     <h2>Admissible Action Admission Queue</h2>
     <div class="queue-tabs" id="queue-tabs">
@@ -426,7 +452,7 @@
     <div id="queue-table-wrapper">
       <table class="queue-table">
         <thead>
-          <tr><th>Action</th><th>Operation</th><th>Decision</th><th>Execution</th><th>Type</th><th></th></tr>
+          <tr><th>Action</th><th>Operation</th><th>Decision</th><th>Execution</th><th>Ops</th><th>Path</th><th>Type</th><th></th></tr>
         </thead>
         <tbody id="queue-table-body"></tbody>
       </table>
@@ -711,6 +737,38 @@ function lifecycleLabel(status) {
   return LIFECYCLE_LABELS[status] || status;
 }
 
+function sessionWorkspacePath(state) {
+  return (state && state.bounded_executor_workspace) || "";
+}
+
+function syncWorkspacePathFromState(state) {
+  const input = document.getElementById("bridge-workspace-path");
+  const sessionPath = sessionWorkspacePath(state);
+  if (!input || !sessionPath) return;
+  if (!input.value.trim() || input.value.trim() === input.dataset.lastSessionWorkspace) {
+    input.value = sessionPath;
+  }
+  input.dataset.lastSessionWorkspace = sessionPath;
+}
+
+function fmtBoundedOps(item) {
+  const count = item.structured_operation_count ?? 0;
+  if (!count) return "—";
+  const types = item.bounded_execution_operation_types || [];
+  if (types.length) return `${count} (${types.join(", ")})`;
+  return String(count);
+}
+
+function fmtBoundedPaths(item) {
+  const paths = item.bounded_execution_target_paths || [];
+  if (!paths.length) return "—";
+  return paths.join(", ");
+}
+
+function boundedEvidenceForAction(state, actionId) {
+  return ((state.run_loop || {}).evidence_records || []).filter((record) => record.action_id === actionId);
+}
+
 function buildEvidenceTypeOptions(item) {
   const missing = Array.isArray(item.missing_evidence) ? item.missing_evidence : [];
   const missingOpts = missing
@@ -932,6 +990,83 @@ function filteredQueue(state) {
   }
 }
 
+function renderReadyToExecuteLocally(state) {
+  const body = document.getElementById("ready-to-execute-body");
+  const batchBtn = document.getElementById("btn-execute-bounded-batch");
+  const workspaceHint = document.getElementById("ready-exec-workspace-hint");
+  const batchResult = document.getElementById("batch-execution-result");
+  if (!body) return;
+
+  const workspace = sessionWorkspacePath(state);
+  if (workspaceHint) {
+    workspaceHint.textContent = workspace
+      ? `Current workspace: ${workspace}`
+      : "Set and validate a workspace in the bridge section above.";
+  }
+
+  const ready = state.ready_to_execute_locally || [];
+  if (batchBtn) {
+    batchBtn.disabled = !ready.length || !workspace;
+    batchBtn.title = !workspace
+      ? "Set a workspace path in the bridge section first."
+      : ready.length
+        ? `Execute ${ready.length} admitted local file operation(s) in queue order.`
+        : "No admitted local file operations are ready.";
+  }
+
+  if (!ready.length) {
+    body.innerHTML = workspace
+      ? '<p class="no-action-note">No admitted local file operations are ready for this workspace.</p>'
+      : '<p class="no-action-note">Set a workspace path above to review admitted local file operations.</p>';
+  } else {
+    body.innerHTML = `
+      <table class="ready-exec-table">
+        <thead>
+          <tr><th>Action</th><th>Operation</th><th>Path</th><th>Decision</th><th>Execution</th><th></th></tr>
+        </thead>
+        <tbody>
+          ${ready
+            .map(
+              (entry) => `<tr>
+                <td class="mono">${escapeHtml(entry.action_id)}</td>
+                <td><code>${escapeHtml(entry.operation)}</code></td>
+                <td><code>${escapeHtml(entry.path)}</code></td>
+                <td><span class="decision-${escapeHtml(entry.decision)}">${escapeHtml(entry.decision)}</span></td>
+                <td><span class="badge badge-${escapeHtml((entry.execution_status || "").replace(/_/g, "-"))}">${escapeHtml(entry.execution_status)}</span></td>
+                <td><button type="button" class="secondary select-action-btn" data-action-id="${escapeHtml(entry.action_id)}">Review</button></td>
+              </tr>`
+            )
+            .join("")}
+        </tbody>
+      </table>
+    `;
+    body.querySelectorAll(".select-action-btn").forEach((btn) => {
+      btn.addEventListener("click", () => selectAction(btn.getAttribute("data-action-id")));
+    });
+  }
+
+  const batch = state.bounded_local_batch_result;
+  if (batchResult) {
+    if (!batch) {
+      batchResult.innerHTML = "";
+    } else {
+      const rows = (batch.action_results || [])
+        .map((result) => {
+          if (result.success) {
+            return `<li><code>${escapeHtml(result.action_id)}</code> — executed <code>${escapeHtml(result.path || "")}</code></li>`;
+          }
+          return `<li class="batch-result-failure"><code>${escapeHtml(result.action_id)}</code> — failed: ${escapeHtml(result.message || result.diagnostic || "unknown")}</li>`;
+        })
+        .join("");
+      batchResult.innerHTML = `
+        <p><strong>Last batch:</strong> ${escapeHtml(batch.succeeded_count)} succeeded, ${escapeHtml(batch.failed_count)} failed at <code>${escapeHtml(batch.workspace_path)}</code>.</p>
+        ${batch.note ? `<p>${escapeHtml(batch.note)}</p>` : ""}
+        <ul>${rows}</ul>
+      `;
+    }
+  }
+}
+
 function renderQueueTable(state) {
   const tbody = document.getElementById("queue-table-body");
   const countEl = document.getElementById("queue-count");
@@ -940,18 +1075,23 @@ function renderQueueTable(state) {
   countEl.textContent = `(${rows.length} of ${all.length})`;
 
   if (rows.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="6" class="no-action-note">No actions in this view.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8" class="no-action-note">No actions in this view.</td></tr>`;
     return;
   }
 
   tbody.innerHTML = rows
     .map((item) => {
       const selectedClass = item.action_id === selectedActionId ? " selected" : "";
+      const disabledReason = item.bounded_execution_disabled_reason
+        ? ` title="${escapeHtml(item.bounded_execution_disabled_reason)}"`
+        : "";
       return `<tr class="queue-row${selectedClass}" data-action-id="${escapeHtml(item.action_id)}">
         <td class="mono">${escapeHtml(item.action_id)}</td>
         <td class="queue-op-cell" title="${escapeHtml(displayToolOrCommand(item))}">${escapeHtml(truncate(displayToolOrCommand(item), 48))}</td>
         <td><span class="decision-${escapeHtml(item.decision)}">${escapeHtml(item.decision)}</span></td>
         <td><span class="badge badge-${escapeHtml((item.execution_status || "").replace(/_/g, "-"))}">${escapeHtml(item.execution_status)}</span></td>
+        <td${disabledReason}>${escapeHtml(fmtBoundedOps(item))}</td>
+        <td class="queue-path-cell" title="${escapeHtml(fmtBoundedPaths(item))}">${escapeHtml(truncate(fmtBoundedPaths(item), 24))}</td>
         <td>${escapeHtml(item.action_type)}</td>
         <td><button type="button" class="secondary select-action-btn" data-action-id="${escapeHtml(item.action_id)}">Select</button></td>
       </tr>`;
@@ -1058,19 +1198,32 @@ function renderSelectedAction(state) {
       ? `<p class="no-action-note" style="font-style:normal;color:#fde68a;">Admitted by Admissible but not executed here. Use bounded executor for structured local file ops, or run externally and attest if your autonomy level allows.</p>`
       : "";
   const boundedDiagnostic = item.bounded_execution_message
-    ? `<p class="no-action-note" style="font-style:normal;color:var(--cs-muted);">${escapeHtml(item.bounded_execution_message)}${item.bounded_execution_diagnostic ? ` <code>${escapeHtml(item.bounded_execution_diagnostic)}</code>` : ""}</p>`
+    ? `<p class="no-action-note" style="font-style:normal;color:var(--cs-muted);">${escapeHtml(item.bounded_execution_message)}${item.bounded_execution_diagnostic ? ` <code>${escapeHtml(item.bounded_execution_diagnostic)}</code>` : ""}${item.bounded_execution_disabled_reason && !item.bounded_execution_eligible ? ` — <code>${escapeHtml(item.bounded_execution_disabled_reason)}</code>` : ""}</p>`
     : "";
+  const defaultWorkspace = sessionWorkspacePath(state) || document.getElementById("bridge-workspace-path")?.value || "";
   const boundedFormHtml =
     item.bounded_execution_eligible && item.execution_status !== "executed_by_bounded_executor"
       ? `
       <form class="bounded-execute-form" data-action-id="${escapeHtml(item.action_id)}">
-        <div class="field"><label>Workspace path (required)</label>
-          <input type="text" name="workspace_path" placeholder="Path to approved local workspace" value="${escapeHtml(document.getElementById("bridge-workspace-path")?.value || "")}">
+        <div class="field"><label>Workspace path${defaultWorkspace ? " (optional — session default below)" : " (required)"}</label>
+          <input type="text" name="workspace_path" placeholder="${defaultWorkspace ? "Override session workspace (optional)" : "Path to approved local workspace"}" value="">
         </div>
+        ${defaultWorkspace ? `<p class="no-action-note" style="font-style:normal;">Session workspace: <code>${escapeHtml(defaultWorkspace)}</code></p>` : ""}
         <button type="submit">Execute bounded local file action</button>
       </form>
     `
       : "";
+  const boundedEvidence = boundedEvidenceForAction(state, item.action_id);
+  const boundedEvidenceHtml = boundedEvidence.length
+    ? `<dl class="kv-grid">
+      <dt>Bounded executor evidence</dt><dd>${boundedEvidence.length} record(s)</dd>
+      ${boundedEvidence
+        .map(
+          (record) => `<dt>${escapeHtml(record.evidence_type)}</dt><dd><code>${escapeHtml(record.file_path_or_note || "—")}</code> · source <code>${escapeHtml(record.source)}</code>${record.sha256 ? ` · sha256 <span class="mono">${escapeHtml(record.sha256)}</span>` : ""}</dd>`
+        )
+        .join("")}
+    </dl>`
+    : "";
   const closedNote =
     item.lifecycle_status === "resolved_gate" || item.lifecycle_status === "refused_closed" || item.lifecycle_status === "closed"
       ? `<p class="no-action-note" style="font-style:normal;">This item is closed — no immediate human action required.</p>`
@@ -1087,9 +1240,12 @@ function renderSelectedAction(state) {
       <dt>Operational action</dt><dd><code>${escapeHtml(item.operational_admissibility_action)}</code></dd>
       <dt>Risk level</dt><dd>${escapeHtml(item.risk_level)}</dd>
       <dt>Required approval</dt><dd>${escapeHtml(item.required_approval)}</dd>
+      <dt>Structured operations</dt><dd>${escapeHtml(fmtBoundedOps(item))}</dd>
+      <dt>Target path(s)</dt><dd><code>${escapeHtml(fmtBoundedPaths(item))}</code></dd>
       <dt>Originally missing evidence</dt><dd>${fmtList(item.original_missing_evidence?.length ? item.original_missing_evidence : item.missing_evidence)}</dd>
       <dt>Still missing evidence</dt><dd>${fmtList(item.missing_evidence)}</dd>
     </dl>
+    ${boundedEvidenceHtml}
     ${evidenceStateHtml}
     ${lifecycleNote}
     ${admittedNote}
@@ -1426,6 +1582,7 @@ function renderBridgeFromState(state) {
 
 function render(state) {
   lastState = state;
+  syncWorkspacePathFromState(state);
   renderAutonomySelect(state);
   renderSessionDiagnostics(state);
   renderBridgeBlockedBanner(state);
@@ -1435,6 +1592,7 @@ function render(state) {
   renderBridgeFromState(state);
   renderMissionSummary(state);
   renderNeedsAttention(state);
+  renderReadyToExecuteLocally(state);
   renderQueueTable(state);
   renderSelectedAction(state);
   renderGoalIntake(state);
@@ -1478,16 +1636,15 @@ async function onBoundedExecuteSubmit(event) {
   const form = event.currentTarget;
   const actionId = form.getAttribute("data-action-id");
   const formData = new FormData(form);
-  const workspacePath = (formData.get("workspace_path") || "").trim();
+  const workspacePath = (formData.get("workspace_path") || "").trim() || sessionWorkspacePath(lastState);
   if (!workspacePath) {
-    showError("Enter a workspace path before executing a bounded local file action.");
+    showError("Set a workspace path in the bridge section or enter one before executing.");
     return;
   }
   clearError();
+  const body = workspacePath ? { workspace_path: workspacePath } : {};
   await runAction(() =>
-    apiPost(`/api/queue/${encodeURIComponent(actionId)}/execute_bounded_local`, {
-      workspace_path: workspacePath,
-    })
+    apiPost(`/api/queue/${encodeURIComponent(actionId)}/execute_bounded_local`, body)
   );
 }
 
@@ -1538,6 +1695,10 @@ async function checkBridgeWorkspace() {
   try {
     const result = await apiPost("/api/session/run_loop/bridge/check_workspace", { workspace_path: workspacePath });
     renderBridgeWorkspaceStatus(result);
+    if (result.workspace_exists) {
+      const state = await apiGet("/api/session");
+      render(state);
+    }
   } catch (err) {
     const el = document.getElementById("bridge-workspace-status");
     if (el) el.innerHTML = `<p class="bridge-error">Could not check workspace: ${escapeHtml(err.message)}</p>`;
@@ -1604,6 +1765,25 @@ document.getElementById("btn-bridge-open-workspace").addEventListener("click", a
     lastBridgeOpen = { operation: "open_workspace", success: false, error: err.message, ...(err.data || {}) };
     renderBridgeOpenStatus();
   }
+});
+
+document.getElementById("btn-execute-bounded-batch").addEventListener("click", async () => {
+  const workspace = sessionWorkspacePath(lastState) || bridgeWorkspacePath();
+  if (!workspace) {
+    showError("Set and validate a workspace path before batch execution.");
+    return;
+  }
+  const readyCount = (lastState && lastState.ready_to_execute_locally || []).length;
+  if (!readyCount) {
+    showError("No admitted local file operations are ready to execute.");
+    return;
+  }
+  const message = `Execute ${readyCount} admitted local file operation(s) in workspace:\n${workspace}\n\nIngest never executes files — this is an explicit post-admission step.`;
+  if (!window.confirm(message)) return;
+  clearError();
+  await runAction(() =>
+    apiPost("/api/queue/execute_bounded_local_batch", { workspace_path: workspace })
+  );
 });
 
 document.getElementById("autonomy-select").addEventListener("change", (event) => {
