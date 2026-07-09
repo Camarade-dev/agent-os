@@ -21,7 +21,11 @@ from pathlib import Path
 
 from admissible.control_surface import ControlSurfaceController
 from admissible.evaluator.rules_only import evaluate_envelope
-from admissible.long_run_envelope_builder import build_from_raw_output
+from admissible.long_run_envelope_builder import (
+    _build_action_candidate,
+    _plan_gate_operation_label,
+    build_from_raw_output,
+)
 from admissible.runner.extraction_lab import (
     evaluate_fixture,
     load_expected_spec,
@@ -203,8 +207,51 @@ class TestPlanGateResolutionExtraction(unittest.TestCase):
         item = state["queue"][0]
         self.assertEqual(item["action_type"], "plan_gate_resolution")
         self.assertNotEqual(item["action_type"], "unknown")
+        self.assertNotEqual(item["tool_or_command"], "unknown")
+        self.assertEqual(
+            item["tool_or_command"],
+            "Resolve architecture and deployment boundary",
+        )
         self.assertEqual(item["decision"], "REQUIRE_HUMAN_APPROVAL")
         self.assertEqual(item["execution_status"], "proposed_only")
+
+    def test_whole_document_fallback_still_gets_readable_operation_label(self) -> None:
+        raw = load_fixture(FIXTURES_DIR / "cursor_plan_gate_resolution_request.txt")
+        candidate = _build_action_candidate(
+            raw_output=raw,
+            action_index=1,
+            source_metadata={"fixture_path": "cursor_plan_gate_resolution_request.txt"},
+            long_run_prompt=None,
+        )
+        self.assertEqual(candidate["action_type"], "plan_gate_resolution")
+        self.assertEqual(candidate["tool_or_command"], "Resolve architecture and deployment boundary")
+        self.assertNotEqual(candidate["tool_or_command"], "unknown")
+
+    def test_proposal_fallback_when_heading_has_no_label(self) -> None:
+        raw = (
+            "action_gate_001\n"
+            "Verdict class: REQUIRE_HUMAN_APPROVAL\n"
+            "Proposal: Confirm a vanilla HTML/CSS/JS implementation with no framework.\n"
+        )
+        self.assertEqual(
+            _plan_gate_operation_label(raw),
+            "Confirm a vanilla HTML/CSS/JS implementation with no framework",
+        )
+        built = build_from_raw_output(raw, source_metadata={"fixture_path": "inline_proposal_only.txt"})
+        plan_gate = [c for c in built["action_candidates"] if c["action_type"] == "plan_gate_resolution"]
+        self.assertTrue(plan_gate)
+        self.assertNotEqual(plan_gate[0]["tool_or_command"], "unknown")
+        self.assertIn("vanilla HTML/CSS/JS", plan_gate[0]["tool_or_command"])
+
+    def test_human_decision_fallback_when_proposal_absent(self) -> None:
+        raw = (
+            "Verdict class: REQUIRE_HUMAN_APPROVAL\n"
+            "Human decision required: please confirm the architecture before I write any code.\n"
+        )
+        self.assertEqual(
+            _plan_gate_operation_label(raw),
+            "please confirm the architecture before I write any code",
+        )
 
     def test_heading_less_phrase_only_proposal_still_classifies(self) -> None:
         # No `action_gate_` heading at all -- only the softer phrase-based
@@ -222,8 +269,20 @@ class TestPlanGateResolutionExtraction(unittest.TestCase):
         self.assertEqual(len(built["action_candidates"]), 1)
         candidate = built["action_candidates"][0]
         self.assertEqual(candidate["action_type"], "plan_gate_resolution")
+        self.assertNotEqual(candidate["tool_or_command"], "unknown")
+        self.assertIn("confirm the architecture", candidate["tool_or_command"].lower())
         decision = evaluate_envelope(built["envelopes"][0])
         self.assertEqual(decision["decision"], "REQUIRE_HUMAN_APPROVAL")
+
+    def test_vague_unknown_response_stays_unknown(self) -> None:
+        raw = "User: hello\n\nThinking...\nI am not sure what to do next.\n"
+        built = build_from_raw_output(raw, source_metadata={"fixture_path": "inline_vague.txt"})
+        self.assertEqual(len(built["action_candidates"]), 1)
+        candidate = built["action_candidates"][0]
+        self.assertEqual(candidate["action_type"], "unknown")
+        self.assertEqual(candidate["tool_or_command"], "unknown")
+        decision = evaluate_envelope(built["envelopes"][0])
+        self.assertEqual(decision["decision"], "REQUEST_MORE_EVIDENCE")
 
     def test_plan_gate_block_coexists_with_an_unrelated_action_in_one_response(self) -> None:
         # The block-consumption pass must blank only the gate block's own

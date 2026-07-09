@@ -444,6 +444,13 @@ function truncate(value, maxLen) {
   return s.slice(0, maxLen - 1) + "…";
 }
 
+function displayToolOrCommand(item) {
+  const op = item && item.tool_or_command;
+  if (op && op !== "unknown") return op;
+  if (item && item.action_type === "plan_gate_resolution") return "Resolve plan gate";
+  return op || "—";
+}
+
 function fmtList(items) {
   if (!Array.isArray(items) || items.length === 0) return "None";
   return items.map(escapeHtml).join(", ");
@@ -583,7 +590,7 @@ function attentionActionRows(actions) {
     .map(
       (a) => `<div class="attention-row">
         <span class="decision-${escapeHtml(a.decision)}">${escapeHtml(a.decision)}</span>
-        <span class="attn-tool" title="${escapeHtml(a.tool_or_command)}">${escapeHtml(truncate(a.tool_or_command, 70))}</span>
+        <span class="attn-tool" title="${escapeHtml(displayToolOrCommand(a))}">${escapeHtml(truncate(displayToolOrCommand(a), 70))}</span>
         <button type="button" class="secondary review-action-btn" data-action-id="${escapeHtml(a.action_id)}">Review</button>
       </div>`
     )
@@ -667,7 +674,7 @@ function renderQueueTable(state) {
       const selectedClass = item.action_id === selectedActionId ? " selected" : "";
       return `<tr class="queue-row${selectedClass}" data-action-id="${escapeHtml(item.action_id)}">
         <td class="mono">${escapeHtml(item.action_id)}</td>
-        <td class="queue-op-cell" title="${escapeHtml(item.tool_or_command)}">${escapeHtml(truncate(item.tool_or_command, 48))}</td>
+        <td class="queue-op-cell" title="${escapeHtml(displayToolOrCommand(item))}">${escapeHtml(truncate(displayToolOrCommand(item), 48))}</td>
         <td><span class="decision-${escapeHtml(item.decision)}">${escapeHtml(item.decision)}</span></td>
         <td><span class="badge badge-${escapeHtml((item.execution_status || "").replace(/_/g, "-"))}">${escapeHtml(item.execution_status)}</span></td>
         <td>${escapeHtml(item.action_type)}</td>
@@ -772,7 +779,7 @@ function renderSelectedAction(state) {
       <span class="decision-${escapeHtml(item.decision)}">${escapeHtml(item.decision)}</span>
       <span class="badge badge-${escapeHtml((item.execution_status || "").replace(/_/g, "-"))}">${escapeHtml(item.execution_status)}</span>
     </div>
-    <p><code>${escapeHtml(item.tool_or_command)}</code> (${escapeHtml(item.action_type)})</p>
+    <p><code>${escapeHtml(displayToolOrCommand(item))}</code> (${escapeHtml(item.action_type)})</p>
     <dl class="kv-grid">
       <dt>Operational action</dt><dd><code>${escapeHtml(item.operational_admissibility_action)}</code></dd>
       <dt>Risk level</dt><dd>${escapeHtml(item.risk_level)}</dd>

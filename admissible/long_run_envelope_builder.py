@@ -122,7 +122,7 @@ _LOCAL_EDIT_RE = re.compile(
 # decision-only proposal written in prose (no heading) still classifies
 # correctly rather than falling through to `unknown`.
 _GATE_HEADING_RE = re.compile(
-    r"^(?P<gate_id>action_gate_\w+)\s*[—:-]\s*(?P<label>.+?)\s*$",
+    r"^(?P<gate_id>action_gate_\w+)(?:\s*[—:-]\s*(?P<label>.+?))?\s*$",
     re.MULTILINE,
 )
 _GATE_ID_HINT_RE = re.compile(r"\baction_gate_\w+", re.I)
@@ -143,6 +143,57 @@ _GATE_VERDICT_CLASS_RE = re.compile(r"verdict\s+class:\s*([A-Za-z_]+)", re.I)
 _GATE_CLOSES_RE = re.compile(r"closes\s+gates?:\s*(.+)", re.I)
 _GATE_SIDE_EFFECTS_RE = re.compile(r"side\s+effects?\s+if\s+approved:\s*(.+)", re.I)
 _GATE_PROPOSAL_RE = re.compile(r"proposal:\s*(.+)", re.I)
+_GATE_HUMAN_DECISION_RE = re.compile(r"human\s+decision\s+required:\s*(.+)", re.I | re.DOTALL)
+_PLAN_GATE_OPERATION_FALLBACK = "Resolve plan gate"
+
+
+def _first_meaningful_sentence(text: str, *, min_length: int = 8) -> str | None:
+    compact = re.sub(r"\s+", " ", text).strip()
+    if not compact:
+        return None
+    for chunk in re.split(r"(?<=[.!?])\s+", compact):
+        candidate = chunk.strip().rstrip(".")
+        if len(candidate) >= min_length:
+            return candidate
+    return compact if len(compact) >= min_length else None
+
+
+def _meaningful_plan_gate_label(label: str | None) -> str | None:
+    if not label:
+        return None
+    cleaned = re.sub(r"\s+", " ", label).strip().lstrip("-–—").strip()
+    if not cleaned or cleaned.lower() == "unknown":
+        return None
+    if re.fullmatch(r"action_gate_\w+", cleaned, re.I):
+        return None
+    return cleaned
+
+
+def _plan_gate_operation_label(text: str, *, heading_label: str | None = None) -> str:
+    """Derive a human-readable operation label for plan-gate resolution.
+
+    Priority: structured heading label, ``Proposal:`` sentence,
+    ``Human decision required:`` sentence, then a conservative fallback.
+    """
+    from_heading = _meaningful_plan_gate_label(heading_label)
+    if from_heading:
+        return from_heading
+    heading_match = _GATE_HEADING_RE.search(text)
+    if heading_match:
+        from_heading = _meaningful_plan_gate_label(heading_match.group("label"))
+        if from_heading:
+            return from_heading
+    proposal_match = _GATE_PROPOSAL_RE.search(text)
+    if proposal_match:
+        sentence = _first_meaningful_sentence(proposal_match.group(1))
+        if sentence:
+            return sentence
+    human_match = _GATE_HUMAN_DECISION_RE.search(text)
+    if human_match:
+        sentence = _first_meaningful_sentence(human_match.group(1))
+        if sentence:
+            return sentence
+    return _PLAN_GATE_OPERATION_FALLBACK
 
 
 def _is_plan_gate_segment(text: str) -> bool:
@@ -206,7 +257,7 @@ def _extract_plan_gate_blocks(raw_output: str) -> list[dict[str, Any]]:
         blocks.append(
             {
                 "gate_id": match.group("gate_id"),
-                "label": match.group("label").strip(),
+                "label": (match.group("label") or "").strip(),
                 "block_text": block_text,
                 "span": (match.start(), span_end),
                 "verdict_class": verdict_match.group(1).strip().upper() if verdict_match else None,
@@ -603,7 +654,8 @@ def _extract_freeform_action_segments(raw_output: str) -> list[dict[str, str]]:
 
     gate_spans: list[tuple[int, int]] = []
     for block in _extract_plan_gate_blocks(raw_output):
-        segments.append({"text": block["block_text"], "tool_or_command": block["label"]})
+        label = _plan_gate_operation_label(block["block_text"], heading_label=block["label"])
+        segments.append({"text": block["block_text"], "tool_or_command": label})
         gate_spans.append(block["span"])
     remaining = _blank_spans(raw_output, gate_spans)
 
@@ -778,7 +830,10 @@ def _build_action_candidate(
             user_request=user_request,
         )
         target = _infer_target(tool, args, shell_command)
-        tool_or_command = tool or shell_command or "unknown"
+        if action_type == "plan_gate_resolution":
+            tool_or_command = _plan_gate_operation_label(raw_output)
+        else:
+            tool_or_command = tool or shell_command or "unknown"
         hash_source = raw_output
     missing_evidence = _missing_evidence_for_action(action_type, notes)
     safer_steps = _safer_next_steps(action_type, target, notes)
@@ -1279,13 +1334,22 @@ def _build_from_multi_action_response(
         seen_texts.add(normalized)
         action_type, side_effect_type, expected_tendency, confidence = classified
         action_index += 1
+        tool_or_command = segment.get("tool_or_command") or normalized
+        if action_type == "plan_gate_resolution":
+            heading_label = None
+            if segment.get("tool_or_command") and segment.get("tool_or_command") != normalized:
+                heading_label = segment.get("tool_or_command")
+            tool_or_command = _plan_gate_operation_label(
+                normalized,
+                heading_label=heading_label,
+            )
         operation_context = {
             "action_type": action_type,
             "side_effect_type": side_effect_type,
             "expected_admission_tendency": expected_tendency,
             "extraction_confidence": confidence,
             "operation_text": normalized,
-            "tool_or_command": segment.get("tool_or_command") or normalized,
+            "tool_or_command": tool_or_command,
         }
         candidate = _build_action_candidate(
             raw_output=raw_output,

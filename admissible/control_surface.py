@@ -354,15 +354,31 @@ class DecisionQueueItem:
         return _dataclass_from_dict(cls, data)
 
 
+def _display_tool_or_command(
+    tool_or_command: str | None,
+    action_type: str | None,
+) -> str | None:
+    if tool_or_command and tool_or_command != "unknown":
+        return tool_or_command
+    if action_type == "plan_gate_resolution":
+        return "Resolve plan gate"
+    return tool_or_command
+
+
 def _build_queue_item(envelope: RunEnvelope) -> DecisionQueueItem:
     candidate = envelope.candidate
     decision = envelope.decision
     proposed = decision.get("proposed_action") or {}
     decision_label = decision.get("decision", "—")
+    action_type = candidate.get("action_type") or proposed.get("action_type")
+    tool_or_command = _display_tool_or_command(
+        candidate.get("tool_or_command") or proposed.get("tool"),
+        action_type,
+    )
     return DecisionQueueItem(
         action_id=envelope.action_id,
-        tool_or_command=candidate.get("tool_or_command") or proposed.get("tool"),
-        action_type=candidate.get("action_type") or proposed.get("action_type"),
+        tool_or_command=tool_or_command,
+        action_type=action_type,
         decision=decision_label,
         operational_admissibility_action=decision.get("operational_admissibility_action"),
         risk_level=decision.get("risk_level"),
