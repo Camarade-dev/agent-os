@@ -11,9 +11,11 @@ Hard constraints (v0):
 
 - Does not call Cursor, Claude Code, Codex, Gemini, OpenAI, or any
   network provider.
-- Does not execute shell commands and does not implement an automatic
-  executor. "Attest executed" only *records* that a human/external actor
-  executed an already-admitted local action; it never runs anything.
+- Does not execute shell commands and does not implement a general automatic
+  executor. A narrow bounded local file executor (structured list/read/write
+  only) may run for already-admitted actions via
+  ``execute_bounded_local()``; "Attest executed" only *records* that a
+  human/external actor executed an already-admitted local action.
 - Does not import `agent_os`.
 - Does not weaken `admissible.admitted_execution` validation: attestation
   goes through `validate_executed_after_admission_record` unchanged.
@@ -44,9 +46,15 @@ from admissible.admitted_execution import (
     EXECUTION_SCOPE_LOCAL_WORKSPACE_ONLY,
     EXECUTION_STATUS_ADMITTED_NOT_EXECUTED,
     EXECUTION_STATUS_EXECUTED_AFTER_ADMISSION,
+    EXECUTION_STATUS_EXECUTED_BY_BOUNDED_EXECUTOR,
     AdmittedExecutionValidationError,
     is_local_allow_without_missing_evidence,
     validate_executed_after_admission_record,
+)
+from admissible.execution.bounded_local_executor import (
+    BoundedExecutionError,
+    assess_bounded_execution_eligibility,
+    execute_bounded_local_action,
 )
 from admissible.goal_intake import GoalIntake, analyze_goal
 from admissible.plan_audit import (
@@ -265,6 +273,7 @@ _DECISION_LABELS_FOR_SUMMARY: tuple[str, ...] = (
 
 _EXECUTION_STATUSES_FOR_SUMMARY: tuple[str, ...] = (
     "executed_after_admission",
+    "executed_by_bounded_executor",
     "admitted_not_executed",
     "proposed_only",
     "blocked",
@@ -451,7 +460,10 @@ def available_human_actions(item: DecisionQueueItem, autonomy_level: str) -> lis
         return [DECISION_TYPE_LIMIT_SCOPE, DECISION_TYPE_REFUSE]
     if decision == "ALLOW":
         actions = [DECISION_TYPE_REFUSE]
-        already_executed = item.execution_status == EXECUTION_STATUS_EXECUTED_AFTER_ADMISSION
+        already_executed = item.execution_status in (
+            EXECUTION_STATUS_EXECUTED_AFTER_ADMISSION,
+            EXECUTION_STATUS_EXECUTED_BY_BOUNDED_EXECUTOR,
+        )
         if item.attestation_eligible and not already_executed and autonomy_level not in _NO_ATTESTATION_LEVELS:
             actions.append(DECISION_TYPE_ATTEST_EXECUTED)
         return actions
@@ -474,6 +486,7 @@ class ControlSession:
     goal_intake: dict[str, Any] | None = None
     plan_candidate: dict[str, Any] | None = None
     plan_audit: dict[str, Any] | None = None
+    bounded_executor_workspace: str | None = None
     run_loop: RunLoopState = field(default_factory=RunLoopState)
 
     def to_dict(self) -> dict[str, Any]:
@@ -490,6 +503,7 @@ class ControlSession:
             "goal_intake": self.goal_intake,
             "plan_candidate": self.plan_candidate,
             "plan_audit": self.plan_audit,
+            "bounded_executor_workspace": self.bounded_executor_workspace,
             "run_loop": self.run_loop.to_dict(),
         }
 
@@ -519,8 +533,25 @@ class ControlSession:
             goal_intake=data.get("goal_intake"),
             plan_candidate=data.get("plan_candidate"),
             plan_audit=data.get("plan_audit"),
+            bounded_executor_workspace=data.get("bounded_executor_workspace"),
             run_loop=RunLoopState.from_dict(data.get("run_loop") or {}),
         )
+
+
+def _bounded_execution_view(
+    item: DecisionQueueItem,
+    envelope: RunEnvelope | None,
+    *,
+    body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Display-only bounded executor eligibility for one queue item."""
+    assessment = assess_bounded_execution_eligibility(item=item, envelope=envelope, body=body)
+    return {
+        "bounded_execution_eligible": assessment["eligible"],
+        "bounded_execution_diagnostic": assessment["diagnostic"],
+        "bounded_execution_message": assessment["message"],
+        "structured_operation_count": len(assessment.get("operations") or []),
+    }
 
 
 def _transcript_entry(entry_type: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -968,6 +999,10 @@ class ControlSurfaceController:
             {
                 **item.to_dict(),
                 "available_actions": available_human_actions(item, self._session.autonomy_level),
+                **_bounded_execution_view(
+                    item,
+                    self._session.run_envelopes.get(item.action_id),
+                ),
             }
             for item in self._session.queue
         ]
@@ -1226,6 +1261,81 @@ class ControlSurfaceController:
         item.human_decision_ids.append(record.record_id)
         self._session.human_decisions.append(record)
         self._session.transcript.append(_transcript_entry("human_decision", record.to_dict()))
+        self._persist()
+        return self.state_view()
+
+    def execute_bounded_local(self, action_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Execute one admitted action via the bounded local file executor.
+
+        Never mutates the original rules-only admission decision. Updates only
+        derived execution status and appends structured attestation evidence.
+        """
+        item = self._find_queue_item(action_id)
+        if item is None:
+            raise ValueError(f"unknown action_id: {action_id!r}")
+
+        envelope = self._session.run_envelopes.get(action_id)
+        workspace_path = body.get("workspace_path") or self._session.bounded_executor_workspace
+        if body.get("workspace_path"):
+            self._session.bounded_executor_workspace = str(body["workspace_path"]).strip()
+
+        assessment = assess_bounded_execution_eligibility(item=item, envelope=envelope, body=body)
+        if not assessment["eligible"]:
+            raise BoundedExecutionError(
+                assessment["message"],
+                diagnostic=assessment["diagnostic"] or "not_admitted",
+                detail={
+                    "action_id": action_id,
+                    "bounded_execution_diagnostic": assessment["diagnostic"],
+                    "bounded_execution_message": assessment["message"],
+                },
+            )
+
+        result = execute_bounded_local_action(
+            workspace_path=workspace_path,
+            operations=assessment["operations"],
+            action_id=action_id,
+            decision_id=envelope.decision_id if envelope else None,
+            envelope_id=envelope.envelope_id if envelope else None,
+            turn_number=self._session.run_loop.current_turn or None,
+        )
+        if not result.success:
+            raise BoundedExecutionError(
+                result.message,
+                diagnostic=result.diagnostic or "unsupported_operation",
+                detail={
+                    "action_id": action_id,
+                    "bounded_execution_diagnostic": result.diagnostic,
+                },
+            )
+
+        item.execution_status = EXECUTION_STATUS_EXECUTED_BY_BOUNDED_EXECUTOR
+        item.execution_record = result.execution_record
+        item.lifecycle_status = LIFECYCLE_CLOSED
+        if envelope is not None:
+            envelope.candidate["execution_status"] = EXECUTION_STATUS_EXECUTED_BY_BOUNDED_EXECUTOR
+            envelope.candidate["execution_record"] = result.execution_record
+            # Original rules-only decision remains immutable (never assigned here).
+
+        for record in result.evidence_records:
+            self._session.run_loop.evidence_records.append(record)
+
+        self._session.transcript.append(
+            _transcript_entry(
+                "bounded_local_execution",
+                {
+                    "action_id": action_id,
+                    "workspace_path": str(workspace_path),
+                    "operations_executed": result.operations_executed,
+                    "execution_status": EXECUTION_STATUS_EXECUTED_BY_BOUNDED_EXECUTOR,
+                    "evidence_record_ids": [record.record_id for record in result.evidence_records],
+                    "note": (
+                        "Executed by Admissible bounded local executor v0; "
+                        "no shell commands were run."
+                    ),
+                },
+            )
+        )
         self._persist()
         return self.state_view()
 

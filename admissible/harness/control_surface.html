@@ -106,6 +106,7 @@
   .badge-proposed-only { background: #1e2a55; color: #a5b4fc; border-color: #4338ca; }
   .badge-admitted-not-executed { background: #3f3308; color: #fde68a; border-color: #b45309; }
   .badge-executed-after-admission { background: #06322a; color: #6ee7b7; border-color: #059669; }
+  .badge-executed-by-bounded-executor { background: #1a2e44; color: #7dd3fc; border-color: #0284c7; }
   .badge-blocked { background: #3a1010; color: #fca5a5; border-color: #dc2626; }
   .badge-no-side-effect { background: #0f2f4a; color: #93c5fd; border-color: #2563eb; }
 
@@ -632,6 +633,7 @@ function renderMissionSummary(state) {
       <div class="stat-tile"><span class="stat-label">Needs approval</span><span class="stat-value">${escapeHtml(d.REQUIRE_HUMAN_APPROVAL || 0)}</span></div>
       <div class="stat-tile"><span class="stat-label">Refused</span><span class="stat-value">${escapeHtml(d.REFUSE || 0)}</span></div>
       <div class="stat-tile"><span class="stat-label">Executed after admission</span><span class="stat-value">${escapeHtml(e.executed_after_admission || 0)}</span></div>
+      <div class="stat-tile"><span class="stat-label">Executed by bounded executor</span><span class="stat-value">${escapeHtml(e.executed_by_bounded_executor || 0)}</span></div>
       <div class="stat-tile"><span class="stat-label">Admitted, not executed</span><span class="stat-value">${escapeHtml(e.admitted_not_executed || 0)}</span></div>
       <div class="stat-tile"><span class="stat-label">Proposed only</span><span class="stat-value">${escapeHtml(e.proposed_only || 0)}</span></div>
       <div class="${attentionClass}"><span class="stat-label">Needs you now</span><span class="stat-value">${escapeHtml(ms.needs_attention_count || 0)}</span></div>
@@ -890,7 +892,10 @@ function filteredQueue(state) {
     case "allowed_local":
       return queue.filter((item) => item.decision === "ALLOW");
     case "executed":
-      return queue.filter((item) => item.execution_status === "executed_after_admission");
+      return queue.filter((item) =>
+        item.execution_status === "executed_after_admission" ||
+        item.execution_status === "executed_by_bounded_executor"
+      );
     default:
       return queue;
   }
@@ -1019,7 +1024,21 @@ function renderSelectedAction(state) {
     : "";
   const admittedNote =
     item.execution_status === "admitted_not_executed" || item.lifecycle_status === "admitted_not_executed"
-      ? `<p class="no-action-note" style="font-style:normal;color:#fde68a;">Admitted by Admissible but not executed here. Run externally, then attest if your autonomy level allows.</p>`
+      ? `<p class="no-action-note" style="font-style:normal;color:#fde68a;">Admitted by Admissible but not executed here. Use bounded executor for structured local file ops, or run externally and attest if your autonomy level allows.</p>`
+      : "";
+  const boundedDiagnostic = item.bounded_execution_message
+    ? `<p class="no-action-note" style="font-style:normal;color:var(--cs-muted);">${escapeHtml(item.bounded_execution_message)}${item.bounded_execution_diagnostic ? ` <code>${escapeHtml(item.bounded_execution_diagnostic)}</code>` : ""}</p>`
+    : "";
+  const boundedFormHtml =
+    item.bounded_execution_eligible && item.execution_status !== "executed_by_bounded_executor"
+      ? `
+      <form class="bounded-execute-form" data-action-id="${escapeHtml(item.action_id)}">
+        <div class="field"><label>Workspace path (required)</label>
+          <input type="text" name="workspace_path" placeholder="Path to approved local workspace" value="${escapeHtml(document.getElementById("bridge-workspace-path")?.value || "")}">
+        </div>
+        <button type="submit">Execute bounded local file action</button>
+      </form>
+    `
       : "";
   const closedNote =
     item.lifecycle_status === "resolved_gate" || item.lifecycle_status === "refused_closed" || item.lifecycle_status === "closed"
@@ -1043,9 +1062,11 @@ function renderSelectedAction(state) {
     ${evidenceStateHtml}
     ${lifecycleNote}
     ${admittedNote}
+    ${boundedDiagnostic}
     ${closedNote}
     ${decisionsHtml}
     ${evidenceFormHtml}
+    ${boundedFormHtml}
     ${formHtml}
   `;
 
@@ -1053,6 +1074,8 @@ function renderSelectedAction(state) {
   if (form) form.addEventListener("submit", onDecideSubmit);
   const evidenceForm = body.querySelector("form.evidence-form");
   if (evidenceForm) evidenceForm.addEventListener("submit", onEvidenceSubmit);
+  const boundedForm = body.querySelector("form.bounded-execute-form");
+  if (boundedForm) boundedForm.addEventListener("submit", onBoundedExecuteSubmit);
 }
 
 function selectAction(actionId) {
@@ -1395,6 +1418,24 @@ async function onEvidenceSubmit(event) {
   const satisfies = formData.get("satisfies");
   body.satisfies = satisfies ?? "";
   await runAction(() => apiPost(`/api/queue/${encodeURIComponent(actionId)}/evidence`, body));
+}
+
+async function onBoundedExecuteSubmit(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const actionId = form.getAttribute("data-action-id");
+  const formData = new FormData(form);
+  const workspacePath = (formData.get("workspace_path") || "").trim();
+  if (!workspacePath) {
+    showError("Enter a workspace path before executing a bounded local file action.");
+    return;
+  }
+  clearError();
+  await runAction(() =>
+    apiPost(`/api/queue/${encodeURIComponent(actionId)}/execute_bounded_local`, {
+      workspace_path: workspacePath,
+    })
+  );
 }
 
 document.getElementById("btn-generate-instruction").addEventListener("click", () => {

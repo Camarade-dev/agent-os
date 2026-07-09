@@ -48,6 +48,7 @@ from admissible.control_surface import (
     InvalidSessionFileError,
     load_persisted_session,
 )
+from admissible.execution.bounded_local_executor import BoundedExecutionError
 from admissible.runner import cursor_bridge
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -187,6 +188,9 @@ class _ControlSurfaceRequestHandler(BaseHTTPRequestHandler):
             elif parsed.path.startswith("/api/queue/") and parsed.path.endswith("/evidence"):
                 action_id = unquote(parsed.path.split("/")[3])
                 result = self.controller.provide_evidence(action_id, body)
+            elif parsed.path.startswith("/api/queue/") and parsed.path.endswith("/execute_bounded_local"):
+                action_id = unquote(parsed.path.split("/")[3])
+                result = self.controller.execute_bounded_local(action_id, body)
             else:
                 self._send_json(404, {"error": f"not found: {parsed.path}"})
                 return
@@ -195,6 +199,8 @@ class _ControlSurfaceRequestHandler(BaseHTTPRequestHandler):
             detail = getattr(exc, "detail", None)
             if isinstance(detail, dict):
                 payload.update(detail)
+            elif isinstance(exc, BoundedExecutionError):
+                payload["diagnostic"] = exc.diagnostic
             self._send_json(400, payload)
             return
         except Exception as exc:  # local dev tool: surface the error, keep serving
