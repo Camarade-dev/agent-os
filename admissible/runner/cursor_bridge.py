@@ -38,10 +38,10 @@ Hard constraints (v0) -- same boundary as the rest of `admissible`, plus:
   `evaluator.rules_only.evaluate_envelope` unchanged.
 - Never mutates an original admission decision -- this module produces no
   decisions of its own; it only moves packet/response text through files.
-- `bridge-state.json` (see `write_bridge_state`) is bridge diagnostics only
-  -- it is never consulted by, and never an authority for, an admission
-  decision. It only ever produces non-blocking *warnings* (e.g. "this looks
-  stale"), never a gate.
+- `bridge-state.json` (see `write_bridge_state`) tracks instruction/response
+  turn metadata and enforces bridge hygiene only: stale or duplicate response
+  files are blocked from ingestion. This is not an admission gate -- it
+  never changes a rules-only decision on an already-ingested action.
 - The optional "open workspace in Cursor" helper never shells out and never
   constructs a command from response/agent-controlled text -- it only
   launches a discovered or explicitly configured Cursor executable, always
@@ -125,6 +125,18 @@ class ResponseFileNotFoundError(CursorBridgeError):
 
 class InvalidSessionFileError(CursorBridgeError):
     """Raised when a persisted Control Surface session file cannot be loaded."""
+
+
+class StaleResponseError(CursorBridgeError):
+    """Raised when a response file predates the current instruction turn."""
+
+
+class DuplicateResponseError(CursorBridgeError):
+    """Raised when an identical response was already ingested for this turn."""
+
+
+class NoAwaitingInstructionError(CursorBridgeError):
+    """Raised when no instruction is awaiting a response for the current turn."""
 
 
 def _now_iso() -> str:
@@ -217,11 +229,11 @@ def read_bridge_state(workspace: Path) -> dict[str, Any] | None:
 def write_bridge_state(workspace: Path, updates: dict[str, Any]) -> Path:
     """Merge `updates` into `<workspace>/.admissible/bridge-state.json` and persist it.
 
-    Pure bridge diagnostics -- session id, turn, instruction path/sha256,
-    written_at, expected response path, plus (best-effort) the most recent
-    ingestion's turn/sha256 so a later ingest can flag a likely-stale
-    response. Never consulted for, and never able to affect, an admission
-    decision.
+    Bridge turn metadata -- session id, turn, instruction path/sha256,
+    written_at, expected response path, awaiting-response flag, and the most
+    recent ingestion's turn/sha256. Used to block stale or duplicate response
+    ingestion. Never consulted for, and never able to affect, a rules-only
+    admission decision on an already-ingested action.
     """
     path = _bridge_state_path(workspace)
     state = read_bridge_state(workspace) or {}
@@ -292,6 +304,128 @@ def build_controller(
     return controller
 
 
+# -- response freshness / duplicate hygiene (bridge-only; not admission) -----
+
+
+def _archived_response_path(workspace: Path, *, turn: int) -> Path:
+    return _bridge_dir(workspace) / f"agent-response.turn{turn}.archived.md"
+
+
+def _archive_stale_response_file(workspace: Path, *, turn: int) -> str | None:
+    """Move a leftover `agent-response.md` into a turn-labelled archive file.
+
+    Preserves audit trail on disk; the live response path must be empty before
+    a new instruction turn awaits a fresh reply.
+    """
+    response_path = _response_path(workspace)
+    if not response_path.is_file():
+        return None
+    archive_path = _archived_response_path(workspace, turn=turn)
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(response_path), str(archive_path))
+    return str(archive_path)
+
+
+def _validate_response_for_ingest(
+    controller: ControlSurfaceController,
+    workspace: Path,
+    *,
+    response_meta: dict[str, Any],
+) -> None:
+    """Raise a clear `CursorBridgeError` when a response must not be ingested."""
+    instruction_path = _instruction_path(workspace)
+    bridge_state = read_bridge_state(workspace) or {}
+    session_turn = controller.state_view()["run_loop"]["current_turn"] or 0
+    bridge_turn = bridge_state.get("turn")
+    response_sha256 = response_meta["sha256"]
+
+    if not instruction_path.is_file():
+        raise NoAwaitingInstructionError(
+            "No current instruction file found. Write a new instruction before ingesting a response.",
+            detail={
+                "reason": "no_instruction",
+                "instruction_path": str(instruction_path),
+                "exists": False,
+            },
+        )
+
+    if bridge_state.get("awaiting_response") is not True:
+        ingested_turn = bridge_state.get("response_ingested_for_turn")
+        ingested_sha = bridge_state.get("ingested_response_sha256")
+        if ingested_sha == response_sha256 and ingested_turn == bridge_turn:
+            raise DuplicateResponseError(
+                "This response was already ingested for the current instruction turn.",
+                detail={
+                    "reason": "duplicate_response",
+                    "turn_number": ingested_turn,
+                    "response_sha256": response_sha256,
+                    "last_ingested_at": bridge_state.get("last_ingested_at"),
+                },
+            )
+        raise NoAwaitingInstructionError(
+            "No instruction is currently awaiting a response for this turn.",
+            detail={
+                "reason": "no_awaiting_instruction",
+                "bridge_turn": bridge_turn,
+                "response_ingested_for_turn": ingested_turn,
+            },
+        )
+
+    if bridge_turn is not None and session_turn and bridge_turn != session_turn:
+        raise StaleResponseError(
+            "Response does not match the latest instruction turn.",
+            detail={
+                "reason": "instruction_turn_mismatch",
+                "bridge_turn": bridge_turn,
+                "session_turn": session_turn,
+            },
+        )
+
+    instruction_meta = _file_metadata(instruction_path)
+    if (
+        response_meta["modified_at"] is not None
+        and instruction_meta["modified_at"] is not None
+        and response_meta["modified_at"] < instruction_meta["modified_at"]
+    ):
+        raise StaleResponseError(
+            "Response file is older than the current instruction file and is not fresh for this turn.",
+            detail={
+                "reason": "stale_response",
+                "response_modified_at": response_meta["modified_at"],
+                "instruction_modified_at": instruction_meta["modified_at"],
+            },
+        )
+
+    ingested_sha = bridge_state.get("ingested_response_sha256")
+    if ingested_sha == response_sha256 and bridge_state.get("response_ingested_for_turn") == bridge_turn:
+        raise DuplicateResponseError(
+            "This response file's content is identical to one already ingested for this instruction turn.",
+            detail={
+                "reason": "duplicate_response",
+                "turn_number": bridge_turn,
+                "response_sha256": response_sha256,
+                "last_ingested_at": bridge_state.get("last_ingested_at"),
+            },
+        )
+
+
+def _record_blocked_ingest(
+    controller: ControlSurfaceController,
+    workspace: Path,
+    exc: CursorBridgeError,
+    *,
+    response_meta: dict[str, Any],
+) -> None:
+    reason = str(exc.detail.get("reason") or "blocked")
+    controller.record_bridge_ingest_blocked(
+        reason,
+        workspace_path=str(workspace),
+        response_sha256=response_meta.get("sha256"),
+        turn_number=exc.detail.get("turn_number") or exc.detail.get("bridge_turn"),
+        detail=dict(exc.detail),
+    )
+
+
 # -- core operations, parameterized by an existing controller ----------------
 #
 # Split out so admissible.runner.control_surface's HTTP server can reuse the
@@ -320,6 +454,11 @@ def write_next_instruction_with_controller(
     bridge_dir.mkdir(parents=True, exist_ok=True)
     instruction_path = _instruction_path(workspace)
     response_path = _response_path(workspace)
+
+    prior_bridge_state = read_bridge_state(workspace) or {}
+    archive_turn = prior_bridge_state.get("turn") or max(packet["turn_number"] - 1, 1)
+    archived_response_path = _archive_stale_response_file(workspace, turn=archive_turn)
+
     rendered = render_instruction_file(packet["packet_text"], workspace=workspace)
     instruction_path.write_text(rendered, encoding="utf-8")
 
@@ -333,6 +472,9 @@ def write_next_instruction_with_controller(
             "instruction_sha256": file_meta["sha256"],
             "written_at": _now_iso(),
             "expected_response_path": str(response_path),
+            "awaiting_response": True,
+            "response_ingested_for_turn": None,
+            "ingested_response_sha256": None,
         },
     )
 
@@ -350,6 +492,8 @@ def write_next_instruction_with_controller(
         "preview_lines": _preview_lines(rendered),
         "next_instruction": NEXT_INSTRUCTION_NOTE,
         "bridge_state_path": str(bridge_state_path),
+        "archived_response_path": archived_response_path,
+        "prior_response_invalidated": archived_response_path is not None,
     }
     return {**state, "bridge": bridge_info}
 
@@ -368,14 +512,12 @@ def ingest_response_file_with_controller(
     in `.detail`) or `CursorBridgeError` (empty file) -- both ValueError
     subclasses -- rather than silently no-oping. On success, `bridge`
     carries the same independently-re-read file metadata as the write path,
-    plus non-blocking `warnings` (e.g. the response file looking older than
-    the instruction file, or matching a response already ingested for an
-    earlier turn) and the explicit reminder that ingestion never executes
-    anything.
+    plus the explicit reminder that ingestion never executes anything.
+    Stale or duplicate responses are blocked before `ingest_agent_response`
+    is called.
     """
     workspace = _validate_workspace(workspace_path)
     response_path = _response_path(workspace)
-    instruction_path = _instruction_path(workspace)
 
     if not response_path.is_file():
         raise ResponseFileNotFoundError(
@@ -391,25 +533,11 @@ def ingest_response_file_with_controller(
             detail={"path": str(response_path), "exists": True, "bytes": response_meta["bytes"]},
         )
 
-    warnings: list[str] = []
-    if instruction_path.is_file():
-        instruction_meta = _file_metadata(instruction_path)
-        if (
-            response_meta["modified_at"] is not None
-            and instruction_meta["modified_at"] is not None
-            and response_meta["modified_at"] < instruction_meta["modified_at"]
-        ):
-            warnings.append(
-                "Response file's modified time is older than the instruction file's -- "
-                "this response may be stale (written before the current instruction)."
-            )
-
-    bridge_state = read_bridge_state(workspace)
-    if bridge_state and bridge_state.get("last_ingested_response_sha256") == response_meta["sha256"]:
-        warnings.append(
-            "This response file's content is identical to one already ingested "
-            f"(turn {bridge_state.get('last_ingested_turn')}) -- it may be stale from a previous turn."
-        )
+    try:
+        _validate_response_for_ingest(controller, workspace, response_meta=response_meta)
+    except CursorBridgeError as exc:
+        _record_blocked_ingest(controller, workspace, exc, response_meta=response_meta)
+        raise
 
     state = controller.ingest_agent_response(raw_text)
     record = state["run_loop"]["response_records"][-1]
@@ -417,12 +545,16 @@ def ingest_response_file_with_controller(
     new_items = [item for item in state["queue"] if item["action_id"] in action_ids]
     decisions = [item["decision"] for item in new_items]
 
+    ingested_at = _now_iso()
     write_bridge_state(
         workspace,
         {
             "last_ingested_turn": record["turn_number"],
             "last_ingested_response_sha256": response_meta["sha256"],
-            "last_ingested_at": _now_iso(),
+            "last_ingested_at": ingested_at,
+            "awaiting_response": False,
+            "response_ingested_for_turn": record["turn_number"],
+            "ingested_response_sha256": response_meta["sha256"],
         },
     )
 
@@ -441,7 +573,7 @@ def ingest_response_file_with_controller(
         "action_ids": list(record["action_ids"]),
         "decisions": decisions,
         "decision_summary": dict(Counter(decisions)),
-        "warnings": warnings,
+        "ingested_response_sha256": response_meta["sha256"],
         "note": "Nothing was executed by Admissible.",
     }
     return {**state, "bridge": bridge_info}
@@ -683,8 +815,6 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Read turn {bridge['turn_number']} response from {bridge['response_path']}")
             print(f"  bytes={bridge['bytes']} sha256={bridge['sha256']} modified_at={bridge['modified_at']}")
             print(f"  extracted {bridge['action_count']} action candidate(s): {bridge['decision_summary']}")
-            for warning in bridge["warnings"]:
-                print(f"  warning: {warning}")
             print(f"  {bridge['note']}")
             print(json.dumps(bridge, indent=2, sort_keys=True))
         elif args.copy_next_instruction:

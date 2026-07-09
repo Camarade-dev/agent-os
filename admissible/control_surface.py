@@ -1094,6 +1094,31 @@ class ControlSurfaceController:
         self._persist()
         return self.state_view()
 
+    def record_bridge_ingest_blocked(
+        self,
+        reason: str,
+        *,
+        workspace_path: str,
+        response_sha256: str | None = None,
+        turn_number: int | None = None,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        """Record a blocked bridge response-ingest attempt in the session transcript.
+
+        Does not append queue items or mutate any admission decision.
+        """
+        payload: dict[str, Any] = {
+            "reason": reason,
+            "workspace_path": workspace_path,
+            "response_sha256": response_sha256,
+            "turn_number": turn_number,
+            "note": "Bridge ingest blocked before candidate extraction; no queue items were created.",
+        }
+        if detail:
+            payload["detail"] = detail
+        self._session.transcript.append(_transcript_entry("bridge_ingest_blocked", payload))
+        self._persist()
+
     def ingest_agent_response(self, raw_text: str) -> dict[str, Any]:
         """Ingest one pasted, unverified agent/Cursor response.
 

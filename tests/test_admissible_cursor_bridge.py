@@ -29,8 +29,11 @@ from admissible.runner import cursor_bridge
 from admissible.runner.cursor_bridge import (
     CURSOR_LAUNCHER_ENV_VAR,
     CursorBridgeError,
+    DuplicateResponseError,
     InvalidSessionFileError,
+    NoAwaitingInstructionError,
     ResponseFileNotFoundError,
+    StaleResponseError,
     WorkspaceNotFoundError,
     build_controller,
     check_workspace,
@@ -151,6 +154,8 @@ class TestWriteNextInstructionWithController(unittest.TestCase):
 
     def test_advances_turn_and_overwrites_file_on_repeated_calls(self) -> None:
         first = write_next_instruction_with_controller(self.controller, self.workspace)
+        response_path = self.workspace / ".admissible" / "agent-response.md"
+        response_path.write_text(RAW_INSTALL_DEPENDENCY_RESPONSE, encoding="utf-8")
         second = write_next_instruction_with_controller(self.controller, self.workspace)
         self.assertEqual(first["bridge"]["turn_number"], 1)
         self.assertEqual(second["bridge"]["turn_number"], 2)
@@ -158,6 +163,21 @@ class TestWriteNextInstructionWithController(unittest.TestCase):
         instruction_path = Path(second["bridge"]["instruction_path"])
         content = instruction_path.read_text(encoding="utf-8")
         self.assertIn("turn 2", content)
+
+    def test_writing_new_instruction_archives_prior_response_file(self) -> None:
+        write_next_instruction_with_controller(self.controller, self.workspace)
+        response_path = self.workspace / ".admissible" / "agent-response.md"
+        response_path.write_text(RAW_INSTALL_DEPENDENCY_RESPONSE, encoding="utf-8")
+
+        result = write_next_instruction_with_controller(self.controller, self.workspace)
+        bridge = result["bridge"]
+
+        self.assertTrue(bridge["prior_response_invalidated"])
+        self.assertFalse(response_path.exists())
+        archived_path = Path(bridge["archived_response_path"])
+        self.assertTrue(archived_path.is_file())
+        self.assertEqual(archived_path.name, "agent-response.turn1.archived.md")
+        self.assertEqual(archived_path.read_text(encoding="utf-8"), RAW_INSTALL_DEPENDENCY_RESPONSE)
 
     def test_does_not_execute_anything(self) -> None:
         def boom(*args, **kwargs):
@@ -182,7 +202,11 @@ class TestIngestResponseFileWithController(unittest.TestCase):
         self.bridge_dir.mkdir(parents=True, exist_ok=True)
         (self.bridge_dir / "agent-response.md").write_text(text, encoding="utf-8")
 
+    def _write_instruction(self) -> None:
+        write_next_instruction_with_controller(self.controller, self.workspace)
+
     def test_ingests_response_file_and_extracts_action_candidates(self) -> None:
+        self._write_instruction()
         self._write_response(RAW_INSTALL_DEPENDENCY_RESPONSE)
         result = ingest_response_file_with_controller(self.controller, self.workspace)
         bridge = result["bridge"]
@@ -197,6 +221,7 @@ class TestIngestResponseFileWithController(unittest.TestCase):
         self.assertEqual(result["run_loop"]["response_records"][-1]["source_trust"], "unverified_agent_output")
 
     def test_ingest_result_carries_verifiable_file_metadata(self) -> None:
+        self._write_instruction()
         self._write_response(RAW_INSTALL_DEPENDENCY_RESPONSE)
         response_path = self.bridge_dir / "agent-response.md"
         on_disk = response_path.read_bytes()
@@ -210,7 +235,7 @@ class TestIngestResponseFileWithController(unittest.TestCase):
         self.assertEqual(bridge["sha256"], hashlib.sha256(on_disk).hexdigest())
         self.assertTrue(bridge["modified_at"])
         self.assertEqual(bridge["decision_summary"], {"REQUEST_MORE_EVIDENCE": 1})
-        self.assertEqual(bridge["warnings"], [])
+        self.assertEqual(bridge["ingested_response_sha256"], hashlib.sha256(on_disk).hexdigest())
         self.assertEqual(bridge["note"], "Nothing was executed by Admissible.")
 
     def test_ingest_updates_bridge_state_json_with_last_ingested_fields(self) -> None:
@@ -221,6 +246,9 @@ class TestIngestResponseFileWithController(unittest.TestCase):
         state = read_bridge_state(self.workspace)
         self.assertEqual(state["last_ingested_turn"], result["bridge"]["turn_number"])
         self.assertEqual(state["last_ingested_response_sha256"], result["bridge"]["sha256"])
+        self.assertEqual(state["ingested_response_sha256"], result["bridge"]["sha256"])
+        self.assertEqual(state["response_ingested_for_turn"], result["bridge"]["turn_number"])
+        self.assertFalse(state["awaiting_response"])
         self.assertTrue(state["last_ingested_at"])
         # Write-side fields from the earlier write_next_instruction call
         # must survive the merge, not be clobbered by the ingest update.
@@ -234,38 +262,63 @@ class TestIngestResponseFileWithController(unittest.TestCase):
         self.assertEqual(ctx.exception.detail["expected_path"], str(self.bridge_dir / "agent-response.md"))
         self.assertFalse(ctx.exception.detail["exists"])
 
-    def test_stale_warning_when_response_older_than_instruction(self) -> None:
+    def test_stale_response_is_blocked_and_creates_no_queue_items(self) -> None:
+        write_next_instruction_with_controller(self.controller, self.workspace)
         self._write_response(RAW_INSTALL_DEPENDENCY_RESPONSE)
         response_path = self.bridge_dir / "agent-response.md"
+        instruction_path = self.bridge_dir / "next-agent-instruction.md"
 
         import time
 
-        # Give the response file a definitively older mtime, then write the
-        # instruction file (built via the normal write path) afterwards, so
-        # the instruction is unambiguously newer on disk.
         older = time.time() - 3600
         os.utime(response_path, (older, older))
-        write_next_instruction_with_controller(self.controller, self.workspace)
+        os.utime(instruction_path, None)  # bump instruction mtime to now
 
-        result = ingest_response_file_with_controller(self.controller, self.workspace)
-        warnings = result["bridge"]["warnings"]
-        self.assertTrue(any("older than the instruction file" in w for w in warnings))
+        queue_before = len(self.controller.state_view()["queue"])
+        with self.assertRaises(StaleResponseError) as ctx:
+            ingest_response_file_with_controller(self.controller, self.workspace)
+        self.assertIn("older than the current instruction", str(ctx.exception))
+        self.assertEqual(ctx.exception.detail["reason"], "stale_response")
+        self.assertEqual(len(self.controller.state_view()["queue"]), queue_before)
 
-    def test_stale_warning_when_response_content_already_ingested(self) -> None:
+    def test_duplicate_ingest_is_blocked_and_creates_queue_items_only_once(self) -> None:
         write_next_instruction_with_controller(self.controller, self.workspace)
         self._write_response(RAW_INSTALL_DEPENDENCY_RESPONSE)
 
         first = ingest_response_file_with_controller(self.controller, self.workspace)
-        self.assertEqual(first["bridge"]["warnings"], [])
+        self.assertEqual(first["bridge"]["action_count"], 1)
+        queue_len_after_first = len(first["queue"])
 
-        # Same response file content ingested again without a new write in
-        # between -- bridge-state.json's last_ingested_response_sha256 now
-        # matches, so this must be flagged as likely stale.
-        second = ingest_response_file_with_controller(self.controller, self.workspace)
-        warnings = second["bridge"]["warnings"]
-        self.assertTrue(any("already ingested" in w for w in warnings))
+        with self.assertRaises(DuplicateResponseError) as ctx:
+            ingest_response_file_with_controller(self.controller, self.workspace)
+        self.assertIn("already ingested", str(ctx.exception))
+        self.assertEqual(ctx.exception.detail["reason"], "duplicate_response")
+        self.assertEqual(len(self.controller.state_view()["queue"]), queue_len_after_first)
+
+    def test_duplicate_ingest_records_clear_transcript_diagnostic(self) -> None:
+        write_next_instruction_with_controller(self.controller, self.workspace)
+        self._write_response(RAW_INSTALL_DEPENDENCY_RESPONSE)
+        ingest_response_file_with_controller(self.controller, self.workspace)
+
+        with self.assertRaises(DuplicateResponseError):
+            ingest_response_file_with_controller(self.controller, self.workspace)
+
+        blocked = [
+            entry
+            for entry in self.controller.session_dict()["transcript"]
+            if entry["type"] == "bridge_ingest_blocked"
+        ]
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(blocked[0]["payload"]["reason"], "duplicate_response")
+
+    def test_ingest_without_awaiting_instruction_is_blocked(self) -> None:
+        self._write_response(RAW_INSTALL_DEPENDENCY_RESPONSE)
+        with self.assertRaises(NoAwaitingInstructionError) as ctx:
+            ingest_response_file_with_controller(self.controller, self.workspace)
+        self.assertIn("instruction", str(ctx.exception).lower())
 
     def test_empty_response_file_error_detail(self) -> None:
+        self._write_instruction()
         self._write_response("   \n  ")
         on_disk = (self.bridge_dir / "agent-response.md").read_bytes()
         with self.assertRaises(CursorBridgeError) as ctx:
@@ -275,12 +328,14 @@ class TestIngestResponseFileWithController(unittest.TestCase):
         self.assertEqual(ctx.exception.detail["bytes"], len(on_disk))
 
     def test_empty_response_file_raises_clear_error(self) -> None:
+        self._write_instruction()
         self._write_response("   \n  ")
         with self.assertRaises(CursorBridgeError) as ctx:
             ingest_response_file_with_controller(self.controller, self.workspace)
         self.assertIn("empty", str(ctx.exception))
 
     def test_does_not_execute_anything(self) -> None:
+        self._write_instruction()
         self._write_response(RAW_INSTALL_DEPENDENCY_RESPONSE)
 
         def boom(*args, **kwargs):
@@ -771,6 +826,82 @@ class TestCursorBridgeHttpServer(unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertIn("error", body)
+
+    def test_duplicate_ingest_over_http_returns_400_with_clear_reason(self) -> None:
+        dup_workspace = Path(self._tmpdir.name) / "dup_ws"
+        dup_workspace.mkdir()
+        status, _ = self._post(
+            "/api/session/run_loop/bridge/write_instruction", {"workspace_path": str(dup_workspace)}
+        )
+        self.assertEqual(status, 200)
+        response_path = dup_workspace / ".admissible" / "agent-response.md"
+        response_path.write_text(RAW_INSTALL_DEPENDENCY_RESPONSE, encoding="utf-8")
+
+        status, state = self._post(
+            "/api/session/run_loop/bridge/ingest_response", {"workspace_path": str(dup_workspace)}
+        )
+        self.assertEqual(status, 200)
+        queue_len = len(state["queue"])
+
+        status, body = self._post(
+            "/api/session/run_loop/bridge/ingest_response", {"workspace_path": str(dup_workspace)}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("already ingested", body["error"])
+        self.assertEqual(body["reason"], "duplicate_response")
+        self.assertEqual(len(body.get("queue") or state["queue"]), queue_len)
+
+    def test_stale_ingest_over_http_returns_400_with_clear_reason(self) -> None:
+        stale_workspace = Path(self._tmpdir.name) / "stale_ws"
+        stale_workspace.mkdir()
+        status, _ = self._post(
+            "/api/session/run_loop/bridge/write_instruction", {"workspace_path": str(stale_workspace)}
+        )
+        self.assertEqual(status, 200)
+        bridge_dir = stale_workspace / ".admissible"
+        response_path = bridge_dir / "agent-response.md"
+        instruction_path = bridge_dir / "next-agent-instruction.md"
+        response_path.write_text(RAW_INSTALL_DEPENDENCY_RESPONSE, encoding="utf-8")
+
+        import time
+
+        older = time.time() - 3600
+        os.utime(response_path, (older, older))
+        os.utime(instruction_path, None)
+
+        status, body = self._post(
+            "/api/session/run_loop/bridge/ingest_response", {"workspace_path": str(stale_workspace)}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("older than the current instruction", body["error"])
+        self.assertEqual(body["reason"], "stale_response")
+
+
+class TestBridgeFreshnessSessionExport(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.controller = _make_controller(self._tmpdir.name)
+        self.workspace = Path(self._tmpdir.name) / "workspace"
+        self.workspace.mkdir()
+
+    def tearDown(self) -> None:
+        self._tmpdir.cleanup()
+
+    def test_session_export_includes_blocked_bridge_diagnostics(self) -> None:
+        write_next_instruction_with_controller(self.controller, self.workspace)
+        (self.workspace / ".admissible" / "agent-response.md").write_text(
+            RAW_INSTALL_DEPENDENCY_RESPONSE, encoding="utf-8"
+        )
+        ingest_response_file_with_controller(self.controller, self.workspace)
+
+        with self.assertRaises(DuplicateResponseError):
+            ingest_response_file_with_controller(self.controller, self.workspace)
+
+        exported = self.controller.session_dict()
+        blocked = [e for e in exported["transcript"] if e["type"] == "bridge_ingest_blocked"]
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(blocked[0]["payload"]["reason"], "duplicate_response")
+        self.assertEqual(len(exported["queue"]), 1)
 
 
 class TestCursorBridgeHtmlContent(unittest.TestCase):
