@@ -72,7 +72,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from admissible.control_surface import ControlSurfaceController
+from admissible.control_surface import (
+    ControlSurfaceController,
+    InvalidSessionFileError as ControlSurfaceInvalidSessionFileError,
+    load_persisted_session,
+)
 
 BRIDGE_SUBDIR = ".admissible"
 INSTRUCTION_FILENAME = "next-agent-instruction.md"
@@ -291,16 +295,10 @@ def build_controller(
     of letting a raw JSONDecodeError/KeyError escape.
     """
     controller = ControlSurfaceController(repo_root=repo_root, session_dir=session_dir)
-    session_file = controller.session_file
-    if session_file.is_file():
-        try:
-            data = json.loads(session_file.read_text(encoding="utf-8"))
-            controller.import_session(data)
-        except Exception as exc:  # noqa: BLE001 - convert any corrupt-file shape into one clear error
-            raise InvalidSessionFileError(
-                f"invalid session file at {session_file}: {exc}",
-                detail={"session_file": str(session_file)},
-            ) from exc
+    try:
+        load_persisted_session(controller)
+    except ControlSurfaceInvalidSessionFileError as exc:
+        raise InvalidSessionFileError(str(exc), detail=exc.detail) from exc
     return controller
 
 

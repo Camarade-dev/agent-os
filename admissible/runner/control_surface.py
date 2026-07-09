@@ -43,7 +43,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from admissible.control_surface import ControlSurfaceController
+from admissible.control_surface import (
+    ControlSurfaceController,
+    InvalidSessionFileError,
+    load_persisted_session,
+)
 from admissible.runner import cursor_bridge
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -204,12 +208,15 @@ def build_controller(
     session_dir: str | Path | None = None,
     sample_trace_path: str | Path | None = None,
     repo_root: str | Path | None = None,
+    fresh_session: bool = False,
 ) -> ControlSurfaceController:
-    return ControlSurfaceController(
+    controller = ControlSurfaceController(
         session_dir=session_dir,
         sample_trace_path=sample_trace_path,
         repo_root=repo_root,
     )
+    load_persisted_session(controller, fresh_session=fresh_session)
+    return controller
 
 
 def make_server(
@@ -235,19 +242,32 @@ def run(
     session_dir: str | Path | None = None,
     sample_trace_path: str | Path | None = None,
     repo_root: str | Path | None = None,
+    fresh_session: bool = False,
 ) -> None:
     """Build a controller, start the HTTP server, and serve until interrupted."""
-    controller = build_controller(
-        session_dir=session_dir,
-        sample_trace_path=sample_trace_path,
-        repo_root=repo_root,
-    )
+    try:
+        controller = build_controller(
+            session_dir=session_dir,
+            sample_trace_path=sample_trace_path,
+            repo_root=repo_root,
+            fresh_session=fresh_session,
+        )
+    except InvalidSessionFileError as exc:
+        print(f"admissible.runner.control_surface error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
     server = make_server(controller, host=host, port=port)
     actual_port = server.server_address[1]
     url = f"http://{host}:{actual_port}/"
 
     print(_STARTUP_BANNER)
     print(f"Serving at {url} (Ctrl+C to stop)")
+    if controller._session_loaded_from_disk:
+        print(
+            f"Resumed session {controller.session_dict()['session_id']} "
+            f"from {controller.session_file}"
+        )
+    else:
+        print(f"Fresh in-memory session (persist path: {controller.session_file})")
 
     if open_browser:
         webbrowser.open(url)
@@ -289,6 +309,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Directory for local session JSON artifacts (default: .admissible/control_surface_sessions).",
     )
     parser.add_argument(
+        "--fresh-session",
+        action="store_true",
+        help=(
+            "Start from a new empty in-memory session instead of resuming "
+            "session.json when it already exists on disk."
+        ),
+    )
+    parser.add_argument(
         "--sample-trace",
         default=None,
         help=(
@@ -307,6 +335,7 @@ def main(argv: list[str] | None = None) -> int:
         open_browser=args.open_browser,
         session_dir=args.session_dir,
         sample_trace_path=args.sample_trace,
+        fresh_session=args.fresh_session,
     )
     return 0
 

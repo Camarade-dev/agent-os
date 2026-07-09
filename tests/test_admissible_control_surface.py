@@ -24,9 +24,10 @@ from admissible.control_surface import (
     ControlSession,
     ControlSurfaceController,
     DecisionQueueItem,
+    InvalidSessionFileError,
     available_human_actions,
 )
-from admissible.run_loop import queue_item_needs_attention
+from admissible.run_loop import LIFECYCLE_RESOLVED_GATE, queue_item_needs_attention
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SAMPLE_TRACE_PATH = (
@@ -424,6 +425,197 @@ class TestSyntheticRequireApprovalAndRefuse(unittest.TestCase):
             self.controller.decide("synthetic_refuse", {"decision_type": "approve"})
         with self.assertRaises(ValueError):
             self.controller.decide("synthetic_refuse", {"decision_type": "refuse"})
+
+
+class TestSessionPersistenceParity(unittest.TestCase):
+    """ADMISSIBLE_CONTROL_SURFACE_004_SESSION_PERSISTENCE_PARITY.
+
+    HTTP Control Surface startup must resume persisted session.json the same
+    way the CLI cursor_bridge build_controller does.
+    """
+
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.session_dir = Path(self._tmpdir.name) / "sessions"
+        self.sample_trace = SAMPLE_TRACE_PATH
+
+    def tearDown(self) -> None:
+        self._tmpdir.cleanup()
+
+    def _persist_sample_session(self) -> tuple[str, int]:
+        from admissible.runner.control_surface import build_controller as build_http_controller
+
+        writer = build_http_controller(
+            session_dir=self.session_dir,
+            sample_trace_path=self.sample_trace,
+            fresh_session=True,
+        )
+        state = writer.load_sample_session()
+        session_id = state["session_id"]
+        queue_len = len(state["queue"])
+        self.assertGreater(queue_len, 0)
+        return session_id, queue_len
+
+    def test_http_build_controller_resumes_persisted_session(self) -> None:
+        from admissible.runner.control_surface import build_controller as build_http_controller
+
+        session_id, queue_len = self._persist_sample_session()
+        resumed = build_http_controller(session_dir=self.session_dir, sample_trace_path=self.sample_trace)
+        state = resumed.state_view()
+        self.assertEqual(state["session_id"], session_id)
+        self.assertEqual(len(state["queue"]), queue_len)
+        self.assertTrue(state["session_loaded_from_disk"])
+        self.assertEqual(state["session_file"], str(self.session_dir / "session.json"))
+
+    def test_http_startup_does_not_clobber_persisted_queue(self) -> None:
+        from admissible.runner.control_surface import build_controller as build_http_controller
+
+        session_id, queue_len = self._persist_sample_session()
+        before = json.loads((self.session_dir / "session.json").read_text(encoding="utf-8"))
+
+        build_http_controller(session_dir=self.session_dir, sample_trace_path=self.sample_trace)
+        after = json.loads((self.session_dir / "session.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(after["session_id"], session_id)
+        self.assertEqual(len(after["queue"]), queue_len)
+        self.assertEqual(len(before["queue"]), queue_len)
+
+    def test_cli_persisted_session_loads_via_http_build_controller(self) -> None:
+        from admissible.runner.control_surface import build_controller as build_http_controller
+        from admissible.runner.cursor_bridge import build_controller as build_cli_controller
+
+        cli = build_cli_controller(session_dir=self.session_dir)
+        cli.load_sample_session()
+        session_id = cli.session_dict()["session_id"]
+
+        http = build_http_controller(session_dir=self.session_dir, sample_trace_path=self.sample_trace)
+        self.assertEqual(http.state_view()["session_id"], session_id)
+        self.assertEqual(len(http.state_view()["queue"]), len(cli.state_view()["queue"]))
+
+    def test_http_updated_session_reloads_via_cli_build_controller(self) -> None:
+        from admissible.runner.control_surface import build_controller as build_http_controller
+        from admissible.runner.cursor_bridge import build_controller as build_cli_controller
+
+        http = build_http_controller(
+            session_dir=self.session_dir,
+            sample_trace_path=self.sample_trace,
+            fresh_session=True,
+        )
+        http.set_autonomy("L2_LOCAL_BATCH_APPROVAL")
+        http_session_id = http.session_dict()["session_id"]
+
+        cli = build_cli_controller(session_dir=self.session_dir)
+        self.assertEqual(cli.state_view()["session_id"], http_session_id)
+        self.assertEqual(cli.state_view()["autonomy_level"], "L2_LOCAL_BATCH_APPROVAL")
+
+    def test_invalid_session_file_raises_instead_of_silent_reset(self) -> None:
+        from admissible.runner.control_surface import build_controller as build_http_controller
+
+        self.session_dir.mkdir(parents=True)
+        session_file = self.session_dir / "session.json"
+        session_file.write_text("not valid json {{{", encoding="utf-8")
+        with self.assertRaises(InvalidSessionFileError) as ctx:
+            build_http_controller(session_dir=self.session_dir, sample_trace_path=self.sample_trace)
+        self.assertIn("invalid session file", str(ctx.exception))
+        self.assertEqual(ctx.exception.detail["session_file"], str(session_file))
+
+    def test_fresh_session_skips_resume_when_file_exists(self) -> None:
+        from admissible.runner.control_surface import build_controller as build_http_controller
+
+        persisted_id, _ = self._persist_sample_session()
+        fresh = build_http_controller(
+            session_dir=self.session_dir,
+            sample_trace_path=self.sample_trace,
+            fresh_session=True,
+        )
+        state = fresh.state_view()
+        self.assertNotEqual(state["session_id"], persisted_id)
+        self.assertEqual(state["run_loop"]["current_turn"], 0)
+        self.assertFalse(state["session_loaded_from_disk"])
+        on_disk = json.loads((self.session_dir / "session.json").read_text(encoding="utf-8"))
+        self.assertEqual(on_disk["session_id"], persisted_id)
+
+    def test_state_view_exposes_session_path_diagnostics(self) -> None:
+        from admissible.runner.control_surface import build_controller as build_http_controller
+
+        self._persist_sample_session()
+        controller = build_http_controller(session_dir=self.session_dir, sample_trace_path=self.sample_trace)
+        state = controller.state_view()
+        self.assertEqual(state["session_file"], str(self.session_dir / "session.json"))
+        self.assertTrue(state["session_loaded_from_disk"])
+
+    def test_resumed_session_preserves_derived_lifecycle_and_plan_gates(self) -> None:
+        from admissible.runner.control_surface import build_controller as build_http_controller
+        from admissible.runner.extraction_lab import load_fixture
+
+        fixtures_dir = (
+            REPO_ROOT
+            / "benchmark"
+            / "long_run_scenarios"
+            / "cursor_slither_demo"
+            / "fixtures"
+            / "pasted_agent_responses"
+        )
+        plan_gate_fixture = fixtures_dir / "cursor_plan_gate_resolution_request.txt"
+        slither_prompt = (
+            "Build a small browser-based Slither-like game with a moving snake, "
+            "collectible food, growth, collision handling, score display, restart "
+            "behavior, and simple visual polish. Keep it local-only. Do not deploy. "
+            "Ask before installing dependencies or deleting existing files."
+        )
+
+        writer = build_http_controller(session_dir=self.session_dir, sample_trace_path=self.sample_trace)
+        writer.submit_goal(slither_prompt)
+        writer.ingest_agent_response(load_fixture(plan_gate_fixture))
+        item = writer.state_view()["queue"][-1]
+        writer.decide(
+            item["action_id"],
+            {"decision_type": "approve", "scope": "local_workspace_only", "rationale": "ok"},
+        )
+        exported = writer.session_dict()
+
+        resumed = build_http_controller(session_dir=self.session_dir, sample_trace_path=self.sample_trace)
+        state = resumed.state_view()
+        self.assertEqual(
+            len(state["run_loop"]["derived_lifecycle_resolutions"]),
+            len(exported["run_loop"]["derived_lifecycle_resolutions"]),
+        )
+        self.assertEqual(
+            len(state["run_loop"]["resolved_plan_gates"]),
+            len(exported["run_loop"]["resolved_plan_gates"]),
+        )
+        reloaded_item = next(i for i in state["queue"] if i["action_id"] == item["action_id"])
+        self.assertEqual(reloaded_item["lifecycle_status"], LIFECYCLE_RESOLVED_GATE)
+
+    def test_resumed_session_preserves_bridge_blocked_ingest_diagnostics(self) -> None:
+        from admissible.runner.control_surface import build_controller as build_http_controller
+        from admissible.runner.cursor_bridge import (
+            DuplicateResponseError,
+            ingest_response_file_with_controller,
+            write_next_instruction_with_controller,
+        )
+
+        raw_response = (
+            "User: Please add a helper dependency.\n\n"
+            "Proposed command:\n"
+            "    npm install left-pad\n"
+        )
+        workspace = Path(self._tmpdir.name) / "workspace"
+        workspace.mkdir()
+
+        writer = build_http_controller(session_dir=self.session_dir, sample_trace_path=self.sample_trace)
+        write_next_instruction_with_controller(writer, workspace)
+        (workspace / ".admissible" / "agent-response.md").write_text(raw_response, encoding="utf-8")
+        ingest_response_file_with_controller(writer, workspace)
+        with self.assertRaises(DuplicateResponseError):
+            ingest_response_file_with_controller(writer, workspace)
+
+        resumed = build_http_controller(session_dir=self.session_dir, sample_trace_path=self.sample_trace)
+        blocked = [
+            e for e in resumed.session_dict()["transcript"] if e["type"] == "bridge_ingest_blocked"
+        ]
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(blocked[0]["payload"]["reason"], "duplicate_response")
 
 
 class TestControlSurfaceHttpServer(unittest.TestCase):

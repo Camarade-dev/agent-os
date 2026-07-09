@@ -106,6 +106,14 @@ SAMPLE_SLITHER_PROMPT = (
 )
 
 
+class InvalidSessionFileError(ValueError):
+    """Raised when a persisted Control Surface session file cannot be loaded."""
+
+    def __init__(self, message: str, *, detail: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.detail: dict[str, Any] = dict(detail) if detail else {}
+
+
 class AutonomyLevel(str, Enum):
     """Stable v0 autonomy levels. Order is low-to-high autonomy."""
 
@@ -762,6 +770,7 @@ class ControlSurfaceController:
             else self._repo_root / DEFAULT_SAMPLE_TRACE_RELATIVE_PATH
         )
         self._session_file = self._session_dir / "session.json"
+        self._session_loaded_from_disk = False
         self._session = self._new_session()
 
     @staticmethod
@@ -810,6 +819,8 @@ class ControlSurfaceController:
         ]
         view["mission_summary"] = _mission_summary(self._session)
         view["needs_attention"] = _needs_attention(self._session)
+        view["session_file"] = str(self._session_file)
+        view["session_loaded_from_disk"] = self._session_loaded_from_disk
         return view
 
     def _persist(self) -> None:
@@ -1280,6 +1291,42 @@ class ControlSurfaceController:
         return self.state_view()
 
 
+def load_persisted_session(
+    controller: ControlSurfaceController,
+    *,
+    fresh_session: bool = False,
+) -> bool:
+    """Load ``session.json`` from ``controller.session_file`` when present.
+
+    ``ControlSurfaceController.__init__`` always starts from a fresh in-memory
+    session; callers that want CLI/HTTP resume parity invoke this after
+    construction. Returns ``True`` when a persisted session was loaded,
+    ``False`` when starting from the in-memory fresh session (no file, or
+    ``fresh_session=True``). Raises ``InvalidSessionFileError`` when the file
+    exists but cannot be parsed or imported — never silently replaces it with
+    an empty session.
+    """
+    if fresh_session:
+        controller._session_loaded_from_disk = False
+        return False
+
+    session_file = controller.session_file
+    if not session_file.is_file():
+        controller._session_loaded_from_disk = False
+        return False
+
+    try:
+        data = json.loads(session_file.read_text(encoding="utf-8"))
+        controller.import_session(data)
+        controller._session_loaded_from_disk = True
+        return True
+    except Exception as exc:  # noqa: BLE001 - convert any corrupt-file shape into one clear error
+        raise InvalidSessionFileError(
+            f"invalid session file at {session_file}: {exc}",
+            detail={"session_file": str(session_file)},
+        ) from exc
+
+
 __all__ = [
     "AUTONOMY_LEVEL_ORDER",
     "AUTONOMY_PROFILES",
@@ -1288,6 +1335,7 @@ __all__ = [
     "CONTROL_SESSION_SCHEMA_VERSION",
     "ControlSession",
     "ControlSurfaceController",
+    "InvalidSessionFileError",
     "DECISION_TYPES",
     "DecisionQueueItem",
     "HumanDecisionRecord",
@@ -1308,5 +1356,6 @@ __all__ = [
     "LIFECYCLE_RESOLVED_GATE",
     "DerivedLifecycleResolution",
     "ResolvedPlanGateRecord",
+    "load_persisted_session",
     "queue_item_needs_attention",
 ]
