@@ -248,6 +248,151 @@ class TestBoundedLocalExecutorCore(unittest.TestCase):
         self.assertEqual(assessment["diagnostic"], DIAG_FORBIDDEN_OPERATION_CATEGORY)
 
 
+class TestBoundedExecutorContentGuardFalsePositives(unittest.TestCase):
+    """Slice ADMISSIBLE_EXECUTION_019_CONTENT_GUARD_FALSE_POSITIVES regressions.
+
+    The live Cursor batch execution demo failed 2/3 writes (index.html,
+    style.css) with `forbidden operation string in write content` because
+    the naive forbidden-word scan flagged harmless prose such as "No npm,
+    git, deploy, network, or shell commands are required." The content guard
+    is now path-aware: html/css/js prose may use those words, but actual
+    embedded network calls or external resource references are still refused,
+    and every other extension keeps the strict naive scan.
+    """
+
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.workspace = Path(self._tmpdir.name) / "workspace"
+        self.workspace.mkdir()
+
+    def tearDown(self) -> None:
+        self._tmpdir.cleanup()
+
+    def _write(self, path: str, content: str, action_id: str):
+        return execute_bounded_local_action(
+            workspace_path=self.workspace,
+            operations=[{"operation": "write_file", "path": path, "content": content}],
+            action_id=action_id,
+        )
+
+    def test_html_harmless_forbidden_words_succeeds(self) -> None:
+        result = self._write(
+            "index.html",
+            "<!doctype html><html><body>"
+            "<p>No npm, git, deploy, network, or shell commands are required.</p>"
+            "</body></html>",
+            "content_guard_html",
+        )
+        self.assertTrue(result.success, result.message)
+        self.assertTrue((self.workspace / "index.html").is_file())
+
+    def test_css_comment_harmless_forbidden_words_succeeds(self) -> None:
+        result = self._write(
+            "style.css",
+            "/* No npm, no git, no deploy, no network, no shell -- pure local CSS */\n"
+            "body { margin: 0; }",
+            "content_guard_css",
+        )
+        self.assertTrue(result.success, result.message)
+
+    def test_css_import_url_external_refused(self) -> None:
+        result = self._write(
+            "style.css",
+            '@import url("https://example.com/x.css");\nbody { margin: 0; }',
+            "content_guard_css_import_url",
+        )
+        self.assertFalse(result.success)
+        self.assertEqual(result.diagnostic, DIAG_FORBIDDEN_OPERATION_CATEGORY)
+        self.assertFalse((self.workspace / "style.css").exists())
+
+    def test_css_bare_import_external_refused(self) -> None:
+        result = self._write(
+            "style.css",
+            '@import "https://example.com/x.css";\nbody { margin: 0; }',
+            "content_guard_css_bare_import",
+        )
+        self.assertFalse(result.success)
+        self.assertEqual(result.diagnostic, DIAG_FORBIDDEN_OPERATION_CATEGORY)
+
+    def test_css_background_image_url_external_refused(self) -> None:
+        result = self._write(
+            "style.css",
+            'body { background-image: url("https://example.com/bg.png"); }',
+            "content_guard_css_background_url",
+        )
+        self.assertFalse(result.success)
+        self.assertEqual(result.diagnostic, DIAG_FORBIDDEN_OPERATION_CATEGORY)
+        self.assertFalse((self.workspace / "style.css").exists())
+
+    def test_css_bare_http_url_external_refused(self) -> None:
+        result = self._write(
+            "style.css",
+            "/* asset hosted at http://example.com/sprite.png */\nbody { margin: 0; }",
+            "content_guard_css_bare_http",
+        )
+        self.assertFalse(result.success)
+        self.assertEqual(result.diagnostic, DIAG_FORBIDDEN_OPERATION_CATEGORY)
+
+    def test_css_local_relative_url_allowed(self) -> None:
+        result = self._write(
+            "style.css",
+            'canvas { background: url("./sprite.png"); }\nbody { margin: 0; }',
+            "content_guard_css_local_url",
+        )
+        self.assertTrue(result.success, result.message)
+        self.assertTrue((self.workspace / "style.css").is_file())
+
+    def test_simple_local_game_js_succeeds(self) -> None:
+        result = self._write(
+            "game.js",
+            "const ctx = document.getElementById('board').getContext('2d');\n"
+            "function draw() { ctx.clearRect(0, 0, 10, 10); requestAnimationFrame(draw); }\n"
+            "draw();\n",
+            "content_guard_js",
+        )
+        self.assertTrue(result.success, result.message)
+
+    def test_js_fetch_network_call_refused(self) -> None:
+        result = self._write(
+            "game.js",
+            'fetch("https://example.com").then((r) => r.json());',
+            "content_guard_js_fetch",
+        )
+        self.assertFalse(result.success)
+        self.assertEqual(result.diagnostic, DIAG_FORBIDDEN_OPERATION_CATEGORY)
+        self.assertFalse((self.workspace / "game.js").exists())
+
+    def test_html_external_script_src_refused(self) -> None:
+        result = self._write(
+            "index.html",
+            "<!doctype html><html><head>"
+            '<script src="https://cdn.example.com/lib.js"></script>'
+            "</head></html>",
+            "content_guard_html_external",
+        )
+        self.assertFalse(result.success)
+        self.assertEqual(result.diagnostic, DIAG_FORBIDDEN_OPERATION_CATEGORY)
+        self.assertFalse((self.workspace / "index.html").exists())
+
+    def test_package_json_npm_scripts_refused(self) -> None:
+        result = self._write(
+            "package.json",
+            json.dumps({"name": "demo", "scripts": {"build": "npm run build"}}),
+            "content_guard_package_json",
+        )
+        self.assertFalse(result.success)
+        self.assertEqual(result.diagnostic, DIAG_FORBIDDEN_OPERATION_CATEGORY)
+
+    def test_deploy_workflow_yaml_refused(self) -> None:
+        result = self._write(
+            ".github/workflows/deploy.yml",
+            "name: Deploy\non: push\njobs:\n  deploy:\n    steps:\n      - run: npm run deploy\n",
+            "content_guard_deploy_workflow",
+        )
+        self.assertFalse(result.success)
+        self.assertEqual(result.diagnostic, DIAG_FORBIDDEN_OPERATION_CATEGORY)
+
+
 class TestBoundedExecutorAdmissionGates(unittest.TestCase):
     def setUp(self) -> None:
         self._tmpdir = tempfile.TemporaryDirectory()
@@ -436,6 +581,128 @@ class TestBoundedExecutorControlSurface(unittest.TestCase):
         self.assertTrue((self.workspace / "index.html").is_file())
         self.assertTrue((self.workspace / "style.css").is_file())
         self.assertTrue((self.workspace / "game.js").is_file())
+
+    def test_batch_execution_with_harmless_forbidden_words_succeeds_three_of_three(self) -> None:
+        live_style_files = {
+            "index.html": (
+                "<!doctype html><html><body>"
+                "<!-- No npm, git, deploy, network, or shell commands are required. -->"
+                '<canvas id="board"></canvas>'
+                "</body></html>"
+            ),
+            "style.css": (
+                "/* No npm, no git, no deploy, no network, no shell. Pure local CSS. */\n"
+                "body { margin: 0; }"
+            ),
+            "game.js": "console.log('local only: no npm, git, deploy, network, or shell');",
+        }
+        for name, content in live_style_files.items():
+            action_id = f"live_scaffold_{name.replace('.', '_')}"
+            _inject_queue_item(
+                self.controller,
+                action_id=action_id,
+                candidate={
+                    "action_id": action_id,
+                    "envelope_id": f"envelope_{action_id}",
+                    "action_type": "create_file",
+                    "tool_or_command": f"write {name}",
+                    "execution_status": "proposed_only",
+                    "structured_operations": [
+                        {"operation": "write_file", "path": name, "content": content}
+                    ],
+                },
+            )
+        state = self.controller.execute_bounded_local_batch({"workspace_path": str(self.workspace)})
+        result = state["bounded_local_batch_result"]
+        self.assertEqual(result["succeeded_count"], 3)
+        self.assertEqual(result["failed_count"], 0)
+        self.assertTrue((self.workspace / "index.html").is_file())
+        self.assertTrue((self.workspace / "style.css").is_file())
+        self.assertTrue((self.workspace / "game.js").is_file())
+
+
+def _structured_operation_block(operation: dict) -> str:
+    return "ADMISSIBLE_STRUCTURED_OPERATION:\n```json\n" + json.dumps(operation) + "\n```\n\n"
+
+
+LIVE_CONTENT_GUARD_GOAL_PROMPT = (
+    "Build a tiny local-only browser game scaffold with index.html, style.css, "
+    "and game.js. No dependencies, no shell commands, no git, no network, no deploy."
+)
+
+
+class TestBoundedExecutorLiveContentGuardRegression(unittest.TestCase):
+    """End-to-end reproduction of the live Cursor batch execution demo failure.
+
+    Ingest extracts three structured write_file ops whose content echoes the
+    goal's own "no npm/git/deploy/network/shell" phrasing back as harmless
+    prose/comments -- this previously false-positived 2/3 writes.
+    """
+
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.controller = _controller(self._tmpdir.name)
+        self.workspace = Path(self._tmpdir.name) / "workspace"
+        self.workspace.mkdir()
+        self.raw = (
+            "Cursor Agent -- live batch execution demo (no commands executed)\n\n"
+            + _structured_operation_block(
+                {
+                    "operation": "write_file",
+                    "path": "index.html",
+                    "content": (
+                        "<!doctype html><html><body>"
+                        "<!-- No npm, git, deploy, network, or shell commands are required. -->"
+                        '<canvas id="board"></canvas>'
+                        "</body></html>"
+                    ),
+                }
+            )
+            + _structured_operation_block(
+                {
+                    "operation": "write_file",
+                    "path": "style.css",
+                    "content": (
+                        "/* No npm, no git, no deploy, no network, no shell. Pure local CSS. */\n"
+                        "body { margin: 0; }"
+                    ),
+                }
+            )
+            + _structured_operation_block(
+                {
+                    "operation": "write_file",
+                    "path": "game.js",
+                    "content": "console.log('local only: no npm, git, deploy, network, or shell');",
+                }
+            )
+        )
+
+    def tearDown(self) -> None:
+        self._tmpdir.cleanup()
+
+    def _game_files_present(self) -> list[str]:
+        return [name for name in ("index.html", "style.css", "game.js") if (self.workspace / name).is_file()]
+
+    def test_ingest_does_not_auto_execute(self) -> None:
+        self.controller.submit_goal(LIVE_CONTENT_GUARD_GOAL_PROMPT)
+        state = self.controller.ingest_agent_response(self.raw)
+        self.assertEqual(self._game_files_present(), [])
+        self.assertFalse(state["mission_summary"]["side_effect_executed_by_admissible"])
+        game_items = [i for i in state["queue"] if i["action_type"] == "create_file"]
+        self.assertEqual(len(game_items), 3)
+        for item in game_items:
+            self.assertTrue(item["bounded_execution_eligible"], item)
+            self.assertIsNone(item["bounded_execution_diagnostic"])
+
+    def test_batch_execution_succeeds_three_of_three_after_content_guard_fix(self) -> None:
+        self.controller.submit_goal(LIVE_CONTENT_GUARD_GOAL_PROMPT)
+        self.controller.ingest_agent_response(self.raw)
+        self.controller.set_bounded_executor_workspace(self.workspace)
+        state = self.controller.execute_bounded_local_batch({"workspace_path": str(self.workspace)})
+        result = state["bounded_local_batch_result"]
+        self.assertEqual(result["succeeded_count"], 3)
+        self.assertEqual(result["failed_count"], 0)
+        self.assertEqual(self._game_files_present(), ["index.html", "style.css", "game.js"])
 
 
 class TestBoundedExecutorBoundary(unittest.TestCase):

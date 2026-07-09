@@ -158,6 +158,62 @@ def _looks_like_forbidden_natural_language(text: str) -> bool:
     return any(pattern.search(text) for pattern in _FORBIDDEN_NATURAL_LANGUAGE_PATTERNS)
 
 
+_NETWORK_SIDE_EFFECT_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(pattern) for pattern in (
+        r"\bfetch\s*\(",
+        r"\bXMLHttpRequest\b",
+        r"\bWebSocket\s*\(",
+        r"\bEventSource\s*\(",
+        r"https?://",
+    )
+)
+
+_EXTERNAL_RESOURCE_REFERENCE_PATTERN = re.compile(
+    r"(?:src|href)\s*=\s*[\"']\s*https?://", re.IGNORECASE
+)
+
+
+def _has_network_side_effect(content: str) -> bool:
+    return any(pattern.search(content) for pattern in _NETWORK_SIDE_EFFECT_PATTERNS)
+
+
+def _has_external_resource_reference(content: str) -> bool:
+    return bool(_EXTERNAL_RESOURCE_REFERENCE_PATTERN.search(content))
+
+
+def _forbidden_write_content_reason(path: str, content: str) -> str | None:
+    """Return a refusal reason for ``content``, or ``None`` if it is safe.
+
+    Path-aware: local browser text files (html/css/js) are allowed to contain
+    harmless prose using words like npm/git/deploy/network/shell, but actual
+    embedded network calls, external resource references, or external CSS
+    url()/@import references are still refused. Every other file extension
+    keeps the strict naive-language scan.
+    """
+    extension = Path(str(path).replace("\\", "/")).suffix.lower()
+
+    if extension == ".css":
+        if _has_network_side_effect(content):
+            return "forbidden network reference in write content"
+        return None
+
+    if extension == ".js":
+        if _has_network_side_effect(content):
+            return "forbidden network call in write content"
+        return None
+
+    if extension in (".html", ".htm"):
+        if _has_external_resource_reference(content):
+            return "forbidden external resource reference in write content"
+        if _has_network_side_effect(content):
+            return "forbidden network call in write content"
+        return None
+
+    if _looks_like_forbidden_natural_language(content):
+        return "forbidden operation string in write content"
+    return None
+
+
 def _normalize_operation_dict(raw: Any) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
@@ -244,9 +300,10 @@ def _validate_operation_shape(operation: dict[str, Any]) -> None:
                 diagnostic=DIAG_UNSUPPORTED_OPERATION,
                 detail={"operation": name},
             )
-        if _looks_like_forbidden_natural_language(content):
+        violation = _forbidden_write_content_reason(path, content)
+        if violation is not None:
             raise BoundedExecutionError(
-                "forbidden operation string in write content",
+                violation,
                 diagnostic=DIAG_FORBIDDEN_OPERATION_CATEGORY,
             )
 
