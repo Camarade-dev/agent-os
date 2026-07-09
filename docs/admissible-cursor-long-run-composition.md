@@ -182,6 +182,7 @@ The Long-Run Truth Console renders: raw output → proposed action → admission
 | Git commit / push | `git_commit` / `git_push` | `REQUEST_MORE_EVIDENCE` / `REQUIRE_HUMAN_APPROVAL` |
 | Production-ready claim | `claim_status` | `REQUEST_MORE_EVIDENCE` |
 | Safe local file edit | `edit_file` | `ALLOW` or `ALLOW_WITH_LIMITS` |
+| Plan-gate / architecture-boundary resolution (decision-only, no side effect) | `plan_gate_resolution` | `REQUIRE_HUMAN_APPROVAL` |
 | Unknown / ambiguous | `unknown` | `REQUEST_MORE_EVIDENCE` (never default `ALLOW`) |
 
 Conservative default: unknown patterns do **not** silently become `ALLOW`.
@@ -191,18 +192,47 @@ Conservative default: unknown patterns do **not** silently become `ALLOW`.
 A pasted, non-table Cursor-class response (i.e. anything that is not a
 production-readiness table report, see `_is_production_readiness_report`)
 is broken into independently classifiable segments before falling back to
-a single whole-document candidate: explicit `Proposed command:` /
-`Command:` blocks, bare indented commands, fenced shell blocks, `Proposed
-tool call:` blocks, numbered/bulleted list items, and finally remaining
-narrative lines (structural labels like `User:`/`Status:`/`Note:` and
-headings are skipped). Each segment is independently checked for
-negation/conditional phrasing (`I will not …`, `do not …`, `not yet`,
-`unless approved`, `nothing was executed`, …) before classification, so a
-mixed response can yield several positive candidates (e.g. an install, a
-push, and a local edit in one paste) while a negated mention of the same
-action never becomes a positive candidate. Only when **no** segment yields
-a positive classification does extraction fall back to the single
-whole-document `unknown`/`REQUEST_MORE_EVIDENCE` candidate described above.
+a single whole-document candidate: `action_gate_<id>` plan-gate-resolution
+blocks (see below), explicit `Proposed command:` / `Command:` blocks, bare
+indented commands, fenced shell blocks, `Proposed tool call:` blocks,
+numbered/bulleted list items, and finally remaining narrative lines
+(structural labels like `User:`/`Status:`/`Note:` and headings are
+skipped). Each segment is independently checked for negation/conditional
+phrasing (`I will not …`, `do not …`, `not yet`, `unless approved`,
+`nothing was executed`, …) before classification, so a mixed response can
+yield several positive candidates (e.g. an install, a push, and a local
+edit in one paste) while a negated mention of the same action never
+becomes a positive candidate. Only when **no** segment yields a positive
+classification does extraction fall back to the single whole-document
+`unknown`/`REQUEST_MORE_EVIDENCE` candidate described above.
+
+**Plan-gate / architecture-boundary resolution.** A response can also
+propose no side-effecting action at all -- only a decision Admissible
+needs a human to make (which framework, whether a boundary is confirmed,
+...). `admissible.run_loop`'s instruction packets ask Cursor/a frontier
+agent to format that kind of proposal as a structured block (see the
+packet's own `RESPONSE FORMAT` section):
+
+```
+action_gate_<id> -- <short label>
+Verdict class: ALLOW | ALLOW_WITH_LIMITS | REQUEST_MORE_EVIDENCE | REQUIRE_HUMAN_APPROVAL | REFUSE
+Closes gates: <comma-separated gate/step id(s), or none>
+Side effects if approved: <description, or None>
+Proposal: <what is proposed>
+Human decision required: <what the human needs to confirm, approve, or choose>
+```
+
+`_extract_plan_gate_blocks` finds each `action_gate_<id>` heading and takes
+the block up to the next heading, a blank line, a `Status:` line, or end of
+text (whichever comes first) as one candidate -- never one candidate per
+line, and never swallowing an unrelated, independently-proposed action
+later in the same response. It always classifies as `plan_gate_resolution`
+/ `REQUIRE_HUMAN_APPROVAL` with no missing-evidence gap (the block is
+blocked on an explicit human decision, not on evidence). A heading-less
+proposal written as plain prose (e.g. "Human decision required: please
+confirm the architecture...") is still recognized by the same phrase-based
+check (`_is_plan_gate_segment`) per-segment and in the whole-document
+fallback, so this is not limited to the exact structured format.
 
 **Regression harness:** `admissible/runner/extraction_lab.py` runs this
 pipeline over

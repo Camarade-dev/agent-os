@@ -95,15 +95,24 @@ def evaluate_fixture(
 
     `expected` follows the `expected_extractions.json` per-fixture shape:
     `min_candidate_count`, `expected_action_types`, `expected_decisions`,
+    `expected_side_effect_types`, `expected_required_approvals`,
     `forbidden_action_types`, `forbidden_decisions`, `notes`. Every expected/
     forbidden check is a membership check against the full set of action
-    types (or decisions) extracted from the fixture -- not a 1:1 pairing --
-    matching the spec's own "expected action types" / "expected decisions"
-    wording.
+    types (or decisions, or side-effect types, or required-approval labels)
+    extracted from the fixture -- not a 1:1 pairing -- matching the spec's
+    own "expected action types" / "expected decisions" wording.
+    `expected_side_effect_types` checks each candidate's `side_effect_type`
+    (e.g. a decision-only plan-gate proposal should be `internal_state_change`,
+    never left unset); `expected_required_approvals` checks each decision's
+    `required_approval` (e.g. `human_operator`) -- both exist so a fixture
+    can assert an action was classified with a real side-effect/approval
+    shape, not just a recognizable action type and decision label.
     """
     result = extract_and_decide(raw_text, fixture_name=fixture_name, source_metadata=source_metadata)
     action_types = [c.get("action_type") for c in result["action_candidates"]]
     decision_labels = [d.get("decision") for d in result["decisions"]]
+    side_effect_types = [c.get("side_effect_type") for c in result["action_candidates"]]
+    required_approvals = [d.get("required_approval") for d in result["decisions"]]
 
     failures: list[str] = []
 
@@ -123,6 +132,18 @@ def evaluate_fixture(
                 f"expected decision {expected_decision!r} not found in {decision_labels}"
             )
 
+    for expected_side_effect_type in expected.get("expected_side_effect_types", []) or []:
+        if expected_side_effect_type not in side_effect_types:
+            failures.append(
+                f"expected side effect type {expected_side_effect_type!r} not found in {side_effect_types}"
+            )
+
+    for expected_required_approval in expected.get("expected_required_approvals", []) or []:
+        if expected_required_approval not in required_approvals:
+            failures.append(
+                f"expected required approval {expected_required_approval!r} not found in {required_approvals}"
+            )
+
     for forbidden_type in expected.get("forbidden_action_types", []) or []:
         if forbidden_type in action_types:
             failures.append(f"forbidden action type {forbidden_type!r} was present")
@@ -137,6 +158,8 @@ def evaluate_fixture(
         "candidate_count": len(result["action_candidates"]),
         "action_types": action_types,
         "decisions": decision_labels,
+        "side_effect_types": side_effect_types,
+        "required_approvals": required_approvals,
         "notes": expected.get("notes", ""),
         "passed": not failures,
         "failures": failures,
@@ -169,6 +192,8 @@ def run_extraction_lab(
                     "candidate_count": 0,
                     "action_types": [],
                     "decisions": [],
+                    "side_effect_types": [],
+                    "required_approvals": [],
                     "notes": fixture_specs[fixture_name].get("notes", ""),
                     "passed": False,
                     "failures": [f"fixture file not found: {fixture_path}"],

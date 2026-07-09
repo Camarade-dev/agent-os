@@ -157,6 +157,96 @@ class TestEvidenceResponseNotTreatedAsExecution(unittest.TestCase):
         self.assertIn("REQUEST_MORE_EVIDENCE", [d["decision"] for d in decisions])
 
 
+class TestPlanGateResolutionExtraction(unittest.TestCase):
+    """Regression coverage for the originally-reported bug: a structured
+    plan-gate/architecture-boundary resolution proposal (heading, "Verdict
+    class:", "Closes gates:", "Side effects if approved:", a human-decision
+    line) used to collapse into a single `unknown`/REQUEST_MORE_EVIDENCE
+    candidate, identical to a genuinely vague response."""
+
+    def setUp(self) -> None:
+        self.built = _build("cursor_plan_gate_resolution_request.txt")
+        self.candidates = self.built["action_candidates"]
+        self.decisions = [evaluate_envelope(e) for e in self.built["envelopes"]]
+
+    def test_exactly_one_plan_gate_resolution_candidate(self) -> None:
+        self.assertEqual(len(self.candidates), 1)
+        candidate = self.candidates[0]
+        self.assertEqual(candidate["action_type"], "plan_gate_resolution")
+        self.assertEqual(candidate["side_effect_type"], "internal_state_change")
+        self.assertEqual(candidate["tool_or_command"], "Resolve architecture and deployment boundary")
+        self.assertEqual(candidate["missing_evidence_hints"], [])
+
+    def test_decision_is_require_human_approval_not_unknown_or_request_more_evidence(self) -> None:
+        self.assertEqual(len(self.decisions), 1)
+        decision = self.decisions[0]
+        self.assertEqual(decision["decision"], "REQUIRE_HUMAN_APPROVAL")
+        self.assertEqual(decision["required_approval"], "human_operator")
+        self.assertEqual(decision["risk_level"], "low")
+        self.assertEqual(decision["missing_evidence"], [])
+
+    def test_ingest_via_control_surface_queue_shows_plan_gate_resolution_not_unknown(self) -> None:
+        # End-to-end reproduction of the originally-reported bug's exact
+        # symptom: a fresh Cursor response, ingested through the same
+        # ControlSurfaceController.ingest_agent_response the Cursor file
+        # bridge calls, used to surface as queue row
+        # "<action_id> unknown REQUEST_MORE_EVIDENCE proposed_only unknown".
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        controller = ControlSurfaceController(
+            session_dir=Path(tmpdir.name) / "sessions", sample_trace_path=SAMPLE_TRACE_PATH
+        )
+        raw_text = load_fixture(FIXTURES_DIR / "cursor_plan_gate_resolution_request.txt")
+        state = controller.ingest_agent_response(raw_text)
+
+        self.assertEqual(len(state["queue"]), 1)
+        item = state["queue"][0]
+        self.assertEqual(item["action_type"], "plan_gate_resolution")
+        self.assertNotEqual(item["action_type"], "unknown")
+        self.assertEqual(item["decision"], "REQUIRE_HUMAN_APPROVAL")
+        self.assertEqual(item["execution_status"], "proposed_only")
+
+    def test_heading_less_phrase_only_proposal_still_classifies(self) -> None:
+        # No `action_gate_` heading at all -- only the softer phrase-based
+        # signal ("human decision required" / "confirm the architecture").
+        # Covers the "do not overfit to exact strings" requirement: a
+        # decision-only proposal written as plain prose must still resolve
+        # to plan_gate_resolution / REQUIRE_HUMAN_APPROVAL, not unknown.
+        raw = (
+            "User: What should we do about the framework choice?\n\n"
+            "Thinking...\n"
+            "Human decision required: please confirm the architecture before I write any code. "
+            "No files will be touched until you decide.\n"
+        )
+        built = build_from_raw_output(raw, source_metadata={"fixture_path": "inline_phrase_only.txt"})
+        self.assertEqual(len(built["action_candidates"]), 1)
+        candidate = built["action_candidates"][0]
+        self.assertEqual(candidate["action_type"], "plan_gate_resolution")
+        decision = evaluate_envelope(built["envelopes"][0])
+        self.assertEqual(decision["decision"], "REQUIRE_HUMAN_APPROVAL")
+
+    def test_plan_gate_block_coexists_with_an_unrelated_action_in_one_response(self) -> None:
+        # The block-consumption pass must blank only the gate block's own
+        # span, leaving the rest of a mixed response free for the normal
+        # freeform segmenter to extract independently.
+        raw = (
+            "User: Resolve the architecture question, then also add the helper dependency.\n\n"
+            "action_gate_001 — Resolve architecture and deployment boundary\n"
+            "Verdict class: REQUIRE_HUMAN_APPROVAL\n"
+            "Closes gates: step_2_choose_architecture\n"
+            "Side effects if approved: None\n"
+            "Proposal: Confirm vanilla HTML/CSS/JS, no framework, local-only.\n"
+            "Human decision required: please approve this architecture choice.\n\n"
+            "Separately, here is a proposed command:\n"
+            "    npm install left-pad\n"
+        )
+        built = build_from_raw_output(raw, source_metadata={"fixture_path": "inline_mixed.txt"})
+        action_types = [c["action_type"] for c in built["action_candidates"]]
+        self.assertIn("plan_gate_resolution", action_types)
+        self.assertIn("install_dependency", action_types)
+        self.assertNotIn("unknown", action_types)
+
+
 class TestRunLoopIngestsMultipleCandidatesFromOneResponse(unittest.TestCase):
     def setUp(self) -> None:
         self._tmpdir = tempfile.TemporaryDirectory()

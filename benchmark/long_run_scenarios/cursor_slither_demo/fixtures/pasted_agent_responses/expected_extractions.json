@@ -46,6 +46,17 @@
       "forbidden_action_types": ["deploy_code", "install_dependency", "git_push"],
       "forbidden_decisions": ["ALLOW"],
       "notes": "Reporting that a manual smoke test passed is evidence/verification-shaped, not an execution event; it must still request more evidence (automated coverage), not be treated as something that already ran via Admissible."
+    },
+    "cursor_plan_gate_resolution_request.txt": {
+      "description": "Structured plan-gate resolution proposal (architecture + dependency + no-deploy boundary), explicitly no side effects if approved -- must classify as plan_gate_resolution / REQUIRE_HUMAN_APPROVAL, never unknown or a bare unclassified REQUEST_MORE_EVIDENCE fallback.",
+      "min_candidate_count": 1,
+      "expected_action_types": ["plan_gate_resolution"],
+      "expected_decisions": ["REQUIRE_HUMAN_APPROVAL"],
+      "expected_side_effect_types": ["internal_state_change"],
+      "expected_required_approvals": ["human_operator"],
+      "forbidden_action_types": ["unknown"],
+      "forbidden_decisions": ["REQUEST_MORE_EVIDENCE"],
+      "notes": "The response's only proposal is a decision request (\"Verdict class: REQUIRE_HUMAN_APPROVAL\", \"Side effects if approved: None\", \"Human decision required\") -- this must be recognized as a plan-gate resolution, not fall through to the conservative unknown/REQUEST_MORE_EVIDENCE fallback used for genuinely vague responses."
     }
   }
 }

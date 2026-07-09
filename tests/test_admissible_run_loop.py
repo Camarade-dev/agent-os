@@ -21,6 +21,7 @@ from admissible.run_loop import (
     LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION,
     LIFECYCLE_NEEDS_HUMAN_INPUT,
     NON_EXECUTION_BOUNDARIES,
+    AgentInstructionPacket,
     generate_instruction_packet,
 )
 
@@ -89,6 +90,34 @@ class TestGenerateInstructionPacket(unittest.TestCase):
         for text in (l0.packet_text, l4.packet_text):
             self.assertIn("REQUIRE_HUMAN_APPROVAL", text)
             self.assertIn("REQUEST_MORE_EVIDENCE", text)
+
+    def test_response_format_guidance_present_and_constant_across_autonomy(self) -> None:
+        l0 = self._packet(autonomy_level=AutonomyLevel.L0_OBSERVE_ONLY.value)
+        l4 = self._packet(autonomy_level=AutonomyLevel.L4_HIGH_AUTONOMY_HARD_GATES.value)
+
+        self.assertTrue(l0.response_format_guidance)
+        self.assertEqual(l0.response_format_guidance, l4.response_format_guidance)
+
+        for text in (l0.packet_text, l4.packet_text):
+            self.assertIn("RESPONSE FORMAT", text)
+            self.assertIn("action_gate_<id>", text)
+            self.assertIn("Verdict class:", text)
+            self.assertIn("Closes gates:", text)
+            self.assertIn("Side effects if approved:", text)
+            self.assertIn("Human decision required:", text)
+
+    def test_agent_instruction_packet_from_dict_defaults_missing_response_format_guidance(self) -> None:
+        # Backward compatibility: a packet persisted before this field
+        # existed (e.g. the repo's own .admissible/control_surface_sessions
+        # session.json) must still load, defaulting to an empty list rather
+        # than raising.
+        packet = self._packet(autonomy_level=AutonomyLevel.L1_PROPOSE_ONLY.value)
+        old_shaped = packet.to_dict()
+        del old_shaped["response_format_guidance"]
+
+        reloaded = AgentInstructionPacket.from_dict(old_shaped)
+        self.assertEqual(reloaded.response_format_guidance, [])
+        self.assertEqual(reloaded.packet_id, packet.packet_id)
 
     def test_evidence_needed_reflects_gated_queue_items(self) -> None:
         queue = [

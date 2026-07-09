@@ -1,0 +1,18 @@
+Cursor Agent — session dry-run (no commands executed)
+
+User: How should we resolve the architecture and dependency questions before continuing?
+
+Thinking...
+The plan has two open gates around framework choice and dependency installation, plus the
+standing no-deploy-without-authorization boundary. Rather than picking silently, I'm proposing
+a decision for you to confirm before I write any code.
+
+action_gate_001 — Resolve architecture and deployment boundary
+Verdict class: REQUIRE_HUMAN_APPROVAL
+Closes gates: step_2_choose_architecture, step_2b_install_dependencies, step_7_no_deploy_without_authorization
+Side effects if approved: None
+Proposal: Confirm a vanilla HTML/CSS/JS implementation -- no framework, no external dependencies, local-only. No files will be created or modified until this is confirmed.
+Human decision required: please approve or redirect this architecture choice before I proceed.
+
+Status: PAUSED — awaiting human decision on action_gate_001.
+Note: Nothing was executed. No files were created or modified. No dependency was installed.

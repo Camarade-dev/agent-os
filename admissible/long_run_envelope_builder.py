@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from admissible.decision import is_valid_decision_label
+
 BUILDER_VERSION = "0.3"
 BUILDER_CLAIM_BOUNDARY = (
     "Offline rule-based extraction only; raw agent output is unverified."
@@ -106,6 +108,118 @@ _LOCAL_EDIT_RE = re.compile(
     re.I,
 )
 
+# -- plan-gate / architecture-boundary resolution (decision-only proposals) --
+#
+# A Cursor-class agent sometimes needs to resolve an open plan gate (e.g.
+# "which framework?", "confirm the deployment boundary") before it can
+# propose any side-effecting action at all. That kind of response has no
+# tool call, shell command, or file edit to pattern-match against -- left
+# unrecognized, it used to collapse into a single `unknown`/
+# REQUEST_MORE_EVIDENCE candidate indistinguishable from a genuinely vague,
+# non-actionable response. `action_gate_<id>` headings (see the structured
+# RESPONSE FORMAT admissible.run_loop asks agents to use, below) are the
+# strong/structural signal; the phrase list is a softer fallback so a
+# decision-only proposal written in prose (no heading) still classifies
+# correctly rather than falling through to `unknown`.
+_GATE_HEADING_RE = re.compile(
+    r"^(?P<gate_id>action_gate_\w+)\s*[—:-]\s*(?P<label>.+?)\s*$",
+    re.MULTILINE,
+)
+_GATE_ID_HINT_RE = re.compile(r"\baction_gate_\w+", re.I)
+_PLAN_GATE_PHRASES: tuple[str, ...] = (
+    r"\bresolve\s+(?:the\s+)?architecture\b",
+    r"\bresolve\s+(?:the\s+)?(?:plan\s+)?gate\b",
+    r"\bconfirm\s+(?:the\s+)?architecture\b",
+    r"\bchoose\s+(?:a\s+|the\s+)?framework\b",
+    r"\bdeployment\s+boundary\b",
+    r"\bconfirm\b.{0,40}\blocal[- ]only\s+boundary\b",
+    r"\bhuman\s+decision\s+required\b",
+    r"\bapproval\s+required\b",
+    r"\bcloses\s+gates?:",
+    r"\bverdict\s+class:\s*require_human_approval\b",
+)
+_PLAN_GATE_PHRASES_RE = re.compile("|".join(_PLAN_GATE_PHRASES), re.I | re.DOTALL)
+_GATE_VERDICT_CLASS_RE = re.compile(r"verdict\s+class:\s*([A-Za-z_]+)", re.I)
+_GATE_CLOSES_RE = re.compile(r"closes\s+gates?:\s*(.+)", re.I)
+_GATE_SIDE_EFFECTS_RE = re.compile(r"side\s+effects?\s+if\s+approved:\s*(.+)", re.I)
+_GATE_PROPOSAL_RE = re.compile(r"proposal:\s*(.+)", re.I)
+
+
+def _is_plan_gate_segment(text: str) -> bool:
+    return bool(_GATE_ID_HINT_RE.search(text) or _PLAN_GATE_PHRASES_RE.search(text))
+
+
+def _plan_gate_expected_tendency(text: str) -> str:
+    """Best-effort, informational only -- the real decision always comes
+    from `evaluate_envelope` via `_authority_for_action`/`_risk_for_action`
+    (see `plan_gate_resolution` there), never from this string."""
+    match = _GATE_VERDICT_CLASS_RE.search(text)
+    if match:
+        candidate = match.group(1).strip().upper()
+        if is_valid_decision_label(candidate):
+            return candidate
+    return "REQUIRE_HUMAN_APPROVAL"
+
+
+def _extract_plan_gate_blocks(raw_output: str) -> list[dict[str, Any]]:
+    """Split `raw_output` into one block per `action_gate_<id>` heading.
+
+    Each block spans from its heading line to whichever comes first: the
+    next heading, a blank line, a "Status:" line, or end of text. Stopping
+    at the first blank line (in addition to the other terminators) matters
+    for a *mixed* response -- without it, a gate block with no following
+    heading/"Status:" line would swallow every remaining paragraph
+    (including an unrelated, independently-proposed action) all the way to
+    end of text. A structured multi-line gate resolution proposal --
+    heading, "Verdict class:", "Closes gates:", "Side effects if
+    approved:", "Proposal:", a human-decision-required line -- becomes
+    exactly one action candidate this way, not one candidate per line
+    (which is what the generic line-by-line freeform segmenter below would
+    otherwise produce) and not a candidate that accidentally absorbs
+    unrelated later text. Returns `[]` when no `action_gate_` heading is
+    present -- a heading-less, phrase-only plan-gate sentence is instead
+    caught by `_is_plan_gate_segment` during normal per-segment/whole-
+    document classification.
+    """
+    heading_matches = list(_GATE_HEADING_RE.finditer(raw_output))
+    blocks: list[dict[str, Any]] = []
+    for index, match in enumerate(heading_matches):
+        region_end = heading_matches[index + 1].start() if index + 1 < len(heading_matches) else len(raw_output)
+        region = raw_output[match.start() : region_end]
+
+        candidate_ends = [len(region)]
+        blank_line_match = re.search(r"\n[ \t]*\n", region)
+        if blank_line_match:
+            candidate_ends.append(blank_line_match.start())
+        status_match = re.search(r"^[ \t]*Status:", region, re.MULTILINE | re.IGNORECASE)
+        if status_match:
+            candidate_ends.append(status_match.start())
+        span_end = match.start() + min(candidate_ends)
+
+        block_text = raw_output[match.start() : span_end].strip()
+
+        verdict_match = _GATE_VERDICT_CLASS_RE.search(block_text)
+        closes_match = _GATE_CLOSES_RE.search(block_text)
+        side_effects_match = _GATE_SIDE_EFFECTS_RE.search(block_text)
+        proposal_match = _GATE_PROPOSAL_RE.search(block_text)
+
+        blocks.append(
+            {
+                "gate_id": match.group("gate_id"),
+                "label": match.group("label").strip(),
+                "block_text": block_text,
+                "span": (match.start(), span_end),
+                "verdict_class": verdict_match.group(1).strip().upper() if verdict_match else None,
+                "closes_gates": (
+                    [g.strip() for g in closes_match.group(1).split(",") if g.strip()] if closes_match else []
+                ),
+                "side_effects_if_approved": side_effects_match.group(1).strip() if side_effects_match else None,
+                "proposal_text": proposal_match.group(1).strip() if proposal_match else None,
+            }
+        )
+    return blocks
+
+
 # Negation/conditional phrases that mean a segment describes something the
 # agent says it will *not* do (or will only do with approval it does not yet
 # have). Matched per-segment so a mixed response can still extract the
@@ -177,6 +291,11 @@ _DEFAULT_MISSING_EVIDENCE: dict[str, list[str]] = {
     "create_file": [],
     "document_hosting_options": ["hosting_choice_authorization"],
     "verification_plan": ["test_results", "manual_test_results"],
+    # No evidence gap here: a plan-gate resolution is blocked on an explicit
+    # human decision (see _authority_for_action), not on missing evidence --
+    # leaving this non-empty would add a spurious REQUEST_MORE_EVIDENCE
+    # signal alongside the correct REQUIRE_HUMAN_APPROVAL one.
+    "plan_gate_resolution": [],
     "unknown": ["action_classification", "side_effect_scope"],
 }
 
@@ -396,6 +515,8 @@ def _classify_action(
             )
         )
     )
+    if _is_plan_gate_segment(haystack):
+        return "plan_gate_resolution", "internal_state_change", _plan_gate_expected_tendency(haystack), "high"
     for pattern, action_type, side_effect_type, tendency in _ACTION_PATTERNS:
         if pattern.search(haystack):
             return action_type, side_effect_type, tendency, "high"
@@ -418,6 +539,8 @@ def _classify_freeform_segment(text: str) -> tuple[str, str, str, str] | None:
     """
     if _is_negated_segment(text):
         return None
+    if _is_plan_gate_segment(text):
+        return "plan_gate_resolution", "internal_state_change", _plan_gate_expected_tendency(text), "high"
     for pattern, action_type, side_effect_type, tendency in _SEGMENT_ACTION_PATTERNS:
         if pattern.search(text):
             return action_type, side_effect_type, tendency, "high"
@@ -463,6 +586,10 @@ def _extract_freeform_action_segments(raw_output: str) -> list[dict[str, str]]:
     Extraction order (each pass consumes its matched spans so a later,
     coarser pass never reprocesses the same text as a duplicate segment):
 
+    0. `action_gate_<id>` plan-gate-resolution blocks (heading through the
+       next heading/"Status:"/end of text), one per gate -- consumed whole
+       so a multi-line structured gate proposal becomes exactly one
+       segment, not one (unclassifiable) segment per line.
     1. Explicit "Proposed command:" / "Proposed shell call:" / "Command:"
        blocks (one command line each).
     2. Bare indented command lines (npm/pnpm/yarn/pip/git/rm ...) not under
@@ -473,15 +600,20 @@ def _extract_freeform_action_segments(raw_output: str) -> list[dict[str, str]]:
     6. Remaining narrative lines, skipping structural labels/headings.
     """
     segments: list[dict[str, str]] = []
-    consumed_spans: list[tuple[int, int]] = []
 
-    for match in _SHELL_COMMAND_RE.finditer(raw_output):
+    gate_spans: list[tuple[int, int]] = []
+    for block in _extract_plan_gate_blocks(raw_output):
+        segments.append({"text": block["block_text"], "tool_or_command": block["label"]})
+        gate_spans.append(block["span"])
+    remaining = _blank_spans(raw_output, gate_spans)
+
+    shell_spans: list[tuple[int, int]] = []
+    for match in _SHELL_COMMAND_RE.finditer(remaining):
         command = match.group(1).strip()
         if command:
             segments.append({"text": command, "tool_or_command": command})
-        consumed_spans.append(match.span())
-
-    remaining = _blank_spans(raw_output, consumed_spans)
+        shell_spans.append(match.span())
+    remaining = _blank_spans(remaining, shell_spans)
 
     indented_spans: list[tuple[int, int]] = []
     for match in _INDENTED_COMMAND_RE.finditer(remaining):
@@ -746,6 +878,26 @@ def _authority_for_action(action_type: str, notes: list[str]) -> dict[str, Any]:
                 "summary": "Local-only code change within stated task scope.",
             },
         }
+    if action_type == "plan_gate_resolution":
+        return {
+            "requested_by": "agent_session_user",
+            "approved_by": None,
+            "approval_scope": "none",
+            "required_approval": "human_operator",
+            "authority_notes": [
+                "Plan-gate / architecture-boundary resolution requires an explicit human decision "
+                "before the agent proceeds; no side effect occurs until it is approved."
+            ],
+            "approvals": [],
+            "tool_authority": {
+                "has_tool_access": "no",
+                "summary": "Decision-only proposal; no tool was executed.",
+            },
+            "business_authority": {
+                "has_business_authority": "yes",
+                "summary": "In-scope planning/architecture decision for the current project.",
+            },
+        }
     return {
         "requested_by": "agent_session_user",
         "approved_by": None,
@@ -817,6 +969,17 @@ def _risk_for_action(action_type: str) -> dict[str, Any]:
             "safety_impact": "none",
             "reputation_impact": "none",
         }
+    if action_type == "plan_gate_resolution":
+        return {
+            "reversibility": "reversible",
+            "rollback_available": "yes",
+            "blast_radius": "low",
+            "external_visibility": "internal_only",
+            "financial_impact": {"amount": None, "currency": None, "impact_known": "no"},
+            "data_sensitivity": "internal",
+            "safety_impact": "none",
+            "reputation_impact": "none",
+        }
     return {
         "reversibility": "unknown",
         "rollback_available": "unknown",
@@ -844,10 +1007,18 @@ def _workflow_for_action(action_type: str, source_metadata: dict[str, Any]) -> d
         "create_file": "software_engineering",
         "document_hosting_options": "software_engineering",
         "verification_plan": "software_engineering",
+        "plan_gate_resolution": "software_engineering",
         "unknown": "unknown",
     }
     environment = "production" if action_type in ("deploy_code", "prepare_deploy", "git_push") else "local"
-    if action_type in ("edit_file", "local_code_change", "create_file", "document_hosting_options", "verification_plan"):
+    if action_type in (
+        "edit_file",
+        "local_code_change",
+        "create_file",
+        "document_hosting_options",
+        "verification_plan",
+        "plan_gate_resolution",
+    ):
         environment = "local"
     return {
         "domain": domain_map.get(action_type, "unknown"),
