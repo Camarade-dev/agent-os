@@ -60,6 +60,7 @@ from admissible.execution.bounded_local_executor import (
     BoundedExecutionError,
     assess_bounded_execution_eligibility,
     execute_bounded_local_action,
+    extract_structured_operations,
     validate_workspace_path,
 )
 from admissible.goal_intake import GoalIntake, analyze_goal
@@ -99,6 +100,7 @@ from admissible.run_loop import (
     RunTurn,
     SupersedingAdmissionDecision,
     build_candidates_from_agent_response,
+    build_run_timeline,
     default_lifecycle_status,
     derive_evidence_attention_state,
     generate_instruction_packet,
@@ -1101,6 +1103,52 @@ def _lifecycle_overview(session: "ControlSession") -> dict[str, Any]:
     }
 
 
+def _run_timeline(
+    session: "ControlSession",
+    *,
+    bridge_awaiting_response: bool,
+) -> dict[str, Any]:
+    """Display-only run timeline projection (slice ADMISSIBLE_RUN_021).
+
+    Assembles the run as a readable sequence (goal -> turn -> proposal ->
+    admission -> execution -> evidence) from already-computed session state.
+    Pure aggregation: it never re-decides an admission, never executes
+    anything, and never persists new source-of-truth state -- the queue,
+    run-loop turns, and evidence records remain the single source of truth.
+    """
+    operation_context: dict[str, dict[str, Any]] = {}
+    for item in session.queue:
+        envelope = session.run_envelopes.get(item.action_id)
+        # Derive the structured local file operation details straight from the
+        # candidate/envelope so they persist for the timeline even after the
+        # action has been executed (the eligibility assessment stops returning
+        # operations once execution_status flips to executed).
+        operations = extract_structured_operations(
+            candidate=envelope.candidate if envelope else None,
+            envelope=envelope.envelope if envelope else None,
+        )
+        target_paths, operation_types = _bounded_execution_operation_fields(operations)
+        operation_context[item.action_id] = {
+            "operation_types": operation_types,
+            "target_paths": target_paths,
+            "structured_operation_count": len(operations),
+        }
+    pending_human_decision_count = sum(
+        1 for item in session.queue if queue_item_needs_attention(item.to_dict())
+    )
+    timeline = build_run_timeline(
+        session_id=session.session_id,
+        created_at=session.created_at,
+        goal_intake=session.goal_intake,
+        queue=[item.to_dict() for item in session.queue],
+        run_loop=session.run_loop,
+        operation_context=operation_context,
+        bridge_awaiting_response=bridge_awaiting_response,
+        pending_human_decision_count=pending_human_decision_count,
+    )
+    return timeline.to_dict()
+
+
 def _needs_attention(session: "ControlSession") -> dict[str, Any]:
     """Display-only subset of the queue/plan-audit that calls for a human look first.
 
@@ -1263,6 +1311,10 @@ class ControlSurfaceController:
         )
         view["session_has_content"] = _session_has_content(self._session)
         view["lifecycle_overview"] = _lifecycle_overview(self._session)
+        view["run_timeline"] = _run_timeline(
+            self._session,
+            bridge_awaiting_response=view["session_diagnostics"]["bridge_awaiting_response"],
+        )
         view["session_file"] = str(self._session_file)
         view["session_loaded_from_disk"] = self._session_loaded_from_disk
         view["ready_to_execute_locally"] = _ready_to_execute_locally(self._session)

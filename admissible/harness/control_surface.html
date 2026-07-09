@@ -416,6 +416,16 @@
     <div id="mission-summary-body"></div>
   </section>
 
+  <section class="panel" id="run-timeline-panel">
+    <h2>Run Timeline</h2>
+    <p class="hint" style="font-size:.76rem;color:var(--cs-muted);margin:0 0 .55rem;">
+      The governed run in sequence: goal &rarr; turn &rarr; agent proposal &rarr; admission decision &rarr;
+      human-triggered local execution &rarr; evidence. A readable multi-turn view over the same queue —
+      it decides and executes nothing on its own.
+    </p>
+    <div id="run-timeline-body"><p class="no-action-note">No run yet. Submit a goal to begin the timeline.</p></div>
+  </section>
+
   <section class="panel" id="needs-attention-panel">
     <h2>Supervised Run State</h2>
     <p class="hint" style="font-size:.76rem;color:var(--cs-muted);margin:0 0 .55rem;">
@@ -897,6 +907,104 @@ function renderBridgeBlockedBanner(state) {
   banner.innerHTML = `<strong>Bridge ingest blocked</strong> (${events.length} event(s)): ${escapeHtml(reasonText)}` +
     (detailBits.length ? ` — ${escapeHtml(detailBits.join(", "))}` : "") +
     `<div style="margin-top:.25rem;font-size:.76rem;">${escapeHtml(latest.note || "No queue items were created.")}</div>`;
+}
+
+const TIMELINE_STATUS_LABELS = {
+  needs_goal: "Needs goal",
+  planned: "Planned — ready to instruct",
+  awaiting_agent_response: "Awaiting agent response",
+  reviewing_proposals: "Reviewing proposals",
+  ready_to_execute_local: "Ready to execute locally",
+  executed: "Executed",
+  idle: "Idle",
+};
+
+function timelineOperationRow(op) {
+  const opLabel = (op.operation_types && op.operation_types.length)
+    ? op.operation_types.join(", ")
+    : (op.label && op.label !== "unknown" ? op.label : (op.action_type || "—"));
+  const path = (op.target_paths && op.target_paths.length) ? op.target_paths.join(", ") : "";
+  const tags = [];
+  if (op.is_local_file_operation) tags.push('<span class="badge">local file</span>');
+  if (op.executed) tags.push('<span class="badge badge-executed-by-bounded-executor">executed</span>');
+  else if (op.blocked) tags.push('<span class="badge">blocked/refused</span>');
+  else if (op.admitted) tags.push('<span class="badge">admitted</span>');
+  if (op.evidence_count) tags.push(`<span class="badge">evidence ×${escapeHtml(op.evidence_count)}</span>`);
+  return `
+    <li style="display:flex;flex-wrap:wrap;align-items:center;gap:.4rem;padding:.3rem 0;border-top:1px solid var(--cs-border,rgba(128,128,128,.18));">
+      <span class="decision-${escapeHtml(op.decision)}" style="font-weight:600;">${escapeHtml(op.decision)}</span>
+      <code>${escapeHtml(opLabel)}</code>
+      ${path ? `<code style="color:var(--cs-muted);">${escapeHtml(path)}</code>` : ""}
+      ${tags.join(" ")}
+      <button type="button" class="secondary select-action-btn" data-action-id="${escapeHtml(op.action_id)}" style="margin-left:auto;">Review</button>
+    </li>`;
+}
+
+function timelineTurnBlock(turn) {
+  const ops = turn.operations || [];
+  const counts = [];
+  if (turn.admitted_count) counts.push(`${turn.admitted_count} admitted`);
+  if (turn.executed_count) counts.push(`${turn.executed_count} executed`);
+  if (turn.blocked_count) counts.push(`${turn.blocked_count} blocked/refused`);
+  if (turn.evidence_count) counts.push(`${turn.evidence_count} evidence`);
+  const header = turn.turn_number === 0 ? "Loaded actions" : `Turn ${escapeHtml(turn.turn_number)}`;
+  const opsHtml = ops.length
+    ? `<ul style="list-style:none;margin:.35rem 0 0;padding:0;">${ops.map(timelineOperationRow).join("")}</ul>`
+    : `<p class="no-action-note" style="margin:.35rem 0 0;">Instruction sent; no agent proposal ingested yet.</p>`;
+  return `
+    <div class="timeline-turn" style="margin:.5rem 0;padding:.5rem .6rem;border-left:3px solid var(--cs-accent,#6c8cff);background:var(--cs-subtle,rgba(128,128,128,.06));border-radius:0 6px 6px 0;">
+      <div style="display:flex;flex-wrap:wrap;gap:.5rem;align-items:baseline;">
+        <strong>${header}</strong>
+        <span style="font-size:.76rem;color:var(--cs-muted);">${escapeHtml(turn.summary || "")}</span>
+        ${counts.length ? `<span style="margin-left:auto;font-size:.74rem;color:var(--cs-muted);">${escapeHtml(counts.join(" · "))}</span>` : ""}
+      </div>
+      ${opsHtml}
+    </div>`;
+}
+
+function renderRunTimeline(state) {
+  const body = document.getElementById("run-timeline-body");
+  if (!body) return;
+  const timeline = state.run_timeline || {};
+  if (!timeline.goal && (timeline.status === "needs_goal" || !timeline.status)) {
+    body.innerHTML = '<p class="no-action-note">No run yet. Submit a goal above to begin the timeline.</p>';
+    return;
+  }
+
+  const statusLabel = TIMELINE_STATUS_LABELS[timeline.status] || timeline.status || "—";
+  const latest = timeline.latest_agent_proposal;
+  const latestHtml = latest
+    ? `<div style="margin:.45rem 0;font-size:.8rem;">
+         <strong>Latest agent proposal</strong> — turn ${escapeHtml(latest.turn_number)},
+         ${escapeHtml(latest.operation_count)} operation(s): ${escapeHtml(latest.admitted_count)} admitted,
+         ${escapeHtml(latest.blocked_count)} blocked/refused
+         <span style="color:var(--cs-muted);">(${escapeHtml(latest.source_trust)})</span>
+         ${latest.preview ? `<div class="mono" style="margin-top:.25rem;font-size:.72rem;color:var(--cs-muted);white-space:pre-wrap;">${escapeHtml(truncate(latest.preview, 220))}</div>` : ""}
+       </div>`
+    : '<p class="no-action-note" style="margin:.45rem 0;">No agent proposal ingested yet.</p>';
+
+  const turns = timeline.turns || [];
+  const turnsHtml = turns.length
+    ? turns.map(timelineTurnBlock).join("")
+    : '<p class="no-action-note">Goal accepted and plan audited. Generate or write the first instruction to open turn 1.</p>';
+
+  body.innerHTML = `
+    <div class="stat-grid">
+      <div class="stat-tile"><span class="stat-label">Goal</span><span class="stat-value" style="font-size:.8rem;font-weight:500;">${escapeHtml(truncate(timeline.goal, 90))}</span></div>
+      <div class="stat-tile"><span class="stat-label">Run status</span><span class="stat-value" style="font-size:.82rem;">${escapeHtml(statusLabel)}</span></div>
+      <div class="stat-tile"><span class="stat-label">Turns</span><span class="stat-value">${escapeHtml(timeline.turn_count || 0)}</span></div>
+      <div class="stat-tile"><span class="stat-label">Admitted</span><span class="stat-value">${escapeHtml((timeline.admitted_operation_ids || []).length)}</span></div>
+      <div class="stat-tile"><span class="stat-label">Executed</span><span class="stat-value">${escapeHtml((timeline.executed_operation_ids || []).length)}</span></div>
+      <div class="stat-tile"><span class="stat-label">Ready to run locally</span><span class="stat-value">${escapeHtml(timeline.ready_to_execute_local_count || 0)}</span></div>
+      <div class="stat-tile"><span class="stat-label">Evidence records</span><span class="stat-value">${escapeHtml(timeline.evidence_count || 0)}</span></div>
+      <div class="stat-tile ${(timeline.blocked_operation_ids || []).length ? "attention" : ""}"><span class="stat-label">Blocked / refused</span><span class="stat-value">${escapeHtml((timeline.blocked_operation_ids || []).length)}</span></div>
+    </div>
+    ${latestHtml}
+    <div class="timeline-sequence">${turnsHtml}</div>
+  `;
+  body.querySelectorAll(".select-action-btn").forEach((btn) => {
+    btn.addEventListener("click", () => selectAction(btn.getAttribute("data-action-id")));
+  });
 }
 
 function renderNeedsAttention(state) {
@@ -1591,6 +1699,7 @@ function render(state) {
   renderManualFallback(state);
   renderBridgeFromState(state);
   renderMissionSummary(state);
+  renderRunTimeline(state);
   renderNeedsAttention(state);
   renderReadyToExecuteLocally(state);
   renderQueueTable(state);

@@ -1152,6 +1152,301 @@ def reevaluate_envelope_with_evidence(
     return decision
 
 
+# -- run timeline (v0, additive, display-only projection) --------------------
+#
+# Slice ADMISSIBLE_RUN_021_MULTI_TURN_RUN_TIMELINE. The Control Surface already
+# stores every fact a governed run needs (goal intake, per-turn instruction
+# packets, ingested agent responses, admission decisions on queue items,
+# execution status, evidence records, refusals). What it lacked was a single
+# object that reads the run *in sequence* -- goal -> turn -> proposal ->
+# admission -> execution -> evidence -> next turn. `build_run_timeline` is a
+# pure projection over that existing state; it never re-decides an admission,
+# never executes anything, never persists new source-of-truth state, and never
+# calls a provider. It groups the current queue by the turn that proposed each
+# action (via the response records' `action_ids`) and folds in evidence counts
+# and blocked/refused status so the UI can render the run as a timeline instead
+# of a flat queue.
+
+RUN_TIMELINE_SCHEMA_VERSION = "admissible_run_timeline_v0"
+
+TIMELINE_STATUS_NEEDS_GOAL = "needs_goal"
+TIMELINE_STATUS_PLANNED = "planned"
+TIMELINE_STATUS_AWAITING_AGENT_RESPONSE = "awaiting_agent_response"
+TIMELINE_STATUS_REVIEWING_PROPOSALS = "reviewing_proposals"
+TIMELINE_STATUS_READY_TO_EXECUTE_LOCAL = "ready_to_execute_local"
+TIMELINE_STATUS_EXECUTED = "executed"
+TIMELINE_STATUS_IDLE = "idle"
+
+# Execution statuses that mean an admitted action was actually run (by a human
+# attestation or by the bounded local executor). Kept as local string literals
+# so this module stays free of an import from admissible.admitted_execution.
+_TIMELINE_EXECUTED_STATUSES = frozenset(
+    {"executed_after_admission", "executed_by_bounded_executor"}
+)
+_TIMELINE_ADMITTED_DECISIONS = frozenset({"ALLOW", "ALLOW_WITH_LIMITS"})
+# The synthetic turn number used for queue actions that no agent-response
+# record claims -- e.g. actions loaded from a static truth trace via
+# `load_sample_session` / `load_trace`, which never pass through the ingest path.
+TIMELINE_LOADED_TURN = 0
+
+
+@dataclass
+class TimelineOperation:
+    """One proposed action, projected for the run timeline.
+
+    A compact, display-only view of a queue item: which turn proposed it,
+    the immutable admission decision, its derived lifecycle/execution state,
+    whether it counts as admitted / executed / blocked, and any bounded local
+    file operation details already extracted for it.
+    """
+
+    action_id: str
+    turn_number: int
+    label: str | None
+    action_type: str | None
+    decision: str
+    lifecycle_status: str
+    execution_status: str
+    admitted: bool
+    executed: bool
+    blocked: bool
+    is_local_file_operation: bool
+    operation_types: list[str]
+    target_paths: list[str]
+    evidence_count: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "TimelineOperation":
+        return _from_dict(cls, data)
+
+
+@dataclass
+class TimelineTurn:
+    """One turn/phase of the governed run, with the operations it proposed."""
+
+    turn_number: int
+    created_at: str | None
+    instruction_packet_id: str | None
+    agent_response_record_id: str | None
+    has_agent_proposal: bool
+    summary: str
+    operations: list[TimelineOperation]
+    admitted_count: int
+    executed_count: int
+    blocked_count: int
+    evidence_count: int
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["operations"] = [op.to_dict() for op in self.operations]
+        return data
+
+
+@dataclass
+class RunTimeline:
+    """A readable, sequenced projection of one governed run (display-only)."""
+
+    schema_version: str
+    session_id: str
+    created_at: str
+    goal: str | None
+    status: str
+    turn_count: int
+    turns: list[TimelineTurn]
+    admitted_operation_ids: list[str]
+    executed_operation_ids: list[str]
+    blocked_operation_ids: list[str]
+    ready_to_execute_local_count: int
+    evidence_count: int
+    pending_human_decision_count: int
+    latest_agent_proposal: dict[str, Any] | None
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["turns"] = [turn.to_dict() for turn in self.turns]
+        return data
+
+
+def _timeline_turn_for_actions(run_loop: "RunLoopState") -> dict[str, int]:
+    """Map each proposed action id to the turn whose response introduced it."""
+    turn_for_action: dict[str, int] = {}
+    for record in run_loop.response_records:
+        for action_id in record.action_ids:
+            turn_for_action[action_id] = record.turn_number
+    return turn_for_action
+
+
+def build_run_timeline(
+    *,
+    session_id: str,
+    created_at: str,
+    goal_intake: dict[str, Any] | None,
+    queue: list[dict[str, Any]],
+    run_loop: "RunLoopState",
+    operation_context: dict[str, dict[str, Any]] | None = None,
+    bridge_awaiting_response: bool = False,
+    pending_human_decision_count: int = 0,
+) -> RunTimeline:
+    """Build the display-only run timeline from already-computed session state.
+
+    Pure projection: it re-decides nothing and executes nothing. ``queue`` is a
+    list of ``DecisionQueueItem`` dicts (as produced by ``to_dict``);
+    ``operation_context`` optionally maps an action id to the bounded local
+    file operation details already derived for it (``operation_types``,
+    ``target_paths``, ``structured_operation_count``) so the timeline can show
+    which proposals are executable local file operations without importing the
+    control-surface bounded-execution view.
+    """
+    operation_context = operation_context or {}
+    goal = None
+    if goal_intake:
+        goal = goal_intake.get("prompt") or goal_intake.get("deliverable")
+
+    turn_for_action = _timeline_turn_for_actions(run_loop)
+
+    evidence_by_action: dict[str, int] = {}
+    for record in run_loop.evidence_records:
+        evidence_by_action[record.action_id] = evidence_by_action.get(record.action_id, 0) + 1
+
+    ops_by_turn: dict[int, list[TimelineOperation]] = {}
+    all_operations: list[TimelineOperation] = []
+    admitted_ids: list[str] = []
+    executed_ids: list[str] = []
+    blocked_ids: list[str] = []
+    ready_to_execute_local_count = 0
+
+    for item in queue:
+        action_id = item.get("action_id")
+        decision = item.get("decision") or "—"
+        execution_status = item.get("execution_status") or "proposed_only"
+        lifecycle_status = item.get("lifecycle_status") or LIFECYCLE_NEEDS_HUMAN_INPUT
+        context = operation_context.get(action_id, {})
+
+        executed = execution_status in _TIMELINE_EXECUTED_STATUSES
+        blocked = decision == "REFUSE" or lifecycle_status == LIFECYCLE_REFUSED_CLOSED
+        admitted = (not blocked) and (
+            decision in _TIMELINE_ADMITTED_DECISIONS
+            or execution_status == _EXECUTION_STATUS_ADMITTED_NOT_EXECUTED
+            or executed
+        )
+        is_local_file_operation = bool(context.get("structured_operation_count"))
+        turn_number = turn_for_action.get(action_id, TIMELINE_LOADED_TURN)
+
+        operation = TimelineOperation(
+            action_id=action_id,
+            turn_number=turn_number,
+            label=item.get("tool_or_command"),
+            action_type=item.get("action_type"),
+            decision=decision,
+            lifecycle_status=lifecycle_status,
+            execution_status=execution_status,
+            admitted=admitted,
+            executed=executed,
+            blocked=blocked,
+            is_local_file_operation=is_local_file_operation,
+            operation_types=list(context.get("operation_types") or []),
+            target_paths=list(context.get("target_paths") or []),
+            evidence_count=evidence_by_action.get(action_id, 0),
+        )
+        ops_by_turn.setdefault(turn_number, []).append(operation)
+        all_operations.append(operation)
+
+        if blocked:
+            blocked_ids.append(action_id)
+        elif admitted:
+            admitted_ids.append(action_id)
+            if executed:
+                executed_ids.append(action_id)
+            elif is_local_file_operation:
+                ready_to_execute_local_count += 1
+
+    run_turn_by_number = {turn.turn_number: turn for turn in run_loop.turns}
+    turn_numbers = sorted(set(run_turn_by_number) | set(ops_by_turn))
+    timeline_turns: list[TimelineTurn] = []
+    for turn_number in turn_numbers:
+        run_turn = run_turn_by_number.get(turn_number)
+        operations = ops_by_turn.get(turn_number, [])
+        has_proposal = bool(run_turn and run_turn.agent_response_record_id) or bool(operations)
+        if run_turn is not None:
+            summary = run_turn.summary
+        elif turn_number == TIMELINE_LOADED_TURN:
+            summary = f"Loaded {len(operations)} action(s) (no instruction turn)."
+        else:
+            summary = f"Turn {turn_number}."
+        timeline_turns.append(
+            TimelineTurn(
+                turn_number=turn_number,
+                created_at=run_turn.created_at if run_turn else None,
+                instruction_packet_id=run_turn.instruction_packet_id if run_turn else None,
+                agent_response_record_id=run_turn.agent_response_record_id if run_turn else None,
+                has_agent_proposal=has_proposal,
+                summary=summary,
+                operations=operations,
+                admitted_count=sum(1 for op in operations if op.admitted),
+                executed_count=sum(1 for op in operations if op.executed),
+                blocked_count=sum(1 for op in operations if op.blocked),
+                evidence_count=sum(op.evidence_count for op in operations),
+            )
+        )
+
+    latest_agent_proposal: dict[str, Any] | None = None
+    if run_loop.response_records:
+        record = run_loop.response_records[-1]
+        record_action_ids = set(record.action_ids)
+        record_ops = [op for op in all_operations if op.action_id in record_action_ids]
+        latest_agent_proposal = {
+            "turn_number": record.turn_number,
+            "record_id": record.record_id,
+            "created_at": record.created_at,
+            "actor": record.actor,
+            "source_trust": record.source_trust,
+            "operation_count": len(record.action_ids),
+            "admitted_count": sum(1 for op in record_ops if op.admitted),
+            "executed_count": sum(1 for op in record_ops if op.executed),
+            "blocked_count": sum(1 for op in record_ops if op.blocked),
+            "preview": (record.raw_text or "")[:280],
+        }
+
+    has_goal = bool(goal_intake)
+    if not has_goal:
+        status = TIMELINE_STATUS_NEEDS_GOAL
+    elif bridge_awaiting_response:
+        status = TIMELINE_STATUS_AWAITING_AGENT_RESPONSE
+    elif pending_human_decision_count > 0:
+        status = TIMELINE_STATUS_REVIEWING_PROPOSALS
+    elif ready_to_execute_local_count > 0:
+        status = TIMELINE_STATUS_READY_TO_EXECUTE_LOCAL
+    elif executed_ids:
+        status = TIMELINE_STATUS_EXECUTED
+    elif all_operations:
+        status = TIMELINE_STATUS_IDLE
+    else:
+        status = TIMELINE_STATUS_PLANNED
+
+    proposal_turns = sum(1 for turn in timeline_turns if turn.operations or turn.has_agent_proposal)
+    turn_count = max(run_loop.current_turn, proposal_turns)
+
+    return RunTimeline(
+        schema_version=RUN_TIMELINE_SCHEMA_VERSION,
+        session_id=session_id,
+        created_at=created_at,
+        goal=goal,
+        status=status,
+        turn_count=turn_count,
+        turns=timeline_turns,
+        admitted_operation_ids=admitted_ids,
+        executed_operation_ids=executed_ids,
+        blocked_operation_ids=blocked_ids,
+        ready_to_execute_local_count=ready_to_execute_local_count,
+        evidence_count=len(run_loop.evidence_records),
+        pending_human_decision_count=pending_human_decision_count,
+        latest_agent_proposal=latest_agent_proposal,
+    )
+
+
 __all__ = [
     "AGENT_RESPONSE_ACTOR",
     "AGENT_RESPONSE_SOURCE_TRUST",
@@ -1174,14 +1469,26 @@ __all__ = [
     "LIFECYCLE_STATUSES",
     "NON_EXECUTION_BOUNDARIES",
     "RUN_LOOP_SCHEMA_VERSION",
+    "RUN_TIMELINE_SCHEMA_VERSION",
+    "TIMELINE_STATUS_NEEDS_GOAL",
+    "TIMELINE_STATUS_PLANNED",
+    "TIMELINE_STATUS_AWAITING_AGENT_RESPONSE",
+    "TIMELINE_STATUS_REVIEWING_PROPOSALS",
+    "TIMELINE_STATUS_READY_TO_EXECUTE_LOCAL",
+    "TIMELINE_STATUS_EXECUTED",
+    "TIMELINE_STATUS_IDLE",
+    "TIMELINE_LOADED_TURN",
     "AgentInstructionPacket",
     "AgentResponseRecord",
     "DerivedLifecycleResolution",
     "EvidenceRecord",
     "ResolvedPlanGateRecord",
     "RunLoopState",
+    "RunTimeline",
     "RunTurn",
     "SupersedingAdmissionDecision",
+    "TimelineOperation",
+    "TimelineTurn",
     "EVIDENCE_SOURCES",
     "STRUCTURED_OPERATION_MARKER",
     "cumulative_satisfied_evidence_fields",
@@ -1192,6 +1499,7 @@ __all__ = [
     "non_evidence_blockers_from_decision",
     "remaining_missing_after_evidence",
     "build_candidates_from_agent_response",
+    "build_run_timeline",
     "default_lifecycle_status",
     "generate_instruction_packet",
     "lifecycle_status_after_evidence_reevaluation",
