@@ -508,6 +508,13 @@ function fmtList(items) {
   return items.map(escapeHtml).join(", ");
 }
 
+function fmtSatisfiedFields(item) {
+  const original = Array.isArray(item.original_missing_evidence) ? item.original_missing_evidence : [];
+  const satisfied = Array.isArray(item.satisfied_evidence_fields) ? item.satisfied_evidence_fields : [];
+  if (original.length && satisfied.length >= original.length) return "all fields";
+  return fmtList(satisfied);
+}
+
 function showError(message) {
   const banner = document.getElementById("error-banner");
   banner.textContent = "Admissible Control Surface error: " + message;
@@ -652,6 +659,7 @@ function attentionActionRows(actions) {
 const LIFECYCLE_LABELS = {
   needs_human_input: "Needs human input",
   evidence_supplied_pending_reevaluation: "Evidence supplied — pending re-evaluation",
+  evidence_supplied_pending_manual_confirmation: "Evidence supplied — manual confirmation required",
   evidence_supplied_still_blocked: "Evidence supplied — still blocked",
   evidence_insufficient_still_missing: "Evidence insufficient — still missing",
   blocked_by_non_evidence_gate: "Blocked by authority/reversibility/policy",
@@ -706,6 +714,12 @@ function bucketActionRows(actions, { showReview = false, note = "" } = {}) {
       const missing =
         Array.isArray(a.missing_evidence) && a.missing_evidence.length
           ? `<div class="bucket-meta">Still missing: ${fmtList(a.missing_evidence)}</div>`
+          : a.satisfied_evidence_fields?.length
+            ? `<div class="bucket-meta">Still missing: None</div>`
+            : "";
+      const satisfied =
+        Array.isArray(a.satisfied_evidence_fields) && a.satisfied_evidence_fields.length
+          ? `<div class="bucket-meta">Satisfied: ${fmtSatisfiedFields(a)}</div>`
           : "";
       const evidenceSummary = a.evidence_attention_summary
         ? `<div class="bucket-meta">${escapeHtml(a.evidence_attention_summary)}</div>`
@@ -720,6 +734,7 @@ function bucketActionRows(actions, { showReview = false, note = "" } = {}) {
             <span class="mono" style="margin-left:.35rem;">${escapeHtml(a.action_id)}</span></div>
           <div class="bucket-meta">${escapeHtml(truncate(displayToolOrCommand(a), 90))}</div>
           ${lifecycle}
+          ${satisfied}
           ${evidenceSummary}
           ${missing}
           ${extraNote}
@@ -992,7 +1007,7 @@ function renderSelectedAction(state) {
   const evidenceStateHtml =
     isEvidenceCase || item.satisfied_evidence_fields?.length || item.evidence_attention_summary
       ? `<dl class="kv-grid">
-      <dt>Satisfied evidence fields</dt><dd>${fmtList(item.satisfied_evidence_fields)}</dd>
+      <dt>Satisfied evidence fields</dt><dd>${fmtSatisfiedFields(item)}</dd>
       <dt>Non-evidence blockers</dt><dd>${fmtList(item.non_evidence_blockers)}</dd>
       <dt>Latest evidence</dt><dd>${escapeHtml(item.latest_evidence_summary || "—")}</dd>
       <dt>Evidence status</dt><dd>${escapeHtml(item.evidence_attention_summary || "—")}</dd>
@@ -1022,7 +1037,8 @@ function renderSelectedAction(state) {
       <dt>Operational action</dt><dd><code>${escapeHtml(item.operational_admissibility_action)}</code></dd>
       <dt>Risk level</dt><dd>${escapeHtml(item.risk_level)}</dd>
       <dt>Required approval</dt><dd>${escapeHtml(item.required_approval)}</dd>
-      <dt>Missing evidence</dt><dd>${fmtList(item.missing_evidence)}</dd>
+      <dt>Originally missing evidence</dt><dd>${fmtList(item.original_missing_evidence?.length ? item.original_missing_evidence : item.missing_evidence)}</dd>
+      <dt>Still missing evidence</dt><dd>${fmtList(item.missing_evidence)}</dd>
     </dl>
     ${evidenceStateHtml}
     ${lifecycleNote}
@@ -1377,7 +1393,7 @@ async function onEvidenceSubmit(event) {
     rationale: formData.get("rationale") || "",
   };
   const satisfies = formData.get("satisfies");
-  if (satisfies) body.satisfies = satisfies;
+  body.satisfies = satisfies ?? "";
   await runAction(() => apiPost(`/api/queue/${encodeURIComponent(actionId)}/evidence`, body));
 }
 

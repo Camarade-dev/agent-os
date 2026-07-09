@@ -55,6 +55,9 @@ EVIDENCE_ACTOR_HUMAN_OPERATOR = "human_operator"
 
 LIFECYCLE_NEEDS_HUMAN_INPUT = "needs_human_input"
 LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION = "evidence_supplied_pending_reevaluation"
+LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_MANUAL_CONFIRMATION = (
+    "evidence_supplied_pending_manual_confirmation"
+)
 # Derived statuses produced when evidence is supplied and re-evaluated
 # (slice ADMISSIBLE_STATE_LIFECYCLE_002_EVIDENCE_ACCUMULATION_AND_REEVALUATION).
 LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED = "evidence_supplied_still_blocked"
@@ -76,6 +79,7 @@ LIFECYCLE_STATUSES = frozenset(
     {
         LIFECYCLE_NEEDS_HUMAN_INPUT,
         LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION,
+        LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_MANUAL_CONFIRMATION,
         LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED,
         LIFECYCLE_EVIDENCE_SATISFIED_PENDING_HUMAN_DECISION,
         LIFECYCLE_EVIDENCE_INSUFFICIENT_STILL_MISSING,
@@ -114,6 +118,21 @@ _DEFAULT_LIFECYCLE_BY_DECISION: dict[str, str] = {
 def default_lifecycle_status(decision_label: str) -> str:
     """Return the default v0 lifecycle status for a rules-only decision label."""
     return _DEFAULT_LIFECYCLE_BY_DECISION.get(decision_label, LIFECYCLE_NEEDS_HUMAN_INPUT)
+
+
+def lifecycle_status_after_evidence_without_envelope(
+    decision_label: str,
+    *,
+    remaining_missing: list[str] | None = None,
+    latest_evidence_recognized: bool = True,
+) -> str:
+    """Return lifecycle when evidence is recorded but no full envelope exists to re-evaluate."""
+    if decision_label != "REQUEST_MORE_EVIDENCE":
+        return LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_MANUAL_CONFIRMATION
+    remaining = list(remaining_missing or [])
+    if remaining and not latest_evidence_recognized:
+        return LIFECYCLE_EVIDENCE_INSUFFICIENT_STILL_MISSING
+    return LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_MANUAL_CONFIRMATION
 
 
 def lifecycle_status_after_evidence_reevaluation(
@@ -271,6 +290,59 @@ def fields_satisfied_by_record(
     return satisfied
 
 
+_SAME_AS_EVIDENCE_TYPE_PLACEHOLDERS = frozenset(
+    {
+        "",
+        "(same as evidence type)",
+        "same as evidence type",
+        "__same_as_evidence_type__",
+    }
+)
+
+
+def normalize_evidence_satisfies(raw_satisfies: Any, evidence_type: str) -> list[str]:
+    """Normalize satisfies from UI/API, including '(same as evidence type)' placeholders."""
+    if raw_satisfies is None:
+        return [evidence_type] if evidence_type else []
+    if isinstance(raw_satisfies, str):
+        stripped = raw_satisfies.strip()
+        if not stripped or stripped.lower() in {
+            p.lower() for p in _SAME_AS_EVIDENCE_TYPE_PLACEHOLDERS if p
+        }:
+            return [evidence_type] if evidence_type else []
+        return [stripped]
+    normalized: list[str] = []
+    for field in raw_satisfies:
+        token = str(field).strip()
+        if not token:
+            continue
+        if token.lower() in {
+            p.lower() for p in _SAME_AS_EVIDENCE_TYPE_PLACEHOLDERS if p
+        }:
+            if evidence_type and evidence_type not in normalized:
+                normalized.append(evidence_type)
+        elif token not in normalized:
+            normalized.append(token)
+    return normalized or ([evidence_type] if evidence_type else [])
+
+
+def remaining_missing_after_evidence(
+    records: list["EvidenceRecord"],
+    *,
+    original_missing: list[Any],
+) -> list[str]:
+    """Return missing-field ids still outstanding after cumulative evidence records."""
+    remaining = list(original_missing)
+    for record in records:
+        matched = fields_satisfied_by_record(record, missing_before=remaining)
+        remaining = [
+            note
+            for note in remaining
+            if not any(_field_matches_missing(f, [note]) for f in matched)
+        ]
+    return [_missing_field_id(n) for n in remaining]
+
+
 def cumulative_satisfied_evidence_fields(
     records: list["EvidenceRecord"],
     *,
@@ -301,14 +373,21 @@ def derive_evidence_attention_state(
     original_missing: list[Any],
     evidence_records: list["EvidenceRecord"],
     latest_record: "EvidenceRecord | None" = None,
+    without_envelope_reevaluation: bool = False,
 ) -> dict[str, Any]:
     """Compute structured evidence satisfaction and a demo-readable attention summary."""
     cumulative = cumulative_satisfied_evidence_fields(
         evidence_records, original_missing=original_missing
     )
-    remaining = list(decision.get("missing_evidence") or [])
+    if without_envelope_reevaluation:
+        remaining = remaining_missing_after_evidence(
+            evidence_records, original_missing=original_missing
+        )
+    else:
+        remaining = list(decision.get("missing_evidence") or [])
     non_evidence = non_evidence_blockers_from_decision(decision)
     decision_label = str(decision.get("decision") or "")
+    original_ids = [_missing_field_id(n) for n in original_missing]
 
     latest = latest_record
     latest_fields: list[str] = []
@@ -327,14 +406,55 @@ def derive_evidence_attention_state(
         latest_fields = fields_satisfied_by_record(latest, missing_before=missing_before_latest)
         latest_recognized = bool(latest_fields) or not _record_target_fields(latest)
 
-    lifecycle = lifecycle_status_after_evidence_reevaluation(
-        decision_label,
-        missing_evidence=remaining,
-        non_evidence_blockers=non_evidence,
-        latest_evidence_recognized=latest_recognized,
-    )
+    if without_envelope_reevaluation:
+        lifecycle = lifecycle_status_after_evidence_without_envelope(
+            decision_label,
+            remaining_missing=remaining,
+            latest_evidence_recognized=latest_recognized,
+        )
+    else:
+        lifecycle = lifecycle_status_after_evidence_reevaluation(
+            decision_label,
+            missing_evidence=remaining,
+            non_evidence_blockers=non_evidence,
+            latest_evidence_recognized=latest_recognized,
+        )
 
-    if decision_label == "REQUIRE_HUMAN_APPROVAL":
+    all_fields_satisfied = bool(original_ids) and not remaining and bool(cumulative)
+
+    if without_envelope_reevaluation:
+        if lifecycle == LIFECYCLE_EVIDENCE_INSUFFICIENT_STILL_MISSING:
+            summary = (
+                "Evidence insufficient or unrecognized; still missing: "
+                + (", ".join(remaining) if remaining else "(none listed)")
+            )
+        elif all_fields_satisfied:
+            summary = (
+                "Evidence fields satisfied, but no full envelope is available for "
+                "automatic re-evaluation; human confirmation is required."
+            )
+        elif cumulative and remaining:
+            summary = (
+                "Evidence accepted for "
+                + ", ".join(cumulative)
+                + "; still missing: "
+                + ", ".join(remaining)
+                + ". No full envelope is available for automatic re-evaluation; "
+                "human confirmation is required."
+            )
+        elif cumulative:
+            summary = (
+                "Evidence recorded for "
+                + ", ".join(cumulative)
+                + ". No full envelope is available for automatic re-evaluation; "
+                "human confirmation is required."
+            )
+        else:
+            summary = (
+                "Evidence recorded; no full envelope is available for automatic "
+                "re-evaluation; human confirmation is required."
+            )
+    elif decision_label == "REQUIRE_HUMAN_APPROVAL":
         summary = "Evidence satisfied; human approval required."
     elif lifecycle == LIFECYCLE_EVIDENCE_INSUFFICIENT_STILL_MISSING:
         summary = (
@@ -357,7 +477,7 @@ def derive_evidence_attention_state(
         summary = "Evidence supplied; awaiting further resolution."
 
     return {
-        "previously_missing_evidence": [_missing_field_id(n) for n in original_missing],
+        "previously_missing_evidence": original_ids,
         "fields_satisfied_by_latest": latest_fields,
         "satisfied_evidence_fields": cumulative,
         "remaining_missing_evidence": remaining,
@@ -365,6 +485,7 @@ def derive_evidence_attention_state(
         "evidence_attention_summary": summary,
         "latest_evidence_recognized": latest_recognized,
         "lifecycle_status": lifecycle,
+        "all_evidence_fields_satisfied": all_fields_satisfied,
     }
 
 
@@ -713,12 +834,31 @@ def _evidence_needed(queue: list[dict[str, Any]]) -> list[str]:
         if item.get("decision") != "REQUEST_MORE_EVIDENCE":
             continue
         status = item.get("lifecycle_status", LIFECYCLE_NEEDS_HUMAN_INPUT)
-        if status == LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION:
-            items.append(
-                f"{item.get('action_id')}: evidence was already supplied by a human operator but "
-                "could not be automatically re-evaluated in v0 (no full envelope on this action); "
-                "still treat as blocked until a human confirms."
-            )
+        if status in (
+            LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION,
+            LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_MANUAL_CONFIRMATION,
+        ):
+            missing = item.get("missing_evidence") or []
+            satisfied = item.get("satisfied_evidence_fields") or []
+            summary = item.get("evidence_attention_summary")
+            if satisfied and not missing:
+                items.append(
+                    f"{item.get('action_id')}: evidence fields satisfied but manual confirmation "
+                    "required (no full envelope for automatic re-evaluation)."
+                )
+            elif satisfied and missing:
+                for entry in missing:
+                    line = f"{item.get('action_id')}: {entry}"
+                    if line not in items:
+                        items.append(line)
+            elif summary:
+                items.append(f"{item.get('action_id')}: {summary}")
+            else:
+                items.append(
+                    f"{item.get('action_id')}: evidence was already supplied by a human operator but "
+                    "could not be automatically re-evaluated in v0 (no full envelope on this action); "
+                    "still treat as blocked until a human confirms."
+                )
             continue
         if status in (
             LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED,
@@ -993,6 +1133,7 @@ __all__ = [
     "LIFECYCLE_APPROVAL_SUPPLIED_PENDING_REEVALUATION",
     "LIFECYCLE_CLOSED",
     "LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION",
+    "LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_MANUAL_CONFIRMATION",
     "LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED",
     "LIFECYCLE_BLOCKED_BY_NON_EVIDENCE_GATE",
     "LIFECYCLE_EVIDENCE_INSUFFICIENT_STILL_MISSING",
@@ -1018,7 +1159,10 @@ __all__ = [
     "cumulative_satisfied_evidence_fields",
     "derive_evidence_attention_state",
     "fields_satisfied_by_record",
+    "lifecycle_status_after_evidence_without_envelope",
+    "normalize_evidence_satisfies",
     "non_evidence_blockers_from_decision",
+    "remaining_missing_after_evidence",
     "build_candidates_from_agent_response",
     "default_lifecycle_status",
     "generate_instruction_packet",

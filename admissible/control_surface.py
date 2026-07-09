@@ -65,6 +65,7 @@ from admissible.run_loop import (
     LIFECYCLE_APPROVAL_SUPPLIED_PENDING_REEVALUATION,
     LIFECYCLE_CLOSED,
     LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION,
+    LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_MANUAL_CONFIRMATION,
     LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED,
     LIFECYCLE_EVIDENCE_SATISFIED_PENDING_HUMAN_DECISION,
     LIFECYCLE_EVIDENCE_INSUFFICIENT_STILL_MISSING,
@@ -87,6 +88,7 @@ from admissible.run_loop import (
     default_lifecycle_status,
     derive_evidence_attention_state,
     generate_instruction_packet,
+    normalize_evidence_satisfies,
     queue_item_needs_attention,
     reevaluate_envelope_with_evidence,
     resolved_plan_gate_ids,
@@ -367,6 +369,7 @@ class DecisionQueueItem:
     # Structured evidence satisfaction (slice ADMISSIBLE_EVIDENCE_007).
     satisfied_evidence_fields: list[str] = field(default_factory=list)
     non_evidence_blockers: list[str] = field(default_factory=list)
+    original_missing_evidence: list[str] = field(default_factory=list)
     evidence_attention_summary: str | None = None
     latest_evidence_summary: str | None = None
     # Display-only run-loop lifecycle tracking (see admissible.run_loop).
@@ -679,6 +682,7 @@ def _attention_row(item: "DecisionQueueItem") -> dict[str, Any]:
         "execution_status": item.execution_status,
         "lifecycle_status": item.lifecycle_status,
         "missing_evidence": list(item.missing_evidence),
+        "original_missing_evidence": list(item.original_missing_evidence),
         "satisfied_evidence_fields": list(item.satisfied_evidence_fields),
         "non_evidence_blockers": list(item.non_evidence_blockers),
         "evidence_attention_summary": item.evidence_attention_summary,
@@ -703,28 +707,36 @@ def _apply_evidence_attention_to_item(
     evidence_records: list[EvidenceRecord],
     latest_record: EvidenceRecord | None,
     effective_decision: dict[str, Any] | None,
+    without_envelope_reevaluation: bool = False,
 ) -> None:
     """Project structured evidence satisfaction onto a queue item."""
-    if envelope is None or effective_decision is None:
+    if effective_decision is None:
         return
-    original_missing = list(envelope.decision.get("missing_evidence") or [])
-    if envelope.envelope is not None:
-        original_missing = [
-            str(note) if not isinstance(note, dict) else str(note.get("field_id") or note.get("summary") or "")
-            for note in (envelope.envelope.get("evidence") or {}).get("missing") or []
-        ] or original_missing
+    if envelope is not None:
+        original_missing = list(envelope.decision.get("missing_evidence") or [])
+        if not without_envelope_reevaluation and envelope.envelope is not None:
+            original_missing = [
+                str(note) if not isinstance(note, dict) else str(note.get("field_id") or note.get("summary") or "")
+                for note in (envelope.envelope.get("evidence") or {}).get("missing") or []
+            ] or original_missing
+    else:
+        original_missing = list(item.original_missing_evidence or item.missing_evidence or [])
     action_records = [r for r in evidence_records if r.action_id == item.action_id]
     attention = derive_evidence_attention_state(
         effective_decision,
         original_missing=original_missing,
         evidence_records=action_records,
         latest_record=latest_record,
+        without_envelope_reevaluation=without_envelope_reevaluation,
     )
     item.satisfied_evidence_fields = list(attention["satisfied_evidence_fields"])
     item.non_evidence_blockers = list(attention["non_evidence_blockers"])
     item.evidence_attention_summary = attention["evidence_attention_summary"]
+    item.original_missing_evidence = list(attention["previously_missing_evidence"])
     if latest_record is not None:
         item.latest_evidence_summary = latest_record.evidence_text
+    if without_envelope_reevaluation:
+        item.missing_evidence = list(attention["remaining_missing_evidence"])
     if action_records:
         item.lifecycle_status = attention["lifecycle_status"]
 
@@ -802,6 +814,7 @@ def _lifecycle_overview(session: "ControlSession") -> dict[str, Any]:
             LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED,
             LIFECYCLE_EVIDENCE_INSUFFICIENT_STILL_MISSING,
             LIFECYCLE_BLOCKED_BY_NON_EVIDENCE_GATE,
+            LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_MANUAL_CONFIRMATION,
         )
     ]
     evidence_satisfied_pending_human_decision = [
@@ -1378,12 +1391,7 @@ class ControlSurfaceController:
         file_path_or_note = body.get("file_path_or_note") or None
         rationale = body.get("rationale") or ""
         raw_satisfies = body.get("satisfies")
-        if raw_satisfies is None:
-            satisfies = [evidence_type] if evidence_type else []
-        elif isinstance(raw_satisfies, str):
-            satisfies = [raw_satisfies.strip()] if raw_satisfies.strip() else []
-        else:
-            satisfies = [str(f).strip() for f in raw_satisfies if str(f).strip()]
+        satisfies = normalize_evidence_satisfies(raw_satisfies, evidence_type)
         source = str(body.get("source") or "human").strip()
         if source not in EVIDENCE_SOURCES:
             source = "human"
@@ -1446,11 +1454,22 @@ class ControlSurfaceController:
                 effective_decision=new_decision,
             )
         else:
-            item.lifecycle_status = LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION
-            item.latest_evidence_summary = record.evidence_text
-            item.evidence_attention_summary = (
-                "Evidence recorded; automatic re-evaluation is unavailable for this action "
-                "(no full envelope). A human must confirm next steps."
+            effective_decision = (
+                envelope.decision
+                if envelope is not None
+                else {
+                    "decision": item.decision,
+                    "missing_evidence": list(item.missing_evidence),
+                    "reasons": [],
+                }
+            )
+            _apply_evidence_attention_to_item(
+                item,
+                envelope,
+                evidence_records=self._session.run_loop.evidence_records,
+                latest_record=record,
+                effective_decision=effective_decision,
+                without_envelope_reevaluation=True,
             )
 
         self._session.transcript.append(
@@ -1523,6 +1542,7 @@ __all__ = [
     "LIFECYCLE_APPROVAL_SUPPLIED_PENDING_REEVALUATION",
     "LIFECYCLE_CLOSED",
     "LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION",
+    "LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_MANUAL_CONFIRMATION",
     "LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED",
     "LIFECYCLE_EVIDENCE_SATISFIED_PENDING_HUMAN_DECISION",
     "LIFECYCLE_LIMITED_SCOPE_SELECTED",

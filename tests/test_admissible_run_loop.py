@@ -18,6 +18,7 @@ from pathlib import Path
 
 from admissible.control_surface import AutonomyLevel, ControlSurfaceController
 from admissible.run_loop import (
+    LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_MANUAL_CONFIRMATION,
     LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION,
     LIFECYCLE_NEEDS_HUMAN_INPUT,
     NON_EXECUTION_BOUNDARIES,
@@ -289,7 +290,10 @@ class TestControllerRunLoop(unittest.TestCase):
         updated_item = next(i for i in state2["queue"] if i["action_id"] == item["action_id"])
 
         self.assertEqual(updated_item["decision"], original_decision)
-        self.assertEqual(updated_item["lifecycle_status"], LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION)
+        self.assertEqual(
+            updated_item["lifecycle_status"],
+            LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_MANUAL_CONFIRMATION,
+        )
         self.assertEqual(len(state2["run_loop"]["superseding_decisions"]), 0)
         self.assertEqual(len(state2["run_loop"]["evidence_records"]), 1)
 

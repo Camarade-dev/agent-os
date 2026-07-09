@@ -12,13 +12,18 @@ from admissible.run_loop import (
     EvidenceRecord,
     LIFECYCLE_BLOCKED_BY_NON_EVIDENCE_GATE,
     LIFECYCLE_EVIDENCE_INSUFFICIENT_STILL_MISSING,
+    LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_MANUAL_CONFIRMATION,
     LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED,
     derive_evidence_attention_state,
+    normalize_evidence_satisfies,
     reevaluate_envelope_with_evidence,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ADMISSIBLE_ROOT = REPO_ROOT / "admissible"
+SAMPLE_TRACE_PATH = (
+    REPO_ROOT / "benchmark" / "reports" / "admissible_cursor_admitted_execution_truth_console_trace.json"
+)
 
 RAW_INSTALL_DEPENDENCY_RESPONSE = (
     "User: Please add a helper dependency.\n\n"
@@ -268,6 +273,196 @@ class TestStructuredEvidencePackets(unittest.TestCase):
                     if node.module == "agent_os" or node.module.startswith("agent_os."):
                         offenders.append(f"{path}: from {node.module}")
         self.assertEqual(offenders, [])
+
+
+class TestNoEnvelopeEvidenceProjection(unittest.TestCase):
+    """Slice ADMISSIBLE_EVIDENCE_008_NO_ENVELOPE_EVIDENCE_PROJECTION tests."""
+
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.controller = ControlSurfaceController(
+            session_dir=Path(self._tmpdir.name) / "sessions",
+            sample_trace_path=SAMPLE_TRACE_PATH,
+        )
+        self.controller.load_sample_session()
+
+    def tearDown(self) -> None:
+        self._tmpdir.cleanup()
+
+    def _no_envelope_item(self, action_id: str = "action_023") -> dict:
+        item = next(i for i in self.controller.state_view()["queue"] if i["action_id"] == action_id)
+        self.assertEqual(item["decision"], "REQUEST_MORE_EVIDENCE")
+        envelope = self.controller.session_dict()["run_envelopes"][action_id]
+        self.assertIsNone(envelope.get("envelope"))
+        return item
+
+    def test_same_as_evidence_type_normalizes_to_kind(self) -> None:
+        for raw in [None, "", "(same as evidence type)", "same as evidence type"]:
+            self.assertEqual(
+                normalize_evidence_satisfies(raw, "package_trust_review"),
+                ["package_trust_review"],
+            )
+
+    def test_provide_evidence_same_as_kind_records_satisfies(self) -> None:
+        item = self._no_envelope_item()
+        updated = self.controller.provide_evidence(
+            item["action_id"],
+            {
+                "evidence_type": "package_trust_review",
+                "evidence_text": "Package trust reviewed manually.",
+                "satisfies": "(same as evidence type)",
+            },
+        )
+        record = updated["run_loop"]["evidence_records"][-1]
+        self.assertEqual(record["satisfies"], ["package_trust_review"])
+
+    def test_no_envelope_projection_shows_satisfied_field(self) -> None:
+        item = self._no_envelope_item()
+        updated = self.controller.provide_evidence(
+            item["action_id"],
+            {
+                "evidence_type": "package_trust_review",
+                "evidence_text": "Package trust reviewed manually.",
+            },
+        )
+        projected = next(i for i in updated["queue"] if i["action_id"] == item["action_id"])
+        self.assertIn("package_trust_review", projected["satisfied_evidence_fields"])
+        self.assertEqual(
+            projected["lifecycle_status"],
+            LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_MANUAL_CONFIRMATION,
+        )
+
+    def test_no_envelope_projection_shrinks_missing_evidence(self) -> None:
+        item = self._no_envelope_item()
+        before = set(item["missing_evidence"])
+        updated = self.controller.provide_evidence(
+            item["action_id"],
+            {
+                "evidence_type": "package_trust_review",
+                "evidence_text": "Package trust reviewed manually.",
+                "satisfies": ["package_trust_review"],
+            },
+        )
+        projected = next(i for i in updated["queue"] if i["action_id"] == item["action_id"])
+        self.assertIn("package_trust_review", before)
+        self.assertNotIn("package_trust_review", projected["missing_evidence"])
+        self.assertIn("license_compatibility", projected["missing_evidence"])
+        self.assertIn("dependency_lockfile_review", projected["missing_evidence"])
+
+    def test_no_envelope_two_packets_accumulate_satisfied_fields(self) -> None:
+        item = self._no_envelope_item()
+        self.controller.provide_evidence(
+            item["action_id"],
+            {
+                "evidence_type": "package_trust_review",
+                "evidence_text": "Trust ok.",
+                "satisfies": ["package_trust_review"],
+            },
+        )
+        updated = self.controller.provide_evidence(
+            item["action_id"],
+            {
+                "evidence_type": "license_compatibility",
+                "evidence_text": "MIT compatible.",
+                "satisfies": ["license_compatibility"],
+            },
+        )
+        projected = next(i for i in updated["queue"] if i["action_id"] == item["action_id"])
+        self.assertIn("package_trust_review", projected["satisfied_evidence_fields"])
+        self.assertIn("license_compatibility", projected["satisfied_evidence_fields"])
+        self.assertEqual(projected["missing_evidence"], ["dependency_lockfile_review"])
+
+    def test_all_fields_satisfied_without_envelope_requires_manual_confirmation(self) -> None:
+        item = self._no_envelope_item()
+        for etype, etext in [
+            ("package_trust_review", "Trust ok."),
+            ("license_compatibility", "MIT ok."),
+            ("dependency_lockfile_review", "Lockfile ok."),
+        ]:
+            self.controller.provide_evidence(
+                item["action_id"],
+                {"evidence_type": etype, "evidence_text": etext, "satisfies": [etype]},
+            )
+        projected = next(i for i in self.controller.state_view()["queue"] if i["action_id"] == item["action_id"])
+        self.assertEqual(projected["missing_evidence"], [])
+        self.assertEqual(
+            set(projected["satisfied_evidence_fields"]),
+            {
+                "package_trust_review",
+                "license_compatibility",
+                "dependency_lockfile_review",
+            },
+        )
+        self.assertEqual(
+            projected["lifecycle_status"],
+            LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_MANUAL_CONFIRMATION,
+        )
+        self.assertIn("human confirmation is required", projected["evidence_attention_summary"].lower())
+        self.assertEqual(projected["decision"], "REQUEST_MORE_EVIDENCE")
+
+    def test_original_decision_and_envelope_remain_immutable_no_envelope(self) -> None:
+        item = self._no_envelope_item()
+        session_before = self.controller.session_dict()
+        original_decision = session_before["run_envelopes"][item["action_id"]]["decision"]
+        self.controller.provide_evidence(
+            item["action_id"],
+            {
+                "evidence_type": "package_trust_review",
+                "evidence_text": "ok",
+                "satisfies": ["package_trust_review"],
+            },
+        )
+        session_after = self.controller.session_dict()
+        self.assertEqual(
+            session_after["run_envelopes"][item["action_id"]]["decision"],
+            original_decision,
+        )
+        self.assertIsNone(session_after["run_envelopes"][item["action_id"]].get("envelope"))
+
+    def test_original_missing_evidence_auditable_separate_from_projected(self) -> None:
+        item = self._no_envelope_item()
+        original_missing = list(
+            self.controller.session_dict()["run_envelopes"][item["action_id"]]["decision"]["missing_evidence"]
+        )
+        updated = self.controller.provide_evidence(
+            item["action_id"],
+            {
+                "evidence_type": "package_trust_review",
+                "evidence_text": "ok",
+                "satisfies": ["package_trust_review"],
+            },
+        )
+        projected = next(i for i in updated["queue"] if i["action_id"] == item["action_id"])
+        self.assertEqual(projected["original_missing_evidence"], original_missing)
+        self.assertEqual(
+            self.controller.session_dict()["run_envelopes"][item["action_id"]]["decision"]["missing_evidence"],
+            original_missing,
+        )
+        self.assertNotEqual(projected["missing_evidence"], original_missing)
+
+    def test_state_view_exposes_satisfied_fields_for_no_envelope_item(self) -> None:
+        item = self._no_envelope_item()
+        updated = self.controller.provide_evidence(
+            item["action_id"],
+            {
+                "evidence_type": "package_trust_review",
+                "evidence_text": "Reviewed.",
+                "satisfies": ["package_trust_review"],
+            },
+        )
+        projected = next(i for i in updated["queue"] if i["action_id"] == item["action_id"])
+        evidence_needed = updated["needs_attention"]["evidence_needed"]
+        hit = next(e for e in evidence_needed if e["action_id"] == item["action_id"])
+        self.assertIn("package_trust_review", projected["satisfied_evidence_fields"])
+        self.assertIn("package_trust_review", hit["satisfied_evidence_fields"])
+        self.assertTrue(hit["evidence_attention_summary"])
+
+    def test_control_surface_html_renders_satisfied_fields_helpers(self) -> None:
+        html = (REPO_ROOT / "admissible" / "harness" / "control_surface.html").read_text(encoding="utf-8")
+        self.assertIn("fmtSatisfiedFields", html)
+        self.assertIn("evidence_supplied_pending_manual_confirmation", html)
+        self.assertIn("Originally missing evidence", html)
+        self.assertIn("Still missing evidence", html)
 
 
 class TestDeriveEvidenceAttentionState(unittest.TestCase):
