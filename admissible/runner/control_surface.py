@@ -49,6 +49,7 @@ from admissible.control_surface import (
     load_persisted_session,
 )
 from admissible.execution.bounded_local_executor import BoundedExecutionError
+from admissible.execution.bounded_local_verification import BoundedVerificationError
 from admissible.runner import cursor_bridge
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -207,6 +208,8 @@ class _ControlSurfaceRequestHandler(BaseHTTPRequestHandler):
                 result = self.controller.execute_bounded_local(action_id, body)
             elif parsed.path == "/api/queue/execute_bounded_local_batch":
                 result = self.controller.execute_bounded_local_batch(body)
+            elif parsed.path == "/api/queue/verify_bounded_local_workspace":
+                result = self.controller.verify_bounded_local_workspace(body)
             else:
                 self._send_json(404, {"error": f"not found: {parsed.path}"})
                 return
@@ -216,6 +219,8 @@ class _ControlSurfaceRequestHandler(BaseHTTPRequestHandler):
             if isinstance(detail, dict):
                 payload.update(detail)
             elif isinstance(exc, BoundedExecutionError):
+                payload["diagnostic"] = exc.diagnostic
+            elif isinstance(exc, BoundedVerificationError):
                 payload["diagnostic"] = exc.diagnostic
             self._send_json(400, payload)
             return

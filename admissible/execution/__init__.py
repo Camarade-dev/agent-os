@@ -1,4 +1,4 @@
-"""Admissible bounded local execution (v0)."""
+"""Admissible bounded local execution and verification (v0)."""
 
 from admissible.execution.bounded_local_executor import (
     ALLOWED_BOUNDED_OPERATIONS,
@@ -17,6 +17,18 @@ from admissible.execution.bounded_local_executor import (
     validate_relative_path_inside_workspace,
     validate_workspace_path,
 )
+from admissible.execution.bounded_local_verification import (
+    ALLOWED_VERIFICATION_CHECKS,
+    ALLOWED_VERIFICATION_PROFILES,
+    BoundedVerificationError,
+    VerificationEvidence,
+    VerificationRequest,
+    VerificationResult,
+    default_requests_for_profile,
+    run_bounded_verification,
+    run_single_verification_check,
+    validate_verification_request,
+)
 
 __all__ = [
     "ALLOWED_BOUNDED_OPERATIONS",
@@ -34,4 +46,14 @@ __all__ = [
     "extract_structured_operations",
     "validate_relative_path_inside_workspace",
     "validate_workspace_path",
+    "ALLOWED_VERIFICATION_CHECKS",
+    "ALLOWED_VERIFICATION_PROFILES",
+    "BoundedVerificationError",
+    "VerificationEvidence",
+    "VerificationRequest",
+    "VerificationResult",
+    "default_requests_for_profile",
+    "run_bounded_verification",
+    "run_single_verification_check",
+    "validate_verification_request",
 ]

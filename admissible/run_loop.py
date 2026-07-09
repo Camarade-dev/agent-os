@@ -760,6 +760,7 @@ class RunLoopState:
     instruction_packets: list[AgentInstructionPacket] = field(default_factory=list)
     response_records: list[AgentResponseRecord] = field(default_factory=list)
     evidence_records: list[EvidenceRecord] = field(default_factory=list)
+    verification_records: list[dict[str, Any]] = field(default_factory=list)
     superseding_decisions: list[SupersedingAdmissionDecision] = field(default_factory=list)
     derived_lifecycle_resolutions: list[DerivedLifecycleResolution] = field(default_factory=list)
     resolved_plan_gates: list[ResolvedPlanGateRecord] = field(default_factory=list)
@@ -772,6 +773,7 @@ class RunLoopState:
             "instruction_packets": [p.to_dict() for p in self.instruction_packets],
             "response_records": [r.to_dict() for r in self.response_records],
             "evidence_records": [e.to_dict() for e in self.evidence_records],
+            "verification_records": list(self.verification_records),
             "superseding_decisions": [s.to_dict() for s in self.superseding_decisions],
             "derived_lifecycle_resolutions": [r.to_dict() for r in self.derived_lifecycle_resolutions],
             "resolved_plan_gates": [g.to_dict() for g in self.resolved_plan_gates],
@@ -790,6 +792,7 @@ class RunLoopState:
                 AgentResponseRecord.from_dict(d) for d in data.get("response_records") or []
             ],
             evidence_records=[EvidenceRecord.from_dict(d) for d in data.get("evidence_records") or []],
+            verification_records=[dict(record) for record in data.get("verification_records") or []],
             superseding_decisions=[
                 SupersedingAdmissionDecision.from_dict(d)
                 for d in data.get("superseding_decisions") or []

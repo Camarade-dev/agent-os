@@ -63,6 +63,12 @@ from admissible.execution.bounded_local_executor import (
     extract_structured_operations,
     validate_workspace_path,
 )
+from admissible.execution.bounded_local_verification import (
+    BoundedVerificationError,
+    VerificationRequest,
+    run_bounded_verification,
+    validate_verification_request,
+)
 from admissible.goal_intake import GoalIntake, analyze_goal
 from admissible.plan_audit import (
     PLAN_VERDICT_BLOCKED,
@@ -1176,6 +1182,31 @@ def _continuation_instruction(
     return result.to_dict()
 
 
+def _verification_summary(session: "ControlSession") -> dict[str, Any]:
+    """Display-only bounded verification readiness derived from stored verification runs."""
+    records = list(session.run_loop.verification_records or [])
+    if not records:
+        return {
+            "verification_count": 0,
+            "readiness": "not_run",
+            "latest": None,
+            "latest_overall_status": None,
+            "passed_count": 0,
+            "failed_count": 0,
+        }
+    latest = records[-1]
+    return {
+        "verification_count": len(records),
+        "readiness": latest.get("overall_status") or "unknown",
+        "latest": latest,
+        "latest_overall_status": latest.get("overall_status"),
+        "passed_count": latest.get("passed_count", 0),
+        "failed_count": latest.get("failed_count", 0),
+        "profile": latest.get("profile"),
+        "workspace_path": latest.get("workspace_path"),
+    }
+
+
 def _needs_attention(session: "ControlSession") -> dict[str, Any]:
     """Display-only subset of the queue/plan-audit that calls for a human look first.
 
@@ -1344,6 +1375,7 @@ class ControlSurfaceController:
         )
         view["run_timeline"] = timeline.to_dict()
         view["continuation_instruction"] = _continuation_instruction(self._session, timeline)
+        view["verification_summary"] = _verification_summary(self._session)
         view["session_file"] = str(self._session_file)
         view["session_loaded_from_disk"] = self._session_loaded_from_disk
         view["ready_to_execute_locally"] = _ready_to_execute_locally(self._session)
@@ -1762,6 +1794,65 @@ class ControlSurfaceController:
                 else None
             ),
         }
+        return view
+
+    def verify_bounded_local_workspace(self, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Run explicit bounded verification checks against the local workspace.
+
+        Human-triggered only; never called from ingest or model proposals.
+        This is not shell authority: only allowlisted read-only checks run.
+        """
+        body = body or {}
+        workspace_path = body.get("workspace_path") or self._session.bounded_executor_workspace
+        if body.get("workspace_path"):
+            self._session.bounded_executor_workspace = str(body["workspace_path"]).strip()
+            workspace_path = self._session.bounded_executor_workspace
+
+        if not workspace_path:
+            raise BoundedVerificationError(
+                "no workspace configured for bounded local verification",
+                diagnostic=DIAG_NO_WORKSPACE_CONFIGURED,
+            )
+
+        profile = str(body.get("profile") or "tiny_game_demo").strip()
+        include_node_syntax_check = bool(body.get("include_node_syntax_check"))
+        raw_requests = body.get("requests")
+        requests: list[VerificationRequest] | None = None
+        if raw_requests is not None:
+            requests = [VerificationRequest.from_dict(item) for item in raw_requests]
+            for request in requests:
+                validate_verification_request(request)
+
+        evidence = run_bounded_verification(
+            workspace_path=workspace_path,
+            profile=profile,
+            requests=requests,
+            write_evidence_records=self._session.run_loop.evidence_records,
+            include_node_syntax_check=include_node_syntax_check,
+        )
+        self._session.run_loop.verification_records.append(evidence.to_dict())
+
+        self._session.transcript.append(
+            _transcript_entry(
+                "bounded_local_verification",
+                {
+                    "evidence_id": evidence.evidence_id,
+                    "workspace_path": evidence.workspace_path,
+                    "profile": evidence.profile,
+                    "overall_status": evidence.overall_status,
+                    "check_count": len(evidence.results),
+                    "passed_count": sum(1 for result in evidence.results if result.status == "pass"),
+                    "failed_count": sum(1 for result in evidence.results if result.status == "fail"),
+                    "note": (
+                        "Explicit bounded verification v0; allowlisted read-only checks only. "
+                        "No shell/npm/network/deploy authority was granted."
+                    ),
+                },
+            )
+        )
+        self._persist()
+        view = self.state_view()
+        view["bounded_local_verification_result"] = evidence.to_dict()
         return view
 
     def _trace_view(self) -> dict[str, Any]:
