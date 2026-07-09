@@ -249,6 +249,37 @@
   .transcript-entry.role-admissible { margin-right: 2rem; }
   .transcript-entry .entry-label { display: block; font-size: .68rem; text-transform: uppercase; letter-spacing: .03em; color: var(--cs-muted); margin-bottom: .25rem; }
 
+  /* Governed run narrative (slice ADMISSIBLE_UX_026) */
+  section.panel.governed-run-panel { border-color: #1d4ed8; box-shadow: 0 0 0 1px #1d4ed8 inset; }
+  .narrative-hint { font-size: .76rem; color: var(--cs-muted); margin: 0 0 .55rem; }
+  .status-badge { display: inline-block; padding: .12rem .45rem; border-radius: 6px; font-size: .72rem; font-weight: 600; border: 1px solid transparent; }
+  .status-badge-pass { background: #06322a; color: #6ee7b7; border-color: #059669; }
+  .status-badge-fail { background: #3a1010; color: #fca5a5; border-color: #dc2626; }
+  .status-badge-not-run { background: var(--cs-card-bg); color: var(--cs-muted); border-color: var(--cs-border-strong); }
+  .status-badge-pending { background: var(--cs-attn-bg); color: var(--cs-attn-text); border-color: var(--cs-attn-border); }
+  .status-badge-available { background: #1a2e44; color: #7dd3fc; border-color: #0284c7; }
+
+  .timeline-turn-card { margin: .55rem 0; padding: .55rem .65rem; border: 1px solid var(--cs-border-strong); border-radius: 8px; background: var(--cs-card-bg); }
+  .timeline-turn-header { display: flex; flex-wrap: wrap; gap: .45rem; align-items: baseline; margin-bottom: .35rem; }
+  .timeline-turn-header strong { font-size: .88rem; }
+  .timeline-turn-stats { font-size: .72rem; color: var(--cs-muted); margin-left: auto; }
+  .timeline-ops-table { width: 100%; border-collapse: collapse; font-size: .76rem; margin-top: .35rem; }
+  .timeline-ops-table th { text-align: left; color: var(--cs-muted); font-weight: 600; font-size: .66rem; text-transform: uppercase; padding: .25rem .4rem; border-bottom: 1px solid var(--cs-border-strong); }
+  .timeline-ops-table td { padding: .28rem .4rem; border-bottom: 1px dashed var(--cs-border-strong); vertical-align: top; }
+  .timeline-ops-table tr:last-child td { border-bottom: none; }
+  .timeline-proposal-cell { max-width: 14rem; color: var(--cs-text); }
+  .timeline-proposal-path { display: block; font-size: .7rem; color: var(--cs-muted); margin-top: .1rem; }
+
+  .continuation-status-note { margin: .45rem 0; padding: .45rem .6rem; border-radius: 6px; font-size: .78rem; border: 1px solid var(--cs-border-strong); background: var(--cs-card-bg); }
+  .continuation-status-note.attention { border-color: var(--cs-attn-border); background: var(--cs-attn-bg); color: var(--cs-attn-text); }
+  .continuation-status-note.available { border-color: #0284c7; background: #1a2e44; color: #bae6fd; }
+  .continuation-not-auto { font-size: .74rem; color: var(--cs-muted); margin: .35rem 0 0; font-style: italic; }
+
+  #bounded-verification-panel { border-color: #5b21b6; }
+  .verification-result-summary { margin-top: .45rem; font-size: .78rem; }
+  .verification-failures { margin: .35rem 0 0 1rem; padding: 0; color: #fca5a5; font-size: .76rem; }
+  .verification-actions { display: flex; flex-wrap: wrap; gap: .45rem; align-items: center; margin-top: .5rem; }
+
   footer.app-footer { max-width: 960px; margin: 0 auto; padding: .5rem 1.1rem 2rem; color: var(--cs-muted); font-size: .74rem; }
   footer.app-footer .footer-note { margin-top: .6rem; }
 </style>
@@ -411,27 +442,33 @@
     </details>
   </section>
 
-  <section class="panel" id="mission-summary-panel">
-    <h2>Mission Summary</h2>
-    <div id="mission-summary-body"></div>
+  <section class="panel governed-run-panel" id="governed-run-panel">
+    <h2>Governed Run</h2>
+    <p class="narrative-hint">
+      The story of this supervised run at a glance: goal, current phase, what was admitted,
+      executed, blocked, evidenced, and whether bounded verification has run. Read-only
+      projection &mdash; nothing here decides or executes on its own.
+    </p>
+    <div id="governed-run-body"><p class="no-action-note">No run yet. Submit a goal to begin.</p></div>
   </section>
 
   <section class="panel" id="run-timeline-panel">
     <h2>Run Timeline</h2>
-    <p class="hint" style="font-size:.76rem;color:var(--cs-muted);margin:0 0 .55rem;">
+    <p class="narrative-hint">
       The governed run in sequence: goal &rarr; turn &rarr; agent proposal &rarr; admission decision &rarr;
-      human-triggered local execution &rarr; evidence. A readable multi-turn view over the same queue —
-      it decides and executes nothing on its own.
+      human-triggered local execution &rarr; evidence. Each row is one proposed operation from an ingested
+      agent response &mdash; readable as a multi-turn story, not a raw queue dump.
     </p>
     <div id="run-timeline-body"><p class="no-action-note">No run yet. Submit a goal to begin the timeline.</p></div>
   </section>
 
   <section class="panel" id="continuation-panel">
     <h2>Evidence-Grounded Continuation</h2>
-    <p class="hint" style="font-size:.76rem;color:var(--cs-muted);margin:0 0 .55rem;">
+    <p class="narrative-hint">
       The next bounded instruction for Cursor, grounded in what actually executed (files written +
-      sha256) and what was blocked/refused. Supervised continuation, not autonomous completion &mdash; it
-      decides and executes nothing on its own, and never claims the goal is done without a completion signal.
+      sha256) and what was blocked/refused. <strong>Continuation is a copyable human handoff, not
+      auto-execution.</strong> When admitted local file ops are still pending, continuation stays
+      unavailable until you explicitly execute (or refuse) them.
     </p>
     <div id="continuation-body"><p class="no-action-note">No run yet. Submit a goal to begin.</p></div>
     <div id="continuation-wrapper" style="display:none;">
@@ -441,6 +478,21 @@
         <button type="button" id="btn-copy-continuation" class="secondary">Copy continuation instruction</button>
       </div>
     </div>
+  </section>
+
+  <section class="panel" id="bounded-verification-panel">
+    <h2>Bounded Verification</h2>
+    <p class="narrative-hint">
+      Explicit, human-triggered read-only checks against the local workspace after governed writes.
+      Verification evidence is stored separately from write evidence. This panel never auto-runs checks
+      &mdash; use the button below when you are ready to verify.
+    </p>
+    <div id="bounded-verification-body"><p class="no-action-note">No run yet. Submit a goal and execute local writes first.</p></div>
+    <div class="verification-actions">
+      <button type="button" id="btn-verify-bounded-local" disabled>Run bounded verification</button>
+      <span id="verify-workspace-hint" class="narrative-hint" style="margin:0;"></span>
+    </div>
+    <div id="verification-result-summary" class="verification-result-summary"></div>
   </section>
 
   <section class="panel" id="needs-attention-panel">
@@ -511,6 +563,14 @@
       <div id="decision-records-full-body"></div>
     </details>
   </section>
+
+  <details id="mission-summary-details" class="advanced-drawer">
+    <summary>Advanced: mission summary &amp; aggregate counts</summary>
+    <section class="panel" id="mission-summary-panel">
+      <h2>Mission Summary</h2>
+      <div id="mission-summary-body"></div>
+    </section>
+  </details>
 
   <details id="session-diagnostics-details" class="advanced-drawer">
     <summary>Advanced: session diagnostics &amp; bridge internals</summary>
@@ -936,47 +996,127 @@ const TIMELINE_STATUS_LABELS = {
   idle: "Idle",
 };
 
-function timelineOperationRow(op) {
+const CONTINUATION_STATUS_LABELS = {
+  no_goal: "No goal submitted",
+  first_turn: "First turn — write instruction",
+  pending_local_execution: "Blocked — pending local execution",
+  evidence_grounded_continuation: "Evidence-grounded — ready to copy",
+};
+
+const VERIFICATION_READINESS_LABELS = {
+  not_run: "Not run",
+  pass: "Pass",
+  fail: "Fail",
+  unknown: "Unknown",
+};
+
+function verificationStatusBadge(readiness) {
+  const label = VERIFICATION_READINESS_LABELS[readiness] || readiness || "—";
+  const cls =
+    readiness === "pass" ? "status-badge status-badge-pass"
+      : readiness === "fail" ? "status-badge status-badge-fail"
+        : readiness === "not_run" ? "status-badge status-badge-not-run"
+          : "status-badge status-badge-not-run";
+  return `<span class="${cls}">${escapeHtml(label)}</span>`;
+}
+
+function executionOutcomeLabel(op) {
+  if (op.executed) {
+    if (op.execution_status === "executed_by_bounded_executor") return "Executed (bounded)";
+    if (op.execution_status === "executed_after_admission") return "Executed (attested)";
+    return "Executed";
+  }
+  if (op.blocked) return "Blocked / refused";
+  if (op.execution_status === "admitted_not_executed") return "Admitted — not executed";
+  if (op.admitted && op.is_local_file_operation) return "Admitted — ready locally";
+  if (op.admitted) return "Admitted";
+  return "Proposed";
+}
+
+function timelineProposalSummary(op) {
   const opLabel = (op.operation_types && op.operation_types.length)
     ? op.operation_types.join(", ")
     : (op.label && op.label !== "unknown" ? op.label : (op.action_type || "—"));
   const path = (op.target_paths && op.target_paths.length) ? op.target_paths.join(", ") : "";
-  const tags = [];
-  if (op.is_local_file_operation) tags.push('<span class="badge">local file</span>');
-  if (op.executed) tags.push('<span class="badge badge-executed-by-bounded-executor">executed</span>');
-  else if (op.blocked) tags.push('<span class="badge">blocked/refused</span>');
-  else if (op.admitted) tags.push('<span class="badge">admitted</span>');
-  if (op.evidence_count) tags.push(`<span class="badge">evidence ×${escapeHtml(op.evidence_count)}</span>`);
-  return `
-    <li style="display:flex;flex-wrap:wrap;align-items:center;gap:.4rem;padding:.3rem 0;border-top:1px solid var(--cs-border,rgba(128,128,128,.18));">
-      <span class="decision-${escapeHtml(op.decision)}" style="font-weight:600;">${escapeHtml(op.decision)}</span>
-      <code>${escapeHtml(opLabel)}</code>
-      ${path ? `<code style="color:var(--cs-muted);">${escapeHtml(path)}</code>` : ""}
-      ${tags.join(" ")}
-      <button type="button" class="secondary select-action-btn" data-action-id="${escapeHtml(op.action_id)}" style="margin-left:auto;">Review</button>
-    </li>`;
+  return `<span class="timeline-proposal-cell"><code>${escapeHtml(opLabel)}</code>` +
+    (path ? `<span class="timeline-proposal-path">${escapeHtml(path)}</span>` : "") +
+    `</span>`;
+}
+
+function timelineOperationTableRow(op) {
+  const blockedItems = op.blocked
+    ? `<span class="badge badge-blocked">not completed</span>`
+    : (op.evidence_count ? "" : "—");
+  const evidenceCell = op.evidence_count
+    ? `<span class="badge">${escapeHtml(op.evidence_count)} write record(s)</span>`
+    : "—";
+  return `<tr>
+    <td>${timelineProposalSummary(op)}</td>
+    <td><span class="decision-${escapeHtml(op.decision)}">${escapeHtml(op.decision)}</span></td>
+    <td>${escapeHtml(executionOutcomeLabel(op))}</td>
+    <td>${evidenceCell}</td>
+    <td>${blockedItems}</td>
+    <td><button type="button" class="secondary select-action-btn" data-action-id="${escapeHtml(op.action_id)}">Review</button></td>
+  </tr>`;
 }
 
 function timelineTurnBlock(turn) {
   const ops = turn.operations || [];
+  const header = turn.turn_number === 0 ? "Loaded actions" : `Turn ${escapeHtml(turn.turn_number)}`;
   const counts = [];
   if (turn.admitted_count) counts.push(`${turn.admitted_count} admitted`);
   if (turn.executed_count) counts.push(`${turn.executed_count} executed`);
-  if (turn.blocked_count) counts.push(`${turn.blocked_count} blocked/refused`);
+  if (turn.blocked_count) counts.push(`${turn.blocked_count} blocked`);
   if (turn.evidence_count) counts.push(`${turn.evidence_count} evidence`);
-  const header = turn.turn_number === 0 ? "Loaded actions" : `Turn ${escapeHtml(turn.turn_number)}`;
   const opsHtml = ops.length
-    ? `<ul style="list-style:none;margin:.35rem 0 0;padding:0;">${ops.map(timelineOperationRow).join("")}</ul>`
+    ? `<table class="timeline-ops-table">
+         <thead><tr>
+           <th>Proposal</th><th>Admission</th><th>Execution</th><th>Evidence</th><th>Blocked</th><th></th>
+         </tr></thead>
+         <tbody>${ops.map(timelineOperationTableRow).join("")}</tbody>
+       </table>`
     : `<p class="no-action-note" style="margin:.35rem 0 0;">Instruction sent; no agent proposal ingested yet.</p>`;
   return `
-    <div class="timeline-turn" style="margin:.5rem 0;padding:.5rem .6rem;border-left:3px solid var(--cs-accent,#6c8cff);background:var(--cs-subtle,rgba(128,128,128,.06));border-radius:0 6px 6px 0;">
-      <div style="display:flex;flex-wrap:wrap;gap:.5rem;align-items:baseline;">
+    <div class="timeline-turn-card">
+      <div class="timeline-turn-header">
         <strong>${header}</strong>
         <span style="font-size:.76rem;color:var(--cs-muted);">${escapeHtml(turn.summary || "")}</span>
-        ${counts.length ? `<span style="margin-left:auto;font-size:.74rem;color:var(--cs-muted);">${escapeHtml(counts.join(" · "))}</span>` : ""}
+        ${counts.length ? `<span class="timeline-turn-stats">${escapeHtml(counts.join(" · "))}</span>` : ""}
       </div>
       ${opsHtml}
     </div>`;
+}
+
+function renderGovernedRun(state) {
+  const body = document.getElementById("governed-run-body");
+  if (!body) return;
+  const overview = state.governed_run_overview || {};
+  const timeline = state.run_timeline || {};
+  if (!overview.goal && (timeline.status === "needs_goal" || !timeline.status)) {
+    body.innerHTML = '<p class="no-action-note">No run yet. Submit a goal above to open the governed run story.</p>';
+    return;
+  }
+  const statusLabel = TIMELINE_STATUS_LABELS[overview.status] || overview.status || "—";
+  const contAvail = overview.continuation_available;
+  const contStatus = CONTINUATION_STATUS_LABELS[overview.continuation_status] || overview.continuation_status || "—";
+  body.innerHTML = `
+    <div class="stat-grid">
+      <div class="stat-tile" style="grid-column:span 2;"><span class="stat-label">Goal</span>
+        <span class="stat-value" style="font-size:.82rem;font-weight:500;">${escapeHtml(truncate(overview.goal, 120))}</span></div>
+      <div class="stat-tile"><span class="stat-label">Run status</span>
+        <span class="stat-value" style="font-size:.82rem;">${escapeHtml(statusLabel)}</span></div>
+      <div class="stat-tile"><span class="stat-label">Turns</span><span class="stat-value">${escapeHtml(overview.turn_count || 0)}</span></div>
+      <div class="stat-tile"><span class="stat-label">Ready to execute</span><span class="stat-value">${escapeHtml(overview.ready_to_execute_local_count || 0)}</span></div>
+      <div class="stat-tile ${overview.blocked_count ? "attention" : ""}"><span class="stat-label">Blocked / refused</span>
+        <span class="stat-value">${escapeHtml(overview.blocked_count || 0)}</span></div>
+      <div class="stat-tile"><span class="stat-label">Write evidence</span><span class="stat-value">${escapeHtml(overview.write_evidence_count || 0)}</span></div>
+      <div class="stat-tile"><span class="stat-label">Verification</span>
+        <span class="stat-value" style="font-size:.82rem;">${verificationStatusBadge(overview.verification_readiness)}</span></div>
+      <div class="stat-tile ${contAvail ? "" : "attention"}"><span class="stat-label">Continuation</span>
+        <span class="stat-value" style="font-size:.78rem;">${escapeHtml(contAvail ? "Available" : "Not yet")}</span>
+        <span style="display:block;font-size:.68rem;color:var(--cs-muted);margin-top:.15rem;">${escapeHtml(contStatus)}</span></div>
+    </div>
+  `;
 }
 
 function renderRunTimeline(state) {
@@ -991,14 +1131,16 @@ function renderRunTimeline(state) {
   const statusLabel = TIMELINE_STATUS_LABELS[timeline.status] || timeline.status || "—";
   const latest = timeline.latest_agent_proposal;
   const latestHtml = latest
-    ? `<div style="margin:.45rem 0;font-size:.8rem;">
-         <strong>Latest agent proposal</strong> — turn ${escapeHtml(latest.turn_number)},
-         ${escapeHtml(latest.operation_count)} operation(s): ${escapeHtml(latest.admitted_count)} admitted,
-         ${escapeHtml(latest.blocked_count)} blocked/refused
+    ? `<div style="margin:.45rem 0;font-size:.8rem;padding:.45rem .55rem;background:var(--cs-input-bg);border-radius:6px;border:1px solid var(--cs-border-strong);">
+         <strong>Latest agent proposal (turn ${escapeHtml(latest.turn_number)})</strong> —
+         ${escapeHtml(latest.operation_count)} operation(s):
+         ${escapeHtml(latest.admitted_count)} admitted,
+         ${escapeHtml(latest.executed_count)} executed,
+         ${escapeHtml(latest.blocked_count)} blocked
          <span style="color:var(--cs-muted);">(${escapeHtml(latest.source_trust)})</span>
          ${latest.preview ? `<div class="mono" style="margin-top:.25rem;font-size:.72rem;color:var(--cs-muted);white-space:pre-wrap;">${escapeHtml(truncate(latest.preview, 220))}</div>` : ""}
        </div>`
-    : '<p class="no-action-note" style="margin:.45rem 0;">No agent proposal ingested yet.</p>';
+    : "";
 
   const turns = timeline.turns || [];
   const turnsHtml = turns.length
@@ -1006,16 +1148,9 @@ function renderRunTimeline(state) {
     : '<p class="no-action-note">Goal accepted and plan audited. Generate or write the first instruction to open turn 1.</p>';
 
   body.innerHTML = `
-    <div class="stat-grid">
-      <div class="stat-tile"><span class="stat-label">Goal</span><span class="stat-value" style="font-size:.8rem;font-weight:500;">${escapeHtml(truncate(timeline.goal, 90))}</span></div>
-      <div class="stat-tile"><span class="stat-label">Run status</span><span class="stat-value" style="font-size:.82rem;">${escapeHtml(statusLabel)}</span></div>
-      <div class="stat-tile"><span class="stat-label">Turns</span><span class="stat-value">${escapeHtml(timeline.turn_count || 0)}</span></div>
-      <div class="stat-tile"><span class="stat-label">Admitted</span><span class="stat-value">${escapeHtml((timeline.admitted_operation_ids || []).length)}</span></div>
-      <div class="stat-tile"><span class="stat-label">Executed</span><span class="stat-value">${escapeHtml((timeline.executed_operation_ids || []).length)}</span></div>
-      <div class="stat-tile"><span class="stat-label">Ready to run locally</span><span class="stat-value">${escapeHtml(timeline.ready_to_execute_local_count || 0)}</span></div>
-      <div class="stat-tile"><span class="stat-label">Evidence records</span><span class="stat-value">${escapeHtml(timeline.evidence_count || 0)}</span></div>
-      <div class="stat-tile ${(timeline.blocked_operation_ids || []).length ? "attention" : ""}"><span class="stat-label">Blocked / refused</span><span class="stat-value">${escapeHtml((timeline.blocked_operation_ids || []).length)}</span></div>
-    </div>
+    <p style="font-size:.78rem;margin:0 0 .45rem;color:var(--cs-muted);">
+      Run phase: <strong style="color:var(--cs-text);">${escapeHtml(statusLabel)}</strong>
+    </p>
     ${latestHtml}
     <div class="timeline-sequence">${turnsHtml}</div>
   `;
@@ -1041,29 +1176,35 @@ function renderContinuation(state) {
     return;
   }
 
-  const availLabel = cont.available ? "Available" : "Not available yet";
+  const availLabel = cont.available ? "Available — copy next instruction" : "Not available yet";
   const notDone = cont.not_completed_operations || [];
   const pending = cont.pending_execution_operations || [];
+  const statusNoteClass = cont.available ? "continuation-status-note available"
+    : (cont.status === "pending_local_execution" ? "continuation-status-note attention" : "continuation-status-note");
+  const statusHuman = CONTINUATION_STATUS_LABELS[cont.status] || cont.status || "—";
   const parts = [];
+  parts.push(`<div class="${statusNoteClass}">
+    <strong>${escapeHtml(availLabel)}</strong> — ${escapeHtml(statusHuman)}
+    ${cont.reason ? `<div style="margin-top:.25rem;">${escapeHtml(cont.reason)}</div>` : ""}
+  </div>`);
   parts.push(`<div class="stat-grid">
-    <div class="stat-tile ${cont.available ? "" : "attention"}"><span class="stat-label">Continuation</span><span class="stat-value" style="font-size:.82rem;">${escapeHtml(availLabel)}</span></div>
     <div class="stat-tile"><span class="stat-label">Executed w/ evidence</span><span class="stat-value">${escapeHtml(cont.executed_count || 0)}</span></div>
-    <div class="stat-tile"><span class="stat-label">Evidence records</span><span class="stat-value">${escapeHtml(cont.evidence_count || 0)}</span></div>
+    <div class="stat-tile"><span class="stat-label">Write evidence records</span><span class="stat-value">${escapeHtml(cont.evidence_count || 0)}</span></div>
     <div class="stat-tile ${notDone.length ? "attention" : ""}"><span class="stat-label">Not completed</span><span class="stat-value">${escapeHtml(cont.not_completed_count || 0)}</span></div>
   </div>`);
-  if (cont.reason) {
-    parts.push(`<p style="font-size:.8rem;margin:.45rem 0;">${escapeHtml(cont.reason)}</p>`);
-  }
   if (!cont.available && pending.length) {
-    parts.push(`<p class="no-action-note" style="margin:.3rem 0;"><strong>Execute (or refuse) first:</strong> ` +
-      pending.map((op) => `${escapeHtml(op.action_id)} &rarr; ${escapeHtml((op.target_paths || []).join(", ") || "(no path)")}`).join("; ") + `</p>`);
+    parts.push(`<p class="no-action-note" style="margin:.45rem 0;font-style:normal;"><strong>Why continuation is blocked:</strong> admitted local file operations still need explicit execution (or refusal) before the next safe instruction can be issued.</p>`);
+    parts.push(`<ul style="margin:.25rem 0 .45rem 1.1rem;font-size:.78rem;">` +
+      pending.map((op) => `<li><code>${escapeHtml(op.action_id)}</code> &rarr; ${escapeHtml((op.target_paths || []).join(", ") || "(no path)")} — execute locally first</li>`).join("") +
+      `</ul>`);
   }
   if (notDone.length) {
-    parts.push(`<div style="font-size:.78rem;margin:.35rem 0;"><strong>Not completed (must not be treated as done):</strong>` +
+    parts.push(`<div style="font-size:.78rem;margin:.35rem 0;"><strong>Blocked / refused — must not be treated as done:</strong>` +
       `<ul style="margin:.25rem 0 0 1rem;">` +
-      notDone.map((op) => `<li>${escapeHtml(op.action_id)} <span style="color:var(--cs-muted);">(${escapeHtml(op.decision)})</span> &mdash; ${escapeHtml(op.reason)}</li>`).join("") +
+      notDone.map((op) => `<li><code>${escapeHtml(op.action_id)}</code> <span style="color:var(--cs-muted);">(${escapeHtml(op.decision)})</span> &mdash; ${escapeHtml(op.reason)}</li>`).join("") +
       `</ul></div>`);
   }
+  parts.push(`<p class="continuation-not-auto">Copy the instruction below into Cursor manually. Admissible does not auto-execute admitted operations or send this packet to any provider.</p>`);
   body.innerHTML = parts.join("");
 
   if (cont.instruction_text) {
@@ -1072,6 +1213,91 @@ function renderContinuation(state) {
   } else {
     if (wrapper) wrapper.style.display = "none";
     if (textarea) textarea.value = "";
+  }
+}
+
+function renderBoundedVerification(state) {
+  const body = document.getElementById("bounded-verification-body");
+  const btn = document.getElementById("btn-verify-bounded-local");
+  const hint = document.getElementById("verify-workspace-hint");
+  const resultEl = document.getElementById("verification-result-summary");
+  if (!body) return;
+
+  const summary = state.verification_summary || {};
+  const workspace = sessionWorkspacePath(state);
+  const hasGoal = Boolean(state.goal_intake);
+  const writeEvidence = (state.run_timeline || {}).evidence_count || 0;
+
+  if (hint) {
+    hint.textContent = workspace
+      ? `Workspace: ${workspace}`
+      : "Set a workspace path in the bridge section before running verification.";
+  }
+  if (btn) {
+    btn.disabled = !hasGoal || !workspace;
+    btn.title = !hasGoal
+      ? "Submit a goal first."
+      : !workspace
+        ? "Set a workspace path first."
+        : "Run explicit bounded verification (read-only checks only).";
+  }
+
+  if (!hasGoal) {
+    body.innerHTML = '<p class="no-action-note">No run yet. Submit a goal and execute local writes first.</p>';
+    if (resultEl) resultEl.innerHTML = "";
+    return;
+  }
+
+  const readiness = summary.readiness || "not_run";
+  const profile = summary.profile || "tiny_game_demo (default)";
+  const failedMessages = summary.failed_check_messages || [];
+  const latest = summary.latest;
+
+  let failuresHtml = "";
+  if (failedMessages.length) {
+    failuresHtml = `<ul class="verification-failures">${failedMessages.map((m) => `<li>${escapeHtml(m)}</li>`).join("")}</ul>`;
+  } else if (latest && Array.isArray(latest.results)) {
+    const fromLatest = latest.results.filter((r) => r.status === "fail").map((r) => r.message || r.check_id);
+    if (fromLatest.length) {
+      failuresHtml = `<ul class="verification-failures">${fromLatest.map((m) => `<li>${escapeHtml(m)}</li>`).join("")}</ul>`;
+    }
+  }
+
+  body.innerHTML = `
+    <div class="stat-grid">
+      <div class="stat-tile"><span class="stat-label">Status</span>
+        <span class="stat-value" style="font-size:.82rem;">${verificationStatusBadge(readiness)}</span></div>
+      <div class="stat-tile"><span class="stat-label">Runs recorded</span><span class="stat-value">${escapeHtml(summary.verification_count || 0)}</span></div>
+      <div class="stat-tile"><span class="stat-label">Latest profile</span>
+        <span class="stat-value" style="font-size:.78rem;">${escapeHtml(profile)}</span></div>
+      <div class="stat-tile"><span class="stat-label">Passed checks</span><span class="stat-value">${escapeHtml(summary.passed_count || 0)}</span></div>
+      <div class="stat-tile ${summary.failed_count ? "attention" : ""}"><span class="stat-label">Failed checks</span>
+        <span class="stat-value">${escapeHtml(summary.failed_count || 0)}</span></div>
+      <div class="stat-tile"><span class="stat-label">Write evidence (separate)</span><span class="stat-value">${escapeHtml(writeEvidence)}</span></div>
+    </div>
+    ${readiness === "not_run"
+      ? '<p class="no-action-note" style="font-style:normal;margin-top:.45rem;">Verification has not been run yet. After local writes complete, click the button below.</p>'
+      : failuresHtml
+        ? `<div style="margin-top:.45rem;font-size:.78rem;"><strong>Failed check messages:</strong>${failuresHtml}</div>`
+        : readiness === "pass"
+          ? '<p style="margin-top:.45rem;font-size:.78rem;color:#6ee7b7;">All allowlisted checks passed. Verification evidence is stored separately from write evidence.</p>'
+          : ""}
+  `;
+
+  const batchResult = state.bounded_local_verification_result;
+  if (resultEl) {
+    if (!batchResult && !latest) {
+      resultEl.innerHTML = "";
+    } else {
+      const active = batchResult || latest;
+      const checks = (active.results || [])
+        .map((entry) => `<li><code>${escapeHtml(entry.check_id)}</code> — ${escapeHtml(entry.status)}${entry.message ? `: ${escapeHtml(entry.message)}` : ""}</li>`)
+        .join("");
+      resultEl.innerHTML = active
+        ? `<p><strong>Last verification run:</strong> ${verificationStatusBadge(active.overall_status || readiness)} at <code>${escapeHtml(active.workspace_path || workspace || "—")}</code></p>` +
+          (checks ? `<ul style="margin:.35rem 0 0 1.1rem;font-size:.76rem;">${checks}</ul>` : "")
+        : "";
+    }
   }
 }
 
@@ -1766,9 +1992,11 @@ function render(state) {
   renderBridgeGating(state);
   renderManualFallback(state);
   renderBridgeFromState(state);
-  renderMissionSummary(state);
+  renderGovernedRun(state);
   renderRunTimeline(state);
   renderContinuation(state);
+  renderBoundedVerification(state);
+  renderMissionSummary(state);
   renderNeedsAttention(state);
   renderReadyToExecuteLocally(state);
   renderQueueTable(state);
@@ -1971,6 +2199,20 @@ document.getElementById("btn-execute-bounded-batch").addEventListener("click", a
   clearError();
   await runAction(() =>
     apiPost("/api/queue/execute_bounded_local_batch", { workspace_path: workspace })
+  );
+});
+
+document.getElementById("btn-verify-bounded-local").addEventListener("click", async () => {
+  const workspace = sessionWorkspacePath(lastState) || bridgeWorkspacePath();
+  if (!workspace) {
+    showError("Set and validate a workspace path before running bounded verification.");
+    return;
+  }
+  const message = `Run bounded verification (read-only checks only) on workspace:\n${workspace}\n\nThis does not execute writes, shell, npm, or deploy.`;
+  if (!window.confirm(message)) return;
+  clearError();
+  await runAction(() =>
+    apiPost("/api/queue/verify_bounded_local_workspace", { workspace_path: workspace, profile: "tiny_game_demo" })
   );
 });
 

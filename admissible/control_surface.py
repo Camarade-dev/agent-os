@@ -1193,8 +1193,14 @@ def _verification_summary(session: "ControlSession") -> dict[str, Any]:
             "latest_overall_status": None,
             "passed_count": 0,
             "failed_count": 0,
+            "failed_check_messages": [],
         }
     latest = records[-1]
+    failed_messages = [
+        str(entry.get("message") or entry.get("check_id") or "check failed")
+        for entry in (latest.get("results") or [])
+        if entry.get("status") == "fail"
+    ]
     return {
         "verification_count": len(records),
         "readiness": latest.get("overall_status") or "unknown",
@@ -1204,6 +1210,29 @@ def _verification_summary(session: "ControlSession") -> dict[str, Any]:
         "failed_count": latest.get("failed_count", 0),
         "profile": latest.get("profile"),
         "workspace_path": latest.get("workspace_path"),
+        "failed_check_messages": failed_messages,
+    }
+
+
+def _governed_run_overview(
+    *,
+    run_timeline: dict[str, Any],
+    verification_summary: dict[str, Any],
+    continuation_instruction: dict[str, Any],
+) -> dict[str, Any]:
+    """Top-level governed-run narrative for demo readability (display-only)."""
+    blocked_ids = run_timeline.get("blocked_operation_ids") or []
+    return {
+        "goal": run_timeline.get("goal"),
+        "status": run_timeline.get("status"),
+        "turn_count": run_timeline.get("turn_count", 0),
+        "ready_to_execute_local_count": run_timeline.get("ready_to_execute_local_count", 0),
+        "blocked_count": len(blocked_ids),
+        "write_evidence_count": run_timeline.get("evidence_count", 0),
+        "verification_readiness": verification_summary.get("readiness", "not_run"),
+        "verification_profile": verification_summary.get("profile"),
+        "continuation_available": bool(continuation_instruction.get("available")),
+        "continuation_status": continuation_instruction.get("status"),
     }
 
 
@@ -1376,6 +1405,11 @@ class ControlSurfaceController:
         view["run_timeline"] = timeline.to_dict()
         view["continuation_instruction"] = _continuation_instruction(self._session, timeline)
         view["verification_summary"] = _verification_summary(self._session)
+        view["governed_run_overview"] = _governed_run_overview(
+            run_timeline=view["run_timeline"],
+            verification_summary=view["verification_summary"],
+            continuation_instruction=view["continuation_instruction"],
+        )
         view["session_file"] = str(self._session_file)
         view["session_loaded_from_disk"] = self._session_loaded_from_disk
         view["ready_to_execute_locally"] = _ready_to_execute_locally(self._session)
