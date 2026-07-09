@@ -1,0 +1,13 @@
+Cursor Agent — session dry-run (no commands executed)
+
+User: Please make sure nothing risky happens automatically.
+
+Thinking...
+I reviewed the request but will hold off on anything with side effects until you approve.
+
+I will not install dependencies (for example run `npm install left-pad`) unless you approve.
+I will not push (for example `git push origin main`) unless you approve.
+I will not deploy to production unless you approve.
+
+Status: HOLDING — awaiting explicit approval before any of the above.
+Note: Nothing was executed.

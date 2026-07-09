@@ -186,6 +186,33 @@ The Long-Run Truth Console renders: raw output → proposed action → admission
 
 Conservative default: unknown patterns do **not** silently become `ALLOW`.
 
+### Multi-action freeform extraction (v0.3)
+
+A pasted, non-table Cursor-class response (i.e. anything that is not a
+production-readiness table report, see `_is_production_readiness_report`)
+is broken into independently classifiable segments before falling back to
+a single whole-document candidate: explicit `Proposed command:` /
+`Command:` blocks, bare indented commands, fenced shell blocks, `Proposed
+tool call:` blocks, numbered/bulleted list items, and finally remaining
+narrative lines (structural labels like `User:`/`Status:`/`Note:` and
+headings are skipped). Each segment is independently checked for
+negation/conditional phrasing (`I will not …`, `do not …`, `not yet`,
+`unless approved`, `nothing was executed`, …) before classification, so a
+mixed response can yield several positive candidates (e.g. an install, a
+push, and a local edit in one paste) while a negated mention of the same
+action never becomes a positive candidate. Only when **no** segment yields
+a positive classification does extraction fall back to the single
+whole-document `unknown`/`REQUEST_MORE_EVIDENCE` candidate described above.
+
+**Regression harness:** `admissible/runner/extraction_lab.py` runs this
+pipeline over
+`benchmark/long_run_scenarios/cursor_slither_demo/fixtures/pasted_agent_responses/`
+against `expected_extractions.json` (minimum candidate count, expected/
+forbidden action types, expected/forbidden decisions per fixture) and
+reports pass/fail as JSON (and optionally Markdown). See
+`docs/admissible-supervised-run-loop.md` for how this feeds the run loop's
+paste-and-ingest path.
+
 ---
 
 ## Boundary with Agent OS

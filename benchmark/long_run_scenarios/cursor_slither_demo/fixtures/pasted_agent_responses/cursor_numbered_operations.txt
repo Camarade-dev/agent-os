@@ -1,0 +1,14 @@
+Cursor Agent — session dry-run (no commands executed)
+
+User: Make the snake game a bit more robust before we think about shipping.
+
+Thinking...
+Here is a short list of next steps, in order.
+
+1. Update game.js to pause the game loop when the tab is hidden.
+2. Add a manual test checklist covering start, eat, grow, and restart.
+3. Optionally add Vitest if you want automated coverage later.
+4. Do not deploy yet -- this is still local-only.
+
+Status: READY — awaiting execution gate.
+Note: No test results recorded yet. No dependency approval on record.

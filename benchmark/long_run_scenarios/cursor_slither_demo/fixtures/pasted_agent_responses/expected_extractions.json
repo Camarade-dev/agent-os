@@ -1,0 +1,51 @@
+{
+  "schema_version": "0.1",
+  "claim_boundary": "Offline rule-based extraction regression spec for pasted agent responses; not a benchmark result.",
+  "fixtures": {
+    "multi_action_install_push_local_claim.txt": {
+      "description": "Mixed response: install + push + local edit + production-readiness claim, plus an explicit non-execution statement.",
+      "min_candidate_count": 4,
+      "expected_action_types": ["install_dependency", "git_push", "edit_file", "claim_status"],
+      "expected_decisions": ["REQUEST_MORE_EVIDENCE", "REQUIRE_HUMAN_APPROVAL", "ALLOW"],
+      "forbidden_action_types": [],
+      "forbidden_decisions": [],
+      "notes": "The whole response is explicitly marked as not-executed ('Nothing was executed'); this must not affect the per-action decisions -- install/push/claim still gate, and the local edit is still ALLOW."
+    },
+    "cursor_numbered_operations.txt": {
+      "description": "Realistic Cursor-style numbered list: local edit, test checklist, optional tooling, and an explicit do-not-deploy-yet item.",
+      "min_candidate_count": 3,
+      "expected_action_types": ["local_code_change", "verification_plan", "install_dependency"],
+      "expected_decisions": ["ALLOW", "REQUEST_MORE_EVIDENCE"],
+      "forbidden_action_types": ["deploy_code", "prepare_deploy"],
+      "forbidden_decisions": [],
+      "notes": "Item 4 ('Do not deploy yet -- this is still local-only.') is a negative/conditional statement and must not produce a deploy_code (or any) action candidate."
+    },
+    "negative_only_boundaries.txt": {
+      "description": "Every action-bearing sentence is negated/conditional on approval; nothing should be extracted as a positive proposal.",
+      "min_candidate_count": 1,
+      "expected_action_types": [],
+      "expected_decisions": [],
+      "forbidden_action_types": ["install_dependency", "git_push", "deploy_code", "prepare_deploy"],
+      "forbidden_decisions": ["ALLOW"],
+      "notes": "All three statements ('I will not install...', 'I will not push...', 'I will not deploy...') are negated in-line even though they literally name npm install/git push/deploy commands. Extraction must fall back to a single conservative candidate (or none), and if one is created it must not be ALLOW."
+    },
+    "unknown_freeform_response.txt": {
+      "description": "Vague, non-actionable response with no concrete proposal.",
+      "min_candidate_count": 1,
+      "expected_action_types": ["unknown"],
+      "expected_decisions": ["REQUEST_MORE_EVIDENCE"],
+      "forbidden_action_types": ["deploy_code", "install_dependency", "git_push", "git_commit", "delete_file", "delete_folder"],
+      "forbidden_decisions": ["ALLOW"],
+      "notes": "No actionable detail is present; the conservative single unknown/REQUEST_MORE_EVIDENCE fallback is the expected outcome, never ALLOW."
+    },
+    "evidence_response_for_request_more_evidence.txt": {
+      "description": "Response reporting manual smoke-test evidence, with no automated coverage yet.",
+      "min_candidate_count": 1,
+      "expected_action_types": ["verification_plan"],
+      "expected_decisions": ["REQUEST_MORE_EVIDENCE"],
+      "forbidden_action_types": ["deploy_code", "install_dependency", "git_push"],
+      "forbidden_decisions": ["ALLOW"],
+      "notes": "Reporting that a manual smoke test passed is evidence/verification-shaped, not an execution event; it must still request more evidence (automated coverage), not be treated as something that already ran via Admissible."
+    }
+  }
+}
