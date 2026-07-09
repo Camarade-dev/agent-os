@@ -26,6 +26,7 @@ from admissible.control_surface import (
     DecisionQueueItem,
     available_human_actions,
 )
+from admissible.run_loop import queue_item_needs_attention
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SAMPLE_TRACE_PATH = (
@@ -166,11 +167,7 @@ class TestControllerWithSampleSession(unittest.TestCase):
         counted_allow = sum(1 for item in state["queue"] if item["decision"] == "ALLOW")
         self.assertEqual(summary["counts_by_decision"]["ALLOW"], counted_allow)
 
-        expected_attention = sum(
-            1
-            for item in state["queue"]
-            if item["decision"] in ("REQUEST_MORE_EVIDENCE", "REQUIRE_HUMAN_APPROVAL", "REFUSE", "ALLOW_WITH_LIMITS")
-        )
+        expected_attention = sum(1 for item in state["queue"] if queue_item_needs_attention(item))
         self.assertEqual(summary["needs_attention_count"], expected_attention)
         self.assertGreater(summary["needs_attention_count"], 0)
 
@@ -179,7 +176,7 @@ class TestControllerWithSampleSession(unittest.TestCase):
         attention = state["needs_attention"]
         attention_action_ids = {a["action_id"] for a in attention["actions"]}
         for item in state["queue"]:
-            if item["decision"] in ("REQUEST_MORE_EVIDENCE", "REQUIRE_HUMAN_APPROVAL", "REFUSE", "ALLOW_WITH_LIMITS"):
+            if queue_item_needs_attention(item):
                 self.assertIn(item["action_id"], attention_action_ids)
             elif item["decision"] == "ALLOW":
                 self.assertNotIn(item["action_id"], attention_action_ids)

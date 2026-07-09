@@ -271,6 +271,25 @@ def _extract_plan_gate_blocks(raw_output: str) -> list[dict[str, Any]]:
     return blocks
 
 
+def plan_gate_closes_gates(text: str) -> list[str]:
+    """Return gate/step ids a plan-gate-resolution block closes, if any."""
+    for block in _extract_plan_gate_blocks(text):
+        closes = block.get("closes_gates") or []
+        if closes:
+            return list(closes)
+    closes_match = _GATE_CLOSES_RE.search(text)
+    if closes_match:
+        raw = closes_match.group(1)
+        raw = re.split(
+            r"\b(?:side\s+effects|proposal|human\s+decision)\b",
+            raw,
+            maxsplit=1,
+            flags=re.I,
+        )[0]
+        return [g.strip() for g in raw.split(",") if g.strip()]
+    return []
+
+
 # Negation/conditional phrases that mean a segment describes something the
 # agent says it will *not* do (or will only do with approval it does not yet
 # have). Matched per-segment so a mixed response can still extract the

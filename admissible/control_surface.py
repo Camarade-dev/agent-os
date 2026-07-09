@@ -42,6 +42,7 @@ from typing import Any
 from admissible.admitted_execution import (
     EXECUTION_ACTOR_HUMAN_OPERATOR,
     EXECUTION_SCOPE_LOCAL_WORKSPACE_ONLY,
+    EXECUTION_STATUS_ADMITTED_NOT_EXECUTED,
     EXECUTION_STATUS_EXECUTED_AFTER_ADMISSION,
     AdmittedExecutionValidationError,
     is_local_allow_without_missing_evidence,
@@ -58,22 +59,31 @@ from admissible.plan_audit import (
     audit_plan,
     generate_plan_candidate,
 )
+from admissible.long_run_envelope_builder import plan_gate_closes_gates
 from admissible.run_loop import (
+    LIFECYCLE_ADMITTED_NOT_EXECUTED,
     LIFECYCLE_APPROVAL_SUPPLIED_PENDING_REEVALUATION,
     LIFECYCLE_CLOSED,
     LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION,
     LIFECYCLE_LIMITED_SCOPE_SELECTED,
     LIFECYCLE_NEEDS_HUMAN_INPUT,
+    LIFECYCLE_NO_LONGER_NEEDS_ATTENTION,
     LIFECYCLE_READY_FOR_NEXT_AGENT_INSTRUCTION,
+    LIFECYCLE_REFUSED_CLOSED,
+    LIFECYCLE_RESOLVED_GATE,
     AgentResponseRecord,
+    DerivedLifecycleResolution,
     EvidenceRecord,
+    ResolvedPlanGateRecord,
     RunLoopState,
     RunTurn,
     SupersedingAdmissionDecision,
     build_candidates_from_agent_response,
     default_lifecycle_status,
     generate_instruction_packet,
+    queue_item_needs_attention,
     reevaluate_envelope_with_evidence,
+    resolved_plan_gate_ids,
 )
 
 CONTROL_SESSION_SCHEMA_VERSION = "admissible_control_surface_session_v0"
@@ -401,6 +411,13 @@ def available_human_actions(item: DecisionQueueItem, autonomy_level: str) -> lis
     for `REFUSE`, `REQUIRE_HUMAN_APPROVAL`, `REQUEST_MORE_EVIDENCE`, or
     `ALLOW_WITH_LIMITS` beyond what those decisions always permit.
     """
+    if item.lifecycle_status in (
+        LIFECYCLE_RESOLVED_GATE,
+        LIFECYCLE_REFUSED_CLOSED,
+        LIFECYCLE_LIMITED_SCOPE_SELECTED,
+        LIFECYCLE_ADMITTED_NOT_EXECUTED,
+    ):
+        return []
     decision = item.decision
     if decision == "REFUSE":
         return []
@@ -505,6 +522,103 @@ def _admissible_message_for_audit(intake: GoalIntake, audit: PlanAudit) -> str:
     )
 
 
+def _closes_gates_for_item(envelope: RunEnvelope | None, item: DecisionQueueItem) -> list[str]:
+    if envelope is None or item.action_type != "plan_gate_resolution":
+        return []
+    candidate = envelope.candidate
+    stored = candidate.get("closes_gates")
+    if isinstance(stored, list) and stored:
+        return [str(g) for g in stored if g]
+    for key in ("operation_text", "tool_or_command"):
+        text = candidate.get(key)
+        if isinstance(text, str) and text.strip():
+            closes = plan_gate_closes_gates(text)
+            if closes:
+                return closes
+    proposed = envelope.decision.get("proposed_action") or {}
+    for key in ("operation_text", "description"):
+        text = proposed.get(key)
+        if isinstance(text, str) and text.strip():
+            closes = plan_gate_closes_gates(text)
+            if closes:
+                return closes
+    return []
+
+
+def _is_side_effecting_approval_item(item: DecisionQueueItem, envelope: RunEnvelope | None) -> bool:
+    if item.action_type == "plan_gate_resolution":
+        return False
+    if envelope is not None:
+        side_effect = envelope.candidate.get("side_effect_type")
+        if side_effect == "internal_state_change":
+            return False
+    return item.decision == "REQUIRE_HUMAN_APPROVAL"
+
+
+def _apply_human_decision_lifecycle(
+    session: ControlSession,
+    *,
+    item: DecisionQueueItem,
+    envelope: RunEnvelope | None,
+    record: HumanDecisionRecord,
+    decision_type: str,
+) -> None:
+    """Append derived lifecycle records and update queue projections.
+
+    Never mutates the original rules-only admission decision on the envelope.
+    """
+    run_loop = session.run_loop
+    derived_status: str | None = None
+    closes_gate_ids: list[str] = []
+
+    if decision_type == DECISION_TYPE_APPROVE:
+        if item.action_type == "plan_gate_resolution":
+            derived_status = LIFECYCLE_RESOLVED_GATE
+            item.lifecycle_status = LIFECYCLE_RESOLVED_GATE
+            closes_gate_ids = _closes_gates_for_item(envelope, item)
+            resolved_at = record.timestamp
+            for gate_id in closes_gate_ids:
+                if any(g.gate_id == gate_id for g in run_loop.resolved_plan_gates):
+                    continue
+                run_loop.resolved_plan_gates.append(
+                    ResolvedPlanGateRecord(
+                        gate_id=gate_id,
+                        resolved_by_action_id=item.action_id,
+                        resolved_by_human_decision_id=record.record_id,
+                        approved_scope=record.scope,
+                        resolved_at=resolved_at,
+                    )
+                )
+        elif _is_side_effecting_approval_item(item, envelope):
+            derived_status = LIFECYCLE_ADMITTED_NOT_EXECUTED
+            item.lifecycle_status = LIFECYCLE_ADMITTED_NOT_EXECUTED
+            item.execution_status = EXECUTION_STATUS_ADMITTED_NOT_EXECUTED
+            if envelope is not None:
+                envelope.candidate["execution_status"] = EXECUTION_STATUS_ADMITTED_NOT_EXECUTED
+        else:
+            derived_status = LIFECYCLE_READY_FOR_NEXT_AGENT_INSTRUCTION
+            item.lifecycle_status = LIFECYCLE_READY_FOR_NEXT_AGENT_INSTRUCTION
+    elif decision_type == DECISION_TYPE_LIMIT_SCOPE:
+        derived_status = LIFECYCLE_LIMITED_SCOPE_SELECTED
+        item.lifecycle_status = LIFECYCLE_LIMITED_SCOPE_SELECTED
+    elif decision_type == DECISION_TYPE_REFUSE:
+        derived_status = LIFECYCLE_REFUSED_CLOSED
+        item.lifecycle_status = LIFECYCLE_REFUSED_CLOSED
+
+    if derived_status is not None:
+        run_loop.derived_lifecycle_resolutions.append(
+            DerivedLifecycleResolution(
+                record_id=f"derived_lifecycle_{uuid.uuid4().hex[:12]}",
+                action_id=item.action_id,
+                human_decision_id=record.record_id,
+                derived_status=derived_status,
+                approved_scope=record.scope,
+                closes_gate_ids=closes_gate_ids,
+                timestamp=record.timestamp,
+            )
+        )
+
+
 def _mission_summary(session: "ControlSession") -> dict[str, Any]:
     """Display-only aggregate for the UI's "Mission Summary" panel.
 
@@ -531,7 +645,9 @@ def _mission_summary(session: "ControlSession") -> dict[str, Any]:
         "counts_by_execution_status": {
             status: by_execution_status.get(status, 0) for status in _EXECUTION_STATUSES_FOR_SUMMARY
         },
-        "needs_attention_count": sum(1 for item in queue if item.decision in _ATTENTION_DECISIONS),
+        "needs_attention_count": sum(
+            1 for item in queue if queue_item_needs_attention(item.to_dict())
+        ),
         "side_effect_executed_by_admissible": False,
     }
 
@@ -556,11 +672,28 @@ def _needs_attention(session: "ControlSession") -> dict[str, Any]:
     goal_intake = session.goal_intake or {}
     plan_audit = session.plan_audit or {}
     queue = session.queue
+    resolved_ids = resolved_plan_gate_ids(
+        [g.to_dict() for g in session.run_loop.resolved_plan_gates]
+    )
 
-    attention_actions = [_attention_row(item) for item in queue if item.decision in _ATTENTION_DECISIONS]
-    evidence_needed = [_attention_row(item) for item in queue if item.decision == "REQUEST_MORE_EVIDENCE"]
-    approval_needed = [_attention_row(item) for item in queue if item.decision == "REQUIRE_HUMAN_APPROVAL"]
-    scope_limits_needed = [_attention_row(item) for item in queue if item.decision == "ALLOW_WITH_LIMITS"]
+    attention_actions = [
+        _attention_row(item) for item in queue if queue_item_needs_attention(item.to_dict())
+    ]
+    evidence_needed = [
+        _attention_row(item)
+        for item in queue
+        if item.decision == "REQUEST_MORE_EVIDENCE" and queue_item_needs_attention(item.to_dict())
+    ]
+    approval_needed = [
+        _attention_row(item)
+        for item in queue
+        if item.decision == "REQUIRE_HUMAN_APPROVAL" and queue_item_needs_attention(item.to_dict())
+    ]
+    scope_limits_needed = [
+        _attention_row(item)
+        for item in queue
+        if item.decision == "ALLOW_WITH_LIMITS" and queue_item_needs_attention(item.to_dict())
+    ]
     ready_to_continue = [
         _attention_row(item) for item in queue if item.lifecycle_status == LIFECYCLE_READY_FOR_NEXT_AGENT_INSTRUCTION
     ]
@@ -568,13 +701,23 @@ def _needs_attention(session: "ControlSession") -> dict[str, Any]:
     plan_clarifications: list[str] = []
     if plan_audit.get("verdict") and plan_audit.get("verdict") != PLAN_VERDICT_OK:
         for gate in plan_audit.get("required_gates") or []:
+            if gate in resolved_ids:
+                continue
             plan_clarifications.append(f"Unresolved plan gate: {gate}")
+    for resolved in session.run_loop.resolved_plan_gates:
+        scope_note = f" (scope: {resolved.approved_scope})" if resolved.approved_scope else ""
+        plan_clarifications.append(f"Human-resolved plan gate: {resolved.gate_id}{scope_note}")
     for question in goal_intake.get("clarifying_questions") or []:
         plan_clarifications.append(question)
 
+    unresolved_plan_gates = [
+        gate for gate in (plan_audit.get("required_gates") or []) if gate not in resolved_ids
+    ]
+
     return {
         "actions": attention_actions,
-        "unresolved_plan_gates": list(plan_audit.get("required_gates") or []),
+        "unresolved_plan_gates": unresolved_plan_gates,
+        "resolved_plan_gates": [g.to_dict() for g in session.run_loop.resolved_plan_gates],
         "missing_context": list(goal_intake.get("missing_context") or []),
         "clarifying_questions": list(goal_intake.get("clarifying_questions") or []),
         "evidence_needed": evidence_needed,
@@ -889,12 +1032,14 @@ class ControlSurfaceController:
             envelope.candidate["execution_status"] = EXECUTION_STATUS_EXECUTED_AFTER_ADMISSION
             envelope.candidate["execution_record"] = exec_record
             item.lifecycle_status = LIFECYCLE_CLOSED
-        elif decision_type == DECISION_TYPE_APPROVE:
-            item.lifecycle_status = LIFECYCLE_APPROVAL_SUPPLIED_PENDING_REEVALUATION
-        elif decision_type == DECISION_TYPE_LIMIT_SCOPE:
-            item.lifecycle_status = LIFECYCLE_LIMITED_SCOPE_SELECTED
-        elif decision_type == DECISION_TYPE_REFUSE:
-            item.lifecycle_status = LIFECYCLE_CLOSED
+        elif decision_type in (DECISION_TYPE_APPROVE, DECISION_TYPE_LIMIT_SCOPE, DECISION_TYPE_REFUSE):
+            _apply_human_decision_lifecycle(
+                self._session,
+                item=item,
+                envelope=envelope,
+                record=record,
+                decision_type=decision_type,
+            )
 
         item.human_decision_ids.append(record.record_id)
         self._session.human_decisions.append(record)
@@ -925,6 +1070,7 @@ class ControlSurfaceController:
             goal_intake=self._session.goal_intake,
             plan_audit=self._session.plan_audit,
             queue=[item.to_dict() for item in self._session.queue],
+            resolved_plan_gates=[g.to_dict() for g in run_loop.resolved_plan_gates],
         )
         run_loop.current_turn = turn_number
         run_loop.instruction_packets.append(packet)
@@ -1110,10 +1256,16 @@ __all__ = [
     "SAMPLE_SLITHER_PROMPT",
     "AdmittedExecutionValidationError",
     "available_human_actions",
+    "LIFECYCLE_ADMITTED_NOT_EXECUTED",
     "LIFECYCLE_APPROVAL_SUPPLIED_PENDING_REEVALUATION",
     "LIFECYCLE_CLOSED",
     "LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION",
     "LIFECYCLE_LIMITED_SCOPE_SELECTED",
     "LIFECYCLE_NEEDS_HUMAN_INPUT",
     "LIFECYCLE_READY_FOR_NEXT_AGENT_INSTRUCTION",
+    "LIFECYCLE_REFUSED_CLOSED",
+    "LIFECYCLE_RESOLVED_GATE",
+    "DerivedLifecycleResolution",
+    "ResolvedPlanGateRecord",
+    "queue_item_needs_attention",
 ]

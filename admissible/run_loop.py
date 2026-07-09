@@ -38,6 +38,15 @@ from admissible.long_run_envelope_builder import build_from_raw_output
 
 RUN_LOOP_SCHEMA_VERSION = "admissible_run_loop_v0"
 
+# Admission decisions that may call for human attention when no derived lifecycle
+# resolution has closed the item yet.
+_ATTENTION_DECISIONS = frozenset(
+    {"REQUEST_MORE_EVIDENCE", "REQUIRE_HUMAN_APPROVAL", "REFUSE", "ALLOW_WITH_LIMITS"}
+)
+
+# Execution status that means a human-approved side effect is admitted but not run.
+_EXECUTION_STATUS_ADMITTED_NOT_EXECUTED = "admitted_not_executed"
+
 AGENT_RESPONSE_SOURCE_TRUST = "unverified_agent_output"
 AGENT_RESPONSE_ACTOR = "external_frontier_agent"
 EVIDENCE_ACTOR_HUMAN_OPERATOR = "human_operator"
@@ -50,6 +59,11 @@ LIFECYCLE_APPROVAL_SUPPLIED_PENDING_REEVALUATION = "approval_supplied_pending_re
 LIFECYCLE_LIMITED_SCOPE_SELECTED = "limited_scope_selected"
 LIFECYCLE_READY_FOR_NEXT_AGENT_INSTRUCTION = "ready_for_next_agent_instruction"
 LIFECYCLE_CLOSED = "closed"
+# Derived terminal/intermediate statuses produced when a human decision is applied
+# (slice ADMISSIBLE_STATE_LIFECYCLE_001_HUMAN_DECISION_APPLICATION).
+LIFECYCLE_RESOLVED_GATE = "resolved_gate"
+LIFECYCLE_REFUSED_CLOSED = "refused_closed"
+LIFECYCLE_ADMITTED_NOT_EXECUTED = "admitted_not_executed"
 
 LIFECYCLE_STATUSES = frozenset(
     {
@@ -59,6 +73,21 @@ LIFECYCLE_STATUSES = frozenset(
         LIFECYCLE_LIMITED_SCOPE_SELECTED,
         LIFECYCLE_READY_FOR_NEXT_AGENT_INSTRUCTION,
         LIFECYCLE_CLOSED,
+        LIFECYCLE_RESOLVED_GATE,
+        LIFECYCLE_REFUSED_CLOSED,
+        LIFECYCLE_ADMITTED_NOT_EXECUTED,
+    }
+)
+
+# Lifecycle statuses that mean the item no longer needs a pending human decision.
+LIFECYCLE_NO_LONGER_NEEDS_ATTENTION = frozenset(
+    {
+        LIFECYCLE_RESOLVED_GATE,
+        LIFECYCLE_REFUSED_CLOSED,
+        LIFECYCLE_CLOSED,
+        LIFECYCLE_LIMITED_SCOPE_SELECTED,
+        LIFECYCLE_READY_FOR_NEXT_AGENT_INSTRUCTION,
+        LIFECYCLE_ADMITTED_NOT_EXECUTED,
     }
 )
 
@@ -74,6 +103,28 @@ _DEFAULT_LIFECYCLE_BY_DECISION: dict[str, str] = {
 def default_lifecycle_status(decision_label: str) -> str:
     """Return the default v0 lifecycle status for a rules-only decision label."""
     return _DEFAULT_LIFECYCLE_BY_DECISION.get(decision_label, LIFECYCLE_NEEDS_HUMAN_INPUT)
+
+
+def queue_item_needs_attention(item: dict[str, Any]) -> bool:
+    """Return True when a queue item still belongs in Needs Attention buckets.
+
+  Uses derived lifecycle state (not the immutable rules-only decision label
+  alone). Old sessions without lifecycle fields fall back to decision-label
+  gating only.
+    """
+    decision = item.get("decision")
+    if decision not in _ATTENTION_DECISIONS:
+        return False
+    lifecycle = item.get("lifecycle_status", LIFECYCLE_NEEDS_HUMAN_INPUT)
+    if lifecycle in LIFECYCLE_NO_LONGER_NEEDS_ATTENTION:
+        return False
+    if item.get("execution_status") == _EXECUTION_STATUS_ADMITTED_NOT_EXECUTED:
+        return False
+    return True
+
+
+def resolved_plan_gate_ids(resolved_plan_gates: list[dict[str, Any]]) -> set[str]:
+    return {str(g.get("gate_id")) for g in resolved_plan_gates if g.get("gate_id")}
 
 
 # Same operational-action mapping used by admissible.long_run_truth, kept as
@@ -288,6 +339,48 @@ class EvidenceRecord:
 
 
 @dataclass
+class DerivedLifecycleResolution:
+    """Append-only derived lifecycle state from one human decision.
+
+    Never mutates the original rules-only admission decision on the run
+    envelope; records what downstream lifecycle state was derived.
+    """
+
+    record_id: str
+    action_id: str
+    human_decision_id: str
+    derived_status: str
+    approved_scope: str | None
+    closes_gate_ids: list[str]
+    timestamp: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "DerivedLifecycleResolution":
+        return _from_dict(cls, data)
+
+
+@dataclass
+class ResolvedPlanGateRecord:
+    """One plan gate closed by a human-approved plan_gate_resolution action."""
+
+    gate_id: str
+    resolved_by_action_id: str
+    resolved_by_human_decision_id: str
+    approved_scope: str | None
+    resolved_at: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ResolvedPlanGateRecord":
+        return _from_dict(cls, data)
+
+
+@dataclass
 class SupersedingAdmissionDecision:
     """A new rules-only decision produced after evidence was supplied.
 
@@ -320,6 +413,8 @@ class RunLoopState:
     response_records: list[AgentResponseRecord] = field(default_factory=list)
     evidence_records: list[EvidenceRecord] = field(default_factory=list)
     superseding_decisions: list[SupersedingAdmissionDecision] = field(default_factory=list)
+    derived_lifecycle_resolutions: list[DerivedLifecycleResolution] = field(default_factory=list)
+    resolved_plan_gates: list[ResolvedPlanGateRecord] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -330,6 +425,8 @@ class RunLoopState:
             "response_records": [r.to_dict() for r in self.response_records],
             "evidence_records": [e.to_dict() for e in self.evidence_records],
             "superseding_decisions": [s.to_dict() for s in self.superseding_decisions],
+            "derived_lifecycle_resolutions": [r.to_dict() for r in self.derived_lifecycle_resolutions],
+            "resolved_plan_gates": [g.to_dict() for g in self.resolved_plan_gates],
         }
 
     @classmethod
@@ -349,6 +446,13 @@ class RunLoopState:
                 SupersedingAdmissionDecision.from_dict(d)
                 for d in data.get("superseding_decisions") or []
             ],
+            derived_lifecycle_resolutions=[
+                DerivedLifecycleResolution.from_dict(d)
+                for d in data.get("derived_lifecycle_resolutions") or []
+            ],
+            resolved_plan_gates=[
+                ResolvedPlanGateRecord.from_dict(d) for d in data.get("resolved_plan_gates") or []
+            ],
         )
 
 
@@ -367,13 +471,26 @@ def _allowed_scope(goal_intake: dict[str, Any]) -> list[str]:
     return scope
 
 
-def _open_gates_summary(goal_intake: dict[str, Any], plan_audit: dict[str, Any]) -> list[str]:
+def _open_gates_summary(
+    goal_intake: dict[str, Any],
+    plan_audit: dict[str, Any],
+    *,
+    resolved_plan_gates: list[dict[str, Any]] | None = None,
+) -> list[str]:
     items: list[str] = []
+    resolved_ids = resolved_plan_gate_ids(resolved_plan_gates or [])
     verdict = plan_audit.get("verdict")
     if verdict and verdict != "PLAN_OK_FOR_LOCAL_PROTOTYPE":
         items.append(f"Plan audit verdict: {verdict}.")
     for gate in plan_audit.get("required_gates") or []:
+        if gate in resolved_ids:
+            continue
         items.append(f"Unresolved plan gate: {gate}.")
+    for resolved in resolved_plan_gates or []:
+        gate_id = resolved.get("gate_id")
+        scope = resolved.get("approved_scope")
+        scope_note = f" (scope: {scope})" if scope else ""
+        items.append(f"Human-resolved plan gate: {gate_id}{scope_note}.")
     for missing in goal_intake.get("missing_context") or []:
         items.append(f"Missing context: {missing}.")
     for question in goal_intake.get("clarifying_questions") or []:
@@ -453,6 +570,7 @@ def generate_instruction_packet(
     goal_intake: dict[str, Any] | None,
     plan_audit: dict[str, Any] | None,
     queue: list[dict[str, Any]],
+    resolved_plan_gates: list[dict[str, Any]] | None = None,
 ) -> AgentInstructionPacket:
     """Deterministically build the next agent instruction packet (v0).
 
@@ -482,7 +600,9 @@ def generate_instruction_packet(
         must_not=list(_MUST_NOT),
         evidence_needed=_evidence_needed(queue),
         continuation_instruction=_CONTINUATION_INSTRUCTION,
-        open_gates_summary=_open_gates_summary(goal_intake, plan_audit),
+        open_gates_summary=_open_gates_summary(
+            goal_intake, plan_audit, resolved_plan_gates=resolved_plan_gates
+        ),
         queue_summary=_queue_summary(queue),
         packet_text="",
         response_format_guidance=list(_RESPONSE_FORMAT_GUIDANCE),
@@ -580,18 +700,24 @@ __all__ = [
     "AGENT_RESPONSE_ACTOR",
     "AGENT_RESPONSE_SOURCE_TRUST",
     "EVIDENCE_ACTOR_HUMAN_OPERATOR",
+    "LIFECYCLE_ADMITTED_NOT_EXECUTED",
     "LIFECYCLE_APPROVAL_SUPPLIED_PENDING_REEVALUATION",
     "LIFECYCLE_CLOSED",
     "LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION",
     "LIFECYCLE_LIMITED_SCOPE_SELECTED",
     "LIFECYCLE_NEEDS_HUMAN_INPUT",
+    "LIFECYCLE_NO_LONGER_NEEDS_ATTENTION",
     "LIFECYCLE_READY_FOR_NEXT_AGENT_INSTRUCTION",
+    "LIFECYCLE_REFUSED_CLOSED",
+    "LIFECYCLE_RESOLVED_GATE",
     "LIFECYCLE_STATUSES",
     "NON_EXECUTION_BOUNDARIES",
     "RUN_LOOP_SCHEMA_VERSION",
     "AgentInstructionPacket",
     "AgentResponseRecord",
+    "DerivedLifecycleResolution",
     "EvidenceRecord",
+    "ResolvedPlanGateRecord",
     "RunLoopState",
     "RunTurn",
     "SupersedingAdmissionDecision",
@@ -599,5 +725,7 @@ __all__ = [
     "default_lifecycle_status",
     "generate_instruction_packet",
     "operational_action_for_decision",
+    "queue_item_needs_attention",
     "reevaluate_envelope_with_evidence",
+    "resolved_plan_gate_ids",
 ]
