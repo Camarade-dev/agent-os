@@ -1,0 +1,195 @@
+{
+  "slice": "ADMISSIBLE_AUDIT_013_PRODUCT_UX_GENERALIZATION_AND_LIVE_RUN_FLOW",
+  "date": "2026-07-09",
+  "verdict": "TECH_READY_UX_NOT_READY",
+  "verdict_note": "Engine, gates, bridge, and executor are solid (771 admissible tests passing, all diagnostic suites green, ingest verified side-effect-free). The blank-prompt product experience is blocked by first-run gating, information architecture, and Slither-default gaps. All P0s are ordering/guarding/copy fixes, not engine changes.",
+  "diagnostics": {
+    "git_status": "clean before audit; audit adds tests/test_admissible_first_run_product_gaps.py and two report files; nothing committed",
+    "pytest_admissible": "771 passed, 1258 deselected, 7 xfailed, 156 subtests passed",
+    "canonical_demo_e2e": "passed",
+    "bounded_local_executor": "passed",
+    "structured_operation_contract": "passed",
+    "tiny_local_game_dynamic_run": "passed",
+    "control_surface_live_dynamic_run_rehearsal": "passed"
+  },
+  "gaps": [
+    {
+      "id": "GAP-001",
+      "severity": "P0",
+      "category": "first-run-flow",
+      "observed_behavior": "generate_next_instruction_packet() and the bridge's write_next_instruction_with_controller() succeed on a blank session: the packet TASK is 'No goal has been submitted to Admissible yet.', the run-loop turn advances, the instruction file is written into the workspace, and bridge-state.json sets awaiting_response=true (probes P1/P2).",
+      "expected_behavior": "Both paths raise a clear 'submit a goal first' ValueError; the UI disables 'Write instruction file' and 'Generate next agent instruction' with an inline reason; the turn counter is untouched and no file is written.",
+      "affected": [
+        "admissible/control_surface.py:generate_next_instruction_packet",
+        "admissible/run_loop.py:generate_instruction_packet (task fallback string, line ~981)",
+        "admissible/runner/cursor_bridge.py:write_next_instruction_with_controller",
+        "admissible/harness/control_surface.html (btn-bridge-write-instruction, btn-generate-instruction)"
+      ],
+      "suggested_fix": "Guard in ControlSurfaceController.generate_next_instruction_packet when self._session.goal_intake is None; delete the 'No goal has been submitted' fallback from run_loop.generate_instruction_packet; expose has_goal in state_view and disable the buttons client-side with a reason.",
+      "suggested_tests": [
+        "tests/test_admissible_first_run_product_gaps.py::TestInstructionRequiresGoalDesiredBehavior (added, xfail; flip on fix)"
+      ],
+      "slice": "ADMISSIBLE_UX_014_GOAL_FIRST_GATING"
+    },
+    {
+      "id": "GAP-002",
+      "severity": "P0",
+      "category": "first-run-flow",
+      "observed_behavior": "Blank session renders Session Diagnostics first, then the Cursor bridge (all buttons enabled), Mission Summary, Supervised Run State, queue, and Selected Action; the goal form is the 10th panel, below the fold. The empty state says 'Send a goal below' while the visible controls point elsewhere.",
+      "expected_behavior": "Blank session leads with a large focused goal input; bridge/workspace/instruction controls are hidden or disabled-with-reason until a goal exists; a stepper shows the run phases.",
+      "affected": [
+        "admissible/harness/control_surface.html (panel order in <main id=\"app-main\">)",
+        "admissible/control_surface.py:state_view (missing has_goal / run_phase / next_expected_action)"
+      ],
+      "suggested_fix": "Reorder panels goal-first; add has_goal, run_phase, next_expected_action to state_view; render a single current-step line driving which controls are active.",
+      "suggested_tests": [
+        "tests/test_admissible_first_run_product_gaps.py::TestBlankSessionGoalFirstDesiredBehavior::test_goal_form_appears_before_bridge_and_queue_panels (added, xfail)"
+      ],
+      "slice": "ADMISSIBLE_UX_014_GOAL_FIRST_GATING"
+    },
+    {
+      "id": "GAP-003",
+      "severity": "P0",
+      "category": "generalization",
+      "observed_behavior": "'Load sample Slither session' is the only primary-styled header button; the goal placeholder and empty state also name Slither; load_sample_session() silently replaces an in-progress session with no confirmation (probe P5) while the less destructive Reset button does confirm.",
+      "expected_behavior": "Sample demoted to a secondary 'Load a sample run' affordance in a sample gallery/advanced drawer; generic goal placeholder; confirmation or auto-archive before replacing a non-empty session; sample sessions labeled is_sample_session.",
+      "affected": [
+        "admissible/harness/control_surface.html:276 (btn-load-sample), :415 (goal placeholder), :606 (empty state)",
+        "admissible/control_surface.py:load_sample_session, SAMPLE_SLITHER_PROMPT"
+      ],
+      "suggested_fix": "Rename/demote the button, move it into the advanced drawer, require confirm (or refuse) when goal_intake or queue is non-empty, mark resulting sessions as samples.",
+      "suggested_tests": [
+        "tests/test_admissible_first_run_product_gaps.py::TestBlankSessionGoalFirstDesiredBehavior::test_sample_session_is_not_the_primary_default_action (added, xfail)",
+        "tests/test_admissible_first_run_product_gaps.py::TestBlankSessionGoalFirstDesiredBehavior::test_goal_placeholder_is_not_slither_specific (added, xfail)",
+        "new: load_sample_session refuses/archives when session non-empty"
+      ],
+      "slice": "ADMISSIBLE_UX_015_SAMPLE_DEMOTION_AND_GENERIC_COPY"
+    },
+    {
+      "id": "GAP-004",
+      "severity": "P1",
+      "category": "state-machine",
+      "observed_behavior": "Instruction turns that never receive a response (e.g. the no-goal turn 1) stay in bridge_awaiting_turns forever; session diagnostics permanently show 'Yes — turn(s) 1 awaiting Cursor response' even after later turns complete round trips (probe P3).",
+      "expected_behavior": "Writing a new instruction supersedes the previous outstanding turn; superseded turns are excluded from the awaiting list; diagnostics reflect only the genuinely outstanding turn.",
+      "affected": [
+        "admissible/control_surface.py:_bridge_awaiting_response",
+        "admissible/run_loop.py (instruction_packets / turns model)"
+      ],
+      "suggested_fix": "Track a superseded_by_turn field on RunTurn (or compute: only the latest packet turn can be awaiting) and report at most one awaiting turn.",
+      "suggested_tests": [
+        "new: after write(no-response) + write + ingest, bridge_awaiting_turns == []"
+      ],
+      "slice": "ADMISSIBLE_STATE_016_BRIDGE_SESSION_BINDING"
+    },
+    {
+      "id": "GAP-005",
+      "severity": "P1",
+      "category": "state-machine",
+      "observed_behavior": "After 'Reset local session', a response file written for the pre-reset instruction ingests cleanly into the fresh session: bridge-state.json stores session_id but _validate_response_for_ingest never compares it, and session_turn=0 is falsy so the turn-mismatch guard is skipped (probe P6).",
+      "expected_behavior": "Ingest rejects a response whose bridge-state session_id does not match the live session; turn 0 is handled explicitly ('no instruction written by this session yet').",
+      "affected": [
+        "admissible/runner/cursor_bridge.py:_validate_response_for_ingest"
+      ],
+      "suggested_fix": "Add session-id comparison and explicit session_turn==0 rejection with a typed error and recorded blocked-ingest transcript entry.",
+      "suggested_tests": [
+        "new: write under session A, reset to session B, ingest -> CursorBridgeError(reason=session_mismatch)"
+      ],
+      "slice": "ADMISSIBLE_STATE_016_BRIDGE_SESSION_BINDING"
+    },
+    {
+      "id": "GAP-006",
+      "severity": "P1",
+      "category": "first-run-flow",
+      "observed_behavior": "Manual paste ingest (ingest_agent_response) accepts a response with no goal and no instruction; a queue item is created at turn 0 (probe P4).",
+      "expected_behavior": "Manual paste path requires a goal (or is explicitly labeled and gated as a debug-only import) so a blank session cannot acquire queue items with no run objective.",
+      "affected": [
+        "admissible/control_surface.py:ingest_agent_response",
+        "admissible/harness/control_surface.html (advanced manual paste fallback)"
+      ],
+      "suggested_fix": "Same has_goal guard as GAP-001, with a debug override flag if the raw-import capability must remain for lab use.",
+      "suggested_tests": [
+        "new: ingest_agent_response without goal raises unless debug flag set"
+      ],
+      "slice": "ADMISSIBLE_UX_014_GOAL_FIRST_GATING"
+    },
+    {
+      "id": "GAP-007",
+      "severity": "P1",
+      "category": "information-architecture",
+      "observed_behavior": "Debug-grade material is visible by default: session diagnostics (file path, disk-load flag, turn bookkeeping), bridge file facts (sha256/bytes/mtime), raw packet textarea, full autonomy fine print, triple-repeated non-execution banners, 15-tile mission summary including 'side_effect_executed_by_admissible: false'.",
+      "expected_behavior": "Default view shows only: goal/run overview, current step, agent handoff status, decisions needed, admitted actions, execution evidence. Everything else in one collapsed Advanced/Debug drawer; one calm persistent safety line.",
+      "affected": [
+        "admissible/harness/control_surface.html (all panels)",
+        "admissible/control_surface.py (_mission_summary, _session_diagnostics: display-only, safe to reshape)"
+      ],
+      "suggested_fix": "Implement the 7-level hierarchy from the audit report section 6; move diagnostics/transcript/decision-history/raw-preview into the drawer.",
+      "suggested_tests": [
+        "tests/test_admissible_first_run_product_gaps.py::TestBlankSessionGoalFirstDesiredBehavior::test_session_diagnostics_are_collapsed_by_default (added, xfail)"
+      ],
+      "slice": "ADMISSIBLE_UX_017_IA_RESTRUCTURE"
+    },
+    {
+      "id": "GAP-008",
+      "severity": "P2",
+      "category": "product-language",
+      "observed_behavior": "Lab phrasing: 'Admissible Control Surface v0', 'Mission Summary', 'Supervised Run State', 'Admissible Action Admission Queue', 'Cursor supervised file bridge', 'Ingest Cursor response file', 'Attest executed after admission'; safety boundary repeated in 3 warning banners plus footer plus packet text.",
+      "expected_behavior": "Product-grade names (Run overview, Decisions needed, Proposed actions, Agent handoff, Send instructions to agent, Check for agent response, Apply approved file changes, Mark as done outside Admissible); one persistent calm safety line with full boundary text in the drawer.",
+      "affected": [
+        "admissible/harness/control_surface.html (headings, buttons, banners)",
+        "admissible/control_surface.py (transcript message strings)"
+      ],
+      "suggested_fix": "Apply the copy table in audit report section 8.",
+      "suggested_tests": [
+        "HTML copy guards asserting new names and single always-visible safety banner"
+      ],
+      "slice": "ADMISSIBLE_UX_017_IA_RESTRUCTURE"
+    },
+    {
+      "id": "GAP-009",
+      "severity": "P2",
+      "category": "information-architecture",
+      "observed_behavior": "Mission summary renders 15 stat tiles including zero-value tiles and a raw boolean sentence about side effects.",
+      "expected_behavior": "3-4 headline tiles (needs you now, admitted, executed, blocked); remaining counts live in the actions view or drawer.",
+      "affected": [
+        "admissible/harness/control_surface.html:renderMissionSummary",
+        "admissible/control_surface.py:_mission_summary (display-only)"
+      ],
+      "suggested_fix": "Reduce headline tiles; keep full counts in state_view for the drawer.",
+      "suggested_tests": [],
+      "slice": "ADMISSIBLE_UX_017_IA_RESTRUCTURE"
+    },
+    {
+      "id": "GAP-010",
+      "severity": "P2",
+      "category": "architecture",
+      "observed_behavior": "control_surface.html is a 1,617-line monolith (CSS + markup + ~1,150 lines JS); render(state) re-renders 12 panels per action; UI derives product state (button enablement) client-side.",
+      "expected_behavior": "Same stdlib no-build server, but split static assets (css/js modules/template) served by the handler; server-provided run_phase/blocked_reason fields drive the UI.",
+      "affected": [
+        "admissible/harness/control_surface.html",
+        "admissible/runner/control_surface.py (add static routes)",
+        "admissible/control_surface.py:state_view"
+      ],
+      "suggested_fix": "Split files without introducing a framework or build step; add missing state_view fields (has_goal, run_phase, next_expected_action, blocked_reason, is_sample_session).",
+      "suggested_tests": [
+        "existing HTML-content tests updated to read the split assets; live rehearsal test unchanged"
+      ],
+      "slice": "ADMISSIBLE_UX_017_IA_RESTRUCTURE"
+    }
+  ],
+  "verified_ok": [
+    "Ingest creates no files outside .admissible/ (probe P7 + new guard test)",
+    "Bounded execution requires admission for all non-ALLOW decisions (new guard test)",
+    "Rules-only decisions never mutated by human decisions, evidence, or execution",
+    "Stale/duplicate bridge responses blocked with typed errors and transcript records",
+    "Goal intake is task-agnostic; non-Slither dynamic run proven by tiny-local-game suite",
+    "Corrupt session files fail loudly instead of silently resetting"
+  ],
+  "tests_added": {
+    "file": "tests/test_admissible_first_run_product_gaps.py",
+    "xfail_desired_behavior": 7,
+    "passing_refactor_guards": 3,
+    "suite_after": "771 passed, 7 xfailed"
+  },
+  "next_slice_recommended": "ADMISSIBLE_UX_014_GOAL_FIRST_GATING",
+  "committed": false
+}
