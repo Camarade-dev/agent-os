@@ -90,8 +90,8 @@ This manual path mirrors live Cursor use later; the tests do not depend on Curso
 - **Human-triggered ingest** for each agent response.
 - **No completion model** — continuation always asks for the next smallest
   admissible step; it never declares the goal done.
-- **No blocker/recovery loop** yet — if execution fails or the agent proposes
-  forbidden actions, recovery is manual.
+- **Blocker/recovery loop** — see `docs/admissible-blocker-recovery-loop-demo.md`
+  (slice `ADMISSIBLE_DEMO_024`) for the four-turn deterministic scenario.
 - **No bounded verification** pass after Turn 2 (e.g. automated smoke test of
   the game in a browser).
 - The Cursor bridge still writes the standard instruction packet via
@@ -109,10 +109,15 @@ The governed invariants hold:
 - continuation blocks until execution evidence exists;
 - timeline and evidence accumulate across turns.
 
-## Remaining before `ADMISSIBLE_DEMO_024_BLOCKER_AND_RECOVERY_LOOP`
+## Related: blocker / recovery loop (demo 024)
 
-- Blocker detection and bounded recovery when batch execution partially fails.
-- Explicit handling when Turn 2 proposes forbidden ops alongside local writes.
+Slice `ADMISSIBLE_DEMO_024_BLOCKER_AND_RECOVERY_LOOP` extends this demo with
+Turns 3–4 (blocked npm/deploy proposals, then local-only recovery). See
+`docs/admissible-blocker-recovery-loop-demo.md`.
+
+## Remaining before bounded verification / final live demo
+
+- Partial batch failure recovery when execution fails mid-batch.
 - Optional wiring: bridge writes evidence-grounded continuation text instead of
   (or in addition to) the generic next packet.
 - Completion / verification model for declaring the demo goal satisfied.
