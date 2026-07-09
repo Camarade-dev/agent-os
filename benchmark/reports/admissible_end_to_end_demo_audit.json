@@ -1,0 +1,155 @@
+{
+  "schema_version": "admissible_demo_audit_v0",
+  "generated_at": "2026-07-09",
+  "git_head": "75bc672",
+  "verdict": "NOT_DEMO_READY_P0_STATE_GAPS",
+  "claim_boundary": "Offline audit of the Admissible supervised-loop demo path; observations come from static code review plus an in-process driver run over committed fixtures. No providers called, nothing executed, no product code changed.",
+  "diagnostics": {
+    "pytest_admissible": {"command": "python -m pytest tests/ -k admissible -q", "passed": 647, "failed": 0, "deselected": 1258, "subtests_passed": 154},
+    "extraction_lab": {"fixtures": 6, "passed": 6, "failed": 0},
+    "demo_driver": "blank-session canonical scenario executed in a temp session dir + temp workspace; see markdown report section 3"
+  },
+  "gaps": [
+    {
+      "gap_id": "G1",
+      "severity": "P0",
+      "kind": "conceptual_missing_behavior",
+      "title": "Plan-gate approval never closes the gate; no resolved-gates store",
+      "affected": ["admissible/control_surface.py:decide", "admissible/run_loop.py:_open_gates_summary", "admissible/control_surface.py:ControlSession"],
+      "observed": "Approving a plan_gate_resolution item sets lifecycle_status=approval_supplied_pending_reevaluation permanently; plan_audit.required_gates is re-listed verbatim in every subsequent instruction packet and in needs_attention.unresolved_plan_gates.",
+      "expected": "A decision-only gate approved by a human becomes closed/resolved with the scope recorded; resolved gates are stored append-only and excluded from unresolved listings while the original plan audit stays immutable.",
+      "suggested_tests": ["test_approving_plan_gate_resolves_it", "test_next_packet_excludes_human_resolved_gates"],
+      "suggested_slice": "slice_1_decision_application"
+    },
+    {
+      "gap_id": "G2",
+      "severity": "P0",
+      "kind": "conceptual_missing_behavior_and_ui_clarity",
+      "title": "Needs-attention buckets and count filter by decision label only; resolved/refused items never leave",
+      "affected": ["admissible/control_surface.py:_needs_attention", "admissible/control_surface.py:_mission_summary", "admissible/harness/control_surface.html:renderNeedsAttention"],
+      "observed": "Approved and refused (closed) items remain in approval_needed/evidence_needed; needs_attention_count never decreases; lifecycle_status is present in the row data but not rendered in the buckets.",
+      "expected": "Buckets exclude items whose lifecycle is closed/approved/supplied; the count derives from the buckets; lifecycle badge visible per row.",
+      "suggested_tests": ["test_refused_item_leaves_attention_buckets", "test_needs_attention_count_decreases_after_decisions"],
+      "suggested_slice": "slice_1_decision_application"
+    },
+    {
+      "gap_id": "G3",
+      "severity": "P0",
+      "kind": "conceptual_missing_behavior",
+      "title": "Approved side-effecting action never becomes admitted_not_executed and can never be attested",
+      "affected": ["admissible/control_surface.py:decide", "admissible/control_surface.py:available_human_actions", "admissible/admitted_execution.py"],
+      "observed": "Approve on a REQUIRE_HUMAN_APPROVAL action leaves execution_status=proposed_only; admitted_not_executed is never produced by any Control Surface transition (Mission Summary tile is permanently 0); attest_executed is only offered on ALLOW items.",
+      "expected": "A scoped human approval yields admitted-but-not-executed derived state, opening the admitted-execution attestation path later, without mutating the original decision.",
+      "suggested_tests": ["test_approved_side_effect_becomes_admitted_not_executed"],
+      "suggested_slice": "slice_1_decision_application"
+    },
+    {
+      "gap_id": "G4",
+      "severity": "P0",
+      "kind": "implementation_bug",
+      "title": "Evidence re-evaluation forgets previously supplied evidence",
+      "affected": ["admissible/control_surface.py:provide_evidence", "admissible/run_loop.py:reevaluate_envelope_with_evidence"],
+      "observed": "Each provide_evidence call re-evaluates the ORIGINAL envelope plus only the latest evidence item: supplying license_compatibility after package_trust_review makes package_trust_review reappear in missing_evidence; after all three evidences the decision is unchanged and missing_evidence still lists two items.",
+      "expected": "Re-evaluation folds in ALL evidence records supplied for the action; missing_evidence shrinks monotonically; original decision stays immutable via superseding decisions.",
+      "suggested_tests": ["test_evidence_accumulates_across_supplies"],
+      "suggested_slice": "slice_3_evidence_accumulation"
+    },
+    {
+      "gap_id": "G5",
+      "severity": "P0",
+      "kind": "bridge_hygiene",
+      "title": "Stale/duplicate response ingestion is warn-only and write-instruction never archives the old response",
+      "affected": ["admissible/runner/cursor_bridge.py:ingest_response_file_with_controller", "admissible/runner/cursor_bridge.py:write_next_instruction_with_controller"],
+      "observed": "agent-response.md survives a new instruction write; re-ingesting the byte-identical file succeeds with a warning and creates duplicate queue items with fresh action_ids (observed queue 1 -> 2).",
+      "expected": "write_instruction archives the previous response (e.g. agent-response.turn<N>.md); ingest refuses a byte-identical already-ingested response by default with an explicit override. Framed as ingestion hygiene, not an admission gate.",
+      "suggested_tests": ["test_write_instruction_archives_previous_response", "test_reingest_identical_response_is_refused_by_default"],
+      "suggested_slice": "slice_4_bridge_hygiene"
+    },
+    {
+      "gap_id": "G6",
+      "severity": "P1",
+      "kind": "implementation_gap",
+      "title": "Closes gates: parsed but dropped; candidates carry no gate ids",
+      "affected": ["admissible/long_run_envelope_builder.py:656"],
+      "observed": "_extract_plan_gate_blocks captures closes_gates/verdict_class/side_effects_if_approved, but segment construction keeps only block_text and a label; the candidate dict has no plan-gate metadata.",
+      "expected": "Candidate carries a plan_gate sub-dict (gate_id, closes_gates, verdict_class, side_effects_if_approved) so gate closure can target the exact plan-audit gate ids.",
+      "suggested_tests": ["test_candidate_carries_plan_gate_closes_gates"],
+      "suggested_slice": "slice_5_gate_id_plumbing"
+    },
+    {
+      "gap_id": "G7",
+      "severity": "P1",
+      "kind": "conceptual_missing_behavior",
+      "title": "REQUEST_MORE_EVIDENCE lane cannot converge even with full evidence",
+      "affected": ["admissible/evaluator/rules_only.py:_request_more_evidence_signals", "admissible/control_surface.py:available_human_actions"],
+      "observed": "With missing=[] and all evidence folded in, install_dependency still yields REQUEST_MORE_EVIDENCE via reversibility=unknown and business_authority=unknown signals that human evidence records cannot address; the only human actions offered are request_evidence and refuse.",
+      "expected": "A demo-scriptable closure path: either evidence types that satisfy those signals, or an explicit superseding human decision path that never mutates or weakens the original decision.",
+      "suggested_tests": ["test_full_evidence_supply_reaches_a_terminal_state"],
+      "suggested_slice": "slice_3_evidence_accumulation"
+    },
+    {
+      "gap_id": "G8",
+      "severity": "P1",
+      "kind": "behavior_divergence",
+      "title": "HTTP server starts fresh and silently clobbers the persisted session; CLI resumes it",
+      "affected": ["admissible/control_surface.py:ControlSurfaceController.__init__", "admissible/runner/cursor_bridge.py:build_controller"],
+      "observed": "A live persisted session exists (.admissible/control_surface_sessions/session.json, 32 queue items); the server ignores it and overwrites on first mutation while the CLI bridge loads it, so the two entry points can see different sessions.",
+      "expected": "One resume policy shared by server and CLI; a server restart mid-demo must not lose the session.",
+      "suggested_tests": ["test_server_resumes_persisted_session"],
+      "suggested_slice": "slice_6_session_resume_parity"
+    },
+    {
+      "gap_id": "G9",
+      "severity": "P2",
+      "kind": "status_ambiguity",
+      "title": "decide(request_evidence) is record-only with no lifecycle transition",
+      "affected": ["admissible/control_surface.py:decide"],
+      "observed": "Lifecycle stays needs_human_input before and after; the recorded decision is invisible in the queue projection.",
+      "expected": "Either remove the decision type or give it a visible state (e.g. evidence_requested_from_agent) consumed by the next packet.",
+      "suggested_tests": ["test_request_evidence_decision_has_visible_effect"],
+      "suggested_slice": "slice_1_decision_application"
+    },
+    {
+      "gap_id": "G10",
+      "severity": "P2",
+      "kind": "conceptual_missing_behavior",
+      "title": "limited_scope_selected is a dead end; the chosen scope never reaches instruction packets",
+      "affected": ["admissible/control_surface.py:decide", "admissible/run_loop.py:_allowed_scope"],
+      "observed": "Scope string lives only on the HumanDecisionRecord.",
+      "expected": "Human-selected scope limits surface in the next packet's allowed scope and the item reaches a terminal or ready state.",
+      "suggested_tests": ["test_limit_scope_propagates_to_next_packet"],
+      "suggested_slice": "slice_2_packet_correctness"
+    },
+    {
+      "gap_id": "G11",
+      "severity": "P2",
+      "kind": "missing_linkage",
+      "title": "Agent evidence responses become new unlinked queue items",
+      "affected": ["admissible/long_run_envelope_builder.py", "admissible/control_surface.py:ingest_agent_response"],
+      "observed": "evidence_response_for_request_more_evidence.txt extracts as a fresh verification_plan/REQUEST_MORE_EVIDENCE item with no link to the gated action whose evidence it answers.",
+      "expected": "Optional linkage (human-confirmed) from agent-declared evidence to the earlier gated action; agent-declared evidence stays unverified_agent_output.",
+      "suggested_tests": ["test_agent_evidence_response_can_be_linked_by_human"],
+      "suggested_slice": "later"
+    },
+    {
+      "gap_id": "G12",
+      "severity": "P2",
+      "kind": "robustness",
+      "title": "Approve is repeatable on an already-approved item",
+      "affected": ["admissible/control_surface.py:available_human_actions"],
+      "observed": "A second approve appends another HumanDecisionRecord with no guard.",
+      "expected": "Idempotence guard or explicit re-approve affordance.",
+      "suggested_tests": ["test_double_approve_is_guarded"],
+      "suggested_slice": "slice_1_decision_application"
+    }
+  ],
+  "slices": [
+    {"id": "slice_1_decision_application", "order": 1, "summary": "Derived state for human decisions: append-only resolved_gates records; approve closes decision-only gates; side-effect approvals become admitted_not_executed; attention buckets/count respect lifecycle."},
+    {"id": "slice_2_packet_correctness", "order": 2, "summary": "Instruction packets subtract resolved gates, add a HUMAN-RESOLVED GATES section with scopes, and split queue_summary by lifecycle."},
+    {"id": "slice_3_evidence_accumulation", "order": 3, "summary": "Re-evaluate against original envelope + all evidence records; define a terminal outcome for the evidence lane."},
+    {"id": "slice_4_bridge_hygiene", "order": 4, "summary": "Archive agent-response.md on instruction write; refuse byte-identical re-ingest by default with explicit override."},
+    {"id": "slice_5_gate_id_plumbing", "order": 5, "summary": "Carry parsed plan_gate block metadata (closes_gates etc.) on candidates."},
+    {"id": "slice_6_session_resume_parity", "order": 6, "summary": "Server resumes the persisted session like the CLI does."}
+  ],
+  "recommended_next_slice": "slice_1_decision_application"
+}
