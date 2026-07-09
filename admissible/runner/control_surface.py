@@ -4,7 +4,7 @@ Starts a local, stdlib-only HTTP server that serves the Control Surface
 UI (`admissible/harness/control_surface.html`) and a small same-origin
 JSON API backed by `admissible.control_surface.ControlSurfaceController`.
 
-Also exposes three routes (`/api/session/run_loop/bridge/*`) backed by
+Also exposes four routes (`/api/session/run_loop/bridge/*`) backed by
 `admissible.runner.cursor_bridge` -- a local file bridge that writes/reads
 `.admissible/next-agent-instruction.md` and `.admissible/agent-response.md`
 in a target workspace so a human does not have to copy/paste the packet and
@@ -162,6 +162,8 @@ class _ControlSurfaceRequestHandler(BaseHTTPRequestHandler):
                 result = self.controller.generate_next_instruction_packet()
             elif parsed.path == "/api/session/run_loop/ingest_response":
                 result = self.controller.ingest_agent_response(body.get("raw_response", ""))
+            elif parsed.path == "/api/session/run_loop/bridge/check_workspace":
+                result = cursor_bridge.check_workspace(body.get("workspace_path", ""))
             elif parsed.path == "/api/session/run_loop/bridge/write_instruction":
                 result = cursor_bridge.write_next_instruction_with_controller(
                     self.controller, body.get("workspace_path", "")
@@ -185,7 +187,11 @@ class _ControlSurfaceRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(404, {"error": f"not found: {parsed.path}"})
                 return
         except ValueError as exc:
-            self._send_json(400, {"error": str(exc)})
+            payload: dict[str, Any] = {"error": str(exc)}
+            detail = getattr(exc, "detail", None)
+            if isinstance(detail, dict):
+                payload.update(detail)
+            self._send_json(400, payload)
             return
         except Exception as exc:  # local dev tool: surface the error, keep serving
             self._send_json(500, {"error": str(exc)})

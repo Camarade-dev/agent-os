@@ -146,13 +146,35 @@
   .human-decisions-for-action { margin-top: .4rem; font-size: .76rem; color: var(--cs-muted); }
   .human-decisions-for-action li { margin-bottom: .15rem; }
 
-  /* Run Loop */
-  #run-loop-panel .turn-line { font-size: .85rem; margin: 0 0 .5rem; }
-  #run-loop-panel .run-loop-actions { display: flex; flex-wrap: wrap; gap: .5rem; margin-bottom: .5rem; }
-  #run-loop-panel h3 { font-size: .78rem; text-transform: uppercase; letter-spacing: .03em; color: var(--cs-muted); margin: .6rem 0 .3rem; }
+  /* Cursor supervised file bridge (the single canonical workflow) */
+  #cursor-bridge-panel .turn-line { font-size: .85rem; margin: 0 0 .5rem; }
+  #cursor-bridge-panel .run-loop-actions { display: flex; flex-wrap: wrap; gap: .5rem; margin-bottom: .5rem; }
+  #cursor-bridge-panel h3 { font-size: .8rem; margin: 0 0 .3rem; color: var(--cs-text); }
+  #cursor-bridge-panel h4 { font-size: .74rem; text-transform: uppercase; letter-spacing: .03em; color: var(--cs-muted); margin: .6rem 0 .3rem; }
+  .bridge-step { padding: .6rem 0; border-bottom: 1px dashed var(--cs-border-strong); }
+  .bridge-step:last-of-type { border-bottom: none; }
+  .bridge-step-status { font-size: .8rem; margin-top: .4rem; }
+  .bridge-error {
+    color: var(--cs-attn-text); background: var(--cs-attn-bg); border: 1px solid var(--cs-attn-border);
+    border-radius: 6px; padding: .45rem .6rem; font-size: .8rem; margin: 0 0 .3rem;
+  }
+  .bridge-warnings {
+    list-style: none; margin: .4rem 0; padding: 0; display: flex; flex-direction: column; gap: .25rem;
+  }
+  .bridge-warnings li {
+    color: var(--cs-warning-text); background: var(--cs-warning-bg); border: 1px solid var(--cs-warning-border);
+    border-radius: 6px; padding: .35rem .55rem; font-size: .78rem;
+  }
+  .bridge-preview {
+    max-height: 8rem; overflow: auto; background: var(--cs-input-bg); border: 1px solid var(--cs-border-strong);
+    border-radius: 6px; padding: .4rem .55rem; font-size: .72rem; white-space: pre-wrap; word-break: break-word;
+  }
   #instruction-packet-text { width: 100%; min-height: 14rem; font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; font-size: .74rem; }
   #agent-response-input { min-height: 6rem; }
   #last-ingestion-summary { font-size: .8rem; color: var(--cs-muted); margin-top: .4rem; }
+  #advanced-manual-fallback-details { margin-top: .7rem; padding-top: .6rem; border-top: 1px solid var(--cs-border-strong); }
+  #advanced-manual-fallback-details summary { font-weight: 600; color: var(--cs-muted); }
+  #advanced-manual-fallback-details h4 { font-size: .74rem; text-transform: uppercase; letter-spacing: .03em; color: var(--cs-muted); margin: .6rem 0 .3rem; }
 
   /* Needs Attention categories */
   .attn-category { margin-bottom: .6rem; }
@@ -220,45 +242,79 @@
 
 <main id="app-main">
 
-  <section class="panel" id="run-loop-panel">
-    <h2>Run Loop</h2>
-    <p class="turn-line">Turn: <strong id="run-loop-turn">0</strong></p>
+  <section class="panel" id="cursor-bridge-panel">
+    <h2>Cursor supervised file bridge</h2>
+    <p class="turn-line">Turn: <strong id="bridge-turn">0</strong></p>
     <p class="hint" style="font-size:.78rem;color:var(--cs-muted);margin:0 0 .5rem;">
-      Generate a copyable instruction packet for Cursor/a frontier agent, paste its response back in, and
-      Admissible will extract and evaluate action candidates -- it never calls or executes anything itself.
-    </p>
-    <div class="run-loop-actions">
-      <button type="button" id="btn-generate-instruction">Generate next agent instruction</button>
-    </div>
-    <div id="instruction-packet-wrapper" style="display:none;">
-      <h3>Next instruction packet (copy into Cursor)</h3>
-      <textarea id="instruction-packet-text" readonly></textarea>
-      <div class="run-loop-actions">
-        <button type="button" id="btn-copy-packet" class="secondary">Copy to clipboard</button>
-      </div>
-    </div>
-    <h3>Paste agent response</h3>
-    <textarea id="agent-response-input" placeholder="Paste Cursor / frontier-agent response here..."></textarea>
-    <div class="run-loop-actions">
-      <button type="button" id="btn-ingest-response">Ingest response</button>
-    </div>
-    <div id="last-ingestion-summary"><p class="no-action-note">No agent response ingested yet.</p></div>
-
-    <h3>Cursor file bridge (optional)</h3>
-    <p class="hint" style="font-size:.78rem;color:var(--cs-muted);margin:0 0 .5rem;">
-      v0 file/clipboard bridge only -- writes/reads local files in the workspace below; never executes a
-      project command, a command proposed by Cursor, or a call to any model provider. See
+      This is the canonical way to run a turn with Cursor: Admissible writes an instruction file, you point
+      Cursor at it, Cursor writes its reply to a response file, and Admissible ingests that file -- never
+      executing anything itself, never calling Cursor's or any provider's API. See
       docs/admissible-cursor-bridge.md.
     </p>
-    <label class="autonomy-label" for="bridge-workspace-path">Workspace path
-      <input type="text" id="bridge-workspace-path" placeholder="e.g. C:\path\to\your\project">
-    </label>
-    <div class="run-loop-actions">
-      <button type="button" id="btn-bridge-write-instruction" class="secondary">Write packet file</button>
-      <button type="button" id="btn-bridge-ingest-response" class="secondary">Ingest response file</button>
-      <button type="button" id="btn-bridge-open-workspace" class="secondary">Open workspace in Cursor</button>
+
+    <div class="bridge-step" id="bridge-step-workspace">
+      <h3>1. Workspace</h3>
+      <label class="autonomy-label" for="bridge-workspace-path">Workspace path
+        <input type="text" id="bridge-workspace-path" placeholder="e.g. C:\path\to\your\project">
+      </label>
+      <div id="bridge-workspace-status" class="bridge-step-status"><p class="no-action-note">Enter a workspace path to check it.</p></div>
     </div>
-    <div id="bridge-status"><p class="no-action-note">No bridge operation run yet this session.</p></div>
+
+    <div class="bridge-step" id="bridge-step-write">
+      <h3>2. Write instruction file</h3>
+      <div class="run-loop-actions">
+        <button type="button" id="btn-bridge-write-instruction">Write instruction file</button>
+      </div>
+      <div id="bridge-write-status" class="bridge-step-status"><p class="no-action-note">Not written yet this session.</p></div>
+    </div>
+
+    <div class="bridge-step" id="bridge-step-open">
+      <h3>3. Open Cursor</h3>
+      <p class="hint" style="font-size:.76rem;color:var(--cs-muted);margin:0 0 .4rem;">
+        Only opens Cursor on the workspace below -- runs no project command.
+      </p>
+      <div class="run-loop-actions">
+        <button type="button" id="btn-bridge-open-workspace" class="secondary">Open workspace in Cursor</button>
+      </div>
+      <div id="bridge-open-status" class="bridge-step-status"></div>
+    </div>
+
+    <div class="bridge-step" id="bridge-step-ingest">
+      <h3>4. Ingest Cursor response file</h3>
+      <p class="hint" style="font-size:.76rem;color:var(--cs-muted);margin:0 0 .4rem;">
+        Reads the response file and extracts/evaluates action candidates through the existing offline
+        run loop. Nothing was executed by Admissible.
+      </p>
+      <div class="run-loop-actions">
+        <button type="button" id="btn-bridge-ingest-response">Ingest Cursor response file</button>
+      </div>
+      <div id="bridge-ingest-status" class="bridge-step-status"><p class="no-action-note">Not ingested yet this session.</p></div>
+    </div>
+
+    <details id="advanced-manual-fallback-details">
+      <summary>Advanced manual paste fallback</summary>
+      <p class="hint" style="font-size:.76rem;color:var(--cs-muted);margin:.5rem 0;">
+        Debug-only path: generate the instruction packet as text, copy/paste it into Cursor yourself, and
+        paste its reply back in. Still goes through the same offline extraction/evaluation as the file
+        bridge above -- nothing here calls a provider or executes anything either.
+      </p>
+      <div class="run-loop-actions">
+        <button type="button" id="btn-generate-instruction" class="secondary">Generate next agent instruction</button>
+      </div>
+      <div id="instruction-packet-wrapper" style="display:none;">
+        <h4>Next instruction packet</h4>
+        <textarea id="instruction-packet-text" readonly></textarea>
+        <div class="run-loop-actions">
+          <button type="button" id="btn-copy-packet" class="secondary">Copy to clipboard</button>
+        </div>
+      </div>
+      <h4>Paste agent response</h4>
+      <textarea id="agent-response-input" placeholder="Paste Cursor / frontier-agent response here..."></textarea>
+      <div class="run-loop-actions">
+        <button type="button" id="btn-ingest-response" class="secondary">Ingest pasted response</button>
+      </div>
+      <div id="last-ingestion-summary"><p class="no-action-note">No agent response ingested yet.</p></div>
+    </details>
   </section>
 
   <section class="panel" id="mission-summary-panel">
@@ -408,7 +464,11 @@ function clearError() {
 async function apiGet(url) {
   const res = await fetch(url);
   const data = await res.json();
-  if (!res.ok) throw new Error(data.error || ("request failed: " + url));
+  if (!res.ok) {
+    const err = new Error(data.error || ("request failed: " + url));
+    err.data = data;
+    throw err;
+  }
   return data;
 }
 
@@ -419,7 +479,11 @@ async function apiPost(url, body) {
     body: JSON.stringify(body || {}),
   });
   const data = await res.json();
-  if (!res.ok) throw new Error(data.error || ("request failed: " + url));
+  if (!res.ok) {
+    const err = new Error(data.error || ("request failed: " + url));
+    err.data = data;
+    throw err;
+  }
   return data;
 }
 
@@ -875,9 +939,8 @@ function renderTranscript(state) {
     : '<p id="transcript-empty" class="no-action-note">No transcript yet.</p>';
 }
 
-function renderRunLoop(state) {
+function renderManualFallback(state) {
   const runLoop = state.run_loop || {};
-  document.getElementById("run-loop-turn").textContent = runLoop.current_turn || 0;
 
   const packets = runLoop.instruction_packets || [];
   const latestPacket = packets.length ? packets[packets.length - 1] : null;
@@ -903,31 +966,126 @@ function renderRunLoop(state) {
   }
 }
 
-let lastBridgeInfo = null;
+let lastBridgeWrite = null;
+let lastBridgeIngest = null;
+let lastBridgeOpen = null;
 
-function renderBridgeStatus(state) {
-  const el = document.getElementById("bridge-status");
+function renderCursorBridgeTurn(state) {
+  const el = document.getElementById("bridge-turn");
+  if (el) el.textContent = (state.run_loop || {}).current_turn || 0;
+}
+
+function renderBridgeWorkspaceStatus(result) {
+  const el = document.getElementById("bridge-workspace-status");
   if (!el) return;
-  if (state.bridge) lastBridgeInfo = state.bridge;
-  if (!lastBridgeInfo) {
-    el.innerHTML = '<p class="no-action-note">No bridge operation run yet this session.</p>';
+  if (!result || !result.workspace_path) {
+    el.innerHTML = '<p class="no-action-note">Enter a workspace path to check it.</p>';
     return;
   }
-  const b = lastBridgeInfo;
-  if (b.operation === "open_workspace") {
-    el.innerHTML = `<p>${escapeHtml(b.message)}</p>`;
-  } else if (b.operation === "write_instruction") {
-    el.innerHTML = `<p>Wrote turn ${escapeHtml(b.turn_number)} instruction packet to <code>${escapeHtml(b.instruction_path)}</code>. Have Cursor write its response to <code>${escapeHtml(b.response_path)}</code>.</p>`;
-  } else if (b.operation === "ingest_response") {
-    el.innerHTML = `<p>Ingested turn ${escapeHtml(b.turn_number)} response from <code>${escapeHtml(b.response_path)}</code>: ${escapeHtml(b.action_count)} action candidate(s) extracted (${fmtList(b.decisions)}). Nothing was executed.</p>`;
+  el.innerHTML = `
+    <dl class="kv-grid">
+      <dt>Workspace exists</dt><dd>${result.workspace_exists ? "true" : "false"}</dd>
+      <dt>Expected .admissible/ dir</dt><dd><code>${escapeHtml(result.bridge_dir_path)}</code></dd>
+      <dt>.admissible/ dir exists</dt><dd>${result.bridge_dir_exists ? "true" : "false"}</dd>
+    </dl>
+  `;
+}
+
+function _bridgeFileFactsHtml(b, pathLabel, pathValue) {
+  return `
+    <dl class="kv-grid">
+      <dt>${escapeHtml(pathLabel)}</dt><dd><code>${escapeHtml(pathValue)}</code></dd>
+      <dt>File exists</dt><dd>${b.exists ? "true" : "false"}</dd>
+      <dt>Bytes</dt><dd>${escapeHtml(b.bytes)}</dd>
+      <dt>SHA256</dt><dd class="mono" style="word-break:break-all;">${escapeHtml(b.sha256)}</dd>
+      <dt>Modified</dt><dd>${escapeHtml(b.modified_at)}</dd>
+      <dt>Turn</dt><dd>${escapeHtml(b.turn_number)}</dd>
+    </dl>
+  `;
+}
+
+function renderBridgeWriteStatus() {
+  const el = document.getElementById("bridge-write-status");
+  if (!el) return;
+  const b = lastBridgeWrite;
+  if (!b) {
+    el.innerHTML = '<p class="no-action-note">Not written yet this session.</p>';
+    return;
+  }
+  if (b.success === false) {
+    el.innerHTML = `<p class="bridge-error">Write failed: ${escapeHtml(b.error)}</p>`;
+    return;
+  }
+  const preview = (b.preview_lines || []).join("\n");
+  el.innerHTML =
+    _bridgeFileFactsHtml(b, "Path written", b.instruction_path) +
+    `<div class="bridge-preview">${escapeHtml(preview)}</div>` +
+    `<p class="lifecycle-note">${escapeHtml(b.next_instruction)}</p>`;
+}
+
+function renderBridgeOpenStatus() {
+  const el = document.getElementById("bridge-open-status");
+  if (!el) return;
+  const b = lastBridgeOpen;
+  if (!b) {
+    el.innerHTML = "";
+    return;
+  }
+  if (b.success === false) {
+    el.innerHTML = `<p class="bridge-error">${escapeHtml(b.error)}</p>`;
+    return;
+  }
+  el.innerHTML = `<p>${escapeHtml(b.message)}</p>`;
+}
+
+function renderBridgeIngestStatus() {
+  const el = document.getElementById("bridge-ingest-status");
+  if (!el) return;
+  const b = lastBridgeIngest;
+  if (!b) {
+    el.innerHTML = '<p class="no-action-note">Not ingested yet this session.</p>';
+    return;
+  }
+  if (b.success === false) {
+    const expected = b.expected_path
+      ? `<p>Expected path: <code>${escapeHtml(b.expected_path)}</code></p>`
+      : "";
+    el.innerHTML = `<p class="bridge-error">${escapeHtml(b.error)}</p>${expected}`;
+    return;
+  }
+  const warnings = (b.warnings || []).map((w) => `<li>${escapeHtml(w)}</li>`).join("");
+  el.innerHTML =
+    _bridgeFileFactsHtml(b, "Path read", b.response_path) +
+    `<dl class="kv-grid">
+      <dt>Candidates extracted</dt><dd>${escapeHtml(b.action_count)}</dd>
+      <dt>Added action ids</dt><dd>${fmtList(b.action_ids)}</dd>
+      <dt>Decisions</dt><dd>${fmtList(b.decisions)}</dd>
+    </dl>` +
+    (warnings ? `<ul class="bridge-warnings">${warnings}</ul>` : "") +
+    `<p class="lifecycle-note">${escapeHtml(b.note)}</p>`;
+}
+
+function renderBridgeFromState(state) {
+  if (!state.bridge) return;
+  const op = state.bridge.operation;
+  if (op === "write_instruction") {
+    lastBridgeWrite = state.bridge;
+    renderBridgeWriteStatus();
+  } else if (op === "ingest_response") {
+    lastBridgeIngest = state.bridge;
+    renderBridgeIngestStatus();
+  } else if (op === "open_workspace") {
+    lastBridgeOpen = state.bridge;
+    renderBridgeOpenStatus();
   }
 }
 
 function render(state) {
   lastState = state;
   renderAutonomySelect(state);
-  renderRunLoop(state);
-  renderBridgeStatus(state);
+  renderCursorBridgeTurn(state);
+  renderManualFallback(state);
+  renderBridgeFromState(state);
   renderMissionSummary(state);
   renderNeedsAttention(state);
   renderQueueTable(state);
@@ -998,34 +1156,79 @@ function bridgeWorkspacePath() {
   return document.getElementById("bridge-workspace-path").value.trim();
 }
 
-document.getElementById("btn-bridge-write-instruction").addEventListener("click", () => {
+let bridgeWorkspaceCheckTimer = null;
+
+async function checkBridgeWorkspace() {
+  const workspacePath = bridgeWorkspacePath();
+  if (!workspacePath) {
+    renderBridgeWorkspaceStatus(null);
+    return;
+  }
+  try {
+    const result = await apiPost("/api/session/run_loop/bridge/check_workspace", { workspace_path: workspacePath });
+    renderBridgeWorkspaceStatus(result);
+  } catch (err) {
+    const el = document.getElementById("bridge-workspace-status");
+    if (el) el.innerHTML = `<p class="bridge-error">Could not check workspace: ${escapeHtml(err.message)}</p>`;
+  }
+}
+
+document.getElementById("bridge-workspace-path").addEventListener("input", () => {
+  clearTimeout(bridgeWorkspaceCheckTimer);
+  bridgeWorkspaceCheckTimer = setTimeout(checkBridgeWorkspace, 400);
+});
+
+document.getElementById("bridge-workspace-path").addEventListener("blur", () => {
+  clearTimeout(bridgeWorkspaceCheckTimer);
+  checkBridgeWorkspace();
+});
+
+document.getElementById("btn-bridge-write-instruction").addEventListener("click", async () => {
   const workspacePath = bridgeWorkspacePath();
   if (!workspacePath) {
     showError("Enter a workspace path before writing the instruction file.");
     return;
   }
   clearError();
-  runAction(() => apiPost("/api/session/run_loop/bridge/write_instruction", { workspace_path: workspacePath }));
+  try {
+    const state = await apiPost("/api/session/run_loop/bridge/write_instruction", { workspace_path: workspacePath });
+    render(state);
+  } catch (err) {
+    lastBridgeWrite = { operation: "write_instruction", success: false, error: err.message, ...(err.data || {}) };
+    renderBridgeWriteStatus();
+  }
 });
 
-document.getElementById("btn-bridge-ingest-response").addEventListener("click", () => {
+document.getElementById("btn-bridge-ingest-response").addEventListener("click", async () => {
   const workspacePath = bridgeWorkspacePath();
   if (!workspacePath) {
     showError("Enter a workspace path before ingesting the response file.");
     return;
   }
   clearError();
-  runAction(() => apiPost("/api/session/run_loop/bridge/ingest_response", { workspace_path: workspacePath }));
+  try {
+    const state = await apiPost("/api/session/run_loop/bridge/ingest_response", { workspace_path: workspacePath });
+    render(state);
+  } catch (err) {
+    lastBridgeIngest = { operation: "ingest_response", success: false, error: err.message, ...(err.data || {}) };
+    renderBridgeIngestStatus();
+  }
 });
 
-document.getElementById("btn-bridge-open-workspace").addEventListener("click", () => {
+document.getElementById("btn-bridge-open-workspace").addEventListener("click", async () => {
   const workspacePath = bridgeWorkspacePath();
   if (!workspacePath) {
     showError("Enter a workspace path before opening it in Cursor.");
     return;
   }
   clearError();
-  runAction(() => apiPost("/api/session/run_loop/bridge/open_workspace", { workspace_path: workspacePath }));
+  try {
+    const state = await apiPost("/api/session/run_loop/bridge/open_workspace", { workspace_path: workspacePath });
+    render(state);
+  } catch (err) {
+    lastBridgeOpen = { operation: "open_workspace", success: false, error: err.message, ...(err.data || {}) };
+    renderBridgeOpenStatus();
+  }
 });
 
 document.getElementById("autonomy-select").addEventListener("change", (event) => {

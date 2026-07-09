@@ -150,8 +150,8 @@ a `REQUEST_MORE_EVIDENCE` item:
 ```
 admissible/run_loop.py                 packet generation, response ingestion, evidence re-evaluation (pure functions)
 admissible/control_surface.py          ControlSession.run_loop + controller methods (generate/ingest/provide_evidence)
-admissible/runner/control_surface.py   3 new POST routes
-admissible/harness/control_surface.html   Run Loop panel + evidence form + categorized Needs Attention
+admissible/runner/control_surface.py   3 new POST routes (plus 4 more for the Cursor file bridge, see below)
+admissible/harness/control_surface.html   Cursor supervised file bridge panel + evidence form + categorized Needs Attention
 ```
 
 ## JSON API additions
@@ -164,10 +164,15 @@ admissible/harness/control_surface.html   Run Loop panel + evidence form + categ
 
 ## UI additions
 
-- **Run Loop panel** (top of the page): current turn, "Generate next agent
-  instruction" button, a read-only packet preview with a copy-to-clipboard
-  button, a "Paste agent response" textarea, an "Ingest response" button,
-  and a last-ingestion summary.
+- **Cursor supervised file bridge panel** (top of the page; see
+  `docs/admissible-cursor-bridge.md`): the canonical, single visible way to
+  run a turn -- current turn, workspace path with a live exists/`.admissible/`
+  check, "Write instruction file", "Open workspace in Cursor", and "Ingest
+  Cursor response file", each with verifiable status (path, exists, bytes,
+  sha256, modified time, and more). Manual copy/paste (generate-packet
+  textarea, copy-to-clipboard, paste-response textarea, "Ingest pasted
+  response") is a collapsed "Advanced manual paste fallback" `<details>`
+  inside the same panel, not part of the default visible flow.
 - **Selected Action panel**: a dedicated evidence form (type, evidence text,
   optional file path/note, rationale) for `REQUEST_MORE_EVIDENCE` items; the
   generic decision form now only shows the scope field for approve/

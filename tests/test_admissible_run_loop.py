@@ -366,12 +366,33 @@ class TestRunLoopHtmlContent(unittest.TestCase):
     def setUp(self) -> None:
         self.raw = HTML_PATH.read_text(encoding="utf-8")
 
-    def test_run_loop_panel_present(self) -> None:
-        self.assertIn('id="run-loop-panel"', self.raw)
-        self.assertIn("Run Loop", self.raw)
+    def test_cursor_bridge_panel_present(self) -> None:
+        # The Supervised Run Loop's canonical UI is now the single "Cursor
+        # supervised file bridge" card -- there is no separate top-level
+        # "Run Loop" panel any more.
+        self.assertIn('id="cursor-bridge-panel"', self.raw)
+        self.assertIn("Cursor supervised file bridge", self.raw)
 
     def test_turn_number_present(self) -> None:
-        self.assertIn('id="run-loop-turn"', self.raw)
+        self.assertIn('id="bridge-turn"', self.raw)
+
+    def test_manual_paste_controls_are_inside_collapsed_advanced_fallback(self) -> None:
+        # Requirement: manual paste is a collapsed, non-default fallback --
+        # its controls must appear textually after the <details> that hides
+        # them, not before it (i.e. inside the collapsed section).
+        details_index = self.raw.index('id="advanced-manual-fallback-details"')
+        summary_index = self.raw.index("<summary>Advanced manual paste fallback</summary>")
+        self.assertGreater(summary_index, details_index)
+        for marker in (
+            'id="instruction-packet-text"',
+            'id="btn-copy-packet"',
+            'id="btn-generate-instruction"',
+            'id="agent-response-input"',
+            'id="btn-ingest-response"',
+        ):
+            self.assertGreater(self.raw.index(marker), summary_index, f"{marker} must be inside the advanced fallback")
+        details_close = self.raw.index("</details>", summary_index)
+        self.assertLess(self.raw.index('id="btn-ingest-response"'), details_close)
 
     def test_instruction_packet_preview_and_copy_present(self) -> None:
         self.assertIn('id="instruction-packet-text"', self.raw)
