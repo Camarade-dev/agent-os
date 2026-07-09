@@ -1447,6 +1447,370 @@ def build_run_timeline(
     )
 
 
+# -- evidence-grounded continuation (v0, additive projection) -----------------
+#
+# Slice ADMISSIBLE_RUN_022_EVIDENCE_GROUNDED_CONTINUATION. The run timeline
+# (above) reads a governed run in sequence but does not yet *drive* the next
+# turn. `build_continuation_instruction` composes the next bounded instruction
+# for Cursor grounded in what actually happened: which operations were proposed,
+# admitted, executed (with target paths + sha256 evidence), and which were
+# blocked/refused/not executed and therefore must not be treated as done. It is
+# a pure projection -- it re-decides nothing, executes nothing, calls no
+# provider, and adds no executor powers. It reuses `generate_instruction_packet`
+# unchanged as the base packet, so every non-execution boundary, must-not rule,
+# and structured-operations-only response format carries over verbatim; it then
+# wraps that with an evidence preamble and the strict bridge constraints. This
+# is supervised continuation, not autonomous task completion: with no completion
+# model yet, it always asks for the next smallest admissible step rather than
+# declaring the goal done.
+
+CONTINUATION_SCHEMA_VERSION = "admissible_continuation_instruction_v0"
+
+CONTINUATION_STATUS_NO_GOAL = "no_goal"
+CONTINUATION_STATUS_FIRST_TURN = "first_turn"
+CONTINUATION_STATUS_PENDING_LOCAL_EXECUTION = "pending_local_execution"
+CONTINUATION_STATUS_EVIDENCE_GROUNDED = "evidence_grounded_continuation"
+
+# Categories for operations that are NOT completed and must never be reported as
+# done in a continuation instruction.
+CONTINUATION_NOT_COMPLETED_REFUSED = "refused"
+CONTINUATION_NOT_COMPLETED_AWAITING_DECISION = "awaiting_human_decision"
+CONTINUATION_NOT_COMPLETED_ADMITTED_NOT_EXECUTED = "admitted_not_executed"
+CONTINUATION_NOT_COMPLETED_UNRESOLVED = "unresolved"
+
+_CONTINUATION_GATING_DECISIONS = frozenset(
+    {"REQUIRE_HUMAN_APPROVAL", "REQUEST_MORE_EVIDENCE", "ALLOW_WITH_LIMITS"}
+)
+
+# The strict bridge constraints every continuation instruction restates, so a
+# continuation is self-contained even outside the file-bridge footer. These
+# mirror the boundaries already carried by the base instruction packet and the
+# Cursor bridge's response-file convention (write only to agent-response.md).
+_CONTINUATION_BRIDGE_CONSTRAINTS: tuple[str, ...] = (
+    "Continue with the next smallest admissible step toward the original goal.",
+    "Propose only structured operations.",
+    "Do not write files directly.",
+    "Do not use shell, npm, network, or deploy commands.",
+    "Write only to .admissible/agent-response.md.",
+)
+
+_CONTINUATION_NO_COMPLETION_NOTE = (
+    "This governed run has no explicit completion signal yet. Do not treat the "
+    "overall goal as complete; propose only the next smallest admissible step."
+)
+
+
+@dataclass
+class ContinuationInstruction:
+    """The next bounded, evidence-grounded continuation instruction (v0).
+
+    Display/handoff-only: composed from already-computed run state. `available`
+    is False (with a `reason`) when a continuation should not be issued yet --
+    no goal, or admitted local operations still pending execution. Never
+    executes anything and never re-decides an admission.
+    """
+
+    schema_version: str
+    available: bool
+    status: str
+    reason: str
+    turn_number: int
+    goal: str | None
+    instruction_text: str | None
+    executed_operations: list[dict[str, Any]]
+    not_completed_operations: list[dict[str, Any]]
+    pending_execution_operations: list[dict[str, Any]]
+    executed_count: int
+    evidence_count: int
+    not_completed_count: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ContinuationInstruction":
+        return _from_dict(cls, data)
+
+
+def _continuation_executed_operations(
+    run_timeline: "RunTimeline", run_loop: "RunLoopState"
+) -> list[dict[str, Any]]:
+    """Executed operations with grounded evidence (target paths + sha256)."""
+    evidence_by_action: dict[str, list["EvidenceRecord"]] = {}
+    for record in run_loop.evidence_records:
+        evidence_by_action.setdefault(record.action_id, []).append(record)
+
+    executed: list[dict[str, Any]] = []
+    for turn in run_timeline.turns:
+        for op in turn.operations:
+            if not op.executed:
+                continue
+            records = evidence_by_action.get(op.action_id, [])
+            sha_list = [r.sha256 for r in records if r.sha256]
+            written_paths = [r.file_path_or_note for r in records if r.file_path_or_note]
+            executed.append(
+                {
+                    "action_id": op.action_id,
+                    "turn_number": op.turn_number,
+                    "operation_types": list(op.operation_types),
+                    "target_paths": list(op.target_paths),
+                    "written_paths": written_paths or list(op.target_paths),
+                    "sha256": sha_list,
+                    "execution_status": op.execution_status,
+                    "evidence_count": op.evidence_count,
+                }
+            )
+    return executed
+
+
+def _continuation_pending_execution_operations(
+    run_timeline: "RunTimeline",
+) -> list[dict[str, Any]]:
+    """Admitted local file operations that are ready but not yet executed."""
+    pending: list[dict[str, Any]] = []
+    for turn in run_timeline.turns:
+        for op in turn.operations:
+            if op.admitted and not op.executed and op.is_local_file_operation:
+                pending.append(
+                    {
+                        "action_id": op.action_id,
+                        "operation_types": list(op.operation_types),
+                        "target_paths": list(op.target_paths),
+                        "execution_status": op.execution_status,
+                    }
+                )
+    return pending
+
+
+def _continuation_not_completed_operations(
+    run_timeline: "RunTimeline", queue: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Operations that are NOT done and must not be treated as completed.
+
+    Refused/blocked, awaiting a human decision, or admitted-but-not-executed
+    (non-local-file) operations. Admitted local file operations that are ready
+    to execute are reported separately as pending execution, not here.
+    """
+    item_by_action = {item.get("action_id"): item for item in queue}
+    not_completed: list[dict[str, Any]] = []
+    for turn in run_timeline.turns:
+        for op in turn.operations:
+            if op.executed:
+                continue
+            if op.admitted and op.is_local_file_operation:
+                # Tracked separately as pending local execution.
+                continue
+            item = item_by_action.get(op.action_id, {})
+            if op.blocked:
+                category = CONTINUATION_NOT_COMPLETED_REFUSED
+                reason = "Refused by admission policy; must not be treated as done."
+            elif op.decision in _CONTINUATION_GATING_DECISIONS:
+                category = CONTINUATION_NOT_COMPLETED_AWAITING_DECISION
+                missing = [
+                    _note_text(m) for m in (item.get("missing_evidence") or []) if _note_text(m)
+                ]
+                if op.decision == "REQUEST_MORE_EVIDENCE" and missing:
+                    reason = "Awaiting evidence: " + ", ".join(missing)
+                elif op.decision == "REQUIRE_HUMAN_APPROVAL":
+                    reason = "Requires explicit human approval; not yet approved."
+                else:
+                    reason = "Admitted only with limits; awaiting a human scope decision."
+            elif op.admitted:
+                category = CONTINUATION_NOT_COMPLETED_ADMITTED_NOT_EXECUTED
+                reason = "Admitted but not executed; there is no executor in this loop."
+            else:
+                category = CONTINUATION_NOT_COMPLETED_UNRESOLVED
+                reason = "Proposed but neither admitted nor executed; not done."
+            not_completed.append(
+                {
+                    "action_id": op.action_id,
+                    "decision": op.decision,
+                    "lifecycle_status": op.lifecycle_status,
+                    "category": category,
+                    "reason": reason,
+                }
+            )
+    return not_completed
+
+
+def _render_continuation_text(
+    *,
+    turn_number: int,
+    goal: str,
+    run_timeline: "RunTimeline",
+    executed_ops: list[dict[str, Any]],
+    not_completed: list[dict[str, Any]],
+    base_packet_text: str,
+) -> str:
+    executed_lines: list[str] = []
+    for op in executed_ops:
+        paths = ", ".join(op["written_paths"]) or "(no path recorded)"
+        types = ", ".join(op["operation_types"]) or "(unspecified operation)"
+        shas = ", ".join(op["sha256"]) if op["sha256"] else "(no sha256 recorded)"
+        executed_lines.append(
+            f"{op['action_id']} [{types}] -> {paths} "
+            f"(sha256: {shas}); status {op['execution_status']}; "
+            f"evidence x{op['evidence_count']}"
+        )
+
+    not_completed_lines = [
+        f"{op['action_id']} ({op['decision']} / {op['lifecycle_status']}): {op['reason']}"
+        for op in not_completed
+    ]
+
+    proposed_count = sum(len(turn.operations) for turn in run_timeline.turns)
+    run_state_lines = [
+        f"Turns so far: {run_timeline.turn_count}",
+        f"Actions proposed: {proposed_count}",
+        f"Actions admitted: {len(run_timeline.admitted_operation_ids)}",
+        f"Actions executed: {len(run_timeline.executed_operation_ids)}",
+        f"Evidence records: {run_timeline.evidence_count}",
+        f"Actions blocked/refused: {len(run_timeline.blocked_operation_ids)}",
+    ]
+
+    return (
+        f"=== Admissible Evidence-Grounded Continuation Instruction -- turn {turn_number} ===\n\n"
+        f"ORIGINAL GOAL\n{goal}\n\n"
+        f"GOVERNED RUN STATE SO FAR\n{_bullets(run_state_lines)}\n\n"
+        f"ACTIONS EXECUTED WITH EVIDENCE (grounded -- already done)\n"
+        f"{_bullets(executed_lines)}\n\n"
+        f"ACTIONS BLOCKED / REFUSED / NOT EXECUTED (must NOT be treated as done)\n"
+        f"{_bullets(not_completed_lines)}\n\n"
+        f"COMPLETION STATUS\n- {_CONTINUATION_NO_COMPLETION_NOTE}\n\n"
+        f"STANDING INSTRUCTION PACKET (boundaries unchanged from turn 1)\n{base_packet_text}\n\n"
+        f"CONTINUE (bridge constraints -- always apply)\n"
+        f"{_bullets(list(_CONTINUATION_BRIDGE_CONSTRAINTS))}"
+    )
+
+
+def build_continuation_instruction(
+    *,
+    turn_number: int,
+    autonomy_level: str,
+    goal_intake: dict[str, Any] | None,
+    plan_audit: dict[str, Any] | None,
+    queue: list[dict[str, Any]],
+    run_loop: "RunLoopState",
+    run_timeline: "RunTimeline",
+    resolved_plan_gates: list[dict[str, Any]] | None = None,
+) -> ContinuationInstruction:
+    """Compose the next bounded continuation instruction from run evidence.
+
+    Pure and offline. Behavior:
+
+    - No goal -> no continuation (``available=False``, with a clear reason).
+    - No agent response ingested yet -> preserve first-turn behavior: return the
+      standard first instruction packet text unchanged.
+    - Admitted local file operations still pending execution -> do not continue;
+      report that execution (or refusal) is pending first.
+    - Otherwise -> an evidence-grounded continuation packet listing executed
+      operations (paths + sha256), blocked/refused/not-completed operations, and
+      the strict bridge constraints, reusing ``generate_instruction_packet`` so
+      every non-execution boundary and structured-operations-only rule carries
+      over verbatim. Never claims the overall goal is complete (there is no
+      completion model yet); always asks for the next smallest admissible step.
+    """
+    empty_grounding: dict[str, Any] = {
+        "executed_operations": [],
+        "not_completed_operations": [],
+        "pending_execution_operations": [],
+        "executed_count": 0,
+        "evidence_count": 0,
+        "not_completed_count": 0,
+    }
+
+    if not goal_intake:
+        return ContinuationInstruction(
+            schema_version=CONTINUATION_SCHEMA_VERSION,
+            available=False,
+            status=CONTINUATION_STATUS_NO_GOAL,
+            reason=(
+                "No goal has been submitted; a continuation cannot be grounded "
+                "without an original goal."
+            ),
+            turn_number=turn_number,
+            goal=None,
+            instruction_text=None,
+            **empty_grounding,
+        )
+
+    base_packet = generate_instruction_packet(
+        turn_number=turn_number,
+        autonomy_level=autonomy_level,
+        goal_intake=goal_intake,
+        plan_audit=plan_audit,
+        queue=queue,
+        resolved_plan_gates=resolved_plan_gates,
+    )
+    goal = run_timeline.goal or goal_intake.get("prompt") or goal_intake.get("deliverable")
+
+    if not run_loop.response_records:
+        return ContinuationInstruction(
+            schema_version=CONTINUATION_SCHEMA_VERSION,
+            available=True,
+            status=CONTINUATION_STATUS_FIRST_TURN,
+            reason=(
+                "No agent response has been ingested yet; use the standard "
+                "first-turn instruction packet."
+            ),
+            turn_number=turn_number,
+            goal=goal,
+            instruction_text=base_packet.packet_text,
+            **empty_grounding,
+        )
+
+    executed_ops = _continuation_executed_operations(run_timeline, run_loop)
+    not_completed = _continuation_not_completed_operations(run_timeline, queue)
+    pending_ops = _continuation_pending_execution_operations(run_timeline)
+    grounding: dict[str, Any] = {
+        "executed_operations": executed_ops,
+        "not_completed_operations": not_completed,
+        "pending_execution_operations": pending_ops,
+        "executed_count": len(run_timeline.executed_operation_ids),
+        "evidence_count": run_timeline.evidence_count,
+        "not_completed_count": len(not_completed),
+    }
+
+    if run_timeline.ready_to_execute_local_count > 0:
+        return ContinuationInstruction(
+            schema_version=CONTINUATION_SCHEMA_VERSION,
+            available=False,
+            status=CONTINUATION_STATUS_PENDING_LOCAL_EXECUTION,
+            reason=(
+                f"{run_timeline.ready_to_execute_local_count} admitted local file "
+                "operation(s) are ready but not executed yet. Execute or refuse "
+                "them before asking the agent to continue, so the next step is "
+                "grounded in real evidence rather than an assumed result."
+            ),
+            turn_number=turn_number,
+            goal=goal,
+            instruction_text=None,
+            **grounding,
+        )
+
+    instruction_text = _render_continuation_text(
+        turn_number=turn_number,
+        goal=goal,
+        run_timeline=run_timeline,
+        executed_ops=executed_ops,
+        not_completed=not_completed,
+        base_packet_text=base_packet.packet_text,
+    )
+    return ContinuationInstruction(
+        schema_version=CONTINUATION_SCHEMA_VERSION,
+        available=True,
+        status=CONTINUATION_STATUS_EVIDENCE_GROUNDED,
+        reason=(
+            "Latest turn produced executed evidence and/or blocked actions; "
+            "the continuation is grounded in that evidence."
+        ),
+        turn_number=turn_number,
+        goal=goal,
+        instruction_text=instruction_text,
+        **grounding,
+    )
+
+
 __all__ = [
     "AGENT_RESPONSE_ACTOR",
     "AGENT_RESPONSE_SOURCE_TRUST",
@@ -1468,6 +1832,15 @@ __all__ = [
     "LIFECYCLE_RESOLVED_GATE",
     "LIFECYCLE_STATUSES",
     "NON_EXECUTION_BOUNDARIES",
+    "CONTINUATION_SCHEMA_VERSION",
+    "CONTINUATION_STATUS_NO_GOAL",
+    "CONTINUATION_STATUS_FIRST_TURN",
+    "CONTINUATION_STATUS_PENDING_LOCAL_EXECUTION",
+    "CONTINUATION_STATUS_EVIDENCE_GROUNDED",
+    "CONTINUATION_NOT_COMPLETED_REFUSED",
+    "CONTINUATION_NOT_COMPLETED_AWAITING_DECISION",
+    "CONTINUATION_NOT_COMPLETED_ADMITTED_NOT_EXECUTED",
+    "CONTINUATION_NOT_COMPLETED_UNRESOLVED",
     "RUN_LOOP_SCHEMA_VERSION",
     "RUN_TIMELINE_SCHEMA_VERSION",
     "TIMELINE_STATUS_NEEDS_GOAL",
@@ -1480,6 +1853,7 @@ __all__ = [
     "TIMELINE_LOADED_TURN",
     "AgentInstructionPacket",
     "AgentResponseRecord",
+    "ContinuationInstruction",
     "DerivedLifecycleResolution",
     "EvidenceRecord",
     "ResolvedPlanGateRecord",
@@ -1499,6 +1873,7 @@ __all__ = [
     "non_evidence_blockers_from_decision",
     "remaining_missing_after_evidence",
     "build_candidates_from_agent_response",
+    "build_continuation_instruction",
     "build_run_timeline",
     "default_lifecycle_status",
     "generate_instruction_packet",

@@ -78,9 +78,9 @@ whether anything has executed.
 
 ## Surfacing
 
-- Backend: `admissible.control_surface._run_timeline` derives the per-action
-  bounded operation detail (straight from the candidate/envelope, so it
-  persists even after execution) and calls `build_run_timeline`.
+- Backend: `admissible.control_surface._run_timeline_object` derives the
+  per-action bounded operation detail (straight from the candidate/envelope, so
+  it persists even after execution) and calls `build_run_timeline`.
   `ControlSurfaceController.state_view()` exposes it as `run_timeline`.
 - UI: a **Run Timeline** panel (`#run-timeline-panel`, `renderRunTimeline`) in
   `admissible/harness/control_surface.html`, between Mission Summary and the
@@ -109,11 +109,19 @@ are represented; ingest still executes nothing; and evidence stays visible in
 the timeline across export/import. The existing execution-review, control
 surface, and run-loop suites continue to pass unchanged.
 
-## Remaining gaps before `ADMISSIBLE_RUN_022_EVIDENCE_GROUNDED_CONTINUATION`
+## Follow-up: `ADMISSIBLE_RUN_022_EVIDENCE_GROUNDED_CONTINUATION`
 
-- The timeline reflects turns; it does not yet *drive* continuation (e.g.
-  auto-composing the next instruction packet from executed evidence).
-- Evidence is counted and linked per action but not yet grounded back into a
-  next-turn proposal or an inter-turn "what changed" diff.
+The timeline reflected turns but did not yet *drive* continuation. Slice 022
+adds `build_continuation_instruction`, which composes the next bounded
+instruction packet grounded in the timeline's executed evidence and
+blocked/refused actions — see
+`docs/admissible-evidence-grounded-continuation.md`.
+
+Still open for later slices:
+
+- No completion model yet: continuation asks for the next smallest admissible
+  step and cannot recognize "the goal is done."
+- Evidence is grounded as a per-run aggregate, not yet an inter-turn "what
+  changed since last turn" diff.
 - Turn 0 grouping for statically loaded traces is intentionally coarse; a
   richer plan-step alignment is left for a later slice.

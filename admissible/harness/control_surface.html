@@ -191,7 +191,7 @@
     max-height: 8rem; overflow: auto; background: var(--cs-input-bg); border: 1px solid var(--cs-border-strong);
     border-radius: 6px; padding: .4rem .55rem; font-size: .72rem; white-space: pre-wrap; word-break: break-word;
   }
-  #instruction-packet-text { width: 100%; min-height: 14rem; font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; font-size: .74rem; }
+  #instruction-packet-text, #continuation-text { width: 100%; min-height: 14rem; font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; font-size: .74rem; }
   #agent-response-input { min-height: 6rem; }
   #last-ingestion-summary { font-size: .8rem; color: var(--cs-muted); margin-top: .4rem; }
   #advanced-manual-fallback-details { margin-top: .7rem; padding-top: .6rem; border-top: 1px solid var(--cs-border-strong); }
@@ -424,6 +424,23 @@
       it decides and executes nothing on its own.
     </p>
     <div id="run-timeline-body"><p class="no-action-note">No run yet. Submit a goal to begin the timeline.</p></div>
+  </section>
+
+  <section class="panel" id="continuation-panel">
+    <h2>Evidence-Grounded Continuation</h2>
+    <p class="hint" style="font-size:.76rem;color:var(--cs-muted);margin:0 0 .55rem;">
+      The next bounded instruction for Cursor, grounded in what actually executed (files written +
+      sha256) and what was blocked/refused. Supervised continuation, not autonomous completion &mdash; it
+      decides and executes nothing on its own, and never claims the goal is done without a completion signal.
+    </p>
+    <div id="continuation-body"><p class="no-action-note">No run yet. Submit a goal to begin.</p></div>
+    <div id="continuation-wrapper" style="display:none;">
+      <h4>Next continuation instruction</h4>
+      <textarea id="continuation-text" readonly></textarea>
+      <div class="run-loop-actions">
+        <button type="button" id="btn-copy-continuation" class="secondary">Copy continuation instruction</button>
+      </div>
+    </div>
   </section>
 
   <section class="panel" id="needs-attention-panel">
@@ -1005,6 +1022,57 @@ function renderRunTimeline(state) {
   body.querySelectorAll(".select-action-btn").forEach((btn) => {
     btn.addEventListener("click", () => selectAction(btn.getAttribute("data-action-id")));
   });
+}
+
+// Slice ADMISSIBLE_RUN_022: the evidence-grounded continuation. Display-only,
+// read from state.continuation_instruction (a pure projection). Shows whether a
+// continuation is available, why it is blocked (pending local execution), and
+// the generated instruction text for copy. First-turn behavior is unchanged.
+function renderContinuation(state) {
+  const body = document.getElementById("continuation-body");
+  const wrapper = document.getElementById("continuation-wrapper");
+  const textarea = document.getElementById("continuation-text");
+  if (!body) return;
+  const cont = state.continuation_instruction || {};
+  if (!cont.status) {
+    body.innerHTML = '<p class="no-action-note">No run yet. Submit a goal to begin.</p>';
+    if (wrapper) wrapper.style.display = "none";
+    if (textarea) textarea.value = "";
+    return;
+  }
+
+  const availLabel = cont.available ? "Available" : "Not available yet";
+  const notDone = cont.not_completed_operations || [];
+  const pending = cont.pending_execution_operations || [];
+  const parts = [];
+  parts.push(`<div class="stat-grid">
+    <div class="stat-tile ${cont.available ? "" : "attention"}"><span class="stat-label">Continuation</span><span class="stat-value" style="font-size:.82rem;">${escapeHtml(availLabel)}</span></div>
+    <div class="stat-tile"><span class="stat-label">Executed w/ evidence</span><span class="stat-value">${escapeHtml(cont.executed_count || 0)}</span></div>
+    <div class="stat-tile"><span class="stat-label">Evidence records</span><span class="stat-value">${escapeHtml(cont.evidence_count || 0)}</span></div>
+    <div class="stat-tile ${notDone.length ? "attention" : ""}"><span class="stat-label">Not completed</span><span class="stat-value">${escapeHtml(cont.not_completed_count || 0)}</span></div>
+  </div>`);
+  if (cont.reason) {
+    parts.push(`<p style="font-size:.8rem;margin:.45rem 0;">${escapeHtml(cont.reason)}</p>`);
+  }
+  if (!cont.available && pending.length) {
+    parts.push(`<p class="no-action-note" style="margin:.3rem 0;"><strong>Execute (or refuse) first:</strong> ` +
+      pending.map((op) => `${escapeHtml(op.action_id)} &rarr; ${escapeHtml((op.target_paths || []).join(", ") || "(no path)")}`).join("; ") + `</p>`);
+  }
+  if (notDone.length) {
+    parts.push(`<div style="font-size:.78rem;margin:.35rem 0;"><strong>Not completed (must not be treated as done):</strong>` +
+      `<ul style="margin:.25rem 0 0 1rem;">` +
+      notDone.map((op) => `<li>${escapeHtml(op.action_id)} <span style="color:var(--cs-muted);">(${escapeHtml(op.decision)})</span> &mdash; ${escapeHtml(op.reason)}</li>`).join("") +
+      `</ul></div>`);
+  }
+  body.innerHTML = parts.join("");
+
+  if (cont.instruction_text) {
+    if (wrapper) wrapper.style.display = "";
+    if (textarea) textarea.value = cont.instruction_text;
+  } else {
+    if (wrapper) wrapper.style.display = "none";
+    if (textarea) textarea.value = "";
+  }
 }
 
 function renderNeedsAttention(state) {
@@ -1700,6 +1768,7 @@ function render(state) {
   renderBridgeFromState(state);
   renderMissionSummary(state);
   renderRunTimeline(state);
+  renderContinuation(state);
   renderNeedsAttention(state);
   renderReadyToExecuteLocally(state);
   renderQueueTable(state);
@@ -1773,6 +1842,16 @@ document.getElementById("btn-copy-packet").addEventListener("click", async () =>
   } catch (err) {
     // Clipboard API may be unavailable (e.g. insecure context); the
     // textarea is already selected so the user can copy manually.
+  }
+});
+
+document.getElementById("btn-copy-continuation").addEventListener("click", async () => {
+  const textarea = document.getElementById("continuation-text");
+  textarea.select();
+  try {
+    await navigator.clipboard.writeText(textarea.value);
+  } catch (err) {
+    // Clipboard API may be unavailable; the textarea is selected for manual copy.
   }
 });
 
