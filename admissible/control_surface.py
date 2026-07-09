@@ -65,6 +65,8 @@ from admissible.run_loop import (
     LIFECYCLE_APPROVAL_SUPPLIED_PENDING_REEVALUATION,
     LIFECYCLE_CLOSED,
     LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION,
+    LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED,
+    LIFECYCLE_EVIDENCE_SATISFIED_PENDING_HUMAN_DECISION,
     LIFECYCLE_LIMITED_SCOPE_SELECTED,
     LIFECYCLE_NEEDS_HUMAN_INPUT,
     LIFECYCLE_NO_LONGER_NEEDS_ATTENTION,
@@ -81,6 +83,7 @@ from admissible.run_loop import (
     build_candidates_from_agent_response,
     default_lifecycle_status,
     generate_instruction_packet,
+    lifecycle_status_after_evidence_reevaluation,
     queue_item_needs_attention,
     reevaluate_envelope_with_evidence,
     resolved_plan_gate_ids,
@@ -1040,6 +1043,10 @@ class ControlSurfaceController:
                 record=record,
                 decision_type=decision_type,
             )
+        # DECISION_TYPE_REQUEST_EVIDENCE intentionally does not transition
+        # lifecycle: it records that the human asked for more evidence from
+        # the agent. Actual evidence supply and cumulative re-evaluation
+        # happen via provide_evidence() / POST .../evidence.
 
         item.human_decision_ids.append(record.record_id)
         self._session.human_decisions.append(record)
@@ -1199,10 +1206,17 @@ class ControlSurfaceController:
         )
         self._session.run_loop.evidence_records.append(record)
 
+        action_evidence_items = [
+            (r.evidence_type, r.evidence_text)
+            for r in self._session.run_loop.evidence_records
+            if r.action_id == action_id
+        ]
+
         new_decision = None
         if envelope is not None and envelope.envelope is not None:
             new_decision = reevaluate_envelope_with_evidence(
-                envelope.envelope, evidence_type=evidence_type, evidence_text=evidence_text
+                envelope.envelope,
+                evidence_items=action_evidence_items,
             )
 
         if new_decision is not None:
@@ -1223,7 +1237,7 @@ class ControlSurfaceController:
             item.required_approval = new_decision.get("required_approval")
             item.missing_evidence = list(new_decision.get("missing_evidence") or [])
             item.attestation_eligible = is_local_allow_without_missing_evidence(new_decision, envelope.candidate)
-            item.lifecycle_status = default_lifecycle_status(item.decision)
+            item.lifecycle_status = lifecycle_status_after_evidence_reevaluation(item.decision)
         else:
             item.lifecycle_status = LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION
 
@@ -1260,6 +1274,8 @@ __all__ = [
     "LIFECYCLE_APPROVAL_SUPPLIED_PENDING_REEVALUATION",
     "LIFECYCLE_CLOSED",
     "LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION",
+    "LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED",
+    "LIFECYCLE_EVIDENCE_SATISFIED_PENDING_HUMAN_DECISION",
     "LIFECYCLE_LIMITED_SCOPE_SELECTED",
     "LIFECYCLE_NEEDS_HUMAN_INPUT",
     "LIFECYCLE_READY_FOR_NEXT_AGENT_INSTRUCTION",

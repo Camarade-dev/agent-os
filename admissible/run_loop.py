@@ -55,6 +55,10 @@ EVIDENCE_ACTOR_HUMAN_OPERATOR = "human_operator"
 
 LIFECYCLE_NEEDS_HUMAN_INPUT = "needs_human_input"
 LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION = "evidence_supplied_pending_reevaluation"
+# Derived statuses produced when evidence is supplied and re-evaluated
+# (slice ADMISSIBLE_STATE_LIFECYCLE_002_EVIDENCE_ACCUMULATION_AND_REEVALUATION).
+LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED = "evidence_supplied_still_blocked"
+LIFECYCLE_EVIDENCE_SATISFIED_PENDING_HUMAN_DECISION = "evidence_satisfied_pending_human_decision"
 LIFECYCLE_APPROVAL_SUPPLIED_PENDING_REEVALUATION = "approval_supplied_pending_reevaluation"
 LIFECYCLE_LIMITED_SCOPE_SELECTED = "limited_scope_selected"
 LIFECYCLE_READY_FOR_NEXT_AGENT_INSTRUCTION = "ready_for_next_agent_instruction"
@@ -69,6 +73,8 @@ LIFECYCLE_STATUSES = frozenset(
     {
         LIFECYCLE_NEEDS_HUMAN_INPUT,
         LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION,
+        LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED,
+        LIFECYCLE_EVIDENCE_SATISFIED_PENDING_HUMAN_DECISION,
         LIFECYCLE_APPROVAL_SUPPLIED_PENDING_REEVALUATION,
         LIFECYCLE_LIMITED_SCOPE_SELECTED,
         LIFECYCLE_READY_FOR_NEXT_AGENT_INSTRUCTION,
@@ -103,6 +109,19 @@ _DEFAULT_LIFECYCLE_BY_DECISION: dict[str, str] = {
 def default_lifecycle_status(decision_label: str) -> str:
     """Return the default v0 lifecycle status for a rules-only decision label."""
     return _DEFAULT_LIFECYCLE_BY_DECISION.get(decision_label, LIFECYCLE_NEEDS_HUMAN_INPUT)
+
+
+def lifecycle_status_after_evidence_reevaluation(decision_label: str) -> str:
+    """Return the derived lifecycle status after cumulative evidence re-evaluation.
+
+    Never claims approval or execution; only reflects what the rules-only
+    evaluator returned after folding in all supplied evidence.
+    """
+    if decision_label == "REQUEST_MORE_EVIDENCE":
+        return LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED
+    if decision_label == "REQUIRE_HUMAN_APPROVAL":
+        return LIFECYCLE_EVIDENCE_SATISFIED_PENDING_HUMAN_DECISION
+    return default_lifecycle_status(decision_label)
 
 
 def queue_item_needs_attention(item: dict[str, Any]) -> bool:
@@ -511,6 +530,20 @@ def _evidence_needed(queue: list[dict[str, Any]]) -> list[str]:
                 "still treat as blocked until a human confirms."
             )
             continue
+        if status == LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED:
+            missing = item.get("missing_evidence") or []
+            if missing:
+                for entry in missing:
+                    line = f"{item.get('action_id')}: {entry}"
+                    if line not in items:
+                        items.append(line)
+            else:
+                items.append(
+                    f"{item.get('action_id')}: human-suppliable evidence fields are satisfied, "
+                    "but the action remains blocked on non-evidence gates (e.g. authority or "
+                    "policy); a human decision is still required."
+                )
+            continue
         if status != LIFECYCLE_NEEDS_HUMAN_INPUT:
             continue
         for missing in item.get("missing_evidence") or []:
@@ -659,11 +692,17 @@ def build_candidates_from_agent_response(
 def reevaluate_envelope_with_evidence(
     envelope: dict[str, Any] | None,
     *,
-    evidence_type: str,
-    evidence_text: str,
+    evidence_items: list[tuple[str, str]] | None = None,
+    evidence_type: str | None = None,
+    evidence_text: str | None = None,
 ) -> dict[str, Any] | None:
-    """Fold one supplied evidence item into a copy of `envelope` and re-run
-    the unmodified rules-only evaluator.
+    """Fold supplied evidence into a copy of `envelope` and re-run the
+    unmodified rules-only evaluator.
+
+    Evidence is cumulative: pass every ``(evidence_type, evidence_text)``
+    pair previously supplied for this action via ``evidence_items``. A
+    single latest item may still be passed via ``evidence_type`` /
+    ``evidence_text`` for backward compatibility.
 
     Returns the new decision dict, or None when no full schema envelope is
     available to reevaluate (e.g. actions loaded from a static trace file
@@ -674,19 +713,30 @@ def reevaluate_envelope_with_evidence(
     if not isinstance(envelope, dict):
         return None
 
+    items: list[tuple[str, str]] = list(evidence_items or [])
+    if evidence_type and evidence_text:
+        items.append((evidence_type, evidence_text))
+    if not items:
+        return None
+
     new_envelope = copy.deepcopy(envelope)
     evidence = new_envelope.setdefault("evidence", {})
     available = list(evidence.get("available") or [])
-    available.append(
-        {
-            "type": evidence_type,
-            "summary": evidence_text,
-            "confidence": "human_provided",
-        }
-    )
+    satisfied_types: set[str] = set()
+    for etype, etext in items:
+        available.append(
+            {
+                "type": etype,
+                "summary": etext,
+                "confidence": "human_provided",
+            }
+        )
+        satisfied_types.add(etype.lower())
     evidence["available"] = available
     evidence["missing"] = [
-        item for item in (evidence.get("missing") or []) if evidence_type.lower() not in _note_text(item).lower()
+        item
+        for item in (evidence.get("missing") or [])
+        if not any(st in _note_text(item).lower() for st in satisfied_types)
     ]
 
     decision = evaluate_envelope(new_envelope)
@@ -704,6 +754,8 @@ __all__ = [
     "LIFECYCLE_APPROVAL_SUPPLIED_PENDING_REEVALUATION",
     "LIFECYCLE_CLOSED",
     "LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION",
+    "LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED",
+    "LIFECYCLE_EVIDENCE_SATISFIED_PENDING_HUMAN_DECISION",
     "LIFECYCLE_LIMITED_SCOPE_SELECTED",
     "LIFECYCLE_NEEDS_HUMAN_INPUT",
     "LIFECYCLE_NO_LONGER_NEEDS_ATTENTION",
@@ -724,6 +776,7 @@ __all__ = [
     "build_candidates_from_agent_response",
     "default_lifecycle_status",
     "generate_instruction_packet",
+    "lifecycle_status_after_evidence_reevaluation",
     "operational_action_for_decision",
     "queue_item_needs_attention",
     "reevaluate_envelope_with_evidence",

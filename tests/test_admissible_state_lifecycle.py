@@ -1,13 +1,18 @@
-"""Tests for ADMISSIBLE_STATE_LIFECYCLE_001_HUMAN_DECISION_APPLICATION.
+"""Tests for Admissible state lifecycle slices.
 
-Verifies that human decisions append derived lifecycle state without mutating
-original admission decisions, and that Needs Attention / instruction packets
-consume that derived state.
+Slice 001 (ADMISSIBLE_STATE_LIFECYCLE_001_HUMAN_DECISION_APPLICATION):
+human decisions append derived lifecycle state without mutating original
+admission decisions.
+
+Slice 002 (ADMISSIBLE_STATE_LIFECYCLE_002_EVIDENCE_ACCUMULATION_AND_REEVALUATION):
+evidence provision is append-only and cumulative; re-evaluation never forgets
+earlier evidence items.
 """
 
 from __future__ import annotations
 
 import ast
+import copy
 import json
 import tempfile
 import unittest
@@ -17,8 +22,14 @@ from admissible.admitted_execution import EXECUTION_STATUS_ADMITTED_NOT_EXECUTED
 from admissible.control_surface import ControlSurfaceController
 from admissible.run_loop import (
     LIFECYCLE_ADMITTED_NOT_EXECUTED,
+    LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION,
+    LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED,
+    LIFECYCLE_EVIDENCE_SATISFIED_PENDING_HUMAN_DECISION,
+    LIFECYCLE_NEEDS_HUMAN_INPUT,
     LIFECYCLE_REFUSED_CLOSED,
     LIFECYCLE_RESOLVED_GATE,
+    lifecycle_status_after_evidence_reevaluation,
+    reevaluate_envelope_with_evidence,
 )
 from admissible.runner.extraction_lab import load_fixture
 
@@ -33,6 +44,11 @@ FIXTURES_DIR = (
 )
 PLAN_GATE_FIXTURE = FIXTURES_DIR / "cursor_plan_gate_resolution_request.txt"
 MULTI_ACTION_FIXTURE = FIXTURES_DIR / "multi_action_install_push_local_claim.txt"
+RAW_INSTALL_DEPENDENCY_RESPONSE = (
+    "User: Please add a helper dependency.\n\n"
+    "Proposed command:\n"
+    "    npm install left-pad\n"
+)
 SAMPLE_SLITHER_PROMPT = (
     "Build a small browser-based Slither-like game with a moving snake, "
     "collectible food, growth, collision handling, score display, restart "
@@ -261,6 +277,187 @@ class TestAdmissibleBoundary(unittest.TestCase):
                     if module and (module == "agent_os" or module.startswith("agent_os.")):
                         hits.append(f"{path}: from {module}")
         self.assertEqual(hits, [])
+
+
+def _session_with_install_dependency(controller: ControlSurfaceController) -> tuple[dict, str]:
+    controller.submit_goal(SAMPLE_SLITHER_PROMPT)
+    state = controller.ingest_agent_response(RAW_INSTALL_DEPENDENCY_RESPONSE)
+    item = state["queue"][0]
+    return state, item["action_id"]
+
+
+class TestEvidenceAccumulationLifecycle(unittest.TestCase):
+    """Slice 002: cumulative evidence re-evaluation and derived lifecycle."""
+
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.controller = _controller(self._tmpdir.name)
+
+    def tearDown(self) -> None:
+        self._tmpdir.cleanup()
+
+    def test_first_evidence_item_reduces_missing_evidence(self) -> None:
+        state, action_id = _session_with_install_dependency(self.controller)
+        original_missing = list(state["run_envelopes"][action_id]["decision"]["missing_evidence"])
+        self.assertIn("package_trust_review", original_missing)
+
+        updated = self.controller.provide_evidence(
+            action_id,
+            {"evidence_type": "package_trust_review", "evidence_text": "Package is from a trusted maintainer."},
+        )
+        item = next(i for i in updated["queue"] if i["action_id"] == action_id)
+        self.assertNotIn("package_trust_review", item["missing_evidence"])
+        self.assertEqual(item["lifecycle_status"], LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED)
+
+    def test_second_evidence_preserves_first_during_reevaluation(self) -> None:
+        state, action_id = _session_with_install_dependency(self.controller)
+        self.controller.provide_evidence(
+            action_id,
+            {"evidence_type": "package_trust_review", "evidence_text": "Trusted package."},
+        )
+        updated = self.controller.provide_evidence(
+            action_id,
+            {"evidence_type": "license_compatibility", "evidence_text": "MIT license is compatible."},
+        )
+        item = next(i for i in updated["queue"] if i["action_id"] == action_id)
+        self.assertNotIn("package_trust_review", item["missing_evidence"])
+        self.assertNotIn("license_compatibility", item["missing_evidence"])
+        self.assertIn("dependency_lockfile_review", item["missing_evidence"])
+
+    def test_missing_evidence_does_not_regress_across_supplies(self) -> None:
+        state, action_id = _session_with_install_dependency(self.controller)
+        supplies = [
+            ("package_trust_review", "Trusted."),
+            ("license_compatibility", "MIT ok."),
+            ("dependency_lockfile_review", "Lockfile reviewed."),
+        ]
+        satisfied: set[str] = set()
+        for etype, etext in supplies:
+            updated = self.controller.provide_evidence(
+                action_id, {"evidence_type": etype, "evidence_text": etext}
+            )
+            item = next(i for i in updated["queue"] if i["action_id"] == action_id)
+            current = set(item["missing_evidence"])
+            for prev in satisfied:
+                self.assertNotIn(prev, current, f"{prev} regressed after supplying {etype}")
+            satisfied.add(etype)
+
+    def test_evidence_records_are_append_only_and_export_round_trips(self) -> None:
+        state, action_id = _session_with_install_dependency(self.controller)
+        self.controller.provide_evidence(
+            action_id, {"evidence_type": "package_trust_review", "evidence_text": "A"}
+        )
+        self.controller.provide_evidence(
+            action_id, {"evidence_type": "license_compatibility", "evidence_text": "B"}
+        )
+        exported = self.controller.session_dict()
+        records = [r for r in exported["run_loop"]["evidence_records"] if r["action_id"] == action_id]
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["evidence_type"], "package_trust_review")
+        self.assertEqual(records[1]["evidence_type"], "license_compatibility")
+
+        other = _controller(self._tmpdir.name + "_reload")
+        imported = other.import_session(exported)
+        reloaded = [r for r in imported["run_loop"]["evidence_records"] if r["action_id"] == action_id]
+        self.assertEqual(len(reloaded), 2)
+        json.dumps(imported)
+
+    def test_original_decision_remains_immutable_after_evidence(self) -> None:
+        state, action_id = _session_with_install_dependency(self.controller)
+        original_decision = copy.deepcopy(state["run_envelopes"][action_id]["decision"])
+        self.controller.provide_evidence(
+            action_id, {"evidence_type": "package_trust_review", "evidence_text": "ok"}
+        )
+        self.controller.provide_evidence(
+            action_id, {"evidence_type": "license_compatibility", "evidence_text": "ok"}
+        )
+        final = self.controller.state_view()
+        self.assertEqual(final["run_envelopes"][action_id]["decision"], original_decision)
+
+    def test_original_envelope_schema_remains_auditable(self) -> None:
+        state, action_id = _session_with_install_dependency(self.controller)
+        original_envelope = copy.deepcopy(state["run_envelopes"][action_id]["envelope"])
+        self.assertIsNotNone(original_envelope)
+        self.controller.provide_evidence(
+            action_id, {"evidence_type": "package_trust_review", "evidence_text": "ok"}
+        )
+        final = self.controller.state_view()
+        self.assertEqual(final["run_envelopes"][action_id]["envelope"], original_envelope)
+        self.assertEqual(
+            final["run_envelopes"][action_id]["envelope"]["evidence"]["missing"],
+            original_envelope["evidence"]["missing"],
+        )
+
+    def test_request_more_evidence_stays_in_needs_attention_until_resolved(self) -> None:
+        state, action_id = _session_with_install_dependency(self.controller)
+        before = state["mission_summary"]["needs_attention_count"]
+        self.assertGreater(before, 0)
+
+        updated = self.controller.provide_evidence(
+            action_id, {"evidence_type": "package_trust_review", "evidence_text": "partial"}
+        )
+        item = next(i for i in updated["queue"] if i["action_id"] == action_id)
+        self.assertEqual(item["decision"], "REQUEST_MORE_EVIDENCE")
+        self.assertEqual(item["lifecycle_status"], LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED)
+        self.assertEqual(updated["mission_summary"]["needs_attention_count"], before)
+
+    def test_insufficient_evidence_keeps_blocked_derived_status(self) -> None:
+        _, action_id = _session_with_install_dependency(self.controller)
+        updated = self.controller.provide_evidence(
+            action_id, {"evidence_type": "package_trust_review", "evidence_text": "only one of three"}
+        )
+        item = next(i for i in updated["queue"] if i["action_id"] == action_id)
+        self.assertEqual(item["decision"], "REQUEST_MORE_EVIDENCE")
+        self.assertEqual(item["lifecycle_status"], LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED)
+        self.assertTrue(item["missing_evidence"])
+
+    def test_all_satisfiable_evidence_clears_missing_without_auto_execution(self) -> None:
+        _, action_id = _session_with_install_dependency(self.controller)
+        for etype, etext in [
+            ("package_trust_review", "trusted"),
+            ("license_compatibility", "MIT"),
+            ("dependency_lockfile_review", "lock ok"),
+        ]:
+            self.controller.provide_evidence(action_id, {"evidence_type": etype, "evidence_text": etext})
+
+        final = self.controller.state_view()
+        item = next(i for i in final["queue"] if i["action_id"] == action_id)
+        self.assertEqual(item["missing_evidence"], [])
+        self.assertEqual(item["lifecycle_status"], LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED)
+        self.assertEqual(item["decision"], "REQUEST_MORE_EVIDENCE")
+        self.assertNotEqual(item.get("execution_status"), EXECUTION_STATUS_ADMITTED_NOT_EXECUTED)
+
+    def test_request_evidence_human_decision_does_not_transition_lifecycle(self) -> None:
+        state, action_id = _session_with_install_dependency(self.controller)
+        updated = self.controller.decide(action_id, {"decision_type": "request_evidence", "rationale": "need more"})
+        item = next(i for i in updated["queue"] if i["action_id"] == action_id)
+        self.assertEqual(item["lifecycle_status"], LIFECYCLE_NEEDS_HUMAN_INPUT)
+        self.assertEqual(len(updated["human_decisions"]), 1)
+
+    def test_pure_reevaluation_accumulates_all_items(self) -> None:
+        state, action_id = _session_with_install_dependency(self.controller)
+        envelope = state["run_envelopes"][action_id]["envelope"]
+        decision = reevaluate_envelope_with_evidence(
+            envelope,
+            evidence_items=[
+                ("package_trust_review", "trusted"),
+                ("license_compatibility", "MIT"),
+            ],
+        )
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertNotIn("package_trust_review", decision["missing_evidence"])
+        self.assertNotIn("license_compatibility", decision["missing_evidence"])
+
+    def test_lifecycle_mapping_after_evidence_reevaluation(self) -> None:
+        self.assertEqual(
+            lifecycle_status_after_evidence_reevaluation("REQUEST_MORE_EVIDENCE"),
+            LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED,
+        )
+        self.assertEqual(
+            lifecycle_status_after_evidence_reevaluation("REQUIRE_HUMAN_APPROVAL"),
+            LIFECYCLE_EVIDENCE_SATISFIED_PENDING_HUMAN_DECISION,
+        )
 
 
 if __name__ == "__main__":
