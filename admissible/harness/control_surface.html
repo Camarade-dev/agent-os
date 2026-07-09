@@ -276,6 +276,13 @@
   .continuation-not-auto { font-size: .74rem; color: var(--cs-muted); margin: .35rem 0 0; font-style: italic; }
 
   #bounded-verification-panel { border-color: #5b21b6; }
+  section.panel.high-autonomy-panel { border-color: #047857; box-shadow: 0 0 0 1px #047857 inset; }
+  .ha-status-grid { display: grid; gap: .45rem; margin: .5rem 0; }
+  .ha-status-row { display: flex; gap: .5rem; align-items: baseline; font-size: .82rem; }
+  .ha-status-row dt { min-width: 7.5rem; color: var(--cs-muted); font-weight: 600; }
+  .ha-status-row dd { margin: 0; flex: 1; }
+  .ha-primary-actions { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .65rem; }
+  .ha-evidence-line { font-size: .78rem; color: var(--cs-muted); margin-top: .35rem; }
   .verification-result-summary { margin-top: .45rem; font-size: .78rem; }
   .verification-failures { margin: .35rem 0 0 1rem; padding: 0; color: #fca5a5; font-size: .76rem; }
   .verification-actions { display: flex; flex-wrap: wrap; gap: .45rem; align-items: center; margin-top: .5rem; }
@@ -350,6 +357,21 @@
       <button type="submit">Send to Admissible</button>
     </form>
   </section>
+
+  <section class="panel high-autonomy-panel" id="high-autonomy-panel">
+    <h2>High-Autonomy Governed Run</h2>
+    <p class="narrative-hint">
+      Opt-in tick-driven loop: Admissible writes instructions, ingests responses, and auto-executes
+      admitted low-risk local writes under strict policy. Human approval is required only for
+      genuinely human-critical actions.
+    </p>
+    <div id="high-autonomy-body"><p class="no-action-note">Submit a goal, then start a high-autonomy run.</p></div>
+    <div class="ha-primary-actions" id="high-autonomy-actions"></div>
+    <p class="ha-evidence-line" id="high-autonomy-evidence-line"></p>
+  </section>
+
+  <details id="advanced-debug-details" class="advanced-drawer" open>
+    <summary>Advanced / Debug (manual bridge, queue, timeline)</summary>
 
   <details id="examples-drawer" class="advanced-drawer">
     <summary>Examples (optional demo sessions)</summary>
@@ -564,6 +586,8 @@
       <div id="decision-records-full-body"></div>
     </details>
   </section>
+
+  </details>
 
   <details id="mission-summary-details" class="advanced-drawer">
     <summary>Advanced: mission summary &amp; aggregate counts</summary>
@@ -1086,6 +1110,67 @@ function timelineTurnBlock(turn) {
       </div>
       ${opsHtml}
     </div>`;
+}
+
+function renderHighAutonomy(state) {
+  const body = document.getElementById("high-autonomy-body");
+  const actions = document.getElementById("high-autonomy-actions");
+  const evidenceLine = document.getElementById("high-autonomy-evidence-line");
+  if (!body || !actions) return;
+
+  const ha = state.high_autonomy_summary || {};
+  const goalReady = Boolean(state.goal_intake);
+
+  if (!goalReady) {
+    body.innerHTML = '<p class="no-action-note">Submit a goal above to enable high-autonomy mode.</p>';
+    actions.innerHTML = "";
+    if (evidenceLine) evidenceLine.textContent = "";
+    return;
+  }
+
+  const blocking = ha.problem_summary || ha.human_required_reason || "";
+  body.innerHTML = `
+    <dl class="ha-status-grid">
+      <div class="ha-status-row"><dt>Doing now</dt><dd>${escapeHtml(ha.doing_now || "—")}</dd></div>
+      <div class="ha-status-row"><dt>Needed now</dt><dd>${escapeHtml(ha.needed_now || "—")}</dd></div>
+      <div class="ha-status-row"><dt>Blocking</dt><dd>${escapeHtml(blocking || "Nothing blocking.")}</dd></div>
+      <div class="ha-status-row"><dt>Last event</dt><dd>${escapeHtml(ha.last_event || "—")}</dd></div>
+      <div class="ha-status-row"><dt>Mode</dt><dd><span class="status-badge status-badge-pending">${escapeHtml(ha.mode || "off")}</span></dd></div>
+    </dl>`;
+
+  if (evidenceLine) {
+    evidenceLine.textContent =
+      `Evidence: ${ha.evidence_count ?? 0} write(s) · ` +
+      `Auto-executed: ${ha.auto_executed_action_count ?? 0} · ` +
+      `Blocked (not completed): ${ha.blocked_count ?? ha.blocked_action_count ?? 0} · ` +
+      `Verification: ${ha.verification_readiness || "not_run"}`;
+  }
+
+  const workspace = document.getElementById("bridge-workspace-path");
+  const workspacePath = workspace ? workspace.value.trim() : (state.bounded_executor_workspace || "");
+
+  const btn = (id, label, cls) =>
+    `<button type="button" id="${id}" class="${cls || ""}">${escapeHtml(label)}</button>`;
+
+  let primary = "";
+  const primaryAction = ha.primary_button || "start";
+  if (primaryAction === "start") {
+    primary = btn("btn-ha-start", "Start high-autonomy run");
+  } else if (primaryAction === "pause") {
+    primary = btn("btn-ha-pause", "Pause", "secondary") + btn("btn-ha-stop", "Stop", "secondary");
+  } else if (primaryAction === "resume") {
+    primary = btn("btn-ha-resume", "Resume") + btn("btn-ha-stop", "Stop", "secondary");
+  } else if (primaryAction === "approve_or_refuse") {
+    primary =
+      btn("btn-ha-approve", "Approve human-critical action") +
+      btn("btn-ha-refuse", "Refuse human-critical action", "secondary");
+  } else {
+    primary = btn("btn-ha-start", "Start high-autonomy run");
+  }
+
+  actions.innerHTML =
+    primary +
+    (ha.active ? btn("btn-ha-tick", "Step tick", "secondary") : "");
 }
 
 function renderGovernedRun(state) {
@@ -1993,6 +2078,7 @@ function render(state) {
   renderBridgeGating(state);
   renderManualFallback(state);
   renderBridgeFromState(state);
+  renderHighAutonomy(state);
   renderGovernedRun(state);
   renderRunTimeline(state);
   renderContinuation(state);
@@ -2301,6 +2387,49 @@ document.querySelectorAll("#queue-tabs .tab-btn").forEach((btn) => {
     document.querySelectorAll("#queue-tabs .tab-btn").forEach((b) => b.classList.toggle("active", b === btn));
     if (lastState) renderQueueTable(lastState);
   });
+});
+
+document.getElementById("high-autonomy-actions").addEventListener("click", async (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLElement)) return;
+  const workspaceInput = document.getElementById("bridge-workspace-path");
+  const workspacePath = workspaceInput ? workspaceInput.value.trim() : "";
+  if (target.id === "btn-ha-start") {
+    if (!workspacePath) {
+      showError("Enter a workspace path in the Cursor bridge section (Advanced) before starting.");
+      return;
+    }
+    await runAction(() =>
+      apiPost("/api/session/high_autonomy/start", { workspace_path: workspacePath, max_turns: 12 })
+    );
+    return;
+  }
+  if (target.id === "btn-ha-pause") {
+    await runAction(() => apiPost("/api/session/high_autonomy/pause", {}));
+    return;
+  }
+  if (target.id === "btn-ha-resume") {
+    await runAction(() => apiPost("/api/session/high_autonomy/resume", {}));
+    return;
+  }
+  if (target.id === "btn-ha-stop") {
+    await runAction(() => apiPost("/api/session/high_autonomy/stop", {}));
+    return;
+  }
+  if (target.id === "btn-ha-tick") {
+    await runAction(() => apiPost("/api/session/high_autonomy/tick", {}));
+    return;
+  }
+  if (target.id === "btn-ha-approve" || target.id === "btn-ha-refuse") {
+    const pending = (lastState && lastState.high_autonomy_summary && lastState.high_autonomy_summary.pending_human_action_id) || "";
+    const actionId = pending || (lastState && lastState.needs_attention && lastState.needs_attention.approval_needed && lastState.needs_attention.approval_needed[0] && lastState.needs_attention.approval_needed[0].action_id) || "";
+    if (!actionId) {
+      showError("No human-critical action id is pending.");
+      return;
+    }
+    const path = target.id === "btn-ha-approve" ? "/api/session/high_autonomy/approve" : "/api/session/high_autonomy/refuse";
+    await runAction(() => apiPost(path, { action_id: actionId }));
+  }
 });
 
 refresh();

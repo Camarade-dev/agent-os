@@ -210,6 +210,34 @@ class _ControlSurfaceRequestHandler(BaseHTTPRequestHandler):
                 result = self.controller.execute_bounded_local_batch(body)
             elif parsed.path == "/api/queue/verify_bounded_local_workspace":
                 result = self.controller.verify_bounded_local_workspace(body)
+            elif parsed.path == "/api/session/high_autonomy/start":
+                workspace_path = body.get("workspace_path", "")
+                if workspace_path:
+                    self.controller.set_bounded_executor_workspace(workspace_path)
+                result = self.controller.start_high_autonomy_run(
+                    workspace_path=workspace_path,
+                    max_turns=int(body.get("max_turns") or 12),
+                )
+            elif parsed.path == "/api/session/high_autonomy/pause":
+                result = self.controller.pause_high_autonomy_run()
+            elif parsed.path == "/api/session/high_autonomy/resume":
+                result = self.controller.resume_high_autonomy_run()
+            elif parsed.path == "/api/session/high_autonomy/stop":
+                result = self.controller.stop_high_autonomy_run(
+                    reason=str(body.get("reason") or "Stopped by operator.")
+                )
+            elif parsed.path == "/api/session/high_autonomy/tick":
+                result = self.controller.tick_high_autonomy_run()
+            elif parsed.path == "/api/session/high_autonomy/approve":
+                result = self.controller.approve_high_autonomy_human_action(
+                    str(body.get("action_id") or ""),
+                    rationale=str(body.get("rationale") or ""),
+                )
+            elif parsed.path == "/api/session/high_autonomy/refuse":
+                result = self.controller.refuse_high_autonomy_human_action(
+                    str(body.get("action_id") or ""),
+                    rationale=str(body.get("rationale") or ""),
+                )
             else:
                 self._send_json(404, {"error": f"not found: {parsed.path}"})
                 return

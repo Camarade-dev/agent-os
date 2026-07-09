@@ -32,6 +32,7 @@ See docs/admissible-control-surface.md and docs/admissible-autonomy-levels.md.
 from __future__ import annotations
 
 import dataclasses
+import dataclasses
 import json
 import uuid
 from collections import Counter
@@ -552,6 +553,7 @@ class ControlSession:
     bounded_executor_workspace: str | None = None
     run_loop: RunLoopState = field(default_factory=RunLoopState)
     is_sample_session: bool = False
+    high_autonomy_run: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -570,6 +572,7 @@ class ControlSession:
             "bounded_executor_workspace": self.bounded_executor_workspace,
             "run_loop": self.run_loop.to_dict(),
             "is_sample_session": self.is_sample_session,
+            "high_autonomy_run": dict(self.high_autonomy_run) if self.high_autonomy_run else None,
         }
 
     @classmethod
@@ -601,6 +604,7 @@ class ControlSession:
             bounded_executor_workspace=data.get("bounded_executor_workspace"),
             run_loop=RunLoopState.from_dict(data.get("run_loop") or {}),
             is_sample_session=bool(data.get("is_sample_session", False)),
+            high_autonomy_run=data.get("high_autonomy_run"),
         )
 
 
@@ -1488,6 +1492,16 @@ class ControlSurfaceController:
         self._session_file = self._session_dir / "session.json"
         self._session_loaded_from_disk = False
         self._session = self._new_session()
+        self._high_autonomy_transport: Any = None
+
+    def _high_autonomy_state(self) -> Any:
+        from admissible.high_autonomy_controller import HighAutonomyRunState
+
+        raw = self._session.high_autonomy_run
+        return HighAutonomyRunState.from_dict(raw)
+
+    def _set_high_autonomy_state(self, state: Any) -> None:
+        self._session.high_autonomy_run = state.to_dict()
 
     @staticmethod
     def _new_session() -> ControlSession:
@@ -1580,6 +1594,13 @@ class ControlSurfaceController:
         )
         view["session_file"] = str(self._session_file)
         view["session_loaded_from_disk"] = self._session_loaded_from_disk
+        ha_state = self._high_autonomy_state()
+        from admissible.high_autonomy_controller import build_high_autonomy_summary
+
+        view["high_autonomy_summary"] = build_high_autonomy_summary(
+            ha_state=ha_state,
+            state_view=view,
+        )
         return view
 
     def set_bounded_executor_workspace(self, workspace_path: str | Path) -> dict[str, Any]:
@@ -2110,6 +2131,55 @@ class ControlSurfaceController:
         self._persist()
         return self.state_view()
 
+    def generate_next_continuation_instruction_packet(
+        self,
+        *,
+        instruction_text: str,
+    ) -> dict[str, Any]:
+        """Advance the run-loop turn using evidence-grounded continuation text.
+
+        Used by the high-autonomy controller to write continuation instructions
+        without manual copy/paste. Does not weaken admission or execution gates.
+        """
+        if not self._session.goal_intake:
+            raise NoGoalSubmittedError(
+                "Submit a goal to Admissible before generating an instruction packet.",
+                detail={"reason": GOAL_REQUIRED_REASON},
+            )
+        if not isinstance(instruction_text, str) or not instruction_text.strip():
+            raise ValueError("continuation instruction_text must be a non-empty string")
+
+        run_loop = self._session.run_loop
+        turn_number = run_loop.current_turn + 1
+        packet = generate_instruction_packet(
+            turn_number=turn_number,
+            autonomy_level=self._session.autonomy_level,
+            goal_intake=self._session.goal_intake,
+            plan_audit=self._session.plan_audit,
+            queue=[item.to_dict() for item in self._session.queue],
+            resolved_plan_gates=[g.to_dict() for g in run_loop.resolved_plan_gates],
+        )
+        stored_packet = dataclasses.replace(packet, packet_text=instruction_text.strip())
+        run_loop.current_turn = turn_number
+        run_loop.instruction_packets.append(stored_packet)
+        run_loop.turns.append(
+            RunTurn(
+                turn_number=turn_number,
+                created_at=stored_packet.created_at,
+                instruction_packet_id=stored_packet.packet_id,
+                agent_response_record_id=None,
+                summary=f"Generated evidence-grounded continuation for turn {turn_number}.",
+            )
+        )
+        self._session.transcript.append(
+            _transcript_entry(
+                "continuation_instruction_packet_generated",
+                {**stored_packet.to_dict(), "continuation_grounded": True},
+            )
+        )
+        self._persist()
+        return self.state_view()
+
     def record_bridge_ingest_blocked(
         self,
         reason: str,
@@ -2203,6 +2273,70 @@ class ControlSurfaceController:
         )
         self._persist()
         return self.state_view()
+
+    # -- high-autonomy governed loop (slice ADMISSIBLE_RUN_029) ---------------
+
+    def set_high_autonomy_transport(self, transport: Any) -> None:
+        """Attach a transport for tests or custom bridge implementations."""
+        self._high_autonomy_transport = transport
+
+    def start_high_autonomy_run(
+        self,
+        *,
+        workspace_path: str,
+        max_turns: int = 12,
+        transport: Any = None,
+    ) -> dict[str, Any]:
+        from admissible.high_autonomy_controller import start_high_autonomy_run
+
+        return start_high_autonomy_run(
+            self,
+            workspace_path=workspace_path,
+            transport=transport,
+            max_turns=max_turns,
+        )
+
+    def pause_high_autonomy_run(self) -> dict[str, Any]:
+        from admissible.high_autonomy_controller import pause_high_autonomy_run
+
+        return pause_high_autonomy_run(self)
+
+    def resume_high_autonomy_run(self) -> dict[str, Any]:
+        from admissible.high_autonomy_controller import resume_high_autonomy_run
+
+        return resume_high_autonomy_run(self)
+
+    def stop_high_autonomy_run(self, *, reason: str = "Stopped by operator.") -> dict[str, Any]:
+        from admissible.high_autonomy_controller import stop_high_autonomy_run
+
+        return stop_high_autonomy_run(self, reason=reason)
+
+    def tick_high_autonomy_run(self) -> dict[str, Any]:
+        from admissible.high_autonomy_controller import tick_high_autonomy_run
+
+        return tick_high_autonomy_run(self)
+
+    def approve_high_autonomy_human_action(
+        self, action_id: str, *, rationale: str = ""
+    ) -> dict[str, Any]:
+        from admissible.high_autonomy_controller import approve_human_critical_action
+
+        return approve_human_critical_action(
+            self,
+            action_id=action_id,
+            rationale=rationale or "Approved in high-autonomy human-required state.",
+        )
+
+    def refuse_high_autonomy_human_action(
+        self, action_id: str, *, rationale: str = ""
+    ) -> dict[str, Any]:
+        from admissible.high_autonomy_controller import refuse_human_critical_action
+
+        return refuse_human_critical_action(
+            self,
+            action_id=action_id,
+            rationale=rationale or "Refused in high-autonomy human-required state.",
+        )
 
     def provide_evidence(self, action_id: str, body: dict[str, Any]) -> dict[str, Any]:
         """Record one EvidenceRecord for a REQUEST_MORE_EVIDENCE action.
