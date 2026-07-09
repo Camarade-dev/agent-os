@@ -147,6 +147,153 @@ _GATE_HUMAN_DECISION_RE = re.compile(r"human\s+decision\s+required:\s*(.+)", re.
 _PLAN_GATE_OPERATION_FALLBACK = "Resolve plan gate"
 
 
+# -- bounded local file operation proposals (structured operation contract) --
+#
+# ADMISSIBLE_EXECUTION_010: a Cursor-class agent that wants to propose a
+# *bounded local file operation* (create/overwrite a file, read a file, or
+# list a directory inside the approved workspace) emits an explicit structured
+# block so the offline extraction path can hand the operation to
+# `admissible.execution.bounded_local_executor` verbatim, instead of leaving
+# the executor with only unparsed prose (which it refuses with
+# `not_executable_without_structured_operation`). The block the run-loop
+# instruction packet asks agents to use (see
+# `admissible.run_loop.STRUCTURED_OPERATION_MARKER`) is:
+#
+#     ADMISSIBLE_STRUCTURED_OPERATION:
+#     ```json
+#     {"operation": "write_file", "path": "index.html", "content": "..."}
+#     ```
+#
+# The JSON payload may be a single operation object, a list of operation
+# objects, or an object with an "operations" list. Extraction only *records*
+# what was proposed onto `candidate.structured_operations`; it never executes,
+# never mutates a decision, and never relaxes an admission gate. The bounded
+# executor re-validates operation category, path scope, and shape before any
+# file is touched, and the normal decision gates still apply.
+STRUCTURED_OPERATION_MARKER = "ADMISSIBLE_STRUCTURED_OPERATION:"
+_STRUCTURED_OPERATION_MARKER_RE = re.compile(re.escape(STRUCTURED_OPERATION_MARKER), re.IGNORECASE)
+
+
+def _scan_balanced_json(text: str, start: int) -> tuple[str, int] | None:
+    """Return the first balanced JSON object/array in ``text`` at/after ``start``.
+
+    Returns ``(substring, end_index)`` or ``None``. This deliberately scans
+    from the marker rather than matching a fenced block with a regex so both
+    the fenced form (```json ... ```) and a bare inline object are handled by
+    one path -- the scan simply skips the fence and language tag to the first
+    ``{``/``[``. JSON string literals (and their escapes) are respected so
+    braces inside a ``content`` value (HTML/JS/CSS) do not miscount; tracking
+    only the opening delimiter's matching pair is sufficient because the other
+    delimiter type stays balanced within well-formed JSON.
+    """
+    n = len(text)
+    i = start
+    while i < n and text[i] not in "{[":
+        i += 1
+    if i >= n:
+        return None
+    open_ch = text[i]
+    close_ch = "}" if open_ch == "{" else "]"
+    depth = 0
+    in_str = False
+    escape = False
+    for j in range(i, n):
+        ch = text[j]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0:
+                return text[i : j + 1], j + 1
+    return None
+
+
+def _normalize_structured_operation(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    operation = str(raw.get("operation") or "").strip()
+    if not operation:
+        return None
+    return dict(raw)
+
+
+def _operations_from_payload(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, dict) and isinstance(payload.get("operations"), list):
+        items: list[Any] = payload["operations"]
+    elif isinstance(payload, list):
+        items = payload
+    else:
+        items = [payload]
+    operations: list[dict[str, Any]] = []
+    for item in items:
+        normalized = _normalize_structured_operation(item)
+        if normalized is not None:
+            operations.append(normalized)
+    return operations
+
+
+def extract_structured_operation_blocks(raw_output: str) -> list[dict[str, Any]]:
+    """Parse each ``ADMISSIBLE_STRUCTURED_OPERATION:`` block from raw output.
+
+    Returns one entry per marker whose payload parses into at least one
+    operation dict, as ``{"operations": [...], "span": (start, end)}`` where
+    ``span`` covers the marker through the end of the JSON payload. This is a
+    pure recorder: it performs no execution and no path/category enforcement
+    (the bounded executor re-validates before any file is touched). A marker
+    with unparseable or empty JSON is skipped rather than raising.
+    """
+    blocks: list[dict[str, Any]] = []
+    for marker in _STRUCTURED_OPERATION_MARKER_RE.finditer(raw_output):
+        scanned = _scan_balanced_json(raw_output, marker.end())
+        if scanned is None:
+            continue
+        json_text, end = scanned
+        try:
+            payload = json.loads(json_text)
+        except json.JSONDecodeError:
+            continue
+        operations = _operations_from_payload(payload)
+        if not operations:
+            continue
+        blocks.append({"operations": operations, "span": (marker.start(), end)})
+    return blocks
+
+
+def _structured_operation_classification(
+    operations: list[dict[str, Any]],
+) -> tuple[str, str, str, str]:
+    """Map a structured-operation block to (action_type, side_effect, tendency, confidence).
+
+    A block that writes a file is a local, reversible ALLOW-tier code change; a
+    read-only block (read_file/list_files) is a local observation. Either way
+    the operation stays inside the approved workspace, so the label is ALLOW-
+    tier local -- but the bounded executor and the normal decision gates, not
+    this label, decide what may actually run.
+    """
+    names = {str(op.get("operation") or "").strip().lower() for op in operations}
+    if "write_file" in names:
+        return "create_file", "code_change", "ALLOW", "high"
+    return "read_file", "internal_state_change", "ALLOW", "high"
+
+
+def _structured_operation_label(operations: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for op in operations:
+        name = str(op.get("operation") or "operation").strip()
+        path = str(op.get("path") or "").strip()
+        parts.append(f"{name} {path}".strip())
+    return "; ".join(p for p in parts if p) or "structured local operation"
+
+
 def _first_meaningful_sentence(text: str, *, min_length: int = 8) -> str | None:
     compact = re.sub(r"\s+", " ", text).strip()
     if not compact:
@@ -359,6 +506,9 @@ _DEFAULT_MISSING_EVIDENCE: dict[str, list[str]] = {
     "edit_file": [],
     "local_code_change": [],
     "create_file": [],
+    # Read-only bounded local operations (read_file/list_files); an
+    # observation inside the approved workspace has no evidence gap.
+    "read_file": [],
     "document_hosting_options": ["hosting_choice_authorization"],
     "verification_plan": ["test_results", "manual_test_results"],
     # No evidence gap here: a plan-gate resolution is blocked on an explicit
@@ -895,6 +1045,13 @@ def _build_action_candidate(
             candidate["operation_text"] = operation_context["operation_text"]
         if operation_context.get("claim_kind"):
             candidate["claim_kind"] = operation_context["claim_kind"]
+        if operation_context.get("structured_operations"):
+            # Recorded verbatim for the bounded local executor to consume; the
+            # candidate is the sole carrier (not the envelope) so the executor's
+            # candidate/envelope collection cannot double-count the same op.
+            candidate["structured_operations"] = [
+                dict(op) for op in operation_context["structured_operations"]
+            ]
     return candidate
 
 
@@ -935,17 +1092,17 @@ def _authority_for_action(action_type: str, notes: list[str]) -> dict[str, Any]:
                 "summary": "Reversible relocation may proceed under limited scope.",
             },
         }
-    if action_type in ("edit_file", "local_code_change", "create_file", "document_hosting_options"):
+    if action_type in ("edit_file", "local_code_change", "create_file", "read_file", "document_hosting_options"):
         return {
             "requested_by": "agent_session_user",
             "approved_by": None,
             "approval_scope": "execute_with_limits",
             "required_approval": "none",
-            "authority_notes": ["Local file edit within user-authorized workspace scope."],
+            "authority_notes": ["Local file operation within user-authorized workspace scope."],
             "approvals": [],
             "tool_authority": {
                 "has_tool_access": "yes",
-                "summary": "File edit tool access assumed for local workspace.",
+                "summary": "File access assumed for local workspace.",
             },
             "business_authority": {
                 "has_business_authority": "yes",
@@ -1021,7 +1178,7 @@ def _risk_for_action(action_type: str) -> dict[str, Any]:
             "safety_impact": "none",
             "reputation_impact": "none",
         }
-    if action_type in ("edit_file", "local_code_change", "create_file", "document_hosting_options"):
+    if action_type in ("edit_file", "local_code_change", "create_file", "read_file", "document_hosting_options"):
         return {
             "reversibility": "reversible",
             "rollback_available": "yes",
@@ -1079,6 +1236,7 @@ def _workflow_for_action(action_type: str, source_metadata: dict[str, Any]) -> d
         "edit_file": "software_engineering",
         "local_code_change": "software_engineering",
         "create_file": "software_engineering",
+        "read_file": "software_engineering",
         "document_hosting_options": "software_engineering",
         "verification_plan": "software_engineering",
         "plan_gate_resolution": "software_engineering",
@@ -1089,6 +1247,7 @@ def _workflow_for_action(action_type: str, source_metadata: dict[str, Any]) -> d
         "edit_file",
         "local_code_change",
         "create_file",
+        "read_file",
         "document_hosting_options",
         "verification_plan",
         "plan_gate_resolution",
@@ -1343,7 +1502,58 @@ def _build_from_multi_action_response(
     action_index = 0
     seen_texts: set[str] = set()
 
-    for segment in _extract_freeform_action_segments(raw_output):
+    # Explicit bounded-local-operation blocks are the strongest, most precise
+    # signal, so they are consumed first (one candidate each, carrying the
+    # parsed ops on `structured_operations`) and their spans are blanked out of
+    # the text the freeform segmenter then processes -- otherwise the JSON body
+    # would also surface as noisy narrative segments.
+    structured_blocks = extract_structured_operation_blocks(raw_output)
+    remaining_raw = (
+        _blank_spans(raw_output, [block["span"] for block in structured_blocks])
+        if structured_blocks
+        else raw_output
+    )
+    for block in structured_blocks:
+        operations = block["operations"]
+        action_type, side_effect_type, expected_tendency, confidence = (
+            _structured_operation_classification(operations)
+        )
+        action_index += 1
+        label = _structured_operation_label(operations)
+        operation_context = {
+            "action_type": action_type,
+            "side_effect_type": side_effect_type,
+            "expected_admission_tendency": expected_tendency,
+            "extraction_confidence": confidence,
+            "operation_text": f"{STRUCTURED_OPERATION_MARKER} {label}",
+            "tool_or_command": label,
+            "structured_operations": operations,
+        }
+        candidate = _build_action_candidate(
+            raw_output=raw_output,
+            action_index=action_index,
+            source_metadata=source_metadata,
+            long_run_prompt=long_run_prompt,
+            operation_context=operation_context,
+        )
+        case_id = (
+            f"{fixture_stem}__structop_{action_index:03d}"
+            if fixture_stem
+            else f"case_lr_{_sha12(label)}_{action_index:03d}"
+        )
+        envelope = build_envelope_from_raw_output(
+            raw_output,
+            long_run_prompt=long_run_prompt,
+            source_metadata=source_metadata,
+            action_index=action_index,
+            benchmark_case_id=case_id,
+            candidate=candidate,
+            operation_snippet=label,
+        )
+        candidates.append(candidate)
+        envelopes.append(envelope)
+
+    for segment in _extract_freeform_action_segments(remaining_raw):
         normalized = re.sub(r"\s+", " ", segment["text"]).strip()
         if not normalized or normalized in seen_texts:
             continue

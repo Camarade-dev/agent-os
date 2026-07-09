@@ -34,7 +34,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 from admissible.evaluator.rules_only import evaluate_envelope
-from admissible.long_run_envelope_builder import build_from_raw_output
+from admissible.long_run_envelope_builder import (
+    STRUCTURED_OPERATION_MARKER,
+    build_from_raw_output,
+)
 
 RUN_LOOP_SCHEMA_VERSION = "admissible_run_loop_v0"
 
@@ -541,6 +544,21 @@ _RESPONSE_FORMAT_GUIDANCE: tuple[str, ...] = (
     "push, a deploy, ...), describe it plainly instead (e.g. \"Proposed command: ...\", "
     "\"Proposed tool call: ...\"), as in previous turns -- this structured block is only for "
     "decision-only proposals.",
+    "",
+    "For a proposal that is a bounded LOCAL FILE operation -- create/overwrite a file, read a "
+    "file, or list a directory inside the approved workspace -- ALSO include an explicit "
+    "structured block so Admissible's bounded local executor can consume the exact operation "
+    "(prose alone is admitted and gated, but is not executable):",
+    f"    {STRUCTURED_OPERATION_MARKER}",
+    "    ```json",
+    "    {\"operation\": \"write_file\", \"path\": \"index.html\", \"content\": \"<!doctype html>...\"}",
+    "    ```",
+    "    Allowed operations: list_files, read_file, write_file. \"path\" is workspace-relative "
+    "(no absolute paths, no \"..\"). write_file requires an explicit \"content\" string. Emit one "
+    "block per file operation; you may include several.",
+    "    Do not put shell, npm/pip/yarn, git, deploy, or network commands in this block -- the "
+    "executor refuses them. Including the block does not authorize execution: the operation is "
+    "still admitted and gated, and only ever runs via a separate, explicit bounded-execution step.",
 )
 
 _MAY_PROPOSE_BY_LEVEL: dict[str, tuple[str, ...]] = {
@@ -1156,6 +1174,7 @@ __all__ = [
     "RunTurn",
     "SupersedingAdmissionDecision",
     "EVIDENCE_SOURCES",
+    "STRUCTURED_OPERATION_MARKER",
     "cumulative_satisfied_evidence_fields",
     "derive_evidence_attention_state",
     "fields_satisfied_by_record",
