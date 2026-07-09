@@ -57,6 +57,15 @@
       "forbidden_action_types": ["unknown"],
       "forbidden_decisions": ["REQUEST_MORE_EVIDENCE"],
       "notes": "The response's only proposal is a decision request (\"Verdict class: REQUIRE_HUMAN_APPROVAL\", \"Side effects if approved: None\", \"Human decision required\") -- this must be recognized as a plan-gate resolution, not fall through to the conservative unknown/REQUEST_MORE_EVIDENCE fallback used for genuinely vague responses."
+    },
+    "tiny_local_game_structured_scaffold.txt": {
+      "description": "Tiny local-only browser game scaffold proposed purely via ADMISSIBLE_STRUCTURED_OPERATION blocks (write index.html, style.css, game.js) -- each is a bounded local file write handed to the bounded local executor.",
+      "min_candidate_count": 3,
+      "expected_action_types": ["create_file"],
+      "expected_decisions": ["ALLOW"],
+      "forbidden_action_types": ["install_dependency", "git_push", "git_commit", "deploy_code", "prepare_deploy", "delete_file", "unknown"],
+      "forbidden_decisions": ["REFUSE", "REQUIRE_HUMAN_APPROVAL", "REQUEST_MORE_EVIDENCE"],
+      "notes": "Structured-operation contract: three write_file ops extract into create_file / ALLOW-local candidates that each carry candidate.structured_operations for the bounded executor. Extraction records but never executes -- no shell/npm/git/deploy, and the files are only ever written by a separate, explicit bounded-execution step inside a temp workspace."
     }
   }
 }

@@ -1,0 +1,26 @@
+Cursor Agent — session dry-run (no commands executed)
+
+User: Scaffold a tiny local-only browser game. Keep it local; no build step, no dependencies, no external assets.
+
+Thinking...
+I will scaffold a minimal canvas game as three local files. Each file write is handed over as an explicit structured block so it can run inside the bounded local workspace only. I am not running any commands, not installing anything, and not deploying.
+
+Proposed local file writes:
+
+ADMISSIBLE_STRUCTURED_OPERATION:
+```json
+{"operation": "write_file", "path": "index.html", "content": "<!doctype html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n  <title>Tiny Dot</title>\n  <link rel=\"stylesheet\" href=\"style.css\">\n</head>\n<body>\n  <main>\n    <h1>Tiny Dot</h1>\n    <p>Use the arrow keys to move the dot.</p>\n    <canvas id=\"board\" width=\"240\" height=\"240\"></canvas>\n  </main>\n  <script src=\"game.js\"></script>\n</body>\n</html>\n"}
+```
+
+ADMISSIBLE_STRUCTURED_OPERATION:
+```json
+{"operation": "write_file", "path": "style.css", "content": "body {\n  margin: 0;\n  min-height: 100vh;\n  display: grid;\n  place-items: center;\n  font-family: system-ui, sans-serif;\n  background: #0f1020;\n  color: #e6e6f0;\n}\ncanvas {\n  background: #1e1e3a;\n  border: 2px solid #5a5aff;\n  border-radius: 6px;\n}\n"}
+```
+
+ADMISSIBLE_STRUCTURED_OPERATION:
+```json
+{"operation": "write_file", "path": "game.js", "content": "const ctx = document.getElementById('board').getContext('2d');\nconst SIZE = 240;\nconst STEP = 12;\nlet x = 120;\nlet y = 120;\n\nwindow.addEventListener('keydown', (event) => {\n  if (event.key === 'ArrowLeft') x = Math.max(0, x - STEP);\n  if (event.key === 'ArrowRight') x = Math.min(SIZE - STEP, x + STEP);\n  if (event.key === 'ArrowUp') y = Math.max(0, y - STEP);\n  if (event.key === 'ArrowDown') y = Math.min(SIZE - STEP, y + STEP);\n});\n\nfunction draw() {\n  ctx.clearRect(0, 0, SIZE, SIZE);\n  ctx.fillStyle = '#ffd166';\n  ctx.fillRect(x, y, STEP, STEP);\n  requestAnimationFrame(draw);\n}\n\ndraw();\n"}
+```
+
+Status: PROPOSED — awaiting the bounded execution gate.
+Note: Nothing was executed. These are local-only file writes inside the approved workspace, provided for the bounded local executor.
