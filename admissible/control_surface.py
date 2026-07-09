@@ -1236,6 +1236,162 @@ def _governed_run_overview(
     }
 
 
+REHEARSAL_PACKET_SCHEMA_VERSION = "admissible_live_rehearsal_packet_v0"
+
+
+def _rehearsal_operator_next_steps(
+    *,
+    product_state: dict[str, Any],
+    governed_run_overview: dict[str, Any],
+    continuation_instruction: dict[str, Any],
+    ready_to_execute_locally: list[dict[str, Any]],
+    bridge_awaiting_response: bool,
+) -> list[str]:
+    """Display-only operator guidance for live Cursor multi-turn rehearsal."""
+    next_action = product_state.get("next_expected_action")
+    steps: list[str] = []
+
+    if next_action == NEXT_ACTION_SUBMIT_GOAL:
+        steps.append("Submit the canonical tiny-game goal in the goal form.")
+        return steps
+
+    if next_action == NEXT_ACTION_WRITE_INSTRUCTION:
+        steps.append("Enter workspace path and click Write instruction file.")
+        steps.append("Optional: Open workspace in Cursor.")
+        steps.append(
+            "Turn 1 only: Cursor reads .admissible/next-agent-instruction.md and writes "
+            ".admissible/agent-response.md."
+        )
+        steps.append(
+            "Turn 2+: prefer Copy continuation instruction (after prior turn executed) "
+            "instead of Write instruction file when evidence-grounded handoff is available."
+        )
+        return steps
+
+    if next_action == NEXT_ACTION_INGEST_RESPONSE or bridge_awaiting_response:
+        steps.append(
+            "Confirm Cursor wrote .admissible/agent-response.md in the workspace."
+        )
+        steps.append("Click Ingest Cursor response file.")
+        steps.append("Review admission decisions in the queue — nothing executes on ingest.")
+        return steps
+
+    if ready_to_execute_locally:
+        steps.append(
+            f"Execute all ready locally ({len(ready_to_execute_locally)} admitted file op(s)) "
+            "before copying continuation."
+        )
+
+    if continuation_instruction.get("status") == "pending_local_execution":
+        steps.append(
+            "Continuation unavailable until pending admitted local ops are explicitly executed."
+        )
+
+    if continuation_instruction.get("available"):
+        steps.append("Copy continuation instruction and hand off to Cursor for the next turn.")
+
+    if governed_run_overview.get("blocked_count", 0) > 0:
+        steps.append(
+            "Review blocked/gated ops in Run Timeline — do not treat them as executed."
+        )
+
+    verification = governed_run_overview.get("verification_readiness", "not_run")
+    turn_count = governed_run_overview.get("turn_count", 0)
+    evidence_count = governed_run_overview.get("write_evidence_count", 0)
+    if turn_count >= 4 and evidence_count >= 8 and verification == "not_run":
+        steps.append("Run bounded verification when the four-turn recovery path is complete.")
+    elif verification == "pass":
+        steps.append("Live rehearsal complete — capture session export and verification summary.")
+    elif verification == "fail":
+        steps.append("Review failed verification checks before claiming rehearsal success.")
+
+    if not steps:
+        steps.append("Review queue and Supervised Run State; proceed per next_expected_action.")
+    return steps
+
+
+def _format_rehearsal_checklist_text(packet: dict[str, Any]) -> str:
+    """Human-readable checklist for clipboard export (display-only)."""
+    lines = [
+        "ADMISSIBLE LIVE CURSOR MULTI-TURN REHEARSAL CHECKLIST",
+        f"schema: {packet.get('schema_version')}",
+        "",
+        f"Goal: {packet.get('goal') or '(none yet)'}",
+        f"Run phase: {packet.get('run_phase')}",
+        f"Next expected action: {packet.get('next_expected_action')}",
+        f"Current turn: {packet.get('current_turn')}",
+        f"Bridge awaiting response: {packet.get('bridge_awaiting_response')}",
+        "",
+        f"Pending local execution: {packet.get('pending_local_execution_count')}",
+        f"Write evidence count: {packet.get('write_evidence_count')}",
+        f"Continuation available: {packet.get('continuation_available')} "
+        f"({packet.get('continuation_status')})",
+        f"Verification readiness: {packet.get('verification_readiness')}",
+        "",
+        "Operator next steps:",
+    ]
+    for index, step in enumerate(packet.get("operator_next_steps") or [], start=1):
+        lines.append(f"  {index}. {step}")
+    lines.extend(
+        [
+            "",
+            "Cursor MAY: read instruction/continuation, write agent-response.md, "
+            "propose structured local file ops.",
+            "Cursor MUST NOT: execute shell/npm/network/deploy, write workspace files "
+            "directly, or bypass Admissible admission.",
+            "",
+            "See docs/admissible-live-cursor-multi-turn-rehearsal.md",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _rehearsal_packet(
+    *,
+    session: "ControlSession",
+    product_state: dict[str, Any],
+    governed_run_overview: dict[str, Any],
+    continuation_instruction: dict[str, Any],
+    ready_to_execute_locally: list[dict[str, Any]],
+    bridge_awaiting_response: bool,
+) -> dict[str, Any]:
+    """Display-only live rehearsal summary for operator handoff (slice DEMO_027).
+
+    Pure projection: summarizes goal, phase, continuation, execution backlog,
+    evidence, and verification readiness. Does not execute anything and does
+    not call providers.
+    """
+    run_loop = session.run_loop
+    goal_intake = session.goal_intake or {}
+    latest_packet = run_loop.instruction_packets[-1] if run_loop.instruction_packets else None
+    operator_next_steps = _rehearsal_operator_next_steps(
+        product_state=product_state,
+        governed_run_overview=governed_run_overview,
+        continuation_instruction=continuation_instruction,
+        ready_to_execute_locally=ready_to_execute_locally,
+        bridge_awaiting_response=bridge_awaiting_response,
+    )
+    packet: dict[str, Any] = {
+        "schema_version": REHEARSAL_PACKET_SCHEMA_VERSION,
+        "goal": governed_run_overview.get("goal") or goal_intake.get("normalized_goal"),
+        "run_phase": product_state.get("run_phase"),
+        "next_expected_action": product_state.get("next_expected_action"),
+        "current_turn": run_loop.current_turn,
+        "bridge_awaiting_response": bridge_awaiting_response,
+        "latest_instruction_turn": latest_packet.turn_number if latest_packet else None,
+        "latest_instruction_written": bool(run_loop.instruction_packets),
+        "continuation_available": bool(continuation_instruction.get("available")),
+        "continuation_status": continuation_instruction.get("status"),
+        "pending_local_execution_count": len(ready_to_execute_locally),
+        "write_evidence_count": governed_run_overview.get("write_evidence_count", 0),
+        "blocked_count": governed_run_overview.get("blocked_count", 0),
+        "verification_readiness": governed_run_overview.get("verification_readiness", "not_run"),
+        "operator_next_steps": operator_next_steps,
+    }
+    packet["checklist_text"] = _format_rehearsal_checklist_text(packet)
+    return packet
+
+
 def _needs_attention(session: "ControlSession") -> dict[str, Any]:
     """Display-only subset of the queue/plan-audit that calls for a human look first.
 
@@ -1410,9 +1566,20 @@ class ControlSurfaceController:
             verification_summary=view["verification_summary"],
             continuation_instruction=view["continuation_instruction"],
         )
+        view["ready_to_execute_locally"] = _ready_to_execute_locally(self._session)
+        view["rehearsal_packet"] = _rehearsal_packet(
+            session=self._session,
+            product_state={
+                "run_phase": view["run_phase"],
+                "next_expected_action": view["next_expected_action"],
+            },
+            governed_run_overview=view["governed_run_overview"],
+            continuation_instruction=view["continuation_instruction"],
+            ready_to_execute_locally=view["ready_to_execute_locally"],
+            bridge_awaiting_response=view["session_diagnostics"]["bridge_awaiting_response"],
+        )
         view["session_file"] = str(self._session_file)
         view["session_loaded_from_disk"] = self._session_loaded_from_disk
-        view["ready_to_execute_locally"] = _ready_to_execute_locally(self._session)
         return view
 
     def set_bounded_executor_workspace(self, workspace_path: str | Path) -> dict[str, Any]:

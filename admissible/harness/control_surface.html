@@ -326,6 +326,7 @@
   </div>
   <div class="top-actions">
     <button type="button" id="btn-export" class="secondary">Export session JSON</button>
+    <button type="button" id="btn-copy-rehearsal-checklist" class="secondary">Copy live rehearsal checklist</button>
     <label class="file-label" for="import-file">Import session JSON</label>
     <input type="file" id="import-file" accept="application/json" hidden>
     <button type="button" id="btn-reset" class="secondary">Reset local session</button>
@@ -2080,6 +2081,20 @@ document.getElementById("btn-copy-continuation").addEventListener("click", async
     await navigator.clipboard.writeText(textarea.value);
   } catch (err) {
     // Clipboard API may be unavailable; the textarea is selected for manual copy.
+  }
+});
+
+document.getElementById("btn-copy-rehearsal-checklist").addEventListener("click", async () => {
+  const text = (lastState && lastState.rehearsal_packet && lastState.rehearsal_packet.checklist_text) || "";
+  if (!text) {
+    showError("No rehearsal checklist yet — submit a goal and refresh session state first.");
+    return;
+  }
+  clearError();
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (err) {
+    showError("Could not copy checklist to clipboard — see rehearsal_packet.checklist_text in session export.");
   }
 });
 
