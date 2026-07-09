@@ -186,6 +186,42 @@
 
   #error-banner { display: none; margin: .6rem 1.1rem 0; padding: .5rem .7rem; background: #3a1010; color: #fca5a5; border: 1px solid #dc2626; border-radius: 6px; font-size: .82rem; }
 
+  #no-execution-banner {
+    margin: 0; padding: .55rem 1.1rem; background: var(--cs-warning-bg); color: var(--cs-warning-text);
+    border-bottom: 1px solid var(--cs-warning-border); font-size: .82rem; text-align: center;
+  }
+  #no-execution-banner strong { color: #fff; }
+
+  #bridge-blocked-banner {
+    display: none; margin: .6rem 1.1rem 0; padding: .55rem .75rem; background: var(--cs-attn-bg);
+    color: var(--cs-attn-text); border: 1px solid var(--cs-attn-border); border-radius: 6px; font-size: .82rem;
+  }
+  #bridge-blocked-banner.visible { display: block; }
+
+  .bucket-section { margin-bottom: .75rem; padding: .55rem .65rem; border-radius: 8px; border: 1px solid var(--cs-border-strong); }
+  .bucket-section h3 { font-size: .74rem; text-transform: uppercase; letter-spacing: .03em; margin: 0 0 .35rem; }
+  .bucket-pending { background: var(--cs-attn-bg); border-color: var(--cs-attn-border); }
+  .bucket-pending h3 { color: var(--cs-attn-text); }
+  .bucket-closed { background: var(--cs-card-bg); border-color: var(--cs-border-strong); opacity: .92; }
+  .bucket-closed h3 { color: var(--cs-muted); }
+  .bucket-info { background: #1a2333; border-color: #4a5568; }
+  .bucket-info h3 { color: #fde68a; }
+  .bucket-evidence { background: #1e1a3a; border-color: #5b21b6; }
+  .bucket-evidence h3 { color: #c4b5fd; }
+  .bucket-row { display: flex; align-items: flex-start; gap: .5rem; padding: .3rem 0; border-bottom: 1px dashed var(--cs-border-strong); font-size: .82rem; }
+  .bucket-row:last-child { border-bottom: none; }
+  .bucket-row .bucket-main { flex: 1; min-width: 0; }
+  .bucket-row .bucket-meta { font-size: .72rem; color: var(--cs-muted); margin-top: .1rem; }
+  .bucket-empty { font-size: .78rem; color: var(--cs-muted); font-style: italic; margin: 0; }
+  .gate-closure { font-size: .8rem; padding: .25rem 0; color: var(--cs-muted); }
+  .gate-closure strong { color: var(--cs-text); font-weight: 600; }
+
+  .session-diagnostics-grid { display: grid; grid-template-columns: auto 1fr; gap: .12rem .6rem; font-size: .8rem; margin: 0; }
+  .session-diagnostics-grid dt { color: var(--cs-muted); }
+  .session-diagnostics-grid dd { margin: 0; word-break: break-all; }
+  .diag-awaiting { color: var(--cs-attn-text); font-weight: 600; }
+  .diag-idle { color: var(--cs-muted); }
+
   .transcript-entry { border-radius: 8px; padding: .5rem .65rem; font-size: .82rem; border: 1px solid var(--cs-border-strong); background: var(--cs-card-bg); margin-bottom: .45rem; }
   .transcript-entry.role-user { margin-left: 2rem; background: #16324a; border-color: #1e4a6b; }
   .transcript-entry.role-admissible { margin-right: 2rem; }
@@ -220,6 +256,12 @@
   </details>
 </header>
 
+<p id="no-execution-banner" role="status">
+  <strong>No execution by Admissible.</strong>
+  Admissible evaluates and admits actions; it does not execute side effects.
+  External execution and attestation happen outside this tool.
+</p>
+
 <section class="top-controls" id="top-controls">
   <label class="autonomy-label">
     Autonomy level
@@ -239,8 +281,14 @@
 </section>
 
 <div id="error-banner" role="alert"></div>
+<div id="bridge-blocked-banner" role="alert"></div>
 
 <main id="app-main">
+
+  <section class="panel" id="session-diagnostics-panel">
+    <h2>Session Diagnostics</h2>
+    <div id="session-diagnostics-body"><p class="no-action-note">Loading session diagnostics…</p></div>
+  </section>
 
   <section class="panel" id="cursor-bridge-panel">
     <h2>Cursor supervised file bridge</h2>
@@ -323,7 +371,11 @@
   </section>
 
   <section class="panel" id="needs-attention-panel">
-    <h2>Needs Attention</h2>
+    <h2>Supervised Run State</h2>
+    <p class="hint" style="font-size:.76rem;color:var(--cs-muted);margin:0 0 .55rem;">
+      Pending items need a human decision now. Resolved, refused, and admitted-not-executed items are
+      shown as closed context — not as unresolved blockers.
+    </p>
     <div id="needs-attention-body"><p class="no-action-note">Nothing loaded yet.</p></div>
   </section>
 
@@ -597,45 +649,185 @@ function attentionActionRows(actions) {
     .join("");
 }
 
+const LIFECYCLE_LABELS = {
+  needs_human_input: "Needs human input",
+  evidence_supplied_pending_reevaluation: "Evidence supplied — pending re-evaluation",
+  evidence_supplied_still_blocked: "Evidence supplied — still blocked",
+  evidence_satisfied_pending_human_decision: "Evidence satisfied — pending human decision",
+  approval_supplied_pending_reevaluation: "Approval supplied — pending re-evaluation",
+  limited_scope_selected: "Limited scope selected",
+  ready_for_next_agent_instruction: "Ready for next agent instruction",
+  closed: "Closed",
+  resolved_gate: "Resolved plan gate",
+  refused_closed: "Refused / closed",
+  admitted_not_executed: "Admitted — not executed by Admissible",
+};
+
+function lifecycleLabel(status) {
+  if (!status) return "—";
+  return LIFECYCLE_LABELS[status] || status;
+}
+
+function bucketActionRows(actions, { showReview = false, note = "" } = {}) {
+  if (!actions.length) return `<p class="bucket-empty">None.</p>`;
+  return actions
+    .map((a) => {
+      const reviewBtn = showReview
+        ? `<button type="button" class="secondary review-action-btn" data-action-id="${escapeHtml(a.action_id)}">Review</button>`
+        : "";
+      const missing =
+        Array.isArray(a.missing_evidence) && a.missing_evidence.length
+          ? `<div class="bucket-meta">Still missing: ${fmtList(a.missing_evidence)}</div>`
+          : "";
+      const lifecycle = a.lifecycle_status
+        ? `<div class="bucket-meta">Lifecycle: ${escapeHtml(lifecycleLabel(a.lifecycle_status))}</div>`
+        : "";
+      const extraNote = note ? `<div class="bucket-meta">${escapeHtml(note)}</div>` : "";
+      return `<div class="bucket-row">
+        <div class="bucket-main">
+          <div><span class="decision-${escapeHtml(a.decision)}">${escapeHtml(a.decision)}</span>
+            <span class="mono" style="margin-left:.35rem;">${escapeHtml(a.action_id)}</span></div>
+          <div class="bucket-meta">${escapeHtml(truncate(displayToolOrCommand(a), 90))}</div>
+          ${lifecycle}
+          ${missing}
+          ${extraNote}
+        </div>
+        ${reviewBtn}
+      </div>`;
+    })
+    .join("");
+}
+
+function resolvedGateRows(gates) {
+  if (!gates.length) return `<p class="bucket-empty">None resolved yet.</p>`;
+  return gates
+    .map((g) => {
+      const scope = g.approved_scope ? ` — scope: <code>${escapeHtml(g.approved_scope)}</code>` : "";
+      return `<div class="gate-closure"><strong>${escapeHtml(g.gate_id)}</strong> closed${scope}
+        <span class="bucket-meta"> (action ${escapeHtml(g.action_id)}, ${escapeHtml(g.timestamp)})</span></div>`;
+    })
+    .join("");
+}
+
+function renderSessionDiagnostics(state) {
+  const body = document.getElementById("session-diagnostics-body");
+  if (!body) return;
+  const diag = state.session_diagnostics || {};
+  const loaded = diag.session_loaded_from_disk ? "Yes — resumed from disk" : "No — fresh in-memory session";
+  const awaiting = diag.bridge_awaiting_response
+    ? `<span class="diag-awaiting">Yes — turn(s) ${fmtList(diag.bridge_awaiting_turns || [])} awaiting Cursor response</span>`
+    : '<span class="diag-idle">No — no outstanding instruction awaiting ingest</span>';
+  const latestEvidence = diag.latest_evidence_record;
+  const evidenceSummary = latestEvidence
+    ? `<code>${escapeHtml(latestEvidence.evidence_type)}</code> for <code>${escapeHtml(latestEvidence.action_id)}</code> at ${escapeHtml(latestEvidence.timestamp)}`
+    : "None supplied yet";
+
+  body.innerHTML = `
+    <dl class="session-diagnostics-grid">
+      <dt>Session file</dt><dd><code>${escapeHtml(diag.session_file || state.session_file || "—")}</code></dd>
+      <dt>Loaded from disk</dt><dd>${escapeHtml(loaded)}</dd>
+      <dt>Session id</dt><dd><code>${escapeHtml(diag.session_id || state.session_id || "—")}</code></dd>
+      <dt>Current turn</dt><dd>${escapeHtml(diag.current_turn ?? (state.run_loop || {}).current_turn ?? 0)}</dd>
+      <dt>Bridge awaiting response</dt><dd>${awaiting}</dd>
+      <dt>Evidence records</dt><dd>${escapeHtml(diag.evidence_record_count ?? 0)} total — latest: ${evidenceSummary}</dd>
+    </dl>
+  `;
+}
+
+function renderBridgeBlockedBanner(state) {
+  const banner = document.getElementById("bridge-blocked-banner");
+  if (!banner) return;
+  const diag = state.session_diagnostics || {};
+  const events = diag.bridge_blocked_ingest_events || [];
+  if (!events.length) {
+    banner.classList.remove("visible");
+    banner.innerHTML = "";
+    return;
+  }
+  const latest = events[events.length - 1];
+  const reasonLabels = {
+    duplicate_response: "Duplicate response file (already ingested for this turn)",
+    stale_response: "Stale response file (does not match the current instruction turn)",
+    no_awaiting_instruction: "No instruction awaiting a response (write instruction first)",
+  };
+  const reasonText = reasonLabels[latest.reason] || latest.reason || "unknown";
+  const detailBits = [];
+  if (latest.turn_number != null) detailBits.push(`turn ${latest.turn_number}`);
+  if (latest.response_sha256) detailBits.push(`sha256 ${truncate(latest.response_sha256, 16)}`);
+  if (latest.workspace_path) detailBits.push(`workspace ${latest.workspace_path}`);
+  banner.classList.add("visible");
+  banner.innerHTML = `<strong>Bridge ingest blocked</strong> (${events.length} event(s)): ${escapeHtml(reasonText)}` +
+    (detailBits.length ? ` — ${escapeHtml(detailBits.join(", "))}` : "") +
+    `<div style="margin-top:.25rem;font-size:.76rem;">${escapeHtml(latest.note || "No queue items were created.")}</div>`;
+}
+
 function renderNeedsAttention(state) {
   const body = document.getElementById("needs-attention-body");
+  const overview = state.lifecycle_overview || {};
   const na = state.needs_attention || {};
-  const evidenceNeeded = na.evidence_needed || [];
-  const approvalNeeded = na.approval_needed || [];
-  const scopeLimitsNeeded = na.scope_limits_needed || [];
-  const planClarifications = na.plan_clarifications || [];
-  const readyToContinue = na.ready_to_continue || [];
+  const pending = overview.pending_human_decision || na.actions || [];
+  const resolvedGates = overview.resolved_plan_gates || na.resolved_plan_gates || [];
+  const admittedNe = overview.admitted_not_executed || [];
+  const refusedClosed = overview.refused_closed || [];
+  const evidenceStillBlocked = overview.evidence_supplied_still_blocked || [];
+  const evidenceSatisfied = overview.evidence_satisfied_pending_human_decision || [];
+  const unresolvedGates = na.unresolved_plan_gates || [];
+  const planClarifications = (na.plan_clarifications || []).filter(
+    (q) => !String(q).startsWith("Human-resolved plan gate:")
+  );
 
   const hasAnything =
-    evidenceNeeded.length || approvalNeeded.length || scopeLimitsNeeded.length ||
-    planClarifications.length || readyToContinue.length;
+    pending.length || resolvedGates.length || admittedNe.length || refusedClosed.length ||
+    evidenceStillBlocked.length || evidenceSatisfied.length || unresolvedGates.length ||
+    planClarifications.length;
 
   if (!hasAnything) {
-    body.innerHTML = '<p class="no-action-note">Nothing needs attention right now.</p>';
+    body.innerHTML = '<p class="no-action-note">Nothing needs attention right now. Session is idle or fully resolved.</p>';
     return;
   }
 
+  const unresolvedGateHtml = unresolvedGates.length
+    ? `<ul>${unresolvedGates.map((g) => `<li><span class="decision-REQUIRE_HUMAN_APPROVAL">Unresolved plan gate:</span> ${escapeHtml(g)}</li>`).join("")}</ul>`
+    : '<p class="bucket-empty">None.</p>';
+  const clarificationsHtml = planClarifications.length
+    ? `<ul>${planClarifications.map((q) => `<li>${escapeHtml(q)}</li>`).join("")}</ul>`
+    : "";
+
   body.innerHTML = `
-    <div class="attn-category">
-      <h3>Evidence needed (${evidenceNeeded.length})</h3>
-      ${attentionActionRows(evidenceNeeded)}
+    <div class="bucket-section bucket-pending">
+      <h3>Needs attention — pending human decision (${pending.length})</h3>
+      ${bucketActionRows(pending, { showReview: true })}
     </div>
-    <div class="attn-category">
-      <h3>Approval needed (${approvalNeeded.length})</h3>
-      ${attentionActionRows(approvalNeeded)}
+    <div class="bucket-section bucket-closed">
+      <h3>Resolved plan gates — closed context (${resolvedGates.length})</h3>
+      ${resolvedGateRows(resolvedGates)}
     </div>
-    <div class="attn-category">
-      <h3>Scope limits needed (${scopeLimitsNeeded.length})</h3>
-      ${attentionActionRows(scopeLimitsNeeded)}
+    <div class="bucket-section bucket-info">
+      <h3>Admitted, not executed (${admittedNe.length})</h3>
+      <p class="bucket-empty" style="margin-bottom:.35rem;">Approved side-effecting actions Admissible admitted but did not run. External execution/attestation is separate.</p>
+      ${bucketActionRows(admittedNe, { note: "Execution happens outside Admissible; use attest executed only after you run it." })}
     </div>
-    <div class="attn-category">
-      <h3>Plan clarifications (${planClarifications.length})</h3>
-      ${planClarifications.length ? `<ul>${planClarifications.map((q) => `<li>${escapeHtml(q)}</li>`).join("")}</ul>` : '<p class="attn-empty">None right now.</p>'}
+    <div class="bucket-section bucket-closed">
+      <h3>Refused / closed (${refusedClosed.length})</h3>
+      ${bucketActionRows(refusedClosed)}
     </div>
-    <div class="attn-category">
-      <h3>Ready to continue (${readyToContinue.length})</h3>
-      ${attentionActionRows(readyToContinue)}
+    <div class="bucket-section bucket-evidence">
+      <h3>Evidence supplied — still blocked (${evidenceStillBlocked.length})</h3>
+      ${bucketActionRows(evidenceStillBlocked, { showReview: true })}
     </div>
+    <div class="bucket-section bucket-evidence">
+      <h3>Evidence satisfied — pending human decision (${evidenceSatisfied.length})</h3>
+      ${bucketActionRows(evidenceSatisfied, { showReview: true })}
+    </div>
+    ${
+      unresolvedGates.length || planClarifications.length
+        ? `<div class="bucket-section bucket-pending">
+            <h3>Unresolved plan gates &amp; clarifications</h3>
+            ${unresolvedGateHtml}
+            ${clarificationsHtml}
+          </div>`
+        : ""
+    }
   `;
 
   body.querySelectorAll(".review-action-btn").forEach((btn) => {
@@ -770,8 +962,16 @@ function renderSelectedAction(state) {
     : "";
 
   const lifecycleNote = item.lifecycle_status
-    ? `<p class="lifecycle-note">Lifecycle: <code>${escapeHtml(item.lifecycle_status)}</code></p>`
+    ? `<p class="lifecycle-note">Lifecycle: <code>${escapeHtml(item.lifecycle_status)}</code> — ${escapeHtml(lifecycleLabel(item.lifecycle_status))}</p>`
     : "";
+  const admittedNote =
+    item.execution_status === "admitted_not_executed" || item.lifecycle_status === "admitted_not_executed"
+      ? `<p class="no-action-note" style="font-style:normal;color:#fde68a;">Admitted by Admissible but not executed here. Run externally, then attest if your autonomy level allows.</p>`
+      : "";
+  const closedNote =
+    item.lifecycle_status === "resolved_gate" || item.lifecycle_status === "refused_closed" || item.lifecycle_status === "closed"
+      ? `<p class="no-action-note" style="font-style:normal;">This item is closed — no immediate human action required.</p>`
+      : "";
 
   body.innerHTML = `
     <div class="sel-header">
@@ -787,6 +987,8 @@ function renderSelectedAction(state) {
       <dt>Missing evidence</dt><dd>${fmtList(item.missing_evidence)}</dd>
     </dl>
     ${lifecycleNote}
+    ${admittedNote}
+    ${closedNote}
     ${decisionsHtml}
     ${evidenceFormHtml}
     ${formHtml}
@@ -927,6 +1129,11 @@ function renderTranscriptEntry(entry) {
       label = "Human operator decision";
       bodyHtml = `<p><code>${escapeHtml(payload.decision_type)}</code> on
         <code>${escapeHtml(payload.action_id)}</code>${payload.scope ? " (scope: " + escapeHtml(payload.scope) + ")" : ""}</p>`;
+      break;
+    case "bridge_ingest_blocked":
+      label = "Bridge ingest blocked";
+      bodyHtml = `<p><strong>${escapeHtml(payload.reason)}</strong>${payload.turn_number != null ? " (turn " + escapeHtml(payload.turn_number) + ")" : ""}</p>
+        <p style="color:var(--cs-muted);">${escapeHtml(payload.note || "")}</p>`;
       break;
     default:
       bodyHtml = `<pre class="mono">${escapeHtml(JSON.stringify(payload))}</pre>`;
@@ -1090,6 +1297,8 @@ function renderBridgeFromState(state) {
 function render(state) {
   lastState = state;
   renderAutonomySelect(state);
+  renderSessionDiagnostics(state);
+  renderBridgeBlockedBanner(state);
   renderCursorBridgeTurn(state);
   renderManualFallback(state);
   renderBridgeFromState(state);

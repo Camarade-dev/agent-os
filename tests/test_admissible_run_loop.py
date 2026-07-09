@@ -452,7 +452,13 @@ class TestRunLoopHtmlContent(unittest.TestCase):
         self.assertIn("file_path_or_note", self.raw)
 
     def test_needs_attention_categories_present(self) -> None:
-        for label in ("Evidence needed", "Approval needed", "Scope limits needed", "Plan clarifications", "Ready to continue"):
+        for label in (
+            "Needs attention — pending human decision",
+            "Resolved plan gates — closed context",
+            "Admitted, not executed",
+            "Evidence supplied — still blocked",
+            "Evidence satisfied — pending human decision",
+        ):
             self.assertIn(label, self.raw)
 
     def test_only_one_generic_decide_form_template(self) -> None:

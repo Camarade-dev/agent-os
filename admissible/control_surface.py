@@ -670,6 +670,92 @@ def _attention_row(item: "DecisionQueueItem") -> dict[str, Any]:
         "decision": item.decision,
         "execution_status": item.execution_status,
         "lifecycle_status": item.lifecycle_status,
+        "missing_evidence": list(item.missing_evidence),
+    }
+
+
+def _bridge_awaiting_response(run_loop: RunLoopState) -> tuple[bool, list[int]]:
+    """Return whether an instruction packet is outstanding without a matching response."""
+    if not run_loop.instruction_packets:
+        return False, []
+    response_turns = {record.turn_number for record in run_loop.response_records}
+    awaiting_turns = sorted(
+        {
+            packet.turn_number
+            for packet in run_loop.instruction_packets
+            if packet.turn_number not in response_turns
+        }
+    )
+    return bool(awaiting_turns), awaiting_turns
+
+
+def _session_diagnostics(
+    session: "ControlSession",
+    *,
+    session_file: Path,
+    session_loaded_from_disk: bool,
+) -> dict[str, Any]:
+    """Display-only session/run-loop diagnostics for the Control Surface UI."""
+    run_loop = session.run_loop
+    awaiting, awaiting_turns = _bridge_awaiting_response(run_loop)
+    evidence_records = run_loop.evidence_records
+    latest_evidence = evidence_records[-1].to_dict() if evidence_records else None
+    blocked_events = [
+        entry["payload"]
+        for entry in session.transcript
+        if entry.get("type") == "bridge_ingest_blocked"
+    ]
+    return {
+        "session_file": str(session_file),
+        "session_loaded_from_disk": session_loaded_from_disk,
+        "session_id": session.session_id,
+        "current_turn": run_loop.current_turn,
+        "bridge_awaiting_response": awaiting,
+        "bridge_awaiting_turns": awaiting_turns,
+        "evidence_record_count": len(evidence_records),
+        "latest_evidence_record": latest_evidence,
+        "bridge_blocked_ingest_events": blocked_events,
+        "latest_bridge_blocked_ingest": blocked_events[-1] if blocked_events else None,
+    }
+
+
+def _lifecycle_overview(session: "ControlSession") -> dict[str, Any]:
+    """Display-only lifecycle buckets for supervised-run demo clarity."""
+    queue = session.queue
+
+    def row(item: "DecisionQueueItem") -> dict[str, Any]:
+        return _attention_row(item)
+
+    pending_human_decision = [row(item) for item in queue if queue_item_needs_attention(item.to_dict())]
+    admitted_not_executed = [
+        row(item)
+        for item in queue
+        if item.execution_status == EXECUTION_STATUS_ADMITTED_NOT_EXECUTED
+        or item.lifecycle_status == LIFECYCLE_ADMITTED_NOT_EXECUTED
+    ]
+    refused_closed = [
+        row(item)
+        for item in queue
+        if item.lifecycle_status in (LIFECYCLE_REFUSED_CLOSED, LIFECYCLE_CLOSED)
+        or item.decision == "REFUSE"
+    ]
+    evidence_supplied_still_blocked = [
+        row(item) for item in queue if item.lifecycle_status == LIFECYCLE_EVIDENCE_SUPPLIED_STILL_BLOCKED
+    ]
+    evidence_satisfied_pending_human_decision = [
+        row(item)
+        for item in queue
+        if item.lifecycle_status == LIFECYCLE_EVIDENCE_SATISFIED_PENDING_HUMAN_DECISION
+    ]
+    resolved_plan_gates = [gate.to_dict() for gate in session.run_loop.resolved_plan_gates]
+
+    return {
+        "pending_human_decision": pending_human_decision,
+        "resolved_plan_gates": resolved_plan_gates,
+        "admitted_not_executed": admitted_not_executed,
+        "refused_closed": refused_closed,
+        "evidence_supplied_still_blocked": evidence_supplied_still_blocked,
+        "evidence_satisfied_pending_human_decision": evidence_satisfied_pending_human_decision,
     }
 
 
@@ -715,9 +801,6 @@ def _needs_attention(session: "ControlSession") -> dict[str, Any]:
             if gate in resolved_ids:
                 continue
             plan_clarifications.append(f"Unresolved plan gate: {gate}")
-    for resolved in session.run_loop.resolved_plan_gates:
-        scope_note = f" (scope: {resolved.approved_scope})" if resolved.approved_scope else ""
-        plan_clarifications.append(f"Human-resolved plan gate: {resolved.gate_id}{scope_note}")
     for question in goal_intake.get("clarifying_questions") or []:
         plan_clarifications.append(question)
 
@@ -819,6 +902,12 @@ class ControlSurfaceController:
         ]
         view["mission_summary"] = _mission_summary(self._session)
         view["needs_attention"] = _needs_attention(self._session)
+        view["session_diagnostics"] = _session_diagnostics(
+            self._session,
+            session_file=self._session_file,
+            session_loaded_from_disk=self._session_loaded_from_disk,
+        )
+        view["lifecycle_overview"] = _lifecycle_overview(self._session)
         view["session_file"] = str(self._session_file)
         view["session_loaded_from_disk"] = self._session_loaded_from_disk
         return view

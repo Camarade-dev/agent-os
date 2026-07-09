@@ -25,6 +25,7 @@ from admissible.control_surface import (
     ControlSurfaceController,
     DecisionQueueItem,
     InvalidSessionFileError,
+    SAMPLE_SLITHER_PROMPT,
     available_human_actions,
 )
 from admissible.run_loop import LIFECYCLE_RESOLVED_GATE, queue_item_needs_attention
@@ -222,6 +223,60 @@ class TestControllerWithSampleSession(unittest.TestCase):
         exported = self.controller.session_dict()
         self.assertNotIn("mission_summary", exported)
         self.assertNotIn("needs_attention", exported)
+        self.assertNotIn("session_diagnostics", exported)
+        self.assertNotIn("lifecycle_overview", exported)
+
+    def test_state_view_exposes_session_diagnostics_and_lifecycle_overview(self) -> None:
+        state = self.controller.load_sample_session()
+        diag = state["session_diagnostics"]
+        self.assertEqual(diag["session_file"], str(self.controller.session_file))
+        self.assertFalse(diag["session_loaded_from_disk"])
+        self.assertEqual(diag["session_id"], state["session_id"])
+        self.assertEqual(diag["current_turn"], state["run_loop"]["current_turn"])
+        self.assertIn("bridge_awaiting_response", diag)
+        self.assertIn("evidence_record_count", diag)
+
+        overview = state["lifecycle_overview"]
+        self.assertEqual(
+            len(overview["pending_human_decision"]),
+            state["mission_summary"]["needs_attention_count"],
+        )
+        self.assertIsInstance(overview["resolved_plan_gates"], list)
+        self.assertIsInstance(overview["admitted_not_executed"], list)
+        self.assertIsInstance(overview["refused_closed"], list)
+
+    def test_resolved_plan_gates_not_in_plan_clarifications(self) -> None:
+        from admissible.runner.extraction_lab import load_fixture
+
+        fixtures_dir = (
+            REPO_ROOT
+            / "benchmark"
+            / "long_run_scenarios"
+            / "cursor_slither_demo"
+            / "fixtures"
+            / "pasted_agent_responses"
+        )
+        self.controller.submit_goal(SAMPLE_SLITHER_PROMPT)
+        self.controller.ingest_agent_response(load_fixture(fixtures_dir / "cursor_plan_gate_resolution_request.txt"))
+        item = self.controller.state_view()["queue"][-1]
+        updated = self.controller.decide(
+            item["action_id"],
+            {"decision_type": "approve", "scope": "local_workspace_only", "rationale": "ok"},
+        )
+        clarifications = updated["needs_attention"]["plan_clarifications"]
+        self.assertFalse(any("Human-resolved plan gate:" in c for c in clarifications))
+        self.assertTrue(updated["lifecycle_overview"]["resolved_plan_gates"])
+        self.assertNotIn(
+            item["action_id"],
+            {a["action_id"] for a in updated["lifecycle_overview"]["pending_human_decision"]},
+        )
+
+    def test_bridge_awaiting_response_after_instruction_without_ingest(self) -> None:
+        self.controller.submit_goal("Build a tiny local CLI rename tool.")
+        self.controller.generate_next_instruction_packet()
+        diag = self.controller.state_view()["session_diagnostics"]
+        self.assertTrue(diag["bridge_awaiting_response"])
+        self.assertIn(1, diag["bridge_awaiting_turns"])
 
     def test_submit_goal_runs_intake_and_plan_audit(self) -> None:
         state = self.controller.submit_goal("Build a small local CLI tool to rename files.")
@@ -735,7 +790,40 @@ class TestControlSurfaceHtmlContent(unittest.TestCase):
 
     def test_needs_attention_panel_present(self) -> None:
         self.assertIn('id="needs-attention-panel"', self.raw)
-        self.assertIn("Needs Attention", self.raw)
+        self.assertIn("Supervised Run State", self.raw)
+
+    def test_session_diagnostics_panel_present(self) -> None:
+        self.assertIn('id="session-diagnostics-panel"', self.raw)
+        self.assertIn("Session Diagnostics", self.raw)
+        self.assertIn("renderSessionDiagnostics", self.raw)
+        self.assertIn("session_diagnostics", self.raw)
+
+    def test_no_execution_banner_visible_without_collapsing(self) -> None:
+        self.assertIn('id="no-execution-banner"', self.raw)
+        banner_start = self.raw.index('id="no-execution-banner"')
+        banner_region = self.raw[banner_start : banner_start + 400]
+        self.assertIn("does not execute side effects", banner_region)
+        self.assertNotIn("<details", banner_region)
+
+    def test_lifecycle_buckets_rendered_in_supervised_run_state(self) -> None:
+        for label in (
+            "Needs attention — pending human decision",
+            "Resolved plan gates — closed context",
+            "Admitted, not executed",
+            "Refused / closed",
+            "Evidence supplied — still blocked",
+            "Evidence satisfied — pending human decision",
+        ):
+            self.assertIn(label, self.raw)
+
+    def test_bridge_blocked_banner_present(self) -> None:
+        self.assertIn('id="bridge-blocked-banner"', self.raw)
+        self.assertIn("renderBridgeBlockedBanner", self.raw)
+        self.assertIn("duplicate_response", self.raw)
+
+    def test_resolved_gates_not_rendered_as_unresolved_blockers(self) -> None:
+        self.assertIn("resolvedGateRows", self.raw)
+        self.assertIn('startsWith("Human-resolved plan gate:")', self.raw)
 
     def test_selected_action_panel_present(self) -> None:
         self.assertIn('id="selected-action-panel"', self.raw)
@@ -757,7 +845,7 @@ class TestControlSurfaceHtmlContent(unittest.TestCase):
 
     def test_transcript_present_but_not_first_screen_content(self) -> None:
         self.assertIn('id="transcript-log"', self.raw)
-        # Mission Summary / Needs Attention / Queue must come before the
+        # Mission Summary / Supervised Run State / Queue must come before the
         # transcript in document order (progressive disclosure).
         transcript_index = self.raw.index('id="transcript-log"')
         self.assertLess(self.raw.index('id="mission-summary-panel"'), transcript_index)
