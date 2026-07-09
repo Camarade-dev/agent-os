@@ -173,9 +173,16 @@ class TestBlankSessionGoalFirstHtml(unittest.TestCase):
         # The sample loader must be a demoted/secondary affordance, not the
         # only primary-styled button in the header, and not named after one demo.
         self.assertNotIn("Load sample Slither session", self.html)
+        self.assertNotIn("Load sample session", self.html)
         sample_btn_start = self.html.index('id="btn-load-sample"')
         button_tag = self.html[self.html.rindex("<button", 0, sample_btn_start) : sample_btn_start + 60]
         self.assertIn("secondary", button_tag, "sample loader must not be primary-styled")
+        self.assertIn('id="examples-drawer"', self.html)
+        examples_start = self.html.index('id="examples-drawer"')
+        goal_end = self.html.index('</section>', self.html.index('id="goal-form-panel"'))
+        self.assertLess(goal_end, examples_start, "examples drawer must follow the goal form")
+        bridge_start = self.html.index('id="cursor-bridge-panel"')
+        self.assertLess(examples_start, bridge_start, "examples drawer must come before the bridge")
 
     def test_session_diagnostics_are_collapsed_by_default(self) -> None:
         # Diagnostics (session file path, sha/turn bookkeeping) belong in a

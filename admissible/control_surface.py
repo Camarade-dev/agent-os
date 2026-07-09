@@ -124,6 +124,7 @@ SAMPLE_SLITHER_PROMPT = (
 # the UI can show one clear "submit a goal first" message.
 GOAL_REQUIRED_REASON = "goal_required"
 NO_INSTRUCTION_REASON = "no_instruction"
+SESSION_NOT_EMPTY_REASON = "session_not_empty"
 
 # Display-only product/run phases and the single next action each implies.
 # These drive goal-first UI gating only; they never gate an admission
@@ -153,6 +154,19 @@ class NoGoalSubmittedError(ValueError):
     A ValueError subclass so the HTTP adapter's existing ``except ValueError``
     branch turns it into a 400 with a machine-readable ``reason`` (``goal_required``)
     in the JSON body, and so bridge/CLI callers surface it unchanged.
+    """
+
+    def __init__(self, message: str, *, detail: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.detail: dict[str, Any] = dict(detail) if detail else {}
+
+
+class SessionNotEmptyError(ValueError):
+    """Raised when a sample session load would replace a non-empty session.
+
+    Callers must pass ``force=True`` (or HTTP ``force`` / ``confirmed``) after
+    explicit user confirmation. A ValueError subclass so the HTTP adapter's
+    existing ``except ValueError`` branch returns 400 with ``session_not_empty``.
     """
 
     def __init__(self, message: str, *, detail: dict[str, Any] | None = None) -> None:
@@ -521,6 +535,7 @@ class ControlSession:
     plan_audit: dict[str, Any] | None = None
     bounded_executor_workspace: str | None = None
     run_loop: RunLoopState = field(default_factory=RunLoopState)
+    is_sample_session: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -538,6 +553,7 @@ class ControlSession:
             "plan_audit": self.plan_audit,
             "bounded_executor_workspace": self.bounded_executor_workspace,
             "run_loop": self.run_loop.to_dict(),
+            "is_sample_session": self.is_sample_session,
         }
 
     @classmethod
@@ -568,6 +584,7 @@ class ControlSession:
             plan_audit=data.get("plan_audit"),
             bounded_executor_workspace=data.get("bounded_executor_workspace"),
             run_loop=RunLoopState.from_dict(data.get("run_loop") or {}),
+            is_sample_session=bool(data.get("is_sample_session", False)),
         )
 
 
@@ -803,6 +820,25 @@ def _apply_evidence_attention_to_item(
         item.missing_evidence = list(attention["remaining_missing_evidence"])
     if action_records:
         item.lifecycle_status = attention["lifecycle_status"]
+
+
+def _session_has_content(session: "ControlSession") -> bool:
+    """Return whether the session has user-visible state worth protecting from replacement."""
+    if session.goal_intake or session.queue or session.human_decisions or session.transcript:
+        return True
+    run_loop = session.run_loop
+    if (
+        run_loop.current_turn > 0
+        or run_loop.instruction_packets
+        or run_loop.response_records
+        or run_loop.evidence_records
+        or run_loop.superseding_decisions
+        or run_loop.derived_lifecycle_resolutions
+        or run_loop.resolved_plan_gates
+    ):
+        return True
+    awaiting, _ = _bridge_awaiting_response(run_loop)
+    return awaiting
 
 
 def _bridge_awaiting_response(run_loop: RunLoopState) -> tuple[bool, list[int]]:
@@ -1110,6 +1146,7 @@ class ControlSurfaceController:
                 bridge_awaiting_response=view["session_diagnostics"]["bridge_awaiting_response"],
             )
         )
+        view["session_has_content"] = _session_has_content(self._session)
         view["lifecycle_overview"] = _lifecycle_overview(self._session)
         view["session_file"] = str(self._session_file)
         view["session_loaded_from_disk"] = self._session_loaded_from_disk
@@ -1179,8 +1216,15 @@ class ControlSurfaceController:
 
     # -- queue loading ----------------------------------------------------
 
-    def load_sample_session(self) -> dict[str, Any]:
+    def load_sample_session(self, *, force: bool = False) -> dict[str, Any]:
+        if _session_has_content(self._session) and not force:
+            raise SessionNotEmptyError(
+                "cannot load sample session: current session has content; "
+                "pass force=true after explicit confirmation to replace it",
+                detail={"reason": SESSION_NOT_EMPTY_REASON},
+            )
         self._session = self._new_session()
+        self._session.is_sample_session = True
         self.submit_goal(SAMPLE_SLITHER_PROMPT)
         self._load_queue_from_trace(self._sample_trace_path)
         self._session.transcript.append(
@@ -1188,8 +1232,8 @@ class ControlSurfaceController:
                 "admissible_message",
                 {
                     "message": (
-                        f"Loaded sample Cursor/Admissible admitted-execution trace "
-                        f"({len(self._session.queue)} action(s)) for the Slither demo."
+                        f"Loaded example admitted-execution trace "
+                        f"({len(self._session.queue)} action(s))."
                     )
                 },
             )
@@ -1749,7 +1793,9 @@ __all__ = [
     "ControlSurfaceController",
     "InvalidSessionFileError",
     "NoGoalSubmittedError",
+    "SessionNotEmptyError",
     "GOAL_REQUIRED_REASON",
+    "SESSION_NOT_EMPTY_REASON",
     "DECISION_TYPES",
     "DecisionQueueItem",
     "HumanDecisionRecord",

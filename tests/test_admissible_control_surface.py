@@ -875,10 +875,11 @@ class TestControlSurfaceHtmlContent(unittest.TestCase):
             self.assertIn(decision_type, self.raw)
 
     def test_top_controls_present(self) -> None:
-        self.assertIn('id="btn-load-sample"', self.raw)
         self.assertIn('id="btn-export"', self.raw)
         self.assertIn('id="btn-reset"', self.raw)
         self.assertIn('id="import-file"', self.raw)
+        self.assertIn('id="examples-drawer"', self.raw)
+        self.assertIn('id="btn-load-sample"', self.raw)
 
     def test_truth_boundary_language_present(self) -> None:
         self.assertIn("No side effect executed by Admissible.", self.normalized)

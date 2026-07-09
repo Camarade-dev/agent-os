@@ -283,7 +283,6 @@
     <details id="autonomy-details"><summary>More about this level</summary><div id="autonomy-description"></div></details>
   </div>
   <div class="top-actions">
-    <button type="button" class="secondary" id="btn-load-sample">Load sample session</button>
     <button type="button" id="btn-export" class="secondary">Export session JSON</button>
     <label class="file-label" for="import-file">Import session JSON</label>
     <input type="file" id="import-file" accept="application/json" hidden>
@@ -308,6 +307,18 @@
       <button type="submit">Send to Admissible</button>
     </form>
   </section>
+
+  <details id="examples-drawer" class="advanced-drawer">
+    <summary>Examples (optional demo sessions)</summary>
+    <p class="hint">
+      Load a pre-built example to explore Admissible with a demo goal and admitted-action trace.
+      <strong>This replaces your current session</strong> when one already has a goal, queue, or transcript.
+    </p>
+    <button type="button" class="secondary" id="btn-load-sample">Load example session</button>
+    <p class="hint" style="font-size:.72rem;margin-top:.4rem;">
+      Includes the historical Slither-like browser game demo trace (local-only, no deploy).
+    </p>
+  </details>
 
   <section class="panel" id="cursor-bridge-panel">
     <h2>2. Cursor supervised file bridge</h2>
@@ -623,7 +634,7 @@ function renderMissionSummary(state) {
   if (!hasContent) {
     body.innerHTML = `
       <div class="empty-state">
-        <p>Send a goal in the panel above to get started, or load the sample session from the header.</p>
+        <p>Send a goal in the panel above to get started.</p>
         <div class="phase-legend">
           <div class="phase-box"><strong>Frame</strong>Goal intake turns your prompt into task type, risk, and complexity.</div>
           <span class="phase-arrow">&rarr;</span>
@@ -1600,7 +1611,14 @@ document.getElementById("autonomy-select").addEventListener("change", (event) =>
 });
 
 document.getElementById("btn-load-sample").addEventListener("click", () => {
-  runAction(() => apiPost("/api/session/load_sample", {}));
+  const hasContent = lastState && lastState.session_has_content;
+  const message = hasContent
+    ? "Load example session? This replaces your current goal, queue, transcript, and decision records with a pre-built demo session."
+    : "Load example session? This imports a pre-built demo goal and admitted-action trace into this session.";
+  if (!window.confirm(message)) return;
+  selectedActionId = null;
+  const body = hasContent ? { force: true } : {};
+  runAction(() => apiPost("/api/session/load_sample", body));
 });
 
 document.getElementById("btn-reset").addEventListener("click", () => {

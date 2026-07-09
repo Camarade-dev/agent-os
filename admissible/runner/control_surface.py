@@ -165,7 +165,8 @@ class _ControlSurfaceRequestHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/session/goal":
                 result = self.controller.submit_goal(body.get("prompt", ""))
             elif parsed.path == "/api/session/load_sample":
-                result = self.controller.load_sample_session()
+                force = bool(body.get("force") or body.get("confirmed"))
+                result = self.controller.load_sample_session(force=force)
             elif parsed.path == "/api/session/load_trace":
                 result = self.controller.load_trace(body.get("path"))
             elif parsed.path == "/api/session/run_loop/generate_instruction":
