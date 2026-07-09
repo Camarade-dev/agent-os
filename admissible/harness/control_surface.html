@@ -81,6 +81,16 @@
   #app-main { max-width: 960px; margin: 0 auto; padding: .85rem 1.1rem 2.5rem; display: flex; flex-direction: column; gap: .85rem; }
 
   section.panel { background: var(--cs-panel-bg); border: 1px solid var(--cs-border-strong); border-radius: 10px; padding: .8rem .9rem; }
+  section.panel.goal-first-panel { border-color: var(--cs-accent-strong); box-shadow: 0 0 0 1px var(--cs-accent-strong) inset; }
+  .goal-required-note {
+    margin: 0 0 .6rem; padding: .5rem .7rem; border-radius: 6px; font-size: .8rem;
+    background: var(--cs-warning-bg); color: var(--cs-warning-text); border: 1px solid var(--cs-warning-border);
+  }
+  #cursor-bridge-panel.bridge-disabled { opacity: .62; }
+  details.advanced-drawer { background: var(--cs-panel-bg); border: 1px solid var(--cs-border-strong); border-radius: 10px; padding: .5rem .9rem; }
+  details.advanced-drawer > summary { font-size: .8rem; }
+  details.advanced-drawer[open] { padding-bottom: .8rem; }
+  details.advanced-drawer > #session-diagnostics-panel { border: none; padding: .4rem 0 0; background: transparent; }
 
   .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr)); gap: .5rem; }
   .stat-tile { background: var(--cs-card-bg); border: 1px solid var(--cs-border-strong); border-radius: 8px; padding: .45rem .6rem; }
@@ -273,7 +283,7 @@
     <details id="autonomy-details"><summary>More about this level</summary><div id="autonomy-description"></div></details>
   </div>
   <div class="top-actions">
-    <button type="button" id="btn-load-sample">Load sample Slither session</button>
+    <button type="button" class="secondary" id="btn-load-sample">Load sample session</button>
     <button type="button" id="btn-export" class="secondary">Export session JSON</button>
     <label class="file-label" for="import-file">Import session JSON</label>
     <input type="file" id="import-file" accept="application/json" hidden>
@@ -286,13 +296,26 @@
 
 <main id="app-main">
 
-  <section class="panel" id="session-diagnostics-panel">
-    <h2>Session Diagnostics</h2>
-    <div id="session-diagnostics-body"><p class="no-action-note">Loading session diagnostics…</p></div>
+  <section class="panel goal-first-panel" id="goal-form-panel">
+    <h2>1. Send a Goal to start</h2>
+    <p class="hint">
+      Every Admissible run is goal-first: submit a goal and Admissible runs offline goal intake and
+      plan audit. It will not build or execute anything. The supervised Cursor bridge below stays
+      disabled until a goal exists.
+    </p>
+    <form id="goal-form">
+      <textarea id="goal-input" placeholder="e.g. Build a small browser-based game in a local workspace. Keep it local-only. Do not deploy."></textarea>
+      <button type="submit">Send to Admissible</button>
+    </form>
   </section>
 
   <section class="panel" id="cursor-bridge-panel">
-    <h2>Cursor supervised file bridge</h2>
+    <h2>2. Cursor supervised file bridge</h2>
+    <div id="bridge-goal-required-note" class="goal-required-note" hidden>
+      <strong>Submit a goal first.</strong>
+      The supervised bridge writes an instruction packet derived from your goal; it is disabled until
+      a goal has been submitted above.
+    </div>
     <p class="turn-line">Turn: <strong id="bridge-turn">0</strong></p>
     <p class="hint" style="font-size:.78rem;color:var(--cs-muted);margin:0 0 .5rem;">
       This is the canonical way to run a turn with Cursor: Admissible writes an instruction file, you point
@@ -406,17 +429,6 @@
     </div>
   </section>
 
-  <section class="panel" id="goal-form-panel">
-    <h2>Send a Goal</h2>
-    <form id="goal-form">
-      <p class="hint">
-        Admissible will run offline goal intake and plan audit -- it will not build or execute anything.
-      </p>
-      <textarea id="goal-input" placeholder="e.g. Build a small browser-based Slither-like game..."></textarea>
-      <button type="submit">Send to Admissible</button>
-    </form>
-  </section>
-
   <section class="panel" id="goal-intake-panel">
     <h2>Goal Intake</h2>
     <div id="goal-intake-body"><p id="goal-empty" class="no-action-note">No goal submitted yet.</p></div>
@@ -435,6 +447,14 @@
       <div id="decision-records-full-body"></div>
     </details>
   </section>
+
+  <details id="session-diagnostics-details" class="advanced-drawer">
+    <summary>Advanced: session diagnostics &amp; bridge internals</summary>
+    <section class="panel" id="session-diagnostics-panel">
+      <h2>Session Diagnostics</h2>
+      <div id="session-diagnostics-body"><p class="no-action-note">Loading session diagnostics…</p></div>
+    </section>
+  </details>
 
 </main>
 
@@ -603,7 +623,7 @@ function renderMissionSummary(state) {
   if (!hasContent) {
     body.innerHTML = `
       <div class="empty-state">
-        <p>Send a goal below, or load the sample Slither session above, to get started.</p>
+        <p>Send a goal in the panel above to get started, or load the sample session from the header.</p>
         <div class="phase-legend">
           <div class="phase-box"><strong>Frame</strong>Goal intake turns your prompt into task type, risk, and complexity.</div>
           <span class="phase-arrow">&rarr;</span>
@@ -1267,6 +1287,27 @@ function renderCursorBridgeTurn(state) {
   if (el) el.textContent = (state.run_loop || {}).current_turn || 0;
 }
 
+// Goal-first gating: before a goal is submitted the server rejects every
+// instruction-producing path (reason: goal_required). Mirror that in the UI
+// so the bridge/manual controls are visibly disabled with a clear reason
+// instead of failing only after a click.
+function renderBridgeGating(state) {
+  const canWrite = state.can_write_instruction !== false;
+  const panel = document.getElementById("cursor-bridge-panel");
+  const note = document.getElementById("bridge-goal-required-note");
+  if (panel) panel.classList.toggle("bridge-disabled", !canWrite);
+  if (note) note.hidden = canWrite;
+
+  const goalRequired = state.write_instruction_disabled_reason === "goal_required";
+  const disabledTitle = goalRequired ? "Submit a goal first." : "";
+  for (const id of ["btn-bridge-write-instruction", "btn-generate-instruction"]) {
+    const btn = document.getElementById(id);
+    if (!btn) continue;
+    btn.disabled = !canWrite;
+    btn.title = disabledTitle;
+  }
+}
+
 function renderBridgeWorkspaceStatus(result) {
   const el = document.getElementById("bridge-workspace-status");
   if (!el) return;
@@ -1378,6 +1419,7 @@ function render(state) {
   renderSessionDiagnostics(state);
   renderBridgeBlockedBanner(state);
   renderCursorBridgeTurn(state);
+  renderBridgeGating(state);
   renderManualFallback(state);
   renderBridgeFromState(state);
   renderMissionSummary(state);
@@ -1439,6 +1481,10 @@ async function onBoundedExecuteSubmit(event) {
 }
 
 document.getElementById("btn-generate-instruction").addEventListener("click", () => {
+  if (lastState && lastState.can_write_instruction === false) {
+    showError("Submit a goal to Admissible before generating an instruction packet.");
+    return;
+  }
   runAction(() => apiPost("/api/session/run_loop/generate_instruction", {}));
 });
 
@@ -1498,6 +1544,10 @@ document.getElementById("bridge-workspace-path").addEventListener("blur", () => 
 });
 
 document.getElementById("btn-bridge-write-instruction").addEventListener("click", async () => {
+  if (lastState && lastState.can_write_instruction === false) {
+    showError("Submit a goal to Admissible before writing the instruction file.");
+    return;
+  }
   const workspacePath = bridgeWorkspacePath();
   if (!workspacePath) {
     showError("Enter a workspace path before writing the instruction file.");

@@ -659,6 +659,9 @@ class TestSessionPersistenceParity(unittest.TestCase):
         workspace.mkdir()
 
         writer = build_http_controller(session_dir=self.session_dir, sample_trace_path=self.sample_trace)
+        # Bridge write is goal-first (ADMISSIBLE_UX_014); a packet only exists
+        # once a goal has been submitted.
+        writer.submit_goal("Build a tiny local-only page. Local only. Do not deploy.")
         write_next_instruction_with_controller(writer, workspace)
         (workspace / ".admissible" / "agent-response.md").write_text(raw_response, encoding="utf-8")
         ingest_response_file_with_controller(writer, workspace)

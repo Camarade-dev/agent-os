@@ -974,14 +974,23 @@ def generate_instruction_packet(
     and current queue state. Never calls a model or network provider.
     Autonomy level only changes `may_propose` wording; the non-execution
     boundaries and must-not list are identical at every level.
+
+    Requires a submitted goal: raises ``ValueError`` when ``goal_intake`` is
+    empty rather than emitting a placeholder "No goal has been submitted"
+    packet. The Control Surface's goal-first guard normally rejects this
+    earlier (see ``ControlSurfaceController.generate_next_instruction_packet``);
+    this is defense in depth so no packet-producing path can smuggle a
+    goal-less instruction through this builder.
     """
-    goal_intake = goal_intake or {}
+    if not goal_intake:
+        raise ValueError(
+            "cannot generate an instruction packet before a goal has been submitted"
+        )
     plan_audit = plan_audit or {}
 
     task = (
-        f"{goal_intake.get('task_type', 'unspecified_task')}: {goal_intake.get('deliverable', 'unspecified deliverable')}"
-        if goal_intake
-        else "No goal has been submitted to Admissible yet."
+        f"{goal_intake.get('task_type', 'unspecified_task')}: "
+        f"{goal_intake.get('deliverable', 'unspecified deliverable')}"
     )
 
     packet = AgentInstructionPacket(

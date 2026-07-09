@@ -61,12 +61,31 @@ RAW_INSTALL_DEPENDENCY_RESPONSE = (
     "    npm install left-pad\n"
 )
 
+# Every instruction-producing bridge path is goal-first
+# (ADMISSIBLE_UX_014_GOAL_FIRST_GATING): a packet can only be generated once a
+# goal has been submitted. These bridge-mechanics tests submit this goal first
+# so they exercise the write/ingest plumbing, not the blank-session guard
+# (which is covered directly in tests/test_admissible_first_run_product_gaps.py).
+BRIDGE_TEST_GOAL = (
+    "Build a tiny local-only browser page in a local workspace. "
+    "Keep it local-only. Do not deploy."
+)
+
 
 def _make_controller(tmpdir: str, name: str = "sessions") -> ControlSurfaceController:
-    return ControlSurfaceController(
+    controller = ControlSurfaceController(
         session_dir=Path(tmpdir) / name,
         sample_trace_path=SAMPLE_TRACE_PATH,
     )
+    controller.submit_goal(BRIDGE_TEST_GOAL)
+    return controller
+
+
+def _seed_goal(session_dir: Path) -> None:
+    """Persist a goal into a session dir so a later, separate-process CLI/HTTP
+    controller (built fresh from that dir) passes the goal-first guard."""
+    controller = build_controller(session_dir=session_dir)
+    controller.submit_goal(BRIDGE_TEST_GOAL)
 
 
 class TestRenderInstructionFile(unittest.TestCase):
@@ -437,12 +456,14 @@ class TestCliWrappersLoadPersistedSession(unittest.TestCase):
         self._tmpdir.cleanup()
 
     def test_write_next_instruction_continues_turn_across_processes(self) -> None:
+        _seed_goal(self.session_dir)
         first = write_next_instruction(self.workspace, session_dir=self.session_dir)
         second = write_next_instruction(self.workspace, session_dir=self.session_dir)
         self.assertEqual(first["bridge"]["turn_number"], 1)
         self.assertEqual(second["bridge"]["turn_number"], 2)
 
     def test_ingest_response_file_uses_persisted_session(self) -> None:
+        _seed_goal(self.session_dir)
         write_next_instruction(self.workspace, session_dir=self.session_dir)
         (self.workspace / ".admissible" / "agent-response.md").write_text(
             RAW_INSTALL_DEPENDENCY_RESPONSE, encoding="utf-8"
@@ -467,6 +488,7 @@ class TestCopyNextInstruction(unittest.TestCase):
     def setUp(self) -> None:
         self._tmpdir = tempfile.TemporaryDirectory()
         self.session_dir = Path(self._tmpdir.name) / "sessions"
+        _seed_goal(self.session_dir)
 
     def tearDown(self) -> None:
         self._tmpdir.cleanup()
@@ -641,6 +663,7 @@ class TestCliMain(unittest.TestCase):
         return code, buf.getvalue()
 
     def test_write_instruction_prints_path_bytes_sha256_mtime_turn(self) -> None:
+        _seed_goal(self.session_dir)
         code, out = self._run(["--write-instruction", str(self.workspace)])
         self.assertEqual(code, 0)
         self.assertIn(str(self.workspace / ".admissible" / "next-agent-instruction.md"), out)
@@ -650,6 +673,7 @@ class TestCliMain(unittest.TestCase):
         self.assertIn("turn 1", out)
 
     def test_ingest_response_prints_path_bytes_sha256_mtime_count_and_decision_summary(self) -> None:
+        _seed_goal(self.session_dir)
         self._run(["--write-instruction", str(self.workspace)])
         (self.workspace / ".admissible" / "agent-response.md").write_text(
             RAW_INSTALL_DEPENDENCY_RESPONSE, encoding="utf-8"
@@ -701,6 +725,9 @@ class TestCursorBridgeHttpServer(unittest.TestCase):
             session_dir=Path(cls._tmpdir.name) / "sessions",
             sample_trace_path=SAMPLE_TRACE_PATH,
         )
+        # Bridge write is goal-first (ADMISSIBLE_UX_014); submit a goal so the
+        # write/ingest routes exercise the bridge plumbing, not the guard.
+        controller.submit_goal(BRIDGE_TEST_GOAL)
         cls.server = make_server(controller, host="127.0.0.1", port=0)
         cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)

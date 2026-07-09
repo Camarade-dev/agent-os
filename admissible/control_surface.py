@@ -118,9 +118,42 @@ SAMPLE_SLITHER_PROMPT = (
     "Ask before installing dependencies or deleting existing files."
 )
 
+# Machine-readable reason surfaced (in an error `detail`/`state_view` field)
+# when an instruction-producing or response-ingesting action is attempted
+# before a goal has been submitted. The HTTP layer forwards it verbatim so
+# the UI can show one clear "submit a goal first" message.
+GOAL_REQUIRED_REASON = "goal_required"
+NO_INSTRUCTION_REASON = "no_instruction"
+
+# Display-only product/run phases and the single next action each implies.
+# These drive goal-first UI gating only; they never gate an admission
+# decision (that logic stays in the rules-only evaluator and the gates).
+RUN_PHASE_NEEDS_GOAL = "needs_goal"
+RUN_PHASE_READY_TO_INSTRUCT = "ready_to_instruct"
+RUN_PHASE_AWAITING_AGENT_RESPONSE = "awaiting_agent_response"
+RUN_PHASE_REVIEWING_ACTIONS = "reviewing_actions"
+
+NEXT_ACTION_SUBMIT_GOAL = "submit_goal"
+NEXT_ACTION_WRITE_INSTRUCTION = "write_instruction"
+NEXT_ACTION_INGEST_RESPONSE = "ingest_agent_response"
+NEXT_ACTION_REVIEW_ACTIONS = "review_actions"
+
 
 class InvalidSessionFileError(ValueError):
     """Raised when a persisted Control Surface session file cannot be loaded."""
+
+    def __init__(self, message: str, *, detail: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.detail: dict[str, Any] = dict(detail) if detail else {}
+
+
+class NoGoalSubmittedError(ValueError):
+    """Raised when an instruction packet is requested before a goal exists.
+
+    A ValueError subclass so the HTTP adapter's existing ``except ValueError``
+    branch turns it into a 400 with a machine-readable ``reason`` (``goal_required``)
+    in the JSON body, and so bridge/CLI callers surface it unchanged.
+    """
 
     def __init__(self, message: str, *, detail: dict[str, Any] | None = None) -> None:
         super().__init__(message)
@@ -817,6 +850,59 @@ def _session_diagnostics(
     }
 
 
+def _product_state(
+    session: "ControlSession",
+    *,
+    bridge_awaiting_response: bool,
+) -> dict[str, Any]:
+    """Display/control-only product state for goal-first UI gating.
+
+    Pure projection over already-computed session state -- it carries no
+    gating logic of its own: it only reports whether a goal exists and what
+    the single next expected action is, so the UI can lead with the goal
+    form and disable instruction/bridge controls before a goal is submitted.
+    The server-side guard that actually blocks packet generation lives in
+    ``ControlSurfaceController.generate_next_instruction_packet``; these
+    fields mirror it for display and never substitute for an admission gate.
+    """
+    run_loop = session.run_loop
+    has_goal = bool(session.goal_intake)
+    has_instruction = bool(run_loop.instruction_packets)
+    has_response = bool(run_loop.response_records)
+    has_queue = bool(session.queue)
+
+    if not has_goal:
+        run_phase = RUN_PHASE_NEEDS_GOAL
+        next_expected_action = NEXT_ACTION_SUBMIT_GOAL
+    elif bridge_awaiting_response:
+        run_phase = RUN_PHASE_AWAITING_AGENT_RESPONSE
+        next_expected_action = NEXT_ACTION_INGEST_RESPONSE
+    elif has_response or has_queue:
+        run_phase = RUN_PHASE_REVIEWING_ACTIONS
+        next_expected_action = NEXT_ACTION_REVIEW_ACTIONS
+    else:
+        run_phase = RUN_PHASE_READY_TO_INSTRUCT
+        next_expected_action = NEXT_ACTION_WRITE_INSTRUCTION
+
+    write_instruction_disabled_reason = None if has_goal else GOAL_REQUIRED_REASON
+    if not has_goal:
+        ingest_disabled_reason: str | None = GOAL_REQUIRED_REASON
+    elif not has_instruction:
+        ingest_disabled_reason = NO_INSTRUCTION_REASON
+    else:
+        ingest_disabled_reason = None
+
+    return {
+        "has_goal": has_goal,
+        "run_phase": run_phase,
+        "next_expected_action": next_expected_action,
+        "can_write_instruction": has_goal,
+        "write_instruction_disabled_reason": write_instruction_disabled_reason,
+        "can_ingest_response": ingest_disabled_reason is None,
+        "ingest_disabled_reason": ingest_disabled_reason,
+    }
+
+
 def _lifecycle_overview(session: "ControlSession") -> dict[str, Any]:
     """Display-only lifecycle buckets for supervised-run demo clarity."""
     queue = session.queue
@@ -1016,6 +1102,12 @@ class ControlSurfaceController:
             self._session,
             session_file=self._session_file,
             session_loaded_from_disk=self._session_loaded_from_disk,
+        )
+        view.update(
+            _product_state(
+                self._session,
+                bridge_awaiting_response=view["session_diagnostics"]["bridge_awaiting_response"],
+            )
         )
         view["lifecycle_overview"] = _lifecycle_overview(self._session)
         view["session_file"] = str(self._session_file)
@@ -1353,7 +1445,21 @@ class ControlSurfaceController:
         Deterministic and offline: derived from goal intake, plan audit,
         autonomy level, and the current queue. Does not call any provider
         and does not execute anything.
+
+        Goal-first guard: raises ``NoGoalSubmittedError`` (a ValueError) when
+        no goal has been submitted, before advancing the run-loop turn or
+        producing any packet. This is the single server-side choke point for
+        every instruction-producing path (the manual "Generate next agent
+        instruction" fallback, the Cursor file bridge's
+        ``write_next_instruction_with_controller``, and the CLI
+        ``copy_next_instruction``), so a blank session can never write a
+        placeholder "No goal has been submitted" instruction packet.
         """
+        if not self._session.goal_intake:
+            raise NoGoalSubmittedError(
+                "Submit a goal to Admissible before generating an instruction packet.",
+                detail={"reason": GOAL_REQUIRED_REASON},
+            )
         run_loop = self._session.run_loop
         turn_number = run_loop.current_turn + 1
         packet = generate_instruction_packet(
@@ -1641,6 +1747,8 @@ __all__ = [
     "ControlSession",
     "ControlSurfaceController",
     "InvalidSessionFileError",
+    "NoGoalSubmittedError",
+    "GOAL_REQUIRED_REASON",
     "DECISION_TYPES",
     "DecisionQueueItem",
     "HumanDecisionRecord",
