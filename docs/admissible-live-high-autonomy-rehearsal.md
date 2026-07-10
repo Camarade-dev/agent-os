@@ -35,6 +35,21 @@ writing the response file. That is the only integration.
 > directly, with the agent confined to an isolated **agent workspace** and no direct write
 > authority over the **target workspace**. The file bridge stays available and unchanged as
 > the external/manual backend.
+>
+> **Update (slice ADMISSIBLE_RUN_033):** the callable backend is now configured for the real
+> local **Cursor Agent CLI** (`cursor-agent`) in read-only planning mode
+> (`--print --output-format text --mode plan --workspace {agent_workspace} --trust {prompt}`).
+> Safety validation rejects `--force` / `--yolo` / `--sandbox disabled`, requires `--print` +
+> plan mode, and requires the isolated `{agent_workspace}`. Configure it with:
+>
+> ```powershell
+> $env:ADMISSIBLE_CURSOR_CLI_COMMAND = "cursor-agent"
+> $env:ADMISSIBLE_CURSOR_CLI_ARGS = "--print --output-format text --mode plan --workspace {agent_workspace} --trust {prompt}"
+> $env:ADMISSIBLE_CURSOR_CLI_MODEL_LABEL = "cursor-agent-default"
+> ```
+>
+> Operator smoke before the first real live run (never run from tests):
+> `cursor-agent --print --output-format text --mode plan --workspace <agent_workspace> --trust "Reply with exactly: ADMISSIBLE_CURSOR_AGENT_SMOKE_OK"`.
 
 ## Automatic instruction dispatch (hardened file bridge)
 

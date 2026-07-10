@@ -124,18 +124,57 @@ CURSOR_CLI_MODEL_LABEL_ENV = "ADMISSIBLE_CURSOR_CLI_MODEL_LABEL"
 
 INPUT_MODE_INSTRUCTION_FILE = "instruction_file"
 INPUT_MODE_STDIN = "stdin"
+INPUT_MODE_PROMPT_ARG = "prompt_arg"
 OUTPUT_MODE_STDOUT = "stdout"
 OUTPUT_MODE_RESPONSE_FILE = "response_file"
 
 # Placeholders the operator may reference in the argv template. Substituted with
-# absolute paths that always live inside the *agent* workspace.
+# absolute paths that always live inside the *agent* workspace, or (for
+# ``{prompt}``) with the instruction text as a single argv element (shell=False,
+# so it is never shell-interpreted).
 PLACEHOLDER_INSTRUCTION_FILE = "{instruction_file}"
 PLACEHOLDER_RESPONSE_FILE = "{response_file}"
 PLACEHOLDER_AGENT_WORKSPACE = "{agent_workspace}"
+PLACEHOLDER_PROMPT = "{prompt}"
 
 AGENT_BRIDGE_SUBDIR = ".admissible"
 AGENT_INSTRUCTION_FILENAME = "next-agent-instruction.md"
 AGENT_RESPONSE_FILENAME = "agent-response.md"
+
+# -- Cursor Agent CLI safe preset (slice ADMISSIBLE_RUN_033) -----------------
+# The real local Cursor Agent CLI is ``cursor-agent`` (NOT ``cursor agent`` — the
+# ``cursor`` command is the IDE wrapper and does not expose the real Agent CLI).
+# Admissible only ever drives it in read-only *planning* mode: it analyzes and
+# proposes, it does not edit. The model still proposes; only Admissible's bounded
+# executor writes to the target workspace.
+CURSOR_AGENT_CLI_COMMAND = "cursor-agent"
+CURSOR_AGENT_CLI_SAFE_ARGS: tuple[str, ...] = (
+    "--print",
+    "--output-format",
+    "text",
+    "--mode",
+    "plan",
+    "--workspace",
+    PLACEHOLDER_AGENT_WORKSPACE,
+    "--trust",
+    PLACEHOLDER_PROMPT,
+)
+CURSOR_AGENT_CLI_MODEL_LABEL = "cursor-agent-default"
+
+# Command basenames recognised as the real Cursor Agent CLI vs the IDE wrapper.
+_CURSOR_AGENT_COMMAND_NAMES = frozenset(
+    {"cursor-agent", "cursor-agent.exe", "cursor-agent.cmd"}
+)
+_CURSOR_IDE_COMMAND_NAMES = frozenset({"cursor", "cursor.exe", "cursor.cmd"})
+
+# Flags that must never appear in a Cursor CLI argv template — they grant
+# unsupervised write/execute authority or disable sandboxing.
+_UNSAFE_CURSOR_FLAGS = ("--force", "--yolo")
+
+# When the instruction text exceeds this, the ``{prompt}`` substitution writes it
+# to an agent-workspace file and passes a short pointer prompt instead, so the
+# argv stays well within the Windows command-line length limit.
+PROMPT_ARG_MAX_CHARS = 6000
 
 # Environment variables passed through to a spawned Cursor CLI. Deliberately a
 # small OS-essential allowlist so provider keys and unrelated secrets in the
@@ -487,6 +526,109 @@ def _parse_args_template(raw: str | None) -> list[str] | None:
     return raw.split()
 
 
+def _command_basename(command_path: str | None) -> str:
+    return Path(command_path).name.lower() if command_path else ""
+
+
+def is_cursor_agent_command(command_path: str | None) -> bool:
+    """True when the command is the real Cursor Agent CLI (``cursor-agent``)."""
+    return _command_basename(command_path) in _CURSOR_AGENT_COMMAND_NAMES
+
+
+def _flag_value(tokens: list[str], flag: str) -> str | None:
+    """Return the token following ``flag`` (or the ``flag=value`` tail)."""
+    for index, token in enumerate(tokens):
+        low = token.lower()
+        if low == flag:
+            return tokens[index + 1] if index + 1 < len(tokens) else None
+        if low.startswith(flag + "="):
+            return token.split("=", 1)[1]
+    return None
+
+
+def assess_cursor_cli_safety(
+    command_path: str | None, args_template: list[str] | None
+) -> tuple[list[str], list[str]]:
+    """Return (blocking_reasons, warnings) for a Cursor CLI argv template.
+
+    Admissible only runs the Cursor Agent CLI in read-only *planning* mode. This
+    validation is defense-in-depth on top of the workspace separation and the
+    ingest/admission path: it blocks configurations that would grant the agent
+    unsupervised write/execute authority, and — for the ``cursor-agent`` command
+    specifically — requires the read-only ``--print`` + plan-mode flags.
+    """
+    blocking: list[str] = []
+    warnings: list[str] = []
+    if not args_template:
+        return blocking, warnings
+
+    tokens = list(args_template)
+    lower = [t.lower() for t in tokens]
+
+    # Always-dangerous for any Cursor-family CLI, regardless of command name.
+    for flag in _UNSAFE_CURSOR_FLAGS:
+        if flag in lower:
+            blocking.append(
+                f"Unsafe flag {flag} is not allowed for the Cursor CLI backend "
+                "(grants unsupervised write/execute authority)."
+            )
+    sandbox_value = _flag_value(tokens, "--sandbox")
+    if (sandbox_value or "").lower() == "disabled":
+        blocking.append("`--sandbox disabled` is not allowed; sandboxing must not be disabled.")
+
+    # The IDE wrapper (`cursor agent ...`) does not expose the real Agent CLI.
+    if _command_basename(command_path) in _CURSOR_IDE_COMMAND_NAMES and "agent" in lower:
+        blocking.append(
+            "Use the `cursor-agent` command, not `cursor agent`: the `cursor` IDE wrapper "
+            "does not expose the real Cursor Agent CLI."
+        )
+
+    # A configured --workspace must always be the isolated agent workspace.
+    if "--workspace" in lower:
+        workspace_value = _flag_value(tokens, "--workspace") or ""
+        if PLACEHOLDER_AGENT_WORKSPACE not in workspace_value:
+            blocking.append(
+                "--workspace must use the {agent_workspace} placeholder, never a fixed path "
+                "or the target workspace."
+            )
+
+    # Cursor Agent read-only requirements only apply to the agent CLI itself.
+    if is_cursor_agent_command(command_path):
+        if "--print" not in lower:
+            blocking.append("Cursor Agent CLI must run with --print (non-interactive).")
+        mode_value = (_flag_value(tokens, "--mode") or "").lower()
+        if mode_value != "plan" and "--plan" not in lower:
+            blocking.append(
+                "Cursor Agent CLI must run in read-only planning mode (--mode plan or --plan)."
+            )
+        output_value = (_flag_value(tokens, "--output-format") or "").lower()
+        if output_value and output_value not in ("text", "json"):
+            warnings.append(
+                f"Cursor Agent --output-format {output_value!r} is not text/json; stdout may "
+                "not ingest cleanly."
+            )
+        if "--model" not in lower:
+            warnings.append("No --model configured; Cursor Agent will use its default model.")
+
+    return blocking, warnings
+
+
+def cursor_agent_cli_safe_args_template() -> list[str]:
+    """The safe read-only Cursor Agent CLI argv template (as an argv list)."""
+    return list(CURSOR_AGENT_CLI_SAFE_ARGS)
+
+
+def cursor_agent_cli_preset_env(command: str = CURSOR_AGENT_CLI_COMMAND) -> dict[str, str]:
+    """Environment variables that configure the safe Cursor Agent CLI preset."""
+    return {
+        CURSOR_CLI_COMMAND_ENV: command,
+        CURSOR_CLI_ARGS_ENV: " ".join(CURSOR_AGENT_CLI_SAFE_ARGS),
+        CURSOR_CLI_INPUT_MODE_ENV: INPUT_MODE_PROMPT_ARG,
+        CURSOR_CLI_OUTPUT_MODE_ENV: OUTPUT_MODE_STDOUT,
+        CURSOR_CLI_MODEL_LABEL_ENV: CURSOR_AGENT_CLI_MODEL_LABEL,
+    }
+
+
 @dataclass
 class CursorCliConfig:
     """Safe, discovered/operator-supplied Cursor CLI configuration.
@@ -515,7 +657,11 @@ class CursorCliConfig:
         if version_args is None:
             version_args = ["--version"]
         input_mode = (env.get(CURSOR_CLI_INPUT_MODE_ENV) or INPUT_MODE_INSTRUCTION_FILE).strip()
-        if input_mode not in (INPUT_MODE_INSTRUCTION_FILE, INPUT_MODE_STDIN):
+        if input_mode not in (
+            INPUT_MODE_INSTRUCTION_FILE,
+            INPUT_MODE_STDIN,
+            INPUT_MODE_PROMPT_ARG,
+        ):
             input_mode = INPUT_MODE_INSTRUCTION_FILE
         output_mode = (env.get(CURSOR_CLI_OUTPUT_MODE_ENV) or OUTPUT_MODE_STDOUT).strip()
         if output_mode not in (OUTPUT_MODE_STDOUT, OUTPUT_MODE_RESPONSE_FILE):
@@ -530,6 +676,23 @@ class CursorCliConfig:
             model_label=model_label,
             configured=command_path is not None,
         )
+
+    @classmethod
+    def cursor_agent_preset(cls, command: str = CURSOR_AGENT_CLI_COMMAND) -> "CursorCliConfig":
+        """Build the safe read-only Cursor Agent CLI preset config."""
+        return cls.from_env(cursor_agent_cli_preset_env(command))
+
+    @property
+    def is_cursor_agent(self) -> bool:
+        return is_cursor_agent_command(self.command_path)
+
+    def uses_prompt_arg(self) -> bool:
+        return self.input_mode == INPUT_MODE_PROMPT_ARG or any(
+            PLACEHOLDER_PROMPT in arg for arg in (self.args_template or [])
+        )
+
+    def safety_issues(self) -> tuple[list[str], list[str]]:
+        return assess_cursor_cli_safety(self.command_path, self.args_template)
 
     def command_exists(self) -> bool:
         if not self.command_path:
@@ -570,21 +733,44 @@ class CursorCliConfig:
         if not self.args_template:
             return (
                 f"{CURSOR_CLI_ARGS_ENV} is empty. Provide the argv template that hands the "
-                f"instruction to the CLI (e.g. reference {PLACEHOLDER_INSTRUCTION_FILE})."
+                f"instruction to the CLI (e.g. reference {PLACEHOLDER_PROMPT} or "
+                f"{PLACEHOLDER_INSTRUCTION_FILE})."
             )
-        if self.input_mode == INPUT_MODE_INSTRUCTION_FILE and not any(
+        # The instruction must be able to reach the CLI: via a {prompt} argv
+        # element, a {instruction_file} placeholder, or stdin input mode.
+        has_prompt = any(PLACEHOLDER_PROMPT in arg for arg in self.args_template)
+        has_instruction_file = any(
             PLACEHOLDER_INSTRUCTION_FILE in arg for arg in self.args_template
-        ):
+        )
+        if not (has_prompt or has_instruction_file or self.input_mode == INPUT_MODE_STDIN):
             return (
-                f"Cursor CLI argv template does not reference {PLACEHOLDER_INSTRUCTION_FILE}; "
-                "instruction-file input mode cannot hand the instruction to the CLI safely."
+                f"Cursor CLI argv template references neither {PLACEHOLDER_PROMPT} nor "
+                f"{PLACEHOLDER_INSTRUCTION_FILE} (and input mode is not stdin); the instruction "
+                "cannot be handed to the CLI safely."
             )
+        blocking, _ = self.safety_issues()
+        if blocking:
+            return blocking[0]
         return None
 
     def ready(self) -> bool:
         return self.missing_reason() is None
 
+    def display_label(self) -> str:
+        return (
+            "Cursor Agent CLI (plan mode, proposal-only)"
+            if self.is_cursor_agent
+            else "Cursor CLI / headless"
+        )
+
+    def safety_mode(self) -> str | None:
+        """Short human-readable read-only safety mode string for the UI."""
+        if not self.is_cursor_agent:
+            return None
+        return "Cursor Agent CLI · --print · --mode plan · isolated agent workspace · proposal-only"
+
     def to_dict(self) -> dict[str, Any]:
+        blocking, warnings = self.safety_issues()
         return {
             "command_path": self.command_path,
             "resolved_command": self.resolved_command(),
@@ -597,6 +783,12 @@ class CursorCliConfig:
             "command_exists": self.command_exists(),
             "ready": self.ready(),
             "missing_reason": self.missing_reason(),
+            "is_cursor_agent": self.is_cursor_agent,
+            "proposal_only": True,
+            "display_label": self.display_label(),
+            "safety_mode": self.safety_mode(),
+            "safety_blocking": blocking,
+            "safety_warnings": warnings,
         }
 
 
@@ -669,14 +861,27 @@ class CursorCliAgentBackend(AgentBackend):
                 message=cfg.missing_reason() or "Cursor CLI configuration incomplete.",
                 detail=cfg.to_dict(),
             )
+        safety_mode = cfg.safety_mode()
+        message = (
+            f"{cfg.display_label()} configured and ready — {safety_mode}."
+            if safety_mode
+            else "Cursor CLI backend configured and ready."
+        )
         return AgentBackendAvailability(
             status=AGENT_AVAILABILITY_AVAILABLE,
             configured=True,
-            message="Cursor CLI backend configured and ready.",
+            message=message,
             detail=cfg.to_dict(),
         )
 
-    def _build_argv(self, request: AgentInvocationRequest, *, instruction_file: Path, response_file: Path) -> list[str]:
+    def _build_argv(
+        self,
+        request: AgentInvocationRequest,
+        *,
+        instruction_file: Path,
+        response_file: Path,
+        prompt_value: str,
+    ) -> list[str]:
         command = self.config.resolved_command()
         assert command is not None  # guarded by availability() before invoke
         argv = [command]
@@ -686,8 +891,27 @@ class CursorCliAgentBackend(AgentBackend):
             token = token.replace(
                 PLACEHOLDER_AGENT_WORKSPACE, str(request.agent_workspace_path or "")
             )
+            # ``{prompt}`` is substituted with a single argv element (shell=False,
+            # so it is never shell-interpreted or word-split).
+            token = token.replace(PLACEHOLDER_PROMPT, prompt_value)
             argv.append(token)
         return argv
+
+    def _prompt_value(self, request: AgentInvocationRequest, *, instruction_file: Path) -> str:
+        """The value substituted for ``{prompt}``.
+
+        Passes the full instruction text as a single argv element when it is
+        short enough; otherwise writes it to the agent-workspace instruction file
+        and passes a short pointer prompt, so the argv stays within the Windows
+        command-line length limit. In plan mode the agent only *reads* that file.
+        """
+        text = request.instruction_text
+        if len(text) <= PROMPT_ARG_MAX_CHARS:
+            return text
+        return (
+            f"Read the instruction file at {instruction_file} and output only the Admissible "
+            "structured response. Do not modify any files; propose only."
+        )
 
     def invoke(self, request: AgentInvocationRequest) -> AgentInvocationResult:
         started = _now_iso()
@@ -753,8 +977,12 @@ class CursorCliAgentBackend(AgentBackend):
         if self.config.output_mode == OUTPUT_MODE_RESPONSE_FILE and response_file.exists():
             response_file.unlink()
 
+        prompt_value = self._prompt_value(request, instruction_file=instruction_file)
         argv = self._build_argv(
-            request, instruction_file=instruction_file, response_file=response_file
+            request,
+            instruction_file=instruction_file,
+            response_file=response_file,
+            prompt_value=prompt_value,
         )
         stdin_text = (
             request.instruction_text if self.config.input_mode == INPUT_MODE_STDIN else None
@@ -1227,7 +1455,8 @@ def describe_available_backends(env: dict[str, str] | None = None) -> list[dict[
     invoking anything or calling a provider. The fixture backend is marked
     test-only.
     """
-    cursor = CursorCliAgentBackend(config=CursorCliConfig.from_env(env))
+    cursor_config = CursorCliConfig.from_env(env)
+    cursor = CursorCliAgentBackend(config=cursor_config)
     cursor_availability = cursor.availability()
     return [
         {
@@ -1248,9 +1477,12 @@ def describe_available_backends(env: dict[str, str] | None = None) -> list[dict[
         },
         {
             "backend_id": BACKEND_ID_CURSOR_CLI,
-            "label": CursorCliAgentBackend.label,
+            "label": cursor_config.display_label(),
             "callable": True,
             "semi_autonomous": False,
+            "proposal_only": True,
+            "safety_mode": cursor_config.safety_mode(),
+            "is_cursor_agent": cursor_config.is_cursor_agent,
             "availability": cursor_availability.to_dict(),
         },
         {
@@ -1292,6 +1524,17 @@ __all__ = [
     "CURSOR_CLI_VERSION_ARGS_ENV",
     "CURSOR_CLI_INPUT_MODE_ENV",
     "CURSOR_CLI_OUTPUT_MODE_ENV",
+    "CURSOR_CLI_MODEL_LABEL_ENV",
+    "CURSOR_AGENT_CLI_COMMAND",
+    "CURSOR_AGENT_CLI_SAFE_ARGS",
+    "CURSOR_AGENT_CLI_MODEL_LABEL",
+    "INPUT_MODE_PROMPT_ARG",
+    "PLACEHOLDER_PROMPT",
+    "PROMPT_ARG_MAX_CHARS",
+    "assess_cursor_cli_safety",
+    "cursor_agent_cli_safe_args_template",
+    "cursor_agent_cli_preset_env",
+    "is_cursor_agent_command",
     "AgentInvocationRequest",
     "AgentInvocationResult",
     "AgentBackendAvailability",

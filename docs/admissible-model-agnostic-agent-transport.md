@@ -79,6 +79,48 @@ workspace**: `{instruction_file}`, `{response_file}`, `{agent_workspace}`.
 This is distinct from `ADMISSIBLE_CURSOR_LAUNCHER` (used by `cursor_bridge` to open the
 Cursor *GUI*): those open a window; these drive a headless CLI.
 
+### Cursor Agent CLI safe preset (slice ADMISSIBLE_RUN_033)
+
+The real local Cursor Agent CLI is **`cursor-agent`** — *not* `cursor agent` (the `cursor`
+command is the IDE wrapper and does not expose the real Agent CLI). Admissible drives it only
+in **read-only planning mode**: it analyzes and proposes plans; it does not edit files. The
+model proposes; only Admissible's bounded executor writes to the target workspace.
+
+Safe preset (`cursor_agent_cli_preset_env()` / `CursorCliConfig.cursor_agent_preset()`):
+
+- command: `cursor-agent`
+- args: `--print --output-format text --mode plan --workspace {agent_workspace} --trust {prompt}`
+- `{prompt}` is substituted with the full instruction text as a **single argv element**
+  (`shell=False`, never shell-interpreted). If the instruction exceeds
+  `PROMPT_ARG_MAX_CHARS`, it is written to the agent-workspace instruction file and the
+  `{prompt}` becomes a short pointer: *"Read the instruction file at &lt;path&gt; and output
+  only the Admissible structured response. Do not modify any files; propose only."*
+- output: `--output-format text` → stdout is captured verbatim as `response_text` and ingested
+  through the unchanged extraction/admission path; stdout is never treated as executed.
+
+PowerShell configuration:
+
+```powershell
+$env:ADMISSIBLE_CURSOR_CLI_COMMAND = "cursor-agent"
+$env:ADMISSIBLE_CURSOR_CLI_ARGS = "--print --output-format text --mode plan --workspace {agent_workspace} --trust {prompt}"
+$env:ADMISSIBLE_CURSOR_CLI_MODEL_LABEL = "cursor-agent-default"
+```
+
+### Cursor CLI safety validation
+
+`assess_cursor_cli_safety(command_path, args_template)` is defense-in-depth on top of the
+workspace separation and the ingest/admission path. It **blocks** configuration when the argv:
+
+- contains `--force` or `--yolo`;
+- contains `--sandbox disabled`;
+- is `cursor` with an `agent` subcommand (use `cursor-agent`);
+- has a `--workspace` value that is not the `{agent_workspace}` placeholder;
+- (for `cursor-agent`) is missing `--print`, or missing `--mode plan` / `--plan`.
+
+It **warns** (visible, still allowed) when `--output-format` is not text/json, or `--model` is
+absent (the CLI uses its default model). A blocked config makes the backend report
+`unsupported` / `blocked_by_configuration` and it is **never invoked**.
+
 No provider credentials are hard-coded anywhere. To configure a backend you set the command
 path + argv template for a CLI you have already authenticated separately; Admissible passes
 the child process only a small OS-essential environment allowlist (PATH, HOME/USERPROFILE,
@@ -169,15 +211,26 @@ clear reason** rather than spinning.
 
 ## What remains before a fully live Cursor CLI high-autonomy run
 
-1. A verified Cursor CLI (or headless) command + argv template on the operator's machine,
-   set via the environment variables above — Admissible does not ship one.
-2. Confirmation of the CLI's proposal-only / read-only contract so the agent cannot mutate
-   the target workspace even in principle (the abstraction already withholds target write
-   authority; a reliable CLI-side read-only mode makes that defense-in-depth).
-3. Real-run latency/robustness tuning (timeouts, output caps) for the specific CLI.
+As of slice ADMISSIBLE_RUN_033 the Cursor Agent CLI shape (`cursor-agent`, read-only plan
+mode) is configured and validated, and the loop runs against a **mocked** `cursor-agent` in
+tests. The remaining step before the *first real* live run is an operator-side smoke:
 
-Until then, Cursor CLI is a configured-but-unshipped target; the file bridge remains the
-semi-autonomous default and the fixture backend covers the loop in tests.
+1. Configure the safe preset env vars (above) so the backend reports `available`.
+2. Run the manual one-off smoke (below) to confirm the local `cursor-agent` returns text in
+   plan mode. **This is operator-only — it is never run from tests.**
+3. Then start a high-autonomy run selecting the Cursor Agent CLI backend against a separate
+   target workspace.
+
+### Manual operator smoke (do not run from tests)
+
+```
+cursor-agent --print --output-format text --mode plan --workspace <agent_workspace> --trust "Reply with exactly: ADMISSIBLE_CURSOR_AGENT_SMOKE_OK"
+```
+
+If it prints `ADMISSIBLE_CURSOR_AGENT_SMOKE_OK`, the local CLI is wired correctly for
+Admissible's read-only proposal path. Until an operator runs a real session, the file bridge
+remains the semi-autonomous default and the fixture / mocked-subprocess backends cover the
+loop in tests.
 
 ## Tests
 
@@ -186,6 +239,11 @@ semi-autonomous default and the fixture backend covers the loop in tests.
   = agent workspace + sanitized env; output ingested-not-executed; agent workspace isolation;
   two-turn callable loop with no manual waiting; low-risk writes executed only by the bounded
   executor; npm/deploy recovery; human-critical pause; backend-block pause.
+- `tests/test_admissible_cursor_agent_cli_backend.py` — the `cursor-agent` safe preset,
+  safety validation (rejects `--force`/`--yolo`/`--sandbox disabled`, requires
+  `--print` + plan mode, `cursor-agent` not `cursor agent`, `{agent_workspace}` workspace),
+  subprocess mechanics, prompt-arg + long-prompt file pointer, stdout→ingest, and a two-turn
+  high-autonomy loop driven by a mocked Cursor Agent CLI.
 - `tests/test_admissible_workspace_first_ui.py` — `agent_backend_control` state view, Start
   gating (missing target, agent-os repo target), top-level workspace/backend markup, and the
   truthful truth-boundary wording.

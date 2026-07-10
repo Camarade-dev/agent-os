@@ -414,6 +414,11 @@
           <select id="ha-backend-select"></select>
         </label>
         <p class="ha-backend-note" id="ha-backend-note"></p>
+        <p class="ha-backend-note" style="font-style:italic;">
+          Cursor Agent CLI runs read-only (<code>--print --mode plan</code>) in the isolated
+          agent workspace — proposal-only. Only Admissible's bounded executor writes to the
+          target workspace.
+        </p>
       </div>
       <dl class="ha-ws-grid">
         <div><dt>Agent workspace</dt><dd id="ha-agent-workspace">—</dd></div>
@@ -1298,7 +1303,13 @@ function renderWorkspaceFirst(state) {
 
   const selected = backends.find((b) => b.backend_id === select.value) || {};
   const selAvail = selected.availability || {};
-  if (noteEl) noteEl.textContent = selAvail.message || "";
+  if (noteEl) {
+    // Show the Cursor Agent read-only safety mode prominently when applicable.
+    const safety = selected.safety_mode
+      ? `${selected.safety_mode}. Proposal-only: the agent analyzes and proposes; only Admissible's bounded executor writes to the target workspace. `
+      : "";
+    noteEl.textContent = safety + (selAvail.message || "");
+  }
   if (backendStatusEl) {
     backendStatusEl.textContent = ha.active
       ? `${ha.backend_id || selected.backend_id || "—"} · ${ha.transport_status || "—"}`
