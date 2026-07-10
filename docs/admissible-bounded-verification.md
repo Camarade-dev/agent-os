@@ -161,3 +161,15 @@ marker groups versus missing groups.
 
 After a targeted repair executes, the controller re-runs only failed criteria (plus dependent
 aggregates) before attempting another repair round or final closure.
+
+## Bounded browser-runtime verification (Run 043)
+
+Static file inspection cannot honestly prove many mandatory browser behaviors (continuous
+pointer steering, live entity movement, pause/resume, restart without duplicate animation
+loops, a read-only debug interface). `admissible/browser_runtime/` adds a dedicated,
+read-only runtime verifier — an isolated loopback-only server, an allowlisted installed
+Chromium-family browser launched with fixed safe arguments, network-request interception, and
+a strict declarative step DSL with no arbitrary-JavaScript step — that complements rather than
+replaces this static layer. A criterion's disposition may be `deterministic_runtime`, in which
+case only real runtime evidence (never a static proxy) can move it to `verified_pass`. See
+[admissible-bounded-browser-runtime-verification.md](admissible-bounded-browser-runtime-verification.md).

@@ -203,3 +203,16 @@ LOCAL_DEV.md), aggregate pseudo-gate leakage, missing repair transition, null ex
 projections, and environment-key collisions. Deterministic replay after RUN_040 completes via
 targeted repair without a third provider turn. See
 `benchmark/reports/admissible_pixel_wanderer_cli_010_live_audit.md`.
+
+## Gate before the next live run with real browser verification (Run 043)
+
+Before a live rehearsal can honestly claim runtime-verified completion for a browser-based
+fixture (e.g. Neon Serpents), the run must show, per mandatory criterion: a
+`deterministic_runtime` disposition backed by real `BrowserRuntimeEvidence` with
+`status: verified_pass`, or an honest `human_observation_required` /
+`runtime_observability_gap` / `verification_capability_gap` — never a static proxy standing in
+for a criterion the Mission Contract marks as needing real runtime behavior. See
+[admissible-bounded-browser-runtime-verification.md](admissible-bounded-browser-runtime-verification.md)
+for the verifier this gate depends on, and
+`tests/test_admissible_neon_runtime_regression.py` for the deterministic replay that proves the
+gate holds without a real browser.

@@ -13,6 +13,22 @@ from typing import Any
 
 MISSION_CONTRACT_VERSION = "admissible_mission_contract_v1"
 
+# The canonical verification-disposition vocabulary (PART H.37, RUN_043).
+# ``deterministic_static`` and ``deterministic_runtime`` were added in
+# RUN_043 alongside the pre-existing dispositions; every criterion's
+# disposition (however derived) must be one of these.
+VERIFICATION_DISPOSITIONS = frozenset(
+    {
+        "deterministic_static",
+        "deterministic_structural",
+        "deterministic_runtime",
+        "human_observation_required",
+        "evidence_required",
+        "unsupported_verifier",
+        "ambiguous_requirement",
+    }
+)
+
 _HEADINGS = {
     "deliverables": ("mandatory deliverables", "required files", "deliverables", "livrables obligatoires"),
     "acceptance": ("acceptance criteria", "completion criteria", "critères d'acceptation"),
@@ -283,6 +299,150 @@ def canonical_outcome_for_report(report: dict[str, Any]) -> str:
     if "verification_plan_incomplete" in failures:
         return "verification_plan_incomplete"
     return "incomplete"
+
+
+_DEBUG_INTERFACE_MENTION_RE = re.compile(r"\b(window\.__[A-Za-z_][A-Za-z0-9_]*__)\b")
+_SNAPSHOT_FIELDS_RE = re.compile(r"\bsnapshot\s+returning\s+at\s+least\s*:?\s*(.+)", re.I)
+_QUERY_FLAG_RE = re.compile(r"\benabled\s+with\s+(\?[A-Za-z0-9_=]+)", re.I)
+_QUANTITY_SUBJECT = r"((?:[a-zA-Z][a-zA-Z\-]*\s*){1,3})"
+_AT_LEAST_RE = re.compile(rf"\bat\s+least\s+(\d+)\s+{_QUANTITY_SUBJECT}", re.I)
+_AT_MOST_RE = re.compile(rf"\bat\s+most\s+(\d+)\s+{_QUANTITY_SUBJECT}", re.I)
+_EXACTLY_RE = re.compile(rf"\bexactly\s+(\d+)\s+{_QUANTITY_SUBJECT}", re.I)
+_PRESS_KEY_RE = re.compile(r"\bpress\s+([A-Za-z0-9])\s+to\s+([a-zA-Z][a-zA-Z \-]*?)(?=[.,;]|$)", re.I)
+_PAUSE_RESUME_RE = re.compile(r"\bpause\s+and\s+resume\s+with\s+([A-Za-z0-9])\b", re.I)
+_DOM_TOKEN_RE = re.compile(r"(?<![\w])([#.][A-Za-z_][A-Za-z0-9_\-]*)")
+_NO_DUPLICATE_LOOPS_RE = re.compile(r"\bmust\s+not\s+create\s+duplicate\s+animation\s+loops?\b", re.I)
+_NO_UNCAUGHT_ERRORS_RE = re.compile(r"\bno\s+uncaught\s+errors?\b", re.I)
+_REPEATED_RESTART_RE = re.compile(r"\bremain\s+playable\s+after\s+repeated\s+restart\s+cycles\b", re.I)
+_LEADERBOARD_UPDATES_RE = re.compile(r"\bleaderboard\s+updates?\s+during\s+play\b", re.I)
+_DEBUG_FLAG_OVERLAY_RE = re.compile(r"\?debug=1\b")
+
+_LIFECYCLE_KEYWORDS = (
+    "restart",
+    "pause",
+    "resume",
+    "respawn",
+    "collision",
+    "death",
+    "dropped",
+    "growth",
+    "boost",
+)
+
+
+def extract_runtime_observability_intent(contract: dict[str, Any] | "MissionContract") -> dict[str, Any]:
+    """Deterministic, non-LLM extraction of typed runtime-observability intent.
+
+    Parses structurally-recognizable English patterns (PART F.27) out of the
+    raw goal and mandatory requirement/criterion text. Never hard-codes a
+    game name, field name, selector, or control -- every pattern here is a
+    generic phrase shape ("press X to Y", "at least N ...", "window.__X__",
+    ...), and every list below stays empty when the goal text does not
+    contain a matching phrase.
+    """
+
+    data = contract.to_dict() if isinstance(contract, MissionContract) else dict(contract)
+    raw_goal = str(data.get("raw_goal") or "")
+    fragment_texts = [
+        str(item.get("source_text") or "")
+        for item in list(data.get("mandatory_requirements") or []) + list(data.get("explicit_acceptance_criteria") or [])
+    ]
+    # raw_goal already contains every requirement/criterion line verbatim;
+    # matching only the deduplicated fragment set (falling back to raw_goal
+    # when there are no structured fragments) avoids double-counting the
+    # same sentence once from the whole goal and once per parsed bullet.
+    texts = list(dict.fromkeys(fragment_texts)) if fragment_texts else [raw_goal]
+    joined = "\n".join(texts)
+
+    def _dedupe(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        seen: set[str] = set()
+        unique: list[dict[str, Any]] = []
+        for entry in entries:
+            key = entry.get("source_text") or json.dumps(entry, sort_keys=True)
+            if key not in seen:
+                seen.add(key)
+                unique.append(entry)
+        return unique
+
+    debug_interface_matches = _DEBUG_INTERFACE_MENTION_RE.findall(joined)
+    declared_debug_interface = debug_interface_matches[0] if debug_interface_matches else None
+
+    required_snapshot_fields: list[str] = []
+    snapshot_match = _SNAPSHOT_FIELDS_RE.search(joined)
+    declared_snapshot_method = bool(snapshot_match) or "snapshot()" in joined
+    if snapshot_match:
+        fragment = snapshot_match.group(1).split(".")[0]
+        for field_name in re.split(r",|\band\b", fragment):
+            cleaned = field_name.strip().strip(".").strip()
+            cleaned = re.sub(r"^[`']|[`']$", "", cleaned)
+            if cleaned:
+                required_snapshot_fields.append(cleaned)
+
+    query_flags = sorted(set(_QUERY_FLAG_RE.findall(joined)))
+    if _DEBUG_FLAG_OVERLAY_RE.search(joined) and "?debug=1" not in query_flags:
+        query_flags.append("?debug=1")
+
+    def _trim_subject(subject: str) -> str:
+        trimmed = re.sub(r"\s+(?:must|will|shall|should|may|can|is|are|do|does)\b.*$", "", subject.strip(), flags=re.I)
+        return trimmed.strip().lower()
+
+    numeric_thresholds: list[dict[str, Any]] = []
+    for operator, pattern in (("gte", _AT_LEAST_RE), ("lte", _AT_MOST_RE), ("eq", _EXACTLY_RE)):
+        for match in pattern.finditer(joined):
+            numeric_thresholds.append(
+                {
+                    "operator": operator,
+                    "value": int(match.group(1)),
+                    "subject": _trim_subject(match.group(2)),
+                    "source_text": match.group(0).strip(),
+                }
+            )
+    numeric_thresholds = _dedupe(numeric_thresholds)
+
+    named_controls: list[dict[str, Any]] = []
+    for match in _PRESS_KEY_RE.finditer(joined):
+        named_controls.append({"key": match.group(1), "action": match.group(2).strip().lower(), "source_text": match.group(0).strip()})
+    for match in _PAUSE_RESUME_RE.finditer(joined):
+        named_controls.append({"key": match.group(1), "action": "pause_resume", "source_text": match.group(0).strip()})
+    named_controls = _dedupe(named_controls)
+
+    lifecycle_transitions = sorted({kw for kw in _LIFECYCLE_KEYWORDS if re.search(rf"\b{kw}\b", joined, re.I)})
+
+    temporal_requirements: list[str] = []
+    if _NO_DUPLICATE_LOOPS_RE.search(joined):
+        temporal_requirements.append("no_duplicate_animation_loops")
+    if _REPEATED_RESTART_RE.search(joined):
+        temporal_requirements.append("stable_after_repeated_restart_cycles")
+    if _LEADERBOARD_UPDATES_RE.search(joined):
+        temporal_requirements.append("leaderboard_updates_during_play")
+
+    dom_requirements = sorted(set(_DOM_TOKEN_RE.findall(joined)))
+
+    runtime_stability_requirements: list[str] = []
+    if _NO_UNCAUGHT_ERRORS_RE.search(joined):
+        runtime_stability_requirements.append("no_uncaught_errors")
+
+    human_observation_texts = [
+        text for text in texts if text and infer_verification_disposition(text) == "human_observation_required"
+    ]
+
+    entrypoint_candidates = [p for p in list(data.get("mandatory_paths") or []) if p.lower().endswith((".html", ".htm"))]
+    browser_entrypoint = entrypoint_candidates[0] if entrypoint_candidates else None
+
+    return {
+        "browser_entrypoint": browser_entrypoint,
+        "query_flags": query_flags,
+        "declared_debug_interface": declared_debug_interface,
+        "declared_snapshot_method": declared_snapshot_method,
+        "required_snapshot_fields": required_snapshot_fields,
+        "numeric_thresholds": numeric_thresholds,
+        "named_controls": named_controls,
+        "lifecycle_transitions": lifecycle_transitions,
+        "temporal_requirements": temporal_requirements,
+        "dom_requirements": dom_requirements,
+        "runtime_stability_requirements": runtime_stability_requirements,
+        "human_observation_requirement_count": len(human_observation_texts),
+    }
 
 
 def migrate_legacy_false_completion(session_data: dict[str, Any]) -> dict[str, Any]:

@@ -307,3 +307,13 @@ the persisted run, export, summary, governed overview, and UI.
   `blocking_reason` defaults to empty string. Legacy null session fields migrate on load/export.
 - **Portable JSON:** environment diagnostic keys are canonicalized case-insensitively before
   export; source aliases are recorded separately, never as duplicate object keys.
+- **Browser-runtime verification state (Run 043):** `admissible/browser_runtime/state_machine.py`
+  adds `runtime_verification_pending → preparing_runtime_plan → runtime_capability_check →
+  runtime_verifying → {runtime_verification_pass, runtime_verification_fail,
+  runtime_observability_gap, awaiting_human_observation, runtime_verification_capability_gap}`,
+  reusing the existing `repair_needed` phase so a runtime repair composes with the pre-existing
+  repair loop. A runtime capability gap or failure never becomes `internal_livelock`,
+  `human_authority_blocker`, or `completed`. A dedicated `browser_runtime_verification`
+  admission class keeps a runtime-verification action from ever being represented as a shell
+  action. See
+  [admissible-bounded-browser-runtime-verification.md](admissible-bounded-browser-runtime-verification.md).

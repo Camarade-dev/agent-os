@@ -422,3 +422,13 @@ Invocation records expose canonical environment path keys (`SystemRoot`, `System
 export. When multiple spellings observed the same value, aliases are stored in
 `environment_path_aliases` rather than duplicate JSON object keys — keeping exports parseable
 by PowerShell as well as Python.
+
+## Browser-runtime verification is not an agent transport (Run 043)
+
+`admissible/browser_runtime/` launches an already-installed, allowlisted Chromium-family
+browser the same disciplined way this document's agent backends launch a CLI: fixed argument
+lists, `shell=False`, no user-supplied flags, bounded process-tree cleanup (a Windows Job
+Object or a POSIX process group). It is not another agent transport — there is no model call
+inside it, and it never accepts an arbitrary command or JavaScript expression from a session,
+plan, or API field. See
+[admissible-bounded-browser-runtime-verification.md](admissible-bounded-browser-runtime-verification.md).

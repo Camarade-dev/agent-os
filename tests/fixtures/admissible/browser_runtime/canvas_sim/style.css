@@ -1,0 +1,18 @@
+body {
+  font-family: sans-serif;
+  background: #111;
+  color: #eee;
+  padding: 2rem;
+}
+
+canvas {
+  background: #000;
+  border: 1px solid #444;
+}
+
+#debug-overlay {
+  margin-top: 0.5rem;
+  padding: 0.25rem 0.5rem;
+  background: #222;
+  display: inline-block;
+}

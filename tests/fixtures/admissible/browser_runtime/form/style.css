@@ -1,0 +1,14 @@
+body {
+  font-family: sans-serif;
+  background: #111;
+  color: #eee;
+  padding: 2rem;
+}
+
+#validation-message {
+  color: #f66;
+}
+
+#validation-message.valid {
+  color: #6f6;
+}

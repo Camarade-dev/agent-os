@@ -11,3 +11,18 @@ Every mandatory ledger criterion receives a verification disposition. Unsupporte
 Completion is authorized only by `evaluate_completion_eligibility`. It requires a complete contract, complete contract-to-ledger and verification-plan coverage, terminal satisfaction or recorded waiver for every mandatory criterion, exact path and architecture conformance, no unresolved ambiguity or substitute conflict, no blocker, and no pending useful operation. Imported historical `completed` outcomes remain audit evidence but are re-evaluated canonically.
 
 The isolated agent workspace contains `.admissible/mission-contract.json`. Instructions identify that artifact, its SHA, the raw-goal SHA, open criteria, exact paths, architecture constraints, and verifier capability gaps.
+
+## Runtime observability extraction (Run 043)
+
+`extract_runtime_observability_intent()` deterministically parses typed runtime-observability
+intent out of the raw goal and requirement/criterion text — debug interfaces
+(`window.__NAME__`), snapshot field lists, `?debug=1`-style query flags, numeric thresholds,
+named keyboard controls, temporal/lifecycle requirements, and stability requirements — using
+only generic structural phrase patterns, never a hard-coded field or game name. Every
+verification disposition now draws from one canonical vocabulary,
+`VERIFICATION_DISPOSITIONS` (`deterministic_static`, `deterministic_structural`,
+`deterministic_runtime`, `human_observation_required`, `evidence_required`,
+`unsupported_verifier`, `ambiguous_requirement`); `deterministic_static` and
+`deterministic_runtime` were added in this slice. See
+[admissible-bounded-browser-runtime-verification.md](admissible-bounded-browser-runtime-verification.md)
+for the full runtime verifier this feeds.

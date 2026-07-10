@@ -19,3 +19,8 @@ include = ["agent_os*", "admissible*"]
 
 [tool.setuptools.package-data]
 agent_os = ["templates/*.md"]
+
+[tool.pytest.ini_options]
+markers = [
+    "browser_runtime: opt-in test requiring an already-installed allowlisted Chromium-family browser (RUN_043); skips honestly when unavailable.",
+]
