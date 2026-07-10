@@ -65,7 +65,8 @@ class TestGoalIntakeSlitherExample(unittest.TestCase):
         self.assertTrue(self.intake.clarifying_questions)
         joined = " ".join(self.intake.missing_context).lower()
         self.assertIn("dependency", joined)
-        self.assertIn("deployment", joined)
+        self.assertNotIn("deployment", joined)
+        self.assertEqual(self.intake.explicit_deployment_boundary, "local_only_no_deploy")
 
     def test_recommended_autonomy_ceiling_is_l2_or_l3_never_l4(self) -> None:
         self.assertIn(self.intake.recommended_autonomy_ceiling, (AUTONOMY_CEILING_L2, AUTONOMY_CEILING_L3))

@@ -181,11 +181,13 @@ class TestCursorAgentInvocation(unittest.TestCase):
         self.assertNotEqual(
             Path(captured["kwargs"]["cwd"]).resolve(), self.target.resolve()
         )
-        # Read-only plan-mode flags are present, and the prompt is a single argv
-        # element (never shell-interpreted).
+        # Read-only plan-mode flags are present, and the short pointer adapter is
+        # one argv element (never shell-interpreted).
         self.assertIn("--print", captured["argv"])
         self.assertIn("plan", captured["argv"])
-        self.assertIn("scaffold the game", captured["argv"])
+        adapter = captured["argv"][-1]
+        self.assertIn("Read the complete governed instruction", adapter)
+        self.assertNotIn("scaffold the game", adapter)
         # The --workspace value resolves to the agent workspace, not target.
         ws_idx = captured["argv"].index("--workspace")
         self.assertEqual(
@@ -201,7 +203,9 @@ class TestCursorAgentInvocation(unittest.TestCase):
 
         backend = CursorCliAgentBackend(config=self.config, runner=runner)
         backend.invoke(self._request("Z" * (PROMPT_ARG_MAX_CHARS + 50)))
-        self.assertTrue(any("Read the instruction file at" in a for a in captured["argv"]))
+        self.assertTrue(
+            any("Read the complete governed instruction" in a for a in captured["argv"])
+        )
         instr = self.agent_ws / ".admissible" / "next-agent-instruction.md"
         self.assertTrue(instr.is_file())
         self.assertTrue(instr.read_text(encoding="utf-8").startswith("Z"))

@@ -2383,6 +2383,11 @@ class ControlSurfaceController:
 
         return resume_high_autonomy_run(self)
 
+    def retry_callable_backend_invocation(self) -> dict[str, Any]:
+        from admissible.high_autonomy_controller import retry_callable_backend_invocation
+
+        return retry_callable_backend_invocation(self)
+
     def stop_high_autonomy_run(self, *, reason: str = "Stopped by operator.") -> dict[str, Any]:
         from admissible.high_autonomy_controller import stop_high_autonomy_run
 

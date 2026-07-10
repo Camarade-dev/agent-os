@@ -223,6 +223,8 @@ class _ControlSurfaceRequestHandler(BaseHTTPRequestHandler):
                 result = self.controller.pause_high_autonomy_run()
             elif parsed.path == "/api/session/high_autonomy/resume":
                 result = self.controller.resume_high_autonomy_run()
+            elif parsed.path == "/api/session/high_autonomy/retry_backend":
+                result = self.controller.retry_callable_backend_invocation()
             elif parsed.path == "/api/session/high_autonomy/stop":
                 result = self.controller.stop_high_autonomy_run(
                     reason=str(body.get("reason") or "Stopped by operator.")

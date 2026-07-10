@@ -100,7 +100,8 @@ class TestAuditPlan(unittest.TestCase):
         self.assertIsInstance(audit, PlanAudit)
         self.assertEqual(audit.verdict, PLAN_VERDICT_NEEDS_CLARIFICATION)
         self.assertTrue(audit.reasons)
-        self.assertIn("step_7_no_deploy_without_authorization", audit.required_gates)
+        self.assertNotIn("step_7_no_deploy_without_authorization", audit.required_gates)
+        self.assertIn("step_2_choose_architecture", audit.required_gates)
 
     def test_well_specified_plan_is_ok_for_local_prototype(self) -> None:
         intake = _make_intake(
