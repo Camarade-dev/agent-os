@@ -172,6 +172,19 @@ _EXTERNAL_RESOURCE_REFERENCE_PATTERN = re.compile(
     r"(?:src|href)\s*=\s*[\"']\s*https?://", re.IGNORECASE
 )
 
+_EXECUTABLE_OR_SECRET_CONTENT_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\bchild_process\b",
+        r"\bsubprocess\.(?:run|popen|call)\s*\(",
+        r"\bos\.system\s*\(",
+        r"\bprocess\.env\b",
+        r"\bDeno\.Command\s*\(",
+        r"\bBun\.spawn\s*\(",
+        r"\b(?:exec|spawn|system)Sync\s*\(",
+    )
+)
+
 
 def _has_network_side_effect(content: str) -> bool:
     return any(pattern.search(content) for pattern in _NETWORK_SIDE_EFFECT_PATTERNS)
@@ -191,6 +204,9 @@ def _forbidden_write_content_reason(path: str, content: str) -> str | None:
     keeps the strict naive-language scan.
     """
     extension = Path(str(path).replace("\\", "/")).suffix.lower()
+
+    if any(pattern.search(content) for pattern in _EXECUTABLE_OR_SECRET_CONTENT_PATTERNS):
+        return "forbidden executable-command or secret-reference content"
 
     if extension == ".css":
         if _has_network_side_effect(content):
@@ -504,7 +520,14 @@ class BoundedLocalExecutor:
                             turn_number=turn_number,
                         )
                     )
-                    executed.append({"operation": name, "path": rel_path, "entry_count": len(entries)})
+                    executed.append(
+                        {
+                            "operation": name,
+                            "path": rel_path,
+                            "entry_count": len(entries),
+                            "outcome": "executed_list",
+                        }
+                    )
 
                 elif name == "read_file":
                     if not target.is_file():
@@ -533,13 +556,22 @@ class BoundedLocalExecutor:
                             turn_number=turn_number,
                         )
                     )
-                    executed.append({"operation": name, "path": rel_path, "sha256": digest, "bytes": len(content)})
+                    executed.append(
+                        {
+                            "operation": name,
+                            "path": rel_path,
+                            "sha256": digest,
+                            "bytes": len(content),
+                            "outcome": "executed_read",
+                        }
+                    )
 
                 elif name == "write_file":
                     content = str(operation["content"])
+                    prior_sha256 = _sha256_bytes(target.read_bytes()) if target.is_file() else None
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_text(content, encoding="utf-8")
-                    digest = _sha256_text(content)
+                    target.write_text(content, encoding="utf-8", newline="")
+                    digest = _sha256_bytes(target.read_bytes())
                     summary = f"Wrote file {rel_path} ({len(content)} chars)"
                     evidence_records.append(
                         EvidenceRecord(
@@ -559,7 +591,17 @@ class BoundedLocalExecutor:
                             turn_number=turn_number,
                         )
                     )
-                    executed.append({"operation": name, "path": rel_path, "sha256": digest, "bytes": len(content)})
+                    executed.append(
+                        {
+                            "operation": name,
+                            "path": rel_path,
+                            "sha256": digest,
+                            "prior_sha256": prior_sha256,
+                            "bytes": len(content.encode("utf-8")),
+                            "outcome": "executed_mutation",
+                            "overwrite": prior_sha256 is not None,
+                        }
+                    )
 
         except BoundedExecutionError as exc:
             return BoundedExecutionResult(

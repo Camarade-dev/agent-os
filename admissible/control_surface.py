@@ -32,8 +32,9 @@ See docs/admissible-control-surface.md and docs/admissible-autonomy-levels.md.
 from __future__ import annotations
 
 import dataclasses
-import dataclasses
 import json
+import re
+import threading
 import uuid
 from collections import Counter
 from dataclasses import asdict, dataclass, field
@@ -62,6 +63,7 @@ from admissible.execution.bounded_local_executor import (
     assess_bounded_execution_eligibility,
     execute_bounded_local_action,
     extract_structured_operations,
+    validate_relative_path_inside_workspace,
     validate_workspace_path,
 )
 from admissible.execution.bounded_local_verification import (
@@ -82,6 +84,17 @@ from admissible.plan_audit import (
     generate_plan_candidate,
 )
 from admissible.long_run_envelope_builder import plan_gate_closes_gates
+from admissible.governed_run import (
+    active_blocking_action_ids,
+    canonical_operation_fingerprint,
+    canonical_operation_identity,
+    current_file_sha256,
+    extract_completion_candidate,
+    latest_file_hashes,
+    normalize_workspace_relative_path,
+    sha256_text,
+    validate_coherent_batch_limits,
+)
 from admissible.run_loop import (
     LIFECYCLE_ADMITTED_NOT_EXECUTED,
     LIFECYCLE_APPROVAL_SUPPLIED_PENDING_REEVALUATION,
@@ -99,6 +112,7 @@ from admissible.run_loop import (
     LIFECYCLE_READY_FOR_NEXT_AGENT_INSTRUCTION,
     LIFECYCLE_REFUSED_CLOSED,
     LIFECYCLE_RESOLVED_GATE,
+    LIFECYCLE_SUPERSEDED,
     AgentResponseRecord,
     DerivedLifecycleResolution,
     EvidenceRecord,
@@ -450,6 +464,21 @@ class DecisionQueueItem:
     # gated action across the supervised loop (evidence supplied, approval
     # supplied, scope limited, ready to continue, closed).
     lifecycle_status: str = LIFECYCLE_NEEDS_HUMAN_INPUT
+    # Durable operation/gate hygiene (ADMISSIBLE_RUN_038).  ``decision`` stays
+    # immutable policy output; these fields only record queue/execution state.
+    operation_outcome: str | None = None
+    operation_fingerprints: list[str] = field(default_factory=list)
+    gate_identity: str | None = None
+    closes_gate_ids: list[str] = field(default_factory=list)
+    source_action_id: str | None = None
+    semantic_gate_type: str | None = None
+    gate_target: str | None = None
+    suppressed_pseudo_gate: bool = False
+    merged_into_action_id: str | None = None
+    superseded_by_action_id: str | None = None
+    supersession_reason: str | None = None
+    superseded_at: str | None = None
+    safe_overwrite_review_required: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -497,6 +526,332 @@ def _build_queue_item(envelope: RunEnvelope) -> DecisionQueueItem:
     )
 
 
+_GATE_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_.-])([A-Za-z0-9_.-]+\.(?:html?|css|js|mjs|json|md|txt|py))(?![A-Za-z0-9_.-])",
+    re.IGNORECASE,
+)
+
+
+def _gate_target_for_envelope(envelope: RunEnvelope) -> str | None:
+    candidate = envelope.candidate
+    for key in ("gate_target", "target", "path"):
+        value = candidate.get(key)
+        if isinstance(value, str) and value.strip():
+            try:
+                return normalize_workspace_relative_path(value)
+            except ValueError:
+                return value.strip()
+    text = "\n".join(
+        str(candidate.get(key) or "")
+        for key in ("operation_text", "tool_or_command", "raw_output")
+    )
+    match = _GATE_PATH_RE.search(text)
+    return normalize_workspace_relative_path(match.group(1)) if match else None
+
+
+def _canonical_gate_identity(envelope: RunEnvelope) -> tuple[str, str | None]:
+    closes = sorted(_closes_gates_for_item(envelope, _build_queue_item(envelope)))
+    target = _gate_target_for_envelope(envelope)
+    subject = str(envelope.candidate.get("tool_or_command") or "decision").strip().lower()
+    subject = re.sub(r"\s+", " ", subject)
+    semantic = str(envelope.candidate.get("action_type") or "decision_only")
+    identity_source = json.dumps(
+        {
+            "closes_gate_ids": closes,
+            "semantic_gate_type": semantic,
+            "target": target,
+            "decision_subject": subject if not target and not closes else None,
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    return f"gate_{sha256_text(identity_source)[:20]}", target
+
+
+def _gate_choice_explicit_in_user_goal(
+    envelope: RunEnvelope, goal_text: str
+) -> bool:
+    """Conservative exact-token check for a choice already made by the user."""
+
+    operation_text = str(envelope.candidate.get("operation_text") or "")
+    match = re.search(
+        r"proposal:\s*(.*?)(?:human\s+decision\s+required:|$)",
+        operation_text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return False
+    proposal_text = match.group(1).lower()
+    if "approve" in proposal_text or re.search(r"\b(?:write|create|overwrite)\b", proposal_text):
+        return False
+    stopwords = {
+        "approve",
+        "bounded",
+        "choose",
+        "local",
+        "proposal",
+        "the",
+        "this",
+        "use",
+        "write",
+        "with",
+    }
+    tokens = {
+        token
+        for token in re.findall(r"[a-z0-9]+", proposal_text)
+        if len(token) >= 4 and token not in stopwords
+    }
+    goal_tokens = set(re.findall(r"[a-z0-9]+", goal_text.lower()))
+    return len(tokens) >= 2 and tokens.issubset(goal_tokens)
+
+
+def _is_pseudo_gate_for_concrete_allow(
+    envelope: RunEnvelope,
+    *,
+    concrete_allow_paths: set[str],
+    response_restates_local_write_approval: bool = False,
+) -> bool:
+    """Whether model prose merely restates approval for an ALLOW operation."""
+
+    if envelope.candidate.get("action_type") != "plan_gate_resolution":
+        return False
+    closes = _closes_gates_for_item(envelope, _build_queue_item(envelope))
+    if closes:
+        return False
+    text = "\n".join(
+        str(envelope.candidate.get(key) or "")
+        for key in ("operation_text", "tool_or_command", "raw_output")
+    ).lower()
+    if response_restates_local_write_approval and re.search(
+        r"^(?:action_gate_|verdict\s+class:|closes\s+gates?:|side\s+effects?\s+if\s+approved:|proposal:|human\s+decision\s+required:)",
+        str(envelope.candidate.get("operation_text") or "").strip(),
+        re.IGNORECASE,
+    ):
+        return True
+    if "human decision required" not in text and "approve" not in text:
+        return False
+    target = _gate_target_for_envelope(envelope)
+    if target and target in concrete_allow_paths:
+        return True
+    return len(concrete_allow_paths) == 1 and any(
+        phrase in text
+        for phrase in ("this local write", "the local write", "approve this write", "approve the write")
+    )
+
+
+def _supersede_covered_gates(
+    session: "ControlSession",
+    *,
+    executed_action_id: str,
+    executed_paths: set[str],
+) -> int:
+    """Close stale gate rows after their concrete target has executed.
+
+    This is queue hygiene only.  It creates no HumanDecisionRecord and grants
+    no side-effect authority.
+    """
+
+    if not executed_paths:
+        return 0
+    count = 0
+    now = _now_iso()
+    for item in session.queue:
+        if item.action_type != "plan_gate_resolution" or item.superseded_at:
+            continue
+        if item.lifecycle_status in (
+            LIFECYCLE_RESOLVED_GATE,
+            LIFECYCLE_REFUSED_CLOSED,
+            LIFECYCLE_SUPERSEDED,
+        ):
+            continue
+        if not item.gate_target or item.gate_target not in executed_paths:
+            continue
+        item.lifecycle_status = LIFECYCLE_SUPERSEDED
+        item.superseded_by_action_id = executed_action_id
+        item.supersession_reason = "target_operation_already_executed"
+        item.superseded_at = now
+        session.governance_records.append(
+            {
+                "record_id": f"governance_{uuid.uuid4().hex[:12]}",
+                "event_type": "gate_superseded",
+                "action_id": item.action_id,
+                "gate_identity": item.gate_identity,
+                "superseded_by_action_id": executed_action_id,
+                "supersession_reason": item.supersession_reason,
+                "superseded_at": now,
+            }
+        )
+        count += 1
+    return count
+
+
+def _operation_record(
+    *,
+    action_id: str,
+    operation: dict[str, Any],
+    outcome: str,
+    fingerprint: str,
+    identity: str,
+    original_execution_record_id: str | None = None,
+    current_sha256: str | None = None,
+    overwrite: bool = False,
+    detail: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    content = operation.get("content")
+    return {
+        "record_id": f"operation_{uuid.uuid4().hex[:12]}",
+        "action_id": action_id,
+        "operation": str(operation.get("operation") or ""),
+        "path": normalize_workspace_relative_path(str(operation.get("path") or ".")),
+        "canonical_identity": identity,
+        "fingerprint": fingerprint,
+        "outcome": outcome,
+        "proposed_sha256": sha256_text(content) if isinstance(content, str) else None,
+        "current_sha256_before": current_sha256,
+        "result_sha256": None,
+        "original_execution_record_id": original_execution_record_id,
+        "overwrite": overwrite,
+        "timestamp": _now_iso(),
+        "detail": dict(detail or {}),
+    }
+
+
+def _executed_record_for_fingerprint(
+    session: "ControlSession", fingerprint: str
+) -> dict[str, Any] | None:
+    for record in session.operation_records:
+        if record.get("fingerprint") != fingerprint:
+            continue
+        if record.get("outcome") in ("executed_mutation", "executed_read", "executed_list"):
+            return record
+    return None
+
+
+def _latest_mutation_for_path(
+    session: "ControlSession", path: str
+) -> dict[str, Any] | None:
+    for record in reversed(session.operation_records):
+        if record.get("path") == path and record.get("outcome") == "executed_mutation":
+            return record
+    return None
+
+
+def _action_has_human_approval(session: "ControlSession", action_id: str) -> bool:
+    return any(
+        record.action_id == action_id and record.decision_type == DECISION_TYPE_APPROVE
+        for record in session.human_decisions
+    )
+
+
+def _preclassify_noop_operations(
+    session: "ControlSession",
+    *,
+    action_id: str,
+    operations: list[dict[str, Any]],
+    workspace_path: str | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return (new noop audit records, operations that still need execution)."""
+
+    workspace = validate_workspace_path(workspace_path) if workspace_path else None
+    records: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = []
+    for operation in operations:
+        try:
+            rel_path = normalize_workspace_relative_path(
+                str(operation.get("path") or ".")
+            )
+        except ValueError as exc:
+            raise BoundedExecutionError(
+                str(exc),
+                diagnostic="path_outside_workspace",
+                detail={"path": str(operation.get("path") or ".")},
+            ) from exc
+        target = (
+            validate_relative_path_inside_workspace(workspace, rel_path) if workspace else None
+        )
+        observed_sha = current_file_sha256(target) if target and target.is_file() else None
+        identity = canonical_operation_identity(operation, observed_sha256=observed_sha)
+        fingerprint = canonical_operation_fingerprint(operation, observed_sha256=observed_sha)
+        already_for_action = next(
+            (
+                record
+                for record in session.operation_records
+                if record.get("action_id") == action_id
+                and record.get("fingerprint") == fingerprint
+                and record.get("outcome") in ("duplicate_noop", "already_satisfied_noop")
+            ),
+            None,
+        )
+        if already_for_action:
+            records.append(already_for_action)
+            continue
+        original = _executed_record_for_fingerprint(session, fingerprint)
+        if original is not None:
+            records.append(
+                _operation_record(
+                    action_id=action_id,
+                    operation=operation,
+                    outcome="duplicate_noop",
+                    fingerprint=fingerprint,
+                    identity=identity,
+                    original_execution_record_id=original.get("record_id"),
+                    current_sha256=observed_sha,
+                    detail={"reason": "canonical_operation_already_executed"},
+                )
+            )
+            continue
+        if str(operation.get("operation") or "") == "write_file":
+            proposed_sha = sha256_text(str(operation.get("content") or ""))
+            if observed_sha and proposed_sha == observed_sha:
+                records.append(
+                    _operation_record(
+                        action_id=action_id,
+                        operation=operation,
+                        outcome="already_satisfied_noop",
+                        fingerprint=fingerprint,
+                        identity=identity,
+                        current_sha256=observed_sha,
+                        detail={"reason": "proposed_sha_matches_current_file"},
+                    )
+                )
+                continue
+        pending.append(operation)
+    return records, pending
+
+
+def _safe_overwrite_review_required(
+    session: "ControlSession",
+    *,
+    operation: dict[str, Any],
+    workspace_path: str | None,
+) -> bool:
+    if not workspace_path or operation.get("operation") != "write_file":
+        return False
+    workspace = validate_workspace_path(workspace_path)
+    rel_path = normalize_workspace_relative_path(str(operation.get("path") or "."))
+    target = validate_relative_path_inside_workspace(workspace, rel_path)
+    current_sha = current_file_sha256(target)
+    if not current_sha:
+        return False
+    proposed_sha = sha256_text(str(operation.get("content") or ""))
+    if proposed_sha == current_sha:
+        return False
+    sensitive_name = Path(rel_path).name.lower()
+    if (
+        sensitive_name.startswith(".env")
+        or any(token in sensitive_name for token in ("secret", "credential", "token", "password"))
+        or Path(rel_path).suffix.lower() in (".exe", ".cmd", ".bat", ".ps1", ".sh")
+    ):
+        return True
+    # The operation was extracted under this immutable submitted goal.  An
+    # absent goal means scope cannot be established; a present goal plus the
+    # same-run file/sha lineage below is the bounded direct-goal relationship.
+    if not str((session.goal_intake or {}).get("prompt") or "").strip():
+        return True
+    latest = _latest_mutation_for_path(session, rel_path)
+    return not latest or latest.get("result_sha256") != current_sha
+
+
 def available_human_actions(item: DecisionQueueItem, autonomy_level: str) -> list[str]:
     """Return the human decision types permitted for one queue item.
 
@@ -511,8 +866,13 @@ def available_human_actions(item: DecisionQueueItem, autonomy_level: str) -> lis
         LIFECYCLE_REFUSED_CLOSED,
         LIFECYCLE_LIMITED_SCOPE_SELECTED,
         LIFECYCLE_ADMITTED_NOT_EXECUTED,
+        LIFECYCLE_SUPERSEDED,
     ):
         return []
+    if item.superseded_at or item.suppressed_pseudo_gate:
+        return []
+    if item.safe_overwrite_review_required and not item.human_decision_ids:
+        return [DECISION_TYPE_APPROVE, DECISION_TYPE_REFUSE]
     decision = item.decision
     if decision == "REFUSE":
         return []
@@ -554,6 +914,8 @@ class ControlSession:
     run_loop: RunLoopState = field(default_factory=RunLoopState)
     is_sample_session: bool = False
     high_autonomy_run: dict[str, Any] | None = None
+    operation_records: list[dict[str, Any]] = field(default_factory=list)
+    governance_records: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -573,6 +935,8 @@ class ControlSession:
             "run_loop": self.run_loop.to_dict(),
             "is_sample_session": self.is_sample_session,
             "high_autonomy_run": dict(self.high_autonomy_run) if self.high_autonomy_run else None,
+            "operation_records": [dict(record) for record in self.operation_records],
+            "governance_records": [dict(record) for record in self.governance_records],
         }
 
     @classmethod
@@ -605,6 +969,8 @@ class ControlSession:
             run_loop=RunLoopState.from_dict(data.get("run_loop") or {}),
             is_sample_session=bool(data.get("is_sample_session", False)),
             high_autonomy_run=data.get("high_autonomy_run"),
+            operation_records=[dict(record) for record in data.get("operation_records") or []],
+            governance_records=[dict(record) for record in data.get("governance_records") or []],
         )
 
 
@@ -756,22 +1122,35 @@ def _closes_gates_for_item(envelope: RunEnvelope | None, item: DecisionQueueItem
     if envelope is None or item.action_type != "plan_gate_resolution":
         return []
     candidate = envelope.candidate
+
+    def real_gate_ids(values: list[Any]) -> list[str]:
+        return [
+            str(value)
+            for value in values
+            if value
+            and not re.match(
+                r"^(?:none|null|n/?a)(?:\b|\s|[,;.])",
+                str(value).strip(),
+                re.IGNORECASE,
+            )
+        ]
+
     stored = candidate.get("closes_gates")
     if isinstance(stored, list) and stored:
-        return [str(g) for g in stored if g]
+        return real_gate_ids(stored)
     for key in ("operation_text", "tool_or_command"):
         text = candidate.get(key)
         if isinstance(text, str) and text.strip():
             closes = plan_gate_closes_gates(text)
             if closes:
-                return closes
+                return real_gate_ids(closes)
     proposed = envelope.decision.get("proposed_action") or {}
     for key in ("operation_text", "description"):
         text = proposed.get(key)
         if isinstance(text, str) and text.strip():
             closes = plan_gate_closes_gates(text)
             if closes:
-                return closes
+                return real_gate_ids(closes)
     return []
 
 
@@ -1243,7 +1622,73 @@ def _continuation_instruction(
         run_timeline=timeline,
         resolved_plan_gates=[g.to_dict() for g in run_loop.resolved_plan_gates],
     )
-    return result.to_dict()
+    projected = result.to_dict()
+    ha = session.high_autonomy_run or {}
+    if ha.get("active") and projected.get("instruction_text"):
+        criteria = list(ha.get("acceptance_criteria") or [])
+        satisfied = [
+            item.get("criterion_id")
+            for item in criteria
+            if item.get("status") in ("verified_pass", "waived")
+        ]
+        open_criteria = [
+            item.get("criterion_id")
+            for item in criteria
+            if item.get("status") not in ("verified_pass", "waived")
+        ]
+        pending_useful = [
+            item.action_id
+            for item in session.queue
+            if item.execution_status == "proposed_only"
+            and not item.superseded_at
+            and item.decision == "ALLOW"
+        ]
+        stale = [
+            {
+                "action_id": item.action_id,
+                "superseded_by_action_id": item.superseded_by_action_id,
+                "reason": item.supersession_reason,
+            }
+            for item in session.queue
+            if item.superseded_at
+        ]
+        ledger = {
+            "acceptance_criteria": [
+                {
+                    "criterion_id": item.get("criterion_id"),
+                    "status": item.get("status"),
+                    "source_text": item.get("source_text"),
+                }
+                for item in criteria
+            ],
+            "satisfied_criteria": satisfied,
+            "open_criteria": open_criteria,
+            "current_final_file_hashes": latest_file_hashes(session.operation_records),
+            "pending_useful_operations": pending_useful,
+            "stale_or_superseded_actions": stale,
+            "remaining_work_turn_budget": max(
+                int(ha.get("max_turns") or 0)
+                - int(ha.get("closure_reserve_turns") or 0)
+                - int(ha.get("work_turns_used") or 0),
+                0,
+            ),
+            "closure_phase_status": ha.get("closure_phase_status") or "not_started",
+            "batch_limits": {
+                "max_structured_operations_per_response": int(
+                    ha.get("max_structured_operations_per_response") or 8
+                ),
+                "max_total_proposed_write_bytes": int(
+                    ha.get("max_total_proposed_write_bytes") or 256 * 1024
+                ),
+            },
+        }
+        projected["progress_ledger"] = ledger
+        projected["instruction_text"] = (
+            str(projected["instruction_text"]).rstrip()
+            + "\n\nSTRUCTURED PROGRESS LEDGER (current state only)\n"
+            + json.dumps(ledger, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        )
+    return projected
 
 
 def _verification_summary(session: "ControlSession") -> dict[str, Any]:
@@ -1553,6 +1998,7 @@ class ControlSurfaceController:
         self._session_loaded_from_disk = False
         self._session = self._new_session()
         self._high_autonomy_transport: Any = None
+        self._high_autonomy_tick_lock = threading.Lock()
 
     def _high_autonomy_state(self) -> Any:
         from admissible.high_autonomy_controller import HighAutonomyRunState
@@ -1591,6 +2037,30 @@ class ControlSurfaceController:
 
     def session_dict(self) -> dict[str, Any]:
         """Canonical, round-trippable session state (used for export/import)."""
+        if self._session.high_autonomy_run is not None:
+            from admissible.governed_run import build_canonical_metrics
+            from admissible.high_autonomy_controller import HighAutonomyRunState
+
+            ha_state = HighAutonomyRunState.from_dict(self._session.high_autonomy_run)
+            ha_state.turns_remaining = max(
+                ha_state.max_turns - self._session.run_loop.current_turn, 0
+            )
+            ha_state.blocked_action_count = len(
+                active_blocking_action_ids(self._session.queue)
+            )
+            ha_state.metrics = build_canonical_metrics(
+                operation_records=self._session.operation_records,
+                governance_records=self._session.governance_records,
+                verification_records=self._session.run_loop.verification_records,
+                invocation_history=ha_state.invocation_history,
+                human_decisions=self._session.human_decisions,
+                queue=self._session.queue,
+                work_turns_used=ha_state.work_turns_used,
+                verification_turns_used=ha_state.verification_turns_used,
+                closure_turns_used=ha_state.closure_turns_used,
+                turns_remaining=ha_state.turns_remaining,
+            )
+            self._session.high_autonomy_run = ha_state.to_dict()
         return self._session.to_dict()
 
     def state_view(self) -> dict[str, Any]:
@@ -1668,6 +2138,10 @@ class ControlSurfaceController:
             ha_state=ha_state,
             state_view=view,
         )
+        view["canonical_run_metrics"] = dict(ha_state.metrics or {})
+        view["governed_run_overview"]["blocked_count"] = int(
+            (ha_state.metrics or {}).get("active_blocked_count", 0)
+        )
         view["agent_backend_control"] = _agent_backend_control(
             self._session,
             repo_root=self._repo_root,
@@ -1684,7 +2158,9 @@ class ControlSurfaceController:
     def _persist(self) -> None:
         self._session_dir.mkdir(parents=True, exist_ok=True)
         with self._session_file.open("w", encoding="utf-8") as f:
-            json.dump(self.session_dict(), f, indent=2, sort_keys=True)
+            json.dump(
+                self.session_dict(), f, indent=2, sort_keys=True, ensure_ascii=False
+            )
             f.write("\n")
 
     def reset_session(self) -> dict[str, Any]:
@@ -1957,27 +2433,163 @@ class ControlSurfaceController:
                 },
             )
 
-        result = execute_bounded_local_action(
-            workspace_path=workspace_path,
-            operations=assessment["operations"],
+        operations = list(assessment["operations"])
+        noop_records, pending_operations = _preclassify_noop_operations(
+            self._session,
             action_id=action_id,
-            decision_id=envelope.decision_id if envelope else None,
-            envelope_id=envelope.envelope_id if envelope else None,
-            turn_number=self._session.run_loop.current_turn or None,
+            operations=operations,
+            workspace_path=str(workspace_path) if workspace_path else None,
         )
-        if not result.success:
+        known_record_ids = {
+            str(record.get("record_id")) for record in self._session.operation_records
+        }
+        for record in noop_records:
+            if str(record.get("record_id")) not in known_record_ids:
+                self._session.operation_records.append(record)
+
+        for operation in pending_operations:
+            if not _safe_overwrite_review_required(
+                self._session,
+                operation=operation,
+                workspace_path=str(workspace_path) if workspace_path else None,
+            ):
+                continue
+            if _action_has_human_approval(self._session, action_id):
+                continue
+            workspace = validate_workspace_path(workspace_path)
+            rel_path = normalize_workspace_relative_path(str(operation.get("path") or "."))
+            target = validate_relative_path_inside_workspace(workspace, rel_path)
+            observed_sha = current_file_sha256(target)
+            identity = canonical_operation_identity(operation, observed_sha256=observed_sha)
+            fingerprint = canonical_operation_fingerprint(operation, observed_sha256=observed_sha)
+            blocked_record = _operation_record(
+                action_id=action_id,
+                operation=operation,
+                outcome="blocked",
+                fingerprint=fingerprint,
+                identity=identity,
+                current_sha256=observed_sha,
+                detail={"reason": "unsafe_overwrite_requires_human_review"},
+            )
+            self._session.operation_records.append(blocked_record)
+            item.safe_overwrite_review_required = True
+            if envelope is not None:
+                envelope.candidate["requires_safe_overwrite_review"] = True
+            self._persist()
             raise BoundedExecutionError(
-                result.message,
-                diagnostic=result.diagnostic or "unsupported_operation",
-                detail={
+                (
+                    f"write_file for {rel_path!r} requires human review: the file predates "
+                    "this run or its current sha256 differs from latest execution evidence"
+                ),
+                diagnostic="unsafe_overwrite_requires_review",
+                detail={"action_id": action_id, "path": rel_path},
+            )
+
+        if pending_operations:
+            result = execute_bounded_local_action(
+                workspace_path=workspace_path,
+                operations=pending_operations,
+                action_id=action_id,
+                decision_id=envelope.decision_id if envelope else None,
+                envelope_id=envelope.envelope_id if envelope else None,
+                turn_number=self._session.run_loop.current_turn or None,
+            )
+            if not result.success:
+                for operation in pending_operations:
+                    identity = canonical_operation_identity(operation)
+                    self._session.operation_records.append(
+                        _operation_record(
+                            action_id=action_id,
+                            operation=operation,
+                            outcome="failed",
+                            fingerprint=canonical_operation_fingerprint(operation),
+                            identity=identity,
+                            detail={"diagnostic": result.diagnostic, "message": result.message},
+                        )
+                    )
+                self._persist()
+                raise BoundedExecutionError(
+                    result.message,
+                    diagnostic=result.diagnostic or "unsupported_operation",
+                    detail={
+                        "action_id": action_id,
+                        "bounded_execution_diagnostic": result.diagnostic,
+                    },
+                )
+        else:
+            from admissible.execution.bounded_local_executor import BoundedExecutionResult
+
+            result = BoundedExecutionResult(
+                success=True,
+                message="All bounded operations were canonical no-ops.",
+                action_id=action_id,
+                operations_executed=[],
+                evidence_records=[],
+                execution_record={
                     "action_id": action_id,
-                    "bounded_execution_diagnostic": result.diagnostic,
+                    "execution_status": EXECUTION_STATUS_EXECUTED_BY_BOUNDED_EXECUTOR,
+                    "execution_actor": "bounded_executor",
+                    "execution_timestamp": _now_iso(),
+                    "execution_evidence": {
+                        "operations": [dict(record) for record in noop_records],
+                        "notes": "No mutation or inspection repeated; canonical no-op handling.",
+                    },
                 },
             )
+
+        operation_by_key = {
+            (
+                str(operation.get("operation") or ""),
+                normalize_workspace_relative_path(str(operation.get("path") or ".")),
+            ): operation
+            for operation in pending_operations
+        }
+        executed_operation_records: list[dict[str, Any]] = []
+        for executed in result.operations_executed:
+            key = (str(executed.get("operation") or ""), str(executed.get("path") or "."))
+            operation = operation_by_key.get(key, executed)
+            observed_sha = executed.get("sha256") if key[0] == "read_file" else executed.get(
+                "prior_sha256"
+            )
+            identity = canonical_operation_identity(operation, observed_sha256=observed_sha)
+            fingerprint = canonical_operation_fingerprint(operation, observed_sha256=observed_sha)
+            record = _operation_record(
+                action_id=action_id,
+                operation=operation,
+                outcome=str(executed.get("outcome") or "failed"),
+                fingerprint=fingerprint,
+                identity=identity,
+                current_sha256=executed.get("prior_sha256"),
+                overwrite=bool(executed.get("overwrite")),
+            )
+            record["result_sha256"] = executed.get("sha256")
+            record["detail"] = {
+                key: value
+                for key, value in executed.items()
+                if key not in ("operation", "path", "outcome", "sha256")
+            }
+            self._session.operation_records.append(record)
+            executed_operation_records.append(record)
 
         item.execution_status = EXECUTION_STATUS_EXECUTED_BY_BOUNDED_EXECUTOR
         item.execution_record = result.execution_record
         item.lifecycle_status = LIFECYCLE_CLOSED
+        all_operation_records = [*noop_records, *executed_operation_records]
+        item.operation_fingerprints = [
+            str(record.get("fingerprint")) for record in all_operation_records
+        ]
+        outcomes = [str(record.get("outcome")) for record in all_operation_records]
+        item.operation_outcome = (
+            "executed_mutation"
+            if "executed_mutation" in outcomes
+            else "executed_read"
+            if "executed_read" in outcomes
+            else "executed_list"
+            if "executed_list" in outcomes
+            else "duplicate_noop"
+            if "duplicate_noop" in outcomes
+            else "already_satisfied_noop"
+        )
         if envelope is not None:
             envelope.candidate["execution_status"] = EXECUTION_STATUS_EXECUTED_BY_BOUNDED_EXECUTOR
             envelope.candidate["execution_record"] = result.execution_record
@@ -1986,6 +2598,37 @@ class ControlSurfaceController:
         for record in result.evidence_records:
             self._session.run_loop.evidence_records.append(record)
 
+        covered_write_paths = {
+            str(record.get("path"))
+            for record in all_operation_records
+            if record.get("operation") == "write_file"
+            and record.get("outcome")
+            in ("executed_mutation", "duplicate_noop", "already_satisfied_noop")
+        }
+        superseded_gate_count = _supersede_covered_gates(
+            self._session,
+            executed_action_id=action_id,
+            executed_paths=covered_write_paths,
+        )
+        mutated_paths = {
+            str(record.get("path"))
+            for record in executed_operation_records
+            if record.get("outcome") == "executed_mutation"
+        }
+        if mutated_paths and self._session.high_autonomy_run is not None:
+            criteria = self._session.high_autonomy_run.get("acceptance_criteria") or []
+            for criterion in criteria:
+                criterion_paths = {
+                    str(path)
+                    for request in criterion.get("verification") or []
+                    for path in request.get("target_paths") or []
+                }
+                if criterion_paths & mutated_paths:
+                    criterion["status"] = "evidence_available"
+                    criterion.setdefault("verification_notes", []).append(
+                        "Criterion-relevant file state changed; deterministic re-verification required."
+                    )
+
         self._session.transcript.append(
             _transcript_entry(
                 "bounded_local_execution",
@@ -1993,6 +2636,8 @@ class ControlSurfaceController:
                     "action_id": action_id,
                     "workspace_path": str(workspace_path),
                     "operations_executed": result.operations_executed,
+                    "operation_outcomes": [dict(record) for record in all_operation_records],
+                    "superseded_gate_count": superseded_gate_count,
                     "execution_status": EXECUTION_STATUS_EXECUTED_BY_BOUNDED_EXECUTOR,
                     "evidence_record_ids": [record.record_id for record in result.evidence_records],
                     "note": (
@@ -2115,6 +2760,16 @@ class ControlSurfaceController:
             requests = [VerificationRequest.from_dict(item) for item in raw_requests]
             for request in requests:
                 validate_verification_request(request)
+        elif profile == "acceptance_ledger":
+            criteria = list((self._session.high_autonomy_run or {}).get("acceptance_criteria") or [])
+            requests = []
+            for criterion in criteria:
+                for raw_request in criterion.get("verification") or []:
+                    request_data = dict(raw_request)
+                    request_data.setdefault("criterion_id", criterion.get("criterion_id"))
+                    request = VerificationRequest.from_dict(request_data)
+                    validate_verification_request(request)
+                    requests.append(request)
 
         evidence = run_bounded_verification(
             workspace_path=workspace_path,
@@ -2124,6 +2779,15 @@ class ControlSurfaceController:
             include_node_syntax_check=include_node_syntax_check,
         )
         self._session.run_loop.verification_records.append(evidence.to_dict())
+        if self._session.high_autonomy_run is not None:
+            from admissible.high_autonomy_controller import HighAutonomyRunState
+            from admissible.governed_run import apply_verification_results_to_ledger
+
+            ha_state = HighAutonomyRunState.from_dict(self._session.high_autonomy_run)
+            apply_verification_results_to_ledger(
+                ha_state.acceptance_criteria, evidence.to_dict()
+            )
+            self._session.high_autonomy_run = ha_state.to_dict()
 
         self._session.transcript.append(
             _transcript_entry(
@@ -2291,16 +2955,37 @@ class ControlSurfaceController:
         turn_number = run_loop.current_turn or 1
         long_run_prompt = (self._session.goal_intake or {}).get("prompt")
 
-        built = build_candidates_from_agent_response(
-            raw_text,
-            turn_number=turn_number,
-            long_run_prompt=long_run_prompt,
-            source_metadata={"workspace_context": "local admissible control surface session"},
+        completion_candidate, action_text = extract_completion_candidate(raw_text)
+        without_fences = re.sub(r"```(?:json)?|```", "", action_text, flags=re.IGNORECASE).strip()
+        built = (
+            build_candidates_from_agent_response(
+                action_text,
+                turn_number=turn_number,
+                long_run_prompt=long_run_prompt,
+                source_metadata={"workspace_context": "local admissible control surface session"},
+            )
+            if without_fences
+            else []
         )
 
-        new_action_ids: list[str] = []
-        for entry in built:
-            run_env = RunEnvelope(
+        ha_config = self._session.high_autonomy_run or {}
+        all_structured_operations = [
+            operation
+            for entry in built
+            for operation in (entry.get("candidate") or {}).get("structured_operations") or []
+        ]
+        validate_coherent_batch_limits(
+            all_structured_operations,
+            max_operations=int(
+                ha_config.get("max_structured_operations_per_response") or 8
+            ),
+            max_total_write_bytes=int(
+                ha_config.get("max_total_proposed_write_bytes") or 256 * 1024
+            ),
+        )
+
+        run_envelopes = [
+            RunEnvelope(
                 action_id=entry["action_id"],
                 envelope_id=entry["envelope_id"],
                 decision_id=entry["decision_id"],
@@ -2308,9 +2993,187 @@ class ControlSurfaceController:
                 decision=entry["decision"],
                 envelope=entry["envelope"],
             )
+            for entry in built
+        ]
+        concrete_allow_paths: set[str] = set()
+        for run_env in run_envelopes:
+            if run_env.decision.get("decision") != "ALLOW":
+                continue
+            for operation in run_env.candidate.get("structured_operations") or []:
+                try:
+                    concrete_allow_paths.add(
+                        normalize_workspace_relative_path(str(operation.get("path") or "."))
+                    )
+                except ValueError:
+                    continue
+        closes_values = re.findall(
+            r"closes\s+gates?:\s*([^\r\n]+)", action_text, re.IGNORECASE
+        )
+        non_none_closes = any(
+            value.strip().lower() not in ("none", "null", "n/a", "na")
+            for value in closes_values
+        )
+        response_restates_local_write_approval = bool(
+            concrete_allow_paths
+            and not non_none_closes
+            and re.search(
+                r"human\s+decision\s+required:.*approve.*(?:local\s+write|write)",
+                action_text,
+                re.IGNORECASE | re.DOTALL,
+            )
+        )
+
+        new_action_ids: list[str] = []
+        for run_env in run_envelopes:
+            if _is_pseudo_gate_for_concrete_allow(
+                run_env,
+                concrete_allow_paths=concrete_allow_paths,
+                response_restates_local_write_approval=response_restates_local_write_approval,
+            ):
+                self._session.governance_records.append(
+                    {
+                        "record_id": f"governance_{uuid.uuid4().hex[:12]}",
+                        "event_type": "pseudo_gate_suppressed",
+                        "action_id": run_env.action_id,
+                        "source_action_id": run_env.action_id,
+                        "reason": "model_approval_prose_restates_separately_allowed_operation",
+                        "timestamp": _now_iso(),
+                    }
+                )
+                continue
+
+            item = _build_queue_item(run_env)
+            item.source_action_id = run_env.action_id
+            if item.action_type == "plan_gate_resolution":
+                gate_identity, gate_target = _canonical_gate_identity(run_env)
+                item.gate_identity = gate_identity
+                item.closes_gate_ids = _closes_gates_for_item(run_env, item)
+                item.semantic_gate_type = item.action_type
+                item.gate_target = gate_target
+                if _gate_choice_explicit_in_user_goal(
+                    run_env, str(long_run_prompt or "")
+                ):
+                    item.lifecycle_status = LIFECYCLE_SUPERSEDED
+                    item.superseded_by_action_id = "user_goal"
+                    item.supersession_reason = "underlying_plan_choice_explicit_in_user_goal"
+                    item.superseded_at = _now_iso()
+                    self._session.governance_records.append(
+                        {
+                            "record_id": f"governance_{uuid.uuid4().hex[:12]}",
+                            "event_type": "gate_superseded",
+                            "action_id": run_env.action_id,
+                            "gate_identity": gate_identity,
+                            "superseded_by_action_id": "user_goal",
+                            "supersession_reason": item.supersession_reason,
+                            "superseded_at": item.superseded_at,
+                        }
+                    )
+                equivalent = next(
+                    (
+                        existing
+                        for existing in self._session.queue
+                        if existing.gate_identity == gate_identity
+                    ),
+                    None,
+                )
+                if equivalent is not None:
+                    self._session.governance_records.append(
+                        {
+                            "record_id": f"governance_{uuid.uuid4().hex[:12]}",
+                            "event_type": "equivalent_gate_merged",
+                            "action_id": run_env.action_id,
+                            "gate_identity": gate_identity,
+                            "merged_into_action_id": equivalent.action_id,
+                            "timestamp": _now_iso(),
+                        }
+                    )
+                    continue
+
+            operations = list(run_env.candidate.get("structured_operations") or [])
+            if operations:
+                workspace = (
+                    validate_workspace_path(self._session.bounded_executor_workspace)
+                    if self._session.bounded_executor_workspace
+                    else None
+                )
+                for operation in operations:
+                    rel_path = normalize_workspace_relative_path(
+                        str(operation.get("path") or ".")
+                    )
+                    target = (
+                        validate_relative_path_inside_workspace(workspace, rel_path)
+                        if workspace
+                        else None
+                    )
+                    observed_sha = (
+                        current_file_sha256(target)
+                        if target is not None and target.is_file()
+                        else None
+                    )
+                    item.operation_fingerprints.append(
+                        canonical_operation_fingerprint(
+                            operation, observed_sha256=observed_sha
+                        )
+                    )
+            noop_records, pending_operations = _preclassify_noop_operations(
+                self._session,
+                action_id=run_env.action_id,
+                operations=operations,
+                workspace_path=self._session.bounded_executor_workspace,
+            )
+            if noop_records:
+                self._session.operation_records.extend(noop_records)
+            if operations and not pending_operations:
+                item.operation_outcome = (
+                    "duplicate_noop"
+                    if any(record.get("outcome") == "duplicate_noop" for record in noop_records)
+                    else "already_satisfied_noop"
+                )
+                item.execution_status = EXECUTION_STATUS_EXECUTED_BY_BOUNDED_EXECUTOR
+                item.lifecycle_status = LIFECYCLE_CLOSED
+                item.execution_record = {
+                    "action_id": run_env.action_id,
+                    "execution_status": EXECUTION_STATUS_EXECUTED_BY_BOUNDED_EXECUTOR,
+                    "execution_actor": "bounded_executor",
+                    "execution_timestamp": _now_iso(),
+                    "execution_evidence": {
+                        "operations": [dict(record) for record in noop_records],
+                        "notes": "No file operation executed; canonical no-op classification.",
+                    },
+                }
+                run_env.candidate["execution_status"] = item.execution_status
+                run_env.candidate["execution_record"] = item.execution_record
+            elif any(
+                _safe_overwrite_review_required(
+                    self._session,
+                    operation=operation,
+                    workspace_path=self._session.bounded_executor_workspace,
+                )
+                for operation in pending_operations
+            ):
+                item.safe_overwrite_review_required = True
+                run_env.candidate["requires_safe_overwrite_review"] = True
+
             self._session.run_envelopes[run_env.action_id] = run_env
-            self._session.queue.append(_build_queue_item(run_env))
+            self._session.queue.append(item)
             new_action_ids.append(run_env.action_id)
+
+        if completion_candidate is not None and self._session.high_autonomy_run is not None:
+            known_criterion_ids = {
+                str(item.get("criterion_id"))
+                for item in self._session.high_autonomy_run.get("acceptance_criteria") or []
+            }
+            claimed_ids = {
+                str(item.get("criterion_id"))
+                for item in completion_candidate.get("criteria") or []
+                if item.get("criterion_id")
+            }
+            completion_candidate["unknown_criterion_ids"] = sorted(
+                claimed_ids - known_criterion_ids
+            )
+            completion_candidate["advisory_only"] = True
+            self._session.high_autonomy_run["completion_candidate"] = completion_candidate
+            self._session.high_autonomy_run["completion_candidate_received_at"] = _now_iso()
 
         record = AgentResponseRecord(
             record_id=f"agent_response_{uuid.uuid4().hex[:12]}",
@@ -2334,6 +3197,7 @@ class ControlSurfaceController:
                     "turn_number": turn_number,
                     "action_ids": new_action_ids,
                     "action_count": len(new_action_ids),
+                    "completion_candidate": completion_candidate,
                     "note": (
                         "Raw response is unverified agent output; action candidates were "
                         "extracted and evaluated by the existing offline builder/evaluator, "
@@ -2360,6 +3224,11 @@ class ControlSurfaceController:
         backend: Any = None,
         backend_id: str | None = None,
         agent_workspace_path: str | None = None,
+        closure_reserve_turns: int = 2,
+        max_structured_operations_per_response: int = 8,
+        max_total_proposed_write_bytes: int = 256 * 1024,
+        acceptance_criteria: list[str | dict[str, Any]] | None = None,
+        automatic_empty_success_retries: int = 0,
     ) -> dict[str, Any]:
         from admissible.high_autonomy_controller import start_high_autonomy_run
 
@@ -2371,6 +3240,11 @@ class ControlSurfaceController:
             backend_id=backend_id,
             agent_workspace_path=agent_workspace_path,
             max_turns=max_turns,
+            closure_reserve_turns=closure_reserve_turns,
+            max_structured_operations_per_response=max_structured_operations_per_response,
+            max_total_proposed_write_bytes=max_total_proposed_write_bytes,
+            acceptance_criteria=acceptance_criteria,
+            automatic_empty_success_retries=automatic_empty_success_retries,
         )
 
     def pause_high_autonomy_run(self) -> dict[str, Any]:
@@ -2388,6 +3262,46 @@ class ControlSurfaceController:
 
         return retry_callable_backend_invocation(self)
 
+    def waive_high_autonomy_acceptance_criterion(
+        self, criterion_id: str, *, rationale: str
+    ) -> dict[str, Any]:
+        """Record an explicit human waiver; a model completion claim cannot do this."""
+
+        if not rationale.strip():
+            raise ValueError("acceptance criterion waiver requires a human rationale")
+        from admissible.high_autonomy_controller import HighAutonomyRunState
+
+        ha_state = HighAutonomyRunState.from_dict(self._session.high_autonomy_run)
+        criterion = next(
+            (
+                item
+                for item in ha_state.acceptance_criteria
+                if item.get("criterion_id") == criterion_id
+            ),
+            None,
+        )
+        if criterion is None:
+            raise ValueError(f"unknown acceptance criterion id: {criterion_id!r}")
+        record_id = f"governance_{uuid.uuid4().hex[:12]}"
+        criterion["status"] = "waived"
+        criterion.setdefault("evidence_refs", []).append(record_id)
+        criterion.setdefault("verification_notes", []).append(
+            f"Human waiver: {rationale.strip()}"
+        )
+        self._session.governance_records.append(
+            {
+                "record_id": record_id,
+                "event_type": "acceptance_criterion_waived",
+                "criterion_id": criterion_id,
+                "actor": HUMAN_DECISION_ACTOR,
+                "rationale": rationale.strip(),
+                "timestamp": _now_iso(),
+            }
+        )
+        self._session.high_autonomy_run = ha_state.to_dict()
+        self._persist()
+        return self.state_view()
+
     def stop_high_autonomy_run(self, *, reason: str = "Stopped by operator.") -> dict[str, Any]:
         from admissible.high_autonomy_controller import stop_high_autonomy_run
 
@@ -2395,8 +3309,18 @@ class ControlSurfaceController:
 
     def tick_high_autonomy_run(self) -> dict[str, Any]:
         from admissible.high_autonomy_controller import tick_high_autonomy_run
-
-        return tick_high_autonomy_run(self)
+        if not self._high_autonomy_tick_lock.acquire(blocking=False):
+            state = self.state_view()
+            state["high_autonomy_tick"] = {
+                "step": "tick_already_in_progress",
+                "reason": "single_flight_session_tick",
+            }
+            state["tick_already_in_progress"] = True
+            return state
+        try:
+            return tick_high_autonomy_run(self)
+        finally:
+            self._high_autonomy_tick_lock.release()
 
     def approve_high_autonomy_human_action(
         self, action_id: str | None = None, *, rationale: str = "", scope: str | None = None

@@ -107,7 +107,9 @@ class _ControlSurfaceRequestHandler(BaseHTTPRequestHandler):
         return
 
     def _send_json(self, status: int, payload: dict[str, Any]) -> None:
-        body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+        body = json.dumps(
+            payload, indent=2, sort_keys=True, ensure_ascii=False
+        ).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -218,6 +220,21 @@ class _ControlSurfaceRequestHandler(BaseHTTPRequestHandler):
                     workspace_path=workspace_path,
                     max_turns=int(body.get("max_turns") or 12),
                     backend_id=str(body.get("backend_id") or "") or None,
+                    closure_reserve_turns=int(body.get("closure_reserve_turns") or 2),
+                    max_structured_operations_per_response=int(
+                        body.get("max_structured_operations_per_response") or 8
+                    ),
+                    max_total_proposed_write_bytes=int(
+                        body.get("max_total_proposed_write_bytes") or 256 * 1024
+                    ),
+                    acceptance_criteria=(
+                        list(body.get("acceptance_criteria") or [])
+                        if body.get("acceptance_criteria") is not None
+                        else None
+                    ),
+                    automatic_empty_success_retries=int(
+                        body.get("automatic_empty_success_retries") or 0
+                    ),
                 )
             elif parsed.path == "/api/session/high_autonomy/pause":
                 result = self.controller.pause_high_autonomy_run()
@@ -225,6 +242,11 @@ class _ControlSurfaceRequestHandler(BaseHTTPRequestHandler):
                 result = self.controller.resume_high_autonomy_run()
             elif parsed.path == "/api/session/high_autonomy/retry_backend":
                 result = self.controller.retry_callable_backend_invocation()
+            elif parsed.path == "/api/session/high_autonomy/waive_criterion":
+                result = self.controller.waive_high_autonomy_acceptance_criterion(
+                    str(body.get("criterion_id") or ""),
+                    rationale=str(body.get("rationale") or ""),
+                )
             elif parsed.path == "/api/session/high_autonomy/stop":
                 result = self.controller.stop_high_autonomy_run(
                     reason=str(body.get("reason") or "Stopped by operator.")

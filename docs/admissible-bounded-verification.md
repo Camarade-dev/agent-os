@@ -121,3 +121,28 @@ Recommended demo flow after Turn 4 batch execution:
 - `docs/admissible-blocker-recovery-loop-demo.md`
 - `docs/admissible-evidence-grounded-continuation.md`
 - `docs/admissible-control-surface.md`
+
+## Criterion-level completion verification (Run 038)
+
+The `acceptance_ledger` profile accepts only explicit allowlisted requests and runs no shell,
+browser automation, package manager, network, or deploy command. Generic checks are:
+
+- `file_exists`
+- `file_sha_matches_latest_execution`
+- `file_contains` (required strings and/or an any-of string set)
+- `file_not_empty`
+- `all_required_files_present`
+
+Each request may carry a `criterion_id`; its result updates only that criterion. Multiple
+checks for one criterion must all pass. Reads use workspace-relative path validation and
+explicit UTF-8 decoding. Write-sha checks compare against latest bounded-executor evidence.
+
+Verification is deterministic authority for supported local facts. A model completion claim
+is advisory. Completion requires every mandatory criterion to be `verified_pass` or
+human-waived, a final verification record, no active human-critical blocker, and no pending
+useful admitted operation. A changed criterion-relevant file moves the criterion back to
+`evidence_available` so it must be re-verified.
+
+The Pixel Wanderer regression expresses its file presence, HTML asset/canvas/score, non-empty
+CSS, keyboard control, collectible/score, restart, and local-usage requirements entirely with
+these generic checks; production logic contains no Pixel Wanderer special case.

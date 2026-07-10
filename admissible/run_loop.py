@@ -77,6 +77,7 @@ LIFECYCLE_CLOSED = "closed"
 LIFECYCLE_RESOLVED_GATE = "resolved_gate"
 LIFECYCLE_REFUSED_CLOSED = "refused_closed"
 LIFECYCLE_ADMITTED_NOT_EXECUTED = "admitted_not_executed"
+LIFECYCLE_SUPERSEDED = "superseded"
 
 LIFECYCLE_STATUSES = frozenset(
     {
@@ -94,6 +95,7 @@ LIFECYCLE_STATUSES = frozenset(
         LIFECYCLE_RESOLVED_GATE,
         LIFECYCLE_REFUSED_CLOSED,
         LIFECYCLE_ADMITTED_NOT_EXECUTED,
+        LIFECYCLE_SUPERSEDED,
     }
 )
 
@@ -106,6 +108,7 @@ LIFECYCLE_NO_LONGER_NEEDS_ATTENTION = frozenset(
         LIFECYCLE_LIMITED_SCOPE_SELECTED,
         LIFECYCLE_READY_FOR_NEXT_AGENT_INSTRUCTION,
         LIFECYCLE_ADMITTED_NOT_EXECUTED,
+        LIFECYCLE_SUPERSEDED,
     }
 )
 
@@ -506,7 +509,9 @@ NON_EXECUTION_BOUNDARIES: tuple[str, ...] = (
 _MUST_NOT: tuple[str, ...] = (
     "Do not deploy, publish, or push beyond the local workspace without explicit human authorization.",
     "Do not install or upgrade dependencies without explicit human approval.",
-    "Do not delete or overwrite existing files without explicit human sign-off.",
+    "Do not delete files. Overwrite only when Admissible's safe-overwrite policy confirms the "
+    "file was created by this governed run and its current sha256 matches latest execution evidence; "
+    "otherwise require human review.",
     "Do not treat an autonomy level, a batch approval, or silence as authorization for a REFUSE, "
     "REQUIRE_HUMAN_APPROVAL, or REQUEST_MORE_EVIDENCE action.",
     "Do not claim an action was executed; there is no executor in this loop.",
@@ -519,7 +524,11 @@ _CONTINUATION_INSTRUCTION = (
 )
 
 _DIRECT_LOCAL_PROPOSAL_INSTRUCTION = (
-    "Propose the next smallest structured local file operation needed to advance the goal. "
+    "Propose the next smallest coherent bounded batch of structured local file operations needed "
+    "to advance the goal. Batch independent low-risk final artifacts when acceptance criteria are "
+    "already known, and do not re-propose operations already executed or satisfied. The batch "
+    "may contain the next smallest structured local file operation plus other independent "
+    "acceptance-completing operations. "
     "Return every proposed file operation in an ADMISSIBLE_STRUCTURED_OPERATION block; do not "
     "execute it or claim it ran."
 )
@@ -537,6 +546,9 @@ _DIRECT_LOCAL_PROPOSAL_INSTRUCTION = (
 # proposal (a command, a file edit, a dependency install, ...) should still
 # be described plainly, as in previous turns.
 _RESPONSE_FORMAT_GUIDANCE: tuple[str, ...] = (
+    "For a known local-only task, propose the next smallest coherent bounded batch: complete "
+    "known acceptance criteria, batch independent low-risk final file creates, avoid temporary "
+    "scaffolds when final artifacts are known, and do not re-propose executed operations.",
     "For a proposal that resolves a plan gate, an architecture/framework choice, or another "
     "decision-only question (no command, file, or dependency side effect), use this block so "
     "Admissible can classify it precisely instead of an unclassified fallback:",
@@ -561,7 +573,7 @@ _RESPONSE_FORMAT_GUIDANCE: tuple[str, ...] = (
     "    ```",
     "    Allowed operations: list_files, read_file, write_file. \"path\" is workspace-relative "
     "(no absolute paths, no \"..\"). write_file requires an explicit \"content\" string. Emit one "
-    "block per file operation; you may include several.",
+    "block per file operation; you may include several within the configured count and UTF-8 byte limits.",
     "    Do not put shell, npm/pip/yarn, git, deploy, or network commands in this block -- the "
     "executor refuses them. Including the block does not authorize execution: the operation is "
     "still admitted and gated, and only ever runs via a separate, explicit bounded-execution step.",
@@ -1501,7 +1513,13 @@ _CONTINUATION_GATING_DECISIONS = frozenset(
 # mirror the boundaries already carried by the base instruction packet and the
 # Cursor bridge's response-file convention (write only to agent-response.md).
 _CONTINUATION_BRIDGE_CONSTRAINTS: tuple[str, ...] = (
-    "Continue with the next smallest admissible step toward the original goal.",
+    "Continue with the next smallest coherent bounded batch toward the original goal.",
+    "Prefer completing known acceptance criteria and independent low-risk final file creates.",
+    "Avoid temporary scaffolds when the required final artifacts are already known.",
+    "Do not re-propose an operation already recorded as executed or satisfied.",
+    "When the progress ledger says completion_first, stop optional polish and broad new work; "
+    "finish admitted operations and mandatory acceptance criteria.",
+    "Do not claim an action was executed; only Admissible execution evidence establishes that.",
     "Propose only structured operations.",
     "Do not write files directly.",
     "Do not use shell, npm, network, or deploy commands.",
@@ -1656,6 +1674,7 @@ def _render_continuation_text(
     not_completed: list[dict[str, Any]],
     base_packet_text: str,
 ) -> str:
+    del base_packet_text
     executed_lines: list[str] = []
     for op in executed_ops:
         paths = ", ".join(op["written_paths"]) or "(no path recorded)"
@@ -1691,8 +1710,7 @@ def _render_continuation_text(
         f"ACTIONS BLOCKED / REFUSED / NOT EXECUTED (must NOT be treated as done)\n"
         f"{_bullets(not_completed_lines)}\n\n"
         f"COMPLETION STATUS\n- {_CONTINUATION_NO_COMPLETION_NOTE}\n\n"
-        f"STANDING INSTRUCTION PACKET (boundaries unchanged from turn 1)\n{base_packet_text}\n\n"
-        f"CONTINUE (bridge constraints -- always apply)\n"
+        f"CONTINUE (standing boundaries -- always apply)\n"
         f"{_bullets(list(_CONTINUATION_BRIDGE_CONSTRAINTS))}"
     )
 
@@ -1830,6 +1848,7 @@ __all__ = [
     "AGENT_RESPONSE_SOURCE_TRUST",
     "EVIDENCE_ACTOR_HUMAN_OPERATOR",
     "LIFECYCLE_ADMITTED_NOT_EXECUTED",
+    "LIFECYCLE_SUPERSEDED",
     "LIFECYCLE_APPROVAL_SUPPLIED_PENDING_REEVALUATION",
     "LIFECYCLE_CLOSED",
     "LIFECYCLE_EVIDENCE_SUPPLIED_PENDING_REEVALUATION",

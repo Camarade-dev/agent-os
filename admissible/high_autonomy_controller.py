@@ -15,6 +15,15 @@ if TYPE_CHECKING:
     from admissible.agent_transport import AgentTransport
 
 from admissible.high_autonomy_policy import HighAutonomyPolicy
+from admissible.governed_run import (
+    DEFAULT_CLOSURE_RESERVE_TURNS,
+    DEFAULT_MAX_STRUCTURED_OPERATIONS_PER_RESPONSE,
+    DEFAULT_MAX_TOTAL_PROPOSED_WRITE_BYTES,
+    acceptance_counts,
+    active_blocking_action_ids,
+    build_canonical_metrics,
+    make_acceptance_ledger,
+)
 from admissible.run_loop import (
     CONTINUATION_STATUS_EVIDENCE_GROUNDED,
     CONTINUATION_STATUS_FIRST_TURN,
@@ -57,6 +66,7 @@ _TERMINAL_INVOCATION_RECORD_STATUSES = frozenset(
         "timeout",
         "failed",
         "malformed",
+        "empty_success",
     }
 )
 
@@ -149,6 +159,34 @@ class HighAutonomyRunState:
     last_tick_at: str | None = None
     last_tick_step: str | None = None
     tick_count: int = 0
+    # Cost-aware response bounds and reserved closure budget.
+    max_structured_operations_per_response: int = (
+        DEFAULT_MAX_STRUCTURED_OPERATIONS_PER_RESPONSE
+    )
+    max_total_proposed_write_bytes: int = DEFAULT_MAX_TOTAL_PROPOSED_WRITE_BYTES
+    closure_reserve_turns: int = DEFAULT_CLOSURE_RESERVE_TURNS
+    phase: str = "work"
+    closure_phase_status: str = "not_started"
+    work_turns_used: int = 0
+    verification_turns_used: int = 0
+    closure_turns_used: int = 0
+    turns_remaining: int = DEFAULT_MAX_TURNS
+    # Durable acceptance/completion contract.
+    acceptance_criteria: list[dict[str, Any]] = field(default_factory=list)
+    completion_candidate: dict[str, Any] | None = None
+    completion_candidate_received_at: str | None = None
+    outcome: str | None = None
+    outcome_reason: str | None = None
+    completed_criteria: list[str] = field(default_factory=list)
+    unmet_criteria: list[str] = field(default_factory=list)
+    pending_useful_operations: list[str] = field(default_factory=list)
+    # Durable invocation lineage and visible retry/cost markers.
+    invocation_history: list[dict[str, Any]] = field(default_factory=list)
+    operator_retry_count: int = 0
+    automatic_empty_success_retries: int = 0
+    automatic_empty_success_retry_used: bool = False
+    pending_retry_of_invocation_id: str | None = None
+    metrics: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -251,7 +289,7 @@ def build_high_autonomy_summary(
         HA_MODE_VERIFYING: "Running bounded verification checks.",
         HA_MODE_HUMAN_REQUIRED: "Paused — human authority required.",
         HA_MODE_PAUSED: "Paused by operator.",
-        HA_MODE_STOPPED: "Stopped.",
+        HA_MODE_STOPPED: "Governed run reached a final outcome.",
         HA_MODE_FAILED: "Failed.",
     }.get(ha_state.mode, ha_state.mode)
 
@@ -294,6 +332,15 @@ def build_high_autonomy_summary(
         ha_state=ha_state, state_view=state_view
     )
     pending_invocation = ha_state.pending_agent_invocation or {}
+    acceptance = acceptance_counts(ha_state.acceptance_criteria)
+    metrics = dict(ha_state.metrics or {})
+    outcome_labels = {
+        "completed": "Completed",
+        "incomplete": "Incomplete",
+        "failed": "Failed",
+        "stopped_by_budget": "Budget exhausted",
+        "stopped_by_operator": "Stopped by operator",
+    }
     return {
         "schema_version": HIGH_AUTONOMY_SCHEMA_VERSION,
         "active": ha_state.active,
@@ -313,7 +360,9 @@ def build_high_autonomy_summary(
         "human_required_actions": list(ha_state.human_required_actions),
         "pending_low_risk_action_count": ha_state.pending_low_risk_action_count,
         "auto_executed_action_count": ha_state.auto_executed_action_count,
-        "blocked_action_count": ha_state.blocked_action_count,
+        "blocked_action_count": metrics.get(
+            "active_blocked_count", ha_state.blocked_action_count
+        ),
         "evidence_count": ha_state.evidence_count or timeline.get("evidence_count", 0),
         "verification_readiness": verification_readiness,
         "verification_passed": verification_readiness == "pass",
@@ -322,7 +371,9 @@ def build_high_autonomy_summary(
         "paused": ha_state.paused,
         "primary_button": _primary_button(ha_state),
         "turn_count": timeline.get("turn_count", 0),
-        "blocked_count": governed.get("blocked_count", 0),
+        "blocked_count": metrics.get(
+            "active_blocked_count", ha_state.blocked_action_count
+        ),
         "write_evidence_count": governed.get("write_evidence_count", 0),
         "tick_count": ha_state.tick_count,
         "transport_kind": ha_state.transport_kind,
@@ -347,6 +398,20 @@ def build_high_autonomy_summary(
         "stale_response_blocked": ha_state.stale_response_blocked,
         "auto_tick_safe": _auto_tick_safe(ha_state),
         "live_rehearsal_status": live_status,
+        "outcome": ha_state.outcome,
+        "outcome_label": outcome_labels.get(ha_state.outcome, "In progress"),
+        "outcome_reason": ha_state.outcome_reason,
+        "acceptance_criteria": [dict(item) for item in ha_state.acceptance_criteria],
+        "acceptance_verified_count": acceptance["verified"],
+        "acceptance_total_count": acceptance["total"],
+        "completed_criteria": list(ha_state.completed_criteria),
+        "unmet_criteria": list(ha_state.unmet_criteria),
+        "pending_useful_operations": list(ha_state.pending_useful_operations),
+        "phase": ha_state.phase,
+        "closure_phase_status": ha_state.closure_phase_status,
+        "turns_remaining": ha_state.turns_remaining,
+        "metrics": metrics,
+        "completion_candidate": ha_state.completion_candidate,
     }
 
 
@@ -512,6 +577,10 @@ def _callable_backend_error_summary(ha_state: HighAutonomyRunState) -> dict[str,
         "stderr_summary": record.stderr_summary,
         "error_message": record.error_message,
         "environment_status": record.environment_status,
+        "attempt_number": record.attempt_number,
+        "retry_of_invocation_id": record.retry_of_invocation_id,
+        "estimated_cost": record.estimated_cost,
+        "operator_retry_count": record.operator_retry_count,
         "retry_required": ha_state.backend_retry_required,
     }
 
@@ -560,15 +629,30 @@ def _persist_invocation_from_transport(
     from admissible.agent_backend import build_invocation_record
 
     result = getattr(transport, "last_invocation_result", None)
+    retry_of = ha_state.pending_retry_of_invocation_id
+    previous_attempt = next(
+        (
+            int(item.get("attempt_number") or 1)
+            for item in reversed(ha_state.invocation_history)
+            if item.get("invocation_id") == retry_of
+        ),
+        0,
+    )
     record = build_invocation_record(
         result,
         backend_id=ha_state.backend_id or getattr(transport, "backend_id", "callable"),
         instruction_id=instruction_id,
         session_id=controller._session.session_id,
         turn_number=turn_number,
+        attempt_number=previous_attempt + 1 if retry_of else 1,
+        retry_of_invocation_id=retry_of,
+        estimated_cost="unknown",
+        operator_retry_count=ha_state.operator_retry_count,
     )
     ha_state.pending_agent_invocation = record.to_dict()
     ha_state.last_invocation_id = record.invocation_id
+    ha_state.invocation_history.append(record.to_dict())
+    ha_state.pending_retry_of_invocation_id = None
     return record
 
 
@@ -676,6 +760,7 @@ def _finalize_write_instruction(
 
     from admissible.agent_backend import (
         CALLABLE_STEP_RESPONSE_READY,
+        INVOCATION_STATUS_EMPTY_SUCCESS,
         INVOCATION_STATUS_RESPONSE_READY,
     )
 
@@ -690,6 +775,33 @@ def _finalize_write_instruction(
     step_result["invocation_status"] = record.status
     if record.status != INVOCATION_STATUS_RESPONSE_READY:
         reason = record.error_message or f"Agent invocation status {record.status!r}."
+        if (
+            record.status == INVOCATION_STATUS_EMPTY_SUCCESS
+            and ha_state.automatic_empty_success_retries == 1
+            and not ha_state.automatic_empty_success_retry_used
+        ):
+            ha_state.automatic_empty_success_retry_used = True
+            ha_state.pending_retry_of_invocation_id = record.invocation_id
+            ha_state.backend_reinvoke_pending = True
+            ha_state.mode = HA_MODE_RUNNING
+            ha_state.paused = False
+            ha_state.backend_block_reason = reason
+            ha_state.backend_step = record.status
+            ha_state.backend_retry_required = False
+            ha_state.transport_status = record.status
+            ha_state.next_action = HA_NEXT_WRITE_INSTRUCTION
+            ha_state.last_event = (
+                "Cursor Agent returned empty_success; one configured visible automatic retry "
+                "is queued with the same instruction id and sha256."
+            )
+            ha_state.last_tick_step = "empty_success_retry_queued"
+            step_result["backend_block"] = {
+                "status": record.status,
+                "reason": reason,
+                "automatic_retry_queued": True,
+                "retry_of_invocation_id": record.invocation_id,
+            }
+            return
         ha_state.mode = HA_MODE_PAUSED
         ha_state.paused = True
         ha_state.backend_block_reason = reason
@@ -751,6 +863,8 @@ def _fail_malformed(
     ha_state.mode = HA_MODE_FAILED
     ha_state.active = False
     ha_state.stop_reason = f"Malformed agent response: {exc}"
+    ha_state.outcome = "failed"
+    ha_state.outcome_reason = ha_state.stop_reason
     ha_state.last_event = ha_state.stop_reason
     ha_state.last_tick_step = "failed"
 
@@ -962,7 +1076,6 @@ def _sync_counters(
     session = controller._session
     workspace = session.bounded_executor_workspace
     pending_auto = 0
-    blocked = 0
     recoverable = False
 
     for item in session.queue:
@@ -970,11 +1083,17 @@ def _sync_counters(
         classification = policy.classify_action(
             item=item, envelope=envelope, workspace_path=workspace
         )
-        if classification.category == "auto_executable":
+        if (
+            classification.category == "auto_executable"
+            and item.execution_status == "proposed_only"
+            and not getattr(item, "superseded_at", None)
+        ):
             pending_auto += 1
-        elif classification.category in ("blocked_not_completed", "recoverable_blocker"):
-            blocked += 1
-        if classification.category == "recoverable_blocker":
+        if (
+            classification.category == "recoverable_blocker"
+            and item.execution_status == "proposed_only"
+            and not getattr(item, "superseded_at", None)
+        ):
             recoverable = True
 
     # A genuinely human-critical proposal pauses only while it is still an open,
@@ -984,13 +1103,80 @@ def _sync_counters(
     open_human_critical = _open_human_critical_actions(controller, policy)
 
     ha_state.pending_low_risk_action_count = pending_auto
-    ha_state.blocked_action_count = blocked
+    active_blockers = active_blocking_action_ids(session.queue)
+    ha_state.blocked_action_count = len(active_blockers)
     ha_state.evidence_count = (view.get("run_timeline") or {}).get("evidence_count", 0)
     ha_state.verification_readiness = (view.get("verification_summary") or {}).get(
         "readiness", "not_run"
     )
     ha_state.current_turn = session.run_loop.current_turn
     ha_state.recovery_pending = recoverable and pending_auto == 0 and not ha_state.recovery_attempted
+    ha_state.turns_remaining = max(ha_state.max_turns - ha_state.current_turn, 0)
+    work_limit = max(ha_state.max_turns - ha_state.closure_reserve_turns, 0)
+    if ha_state.phase == "work" and ha_state.current_turn >= work_limit:
+        ha_state.phase = "closure"
+        ha_state.closure_phase_status = "completion_first"
+
+    operation_records = session.operation_records
+    evidence_paths: dict[str, list[str]] = {}
+    for record in operation_records:
+        if record.get("outcome") not in (
+            "executed_mutation",
+            "executed_read",
+            "executed_list",
+            "already_satisfied_noop",
+            "duplicate_noop",
+        ):
+            continue
+        path = str(record.get("path") or "")
+        if path:
+            evidence_paths.setdefault(path, []).append(str(record.get("record_id") or ""))
+    for criterion in ha_state.acceptance_criteria:
+        if criterion.get("status") not in ("open", "evidence_available"):
+            continue
+        requested_paths = {
+            str(path)
+            for request in criterion.get("verification") or []
+            for path in request.get("target_paths") or []
+        }
+        refs = [
+            record_id
+            for path in requested_paths
+            for record_id in evidence_paths.get(path, [])
+            if record_id
+        ]
+        if refs:
+            criterion["status"] = "evidence_available"
+            existing_refs = criterion.setdefault("evidence_refs", [])
+            for ref in refs:
+                if ref not in existing_refs:
+                    existing_refs.append(ref)
+
+    counts = acceptance_counts(ha_state.acceptance_criteria)
+    ha_state.completed_criteria = [
+        str(item.get("criterion_id"))
+        for item in ha_state.acceptance_criteria
+        if item.get("status") in ("verified_pass", "waived")
+    ]
+    ha_state.unmet_criteria = [
+        str(item.get("criterion_id"))
+        for item in ha_state.acceptance_criteria
+        if item.get("mandatory", True)
+        and item.get("status") not in ("verified_pass", "waived")
+    ]
+    ha_state.pending_useful_operations = [
+        item.action_id
+        for item in session.queue
+        if item.execution_status == "proposed_only"
+        and not getattr(item, "superseded_at", None)
+        and policy.classify_action(
+            item=item,
+            envelope=session.run_envelopes.get(item.action_id),
+            workspace_path=workspace,
+        ).category
+        == "auto_executable"
+    ]
+    del counts
 
     ha_state.human_critical_pending = bool(open_human_critical)
     ha_state.human_required_action_ids = [a["action_id"] for a in open_human_critical]
@@ -1004,6 +1190,139 @@ def _sync_counters(
         ha_state.pending_human_action_id = None
         if not ha_state.paused:
             ha_state.human_required_reason = None
+
+    ha_state.metrics = build_canonical_metrics(
+        operation_records=session.operation_records,
+        governance_records=session.governance_records,
+        verification_records=session.run_loop.verification_records,
+        invocation_history=ha_state.invocation_history,
+        human_decisions=session.human_decisions,
+        queue=session.queue,
+        work_turns_used=ha_state.work_turns_used,
+        verification_turns_used=ha_state.verification_turns_used,
+        closure_turns_used=ha_state.closure_turns_used,
+        turns_remaining=ha_state.turns_remaining,
+    )
+
+
+def _has_acceptance_verification_plan(ha_state: HighAutonomyRunState) -> bool:
+    return any(
+        criterion.get("verification") for criterion in ha_state.acceptance_criteria
+    )
+
+
+def _mandatory_acceptance_complete(ha_state: HighAutonomyRunState) -> bool:
+    mandatory = [
+        item for item in ha_state.acceptance_criteria if item.get("mandatory", True)
+    ]
+    return bool(mandatory) and all(
+        item.get("status") in ("verified_pass", "waived") for item in mandatory
+    )
+
+
+def _verification_is_final(controller: "ControlSurfaceController") -> bool:
+    records = controller._session.run_loop.verification_records
+    return bool(records and records[-1].get("overall_status") in ("pass", "fail"))
+
+
+def _set_final_outcome(
+    ha_state: HighAutonomyRunState,
+    *,
+    outcome: str,
+    reason: str,
+) -> None:
+    ha_state.outcome = outcome
+    ha_state.outcome_reason = reason
+    ha_state.active = False
+    ha_state.mode = HA_MODE_STOPPED if outcome != "failed" else HA_MODE_FAILED
+    ha_state.stop_reason = reason
+    ha_state.last_event = reason
+    ha_state.next_action = HA_NEXT_NONE
+    ha_state.closure_phase_status = "finalized"
+
+
+def _try_finalize_outcome(
+    controller: "ControlSurfaceController",
+    ha_state: HighAutonomyRunState,
+) -> bool:
+    """Finalize only from verified governance state, never model prose alone."""
+
+    no_human_critical = not ha_state.human_critical_pending
+    no_pending_useful = not ha_state.pending_useful_operations
+    no_active_blockers = int((ha_state.metrics or {}).get("active_blocked_count", 0)) == 0
+    verification_final = _verification_is_final(controller)
+    if (
+        _mandatory_acceptance_complete(ha_state)
+        and no_human_critical
+        and no_pending_useful
+        and no_active_blockers
+        and verification_final
+    ):
+        _set_final_outcome(
+            ha_state,
+            outcome="completed",
+            reason=(
+                "All mandatory acceptance criteria are verified_pass or human-waived; "
+                "no active human-critical blocker or useful admitted operation remains."
+            ),
+        )
+        return True
+
+    candidate = ha_state.completion_candidate or {}
+    if (
+        candidate.get("claimed_status") == "incomplete"
+        and verification_final
+        and no_pending_useful
+        and no_human_critical
+    ):
+        _set_final_outcome(
+            ha_state,
+            outcome="incomplete",
+            reason="Agent proposed an incomplete result and deterministic verification is final.",
+        )
+        return True
+
+    if (
+        not _has_acceptance_verification_plan(ha_state)
+        and verification_final
+        and ha_state.mode == HA_MODE_VERIFYING
+        and no_pending_useful
+        and no_human_critical
+    ):
+        _set_final_outcome(
+            ha_state,
+            outcome="incomplete",
+            reason=(
+                "Bounded verification is final, but this run has no criterion-level "
+                "verification contract; autonomous completion is not claimed."
+            ),
+        )
+        return True
+
+    if ha_state.current_turn >= ha_state.max_turns:
+        # Response ingest, admitted execution, and deterministic verification
+        # are planned before this function is allowed to close the run.
+        if _pending_ready_invocation(ha_state) is not None:
+            return False
+        if ha_state.mode == HA_MODE_WAITING_FOR_AGENT:
+            return False
+        if _transport_has_pending_response(controller._high_autonomy_transport):
+            return False
+        if ha_state.pending_useful_operations:
+            return False
+        if _has_acceptance_verification_plan(ha_state) and not verification_final:
+            return False
+        _set_final_outcome(
+            ha_state,
+            outcome="stopped_by_budget",
+            reason=(
+                f"Model invocation budget exhausted at {ha_state.max_turns} turn(s); "
+                f"unmet criteria: {', '.join(ha_state.unmet_criteria) or 'none'}; "
+                f"pending useful operations: {', '.join(ha_state.pending_useful_operations) or 'none'}."
+            ),
+        )
+        return True
+    return False
 
 
 def _plan_next_action(
@@ -1058,6 +1377,20 @@ def _plan_next_action(
         if cont_status == CONTINUATION_STATUS_EVIDENCE_GROUNDED and continuation.get("available"):
             return HA_NEXT_WRITE_RECOVERY
 
+    acceptance_needs_verification = _has_acceptance_verification_plan(ha_state) and any(
+        item.get("status") in ("open", "evidence_available")
+        for item in ha_state.acceptance_criteria
+        if item.get("mandatory", True)
+    )
+    if (
+        acceptance_needs_verification
+        and ready_count == 0
+        and ha_state.mode
+        in (HA_MODE_REVIEWING, HA_MODE_RUNNING, HA_MODE_AUTO_EXECUTING, HA_MODE_VERIFYING)
+        and not _transport_has_pending_response(transport)
+    ):
+        return HA_NEXT_VERIFY
+
     if policy.should_run_verification(
         evidence_count=ha_state.evidence_count,
         verification_readiness=ha_state.verification_readiness,
@@ -1068,9 +1401,8 @@ def _plan_next_action(
         return HA_NEXT_VERIFY
 
     if (
-        ha_state.verification_readiness in ("pass", "fail")
+        ha_state.outcome is not None
         and ready_count == 0
-        and ha_state.pending_low_risk_action_count == 0
         and not _transport_has_pending_response(transport)
     ):
         return HA_NEXT_STOP
@@ -1148,6 +1480,11 @@ def start_high_autonomy_run(
     backend_id: str | None = None,
     agent_workspace_path: str | None = None,
     max_turns: int = DEFAULT_MAX_TURNS,
+    closure_reserve_turns: int = DEFAULT_CLOSURE_RESERVE_TURNS,
+    max_structured_operations_per_response: int = DEFAULT_MAX_STRUCTURED_OPERATIONS_PER_RESPONSE,
+    max_total_proposed_write_bytes: int = DEFAULT_MAX_TOTAL_PROPOSED_WRITE_BYTES,
+    acceptance_criteria: list[str | dict[str, Any]] | None = None,
+    automatic_empty_success_retries: int = 0,
 ) -> dict[str, Any]:
     """Start an opt-in high-autonomy run against a workspace.
 
@@ -1166,6 +1503,12 @@ def start_high_autonomy_run(
 
     if not controller._session.goal_intake:
         raise ValueError("Submit a goal before starting a high-autonomy run.")
+    if max_turns < 1:
+        raise ValueError("max_turns must be at least 1")
+    if closure_reserve_turns < 0 or closure_reserve_turns >= max_turns:
+        raise ValueError("closure_reserve_turns must be non-negative and smaller than max_turns")
+    if automatic_empty_success_retries not in (0, 1):
+        raise ValueError("automatic_empty_success_retries must be 0 or 1")
 
     controller.set_bounded_executor_workspace(workspace_path)
     controller.set_autonomy("L4_HIGH_AUTONOMY_HARD_GATES")
@@ -1211,6 +1554,15 @@ def start_high_autonomy_run(
         response_path=snap.get("response_path"),
         last_event="High-autonomy run started.",
         next_action=HA_NEXT_WRITE_INSTRUCTION,
+        closure_reserve_turns=closure_reserve_turns,
+        max_structured_operations_per_response=max_structured_operations_per_response,
+        max_total_proposed_write_bytes=max_total_proposed_write_bytes,
+        turns_remaining=max_turns,
+        automatic_empty_success_retries=automatic_empty_success_retries,
+        acceptance_criteria=make_acceptance_ledger(
+            acceptance_criteria,
+            goal_text=str((controller._session.goal_intake or {}).get("prompt") or ""),
+        ),
     )
     controller._high_autonomy_transport = transport
     _save_ha_state(controller, ha_state)
@@ -1223,6 +1575,13 @@ def start_high_autonomy_run(
                 "max_turns": max_turns,
                 "transport_kind": ha_state.transport_kind,
                 "backend_id": ha_state.backend_id,
+                "closure_reserve_turns": closure_reserve_turns,
+                "max_structured_operations_per_response": max_structured_operations_per_response,
+                "max_total_proposed_write_bytes": max_total_proposed_write_bytes,
+                "automatic_empty_success_retries": automatic_empty_success_retries,
+                "acceptance_criterion_ids": [
+                    item["criterion_id"] for item in ha_state.acceptance_criteria
+                ],
             },
         )
     )
@@ -1289,6 +1648,8 @@ def retry_callable_backend_invocation(
     if not _callable_terminal_failure_pending(ha_state):
         raise ValueError("No terminal backend failure awaiting retry.")
 
+    failed_record = _pending_invocation_record(ha_state)
+    retry_of = failed_record.invocation_id if failed_record is not None else ha_state.last_invocation_id
     ha_state.pending_agent_invocation = None
     ha_state.backend_retry_required = False
     ha_state.backend_block_reason = None
@@ -1297,6 +1658,8 @@ def retry_callable_backend_invocation(
     ha_state.mode = HA_MODE_RUNNING
     ha_state.last_event = "Operator cleared terminal backend failure; ready to re-invoke."
     ha_state.last_tick_step = "backend_retry_cleared"
+    ha_state.operator_retry_count += 1
+    ha_state.pending_retry_of_invocation_id = retry_of
     _ensure_high_autonomy_transport(controller, ha_state)
     ha_state.backend_reinvoke_pending = True
     ha_state.next_action = HA_NEXT_WRITE_INSTRUCTION
@@ -1315,11 +1678,11 @@ def stop_high_autonomy_run(
     ha_state = _ha_state(controller)
     if not ha_state.active and ha_state.mode == HA_MODE_OFF:
         ha_state = HighAutonomyRunState()
-    ha_state.active = False
-    ha_state.mode = HA_MODE_STOPPED
-    ha_state.stop_reason = reason
-    ha_state.last_event = reason
-    ha_state.next_action = HA_NEXT_NONE
+    _set_final_outcome(
+        ha_state,
+        outcome="stopped_by_operator",
+        reason=reason,
+    )
     _save_ha_state(controller, ha_state)
     controller._persist()
     view = controller.state_view()
@@ -1352,18 +1715,37 @@ def tick_high_autonomy_run(
 
     policy = policy or HighAutonomyPolicy()
     _sync_counters(controller, ha_state, policy)
+    if _try_finalize_outcome(controller, ha_state):
+        _save_ha_state(controller, ha_state)
+        controller._persist()
+        view = controller.state_view()
+        view["high_autonomy_summary"] = build_high_autonomy_summary(
+            ha_state=ha_state, state_view=view
+        )
+        view["high_autonomy_tick"] = {
+            "step": "finalize_outcome",
+            "outcome": ha_state.outcome,
+            "reason": ha_state.outcome_reason,
+        }
+        return view
     planned = _plan_next_action(controller, ha_state, policy, transport)
     ha_state.next_action = planned
+    _save_ha_state(controller, ha_state)
     ha_state.last_tick_at = _now_iso()
     ha_state.tick_count += 1
     step_result: dict[str, Any] = {"planned": planned}
 
     if planned == HA_NEXT_STOP:
-        ha_state.mode = HA_MODE_STOPPED
-        ha_state.active = False
-        ha_state.stop_reason = f"Reached max turns ({ha_state.max_turns})."
-        ha_state.last_event = ha_state.stop_reason
-        ha_state.last_tick_step = "stop"
+        if ha_state.outcome is None:
+            _set_final_outcome(
+                ha_state,
+                outcome="stopped_by_budget",
+                reason=(
+                    f"Model invocation budget exhausted at {ha_state.max_turns} turn(s); "
+                    f"unmet criteria: {', '.join(ha_state.unmet_criteria) or 'none'}."
+                ),
+            )
+        ha_state.last_tick_step = "finalize_outcome"
         _save_ha_state(controller, ha_state)
         controller._persist()
         view = controller.state_view()
@@ -1372,14 +1754,26 @@ def tick_high_autonomy_run(
         return view
 
     if planned == HA_NEXT_WRITE_INSTRUCTION:
+        is_backend_retry = ha_state.backend_reinvoke_pending
         ha_state.backend_reinvoke_pending = False
         view_before = controller.state_view()
         continuation = view_before.get("continuation_instruction") or {}
         instruction_text = continuation.get("instruction_text")
         run_loop = controller._session.run_loop
-        if not run_loop.response_records:
-            packet_view = controller.generate_next_instruction_packet()
-            instruction_text = packet_view["run_loop"]["instruction_packets"][-1]["packet_text"]
+        if is_backend_retry:
+            if not run_loop.instruction_packets:
+                raise ValueError("Cannot retry backend invocation without a prior instruction packet.")
+            instruction_text = run_loop.instruction_packets[-1].packet_text
+        elif not run_loop.response_records:
+            if instruction_text:
+                controller.generate_next_continuation_instruction_packet(
+                    instruction_text=instruction_text
+                )
+            else:
+                packet_view = controller.generate_next_instruction_packet()
+                instruction_text = packet_view["run_loop"]["instruction_packets"][-1][
+                    "packet_text"
+                ]
         elif instruction_text:
             controller.generate_next_continuation_instruction_packet(instruction_text=instruction_text)
         else:
@@ -1387,6 +1781,14 @@ def tick_high_autonomy_run(
             instruction_text = packet_view["run_loop"]["instruction_packets"][-1]["packet_text"]
 
         turn_now = controller._session.run_loop.current_turn
+        if not is_backend_retry:
+            work_limit = max(ha_state.max_turns - ha_state.closure_reserve_turns, 0)
+            if turn_now <= work_limit:
+                ha_state.work_turns_used += 1
+            else:
+                ha_state.phase = "closure"
+                ha_state.closure_phase_status = "completion_first"
+                ha_state.closure_turns_used += 1
         if transport is None:
             _pause_for_unavailable_transport(ha_state, step_result)
             _save_ha_state(controller, ha_state)
@@ -1399,13 +1801,19 @@ def tick_high_autonomy_run(
                 instruction_id=_latest_instruction_id(controller),
             )
             step_result.update({"bridge": bridge_result, "turn": turn_now})
+            if is_backend_retry:
+                step_result["retry_of_invocation_id"] = ha_state.pending_retry_of_invocation_id
             _finalize_write_instruction(
                 controller,
                 ha_state,
                 transport,
                 step_result,
                 turn_number=turn_now,
-                event=f"Wrote turn {turn_now} instruction automatically.",
+                event=(
+                    f"Re-invoked turn {turn_now} instruction with preserved instruction id."
+                    if is_backend_retry
+                    else f"Wrote turn {turn_now} instruction automatically."
+                ),
                 event_type="high_autonomy_instruction_written",
                 tick_step="write_instruction",
             )
@@ -1437,6 +1845,13 @@ def tick_high_autonomy_run(
         ha_state.refusal_recovery_pending = False
         ha_state.recovery_attempted = True
         turn_now = controller._session.run_loop.current_turn
+        work_limit = max(ha_state.max_turns - ha_state.closure_reserve_turns, 0)
+        if turn_now <= work_limit:
+            ha_state.work_turns_used += 1
+        else:
+            ha_state.phase = "closure"
+            ha_state.closure_phase_status = "completion_first"
+            ha_state.closure_turns_used += 1
         if transport is None:
             _pause_for_unavailable_transport(ha_state, step_result)
         else:
@@ -1471,6 +1886,8 @@ def tick_high_autonomy_run(
         session = controller._session
         executed_ids: list[str] = []
         for item in list(session.queue):
+            if len(executed_ids) >= policy.max_auto_executions_per_turn:
+                break
             envelope = session.run_envelopes.get(item.action_id)
             if not policy.is_auto_executable(item=item, envelope=envelope, workspace_path=workspace):
                 continue
@@ -1481,7 +1898,13 @@ def tick_high_autonomy_run(
                     item.action_id, {"workspace_path": workspace}
                 )
                 executed_ids.append(item.action_id)
-                ha_state.auto_executed_action_count += 1
+                refreshed_item = controller._find_queue_item(item.action_id)
+                if refreshed_item and refreshed_item.operation_outcome in (
+                    "executed_mutation",
+                    "executed_read",
+                    "executed_list",
+                ):
+                    ha_state.auto_executed_action_count += 1
             except Exception:
                 continue
 
@@ -1506,11 +1929,22 @@ def tick_high_autonomy_run(
 
     elif planned == HA_NEXT_VERIFY:
         workspace = controller._session.bounded_executor_workspace
-        controller.verify_bounded_local_workspace({"workspace_path": workspace, "profile": "tiny_game_demo"})
+        verification_profile = (
+            "acceptance_ledger"
+            if _has_acceptance_verification_plan(ha_state)
+            else "tiny_game_demo"
+        )
+        ha_state.closure_phase_status = "verifying"
+        controller.verify_bounded_local_workspace(
+            {"workspace_path": workspace, "profile": verification_profile}
+        )
+        refreshed = controller._high_autonomy_state()
+        ha_state.acceptance_criteria = refreshed.acceptance_criteria
         ha_state.mode = HA_MODE_VERIFYING
         ha_state.last_event = "Ran bounded verification as a controller step."
         ha_state.last_tick_step = "verify"
         step_result["verified"] = True
+        step_result["verification_profile"] = verification_profile
         _save_ha_state(controller, ha_state)
         controller._persist()
 
@@ -1531,6 +1965,7 @@ def tick_high_autonomy_run(
         controller._persist()
 
     _sync_counters(controller, ha_state, policy)
+    _try_finalize_outcome(controller, ha_state)
     if transport is not None:
         _capture_transport_status(ha_state, transport)
     # For callable backends the durable backend_step (invoking/response_ready/

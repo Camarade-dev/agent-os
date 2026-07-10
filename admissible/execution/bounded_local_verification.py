@@ -16,7 +16,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from admissible.execution.bounded_local_executor import validate_workspace_path
+from admissible.execution.bounded_local_executor import (
+    validate_relative_path_inside_workspace,
+    validate_workspace_path,
+)
 from admissible.run_loop import EvidenceRecord
 
 VERIFICATION_ACTOR = "bounded_verification"
@@ -30,10 +33,15 @@ ALLOWED_VERIFICATION_CHECKS = frozenset(
         "html_local_asset_references",
         "no_external_references",
         "node_syntax_check",
+        "file_exists",
+        "file_sha_matches_latest_execution",
+        "file_contains",
+        "file_not_empty",
+        "all_required_files_present",
     }
 )
 
-ALLOWED_VERIFICATION_PROFILES = frozenset({"tiny_game_demo"})
+ALLOWED_VERIFICATION_PROFILES = frozenset({"tiny_game_demo", "acceptance_ledger"})
 
 TINY_GAME_DEMO_FILES = (
     "index.html",
@@ -101,15 +109,34 @@ class VerificationRequest:
 
     check_id: str
     target_paths: list[str] = field(default_factory=list)
+    criterion_id: str | None = None
+    contains: list[str] = field(default_factory=list)
+    contains_any: list[str] = field(default_factory=list)
+    expected_sha256: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"check_id": self.check_id, "target_paths": list(self.target_paths)}
+        return {
+            "check_id": self.check_id,
+            "target_paths": list(self.target_paths),
+            "criterion_id": self.criterion_id,
+            "contains": list(self.contains),
+            "contains_any": list(self.contains_any),
+            "expected_sha256": self.expected_sha256,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "VerificationRequest":
         return cls(
             check_id=str(data.get("check_id") or "").strip(),
             target_paths=[str(path) for path in data.get("target_paths") or []],
+            criterion_id=(str(data.get("criterion_id")).strip() if data.get("criterion_id") else None),
+            contains=[str(value) for value in data.get("contains") or []],
+            contains_any=[str(value) for value in data.get("contains_any") or []],
+            expected_sha256=(
+                str(data.get("expected_sha256")).strip()
+                if data.get("expected_sha256")
+                else None
+            ),
         )
 
 
@@ -124,6 +151,7 @@ class VerificationResult:
     message: str
     timestamp: str
     evidence_payload: dict[str, Any] = field(default_factory=dict)
+    criterion_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -134,6 +162,7 @@ class VerificationResult:
             "message": self.message,
             "timestamp": self.timestamp,
             "evidence_payload": dict(self.evidence_payload),
+            "criterion_id": self.criterion_id,
         }
 
     @classmethod
@@ -146,6 +175,7 @@ class VerificationResult:
             message=str(data.get("message") or ""),
             timestamp=str(data.get("timestamp") or ""),
             evidence_payload=dict(data.get("evidence_payload") or {}),
+            criterion_id=(str(data.get("criterion_id")) if data.get("criterion_id") else None),
         )
 
 
@@ -219,6 +249,23 @@ def validate_verification_request(request: VerificationRequest) -> None:
                 f"verification check_id implies forbidden capability: {check_id!r}",
                 diagnostic="forbidden_verification_check",
             )
+    if check_id in ("file_exists", "file_not_empty", "file_contains") and len(
+        request.target_paths
+    ) != 1:
+        raise BoundedVerificationError(
+            f"{check_id} requires exactly one target path",
+            diagnostic="invalid_verification_target",
+        )
+    if check_id == "all_required_files_present" and not request.target_paths:
+        raise BoundedVerificationError(
+            "all_required_files_present requires at least one target path",
+            diagnostic="invalid_verification_target",
+        )
+    if check_id == "file_contains" and not (request.contains or request.contains_any):
+        raise BoundedVerificationError(
+            "file_contains requires contains and/or contains_any text",
+            diagnostic="missing_verification_expectation",
+        )
 
 
 def default_requests_for_profile(profile: str, *, include_node_syntax_check: bool = False) -> list[VerificationRequest]:
@@ -229,6 +276,9 @@ def default_requests_for_profile(profile: str, *, include_node_syntax_check: boo
             diagnostic="unsupported_verification_profile",
             detail={"profile": profile, "allowed_profiles": sorted(ALLOWED_VERIFICATION_PROFILES)},
         )
+
+    if profile == "acceptance_ledger":
+        return []
 
     requests = [
         VerificationRequest("files_exist", list(TINY_GAME_DEMO_FILES)),
@@ -477,6 +527,153 @@ def _check_no_external_references(
     )
 
 
+def _generic_target(workspace: Path, request: VerificationRequest) -> tuple[str, Path]:
+    rel_path = request.target_paths[0]
+    return rel_path, validate_relative_path_inside_workspace(workspace, rel_path)
+
+
+def _check_file_exists(
+    workspace: Path, request: VerificationRequest, *, timestamp: str
+) -> VerificationResult:
+    rel_path, target = _generic_target(workspace, request)
+    exists = target.is_file()
+    return VerificationResult(
+        check_id=request.check_id,
+        check_name=_check_display_name(request.check_id),
+        target_paths=[rel_path],
+        status="pass" if exists else "fail",
+        message=(f"File exists: {rel_path}" if exists else f"File is missing: {rel_path}"),
+        timestamp=timestamp,
+        evidence_payload={"path": rel_path, "exists": exists},
+        criterion_id=request.criterion_id,
+    )
+
+
+def _check_file_not_empty(
+    workspace: Path, request: VerificationRequest, *, timestamp: str
+) -> VerificationResult:
+    rel_path, target = _generic_target(workspace, request)
+    size = target.stat().st_size if target.is_file() else 0
+    passed = target.is_file() and size > 0
+    return VerificationResult(
+        check_id=request.check_id,
+        check_name=_check_display_name(request.check_id),
+        target_paths=[rel_path],
+        status="pass" if passed else "fail",
+        message=(
+            f"File is non-empty: {rel_path} ({size} bytes)"
+            if passed
+            else f"File is missing or empty: {rel_path}"
+        ),
+        timestamp=timestamp,
+        evidence_payload={"path": rel_path, "bytes": size},
+        criterion_id=request.criterion_id,
+    )
+
+
+def _check_file_contains(
+    workspace: Path, request: VerificationRequest, *, timestamp: str
+) -> VerificationResult:
+    rel_path, target = _generic_target(workspace, request)
+    if not target.is_file():
+        return VerificationResult(
+            check_id=request.check_id,
+            check_name=_check_display_name(request.check_id),
+            target_paths=[rel_path],
+            status="fail",
+            message=f"File is missing: {rel_path}",
+            timestamp=timestamp,
+            evidence_payload={"path": rel_path, "missing": True},
+            criterion_id=request.criterion_id,
+        )
+    content = target.read_text(encoding="utf-8", errors="replace")
+    missing_all = [needle for needle in request.contains if needle not in content]
+    any_match = not request.contains_any or any(
+        needle in content for needle in request.contains_any
+    )
+    passed = not missing_all and any_match
+    return VerificationResult(
+        check_id=request.check_id,
+        check_name=_check_display_name(request.check_id),
+        target_paths=[rel_path],
+        status="pass" if passed else "fail",
+        message=(
+            f"Expected text is present in {rel_path}."
+            if passed
+            else f"Expected text is missing from {rel_path}."
+        ),
+        timestamp=timestamp,
+        evidence_payload={
+            "path": rel_path,
+            "contains": list(request.contains),
+            "contains_any": list(request.contains_any),
+            "missing": missing_all,
+            "contains_any_matched": any_match,
+        },
+        criterion_id=request.criterion_id,
+    )
+
+
+def _check_file_sha_matches_latest_execution(
+    workspace: Path,
+    request: VerificationRequest,
+    write_records: list[EvidenceRecord],
+    *,
+    timestamp: str,
+) -> VerificationResult:
+    rel_path, target = _generic_target(workspace, request)
+    expected = request.expected_sha256
+    if not expected:
+        for record in write_records:
+            if str(record.file_path_or_note or "") == rel_path and record.sha256:
+                expected = record.sha256
+    actual = _file_sha256_for_write_evidence(target) if target.is_file() else None
+    passed = bool(expected and actual and expected == actual)
+    return VerificationResult(
+        check_id=request.check_id,
+        check_name=_check_display_name(request.check_id),
+        target_paths=[rel_path],
+        status="pass" if passed else "fail",
+        message=(
+            f"File sha256 matches latest execution evidence: {rel_path}"
+            if passed
+            else f"File sha256 does not match latest execution evidence: {rel_path}"
+        ),
+        timestamp=timestamp,
+        evidence_payload={
+            "path": rel_path,
+            "expected_sha256": expected,
+            "actual_sha256": actual,
+        },
+        criterion_id=request.criterion_id,
+    )
+
+
+def _check_all_required_files_present(
+    workspace: Path, request: VerificationRequest, *, timestamp: str
+) -> VerificationResult:
+    missing: list[str] = []
+    for rel_path in request.target_paths:
+        target = validate_relative_path_inside_workspace(workspace, rel_path)
+        if not target.is_file():
+            missing.append(rel_path)
+    passed = not missing
+    return VerificationResult(
+        check_id=request.check_id,
+        check_name=_check_display_name(request.check_id),
+        target_paths=list(request.target_paths),
+        status="pass" if passed else "fail",
+        message=(
+            f"All {len(request.target_paths)} required files are present."
+            if passed
+            else f"Missing required files: {', '.join(missing)}"
+        ),
+        timestamp=timestamp,
+        evidence_payload={"checked_paths": list(request.target_paths), "missing_paths": missing},
+        criterion_id=request.criterion_id,
+    )
+
+
 def _check_node_syntax(
     workspace: Path,
     target_paths: list[str],
@@ -571,6 +768,18 @@ def run_single_verification_check(
         return _check_no_external_references(workspace, request.target_paths, timestamp=ts)
     if request.check_id == "node_syntax_check":
         return _check_node_syntax(workspace, request.target_paths, timestamp=ts)
+    if request.check_id == "file_exists":
+        return _check_file_exists(workspace, request, timestamp=ts)
+    if request.check_id == "file_not_empty":
+        return _check_file_not_empty(workspace, request, timestamp=ts)
+    if request.check_id == "file_contains":
+        return _check_file_contains(workspace, request, timestamp=ts)
+    if request.check_id == "file_sha_matches_latest_execution":
+        return _check_file_sha_matches_latest_execution(
+            workspace, request, write_records, timestamp=ts
+        )
+    if request.check_id == "all_required_files_present":
+        return _check_all_required_files_present(workspace, request, timestamp=ts)
 
     raise BoundedVerificationError(
         f"verification check is not implemented: {request.check_id!r}",
@@ -611,7 +820,9 @@ def run_bounded_verification(
         )
         for request in plan
     ]
-    overall_status = "pass" if all(result.status == "pass" for result in results) else "fail"
+    overall_status = (
+        "pass" if results and all(result.status == "pass" for result in results) else "fail"
+    )
     return VerificationEvidence(
         evidence_id=f"verification_{uuid.uuid4().hex[:12]}",
         actor=VERIFICATION_ACTOR,

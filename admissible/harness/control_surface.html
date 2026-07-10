@@ -650,6 +650,12 @@
     </details>
   </section>
 
+  <section class="panel" id="advanced-run-records-panel">
+    <h2>Advanced Run Records</h2>
+    <p class="no-action-note">Raw invocation diagnostics and canonical operation history.</p>
+    <div id="advanced-run-records-body"></div>
+  </section>
+
   </details>
 
   <details id="mission-summary-details" class="advanced-drawer">
@@ -721,6 +727,7 @@ let queueFilter = "attention";
 let autoRunActive = false;
 let autoRunTimer = null;
 let lastTickResult = "";
+let requestInFlight = false;
 const AUTO_RUN_INTERVAL_MS = 1500;
 
 function stopAutoRun() {
@@ -738,16 +745,25 @@ function summarizeTick(state) {
 
 async function autoRunLoop() {
   if (!autoRunActive) return;
+  if (requestInFlight) {
+    autoRunTimer = setTimeout(autoRunLoop, AUTO_RUN_INTERVAL_MS);
+    return;
+  }
   autoRunTimer = null;
   let state;
+  requestInFlight = true;
+  if (lastState) render(lastState);
   try {
     state = await apiPost("/api/session/high_autonomy/tick", {});
     clearError();
   } catch (err) {
     showError(err.message);
     stopAutoRun();
+    requestInFlight = false;
     await refresh();
     return;
+  } finally {
+    requestInFlight = false;
   }
   lastTickResult = summarizeTick(state);
   render(state);
@@ -770,6 +786,10 @@ function startAutoRun() {
   }
   if (ha.human_action_required) {
     showError("A human-critical action requires approval; auto-run is disabled.");
+    return;
+  }
+  if (requestInFlight) {
+    showError("Backend invocation in progress.");
     return;
   }
   if (autoRunActive) return;
@@ -861,13 +881,23 @@ async function refresh() {
 }
 
 async function runAction(fn) {
+  if (requestInFlight) {
+    showError("Backend invocation in progress.");
+    return lastState;
+  }
+  requestInFlight = true;
+  if (lastState) render(lastState);
   try {
     const state = await fn();
     clearError();
+    requestInFlight = false;
     render(state);
+    return state;
   } catch (err) {
+    requestInFlight = false;
     showError(err.message);
     await refresh();
+    return lastState;
   }
 }
 
@@ -1370,7 +1400,12 @@ function renderHighAutonomy(state) {
     response_ready: "Response ready",
     ingesting_response: "Ingesting response",
     response_consumed: "Response consumed",
+    empty_success: "Empty success — explicit retry required",
   };
+  const metrics = ha.metrics || state.canonical_run_metrics || {};
+  const outcomeLabel = ha.outcome_label || "In progress";
+  const unmet = ha.unmet_criteria || [];
+  const activeBlockerCount = metrics.active_blocked_count ?? ha.blocked_action_count ?? 0;
   const backendError = ha.backend_error || {};
   const backendErrorRow = ha.backend_retry_required && ha.is_callable_backend
     ? `<div class="ha-backend-error" style="margin:.65rem 0;padding:.55rem .65rem;border:1px solid var(--cs-border-strong);border-radius:6px;background:var(--cs-input-bg);">
@@ -1392,6 +1427,13 @@ function renderHighAutonomy(state) {
        <div class="ha-status-row"><dt>Last invocation id</dt><dd>${escapeHtml(ha.last_invocation_id || "—")}</dd></div>`
     : `<div class="ha-status-row"><dt>Backend status</dt><dd>${escapeHtml(ha.transport_status || "—")}</dd></div>`;
   body.innerHTML = `
+    <div class="ha-outcome-summary" style="margin:0 0 .75rem;padding:.65rem;border:1px solid var(--cs-border);border-radius:6px;">
+      <p style="margin:0 0 .35rem;"><strong>Outcome:</strong> ${escapeHtml(outcomeLabel)}</p>
+      <p style="margin:.15rem 0;"><strong>Progress:</strong> acceptance criteria ${escapeHtml(ha.acceptance_verified_count || 0)}/${escapeHtml(ha.acceptance_total_count || 0)} verified</p>
+      <p style="margin:.15rem 0;"><strong>Usage:</strong> ${escapeHtml(metrics.model_invocation_count || 0)} model invocation(s) · ${escapeHtml(metrics.backend_retry_count || 0)} retr${(metrics.backend_retry_count || 0) === 1 ? "y" : "ies"} · ${escapeHtml(metrics.genuine_human_intervention_count || 0)} human interruption(s)</p>
+      <p style="margin:.15rem 0;"><strong>Execution:</strong> ${escapeHtml(metrics.useful_write_count || 0)} useful write(s) · ${escapeHtml(metrics.duplicate_noop_count || 0)} duplicate(s) avoided · ${escapeHtml((metrics.read_count || 0) + (metrics.list_count || 0))} read/list operation(s) · ${escapeHtml(metrics.verification_check_count || 0)} verification check(s)</p>
+      <p style="margin:.15rem 0;"><strong>Remaining:</strong> ${escapeHtml(activeBlockerCount)} active blocker(s)${unmet.length ? ` · unmet criteria: ${escapeHtml(unmet.join(", "))}` : ""}</p>
+    </div>
     <dl class="ha-status-grid">
       <div class="ha-status-row"><dt>Target workspace</dt><dd>${escapeHtml(ha.workspace_path || control.target_workspace_path || "—")}</dd></div>
       <div class="ha-status-row"><dt>Agent backend</dt><dd>${escapeHtml(ha.backend_id || control.backends && selectedBackendId() || "—")} <span style="color:var(--cs-muted);">(${escapeHtml(ha.transport_kind || "—")})</span></dd></div>
@@ -1403,7 +1445,8 @@ function renderHighAutonomy(state) {
       <div class="ha-status-row"><dt>Blocking reason</dt><dd>${escapeHtml(blockingReason)}</dd></div>
       <div class="ha-status-row"><dt>Last event</dt><dd>${escapeHtml(ha.last_event || "—")}</dd></div>
       <div class="ha-status-row"><dt>Mode</dt><dd><span class="status-badge status-badge-pending">${escapeHtml(ha.mode || "off")}</span></dd></div>
-      <div class="ha-status-row"><dt>Evidence</dt><dd>${ha.evidence_count ?? 0} write(s)</dd></div>
+      <div class="ha-status-row"><dt>Phase / budget</dt><dd>${escapeHtml(ha.phase || "work")} · ${escapeHtml(ha.turns_remaining ?? 0)} invocation turn(s) remaining</dd></div>
+      <div class="ha-status-row"><dt>Evidence</dt><dd>${escapeHtml(metrics.useful_write_count || 0)} useful write(s)</dd></div>
       <div class="ha-status-row"><dt>Verification</dt><dd>${escapeHtml(ha.verification_readiness || "not_run")}${ha.verification_passed ? " ✓" : ""}</dd></div>
       <div class="ha-status-row"><dt>Human action required</dt><dd>${escapeHtml(humanAction)}</dd></div>
     </dl>
@@ -1423,10 +1466,10 @@ function renderHighAutonomy(state) {
 
   if (evidenceLine) {
     evidenceLine.textContent =
-      `Evidence: ${ha.evidence_count ?? 0} write(s) · ` +
-      `Auto-executed: ${ha.auto_executed_action_count ?? 0} · ` +
-      `Blocked (not completed): ${ha.blocked_count ?? ha.blocked_action_count ?? 0} · ` +
-      `Verification: ${ha.verification_readiness || "not_run"}`;
+      `Useful writes: ${metrics.useful_write_count || 0} · ` +
+      `Duplicates avoided: ${metrics.duplicate_noop_count || 0} · ` +
+      `Active blockers: ${activeBlockerCount} · ` +
+      `Verification checks: ${metrics.verification_check_count || 0}`;
   }
 
   renderAutoRunStatusLine(ha);
@@ -1436,7 +1479,9 @@ function renderHighAutonomy(state) {
 
   const btn = (id, label, cls, opts) => {
     const o = opts || {};
-    const attrs = `${o.disabled ? " disabled" : ""}${o.title ? ` title="${escapeHtml(o.title)}"` : ""}`;
+    const busyControlled = new Set(["btn-ha-start", "btn-ha-step", "btn-ha-retry-backend", "btn-ha-autorun"]);
+    const disabled = Boolean(o.disabled || (requestInFlight && busyControlled.has(id)) || (id === "btn-ha-step" && autoRunActive));
+    const attrs = `${disabled ? " disabled" : ""}${o.title ? ` title="${escapeHtml(o.title)}"` : ""}`;
     return `<button type="button" id="${id}" class="${cls || ""}"${attrs}>${escapeHtml(label)}</button>`;
   };
 
@@ -1504,6 +1549,7 @@ function renderAutoRunStatusLine(ha) {
     state = "paused";
   }
   const parts = [`Auto-run: ${state}`];
+  if (requestInFlight) parts.push("Backend invocation in progress");
   if (lastTickResult) parts.push(`Last tick: ${lastTickResult}`);
   // Only the file bridge waits on an external response file. A callable backend
   // shows its in-process step instead (never "waiting for a response file").
@@ -1518,6 +1564,19 @@ function renderAutoRunStatusLine(ha) {
   }
   if (ha.human_action_required) parts.push("Human action required");
   line.textContent = parts.join(" · ");
+}
+
+function renderAdvancedRunRecords(state) {
+  const body = document.getElementById("advanced-run-records-body");
+  if (!body) return;
+  const haRun = state.high_autonomy_run || {};
+  const invocations = haRun.invocation_history || [];
+  const operations = state.operation_records || [];
+  body.innerHTML = `
+    <details><summary>Invocation diagnostics (${escapeHtml(invocations.length)})</summary>
+      <pre>${escapeHtml(JSON.stringify(invocations, null, 2))}</pre></details>
+    <details><summary>Operation history (${escapeHtml(operations.length)})</summary>
+      <pre>${escapeHtml(JSON.stringify(operations, null, 2))}</pre></details>`;
 }
 
 function renderGovernedRun(state) {
@@ -2426,6 +2485,7 @@ function render(state) {
   renderManualFallback(state);
   renderBridgeFromState(state);
   renderHighAutonomy(state);
+  renderAdvancedRunRecords(state);
   renderGovernedRun(state);
   renderRunTimeline(state);
   renderContinuation(state);
@@ -2730,7 +2790,7 @@ document.getElementById("btn-reset").addEventListener("click", () => {
 document.getElementById("btn-export").addEventListener("click", async () => {
   try {
     const data = await apiGet("/api/session/export");
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;

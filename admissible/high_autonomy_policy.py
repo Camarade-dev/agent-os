@@ -91,6 +91,17 @@ class HighAutonomyPolicy:
             or ""
         )
 
+        candidate = getattr(envelope, "candidate", {}) if envelope is not None else {}
+        if isinstance(candidate, dict) and candidate.get("requires_safe_overwrite_review"):
+            return HighAutonomyActionClassification(
+                action_id=str(action_id),
+                category="human_critical",
+                reason=(
+                    "The write targets a file that predates this governed run or whose "
+                    "current sha256 is not covered by latest execution evidence."
+                ),
+            )
+
         if action_type in HUMAN_CRITICAL_ACTION_TYPES:
             return HighAutonomyActionClassification(
                 action_id=str(action_id),

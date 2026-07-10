@@ -9,9 +9,11 @@ import unittest.mock as mock
 from pathlib import Path
 
 from admissible.agent_backend import (
+    AGENT_INVOKE_EMPTY_SUCCESS,
     AGENT_INVOKE_MALFORMED,
     AGENT_INVOKE_SUCCESS,
     INPUT_MODE_FILE_POINTER_ALWAYS,
+    INVOCATION_STATUS_EMPTY_SUCCESS,
     INVOCATION_STATUS_MALFORMED,
     PROMPT_MODE_FILE_POINTER,
     AgentInvocationRecord,
@@ -198,10 +200,13 @@ class TestCursorAgentFilePointerContract(unittest.TestCase):
         self.assertEqual(calls["count"], 1)
         self.assertEqual(first["high_autonomy_summary"]["mode"], "paused")
         self.assertEqual(second["high_autonomy_summary"]["mode"], "paused")
-        self.assertEqual(pending.status, INVOCATION_STATUS_MALFORMED)
+        self.assertEqual(pending.status, INVOCATION_STATUS_EMPTY_SUCCESS)
         self.assertEqual(pending.stdout_length, 1)
         self.assertEqual(pending.exit_code, 0)
-        self.assertEqual(backend.status_snapshot()["last_result"]["status"], AGENT_INVOKE_MALFORMED)
+        self.assertEqual(
+            backend.status_snapshot()["last_result"]["status"],
+            AGENT_INVOKE_EMPTY_SUCCESS,
+        )
 
 
 if __name__ == "__main__":

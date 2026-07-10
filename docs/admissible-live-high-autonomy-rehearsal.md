@@ -166,3 +166,30 @@ used.
 change-only response detection, stale/duplicate blocking, controller↔transport turn-metadata
 alignment, bounded auto-execution, human-critical pause + approve/refuse, minimal status,
 auto-run HTML markers, and unchanged manual mode.
+
+## Fresh live-run acceptance after Run 038
+
+The `pixel-wanderer-cli-006` source session is regression evidence, not a completed run. A
+fresh rehearsal should use the four-file coherent batch and criterion-level checks recorded
+in `tests/fixtures/admissible/pixel_wanderer_cli_006_regression.json`.
+
+Expected operator-visible behavior:
+
+1. Independent `index.html`, `style.css`, `game.js`, and `LOCAL_DEV.md` creates can arrive in
+   one bounded response within the default limits.
+2. A later same-run overwrite is automatic only when disk sha256 still matches latest
+   execution evidence; an identical repeated proposal is a no-op.
+3. Approval prose for an independently `ALLOW` local write creates no human stop; a genuine
+   unresolved decision still does.
+4. A 12-turn run enters completion-first closure at turn 10. Already-received responses,
+   admitted operations, and deterministic verification finish without another model call.
+5. Empty-success is visible and pauses by default. Manual retry is one linked invocation and
+   does not duplicate response ingest or target writes.
+6. Outcome/progress/usage/execution/remaining cards use canonical metrics; raw queue,
+   invocation diagnostics, operation history, and verification records remain advanced data.
+7. The final outcome is `completed` only after all mandatory fixture criteria verify. If the
+   model budget ends first, the outcome is `stopped_by_budget` with exact unmet criteria and
+   pending useful operations.
+
+Step and auto-run are single-flight at both browser and server layers. A concurrent request
+returns `tick_already_in_progress`; it does not call Cursor Agent again.

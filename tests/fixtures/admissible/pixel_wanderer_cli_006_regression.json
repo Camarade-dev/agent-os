@@ -1,0 +1,98 @@
+{
+  "schema_version": "admissible_live_regression_fixture_v1",
+  "source_session": "pixel-wanderer-cli-006",
+  "claim_boundary": "Minimized deterministic state derived from the exported live run; it is not a claim that the original task completed.",
+  "budget": {
+    "max_turns": 12,
+    "observed_turns_used": 12,
+    "observed_stop": "max_turns",
+    "observed_verification_readiness": "not_run",
+    "closure_reserve_turns_post_038": 2
+  },
+  "turns": [
+    {"turn": 1, "milestone": "initial_index_write"},
+    {"turn": 2, "milestone": "style_write"},
+    {"turn": 3, "milestone": "game_write"},
+    {"turn": 4, "milestone": "local_dev_write"},
+    {"turn": 5, "milestone": "index_superseding_write"},
+    {"turn": 6, "milestone": "game_superseding_write"},
+    {"turn": 7, "milestone": "duplicate_local_dev_write"},
+    {"turn": 8, "milestone": "list_files"},
+    {"turn": 9, "milestone": "stale_index_gate_repeated"},
+    {"turn": 10, "milestone": "empty_success_then_explicit_retry"},
+    {"turn": 11, "milestone": "verification_reads_started"},
+    {"turn": 12, "milestone": "verification_reads_finished_then_budget_stop"}
+  ],
+  "file_states": {
+    "index_v1": {
+      "path": "index.html",
+      "sha256": "c3f228b0a7bffdb8164af4565ba4335be766510cccff4e59479a62dd85f571f5"
+    },
+    "index_v2": {
+      "path": "index.html",
+      "sha256": "a7cba818dd59fc540c701704fc8e2cd0438093a7380ad672c55568c5d5b04181",
+      "content": "<!doctype html><link rel=\"stylesheet\" href=\"style.css\"><canvas id=\"game\"></canvas><span id=\"score\">0</span><script src=\"game.js\"></script>\n"
+    },
+    "style": {
+      "path": "style.css",
+      "sha256": "41f081a26475df83a598220960aa252a036c4a67dad19af407f8663664e8ea48",
+      "content": "body { margin: 0; background: #111; color: #fff; }\n"
+    },
+    "game_v1": {
+      "path": "game.js",
+      "sha256": "dcccac0b256c0a90081ae45c1c466d2345b26927d27f6460dee8246b5828e856"
+    },
+    "game_v2": {
+      "path": "game.js",
+      "sha256": "298d61d638f8c8c912b580f8805cdc8f0d56277693fd759f1e2ad7886f59cad8",
+      "content": "const keys=['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','w','a','s','d']; let collectible={x:1,y:1}; let score=0; function restart(){score=0;} addEventListener('keydown',e=>{if(e.key==='r'||e.key==='R')restart();});\n"
+    },
+    "local_dev": {
+      "path": "LOCAL_DEV.md",
+      "sha256": "6c1d1beeaf54ca253d7e4bf43f528b8003527ce192cb21178340843c889c3519",
+      "content": "Open index.html locally — no server required.\n"
+    }
+  },
+  "execution_records": [
+    {"id": "exec_001", "turn": 1, "operation": "write_file", "path": "index.html", "state": "index_v1"},
+    {"id": "exec_002", "turn": 2, "operation": "write_file", "path": "style.css", "state": "style"},
+    {"id": "exec_003", "turn": 3, "operation": "write_file", "path": "game.js", "state": "game_v1"},
+    {"id": "exec_004", "turn": 4, "operation": "write_file", "path": "LOCAL_DEV.md", "state": "local_dev"},
+    {"id": "exec_005", "turn": 5, "operation": "write_file", "path": "index.html", "state": "index_v2"},
+    {"id": "exec_006", "turn": 6, "operation": "write_file", "path": "game.js", "state": "game_v2"},
+    {"id": "exec_007", "turn": 7, "operation": "write_file", "path": "LOCAL_DEV.md", "state": "local_dev", "duplicate_of": "exec_004"},
+    {"id": "exec_008", "turn": 8, "operation": "list_files", "path": "."},
+    {"id": "exec_009", "turn": 11, "operation": "read_file", "path": "index.html", "expected_state": "index_v2"},
+    {"id": "exec_010", "turn": 12, "operation": "read_file", "path": "style.css", "expected_state": "style"},
+    {"id": "exec_011", "turn": 12, "operation": "read_file", "path": "game.js", "expected_state": "game_v2"}
+  ],
+  "gates": [
+    {"id": "gate_index_approve_1", "semantic_type": "local_write_approval_restatement", "target": "index.html", "status": "stale"},
+    {"id": "gate_index_approve_2", "semantic_type": "local_write_approval_restatement", "target": "index.html", "equivalent_to": "gate_index_approve_1"},
+    {"id": "gate_local_dev_approve", "semantic_type": "local_write_approval_restatement", "target": "LOCAL_DEV.md", "status": "stale"}
+  ],
+  "human_decisions": {
+    "observed_count": 7,
+    "all_local_or_stale_decision_only": true
+  },
+  "backend_invocations": [
+    {"invocation_id": "invoke_empty", "instruction_id": "packet_turn10", "attempt_number": 1, "exit_code": 0, "stdout": "   \r\n", "stderr": "", "observed_status": "malformed"},
+    {"invocation_id": "invoke_retry", "instruction_id": "packet_turn10", "attempt_number": 2, "retry_of_invocation_id": "invoke_empty", "status": "response_ready"}
+  ],
+  "observed_metrics": {
+    "execution_record_count": 11,
+    "visible_blocked_count": 2,
+    "exported_blocked_action_count": 5,
+    "verification_readiness": "not_run"
+  },
+  "acceptance_criteria": [
+    {"criterion_id": "required_files", "source_text": "All four required files are present.", "verification": [{"check_id": "all_required_files_present", "target_paths": ["index.html", "style.css", "game.js", "LOCAL_DEV.md"]}]},
+    {"criterion_id": "index_assets", "source_text": "index.html references style.css and game.js.", "verification": [{"check_id": "file_contains", "target_paths": ["index.html"], "contains": ["style.css", "game.js"]}]},
+    {"criterion_id": "index_game_ui", "source_text": "index.html contains a canvas and visible score element.", "verification": [{"check_id": "file_contains", "target_paths": ["index.html"], "contains": ["<canvas", "id=\"score\""]}]},
+    {"criterion_id": "style_non_empty", "source_text": "style.css is non-empty.", "verification": [{"check_id": "file_not_empty", "target_paths": ["style.css"]}]},
+    {"criterion_id": "game_controls", "source_text": "game.js handles Arrow keys and WASD.", "verification": [{"check_id": "file_contains", "target_paths": ["game.js"], "contains": ["ArrowUp", "'w'", "'a'", "'s'", "'d'"]}]},
+    {"criterion_id": "game_collectible_score", "source_text": "game.js contains collectible and score behavior.", "verification": [{"check_id": "file_contains", "target_paths": ["game.js"], "contains": ["collectible", "score"]}]},
+    {"criterion_id": "game_restart", "source_text": "game.js supports R-key restart.", "verification": [{"check_id": "file_contains", "target_paths": ["game.js"], "contains": ["restart", "e.key==='R'"]}]},
+    {"criterion_id": "local_usage", "source_text": "LOCAL_DEV.md contains local usage instructions.", "verification": [{"check_id": "file_contains", "target_paths": ["LOCAL_DEV.md"], "contains": ["Open index.html locally", "no server required"]}]}
+  ]
+}

@@ -389,3 +389,26 @@ in tests and never invoke the real CLI/provider.
   exactly once; no re-invoke / no re-ingest across repeated ticks; export/import retains the
   pending response; invocation record turn/instruction/sha alignment; callable UI never says
   "waiting for a response file"; file-bridge semantics unchanged.
+
+## Run 038 empty-success, UTF-8, and single-flight guarantees
+
+Callable results distinguish `empty_success` from malformed agent content. `empty_success`
+means exit code 0, empty/whitespace-only response text, and empty or non-fatal stderr. The
+invocation record persists attempt number, retry lineage, instruction id and sha256, an
+explicit `estimated_cost: unknown` marker, and the operator retry count.
+
+The default is `automatic_empty_success_retries = 0`: the run pauses and does not incur a
+hidden second invocation. An operator retry reuses the exact instruction packet/id/text and
+creates one new invocation id linked through `retry_of_invocation_id`; the empty attempt has
+no response to ingest, and the successful attempt is still consumed exactly once. Operators
+may explicitly configure one visible automatic empty-success retry; values above one are
+rejected.
+
+Cursor CLI stdout/stderr capture specifies `encoding="utf-8"` and `errors="replace"` while
+remaining `shell=False`. Instruction/response files, persisted session JSON, HTTP JSON, and
+browser exports are UTF-8; HTTP and HTML declare UTF-8 explicitly.
+
+`ControlSurfaceController.tick_high_autonomy_run()` has a non-blocking per-session lock.
+Concurrent Step/auto-run requests return `tick_already_in_progress` and never invoke the
+backend twice. The browser disables Start, Step, Retry, and Auto-run while a request is in
+flight, prevents Step and auto-run overlap, and displays “Backend invocation in progress.”

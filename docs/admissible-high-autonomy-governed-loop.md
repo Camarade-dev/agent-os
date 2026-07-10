@@ -223,3 +223,61 @@ stop**.
 - `tests/test_admissible_callable_terminal_pause.py` — terminal callable-backend pause,
   exactly-once/no-rebilling, and disjoint file-bridge vs callable UI wording
   (slice ADMISSIBLE_RUN_036).
+
+## Run 038 closure and governance contract
+
+`ADMISSIBLE_RUN_038_LIVE_RUN_EFFICIENCY_CLOSURE_AND_GOVERNANCE_HARDENING` makes
+`pixel-wanderer-cli-006` the canonical long-run regression without claiming that the
+source run completed. The governed loop now uses these durable rules:
+
+- The agent proposes the next smallest **coherent bounded batch**, not the smallest
+  individual operation. The default response bound is eight structured operations and
+  256 KiB of proposed UTF-8 write content. Every path remains workspace-relative and the
+  bounded executor still rejects shell, package-manager, network, deploy, destructive,
+  external-resource, executable-command, and secret-reference content.
+- Every continuation carries a concise current-state progress ledger: acceptance criteria,
+  satisfied/open criteria, latest final file hashes, pending useful operations,
+  stale/superseded actions, remaining work budget, closure phase, and batch limits. It does
+  not replay the historical transcript.
+- Canonical fingerprints are `write_file + normalized path + sha256(content)`,
+  `read_file + normalized path + observed/expected sha256`, and `list_files + normalized
+  path`. Repeated executed work closes as `duplicate_noop`; a write already matching disk
+  closes as `already_satisfied_noop`.
+- Safe overwrite remains low-risk only for a non-sensitive path under the submitted goal
+  when this run created the file and current disk sha256 matches latest execution evidence.
+  A pre-run file, changed sha256, sensitive/executable path, ambiguous scope, destructive
+  operation, external resource, secret, or authority escalation requires human review or
+  stronger evidence.
+- Model text is never admission authority. A “Human decision required” sentence that merely
+  restates approval for a separately extracted `ALLOW` operation is suppressed. Equivalent
+  gates merge, and already-covered gates are superseded with `superseded_by_action_id`,
+  reason, and timestamp. Supersession is queue cleanup, not approval.
+- Only open, non-superseded, genuinely human-critical actions pause the loop. `REFUSE`,
+  `REQUEST_MORE_EVIDENCE`, sensitive overwrite, destructive/irreversible work, external
+  authority, and actual unresolved user choices retain their hard gates.
+
+### Acceptance, verification, and outcomes
+
+Each high-autonomy run persists criteria with `criterion_id`, source text, mandatory flag,
+status (`open`, `evidence_available`, `verified_pass`, `verified_fail`, `waived`), evidence
+references, verification notes, and generic allowlisted verification requests. A model may
+emit `ADMISSIBLE_COMPLETION_CANDIDATE`, but the record is advisory and cannot waive or
+self-authorize a criterion.
+
+A run reaches `completed` only when all mandatory criteria are `verified_pass` or explicitly
+human-waived, deterministic verification is final, no active human-critical blocker remains,
+and no useful admitted operation is pending. Other final states are `incomplete`, `failed`,
+`stopped_by_budget`, and `stopped_by_operator`, each with an exact reason and unmet/pending
+state.
+
+The model-invocation budget is split into work and closure capacity. With the default 12-turn
+budget and two-turn closure reserve, turn 10 enters completion-first mode. Pending response
+ingest, admitted bounded execution, and deterministic local verification finish even at the
+turn boundary because they require no additional model call. Budget exhaustion is reported
+as `stopped_by_budget`, never generic “Stopped”.
+
+Canonical metrics separate backend invocation/retry/empty-success usage; useful writes,
+unique file states, duplicate no-ops, and overwrites; reads/lists; verification checks; genuine
+human interventions, suppressed pseudo-gates, superseded gates, and active blockers; and
+work/verification/closure budget usage. `active_blocked_count` is the one definition used by
+the persisted run, export, summary, governed overview, and UI.

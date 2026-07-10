@@ -73,6 +73,7 @@ AGENT_INVOKE_UNAVAILABLE = "unavailable"
 AGENT_INVOKE_TIMEOUT = "timeout"
 AGENT_INVOKE_FAILED = "failed"
 AGENT_INVOKE_MALFORMED = "malformed"
+AGENT_INVOKE_EMPTY_SUCCESS = "empty_success"
 AGENT_INVOKE_BLOCKED_BY_CONFIGURATION = "blocked_by_configuration"
 
 AGENT_INVOKE_STATUS_CODES = frozenset(
@@ -82,6 +83,7 @@ AGENT_INVOKE_STATUS_CODES = frozenset(
         AGENT_INVOKE_TIMEOUT,
         AGENT_INVOKE_FAILED,
         AGENT_INVOKE_MALFORMED,
+        AGENT_INVOKE_EMPTY_SUCCESS,
         AGENT_INVOKE_BLOCKED_BY_CONFIGURATION,
     }
 )
@@ -96,6 +98,7 @@ AGENT_INVOKE_TERMINAL_STATUSES = frozenset(
         AGENT_INVOKE_TIMEOUT,
         AGENT_INVOKE_FAILED,
         AGENT_INVOKE_MALFORMED,
+        AGENT_INVOKE_EMPTY_SUCCESS,
     }
 )
 
@@ -440,6 +443,7 @@ INVOCATION_STATUS_CONSUMED = "consumed"
 INVOCATION_STATUS_TIMEOUT = "timeout"
 INVOCATION_STATUS_FAILED = "failed"
 INVOCATION_STATUS_MALFORMED = "malformed"
+INVOCATION_STATUS_EMPTY_SUCCESS = "empty_success"
 
 # Display-only callable-backend step labels (never shown for the file bridge).
 CALLABLE_STEP_INVOKING = "invoking_agent"
@@ -453,6 +457,7 @@ _RESULT_TO_RECORD_STATUS = {
     AGENT_INVOKE_TIMEOUT: INVOCATION_STATUS_TIMEOUT,
     AGENT_INVOKE_FAILED: INVOCATION_STATUS_FAILED,
     AGENT_INVOKE_MALFORMED: INVOCATION_STATUS_MALFORMED,
+    AGENT_INVOKE_EMPTY_SUCCESS: INVOCATION_STATUS_EMPTY_SUCCESS,
     AGENT_INVOKE_UNAVAILABLE: INVOCATION_STATUS_FAILED,
     AGENT_INVOKE_BLOCKED_BY_CONFIGURATION: INVOCATION_STATUS_FAILED,
 }
@@ -509,6 +514,10 @@ class AgentInvocationRecord:
     cursor_profile_environment_present: bool | None = None
     program_data_path_present: bool | None = None
     environment_paths: dict[str, str] | None = None
+    attempt_number: int = 1
+    retry_of_invocation_id: str | None = None
+    estimated_cost: str = "unknown"
+    operator_retry_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -554,6 +563,10 @@ class AgentInvocationRecord:
             "environment_paths": (
                 dict(self.environment_paths) if self.environment_paths is not None else None
             ),
+            "attempt_number": self.attempt_number,
+            "retry_of_invocation_id": self.retry_of_invocation_id,
+            "estimated_cost": self.estimated_cost,
+            "operator_retry_count": self.operator_retry_count,
         }
 
     @classmethod
@@ -572,6 +585,10 @@ def build_invocation_record(
     session_id: str | None,
     turn_number: int | None,
     invocation_id: str | None = None,
+    attempt_number: int = 1,
+    retry_of_invocation_id: str | None = None,
+    estimated_cost: str = "unknown",
+    operator_retry_count: int = 0,
 ) -> AgentInvocationRecord:
     """Normalize a raw ``AgentInvocationResult`` into a durable persisted record."""
     import uuid
@@ -579,8 +596,7 @@ def build_invocation_record(
     status = _RESULT_TO_RECORD_STATUS.get(result.status, INVOCATION_STATUS_FAILED)
     response_text = result.response_text if status == INVOCATION_STATUS_RESPONSE_READY else None
     if status == INVOCATION_STATUS_RESPONSE_READY and not (response_text or "").strip():
-        # An "ok" result with empty text is really malformed.
-        status = INVOCATION_STATUS_MALFORMED
+        status = INVOCATION_STATUS_EMPTY_SUCCESS
         response_text = None
     return AgentInvocationRecord(
         invocation_id=invocation_id or f"invoke_{uuid.uuid4().hex[:12]}",
@@ -614,6 +630,10 @@ def build_invocation_record(
         cursor_profile_environment_present=result.cursor_profile_environment_present,
         program_data_path_present=result.program_data_path_present,
         environment_paths=result.environment_paths,
+        attempt_number=attempt_number,
+        retry_of_invocation_id=retry_of_invocation_id,
+        estimated_cost=estimated_cost,
+        operator_retry_count=operator_retry_count,
     )
 
 
@@ -1666,6 +1686,8 @@ class CursorCliAgentBackend(AgentBackend):
                 timeout=request.timeout_seconds,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 input=stdin_text,
                 env=safe_env,
             )
@@ -1728,9 +1750,15 @@ class CursorCliAgentBackend(AgentBackend):
             return result
 
         if not response_text.strip():
-            self._last_status = AGENT_INVOKE_MALFORMED
+            stderr_is_nonfatal = not re.search(
+                r"\b(error|fatal|traceback|exception)\b", stderr, re.IGNORECASE
+            )
+            empty_status = (
+                AGENT_INVOKE_EMPTY_SUCCESS if stderr_is_nonfatal else AGENT_INVOKE_MALFORMED
+            )
+            self._last_status = empty_status
             result = AgentInvocationResult(
-                status=AGENT_INVOKE_MALFORMED,
+                status=empty_status,
                 raw_stdout=stdout,
                 raw_stderr=stderr,
                 exit_code=exit_code,
@@ -1738,7 +1766,11 @@ class CursorCliAgentBackend(AgentBackend):
                 transport_label=self.backend_id,
                 started_at=started,
                 completed_at=_now_iso(),
-                error_message="Cursor CLI produced no usable response text.",
+                error_message=(
+                    "Cursor CLI exited successfully but produced empty or whitespace-only stdout."
+                    if empty_status == AGENT_INVOKE_EMPTY_SUCCESS
+                    else "Cursor CLI produced no usable response text and stderr indicated a failure."
+                ),
                 **invocation_diagnostics(stdout),
             )
             self._last_result = result
@@ -2183,6 +2215,7 @@ __all__ = [
     "AGENT_INVOKE_TIMEOUT",
     "AGENT_INVOKE_FAILED",
     "AGENT_INVOKE_MALFORMED",
+    "AGENT_INVOKE_EMPTY_SUCCESS",
     "AGENT_INVOKE_BLOCKED_BY_CONFIGURATION",
     "AGENT_INVOKE_STATUS_CODES",
     "AGENT_INVOKE_TERMINAL_STATUSES",
@@ -2219,6 +2252,7 @@ __all__ = [
     "INVOCATION_STATUS_TIMEOUT",
     "INVOCATION_STATUS_FAILED",
     "INVOCATION_STATUS_MALFORMED",
+    "INVOCATION_STATUS_EMPTY_SUCCESS",
     "CALLABLE_STEP_INVOKING",
     "CALLABLE_STEP_RESPONSE_READY",
     "CALLABLE_STEP_INGESTING",
