@@ -336,3 +336,22 @@ explicitly outside this verdict.
 **Files changed by this report:** `benchmark/reports/admissible_demo_readiness_post_slices.md` only.
 
 **Committed:** no.
+
+---
+
+## 12. Milestone update — live Cursor batch (slice 020)
+
+**Date:** 2026-07-09  
+**Does not supersede section 1** (`DEMO_READY_WITH_SCRIPTED_LIMITS` remains the offline scripted-demo verdict).
+
+A subsequent supervised live milestone is documented in
+[admissible_cursor_live_batch_milestone_closure.md](./admissible_cursor_live_batch_milestone_closure.md):
+
+| Field | Value |
+|-------|-------|
+| **Milestone verdict** | `CURSOR_LIVE_STRUCTURED_RUN_USABLE_WITH_BATCH_EXECUTION` |
+| **Related fix** | `LIVE_BATCH_EXECUTION_CONTENT_GUARD_FIXED` |
+| **Claim boundary** | One human-led live turn: Cursor structured response → admission without auto-execute → explicit batch bounded-local write of three admitted files (3/3). |
+| **Not claimed** | Autonomous long-running success, general SE autonomy, benchmark SOTA, agent reliability solved, deployment readiness, production-grade UX |
+
+Recommended next work: bounded multi-turn supervised demo (plan progress, agent proposes next step, Admissible gates each side effect, evidence accumulation, blocked-action handling) — see closure report §Recommended next slices.

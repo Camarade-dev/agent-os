@@ -1,0 +1,59 @@
+﻿AVAILABLE True
+STATUS evidence_grounded_continuation
+---INSTRUCTION TEXT START---
+=== Admissible Evidence-Grounded Continuation Instruction -- turn 2 ===
+
+ORIGINAL GOAL
+Scaffold a tiny local-only browser game in a local workspace. Keep it local-only unless I explicitly approve otherwise.
+
+GOVERNED RUN STATE SO FAR
+- Turns so far: 1
+- Actions proposed: 3
+- Actions admitted: 3
+- Actions executed: 3
+- Evidence records: 3
+- Actions blocked/refused: 0
+
+ACTIONS EXECUTED WITH EVIDENCE (grounded -- already done)
+- resp_t01_001_c4519eff [write_file] -> index.html (sha256: 7f43c31c0613e94f6b91e804eefeda825b9f4e9d5cc24eb61b75232a40697e9d); status executed_by_bounded_executor; evidence x1
+- resp_t01_002_b3598716 [write_file] -> style.css (sha256: db113da065d83c046188c0c10fdb09b57090ec8ea020da4e18f47c555f18343e); status executed_by_bounded_executor; evidence x1
+- resp_t01_003_0ae316dc [write_file] -> game.js (sha256: 839d748dad89bb5acd42fa929fd6042b85ad15cf88512aee16957e40fa61cc71); status executed_by_bounded_executor; evidence x1
+
+ACTIONS BLOCKED / REFUSED / NOT EXECUTED (must NOT be treated as done)
+- (none)
+
+COMPLETION STATUS
+- This governed run has no explicit completion signal yet. Do not treat the overall goal as complete; propose only the next smallest admissible step.
+
+STANDING INSTRUCTION PACKET (boundaries unchanged from turn 1)
+=== Admissible Next Agent Instruction Packet -- turn 2 ===
+Autonomy level: L1_PROPOSE_ONLY
+
+TASK
+general_task: browser local game
+
+ALLOWED SCOPE
+- Local workspace only; no deployment, publish, or push without explicit human authorization.
+- Do not perform server run without explicit human authorization; remain local-only unless the human operator authorizes otherwise.
+- Prompt explicitly scopes risk as local-only.
+- Anticipated side-effect classes: possible_server_run.
+
+NON-EXECUTION BOUNDARIES (apply at every autonomy level)
+- Admissible does not execute this packet's proposals; it only frames, audits, and gates them.
+- Do not execute any shell command, tool call, file mutation, dependency install, or deployment as a result of this packet without a separate, explicit human admission decision.
+- REFUSE, REQUIRE_HUMAN_APPROVAL, and REQUEST_MORE_EVIDENCE always stop for a human decision, regardless of autonomy level.
+- Treat this packet as a request to propose, not an authorization to act.
+
+WHAT YOU MAY PROPOSE AT THIS AUTONOMY LEVEL
+- Propose one action at a time, in enough detail for independent human review.
+- Wait for an explicit human decision on each proposal before describing the next one.
+
+WHAT YOU MUST NOT DO
+- Do not deploy, publish, or push beyond the local workspace without explicit human authorization.
+- Do not install or upgrade dependencies without explicit human approval.
+- Do not delete or overwrite existing files without explicit human sign-off.
+- Do not treat an autonomy level, a batch approval, or silence as authorization for a REFUSE, REQUIRE_HUMAN_APPROVAL, or REQUEST_MORE_EVIDENCE action.
+- Do not claim an action was executed; there is no executor in this loop.
+
+EVIDENCE NEEDED IF CON
+---INSTRUCTION TEXT END---
