@@ -52,6 +52,10 @@ HA_NEXT_STOP = "stop"
 DEFAULT_MAX_TURNS = 12
 DEFAULT_MALFORMED_RETRY_LIMIT = 1
 
+# Mirrors admissible.agent_transport.TRANSPORT_STATUS_MALFORMED_RETRY; kept as a
+# local literal so the controller never needs a module-level transport import.
+_TRANSPORT_STATUS_MALFORMED_RETRY = "malformed_response_retry"
+
 _RECOVERY_PREAMBLE = (
     "RECOVERY REQUEST: prior turn proposed blocked dependency/deploy/network actions "
     "that must NOT be treated as done. Propose the smallest local-only admissible "
@@ -86,10 +90,17 @@ class HighAutonomyRunState:
     malformed_retry_count: int = 0
     last_response_cursor: str | None = None
     pending_human_action_id: str | None = None
+    human_critical_pending: bool = False
     awaiting_instruction_after_review: bool = False
     recovery_pending: bool = False
     recovery_attempted: bool = False
     transport_kind: str = "file_bridge"
+    # Live-rehearsal transport/bridge fields (display-only; not an authority).
+    transport_status: str = "idle"
+    workspace_path: str | None = None
+    instruction_path: str | None = None
+    response_path: str | None = None
+    stale_response_blocked: bool = False
     started_at: str | None = None
     last_tick_at: str | None = None
     last_tick_step: str | None = None
@@ -147,6 +158,12 @@ def build_high_autonomy_summary(
         HA_NEXT_STOP: "Run is stopping.",
     }.get(ha_state.next_action, ha_state.next_action)
 
+    verification_readiness = ha_state.verification_readiness or verification.get(
+        "readiness", "not_run"
+    )
+    live_status = build_live_high_autonomy_rehearsal_status(
+        ha_state=ha_state, state_view=state_view
+    )
     return {
         "schema_version": HIGH_AUTONOMY_SCHEMA_VERSION,
         "active": ha_state.active,
@@ -158,12 +175,15 @@ def build_high_autonomy_summary(
         "needed_now": needed_now,
         "problem_summary": ha_state.problem_summary,
         "human_required_reason": ha_state.human_required_reason,
+        "human_action_required": ha_state.mode == HA_MODE_HUMAN_REQUIRED
+        or ha_state.human_critical_pending,
+        "pending_human_action_id": ha_state.pending_human_action_id,
         "pending_low_risk_action_count": ha_state.pending_low_risk_action_count,
         "auto_executed_action_count": ha_state.auto_executed_action_count,
         "blocked_action_count": ha_state.blocked_action_count,
         "evidence_count": ha_state.evidence_count or timeline.get("evidence_count", 0),
-        "verification_readiness": ha_state.verification_readiness
-        or verification.get("readiness", "not_run"),
+        "verification_readiness": verification_readiness,
+        "verification_passed": verification_readiness == "pass",
         "max_turns": ha_state.max_turns,
         "stop_reason": ha_state.stop_reason,
         "paused": ha_state.paused,
@@ -173,6 +193,78 @@ def build_high_autonomy_summary(
         "write_evidence_count": governed.get("write_evidence_count", 0),
         "tick_count": ha_state.tick_count,
         "transport_kind": ha_state.transport_kind,
+        # Live transport/bridge status (display-only) for the auto-tick UI.
+        "transport_status": ha_state.transport_status,
+        "workspace_path": ha_state.workspace_path,
+        "instruction_path": ha_state.instruction_path,
+        "response_path": ha_state.response_path,
+        "waiting_for_agent": ha_state.mode == HA_MODE_WAITING_FOR_AGENT,
+        "stale_response_blocked": ha_state.stale_response_blocked,
+        "auto_tick_safe": _auto_tick_safe(ha_state),
+        "live_rehearsal_status": live_status,
+    }
+
+
+# Modes in which a browser "auto-run while safe" loop may keep calling tick.
+_AUTO_TICK_SAFE_MODES = frozenset(
+    {
+        HA_MODE_RUNNING,
+        HA_MODE_WAITING_FOR_AGENT,
+        HA_MODE_REVIEWING,
+        HA_MODE_AUTO_EXECUTING,
+        HA_MODE_RECOVERING,
+        HA_MODE_VERIFYING,
+    }
+)
+
+
+def _auto_tick_safe(ha_state: HighAutonomyRunState) -> bool:
+    """Whether a frontend auto-tick loop may safely request another tick.
+
+    Never true for human_required / paused / stopped / failed / off, so the
+    browser loop halts on any human-critical pause or terminal state. Each
+    backend tick still advances at most one safe step regardless.
+    """
+    if not ha_state.active or ha_state.paused:
+        return False
+    if ha_state.human_critical_pending:
+        return False
+    return ha_state.mode in _AUTO_TICK_SAFE_MODES
+
+
+def build_live_high_autonomy_rehearsal_status(
+    *,
+    ha_state: HighAutonomyRunState,
+    state_view: dict[str, Any],
+) -> dict[str, Any]:
+    """Display-only live-rehearsal readiness snapshot (slice ADMISSIBLE_RUN_030).
+
+    Aggregates workspace/transport/turn state so the UI and tests can read one
+    consistent picture of a live high-autonomy Cursor rehearsal. This is not a
+    new authority source: it only projects already-computed run state.
+    """
+    verification = state_view.get("verification_summary") or {}
+    verification_readiness = ha_state.verification_readiness or verification.get(
+        "readiness", "not_run"
+    )
+    return {
+        "schema_version": HIGH_AUTONOMY_SCHEMA_VERSION,
+        "active": ha_state.active,
+        "mode": ha_state.mode,
+        "workspace_path": ha_state.workspace_path,
+        "transport_kind": ha_state.transport_kind,
+        "transport_status": ha_state.transport_status,
+        "instruction_path": ha_state.instruction_path,
+        "response_path": ha_state.response_path,
+        "current_turn": ha_state.current_turn,
+        "waiting_for_cursor": ha_state.mode == HA_MODE_WAITING_FOR_AGENT,
+        "stale_response_blocked": ha_state.stale_response_blocked,
+        "human_action_required": ha_state.mode == HA_MODE_HUMAN_REQUIRED
+        or ha_state.human_critical_pending,
+        "human_required_reason": ha_state.human_required_reason,
+        "verification_passed": verification_readiness == "pass",
+        "verification_readiness": verification_readiness,
+        "auto_tick_safe": _auto_tick_safe(ha_state),
     }
 
 
@@ -195,6 +287,33 @@ def _transport_has_pending_response(transport: "AgentTransport") -> bool:
     return True
 
 
+def _capture_transport_status(
+    ha_state: HighAutonomyRunState, transport: "AgentTransport"
+) -> None:
+    """Persist a compact, display-only transport snapshot onto the run state.
+
+    Lets ``build_high_autonomy_summary`` surface live bridge status from the
+    persisted session even though it has no direct handle on the transport.
+    """
+    from admissible.agent_transport import TRANSPORT_STATUS_STALE_BLOCKED
+
+    snap = transport.status_snapshot()
+    ha_state.transport_status = str(snap.get("status") or "idle")
+    if snap.get("instruction_path"):
+        ha_state.instruction_path = snap.get("instruction_path")
+    if snap.get("response_path"):
+        ha_state.response_path = snap.get("response_path")
+    if snap.get("workspace_path"):
+        ha_state.workspace_path = snap.get("workspace_path")
+    ha_state.stale_response_blocked = snap.get("status") == TRANSPORT_STATUS_STALE_BLOCKED
+
+
+def _latest_instruction_id(controller: "ControlSurfaceController") -> str | None:
+    """Packet id of the most recent instruction, for bridge/controller alignment."""
+    packets = controller._session.run_loop.instruction_packets
+    return packets[-1].packet_id if packets else None
+
+
 def _ha_state(controller: "ControlSurfaceController") -> HighAutonomyRunState:
     return controller._high_autonomy_state()
 
@@ -213,8 +332,9 @@ def _sync_counters(
     workspace = session.bounded_executor_workspace
     pending_auto = 0
     blocked = 0
-    human_critical = False
     recoverable = False
+    human_critical_id: str | None = None
+    human_critical_reason: str | None = None
 
     for item in session.queue:
         envelope = session.run_envelopes.get(item.action_id)
@@ -225,8 +345,18 @@ def _sync_counters(
             pending_auto += 1
         elif classification.category in ("blocked_not_completed", "recoverable_blocker"):
             blocked += 1
-        if classification.category == "human_critical" and item.execution_status == "proposed_only":
-            human_critical = True
+        # A genuinely human-critical proposal pauses only while it is still an
+        # open, undecided proposal. Once a human has approved/refused it (the
+        # item carries a human_decision_id, or execution_status left
+        # proposed_only), it must not re-trigger a pause on the next tick.
+        if (
+            classification.category == "human_critical"
+            and item.execution_status == "proposed_only"
+            and not item.human_decision_ids
+        ):
+            if human_critical_id is None:
+                human_critical_id = item.action_id
+                human_critical_reason = classification.reason
         if classification.category == "recoverable_blocker":
             recoverable = True
 
@@ -239,6 +369,16 @@ def _sync_counters(
     ha_state.current_turn = session.run_loop.current_turn
     ha_state.recovery_pending = recoverable and pending_auto == 0 and not ha_state.recovery_attempted
 
+    ha_state.human_critical_pending = human_critical_id is not None
+    if human_critical_id is not None:
+        ha_state.pending_human_action_id = human_critical_id
+        ha_state.human_required_reason = human_critical_reason
+    elif ha_state.mode != HA_MODE_HUMAN_REQUIRED:
+        # No open human-critical proposal and not currently paused for one.
+        ha_state.pending_human_action_id = None
+        if not ha_state.paused:
+            ha_state.human_required_reason = None
+
 
 def _plan_next_action(
     controller: "ControlSurfaceController",
@@ -248,7 +388,7 @@ def _plan_next_action(
 ) -> str:
     if ha_state.paused or ha_state.mode in (HA_MODE_STOPPED, HA_MODE_FAILED, HA_MODE_OFF):
         return HA_NEXT_NONE
-    if ha_state.mode == HA_MODE_HUMAN_REQUIRED:
+    if ha_state.mode == HA_MODE_HUMAN_REQUIRED or ha_state.human_critical_pending:
         return HA_NEXT_HUMAN_APPROVAL
 
     view = controller.state_view()
@@ -325,6 +465,7 @@ def start_high_autonomy_run(
     if transport is None:
         transport = FileBridgeAgentTransport(workspace_path)
 
+    snap = transport.status_snapshot()
     ha_state = HighAutonomyRunState(
         active=True,
         mode=HA_MODE_RUNNING,
@@ -333,6 +474,10 @@ def start_high_autonomy_run(
         transport_kind=(
             "fixture" if type(transport).__name__ == "FixtureAgentTransport" else "file_bridge"
         ),
+        transport_status=str(snap.get("status") or "idle"),
+        workspace_path=snap.get("workspace_path") or workspace_path,
+        instruction_path=snap.get("instruction_path"),
+        response_path=snap.get("response_path"),
         last_event="High-autonomy run started.",
         next_action=HA_NEXT_WRITE_INSTRUCTION,
     )
@@ -463,7 +608,12 @@ def tick_high_autonomy_run(
             packet_view = controller.generate_next_instruction_packet()
             instruction_text = packet_view["run_loop"]["instruction_packets"][-1]["packet_text"]
 
-        bridge_result = transport.write_instruction(instruction_text)
+        bridge_result = transport.write_instruction(
+            instruction_text,
+            turn_number=controller._session.run_loop.current_turn,
+            session_id=controller._session.session_id,
+            instruction_id=_latest_instruction_id(controller),
+        )
         ha_state.mode = HA_MODE_WAITING_FOR_AGENT
         ha_state.last_event = f"Wrote turn {controller._session.run_loop.current_turn} instruction automatically."
         ha_state.awaiting_instruction_after_review = False
@@ -484,7 +634,12 @@ def tick_high_autonomy_run(
         instruction_text = continuation.get("instruction_text") or ""
         recovery_text = f"{_RECOVERY_PREAMBLE}\n\n{instruction_text}".strip()
         controller.generate_next_continuation_instruction_packet(instruction_text=recovery_text)
-        bridge_result = transport.write_instruction(recovery_text)
+        bridge_result = transport.write_instruction(
+            recovery_text,
+            turn_number=controller._session.run_loop.current_turn,
+            session_id=controller._session.session_id,
+            instruction_id=_latest_instruction_id(controller),
+        )
         ha_state.mode = HA_MODE_WAITING_FOR_AGENT
         ha_state.recovery_pending = False
         ha_state.recovery_attempted = True
@@ -517,13 +672,10 @@ def tick_high_autonomy_run(
                 )
                 ha_state.last_tick_step = "ingest_response"
                 step_result["ingested"] = True
-                from admissible.agent_transport import FileBridgeAgentTransport
-
-                if isinstance(transport, FileBridgeAgentTransport):
-                    transport.mark_response_ingested(
-                        turn_number=controller._session.run_loop.current_turn,
-                        response_sha256=read_result.cursor or "",
-                    )
+                transport.mark_response_consumed(
+                    turn_number=controller._session.run_loop.current_turn,
+                    response_sha256=read_result.cursor or "",
+                )
                 controller._session.transcript.append(
                     _transcript_entry(
                         "high_autonomy_response_ingested",
@@ -539,7 +691,14 @@ def tick_high_autonomy_run(
                         "MALFORMED RESPONSE: your prior response could not be ingested. "
                         f"Error: {exc}. Reply with structured operations only."
                     )
-                    transport.write_instruction(retry_text)
+                    transport.note_status(
+                        _TRANSPORT_STATUS_MALFORMED_RETRY, error=str(exc)
+                    )
+                    transport.write_instruction(
+                        retry_text,
+                        turn_number=controller._session.run_loop.current_turn,
+                        session_id=controller._session.session_id,
+                    )
                     ha_state.mode = HA_MODE_WAITING_FOR_AGENT
                     ha_state.last_event = "Malformed response — sent one bounded retry instruction."
                     ha_state.last_tick_step = "malformed_retry"
@@ -620,8 +779,12 @@ def tick_high_autonomy_run(
         controller._persist()
 
     _sync_counters(controller, ha_state, policy)
+    _capture_transport_status(ha_state, transport)
     ha_state.next_action = _plan_next_action(controller, ha_state, policy, transport)
     _save_ha_state(controller, ha_state)
+    controller._persist()
+    step_result["last_tick_step"] = ha_state.last_tick_step
+    step_result["transport_status"] = ha_state.transport_status
     view = controller.state_view()
     view["high_autonomy_summary"] = build_high_autonomy_summary(ha_state=ha_state, state_view=view)
     view["high_autonomy_tick"] = step_result
@@ -633,18 +796,27 @@ def approve_human_critical_action(
     *,
     action_id: str,
     rationale: str = "Approved in high-autonomy human-required state.",
+    scope: str | None = None,
 ) -> dict[str, Any]:
     ha_state = _ha_state(controller)
     if not ha_state.active or ha_state.mode != HA_MODE_HUMAN_REQUIRED:
         raise ValueError("No human-critical action pending approval.")
-    controller.decide(
-        action_id,
-        {"decision_type": "approve", "rationale": rationale},
-    )
+    # Recording the decision never invents an executor: v0 has no automatic
+    # shell/network/deploy executor at any level, so approving a human-critical
+    # proposal only marks it admitted-not-executed. A human still runs it.
+    decision_body: dict[str, Any] = {
+        "decision_type": "approve",
+        "rationale": rationale,
+        "scope": scope or "high_autonomy_human_approved_local_only",
+    }
+    controller.decide(action_id, decision_body)
     ha_state.mode = HA_MODE_RUNNING
     ha_state.human_required_reason = None
     ha_state.pending_human_action_id = None
-    ha_state.last_event = f"Human approved action {action_id}."
+    ha_state.human_critical_pending = False
+    ha_state.last_event = (
+        f"Human approved action {action_id} (recorded only; no executor was invoked)."
+    )
     _save_ha_state(controller, ha_state)
     controller._persist()
     view = controller.state_view()
@@ -668,6 +840,7 @@ def refuse_human_critical_action(
     ha_state.mode = HA_MODE_RUNNING
     ha_state.human_required_reason = None
     ha_state.pending_human_action_id = None
+    ha_state.human_critical_pending = False
     ha_state.recovery_pending = True
     ha_state.awaiting_instruction_after_review = True
     ha_state.last_event = f"Human refused action {action_id}; recovery may continue."

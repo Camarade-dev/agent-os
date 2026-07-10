@@ -1595,9 +1595,16 @@ class ControlSurfaceController:
         view["session_file"] = str(self._session_file)
         view["session_loaded_from_disk"] = self._session_loaded_from_disk
         ha_state = self._high_autonomy_state()
-        from admissible.high_autonomy_controller import build_high_autonomy_summary
+        from admissible.high_autonomy_controller import (
+            build_high_autonomy_summary,
+            build_live_high_autonomy_rehearsal_status,
+        )
 
         view["high_autonomy_summary"] = build_high_autonomy_summary(
+            ha_state=ha_state,
+            state_view=view,
+        )
+        view["live_high_autonomy_rehearsal_status"] = build_live_high_autonomy_rehearsal_status(
             ha_state=ha_state,
             state_view=view,
         )
@@ -2317,7 +2324,7 @@ class ControlSurfaceController:
         return tick_high_autonomy_run(self)
 
     def approve_high_autonomy_human_action(
-        self, action_id: str, *, rationale: str = ""
+        self, action_id: str, *, rationale: str = "", scope: str | None = None
     ) -> dict[str, Any]:
         from admissible.high_autonomy_controller import approve_human_critical_action
 
@@ -2325,6 +2332,7 @@ class ControlSurfaceController:
             self,
             action_id=action_id,
             rationale=rationale or "Approved in high-autonomy human-required state.",
+            scope=scope or None,
         )
 
     def refuse_high_autonomy_human_action(

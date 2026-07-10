@@ -283,6 +283,9 @@
   .ha-status-row dd { margin: 0; flex: 1; }
   .ha-primary-actions { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .65rem; }
   .ha-evidence-line { font-size: .78rem; color: var(--cs-muted); margin-top: .35rem; }
+  .ha-autorun-line { font-size: .78rem; color: var(--cs-muted); margin-top: .5rem; font-weight: 600; }
+  .ha-autorun-line.autorun-active { color: #34d399; }
+  .ha-autorun-line.autorun-human { color: #fbbf24; }
   .verification-result-summary { margin-top: .45rem; font-size: .78rem; }
   .verification-failures { margin: .35rem 0 0 1rem; padding: 0; color: #fca5a5; font-size: .76rem; }
   .verification-actions { display: flex; flex-wrap: wrap; gap: .45rem; align-items: center; margin-top: .5rem; }
@@ -367,6 +370,7 @@
     </p>
     <div id="high-autonomy-body"><p class="no-action-note">Submit a goal, then start a high-autonomy run.</p></div>
     <div class="ha-primary-actions" id="high-autonomy-actions"></div>
+    <p class="ha-autorun-line" id="high-autonomy-autorun-line"></p>
     <p class="ha-evidence-line" id="high-autonomy-evidence-line"></p>
   </section>
 
@@ -650,6 +654,70 @@ const ATTENTION_DECISIONS = new Set(["REQUEST_MORE_EVIDENCE", "REQUIRE_HUMAN_APP
 let lastState = null;
 let selectedActionId = null;
 let queueFilter = "attention";
+
+// Browser auto-tick ("Auto-run while safe"): the frontend may call the tick
+// endpoint on a timer, but each backend tick still advances at most one safe
+// state-machine step. The loop halts on any human-critical pause, terminal
+// state, missing workspace, or error — it never auto-approves anything.
+let autoRunActive = false;
+let autoRunTimer = null;
+let lastTickResult = "";
+const AUTO_RUN_INTERVAL_MS = 1500;
+
+function stopAutoRun() {
+  autoRunActive = false;
+  if (autoRunTimer) {
+    clearTimeout(autoRunTimer);
+    autoRunTimer = null;
+  }
+}
+
+function summarizeTick(state) {
+  const tick = (state && state.high_autonomy_tick) || {};
+  return tick.last_tick_step || tick.step || tick.planned || "—";
+}
+
+async function autoRunLoop() {
+  if (!autoRunActive) return;
+  autoRunTimer = null;
+  let state;
+  try {
+    state = await apiPost("/api/session/high_autonomy/tick", {});
+    clearError();
+  } catch (err) {
+    showError(err.message);
+    stopAutoRun();
+    await refresh();
+    return;
+  }
+  lastTickResult = summarizeTick(state);
+  render(state);
+  const ha = (state && state.high_autonomy_summary) || {};
+  // auto_tick_safe is false for human_required / paused / stopped / failed /
+  // off, so the loop stops on any human-critical pause or terminal state.
+  if (!autoRunActive || !ha.auto_tick_safe || !ha.workspace_path) {
+    stopAutoRun();
+    render(state);
+    return;
+  }
+  autoRunTimer = setTimeout(autoRunLoop, AUTO_RUN_INTERVAL_MS);
+}
+
+function startAutoRun() {
+  const ha = (lastState && lastState.high_autonomy_summary) || {};
+  if (!ha.active) {
+    showError("Start a high-autonomy run before enabling auto-run.");
+    return;
+  }
+  if (ha.human_action_required) {
+    showError("A human-critical action requires approval; auto-run is disabled.");
+    return;
+  }
+  if (autoRunActive) return;
+  autoRunActive = true;
+  render(lastState);
+  autoRunLoop();
+}
 
 function escapeHtml(value) {
   if (value === null || value === undefined) return "—";
@@ -1129,6 +1197,9 @@ function renderHighAutonomy(state) {
   }
 
   const blocking = ha.problem_summary || ha.human_required_reason || "";
+  const humanAction = ha.human_action_required
+    ? (ha.human_required_reason || "A human-critical action requires approval.")
+    : "None";
   body.innerHTML = `
     <dl class="ha-status-grid">
       <div class="ha-status-row"><dt>Doing now</dt><dd>${escapeHtml(ha.doing_now || "—")}</dd></div>
@@ -1136,6 +1207,9 @@ function renderHighAutonomy(state) {
       <div class="ha-status-row"><dt>Blocking</dt><dd>${escapeHtml(blocking || "Nothing blocking.")}</dd></div>
       <div class="ha-status-row"><dt>Last event</dt><dd>${escapeHtml(ha.last_event || "—")}</dd></div>
       <div class="ha-status-row"><dt>Mode</dt><dd><span class="status-badge status-badge-pending">${escapeHtml(ha.mode || "off")}</span></dd></div>
+      <div class="ha-status-row"><dt>Evidence</dt><dd>${ha.evidence_count ?? 0} write(s)</dd></div>
+      <div class="ha-status-row"><dt>Verification</dt><dd>${escapeHtml(ha.verification_readiness || "not_run")}${ha.verification_passed ? " ✓" : ""}</dd></div>
+      <div class="ha-status-row"><dt>Human action</dt><dd>${escapeHtml(humanAction)}</dd></div>
     </dl>`;
 
   if (evidenceLine) {
@@ -1145,6 +1219,8 @@ function renderHighAutonomy(state) {
       `Blocked (not completed): ${ha.blocked_count ?? ha.blocked_action_count ?? 0} · ` +
       `Verification: ${ha.verification_readiness || "not_run"}`;
   }
+
+  renderAutoRunStatusLine(ha);
 
   const workspace = document.getElementById("bridge-workspace-path");
   const workspacePath = workspace ? workspace.value.trim() : (state.bounded_executor_workspace || "");
@@ -1168,9 +1244,42 @@ function renderHighAutonomy(state) {
     primary = btn("btn-ha-start", "Start high-autonomy run");
   }
 
-  actions.innerHTML =
-    primary +
-    (ha.active ? btn("btn-ha-tick", "Step tick", "secondary") : "");
+  let autoRunControls = "";
+  if (ha.active) {
+    autoRunControls =
+      btn("btn-ha-step", "Step once", "secondary") +
+      (autoRunActive
+        ? btn("btn-ha-autorun-pause", "Pause auto-run", "secondary")
+        : btn("btn-ha-autorun", "Auto-run while safe", "secondary"));
+  }
+  actions.innerHTML = primary + autoRunControls;
+}
+
+function renderAutoRunStatusLine(ha) {
+  const line = document.getElementById("high-autonomy-autorun-line");
+  if (!line) return;
+  line.classList.remove("autorun-active", "autorun-human");
+  if (!ha.active) {
+    line.textContent = "";
+    return;
+  }
+  let state;
+  if (ha.human_action_required) {
+    state = "stopped — human action required";
+    line.classList.add("autorun-human");
+  } else if (autoRunActive && ha.auto_tick_safe) {
+    state = "active";
+    line.classList.add("autorun-active");
+  } else if (autoRunActive) {
+    state = "stopped (state no longer safe)";
+  } else {
+    state = "paused";
+  }
+  const parts = [`Auto-run: ${state}`];
+  if (lastTickResult) parts.push(`Last tick: ${lastTickResult}`);
+  if (ha.waiting_for_agent) parts.push("Waiting for Cursor response");
+  if (ha.human_action_required) parts.push("Human action required");
+  line.textContent = parts.join(" · ");
 }
 
 function renderGovernedRun(state) {
@@ -2405,6 +2514,7 @@ document.getElementById("high-autonomy-actions").addEventListener("click", async
     return;
   }
   if (target.id === "btn-ha-pause") {
+    stopAutoRun();
     await runAction(() => apiPost("/api/session/high_autonomy/pause", {}));
     return;
   }
@@ -2413,11 +2523,26 @@ document.getElementById("high-autonomy-actions").addEventListener("click", async
     return;
   }
   if (target.id === "btn-ha-stop") {
+    stopAutoRun();
     await runAction(() => apiPost("/api/session/high_autonomy/stop", {}));
     return;
   }
-  if (target.id === "btn-ha-tick") {
-    await runAction(() => apiPost("/api/session/high_autonomy/tick", {}));
+  if (target.id === "btn-ha-step") {
+    lastTickResult = "";
+    await runAction(async () => {
+      const state = await apiPost("/api/session/high_autonomy/tick", {});
+      lastTickResult = summarizeTick(state);
+      return state;
+    });
+    return;
+  }
+  if (target.id === "btn-ha-autorun") {
+    startAutoRun();
+    return;
+  }
+  if (target.id === "btn-ha-autorun-pause") {
+    stopAutoRun();
+    render(lastState);
     return;
   }
   if (target.id === "btn-ha-approve" || target.id === "btn-ha-refuse") {

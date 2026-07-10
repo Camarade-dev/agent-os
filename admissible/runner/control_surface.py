@@ -232,6 +232,7 @@ class _ControlSurfaceRequestHandler(BaseHTTPRequestHandler):
                 result = self.controller.approve_high_autonomy_human_action(
                     str(body.get("action_id") or ""),
                     rationale=str(body.get("rationale") or ""),
+                    scope=str(body.get("scope") or "") or None,
                 )
             elif parsed.path == "/api/session/high_autonomy/refuse":
                 result = self.controller.refuse_high_autonomy_human_action(
