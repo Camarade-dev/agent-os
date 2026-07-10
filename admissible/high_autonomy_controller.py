@@ -62,6 +62,15 @@ _RECOVERY_PREAMBLE = (
     "alternative — no npm, pip, shell, network, CDN, or deploy."
 )
 
+_REFUSAL_RECOVERY_PREAMBLE = (
+    "RECOVERY REQUEST (human refusal): a human refused the human-critical action(s) "
+    "listed below. They are NOT completed and must NOT be retried in their "
+    "forbidden/human-critical form. Propose the next smallest admissible LOCAL-ONLY "
+    "structured file operation that makes progress without them. Do not use shell, "
+    "npm, pip, git push/commit, publish, deploy, network, CDN, secrets/env, or any "
+    "path outside the workspace. Write only .admissible/agent-response.md."
+)
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -91,6 +100,18 @@ class HighAutonomyRunState:
     last_response_cursor: str | None = None
     pending_human_action_id: str | None = None
     human_critical_pending: bool = False
+    # Action-specific human-required state: every currently-open human-critical
+    # action, so the UI/tests can show exactly what is blocking (not a generic
+    # message) and refusal can clear all of them at once.
+    human_required_action_ids: list[str] = field(default_factory=list)
+    human_required_action_count: int = 0
+    human_required_actions: list[dict[str, Any]] = field(default_factory=list)
+    # Set when a human refuses the open human-critical action(s); drives the
+    # next tick to compose a bounded local-only recovery instruction. Kept
+    # separate from recovery_pending (recoverable-blocker recovery) so
+    # _sync_counters never clobbers it.
+    refusal_recovery_pending: bool = False
+    last_refused_action_ids: list[str] = field(default_factory=list)
     awaiting_instruction_after_review: bool = False
     recovery_pending: bool = False
     recovery_attempted: bool = False
@@ -120,6 +141,71 @@ class HighAutonomyRunState:
 
 def _transcript_entry(event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
     return {"timestamp": _now_iso(), "event_type": event_type, "payload": payload}
+
+
+def _build_refusal_recovery_text(
+    *,
+    refused_actions: list[dict[str, Any]],
+    continuation_text: str = "",
+) -> str:
+    """Compose a bounded local-only recovery instruction after a human refusal.
+
+    Grounds the request in the exact refused human-critical action(s) so the
+    agent does not retry them, and appends the evidence-grounded continuation
+    instruction when one is available. Adds no new capability: it only asks for
+    the next smallest admissible local-only structured operation.
+    """
+    lines = [_REFUSAL_RECOVERY_PREAMBLE, ""]
+    if refused_actions:
+        lines.append("Refused human-critical action(s) — do NOT retry these forms:")
+        for entry in refused_actions:
+            label = (
+                entry.get("tool_or_command")
+                or entry.get("action_type")
+                or entry.get("action_id")
+                or "action"
+            )
+            reason = entry.get("reason")
+            action_type = entry.get("action_type")
+            prefix = f"{action_type}: " if action_type else ""
+            suffix = f" — {reason}" if reason else ""
+            lines.append(f"- {prefix}{label}{suffix}")
+        lines.append("")
+    if continuation_text.strip():
+        lines.append(continuation_text.strip())
+    return "\n".join(lines).strip()
+
+
+def _refused_action_details(
+    controller: "ControlSurfaceController",
+    action_ids: list[str],
+) -> list[dict[str, Any]]:
+    """Reconstruct refused human-critical action labels for the recovery text.
+
+    Rebuilt from the persisted queue at write-time so the recovery instruction
+    stays grounded even across the tick's state persist/reload boundary.
+    """
+    policy = HighAutonomyPolicy()
+    workspace = controller._session.bounded_executor_workspace
+    details: list[dict[str, Any]] = []
+    for aid in action_ids:
+        item = controller._find_queue_item(aid)
+        if item is None:
+            details.append({"action_id": aid})
+            continue
+        envelope = controller._session.run_envelopes.get(aid)
+        classification = policy.classify_action(
+            item=item, envelope=envelope, workspace_path=workspace
+        )
+        details.append(
+            {
+                "action_id": aid,
+                "action_type": item.action_type,
+                "tool_or_command": item.tool_or_command,
+                "reason": classification.reason,
+            }
+        )
+    return details
 
 
 def build_high_autonomy_summary(
@@ -178,6 +264,9 @@ def build_high_autonomy_summary(
         "human_action_required": ha_state.mode == HA_MODE_HUMAN_REQUIRED
         or ha_state.human_critical_pending,
         "pending_human_action_id": ha_state.pending_human_action_id,
+        "human_required_action_ids": list(ha_state.human_required_action_ids),
+        "human_required_action_count": ha_state.human_required_action_count,
+        "human_required_actions": list(ha_state.human_required_actions),
         "pending_low_risk_action_count": ha_state.pending_low_risk_action_count,
         "auto_executed_action_count": ha_state.auto_executed_action_count,
         "blocked_action_count": ha_state.blocked_action_count,
@@ -262,6 +351,9 @@ def build_live_high_autonomy_rehearsal_status(
         "human_action_required": ha_state.mode == HA_MODE_HUMAN_REQUIRED
         or ha_state.human_critical_pending,
         "human_required_reason": ha_state.human_required_reason,
+        "human_required_action_ids": list(ha_state.human_required_action_ids),
+        "human_required_action_count": ha_state.human_required_action_count,
+        "human_required_actions": list(ha_state.human_required_actions),
         "verification_passed": verification_readiness == "pass",
         "verification_readiness": verification_readiness,
         "auto_tick_safe": _auto_tick_safe(ha_state),
@@ -322,6 +414,53 @@ def _save_ha_state(controller: "ControlSurfaceController", ha_state: HighAutonom
     controller._set_high_autonomy_state(ha_state)
 
 
+def _open_human_critical_actions(
+    controller: "ControlSurfaceController",
+    policy: HighAutonomyPolicy,
+) -> list[dict[str, Any]]:
+    """Every currently-open human-critical queue item that needs a human decision.
+
+    An action counts as an *open* human-critical blocker only when it is (a)
+    classified human-critical by the policy, (b) still an undecided proposal
+    (``proposed_only`` with no recorded human decision), AND (c) actually has a
+    human decision available for it. Condition (c) is important: a proposal the
+    rules-only evaluator already ``REFUSE``d is human-critical by capability but
+    offers no human action to take (``available_human_actions`` is empty), so it
+    is already-blocked — it must not perpetually pin the loop in human_required
+    nor cause ``decide(refuse)`` to raise. This is the single source of truth for
+    "what is blocking" used by _sync_counters, refuse, and approve.
+    """
+    from admissible.control_surface import available_human_actions
+
+    session = controller._session
+    workspace = session.bounded_executor_workspace
+    autonomy_level = session.autonomy_level
+    open_actions: list[dict[str, Any]] = []
+    for item in session.queue:
+        envelope = session.run_envelopes.get(item.action_id)
+        classification = policy.classify_action(
+            item=item, envelope=envelope, workspace_path=workspace
+        )
+        if classification.category != "human_critical":
+            continue
+        if item.execution_status != "proposed_only" or item.human_decision_ids:
+            continue
+        available = available_human_actions(item, autonomy_level)
+        if not available:
+            continue
+        open_actions.append(
+            {
+                "action_id": item.action_id,
+                "action_type": item.action_type,
+                "tool_or_command": item.tool_or_command,
+                "decision": item.decision,
+                "reason": classification.reason,
+                "available_actions": list(available),
+            }
+        )
+    return open_actions
+
+
 def _sync_counters(
     controller: "ControlSurfaceController",
     ha_state: HighAutonomyRunState,
@@ -333,8 +472,6 @@ def _sync_counters(
     pending_auto = 0
     blocked = 0
     recoverable = False
-    human_critical_id: str | None = None
-    human_critical_reason: str | None = None
 
     for item in session.queue:
         envelope = session.run_envelopes.get(item.action_id)
@@ -345,20 +482,14 @@ def _sync_counters(
             pending_auto += 1
         elif classification.category in ("blocked_not_completed", "recoverable_blocker"):
             blocked += 1
-        # A genuinely human-critical proposal pauses only while it is still an
-        # open, undecided proposal. Once a human has approved/refused it (the
-        # item carries a human_decision_id, or execution_status left
-        # proposed_only), it must not re-trigger a pause on the next tick.
-        if (
-            classification.category == "human_critical"
-            and item.execution_status == "proposed_only"
-            and not item.human_decision_ids
-        ):
-            if human_critical_id is None:
-                human_critical_id = item.action_id
-                human_critical_reason = classification.reason
         if classification.category == "recoverable_blocker":
             recoverable = True
+
+    # A genuinely human-critical proposal pauses only while it is still an open,
+    # undecided proposal that a human can actually act on. Once every such
+    # proposal has been approved/refused (or was already blocked outright), the
+    # loop must not re-trigger a human_required pause on the next tick.
+    open_human_critical = _open_human_critical_actions(controller, policy)
 
     ha_state.pending_low_risk_action_count = pending_auto
     ha_state.blocked_action_count = blocked
@@ -369,10 +500,13 @@ def _sync_counters(
     ha_state.current_turn = session.run_loop.current_turn
     ha_state.recovery_pending = recoverable and pending_auto == 0 and not ha_state.recovery_attempted
 
-    ha_state.human_critical_pending = human_critical_id is not None
-    if human_critical_id is not None:
-        ha_state.pending_human_action_id = human_critical_id
-        ha_state.human_required_reason = human_critical_reason
+    ha_state.human_critical_pending = bool(open_human_critical)
+    ha_state.human_required_action_ids = [a["action_id"] for a in open_human_critical]
+    ha_state.human_required_action_count = len(open_human_critical)
+    ha_state.human_required_actions = open_human_critical
+    if open_human_critical:
+        ha_state.pending_human_action_id = open_human_critical[0]["action_id"]
+        ha_state.human_required_reason = open_human_critical[0]["reason"]
     elif ha_state.mode != HA_MODE_HUMAN_REQUIRED:
         # No open human-critical proposal and not currently paused for one.
         ha_state.pending_human_action_id = None
@@ -390,6 +524,11 @@ def _plan_next_action(
         return HA_NEXT_NONE
     if ha_state.mode == HA_MODE_HUMAN_REQUIRED or ha_state.human_critical_pending:
         return HA_NEXT_HUMAN_APPROVAL
+    # After a human refuses the open human-critical action(s), the next safe step
+    # is composing a bounded local-only recovery instruction — never re-ingesting
+    # the already-consumed response and never re-entering human_required.
+    if ha_state.refusal_recovery_pending:
+        return HA_NEXT_WRITE_RECOVERY
 
     view = controller.state_view()
     timeline = view.get("run_timeline") or {}
@@ -632,7 +771,22 @@ def tick_high_autonomy_run(
         view_before = controller.state_view()
         continuation = view_before.get("continuation_instruction") or {}
         instruction_text = continuation.get("instruction_text") or ""
-        recovery_text = f"{_RECOVERY_PREAMBLE}\n\n{instruction_text}".strip()
+        is_refusal_recovery = ha_state.refusal_recovery_pending
+        if is_refusal_recovery:
+            recovery_text = _build_refusal_recovery_text(
+                refused_actions=_refused_action_details(
+                    controller, ha_state.last_refused_action_ids
+                ),
+                continuation_text=instruction_text,
+            )
+            recovery_event = (
+                "Wrote local-only recovery instruction after human refusal automatically."
+            )
+            recovery_event_type = "high_autonomy_refusal_recovery_instruction_written"
+        else:
+            recovery_text = f"{_RECOVERY_PREAMBLE}\n\n{instruction_text}".strip()
+            recovery_event = "Wrote local-only recovery instruction automatically."
+            recovery_event_type = "high_autonomy_recovery_instruction_written"
         controller.generate_next_continuation_instruction_packet(instruction_text=recovery_text)
         bridge_result = transport.write_instruction(
             recovery_text,
@@ -642,12 +796,13 @@ def tick_high_autonomy_run(
         )
         ha_state.mode = HA_MODE_WAITING_FOR_AGENT
         ha_state.recovery_pending = False
+        ha_state.refusal_recovery_pending = False
         ha_state.recovery_attempted = True
-        ha_state.last_event = "Wrote local-only recovery instruction automatically."
+        ha_state.last_event = recovery_event
         ha_state.last_tick_step = "write_recovery_instruction"
-        step_result.update({"bridge": bridge_result})
+        step_result.update({"bridge": bridge_result, "refusal_recovery": is_refusal_recovery})
         controller._session.transcript.append(
-            _transcript_entry("high_autonomy_recovery_instruction_written", {"bridge": bridge_result})
+            _transcript_entry(recovery_event_type, {"bridge": bridge_result})
         )
         _save_ha_state(controller, ha_state)
         controller._persist()
@@ -791,31 +946,103 @@ def tick_high_autonomy_run(
     return view
 
 
+def _require_human_required(ha_state: HighAutonomyRunState, *, verb: str) -> None:
+    if not ha_state.active:
+        raise ValueError("No active high-autonomy run.")
+    if ha_state.mode != HA_MODE_HUMAN_REQUIRED and not ha_state.human_critical_pending:
+        raise ValueError(f"No human-critical action pending {verb}.")
+
+
 def approve_human_critical_action(
     controller: "ControlSurfaceController",
     *,
-    action_id: str,
+    action_id: str | None = None,
     rationale: str = "Approved in high-autonomy human-required state.",
     scope: str | None = None,
 ) -> dict[str, Any]:
+    """Record approval/admission intent for one open human-critical action.
+
+    Approval is a deliberate, per-action authority grant, so it targets a single
+    action (the explicitly passed id, else the surfaced pending one). It never
+    invents an executor: v0 has no automatic shell/network/deploy executor at any
+    level, so an approved human-critical proposal is only recorded as
+    admitted-not-executed — a human still runs it. If other human-critical
+    actions remain undecided the loop stays in human_required for them.
+    """
+    from admissible.admitted_execution import EXECUTION_STATUS_ADMITTED_NOT_EXECUTED
+    from admissible.control_surface import (
+        DECISION_TYPE_APPROVE,
+        available_human_actions,
+    )
+    from admissible.run_loop import LIFECYCLE_ADMITTED_NOT_EXECUTED
+
     ha_state = _ha_state(controller)
-    if not ha_state.active or ha_state.mode != HA_MODE_HUMAN_REQUIRED:
+    _require_human_required(ha_state, verb="approval")
+
+    policy = HighAutonomyPolicy()
+    open_actions = _open_human_critical_actions(controller, policy)
+    open_ids = [a["action_id"] for a in open_actions]
+    target_id = action_id or ha_state.pending_human_action_id or (open_ids[0] if open_ids else None)
+    if not target_id:
         raise ValueError("No human-critical action pending approval.")
-    # Recording the decision never invents an executor: v0 has no automatic
-    # shell/network/deploy executor at any level, so approving a human-critical
-    # proposal only marks it admitted-not-executed. A human still runs it.
-    decision_body: dict[str, Any] = {
-        "decision_type": "approve",
-        "rationale": rationale,
-        "scope": scope or "high_autonomy_human_approved_local_only",
-    }
-    controller.decide(action_id, decision_body)
-    ha_state.mode = HA_MODE_RUNNING
-    ha_state.human_required_reason = None
-    ha_state.pending_human_action_id = None
-    ha_state.human_critical_pending = False
-    ha_state.last_event = (
-        f"Human approved action {action_id} (recorded only; no executor was invoked)."
+
+    item = controller._find_queue_item(target_id)
+    if item is None:
+        raise ValueError(f"unknown action_id: {target_id!r}")
+    allowed = available_human_actions(item, controller._session.autonomy_level)
+    if DECISION_TYPE_APPROVE not in allowed:
+        raise ValueError(
+            f"Action {target_id!r} (admissible decision {item.decision!r}) cannot be approved "
+            "in high-autonomy; provide evidence or refuse instead."
+        )
+
+    controller.decide(
+        target_id,
+        {
+            "decision_type": "approve",
+            "rationale": rationale,
+            "scope": scope or "high_autonomy_human_approved_local_only",
+        },
+    )
+    # No safe executor exists for a human-critical action: if decide() did not
+    # already flip it (side-effecting REQUIRE_HUMAN_APPROVAL items do), record the
+    # approval as admitted-not-executed so it is never treated as done and never
+    # re-opens as a pending human-critical proposal.
+    item = controller._find_queue_item(target_id)
+    if item is not None and item.execution_status == "proposed_only":
+        item.execution_status = EXECUTION_STATUS_ADMITTED_NOT_EXECUTED
+        item.lifecycle_status = LIFECYCLE_ADMITTED_NOT_EXECUTED
+        envelope = controller._session.run_envelopes.get(target_id)
+        if envelope is not None:
+            envelope.candidate["execution_status"] = EXECUTION_STATUS_ADMITTED_NOT_EXECUTED
+
+    _sync_counters(controller, ha_state, policy)
+    if ha_state.human_critical_pending:
+        ha_state.mode = HA_MODE_HUMAN_REQUIRED
+        ha_state.last_event = (
+            f"Human approved action {target_id} (recorded only; no executor was invoked). "
+            f"{ha_state.human_required_action_count} human-critical action(s) still require a decision."
+        )
+    else:
+        ha_state.mode = HA_MODE_RUNNING
+        ha_state.human_required_reason = None
+        ha_state.pending_human_action_id = None
+        ha_state.last_event = (
+            f"Human approved action {target_id} (recorded only; no executor was invoked)."
+        )
+    if controller._high_autonomy_transport is not None:
+        ha_state.next_action = _plan_next_action(
+            controller, ha_state, policy, controller._high_autonomy_transport
+        )
+    else:
+        ha_state.next_action = (
+            HA_NEXT_HUMAN_APPROVAL if ha_state.human_critical_pending else HA_NEXT_WRITE_INSTRUCTION
+        )
+    controller._session.transcript.append(
+        _transcript_entry(
+            "high_autonomy_human_approved",
+            {"action_id": target_id, "admitted_not_executed": True},
+        )
     )
     _save_ha_state(controller, ha_state)
     controller._persist()
@@ -827,23 +1054,93 @@ def approve_human_critical_action(
 def refuse_human_critical_action(
     controller: "ControlSurfaceController",
     *,
-    action_id: str,
+    action_id: str | None = None,
     rationale: str = "Refused in high-autonomy human-required state.",
 ) -> dict[str, Any]:
-    ha_state = _ha_state(controller)
-    if not ha_state.active or ha_state.mode != HA_MODE_HUMAN_REQUIRED:
-        raise ValueError("No human-critical action pending refusal.")
-    controller.decide(
-        action_id,
-        {"decision_type": "refuse", "rationale": rationale},
+    """Refuse the open human-critical action(s) and hand off to local-only recovery.
+
+    Refusal must always clear the ``human_required`` condition, so it records a
+    refusal decision against *every* currently-open human-critical action (not
+    just the surfaced one). Leaving any open would re-pin the loop in
+    human_required on the next tick — the exact bug this fixes. The already-
+    ingested response is not re-consumed; instead the next tick composes a bounded
+    local-only recovery instruction grounded in the refused actions.
+    """
+    from admissible.control_surface import (
+        DECISION_TYPE_REFUSE,
+        available_human_actions,
     )
-    ha_state.mode = HA_MODE_RUNNING
-    ha_state.human_required_reason = None
-    ha_state.pending_human_action_id = None
+
+    ha_state = _ha_state(controller)
+    _require_human_required(ha_state, verb="refusal")
+
+    policy = HighAutonomyPolicy()
+    open_actions = _open_human_critical_actions(controller, policy)
+    # Refuse the whole open set; include an explicitly passed id defensively even
+    # if classification shifted, so the caller's intent is always honoured.
+    target_ids = [a["action_id"] for a in open_actions]
+    if action_id and action_id not in target_ids:
+        extra = controller._find_queue_item(action_id)
+        if (
+            extra is not None
+            and extra.execution_status == "proposed_only"
+            and not extra.human_decision_ids
+            and DECISION_TYPE_REFUSE in available_human_actions(extra, controller._session.autonomy_level)
+        ):
+            target_ids.append(action_id)
+
+    by_id = {a["action_id"]: a for a in open_actions}
+    refused: list[dict[str, Any]] = []
+    for aid in target_ids:
+        item = controller._find_queue_item(aid)
+        if item is None:
+            continue
+        if DECISION_TYPE_REFUSE not in available_human_actions(item, controller._session.autonomy_level):
+            # Already blocked/closed by admission — nothing for a human to refuse.
+            continue
+        controller.decide(aid, {"decision_type": "refuse", "rationale": rationale})
+        entry = by_id.get(aid) or {
+            "action_id": aid,
+            "action_type": item.action_type,
+            "tool_or_command": item.tool_or_command,
+            "reason": None,
+        }
+        refused.append(entry)
+
+    ha_state.last_refused_action_ids = [entry["action_id"] for entry in refused]
     ha_state.human_critical_pending = False
-    ha_state.recovery_pending = True
+    ha_state.pending_human_action_id = None
+    ha_state.human_required_action_ids = []
+    ha_state.human_required_action_count = 0
+    ha_state.human_required_actions = []
+    ha_state.human_required_reason = None
+    ha_state.refusal_recovery_pending = True
     ha_state.awaiting_instruction_after_review = True
-    ha_state.last_event = f"Human refused action {action_id}; recovery may continue."
+    ha_state.recovery_pending = False
+    ha_state.mode = HA_MODE_RECOVERING
+    count = len(refused)
+    ha_state.last_event = (
+        f"Human refused {count} human-critical action(s); composing a local-only "
+        "recovery instruction."
+        if count
+        else "No open human-critical action to refuse; composing a local-only recovery instruction."
+    )
+    controller._session.transcript.append(
+        _transcript_entry(
+            "high_autonomy_human_refused",
+            {"action_ids": ha_state.last_refused_action_ids, "count": count},
+        )
+    )
+    # Recompute counters (all refused actions now carry a human decision, so none
+    # remain open) and plan the recovery-instruction write for the next tick.
+    _sync_counters(controller, ha_state, policy)
+    if controller._high_autonomy_transport is not None:
+        ha_state.next_action = _plan_next_action(
+            controller, ha_state, policy, controller._high_autonomy_transport
+        )
+    else:
+        # refusal_recovery_pending guarantees the recovery write regardless.
+        ha_state.next_action = HA_NEXT_WRITE_RECOVERY
     _save_ha_state(controller, ha_state)
     controller._persist()
     view = controller.state_view()

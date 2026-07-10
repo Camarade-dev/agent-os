@@ -281,6 +281,13 @@
   .ha-status-row { display: flex; gap: .5rem; align-items: baseline; font-size: .82rem; }
   .ha-status-row dt { min-width: 7.5rem; color: var(--cs-muted); font-weight: 600; }
   .ha-status-row dd { margin: 0; flex: 1; }
+  .ha-blocking-actions { margin: .5rem 0; padding: .55rem .65rem; border: 1px solid #fbbf24; border-radius: 6px; background: rgba(251,191,36,.08); }
+  .ha-blocking-title { margin: 0 0 .35rem; font-size: .8rem; font-weight: 700; color: #b45309; }
+  .ha-blocking-list { margin: 0; padding-left: 1.1rem; font-size: .8rem; }
+  .ha-blocking-list li { margin: .2rem 0; }
+  .ha-blocking-cmd { display: inline-block; margin-left: .35rem; font-family: ui-monospace, monospace; color: var(--cs-muted); }
+  .ha-blocking-reason { display: block; font-size: .74rem; color: var(--cs-muted); }
+  .ha-blocking-note { margin: .4rem 0 0; font-size: .72rem; color: var(--cs-muted); }
   .ha-primary-actions { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .65rem; }
   .ha-evidence-line { font-size: .78rem; color: var(--cs-muted); margin-top: .35rem; }
   .ha-autorun-line { font-size: .78rem; color: var(--cs-muted); margin-top: .5rem; font-weight: 600; }
@@ -1197,6 +1204,7 @@ function renderHighAutonomy(state) {
   }
 
   const blocking = ha.problem_summary || ha.human_required_reason || "";
+  const blockingActions = ha.human_required_actions || [];
   const humanAction = ha.human_action_required
     ? (ha.human_required_reason || "A human-critical action requires approval.")
     : "None";
@@ -1210,7 +1218,19 @@ function renderHighAutonomy(state) {
       <div class="ha-status-row"><dt>Evidence</dt><dd>${ha.evidence_count ?? 0} write(s)</dd></div>
       <div class="ha-status-row"><dt>Verification</dt><dd>${escapeHtml(ha.verification_readiness || "not_run")}${ha.verification_passed ? " ✓" : ""}</dd></div>
       <div class="ha-status-row"><dt>Human action</dt><dd>${escapeHtml(humanAction)}</dd></div>
-    </dl>`;
+    </dl>
+    ${ha.human_action_required && blockingActions.length ? `
+      <div class="ha-blocking-actions">
+        <p class="ha-blocking-title">Blocking human-critical action(s) — ${blockingActions.length}:</p>
+        <ul class="ha-blocking-list">
+          ${blockingActions.map((a) => `<li>
+            <code>${escapeHtml(a.action_type || a.action_id || "action")}</code>
+            ${a.tool_or_command ? `<span class="ha-blocking-cmd">${escapeHtml(a.tool_or_command)}</span>` : ""}
+            <span class="ha-blocking-reason">${escapeHtml(a.reason || "")}</span>
+          </li>`).join("")}
+        </ul>
+        <p class="ha-blocking-note">Approve records intent only (admitted-not-executed; no executor runs). Refuse marks all of them not-completed and hands off a local-only recovery instruction.</p>
+      </div>` : ""}`;
 
   if (evidenceLine) {
     evidenceLine.textContent =
@@ -2546,14 +2566,20 @@ document.getElementById("high-autonomy-actions").addEventListener("click", async
     return;
   }
   if (target.id === "btn-ha-approve" || target.id === "btn-ha-refuse") {
-    const pending = (lastState && lastState.high_autonomy_summary && lastState.high_autonomy_summary.pending_human_action_id) || "";
-    const actionId = pending || (lastState && lastState.needs_attention && lastState.needs_attention.approval_needed && lastState.needs_attention.approval_needed[0] && lastState.needs_attention.approval_needed[0].action_id) || "";
-    if (!actionId) {
+    const ha = (lastState && lastState.high_autonomy_summary) || {};
+    const blockingIds = ha.human_required_action_ids || [];
+    const pending = ha.pending_human_action_id || blockingIds[0] || "";
+    const isRefuse = target.id === "btn-ha-refuse";
+    // Approval is a per-action authority grant, so it needs a specific id.
+    // Refusal clears ALL open human-critical actions, so it can proceed even
+    // when no single id is surfaced.
+    if (!pending && !isRefuse) {
       showError("No human-critical action id is pending.");
       return;
     }
-    const path = target.id === "btn-ha-approve" ? "/api/session/high_autonomy/approve" : "/api/session/high_autonomy/refuse";
-    await runAction(() => apiPost(path, { action_id: actionId }));
+    const path = isRefuse ? "/api/session/high_autonomy/refuse" : "/api/session/high_autonomy/approve";
+    const payload = pending ? { action_id: pending } : {};
+    await runAction(() => apiPost(path, payload));
   }
 });
 

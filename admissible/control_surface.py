@@ -2324,25 +2324,25 @@ class ControlSurfaceController:
         return tick_high_autonomy_run(self)
 
     def approve_high_autonomy_human_action(
-        self, action_id: str, *, rationale: str = "", scope: str | None = None
+        self, action_id: str | None = None, *, rationale: str = "", scope: str | None = None
     ) -> dict[str, Any]:
         from admissible.high_autonomy_controller import approve_human_critical_action
 
         return approve_human_critical_action(
             self,
-            action_id=action_id,
+            action_id=(action_id or None),
             rationale=rationale or "Approved in high-autonomy human-required state.",
             scope=scope or None,
         )
 
     def refuse_high_autonomy_human_action(
-        self, action_id: str, *, rationale: str = ""
+        self, action_id: str | None = None, *, rationale: str = ""
     ) -> dict[str, Any]:
         from admissible.high_autonomy_controller import refuse_human_critical_action
 
         return refuse_human_critical_action(
             self,
-            action_id=action_id,
+            action_id=(action_id or None),
             rationale=rationale or "Refused in high-autonomy human-required state.",
         )
 

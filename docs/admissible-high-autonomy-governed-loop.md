@@ -113,6 +113,56 @@ A top-level **High-Autonomy Governed Run** panel shows only:
 
 Manual bridge, queue, timeline, and transcript are under **Advanced / Debug**.
 
+## Human-critical refusal recovery
+
+When a turn proposes genuinely human-critical actions (e.g. `git push`, `git commit`,
+`publish`, a shell command, or a write outside the workspace), the loop pauses in
+`mode = human_required` and stops the browser auto-run. The state now describes the pause
+**per action**, not with a single generic message:
+
+- `human_required_action_ids` / `human_required_action_count` — every currently-open
+  human-critical action still awaiting a decision.
+- `human_required_actions` — concise `{action_id, action_type, tool_or_command, reason}`
+  labels the panel lists so the operator sees exactly what is blocking.
+
+An action only counts as an open human-critical blocker when a human decision is actually
+available for it. A capability the rules-only evaluator already `REFUSE`d is
+human-critical by capability but offers no human action — it is already blocked and never
+pins the loop in `human_required`.
+
+### What happens after **Refuse**
+
+`refuse_high_autonomy_human_action` (route `/api/session/high_autonomy/refuse`):
+
+1. Records a refusal decision — through the existing `decide()` / `HumanDecisionRecord`
+   model — against **every** currently-open human-critical action, not just the surfaced
+   one. (Refusing only one used to leave the others open, re-entering `human_required` on
+   the next tick — the stuck-UI bug this fixes.)
+2. Marks those actions refused/closed and **not completed** (`lifecycle = refused_closed`,
+   `execution_status` stays `proposed_only` — never executed).
+3. Does **not** re-ingest the already-consumed response; stale/duplicate-response
+   protection stays intact and a recorded "duplicate response" bridge warning is
+   non-fatal.
+4. Leaves `human_required` and sets `mode = recovering`, `next_action =
+   write_recovery_instruction`.
+5. On the next safe tick, composes a **bounded local-only** recovery instruction grounded
+   in the refused actions: it names them, says they are not completed and must not be
+   retried in their forbidden form, and asks for the next smallest admissible local-only
+   structured operation writing only `.admissible/agent-response.md` — no shell, npm, pip,
+   git push/commit, publish, deploy, network, CDN, secrets, or paths outside the
+   workspace. It is written to `.admissible/next-agent-instruction.md`; `mode` becomes
+   `waiting_for_agent` and auto-run may safely continue.
+
+### Why **Approve** does not create forbidden executor powers
+
+`approve_high_autonomy_human_action` records approval/admission **intent only** for the
+one targeted action. v0 has no automatic shell/network/deploy executor at any level, so an
+approved human-critical action is marked `admitted_not_executed` — a human still runs it
+externally. Approval is a deliberate per-action authority grant, so it targets a single
+action; a non-approvable proposal (e.g. `REQUEST_MORE_EVIDENCE`) is rejected with a clear
+error rather than inventing approval authority. If other human-critical actions remain, the
+loop stays in `human_required` for them.
+
 ## Manual mode unchanged
 
 Supervised mode is the default. Without calling `start_high_autonomy_run`, behavior is
@@ -136,11 +186,19 @@ using fixture transport. Remaining gap for a true live Cursor high-autonomy run:
 3. **Turn latency** is human/agent-bound; the browser may call `tick` on an interval while
    `mode === waiting_for_agent`.
 4. **Human-critical pauses** need the operator to Approve/Refuse in the minimal panel.
+   Refuse always clears every open human-critical action and hands off a local-only
+   recovery instruction (see *Human-critical refusal recovery*), so the run continues
+   safely without re-entering `human_required`.
 
 The controller, policy, transport, tests, and UI are in place for that live rehearsal
 once Cursor is pointed at the workspace.
 
 ## Tests
 
-`tests/test_admissible_high_autonomy_governed_loop.py` — deterministic four-turn flow with
-`FixtureAgentTransport`.
+- `tests/test_admissible_high_autonomy_governed_loop.py` — deterministic four-turn flow
+  with `FixtureAgentTransport`.
+- `tests/test_admissible_live_high_autonomy_hardening.py` — live file-bridge hardening and
+  the human-critical pause path.
+- `tests/test_admissible_high_autonomy_human_required_recovery.py` — human-critical refusal
+  recovery: refusal clears all open actions, exits `human_required`, writes a local-only
+  recovery instruction, and approval records intent without inventing an executor.
