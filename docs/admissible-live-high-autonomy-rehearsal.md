@@ -28,6 +28,14 @@ communicates only through two files in the target workspace:
 Point Cursor at the workspace once and tell it to keep reading the instruction file and
 writing the response file. That is the only integration.
 
+> **Update (slice ADMISSIBLE_RUN_032):** this GUI file bridge is now recognised as
+> **semi-autonomous only** — a human still has to keep Cursor pointed at the bridge files. A
+> [model-agnostic agent transport](admissible-model-agnostic-agent-transport.md) adds a
+> *callable* `AgentBackend` (Cursor CLI / headless first) so the loop can invoke the agent
+> directly, with the agent confined to an isolated **agent workspace** and no direct write
+> authority over the **target workspace**. The file bridge stays available and unchanged as
+> the external/manual backend.
+
 ## Automatic instruction dispatch (hardened file bridge)
 
 `FileBridgeAgentTransport` now keeps bridge turn metadata aligned with the controller:
@@ -84,7 +92,8 @@ passed) for the UI and tests — display-only, never an authority source.
 ## Running a live rehearsal without copy/paste
 
 1. Open the Control Surface and submit the tiny-game goal.
-2. Enter the workspace path in the Cursor bridge section (Advanced).
+2. Enter the **Target workspace** in the high-autonomy panel (now a top-level field, not an
+   Advanced setting) and pick an **Agent backend** (File bridge is the default).
 3. Open the workspace in Cursor and tell it to read
    `.admissible/next-agent-instruction.md` and write `.admissible/agent-response.md`.
 4. Click **Start high-autonomy run**, then **Auto-run while safe**.
@@ -94,8 +103,13 @@ passed) for the UI and tests — display-only, never an authority source.
 
 ## What is still not implemented
 
-- No provider or Cursor API integration — Cursor remains a separate process.
+- No provider or Cursor API integration in the file-bridge path — Cursor remains a separate
+  process. The [callable Cursor CLI backend](admissible-model-agnostic-agent-transport.md)
+  drives an agent directly, but only when the operator configures a verified CLI command; it
+  ships disabled.
 - No arbitrary shell / npm / network / deploy executor; approving those records intent only.
+  In high-autonomy mode **only admitted low-risk local writes are auto-executed**, by the
+  bounded executor, and **human-critical actions still stop**.
 - High-autonomy mode is opt-in and never the default; supervised/manual mode is unchanged.
 - Response freshness relies on file sha256 + mtime, so Cursor must overwrite the same
   `agent-response.md` per turn (the bridge archives the prior one before each new turn).

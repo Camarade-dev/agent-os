@@ -8,8 +8,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, TYPE_CHECKING
-
+from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -116,6 +115,10 @@ class HighAutonomyRunState:
     recovery_pending: bool = False
     recovery_attempted: bool = False
     transport_kind: str = "file_bridge"
+    # Model-agnostic backend fields (slice ADMISSIBLE_RUN_032; display-only).
+    backend_id: str | None = None
+    agent_workspace_path: str | None = None
+    backend_block_reason: str | None = None
     # Live-rehearsal transport/bridge fields (display-only; not an authority).
     transport_status: str = "idle"
     workspace_path: str | None = None
@@ -282,6 +285,9 @@ def build_high_autonomy_summary(
         "write_evidence_count": governed.get("write_evidence_count", 0),
         "tick_count": ha_state.tick_count,
         "transport_kind": ha_state.transport_kind,
+        "backend_id": ha_state.backend_id,
+        "agent_workspace_path": ha_state.agent_workspace_path,
+        "backend_block_reason": ha_state.backend_block_reason,
         # Live transport/bridge status (display-only) for the auto-tick UI.
         "transport_status": ha_state.transport_status,
         "workspace_path": ha_state.workspace_path,
@@ -342,6 +348,9 @@ def build_live_high_autonomy_rehearsal_status(
         "mode": ha_state.mode,
         "workspace_path": ha_state.workspace_path,
         "transport_kind": ha_state.transport_kind,
+        "backend_id": ha_state.backend_id,
+        "agent_workspace_path": ha_state.agent_workspace_path,
+        "backend_block_reason": ha_state.backend_block_reason,
         "transport_status": ha_state.transport_status,
         "instruction_path": ha_state.instruction_path,
         "response_path": ha_state.response_path,
@@ -397,7 +406,41 @@ def _capture_transport_status(
         ha_state.response_path = snap.get("response_path")
     if snap.get("workspace_path"):
         ha_state.workspace_path = snap.get("workspace_path")
+    if snap.get("agent_workspace_path"):
+        ha_state.agent_workspace_path = snap.get("agent_workspace_path")
+    if snap.get("backend_id"):
+        ha_state.backend_id = snap.get("backend_id")
     ha_state.stale_response_blocked = snap.get("status") == TRANSPORT_STATUS_STALE_BLOCKED
+
+
+def _callable_backend_terminal_block(transport: "AgentTransport") -> Any | None:
+    """Return the last invocation result when a callable backend cannot progress.
+
+    Only callable-backend transports expose ``last_invocation_result``. A
+    terminal block (blocked_by_configuration / unavailable / timeout / failed)
+    means the loop must pause with a clear reason rather than spin re-planning
+    an ingest that will never arrive.
+    """
+    result = getattr(transport, "last_invocation_result", None)
+    if result is not None and getattr(result, "is_terminal_block", False):
+        return result
+    return None
+
+
+def _pause_for_backend_block(
+    ha_state: HighAutonomyRunState,
+    block: Any,
+    step_result: dict[str, Any],
+) -> None:
+    """Pause the run on a callable-backend terminal block (never auto-approve)."""
+    reason = block.error_message or f"Agent backend returned status {block.status!r}."
+    ha_state.mode = HA_MODE_PAUSED
+    ha_state.paused = True
+    ha_state.backend_block_reason = reason
+    ha_state.next_action = HA_NEXT_NONE
+    ha_state.last_event = f"High-autonomy run paused: {reason}"
+    ha_state.last_tick_step = "backend_blocked"
+    step_result["backend_block"] = {"status": block.status, "reason": reason}
 
 
 def _latest_instruction_id(controller: "ControlSurfaceController") -> str | None:
@@ -586,13 +629,71 @@ def _plan_next_action(
     return HA_NEXT_WAIT_FOR_RESPONSE
 
 
+def _resolve_transport_kind(transport: "AgentTransport") -> str:
+    """Compact display label for the attached transport (display-only)."""
+    name = type(transport).__name__
+    if name == "FixtureAgentTransport":
+        return "fixture"
+    if name == "CallableBackendTransport":
+        return "callable_backend"
+    return "file_bridge"
+
+
+def _build_backend_from_id(backend_id: str, workspace_path: str) -> Any:
+    """Resolve a selectable backend id to a callable backend, or None.
+
+    ``file_bridge`` stays a pull/external transport (returns None so the default
+    FileBridgeAgentTransport is used). ``cursor_cli`` builds a callable backend
+    from the environment config and is rejected up front when not available, so
+    a run never starts only to immediately pause. ``fixture`` is test-only and
+    not selectable from the HTTP surface.
+    """
+    from admissible.agent_backend import (
+        AGENT_AVAILABILITY_AVAILABLE,
+        BACKEND_ID_CURSOR_CLI,
+        BACKEND_ID_FILE_BRIDGE,
+        BACKEND_ID_FIXTURE,
+        CursorCliAgentBackend,
+    )
+
+    if not backend_id or backend_id == BACKEND_ID_FILE_BRIDGE:
+        return None
+    if backend_id == BACKEND_ID_CURSOR_CLI:
+        backend = CursorCliAgentBackend()
+        availability = backend.availability()
+        if availability.status != AGENT_AVAILABILITY_AVAILABLE:
+            raise ValueError(
+                f"Cursor CLI backend is not available: {availability.message}"
+            )
+        return backend
+    if backend_id == BACKEND_ID_FIXTURE:
+        raise ValueError("The fixture backend is test-only and cannot be started from the UI.")
+    raise ValueError(f"Unknown agent backend id: {backend_id!r}")
+
+
 def start_high_autonomy_run(
     controller: "ControlSurfaceController",
     *,
     workspace_path: str,
     transport: "AgentTransport | None" = None,
+    backend: Any = None,
+    backend_id: str | None = None,
+    agent_workspace_path: str | None = None,
     max_turns: int = DEFAULT_MAX_TURNS,
 ) -> dict[str, Any]:
+    """Start an opt-in high-autonomy run against a workspace.
+
+    Backend selection (highest precedence first):
+
+    - ``transport`` — an explicit ``AgentTransport`` (fixture/file-bridge, used
+      by tests and the manual bridge). Pull/external mode, unchanged.
+    - ``backend`` — a callable ``AgentBackend`` (fixture backend, Cursor CLI).
+      Wrapped in a ``CallableBackendTransport`` so the same tick machine drives
+      it: each write invokes the backend once (one safe tick step). The backend
+      runs only in the isolated *agent* workspace and never gets direct write
+      authority over the *target* workspace.
+    - neither — defaults to the legacy Cursor GUI file bridge (semi-autonomous).
+    """
     from admissible.agent_transport import FileBridgeAgentTransport
 
     if not controller._session.goal_intake:
@@ -601,18 +702,41 @@ def start_high_autonomy_run(
     controller.set_bounded_executor_workspace(workspace_path)
     controller.set_autonomy("L4_HIGH_AUTONOMY_HARD_GATES")
 
+    if transport is None and backend is None and backend_id:
+        backend = _build_backend_from_id(backend_id, workspace_path)
+
+    resolved_agent_workspace: str | None = None
+    if transport is None and backend is not None:
+        from admissible.agent_backend import (
+            CallableBackendTransport,
+            default_agent_workspace_path,
+            ensure_agent_workspace,
+        )
+
+        if agent_workspace_path:
+            agent_ws = Path(str(agent_workspace_path))
+            agent_ws.mkdir(parents=True, exist_ok=True)
+        else:
+            agent_ws = ensure_agent_workspace(workspace_path)
+        resolved_agent_workspace = str(agent_ws)
+        transport = CallableBackendTransport(
+            backend,
+            target_workspace_path=workspace_path,
+            agent_workspace_path=resolved_agent_workspace,
+        )
     if transport is None:
         transport = FileBridgeAgentTransport(workspace_path)
 
     snap = transport.status_snapshot()
+    transport_kind = _resolve_transport_kind(transport)
     ha_state = HighAutonomyRunState(
         active=True,
         mode=HA_MODE_RUNNING,
         max_turns=max_turns,
         started_at=_now_iso(),
-        transport_kind=(
-            "fixture" if type(transport).__name__ == "FixtureAgentTransport" else "file_bridge"
-        ),
+        transport_kind=transport_kind,
+        backend_id=snap.get("backend_id"),
+        agent_workspace_path=snap.get("agent_workspace_path") or resolved_agent_workspace,
         transport_status=str(snap.get("status") or "idle"),
         workspace_path=snap.get("workspace_path") or workspace_path,
         instruction_path=snap.get("instruction_path"),
@@ -627,8 +751,10 @@ def start_high_autonomy_run(
             "high_autonomy_run_started",
             {
                 "workspace_path": workspace_path,
+                "agent_workspace_path": ha_state.agent_workspace_path,
                 "max_turns": max_turns,
                 "transport_kind": ha_state.transport_kind,
+                "backend_id": ha_state.backend_id,
             },
         )
     )
@@ -753,19 +879,26 @@ def tick_high_autonomy_run(
             session_id=controller._session.session_id,
             instruction_id=_latest_instruction_id(controller),
         )
-        ha_state.mode = HA_MODE_WAITING_FOR_AGENT
-        ha_state.last_event = f"Wrote turn {controller._session.run_loop.current_turn} instruction automatically."
-        ha_state.awaiting_instruction_after_review = False
-        ha_state.last_tick_step = "write_instruction"
         step_result.update({"bridge": bridge_result, "turn": controller._session.run_loop.current_turn})
-        controller._session.transcript.append(
-            _transcript_entry(
-                "high_autonomy_instruction_written",
-                {"turn": controller._session.run_loop.current_turn, "bridge": bridge_result},
+        block = _callable_backend_terminal_block(transport)
+        if block is not None:
+            _pause_for_backend_block(ha_state, block, step_result)
+            _save_ha_state(controller, ha_state)
+            controller._persist()
+        else:
+            ha_state.backend_block_reason = None
+            ha_state.mode = HA_MODE_WAITING_FOR_AGENT
+            ha_state.last_event = f"Wrote turn {controller._session.run_loop.current_turn} instruction automatically."
+            ha_state.awaiting_instruction_after_review = False
+            ha_state.last_tick_step = "write_instruction"
+            controller._session.transcript.append(
+                _transcript_entry(
+                    "high_autonomy_instruction_written",
+                    {"turn": controller._session.run_loop.current_turn, "bridge": bridge_result},
+                )
             )
-        )
-        _save_ha_state(controller, ha_state)
-        controller._persist()
+            _save_ha_state(controller, ha_state)
+            controller._persist()
 
     elif planned == HA_NEXT_WRITE_RECOVERY:
         view_before = controller.state_view()
@@ -794,16 +927,21 @@ def tick_high_autonomy_run(
             session_id=controller._session.session_id,
             instruction_id=_latest_instruction_id(controller),
         )
-        ha_state.mode = HA_MODE_WAITING_FOR_AGENT
         ha_state.recovery_pending = False
         ha_state.refusal_recovery_pending = False
         ha_state.recovery_attempted = True
-        ha_state.last_event = recovery_event
-        ha_state.last_tick_step = "write_recovery_instruction"
         step_result.update({"bridge": bridge_result, "refusal_recovery": is_refusal_recovery})
-        controller._session.transcript.append(
-            _transcript_entry(recovery_event_type, {"bridge": bridge_result})
-        )
+        block = _callable_backend_terminal_block(transport)
+        if block is not None:
+            _pause_for_backend_block(ha_state, block, step_result)
+        else:
+            ha_state.backend_block_reason = None
+            ha_state.mode = HA_MODE_WAITING_FOR_AGENT
+            ha_state.last_event = recovery_event
+            ha_state.last_tick_step = "write_recovery_instruction"
+            controller._session.transcript.append(
+                _transcript_entry(recovery_event_type, {"bridge": bridge_result})
+            )
         _save_ha_state(controller, ha_state)
         controller._persist()
 

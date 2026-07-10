@@ -217,6 +217,7 @@ class _ControlSurfaceRequestHandler(BaseHTTPRequestHandler):
                 result = self.controller.start_high_autonomy_run(
                     workspace_path=workspace_path,
                     max_turns=int(body.get("max_turns") or 12),
+                    backend_id=str(body.get("backend_id") or "") or None,
                 )
             elif parsed.path == "/api/session/high_autonomy/pause":
                 result = self.controller.pause_high_autonomy_run()

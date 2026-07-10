@@ -1067,6 +1067,66 @@ def _product_state(
     }
 
 
+def _agent_backend_control(
+    session: "ControlSession",
+    *,
+    repo_root: str | Path | None,
+) -> dict[str, Any]:
+    """Workspace-first agent-backend control block (slice ADMISSIBLE_RUN_032).
+
+    Display/control-only: surfaces the *target* workspace as a first-class field,
+    the isolated *agent* workspace, the selectable model-agnostic backends and
+    their availability, and the reasons a high-autonomy run would be blocked or
+    warned before Start. It carries no admission authority — it only projects
+    already-computed workspace/backend state so the UI can lead with workspace +
+    backend selection instead of hiding them under Advanced.
+    """
+    from admissible.agent_backend import (
+        BACKEND_ID_CURSOR_CLI,
+        BACKEND_ID_FILE_BRIDGE,
+        assess_workspace_safety,
+        describe_available_backends,
+    )
+
+    target = session.bounded_executor_workspace
+    safety = assess_workspace_safety(
+        target_workspace_path=target,
+        repo_root=repo_root,
+        high_autonomy=True,
+    )
+    backends = describe_available_backends()
+    by_id = {b["backend_id"]: b for b in backends}
+
+    # A backend is start-ready when its availability says available/external.
+    # The file bridge is always available (semi-autonomous); Cursor CLI only when
+    # configured; fixture is test-only and not offered as a start default.
+    def _backend_available(backend_id: str) -> bool:
+        entry = by_id.get(backend_id) or {}
+        return bool((entry.get("availability") or {}).get("available"))
+
+    start_blocking_reasons = list(safety.blocking_reasons)
+    # No callable/external backend available at all would also block a start.
+    any_startable = _backend_available(BACKEND_ID_FILE_BRIDGE) or _backend_available(
+        BACKEND_ID_CURSOR_CLI
+    )
+    if not any_startable:
+        start_blocking_reasons.append("No agent backend is available or configured.")
+
+    return {
+        "target_workspace_path": safety.target_workspace_path,
+        "target_workspace_exists": safety.target_exists,
+        "target_is_agent_os_repo": safety.target_is_agent_os_repo,
+        "agent_workspace_path": safety.agent_workspace_path,
+        "agent_equals_target": safety.agent_equals_target,
+        "workspace_safety": safety.to_dict(),
+        "backends": backends,
+        "cursor_cli_configured": _backend_available(BACKEND_ID_CURSOR_CLI),
+        "can_start_high_autonomy": not start_blocking_reasons,
+        "start_blocking_reasons": start_blocking_reasons,
+        "start_warnings": list(safety.warnings),
+    }
+
+
 def _lifecycle_overview(session: "ControlSession") -> dict[str, Any]:
     """Display-only lifecycle buckets for supervised-run demo clarity."""
     queue = session.queue
@@ -1607,6 +1667,10 @@ class ControlSurfaceController:
         view["live_high_autonomy_rehearsal_status"] = build_live_high_autonomy_rehearsal_status(
             ha_state=ha_state,
             state_view=view,
+        )
+        view["agent_backend_control"] = _agent_backend_control(
+            self._session,
+            repo_root=self._repo_root,
         )
         return view
 
@@ -2293,6 +2357,9 @@ class ControlSurfaceController:
         workspace_path: str,
         max_turns: int = 12,
         transport: Any = None,
+        backend: Any = None,
+        backend_id: str | None = None,
+        agent_workspace_path: str | None = None,
     ) -> dict[str, Any]:
         from admissible.high_autonomy_controller import start_high_autonomy_run
 
@@ -2300,6 +2367,9 @@ class ControlSurfaceController:
             self,
             workspace_path=workspace_path,
             transport=transport,
+            backend=backend,
+            backend_id=backend_id,
+            agent_workspace_path=agent_workspace_path,
             max_turns=max_turns,
         )
 

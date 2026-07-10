@@ -804,8 +804,11 @@ class TestControlSurfaceHtmlContent(unittest.TestCase):
     def test_no_execution_banner_visible_without_collapsing(self) -> None:
         self.assertIn('id="no-execution-banner"', self.raw)
         banner_start = self.raw.index('id="no-execution-banner"')
-        banner_region = self.raw[banner_start : banner_start + 400]
-        self.assertIn("does not execute side effects", banner_region)
+        banner_region = self.raw[banner_start : banner_start + 500]
+        # Truthful high-autonomy wording: no arbitrary executor, but admitted
+        # low-risk local writes may be auto-executed; human-critical still stops.
+        self.assertIn("runs no shell, npm/pip, network, or deploy", banner_region)
+        self.assertIn("human-critical actions still stop", banner_region)
         self.assertNotIn("<details", banner_region)
 
     def test_lifecycle_buckets_rendered_in_supervised_run_state(self) -> None:
@@ -844,7 +847,7 @@ class TestControlSurfaceHtmlContent(unittest.TestCase):
         details_start = self.raw.index('id="truth-boundary-details"')
         details_region = self.raw[details_start : details_start + 2000]
         self.assertIn("<summary>", details_region)
-        self.assertIn("No side effect executed by Admissible.", details_region)
+        self.assertIn("no arbitrary executor", details_region)
 
     def test_transcript_present_but_not_first_screen_content(self) -> None:
         self.assertIn('id="transcript-log"', self.raw)
@@ -882,13 +885,19 @@ class TestControlSurfaceHtmlContent(unittest.TestCase):
         self.assertIn('id="btn-load-sample"', self.raw)
 
     def test_truth_boundary_language_present(self) -> None:
-        self.assertIn("No side effect executed by Admissible.", self.normalized)
-        self.assertIn("does not execute shell commands", self.normalized)
+        # Truthful wording after high-autonomy auto-execution was introduced:
+        # no *arbitrary* executor, no shell/npm/network/deploy, but admitted
+        # low-risk local writes may be auto-executed; human-critical still stops.
+        self.assertIn("no arbitrary executor", self.normalized)
+        self.assertIn("never runs shell, npm/pip, git push, network", self.normalized)
         self.assertIn(
             "does not call Cursor, Claude Code, Codex, Gemini, OpenAI, or any network provider",
             self.normalized,
         )
-        self.assertIn("no automatic executor", self.normalized.lower())
+        self.assertIn(
+            "only admitted low-risk local file writes may be auto-executed", self.normalized
+        )
+        self.assertIn("human-critical action, still stops", self.normalized)
 
     def test_no_provider_network_calls_in_markup_or_script(self) -> None:
         # Only same-origin, relative fetch() calls are allowed.

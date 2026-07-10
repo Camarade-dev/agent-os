@@ -288,6 +288,24 @@
   .ha-blocking-cmd { display: inline-block; margin-left: .35rem; font-family: ui-monospace, monospace; color: var(--cs-muted); }
   .ha-blocking-reason { display: block; font-size: .74rem; color: var(--cs-muted); }
   .ha-blocking-note { margin: .4rem 0 0; font-size: .72rem; color: var(--cs-muted); }
+  .ha-workspace-first { display: grid; gap: .7rem; margin: .3rem 0 .8rem; padding: .7rem .8rem; border: 1px solid #065f46; border-radius: 8px; background: rgba(4,120,87,.06); }
+  .ha-ws-field { display: grid; gap: .3rem; }
+  .ha-ws-field label { font-size: .82rem; font-weight: 600; }
+  .ha-ws-field label .req { font-weight: 400; color: var(--cs-muted); font-size: .74rem; }
+  .ha-ws-field input, .ha-ws-field select { width: 100%; box-sizing: border-box; padding: .4rem .5rem; font-size: .82rem; }
+  .ha-ws-status { font-size: .76rem; }
+  .ha-ws-status.ok { color: #34d399; }
+  .ha-ws-status.blocked { color: #fca5a5; }
+  .ha-ws-status.warn { color: #fbbf24; }
+  .ha-ws-grid { display: grid; gap: .3rem; margin: 0; }
+  .ha-ws-grid > div { display: flex; gap: .5rem; align-items: baseline; font-size: .78rem; }
+  .ha-ws-grid dt { min-width: 8rem; color: var(--cs-muted); font-weight: 600; }
+  .ha-ws-grid dd { margin: 0; flex: 1; font-family: ui-monospace, monospace; word-break: break-all; }
+  .ha-backend-note { margin: 0; font-size: .74rem; color: var(--cs-muted); }
+  .ha-start-gate { font-size: .78rem; }
+  .ha-start-gate ul { margin: .25rem 0 0; padding-left: 1.1rem; }
+  .ha-start-gate.blocked { color: #fca5a5; }
+  .ha-start-gate.warn { color: #fbbf24; }
   .ha-primary-actions { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .65rem; }
   .ha-evidence-line { font-size: .78rem; color: var(--cs-muted); margin-top: .35rem; }
   .ha-autorun-line { font-size: .78rem; color: var(--cs-muted); margin-top: .5rem; font-weight: 600; }
@@ -309,27 +327,33 @@
     <div class="status-pills">
       <span class="pill">Local only</span>
       <span class="pill">No provider calls</span>
-      <span class="pill">No executor</span>
-      <span class="pill">No side effect by Admissible</span>
+      <span class="pill">No arbitrary executor</span>
+      <span class="pill">No shell/npm/network/deploy</span>
+      <span class="pill">Human-critical actions still stop</span>
     </div>
   </div>
   <details id="truth-boundary-details">
     <summary>Truth boundary -- what Admissible does and does not do</summary>
     <div class="truth-boundary-banner">
-      Cursor / a frontier agent proposes. Admissible frames, audits, admits, limits, requests
-      evidence, requests approval, refuses, and records decisions -- it does not execute.
-      <strong>No side effect executed by Admissible.</strong> This surface does not call
-      Cursor, Claude Code, Codex, Gemini, OpenAI, or any network provider, and does not execute
-      shell commands. There is no automatic executor in this v0; "attest executed" only records
-      that an already-admitted local action was carried out by a human operator outside this tool.
+      The agent / model proposes. Admissible frames, audits, admits, limits, requests
+      evidence, requests approval, refuses, and records decisions. It has
+      <strong>no arbitrary executor</strong> and never runs shell, npm/pip, git push, network,
+      CDN, or deploy actions. This surface does not call Cursor, Claude Code, Codex, Gemini,
+      OpenAI, or any network provider.
+      In high-autonomy mode, <strong>only admitted low-risk local file writes may be
+      auto-executed by Admissible's bounded executor</strong>, inside the configured target
+      workspace; everything else, and every <strong>human-critical action, still stops</strong> for
+      a human decision. Outside high-autonomy mode nothing is auto-executed: "attest executed"
+      only records that an already-admitted local action was carried out by a human operator.
     </div>
   </details>
 </header>
 
 <p id="no-execution-banner" role="status">
-  <strong>No execution by Admissible.</strong>
-  Admissible evaluates and admits actions; it does not execute side effects.
-  External execution and attestation happen outside this tool.
+  <strong>No arbitrary execution by Admissible.</strong>
+  Admissible evaluates and admits actions; it runs no shell, npm/pip, network, or deploy.
+  In high-autonomy mode only admitted low-risk local writes may be auto-executed by its bounded
+  executor; human-critical actions still stop for a human decision.
 </p>
 
 <section class="top-controls" id="top-controls">
@@ -371,10 +395,33 @@
   <section class="panel high-autonomy-panel" id="high-autonomy-panel">
     <h2>High-Autonomy Governed Run</h2>
     <p class="narrative-hint">
-      Opt-in tick-driven loop: Admissible writes instructions, ingests responses, and auto-executes
-      admitted low-risk local writes under strict policy. Human approval is required only for
-      genuinely human-critical actions.
+      Opt-in tick-driven loop: Admissible writes instructions, invokes the selected agent backend,
+      ingests responses, and auto-executes admitted low-risk local writes under strict policy. The
+      agent proposes; only Admissible's bounded executor writes to the target workspace. Human
+      approval is required only for genuinely human-critical actions.
     </p>
+
+    <div class="ha-workspace-first" id="ha-workspace-first">
+      <div class="ha-ws-field">
+        <label for="ha-target-workspace">Target workspace
+          <span class="req">— where Admissible applies admitted writes (not the agent-os repo)</span>
+          <input type="text" id="ha-target-workspace" placeholder="e.g. C:\path\to\your\project">
+        </label>
+        <div id="ha-target-workspace-status" class="ha-ws-status"></div>
+      </div>
+      <div class="ha-ws-field">
+        <label for="ha-backend-select">Agent backend
+          <select id="ha-backend-select"></select>
+        </label>
+        <p class="ha-backend-note" id="ha-backend-note"></p>
+      </div>
+      <dl class="ha-ws-grid">
+        <div><dt>Agent workspace</dt><dd id="ha-agent-workspace">—</dd></div>
+        <div><dt>Backend status</dt><dd id="ha-backend-status">—</dd></div>
+      </dl>
+      <div id="ha-start-gate" class="ha-start-gate"></div>
+    </div>
+
     <div id="high-autonomy-body"><p class="no-action-note">Submit a goal, then start a high-autonomy run.</p></div>
     <div class="ha-primary-actions" id="high-autonomy-actions"></div>
     <p class="ha-autorun-line" id="high-autonomy-autorun-line"></p>
@@ -928,14 +975,28 @@ function sessionWorkspacePath(state) {
   return (state && state.bounded_executor_workspace) || "";
 }
 
-function syncWorkspacePathFromState(state) {
-  const input = document.getElementById("bridge-workspace-path");
-  const sessionPath = sessionWorkspacePath(state);
+function syncWorkspaceInput(id, sessionPath) {
+  const input = document.getElementById(id);
   if (!input || !sessionPath) return;
   if (!input.value.trim() || input.value.trim() === input.dataset.lastSessionWorkspace) {
     input.value = sessionPath;
   }
   input.dataset.lastSessionWorkspace = sessionPath;
+}
+
+function syncWorkspacePathFromState(state) {
+  const sessionPath = sessionWorkspacePath(state);
+  // Keep the top-level target-workspace input and the Advanced bridge input in
+  // sync with the session's configured workspace, without clobbering typing.
+  syncWorkspaceInput("ha-target-workspace", sessionPath);
+  syncWorkspaceInput("bridge-workspace-path", sessionPath);
+}
+
+function haTargetWorkspacePath() {
+  const top = document.getElementById("ha-target-workspace");
+  if (top && top.value.trim()) return top.value.trim();
+  const bridge = document.getElementById("bridge-workspace-path");
+  return bridge ? bridge.value.trim() : "";
 }
 
 function fmtBoundedOps(item) {
@@ -1187,13 +1248,95 @@ function timelineTurnBlock(turn) {
     </div>`;
 }
 
+function selectedBackendId() {
+  const sel = document.getElementById("ha-backend-select");
+  return sel && sel.value ? sel.value : "file_bridge";
+}
+
+function renderWorkspaceFirst(state) {
+  const control = state.agent_backend_control || {};
+  const ha = state.high_autonomy_summary || {};
+  const statusEl = document.getElementById("ha-target-workspace-status");
+  const select = document.getElementById("ha-backend-select");
+  const noteEl = document.getElementById("ha-backend-note");
+  const agentWsEl = document.getElementById("ha-agent-workspace");
+  const backendStatusEl = document.getElementById("ha-backend-status");
+  const gateEl = document.getElementById("ha-start-gate");
+  if (!statusEl || !select) return;
+
+  // Target workspace status (truthful about missing / repo / ok).
+  const targetPath = control.target_workspace_path || haTargetWorkspacePath();
+  if (!targetPath) {
+    statusEl.className = "ha-ws-status blocked";
+    statusEl.textContent = "No target workspace set — enter the project folder where admitted writes should be applied.";
+  } else if (!control.target_workspace_exists) {
+    statusEl.className = "ha-ws-status blocked";
+    statusEl.textContent = `Target workspace does not exist: ${targetPath}`;
+  } else if (control.target_is_agent_os_repo) {
+    statusEl.className = "ha-ws-status blocked";
+    statusEl.textContent = "This looks like the agent-os repository — pick a separate project workspace.";
+  } else {
+    statusEl.className = "ha-ws-status ok";
+    statusEl.textContent = `Target workspace ready: ${targetPath}`;
+  }
+
+  // Backend selector — preserve current selection across re-render.
+  const backends = control.backends || [];
+  const current = select.value || (ha.backend_id) || "file_bridge";
+  select.innerHTML = backends
+    .filter((b) => !b.test_only)
+    .map((b) => {
+      const avail = b.availability || {};
+      const disabled = avail.available ? "" : " disabled";
+      const suffix = avail.available ? "" : " (not configured)";
+      return `<option value="${escapeHtml(b.backend_id)}"${disabled}>${escapeHtml(b.label)}${suffix}</option>`;
+    })
+    .join("");
+  if ([...select.options].some((o) => o.value === current && !o.disabled)) select.value = current;
+  if (ha.active && ha.backend_id) { select.value = ha.backend_id; select.disabled = true; }
+  else select.disabled = false;
+
+  const selected = backends.find((b) => b.backend_id === select.value) || {};
+  const selAvail = selected.availability || {};
+  if (noteEl) noteEl.textContent = selAvail.message || "";
+  if (backendStatusEl) {
+    backendStatusEl.textContent = ha.active
+      ? `${ha.backend_id || selected.backend_id || "—"} · ${ha.transport_status || "—"}`
+      : `${selected.backend_id || "—"} · ${selAvail.status || "unknown"}`;
+  }
+  if (agentWsEl) {
+    agentWsEl.textContent = ha.agent_workspace_path || control.agent_workspace_path || "—";
+  }
+
+  // Start gate — surface blocking reasons and warnings before Start.
+  if (gateEl) {
+    const selectedAvailable = Boolean(selAvail.available);
+    const blocking = [...(control.start_blocking_reasons || [])];
+    if (!selectedAvailable) blocking.push(`Selected backend "${selected.label || select.value}" is not available or configured.`);
+    const warnings = control.start_warnings || [];
+    if (blocking.length) {
+      gateEl.className = "ha-start-gate blocked";
+      gateEl.innerHTML = `<strong>Cannot start:</strong><ul>${blocking.map((r) => `<li>${escapeHtml(r)}</li>`).join("")}</ul>`;
+    } else if (warnings.length) {
+      gateEl.className = "ha-start-gate warn";
+      gateEl.innerHTML = `<strong>Warnings:</strong><ul>${warnings.map((r) => `<li>${escapeHtml(r)}</li>`).join("")}</ul>`;
+    } else {
+      gateEl.className = "ha-start-gate";
+      gateEl.textContent = ha.active ? "" : "Ready to start a high-autonomy run.";
+    }
+  }
+}
+
 function renderHighAutonomy(state) {
   const body = document.getElementById("high-autonomy-body");
   const actions = document.getElementById("high-autonomy-actions");
   const evidenceLine = document.getElementById("high-autonomy-evidence-line");
   if (!body || !actions) return;
 
+  renderWorkspaceFirst(state);
+
   const ha = state.high_autonomy_summary || {};
+  const control = state.agent_backend_control || {};
   const goalReady = Boolean(state.goal_intake);
 
   if (!goalReady) {
@@ -1208,16 +1351,22 @@ function renderHighAutonomy(state) {
   const humanAction = ha.human_action_required
     ? (ha.human_required_reason || "A human-critical action requires approval.")
     : "None";
+  const blockingReason = ha.backend_block_reason || blocking || "Nothing blocking.";
   body.innerHTML = `
     <dl class="ha-status-grid">
+      <div class="ha-status-row"><dt>Target workspace</dt><dd>${escapeHtml(ha.workspace_path || control.target_workspace_path || "—")}</dd></div>
+      <div class="ha-status-row"><dt>Agent backend</dt><dd>${escapeHtml(ha.backend_id || control.backends && selectedBackendId() || "—")} <span style="color:var(--cs-muted);">(${escapeHtml(ha.transport_kind || "—")})</span></dd></div>
+      <div class="ha-status-row"><dt>Agent workspace</dt><dd>${escapeHtml(ha.agent_workspace_path || control.agent_workspace_path || "—")}</dd></div>
+      <div class="ha-status-row"><dt>Backend status</dt><dd>${escapeHtml(ha.transport_status || "—")}</dd></div>
       <div class="ha-status-row"><dt>Doing now</dt><dd>${escapeHtml(ha.doing_now || "—")}</dd></div>
       <div class="ha-status-row"><dt>Needed now</dt><dd>${escapeHtml(ha.needed_now || "—")}</dd></div>
-      <div class="ha-status-row"><dt>Blocking</dt><dd>${escapeHtml(blocking || "Nothing blocking.")}</dd></div>
+      <div class="ha-status-row"><dt>Current step</dt><dd>${escapeHtml(ha.next_action || "—")}</dd></div>
+      <div class="ha-status-row"><dt>Blocking reason</dt><dd>${escapeHtml(blockingReason)}</dd></div>
       <div class="ha-status-row"><dt>Last event</dt><dd>${escapeHtml(ha.last_event || "—")}</dd></div>
       <div class="ha-status-row"><dt>Mode</dt><dd><span class="status-badge status-badge-pending">${escapeHtml(ha.mode || "off")}</span></dd></div>
       <div class="ha-status-row"><dt>Evidence</dt><dd>${ha.evidence_count ?? 0} write(s)</dd></div>
       <div class="ha-status-row"><dt>Verification</dt><dd>${escapeHtml(ha.verification_readiness || "not_run")}${ha.verification_passed ? " ✓" : ""}</dd></div>
-      <div class="ha-status-row"><dt>Human action</dt><dd>${escapeHtml(humanAction)}</dd></div>
+      <div class="ha-status-row"><dt>Human action required</dt><dd>${escapeHtml(humanAction)}</dd></div>
     </dl>
     ${ha.human_action_required && blockingActions.length ? `
       <div class="ha-blocking-actions">
@@ -1245,13 +1394,28 @@ function renderHighAutonomy(state) {
   const workspace = document.getElementById("bridge-workspace-path");
   const workspacePath = workspace ? workspace.value.trim() : (state.bounded_executor_workspace || "");
 
-  const btn = (id, label, cls) =>
-    `<button type="button" id="${id}" class="${cls || ""}">${escapeHtml(label)}</button>`;
+  const btn = (id, label, cls, opts) => {
+    const o = opts || {};
+    const attrs = `${o.disabled ? " disabled" : ""}${o.title ? ` title="${escapeHtml(o.title)}"` : ""}`;
+    return `<button type="button" id="${id}" class="${cls || ""}"${attrs}>${escapeHtml(label)}</button>`;
+  };
+
+  // Start is gated on the workspace-first control: target workspace safe AND
+  // the selected backend available. The server re-checks both; this only keeps
+  // the button from launching a run that would immediately block.
+  const selBackend = (control.backends || []).find((b) => b.backend_id === selectedBackendId()) || {};
+  const selBackendAvailable = Boolean((selBackend.availability || {}).available);
+  const startBlockingReasons = [...(control.start_blocking_reasons || [])];
+  if (!selBackendAvailable) startBlockingReasons.push("Selected agent backend is not available or configured.");
+  const canStart = startBlockingReasons.length === 0;
 
   let primary = "";
   const primaryAction = ha.primary_button || "start";
   if (primaryAction === "start") {
-    primary = btn("btn-ha-start", "Start high-autonomy run");
+    primary = btn("btn-ha-start", "Start high-autonomy run", "", {
+      disabled: !canStart,
+      title: canStart ? "" : startBlockingReasons.join(" · "),
+    });
   } else if (primaryAction === "pause") {
     primary = btn("btn-ha-pause", "Pause", "secondary") + btn("btn-ha-stop", "Stop", "secondary");
   } else if (primaryAction === "resume") {
@@ -2361,6 +2525,48 @@ document.getElementById("bridge-workspace-path").addEventListener("blur", () => 
   checkBridgeWorkspace();
 });
 
+// Top-level (workspace-first) target workspace input: checking it also persists
+// the session's bounded-executor workspace via the same read-only check.
+let haTargetWorkspaceCheckTimer = null;
+
+async function checkHaTargetWorkspace() {
+  const workspacePath = haTargetWorkspacePath();
+  if (!workspacePath) {
+    if (lastState) renderWorkspaceFirst(lastState);
+    return;
+  }
+  try {
+    const result = await apiPost("/api/session/run_loop/bridge/check_workspace", { workspace_path: workspacePath });
+    if (result.workspace_exists) {
+      const state = await apiGet("/api/session");
+      render(state);
+    } else if (lastState) {
+      renderWorkspaceFirst(lastState);
+    }
+  } catch (err) {
+    showError("Could not check target workspace: " + err.message);
+  }
+}
+
+const haTargetInput = document.getElementById("ha-target-workspace");
+if (haTargetInput) {
+  haTargetInput.addEventListener("input", () => {
+    clearTimeout(haTargetWorkspaceCheckTimer);
+    haTargetWorkspaceCheckTimer = setTimeout(checkHaTargetWorkspace, 400);
+  });
+  haTargetInput.addEventListener("blur", () => {
+    clearTimeout(haTargetWorkspaceCheckTimer);
+    checkHaTargetWorkspace();
+  });
+}
+
+const haBackendSelect = document.getElementById("ha-backend-select");
+if (haBackendSelect) {
+  haBackendSelect.addEventListener("change", () => {
+    if (lastState) renderWorkspaceFirst(lastState);
+  });
+}
+
 document.getElementById("btn-bridge-write-instruction").addEventListener("click", async () => {
   if (lastState && lastState.can_write_instruction === false) {
     showError("Submit a goal to Admissible before writing the instruction file.");
@@ -2521,15 +2727,24 @@ document.querySelectorAll("#queue-tabs .tab-btn").forEach((btn) => {
 document.getElementById("high-autonomy-actions").addEventListener("click", async (event) => {
   const target = event.target;
   if (!(target instanceof HTMLElement)) return;
-  const workspaceInput = document.getElementById("bridge-workspace-path");
-  const workspacePath = workspaceInput ? workspaceInput.value.trim() : "";
+  const workspacePath = haTargetWorkspacePath();
   if (target.id === "btn-ha-start") {
     if (!workspacePath) {
-      showError("Enter a workspace path in the Cursor bridge section (Advanced) before starting.");
+      showError("Enter a target workspace path in the high-autonomy panel before starting.");
       return;
     }
+    const control = (lastState && lastState.agent_backend_control) || {};
+    if (control.start_blocking_reasons && control.start_blocking_reasons.length) {
+      showError("Cannot start: " + control.start_blocking_reasons.join(" · "));
+      return;
+    }
+    const backendId = selectedBackendId();
     await runAction(() =>
-      apiPost("/api/session/high_autonomy/start", { workspace_path: workspacePath, max_turns: 12 })
+      apiPost("/api/session/high_autonomy/start", {
+        workspace_path: workspacePath,
+        backend_id: backendId,
+        max_turns: 12,
+      })
     );
     return;
   }

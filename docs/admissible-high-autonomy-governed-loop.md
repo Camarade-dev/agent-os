@@ -193,6 +193,20 @@ using fixture transport. Remaining gap for a true live Cursor high-autonomy run:
 The controller, policy, transport, tests, and UI are in place for that live rehearsal
 once Cursor is pointed at the workspace.
 
+## Update — model-agnostic agent transport (slice ADMISSIBLE_RUN_032)
+
+The `AgentTransport` above is the **pull / external** shape: write an instruction, then poll
+for a response file that a human-driven editor produces. That is semi-autonomous. A later
+slice adds a **model-agnostic `AgentBackend`** callable shape so the same tick loop can
+*invoke* an agent backend directly (Cursor CLI first; fixture backend in tests), with the
+agent confined to an isolated agent workspace and no direct write authority over the target
+workspace. See [the model-agnostic agent transport doc](admissible-model-agnostic-agent-transport.md).
+
+The auto-execution described here is unchanged, but the truthful framing is: Admissible has
+**no arbitrary executor** and runs no shell/npm/network/deploy — **only admitted low-risk
+local writes may be auto-executed** in high-autonomy mode, and **human-critical actions still
+stop**.
+
 ## Tests
 
 - `tests/test_admissible_high_autonomy_governed_loop.py` — deterministic four-turn flow
@@ -202,3 +216,5 @@ once Cursor is pointed at the workspace.
 - `tests/test_admissible_high_autonomy_human_required_recovery.py` — human-critical refusal
   recovery: refusal clears all open actions, exits `human_required`, writes a local-only
   recovery instruction, and approval records intent without inventing an executor.
+- `tests/test_admissible_model_agnostic_agent_transport.py` — the callable `AgentBackend`
+  loop (Cursor CLI + fixture backend) and target/agent workspace separation.
