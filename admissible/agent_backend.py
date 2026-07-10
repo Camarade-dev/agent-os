@@ -181,8 +181,62 @@ _UNSAFE_CURSOR_FLAGS = ("--force", "--yolo")
 
 # Generic prompt-argument backends may use this threshold to avoid oversized
 # command lines. Cursor Agent does not use the threshold: its stable contract is
-# always a short file-pointer adapter prompt.
+# always a single-line file-pointer adapter argv element.
 PROMPT_ARG_MAX_CHARS = 6000
+
+# Characters that must never appear in the Cursor Agent ``{prompt}`` adapter.
+# Windows resolves ``cursor-agent`` to ``cursor-agent.CMD``, which forwards through
+# PowerShell ``-File`` and ``node.exe index.js $args`` — multiline argv values are
+# split or dropped at that boundary, producing exit 0 with empty stdout.
+_CURSOR_AGENT_ADAPTER_FORBIDDEN_CHARS = ("\r", "\n", "\x00", "\t")
+
+
+def build_cursor_agent_file_pointer_adapter(instruction_file: Path) -> str:
+    """Build the single-line Cursor Agent file-pointer ``{prompt}`` adapter."""
+    path = str(instruction_file.resolve())
+    return (
+        f'Read the complete governed instruction from the file at "{path}". '
+        "Return the complete proposed response directly to stdout. "
+        "Do not write or modify any file. "
+        "Do not write .admissible/agent-response.md. "
+        "Include all requested ADMISSIBLE_STRUCTURED_OPERATION blocks directly in stdout. "
+        "Follow the response format in the instruction file."
+    )
+
+
+def validate_cursor_agent_file_pointer_adapter(adapter: str) -> str | None:
+    """Return a configuration error when the adapter violates the single-line contract."""
+    for char in _CURSOR_AGENT_ADAPTER_FORBIDDEN_CHARS:
+        if char in adapter:
+            label = {"\r": "CR", "\n": "LF", "\x00": "NUL", "\t": "TAB"}[char]
+            return (
+                "Cursor Agent file-pointer adapter must be exactly one argv line "
+                f"without {label}; refusing to invoke."
+            )
+    line_count = len(adapter.splitlines()) if adapter else 0
+    if line_count != 1:
+        return (
+            "Cursor Agent file-pointer adapter must be exactly one argv line "
+            f"(got {line_count}); refusing to invoke."
+        )
+    return None
+
+
+def cursor_agent_adapter_diagnostics(adapter: str) -> dict[str, Any]:
+    """Safe diagnostics for a Cursor Agent file-pointer adapter (no secrets)."""
+    contains_crlf = any(ch in adapter for ch in ("\r", "\n"))
+    if not adapter:
+        line_count = 0
+    elif contains_crlf:
+        line_count = len(adapter.splitlines())
+    else:
+        line_count = 1
+    return {
+        "adapter_prompt_length": len(adapter),
+        "adapter_line_count": line_count,
+        "adapter_contains_crlf": contains_crlf,
+        "adapter_sha256": _sha256_text(adapter) if adapter else None,
+    }
 
 # Environment variables passed through to a spawned Cursor CLI. Deliberately a
 # small OS-essential allowlist so provider keys and unrelated secrets in the
@@ -307,6 +361,9 @@ class AgentInvocationResult:
     instruction_file_path: str | None = None
     instruction_sha256: str | None = None
     adapter_prompt_length: int | None = None
+    adapter_line_count: int | None = None
+    adapter_contains_crlf: bool | None = None
+    adapter_sha256: str | None = None
     full_instruction_length: int | None = None
     stdout_length: int | None = None
     invocation_duration_ms: float | None = None
@@ -345,6 +402,9 @@ class AgentInvocationResult:
             "instruction_file_path": self.instruction_file_path,
             "instruction_sha256": self.instruction_sha256,
             "adapter_prompt_length": self.adapter_prompt_length,
+            "adapter_line_count": self.adapter_line_count,
+            "adapter_contains_crlf": self.adapter_contains_crlf,
+            "adapter_sha256": self.adapter_sha256,
             "full_instruction_length": self.full_instruction_length,
             "stdout_length": self.stdout_length,
             "invocation_duration_ms": self.invocation_duration_ms,
@@ -436,6 +496,9 @@ class AgentInvocationRecord:
     instruction_file_path: str | None = None
     instruction_sha256: str | None = None
     adapter_prompt_length: int | None = None
+    adapter_line_count: int | None = None
+    adapter_contains_crlf: bool | None = None
+    adapter_sha256: str | None = None
     full_instruction_length: int | None = None
     stdout_length: int | None = None
     invocation_duration_ms: float | None = None
@@ -468,6 +531,9 @@ class AgentInvocationRecord:
             "instruction_file_path": self.instruction_file_path,
             "instruction_sha256": self.instruction_sha256,
             "adapter_prompt_length": self.adapter_prompt_length,
+            "adapter_line_count": self.adapter_line_count,
+            "adapter_contains_crlf": self.adapter_contains_crlf,
+            "adapter_sha256": self.adapter_sha256,
             "full_instruction_length": self.full_instruction_length,
             "stdout_length": self.stdout_length,
             "invocation_duration_ms": self.invocation_duration_ms,
@@ -535,6 +601,9 @@ def build_invocation_record(
         instruction_file_path=result.instruction_file_path,
         instruction_sha256=result.instruction_sha256,
         adapter_prompt_length=result.adapter_prompt_length,
+        adapter_line_count=result.adapter_line_count,
+        adapter_contains_crlf=result.adapter_contains_crlf,
+        adapter_sha256=result.adapter_sha256,
         full_instruction_length=result.full_instruction_length,
         stdout_length=result.stdout_length,
         invocation_duration_ms=result.invocation_duration_ms,
@@ -928,7 +997,7 @@ class CursorCliConfig:
         output_mode = (env.get(CURSOR_CLI_OUTPUT_MODE_ENV) or OUTPUT_MODE_STDOUT).strip()
         if output_mode not in (OUTPUT_MODE_STDOUT, OUTPUT_MODE_RESPONSE_FILE):
             output_mode = OUTPUT_MODE_STDOUT
-        # Cursor Agent's verified live contract is a short positional adapter
+        # Cursor Agent's verified live contract is a single-line positional adapter
         # that points at the governed instruction file, with stdout as the only
         # response channel. Operator settings cannot downgrade this preset to a
         # raw positional prompt or response-file write.
@@ -1403,15 +1472,13 @@ class CursorCliAgentBackend(AgentBackend):
         """Return the ``{prompt}`` value and its diagnostic transport mode."""
         text = request.instruction_text
         if self.config.is_cursor_agent or self.config.input_mode == INPUT_MODE_FILE_POINTER_ALWAYS:
-            adapter = (
-                "Read the complete governed instruction from this file:\n\n"
-                f"{instruction_file}\n\n"
-                "Return your complete proposed response directly to stdout.\n\n"
-                "Do not write or modify any file.\n"
-                "Do not write .admissible/agent-response.md.\n"
-                "Include all requested ADMISSIBLE_STRUCTURED_OPERATION blocks directly in stdout.\n"
-                "Follow the response format in the instruction file."
-            )
+            if self.config.is_cursor_agent:
+                adapter = build_cursor_agent_file_pointer_adapter(instruction_file)
+            else:
+                adapter = (
+                    f"Read the instruction file at {instruction_file} and output only the Admissible "
+                    "structured response. Do not modify any files; propose only."
+                )
             return adapter, PROMPT_MODE_FILE_POINTER
         if len(text) <= PROMPT_ARG_MAX_CHARS:
             return text, PROMPT_MODE_INLINE
@@ -1500,6 +1567,11 @@ class CursorCliAgentBackend(AgentBackend):
             request, instruction_file=instruction_file
         )
         instruction_sha256 = _sha256_text(request.instruction_text)
+        adapter_diag = (
+            cursor_agent_adapter_diagnostics(prompt_value)
+            if self.config.is_cursor_agent and prompt_mode == PROMPT_MODE_FILE_POINTER
+            else {}
+        )
 
         safe_env, env_diag = build_cursor_agent_safe_environment(self._env_base)
         env_fields = {
@@ -1522,8 +1594,13 @@ class CursorCliAgentBackend(AgentBackend):
                 "instruction_file_path": str(instruction_file),
                 "instruction_sha256": instruction_sha256,
                 "adapter_prompt_length": (
-                    len(prompt_value) if prompt_mode == PROMPT_MODE_FILE_POINTER else 0
+                    adapter_diag.get("adapter_prompt_length")
+                    if adapter_diag
+                    else (len(prompt_value) if prompt_mode == PROMPT_MODE_FILE_POINTER else 0)
                 ),
+                "adapter_line_count": adapter_diag.get("adapter_line_count"),
+                "adapter_contains_crlf": adapter_diag.get("adapter_contains_crlf"),
+                "adapter_sha256": adapter_diag.get("adapter_sha256"),
                 "full_instruction_length": len(request.instruction_text),
                 "stdout_length": len(stdout),
                 "invocation_duration_ms": duration_ms(),
@@ -1531,6 +1608,25 @@ class CursorCliAgentBackend(AgentBackend):
             base.update(env_fields)
             base.update(extra)
             return base
+
+        if self.config.is_cursor_agent and prompt_mode == PROMPT_MODE_FILE_POINTER:
+            adapter_error = validate_cursor_agent_file_pointer_adapter(prompt_value)
+            if adapter_error:
+                self._last_status = AGENT_INVOKE_BLOCKED_BY_CONFIGURATION
+                result = AgentInvocationResult(
+                    status=AGENT_INVOKE_BLOCKED_BY_CONFIGURATION,
+                    model_label=self.config.model_label,
+                    transport_label=self.backend_id,
+                    started_at=started,
+                    completed_at=_now_iso(),
+                    error_message=adapter_error,
+                    full_instruction_length=len(request.instruction_text),
+                    invocation_duration_ms=duration_ms(),
+                    **adapter_diag,
+                    **env_fields,
+                )
+                self._last_result = result
+                return result
 
         argv = self._build_argv(
             request,
@@ -2144,6 +2240,9 @@ __all__ = [
     "ensure_agent_workspace",
     "looks_like_agent_os_repo",
     "describe_available_backends",
+    "build_cursor_agent_file_pointer_adapter",
+    "validate_cursor_agent_file_pointer_adapter",
+    "cursor_agent_adapter_diagnostics",
     "build_cursor_agent_safe_environment",
     "probe_cursor_agent_cli_environment",
     "_sanitized_env",

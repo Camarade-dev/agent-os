@@ -91,10 +91,11 @@ Safe preset (`cursor_agent_cli_preset_env()` / `CursorCliConfig.cursor_agent_pre
 - command: `cursor-agent`
 - args: `--print --output-format text --mode plan --workspace {agent_workspace} --trust {prompt}`
 - input mode: `file_pointer_always`. The complete governed instruction is always written to
-  `<agent_workspace>/.admissible/next-agent-instruction.md`. `{prompt}` is always one short
-  adapter argv element containing the absolute instruction path. It requires the complete
-  proposal on stdout, forbids all file writes (including `.admissible/agent-response.md`),
-  and requires every `ADMISSIBLE_STRUCTURED_OPERATION` block directly on stdout.
+  `<agent_workspace>/.admissible/next-agent-instruction.md`. `{prompt}` is always **one
+  single-line** adapter argv element containing the absolute instruction path. It requires the
+  complete proposal on stdout, forbids all file writes (including `.admissible/agent-response.md`),
+  and requires every `ADMISSIBLE_STRUCTURED_OPERATION` block directly on stdout. The adapter must
+  contain no CR, LF, TAB, or NUL — multiline adapters are rejected before invocation.
 - Cursor Agent does **not** use `PROMPT_ARG_MAX_CHARS`. Medium and long instructions follow
   the same pointer contract. Threshold-based inline support remains available only to generic
   headless backends.
@@ -137,8 +138,9 @@ Live evidence showed that Admissible's earlier minimal allowlist omitted Windows
 variables (`SystemDrive`, `APPDATA`, `LOCALAPPDATA`, `ProgramData`, …). When Cursor Agent
 inherited that sanitized environment, nested references such as
 `%SystemDrive%\ProgramData\Microsoft\Windows\Caches` were **not expanded**, producing invalid
-literal paths and empty stdout even though the same command succeeded from PowerShell with
-the normal inherited environment.
+literal paths. That was a real Windows hardening defect and is fixed below — but subsequent
+live A/B evidence (slice `ADMISSIBLE_RUN_037`) showed it was **not** the sole cause of empty
+stdout when the governed instruction file itself was valid.
 
 `build_cursor_agent_safe_environment()` now:
 
@@ -157,10 +159,36 @@ the normal inherited environment.
 env and `cwd` as a real invocation (`shell=False`, no model call). Use it for operator smoke
 tests and unit diagnostics — it is not run automatically on every tick.
 
-Why manual PowerShell worked but Admissible did not: PowerShell inherits the full Windows
-profile environment; Admissible deliberately strips secrets and only forwards the allowlist.
-Without `SystemDrive` / profile paths present and expanded, Cursor Agent could not resolve
-its local profile/cache locations.
+Why manual PowerShell worked but Admissible did not (environment slice): PowerShell inherits
+the full Windows profile environment; Admissible deliberately strips secrets and only forwards
+the allowlist. Without `SystemDrive` / profile paths present and expanded, Cursor Agent could not
+resolve its local profile/cache locations.
+
+### Single-line Cursor Agent file-pointer adapter (slice ADMISSIBLE_RUN_037)
+
+Further live A/B evidence on Windows isolated the remaining empty-stdout failure:
+
+1. Python resolves `cursor-agent` to `cursor-agent.CMD`.
+2. The wrapper chain is `cursor-agent.cmd` → `powershell.exe -NoProfile -ExecutionPolicy Bypass -File cursor-agent.ps1 %*` → `node.exe index.js $args`.
+3. Through that exact `.CMD`, a short inline smoke prompt succeeds; a **strictly one-line**
+   file-pointer adapter succeeds and returns a complete structured proposal; Admissible's
+   earlier **multiline** file-pointer adapter returned exit code 0, empty stderr, and stdout
+   containing only a newline — even when the instruction file was valid and readable.
+
+The final root cause is **command-line argument serialization** of a multiline `{prompt}` adapter
+across the `.cmd → PowerShell -File → Node` forwarding boundary. Direct Node invocation is **not**
+required: the current `.CMD` works when `{prompt}` is one argv line.
+
+Contract:
+
+- `{prompt}` is built by `build_cursor_agent_file_pointer_adapter()` as fixed application text
+  plus the absolute instruction path in double quotes — no heredoc, no embedded governed
+  instruction body.
+- `validate_cursor_agent_file_pointer_adapter()` blocks invocation when the adapter contains
+  CR, LF, TAB, or NUL, or when `adapter_line_count != 1`.
+- Durable diagnostics persist `adapter_prompt_length`, `adapter_line_count` (expected `1`),
+  `adapter_contains_crlf` (expected `false`), and `adapter_sha256` — never secrets or the full
+  environment.
 
 ### Safe configuration ladder
 
@@ -187,8 +215,8 @@ subprocess.run(argv, shell=False, timeout=..., cwd=agent_workspace_path,
 - `timeout` enforced; timeouts are reported as `timeout`, not raised.
 - stdout/stderr capped to `max_output_bytes`.
 - Durable diagnostics record `prompt_mode=file_pointer`, the absolute instruction path,
-  instruction sha256, adapter/full-instruction/stdout lengths, exit code, and invocation
-  duration.
+  instruction sha256, adapter/full-instruction/stdout lengths, adapter line count,
+  `adapter_contains_crlf`, optional `adapter_sha256`, exit code, and invocation duration.
 - `cwd` is the **agent** workspace, never the target workspace — and the backend refuses to
   run when the agent workspace resolves to the target workspace.
 - Unit tests inject `runner` or patch `subprocess.run`; a real Cursor CLI is never spawned in
@@ -316,7 +344,8 @@ therefore file-pointer input plus stdout output.
 For a paused empty-stdout invocation, retry is operator-driven:
 
 1. Confirm the persisted invocation diagnostics show `prompt_mode=file_pointer`, the expected
-   instruction path/hash, exit code, stdout length, and duration.
+   instruction path/hash, `adapter_line_count=1`, `adapter_contains_crlf=false`, exit code,
+   stdout length, and duration.
 2. Confirm the safe preset still reports available and the instruction file contains the full
    governed packet.
 3. In the Control Surface, click **Resume**, then **Step once** (or re-enable auto-run). Resume
@@ -349,6 +378,9 @@ in tests and never invoke the real CLI/provider.
 - `tests/test_admissible_cursor_agent_file_pointer_contract.py` — medium/long stable pointer
   transport, paths with spaces as one argv element under `shell=False`, adapter write bans,
   persisted diagnostics, stdout ingest, and empty-stdout pause without automatic reinvocation.
+- `tests/test_admissible_cursor_agent_single_line_adapter.py` — single-line adapter generation,
+  forbidden-character rejection, one argv element with spaced paths, multiline adapter blocked
+  before subprocess, and adapter diagnostics persistence.
 - `tests/test_admissible_workspace_first_ui.py` — `agent_backend_control` state view, Start
   gating (missing target, agent-os repo target), top-level workspace/backend markup, and the
   truthful truth-boundary wording.
