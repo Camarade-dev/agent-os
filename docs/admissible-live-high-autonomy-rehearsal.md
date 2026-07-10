@@ -60,6 +60,15 @@ writing the response file. That is the only integration.
 > `invoking_agent` → `response_ready` → `ingesting_response` → `response_consumed` and never
 > "waiting for a response file"; only the file bridge waits on an external file. See
 > [the durable handoff section](admissible-model-agnostic-agent-transport.md#durable-callable-response-handoff-across-ticks-slice-admissible_run_034).
+>
+> **Update (slice ADMISSIBLE_RUN_035):** Cursor Agent now always receives a short adapter
+> prompt pointing to the absolute
+> `<agent_workspace>/.admissible/next-agent-instruction.md` path. The full governed packet is
+> never passed as a raw positional prompt, regardless of length. Cursor Agent must return the
+> complete proposal on stdout and must not write any file or
+> `.admissible/agent-response.md`. Empty stdout pauses with persisted path/hash/length/exit/
+> duration diagnostics and does not re-invoke on ordinary ticks. An operator may explicitly
+> retry with **Resume** then **Step once**.
 
 ## Automatic instruction dispatch (hardened file bridge)
 
@@ -125,6 +134,11 @@ passed) for the UI and tests — display-only, never an authority source.
 5. Watch the minimal panel. When it says *Waiting for Cursor response*, let Cursor write its
    reply; the next tick ingests and continues automatically.
 6. If it pauses for a human-critical action, review the reason and Approve / Refuse.
+
+For the callable Cursor Agent backend, steps 3 and 5 use the isolated agent workspace instead:
+Admissible writes the full instruction file there, invokes `cursor-agent` once with the short
+pointer adapter, persists stdout, and ingests that stdout on the next tick. No response file is
+used.
 
 ## What is still not implemented
 

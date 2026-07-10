@@ -37,6 +37,13 @@ dict, and every `PlanAudit` reason names the specific gap it found.
 | `recommended_autonomy_ceiling` | `L1_PROPOSE_ONLY`, `L2_LOCAL_BATCH_APPROVAL`, or `L3_LOCAL_AUTO_ADMIT_WITH_INTERRUPTS` -- **never `L4` in v0** |
 | `initial_non_execution_boundary` | a sentence naming exactly which side effects require explicit authorization first |
 | `signals` | per-field list of the keywords/heuristics that fired, for audit |
+| `explicit_architecture_choice` | explicit stack/plain-web authority, or `null` |
+| `explicit_dependency_preference` | `zero_dependencies`, or `null` when ambiguous |
+| `explicit_deployment_boundary` | `local_only_no_deploy`, or `null` when ambiguous |
+
+Imperative build/create/implement requests for application files are classified as
+`software_build` even when the requested product contains explanatory text. A genuine request
+to explain how something works, with no implementation directive, remains `explanation`.
 
 ### Worked example
 
@@ -54,13 +61,17 @@ global_complexity: medium            (7 listed features, offset by "simple"/"sma
 global_risk: medium                  (dependency-install language, mitigated by explicit local-only scope)
 likely_side_effect_classes: [file_create, file_edit, possible_dependency_install, possible_server_run]
 recommended_autonomy_ceiling: L2_LOCAL_BATCH_APPROVAL
-clarifying_questions: framework vs. no-framework/vanilla; local-only vs. eventual hosting
+clarifying_questions: architecture/framework choice; dependencies allowed vs. zero dependencies
 ```
 
 Note `possible_deploy` and `possible_destructive_file_op` are correctly
 **absent**: the prompt explicitly negates deploy ("do not deploy"), and
 delete language attached to a brand-new project isn't a plausible side
 effect (there is nothing pre-existing to delete yet).
+
+The explicit `local-only` / `do not deploy` language also resolves the plan's deployment
+boundary. It is preserved as a non-gated local-only step rather than being turned into a
+redundant human confirmation.
 
 ## Plan generation v0
 
@@ -75,7 +86,8 @@ is inserted when `possible_dependency_install` is a likely side effect):
 5. `implement_core_behavior`
 6. `verify_locally`
 7. `assess_production_readiness`
-8. `deployment_gate` ("do not deploy unless authorized") -- always gated
+8. `deployment_gate` -- gated when deployment authority is ambiguous; non-gated when the user
+   explicitly requires local-only/no-deploy behavior
 
 This function only **proposes**. It never judges whether its own output
 is acceptable.
@@ -95,7 +107,8 @@ that can't happen.
    `medium`/`high`?
 2. Is dependency/install language gated when dependency installation is a
    likely side effect?
-3. Is there a gated deployment/publish/push boundary at all?
+3. Is there either an explicit local-only/no-deploy boundary or a gated
+   deployment/publish/push boundary?
 4. Does a local-verification step exist?
 5. Does unresolved `missing_context` from goal intake still require
    clarification?
@@ -112,6 +125,21 @@ style as `admissible.decision.resolve_precedence`:
 
 `PlanAudit.required_gates` lists the `step_id`s of every gated step found,
 so the UI can point directly at what needs a human decision.
+
+## Explicit goal authority is not auto-approval
+
+The user's explicit constraints close only their matching decision gates:
+
+- plain HTML/CSS/JavaScript, vanilla, or no framework resolves architecture;
+- zero/no dependencies, no npm, or no package manager resolves dependency preference;
+- local-only or explicit no deploy/publish/host/push resolves the deployment boundary.
+
+This is interpretation of authority already present in the goal, not approval of a new side
+effect. Actual dependency installation, network, shell, deployment, or out-of-scope proposals
+still enter the unchanged admission policy and can require human approval or be refused.
+Ambiguous wording still produces the corresponding gates and clarifying questions. A fully
+explicit local build receives `PLAN_OK_FOR_LOCAL_PROTOTYPE`, no redundant gate-confirmation
+request, and a first instruction asking for the next smallest structured local file proposal.
 
 ## Module entry points
 

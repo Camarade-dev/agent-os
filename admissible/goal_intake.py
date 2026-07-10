@@ -71,6 +71,8 @@ _NEW_PROJECT_WORDS = ("new", "from scratch", "greenfield", "build a", "create a"
 _EXPLICIT_STACK_WORDS = (
     "react", "vue", "angular", "svelte", "phaser", "vanilla", "no framework",
     "plain javascript", "plain js", "using django", "using flask", "using express",
+    "plain html/css/javascript", "plain html, css, and javascript",
+    "plain html, css and javascript", "html/css/javascript only",
     "next.js", "nextjs", "typescript", "using canvas api",
 )
 
@@ -91,7 +93,17 @@ _LOW_RISK_SCOPE_WORDS = ("local-only", "local only", "no deployment", "offline")
 _DEPENDENCY_WORDS = (
     "install", "dependency", "dependencies", "npm", "pip", "package", "library", "framework",
 )
-_NO_DEPENDENCY_WORDS = ("no dependencies", "dependency-free", "vanilla js only", "without any dependencies")
+_NO_DEPENDENCY_WORDS = (
+    "no dependencies", "zero dependencies", "dependency-free", "vanilla js only",
+    "without any dependencies", "without dependencies", "no npm", "no package manager",
+    "do not use npm", "do not use a package manager",
+)
+_LOCAL_ONLY_BOUNDARY_WORDS = ("local-only", "local only", "strictly local")
+_NO_DEPLOY_BOUNDARY_WORDS = (
+    "do not deploy", "don't deploy", "never deploy", "no deploy", "no deployment",
+    "do not publish", "don't publish", "no publishing", "do not host", "don't host",
+    "no hosting", "do not push", "don't push", "no push",
+)
 _SERVER_WORDS = ("server", "backend", "api")
 _BROWSER_WORDS = ("browser", "web-based", "web based", "website", "webpage", "web page")
 _NETWORK_WORDS = ("api", "network", "online", "fetch data", "backend service", "multiplayer")
@@ -116,6 +128,9 @@ class GoalIntake:
     recommended_autonomy_ceiling: str
     initial_non_execution_boundary: str
     signals: dict[str, list[str]] = field(default_factory=dict)
+    explicit_architecture_choice: str | None = None
+    explicit_dependency_preference: str | None = None
+    explicit_deployment_boundary: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -127,6 +142,35 @@ def _lower(text: str) -> str:
 
 def _find_matches(text_lower: str, words: tuple[str, ...]) -> list[str]:
     return [w for w in words if w in text_lower]
+
+
+def _find_explicit_matches(text_lower: str, words: tuple[str, ...]) -> list[str]:
+    """Match authority phrases only when their sentence is not hedged."""
+    hedges = (
+        "maybe", "perhaps", "possibly", "if possible", "prefer", "preferably",
+        "could", "might", "consider", "open to", "not sure", "unless needed",
+        "unless necessary",
+    )
+    matches: list[str] = []
+    for word in words:
+        index = text_lower.find(word)
+        if index < 0:
+            continue
+        sentence_start = max(
+            text_lower.rfind(".", 0, index),
+            text_lower.rfind("!", 0, index),
+            text_lower.rfind("?", 0, index),
+            text_lower.rfind("\n", 0, index),
+        ) + 1
+        ends = [
+            pos for marker in (".", "!", "?", "\n")
+            if (pos := text_lower.find(marker, index + len(word))) >= 0
+        ]
+        sentence_end = min(ends) + 1 if ends else len(text_lower)
+        sentence = text_lower[sentence_start:sentence_end]
+        if not any(hedge in sentence for hedge in hedges) and "?" not in sentence:
+            matches.append(word)
+    return matches
 
 
 def _is_negated(text_lower: str, word: str) -> bool:
@@ -155,13 +199,23 @@ def _detect_task_type(text_lower: str, signals: dict[str, list[str]]) -> str:
         signals["task_type"] = refactor_hits
         return "refactor"
 
+    deploy_hits = [w for w in _DEPLOY_WORDS if w in text_lower and not _is_negated(text_lower, w)]
+    build_hits = _find_matches(text_lower, _BUILD_VERBS)
     explain_hits = _find_matches(text_lower, _EXPLAIN_WORDS)
+    build_directive = re.search(
+        r"(?:^|[.!?\n]\s*|[-*]\s+)(?:please\s+)?"
+        r"(?:build|create|implement|write|make|develop|design)\b",
+        text_lower,
+    ) or re.search(r"\b(?:please\s+|want\s+you\s+|task\s+is\s+to\s+)"
+                    r"(?:build|create|implement|write|make|develop|design)\b", text_lower)
+    if build_hits and (not explain_hits or build_directive):
+        signals["task_type"] = build_hits
+        return "software_build"
+
     if explain_hits:
         signals["task_type"] = explain_hits
         return "explanation"
 
-    deploy_hits = [w for w in _DEPLOY_WORDS if w in text_lower and not _is_negated(text_lower, w)]
-    build_hits = _find_matches(text_lower, _BUILD_VERBS)
     if deploy_hits and not build_hits:
         signals["task_type"] = deploy_hits
         return "deployment"
@@ -215,7 +269,7 @@ def _detect_architecture_choice_burden(
         signals["architecture_choice_burden"] = []
         return "low"
 
-    explicit_stack = _find_matches(text_lower, _EXPLICIT_STACK_WORDS)
+    explicit_stack = _find_explicit_matches(text_lower, _EXPLICIT_STACK_WORDS)
     if explicit_stack:
         signals["architecture_choice_burden"] = explicit_stack
         return "low"
@@ -232,6 +286,24 @@ def _detect_architecture_choice_burden(
 
     signals["architecture_choice_burden"] = []
     return "low"
+
+
+def _detect_explicit_goal_constraints(
+    text_lower: str, signals: dict[str, list[str]]
+) -> tuple[str | None, str | None, str | None]:
+    architecture_hits = _find_explicit_matches(text_lower, _EXPLICIT_STACK_WORDS)
+    dependency_hits = _find_explicit_matches(text_lower, _NO_DEPENDENCY_WORDS)
+    local_hits = _find_explicit_matches(text_lower, _LOCAL_ONLY_BOUNDARY_WORDS)
+    no_deploy_hits = _find_explicit_matches(text_lower, _NO_DEPLOY_BOUNDARY_WORDS)
+
+    signals["explicit_architecture_choice"] = architecture_hits
+    signals["explicit_dependency_preference"] = dependency_hits
+    signals["explicit_deployment_boundary"] = local_hits + no_deploy_hits
+
+    architecture = "explicit_stack_or_plain_web" if architecture_hits else None
+    dependencies = "zero_dependencies" if dependency_hits else None
+    deployment = "local_only_no_deploy" if local_hits or no_deploy_hits else None
+    return architecture, dependencies, deployment
 
 
 def _count_features(text_lower: str) -> int:
@@ -289,6 +361,7 @@ def _detect_side_effects(
     task_type: str,
     project_maturity: str,
     architecture_choice_burden: str,
+    explicit_dependency_preference: str | None,
     signals: dict[str, list[str]],
 ) -> list[str]:
     effects: set[str] = set()
@@ -304,9 +377,9 @@ def _detect_side_effects(
 
     no_dep_hits = [w for w in _NO_DEPENDENCY_WORDS if w in text_lower]
     dep_hits = [w for w in _DEPENDENCY_WORDS if w in text_lower and not _is_negated(text_lower, w)]
-    if no_dep_hits:
+    if explicit_dependency_preference == "zero_dependencies":
         notes.append(f"dependency-free requested: {no_dep_hits}")
-    elif dep_hits or architecture_choice_burden != "low":
+    elif dep_hits or architecture_choice_burden != "low" or task_type == "software_build":
         effects.add("possible_dependency_install")
         notes.append(f"dependency signals: {dep_hits or ['ambiguous architecture']}")
 
@@ -340,16 +413,26 @@ def _missing_context_and_questions(
     project_maturity: str,
     architecture_choice_burden: str,
     deliverable: str,
+    explicit_dependency_preference: str | None,
+    explicit_deployment_boundary: str | None,
 ) -> tuple[list[str], list[str]]:
     missing: list[str] = []
     questions: list[str] = []
 
     if task_type == "software_build" and architecture_choice_burden in ("medium", "high"):
-        missing.append("dependency preference (framework vs. no framework / vanilla)")
+        missing.append("architecture/framework choice")
         questions.append(
             "Should this use a specific framework/library, or a plain/vanilla "
-            "implementation with no dependencies?"
+            "implementation?"
         )
+
+    if task_type == "software_build" and explicit_dependency_preference is None:
+        missing.append("dependency preference (dependencies allowed vs. zero dependencies)")
+        questions.append(
+            "May this use dependencies, or must it use zero dependencies and no package manager?"
+        )
+
+    if task_type == "software_build" and explicit_deployment_boundary is None:
         missing.append("deployment boundary (confirm local-only vs. eventual hosting)")
         questions.append(
             "Should this remain strictly local-only, or is any future hosting/"
@@ -419,13 +502,28 @@ def analyze_goal(prompt: str) -> GoalIntake:
     deliverable = _detect_deliverable(text_lower, signals)
     project_maturity = _detect_project_maturity(text_lower, signals)
     architecture_choice_burden = _detect_architecture_choice_burden(text_lower, task_type, signals)
+    (
+        explicit_architecture_choice,
+        explicit_dependency_preference,
+        explicit_deployment_boundary,
+    ) = _detect_explicit_goal_constraints(text_lower, signals)
     global_complexity = _detect_complexity(text_lower, task_type, signals)
     global_risk, risk_scope = _detect_risk(text_lower, signals)
     likely_side_effect_classes = _detect_side_effects(
-        text_lower, task_type, project_maturity, architecture_choice_burden, signals
+        text_lower,
+        task_type,
+        project_maturity,
+        architecture_choice_burden,
+        explicit_dependency_preference,
+        signals,
     )
     missing_context, clarifying_questions = _missing_context_and_questions(
-        task_type, project_maturity, architecture_choice_burden, deliverable
+        task_type,
+        project_maturity,
+        architecture_choice_burden,
+        deliverable,
+        explicit_dependency_preference,
+        explicit_deployment_boundary,
     )
     recommended_autonomy_ceiling = _recommend_autonomy_ceiling(
         global_risk, architecture_choice_burden, global_complexity, project_maturity
@@ -447,4 +545,7 @@ def analyze_goal(prompt: str) -> GoalIntake:
         recommended_autonomy_ceiling=recommended_autonomy_ceiling,
         initial_non_execution_boundary=initial_non_execution_boundary,
         signals=signals,
+        explicit_architecture_choice=explicit_architecture_choice,
+        explicit_dependency_preference=explicit_dependency_preference,
+        explicit_deployment_boundary=explicit_deployment_boundary,
     )

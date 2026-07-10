@@ -47,6 +47,7 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -125,8 +126,12 @@ CURSOR_CLI_MODEL_LABEL_ENV = "ADMISSIBLE_CURSOR_CLI_MODEL_LABEL"
 INPUT_MODE_INSTRUCTION_FILE = "instruction_file"
 INPUT_MODE_STDIN = "stdin"
 INPUT_MODE_PROMPT_ARG = "prompt_arg"
+INPUT_MODE_FILE_POINTER_ALWAYS = "file_pointer_always"
 OUTPUT_MODE_STDOUT = "stdout"
 OUTPUT_MODE_RESPONSE_FILE = "response_file"
+
+PROMPT_MODE_INLINE = "inline"
+PROMPT_MODE_FILE_POINTER = "file_pointer"
 
 # Placeholders the operator may reference in the argv template. Substituted with
 # absolute paths that always live inside the *agent* workspace, or (for
@@ -171,9 +176,9 @@ _CURSOR_IDE_COMMAND_NAMES = frozenset({"cursor", "cursor.exe", "cursor.cmd"})
 # unsupervised write/execute authority or disable sandboxing.
 _UNSAFE_CURSOR_FLAGS = ("--force", "--yolo")
 
-# When the instruction text exceeds this, the ``{prompt}`` substitution writes it
-# to an agent-workspace file and passes a short pointer prompt instead, so the
-# argv stays well within the Windows command-line length limit.
+# Generic prompt-argument backends may use this threshold to avoid oversized
+# command lines. Cursor Agent does not use the threshold: its stable contract is
+# always a short file-pointer adapter prompt.
 PROMPT_ARG_MAX_CHARS = 6000
 
 # Environment variables passed through to a spawned Cursor CLI. Deliberately a
@@ -260,6 +265,13 @@ class AgentInvocationResult:
     started_at: str | None = None
     completed_at: str | None = None
     error_message: str | None = None
+    prompt_mode: str | None = None
+    instruction_file_path: str | None = None
+    instruction_sha256: str | None = None
+    adapter_prompt_length: int | None = None
+    full_instruction_length: int | None = None
+    stdout_length: int | None = None
+    invocation_duration_ms: float | None = None
 
     @property
     def ok(self) -> bool:
@@ -284,6 +296,13 @@ class AgentInvocationResult:
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "error_message": self.error_message,
+            "prompt_mode": self.prompt_mode,
+            "instruction_file_path": self.instruction_file_path,
+            "instruction_sha256": self.instruction_sha256,
+            "adapter_prompt_length": self.adapter_prompt_length,
+            "full_instruction_length": self.full_instruction_length,
+            "stdout_length": self.stdout_length,
+            "invocation_duration_ms": self.invocation_duration_ms,
         }
 
 
@@ -351,6 +370,13 @@ class AgentInvocationRecord:
     started_at: str | None = None
     completed_at: str | None = None
     consumed_at: str | None = None
+    prompt_mode: str | None = None
+    instruction_file_path: str | None = None
+    instruction_sha256: str | None = None
+    adapter_prompt_length: int | None = None
+    full_instruction_length: int | None = None
+    stdout_length: int | None = None
+    invocation_duration_ms: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -369,6 +395,13 @@ class AgentInvocationRecord:
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "consumed_at": self.consumed_at,
+            "prompt_mode": self.prompt_mode,
+            "instruction_file_path": self.instruction_file_path,
+            "instruction_sha256": self.instruction_sha256,
+            "adapter_prompt_length": self.adapter_prompt_length,
+            "full_instruction_length": self.full_instruction_length,
+            "stdout_length": self.stdout_length,
+            "invocation_duration_ms": self.invocation_duration_ms,
         }
 
     @classmethod
@@ -412,6 +445,13 @@ def build_invocation_record(
         error_message=result.error_message,
         started_at=result.started_at,
         completed_at=result.completed_at,
+        prompt_mode=result.prompt_mode,
+        instruction_file_path=result.instruction_file_path,
+        instruction_sha256=result.instruction_sha256,
+        adapter_prompt_length=result.adapter_prompt_length,
+        full_instruction_length=result.full_instruction_length,
+        stdout_length=result.stdout_length,
+        invocation_duration_ms=result.invocation_duration_ms,
     )
 
 
@@ -751,7 +791,7 @@ def cursor_agent_cli_preset_env(command: str = CURSOR_AGENT_CLI_COMMAND) -> dict
     return {
         CURSOR_CLI_COMMAND_ENV: command,
         CURSOR_CLI_ARGS_ENV: " ".join(CURSOR_AGENT_CLI_SAFE_ARGS),
-        CURSOR_CLI_INPUT_MODE_ENV: INPUT_MODE_PROMPT_ARG,
+        CURSOR_CLI_INPUT_MODE_ENV: INPUT_MODE_FILE_POINTER_ALWAYS,
         CURSOR_CLI_OUTPUT_MODE_ENV: OUTPUT_MODE_STDOUT,
         CURSOR_CLI_MODEL_LABEL_ENV: CURSOR_AGENT_CLI_MODEL_LABEL,
     }
@@ -789,10 +829,18 @@ class CursorCliConfig:
             INPUT_MODE_INSTRUCTION_FILE,
             INPUT_MODE_STDIN,
             INPUT_MODE_PROMPT_ARG,
+            INPUT_MODE_FILE_POINTER_ALWAYS,
         ):
             input_mode = INPUT_MODE_INSTRUCTION_FILE
         output_mode = (env.get(CURSOR_CLI_OUTPUT_MODE_ENV) or OUTPUT_MODE_STDOUT).strip()
         if output_mode not in (OUTPUT_MODE_STDOUT, OUTPUT_MODE_RESPONSE_FILE):
+            output_mode = OUTPUT_MODE_STDOUT
+        # Cursor Agent's verified live contract is a short positional adapter
+        # that points at the governed instruction file, with stdout as the only
+        # response channel. Operator settings cannot downgrade this preset to a
+        # raw positional prompt or response-file write.
+        if is_cursor_agent_command(command_path):
+            input_mode = INPUT_MODE_FILE_POINTER_ALWAYS
             output_mode = OUTPUT_MODE_STDOUT
         model_label = (env.get(CURSOR_CLI_MODEL_LABEL_ENV) or "cursor-cli").strip() or "cursor-cli"
         return cls(
@@ -815,7 +863,7 @@ class CursorCliConfig:
         return is_cursor_agent_command(self.command_path)
 
     def uses_prompt_arg(self) -> bool:
-        return self.input_mode == INPUT_MODE_PROMPT_ARG or any(
+        return self.input_mode in (INPUT_MODE_PROMPT_ARG, INPUT_MODE_FILE_POINTER_ALWAYS) or any(
             PLACEHOLDER_PROMPT in arg for arg in (self.args_template or [])
         )
 
@@ -870,6 +918,11 @@ class CursorCliConfig:
         has_instruction_file = any(
             PLACEHOLDER_INSTRUCTION_FILE in arg for arg in self.args_template
         )
+        if self.is_cursor_agent and not has_prompt:
+            return (
+                "Cursor Agent CLI argv template must reference {prompt}; Admissible passes a "
+                "short adapter prompt that points to the governed instruction file."
+            )
         if not (has_prompt or has_instruction_file or self.input_mode == INPUT_MODE_STDIN):
             return (
                 f"Cursor CLI argv template references neither {PLACEHOLDER_PROMPT} nor "
@@ -1025,24 +1078,37 @@ class CursorCliAgentBackend(AgentBackend):
             argv.append(token)
         return argv
 
-    def _prompt_value(self, request: AgentInvocationRequest, *, instruction_file: Path) -> str:
-        """The value substituted for ``{prompt}``.
-
-        Passes the full instruction text as a single argv element when it is
-        short enough; otherwise writes it to the agent-workspace instruction file
-        and passes a short pointer prompt, so the argv stays within the Windows
-        command-line length limit. In plan mode the agent only *reads* that file.
-        """
+    def _prompt_value(
+        self, request: AgentInvocationRequest, *, instruction_file: Path
+    ) -> tuple[str, str]:
+        """Return the ``{prompt}`` value and its diagnostic transport mode."""
         text = request.instruction_text
+        if self.config.is_cursor_agent or self.config.input_mode == INPUT_MODE_FILE_POINTER_ALWAYS:
+            adapter = (
+                "Read the complete governed instruction from this file:\n\n"
+                f"{instruction_file}\n\n"
+                "Return your complete proposed response directly to stdout.\n\n"
+                "Do not write or modify any file.\n"
+                "Do not write .admissible/agent-response.md.\n"
+                "Include all requested ADMISSIBLE_STRUCTURED_OPERATION blocks directly in stdout.\n"
+                "Follow the response format in the instruction file."
+            )
+            return adapter, PROMPT_MODE_FILE_POINTER
         if len(text) <= PROMPT_ARG_MAX_CHARS:
-            return text
-        return (
+            return text, PROMPT_MODE_INLINE
+        adapter = (
             f"Read the instruction file at {instruction_file} and output only the Admissible "
             "structured response. Do not modify any files; propose only."
         )
+        return adapter, PROMPT_MODE_FILE_POINTER
 
     def invoke(self, request: AgentInvocationRequest) -> AgentInvocationResult:
         started = _now_iso()
+        started_clock = time.perf_counter()
+
+        def duration_ms() -> float:
+            return round((time.perf_counter() - started_clock) * 1000, 3)
+
         availability = self.availability()
         if availability.status != AGENT_AVAILABILITY_AVAILABLE:
             status = (
@@ -1059,6 +1125,8 @@ class CursorCliAgentBackend(AgentBackend):
                 started_at=started,
                 completed_at=_now_iso(),
                 error_message=availability.message,
+                full_instruction_length=len(request.instruction_text),
+                invocation_duration_ms=duration_ms(),
             )
             self._last_result = result
             return result
@@ -1073,11 +1141,13 @@ class CursorCliAgentBackend(AgentBackend):
                 started_at=started,
                 completed_at=_now_iso(),
                 error_message="No agent workspace configured for the Cursor CLI backend.",
+                full_instruction_length=len(request.instruction_text),
+                invocation_duration_ms=duration_ms(),
             )
             self._last_result = result
             return result
 
-        agent_workspace = Path(agent_workspace_raw)
+        agent_workspace = Path(agent_workspace_raw).resolve()
         # Guardrail: never run the agent in / against the target workspace.
         target = request.target_workspace_path
         if target and Path(target).resolve() == agent_workspace.resolve():
@@ -1092,20 +1162,39 @@ class CursorCliAgentBackend(AgentBackend):
                     "Agent workspace must differ from the target workspace; refusing to run "
                     "the agent with cwd inside the target workspace."
                 ),
+                full_instruction_length=len(request.instruction_text),
+                invocation_duration_ms=duration_ms(),
             )
             self._last_result = result
             return result
 
         bridge_dir = _agent_bridge_dir(agent_workspace)
         bridge_dir.mkdir(parents=True, exist_ok=True)
-        instruction_file = bridge_dir / AGENT_INSTRUCTION_FILENAME
+        instruction_file = (bridge_dir / AGENT_INSTRUCTION_FILENAME).resolve()
         response_file = bridge_dir / AGENT_RESPONSE_FILENAME
         instruction_file.write_text(request.instruction_text, encoding="utf-8")
         # Clear any stale response before invoking so we never read an old turn.
         if self.config.output_mode == OUTPUT_MODE_RESPONSE_FILE and response_file.exists():
             response_file.unlink()
 
-        prompt_value = self._prompt_value(request, instruction_file=instruction_file)
+        prompt_value, prompt_mode = self._prompt_value(
+            request, instruction_file=instruction_file
+        )
+        instruction_sha256 = _sha256_text(request.instruction_text)
+
+        def invocation_diagnostics(stdout: str = "") -> dict[str, Any]:
+            return {
+                "prompt_mode": prompt_mode,
+                "instruction_file_path": str(instruction_file),
+                "instruction_sha256": instruction_sha256,
+                "adapter_prompt_length": (
+                    len(prompt_value) if prompt_mode == PROMPT_MODE_FILE_POINTER else 0
+                ),
+                "full_instruction_length": len(request.instruction_text),
+                "stdout_length": len(stdout),
+                "invocation_duration_ms": duration_ms(),
+            }
+
         argv = self._build_argv(
             request,
             instruction_file=instruction_file,
@@ -1136,6 +1225,7 @@ class CursorCliAgentBackend(AgentBackend):
                 started_at=started,
                 completed_at=_now_iso(),
                 error_message=f"Cursor CLI timed out after {request.timeout_seconds}s: {exc}",
+                **invocation_diagnostics(),
             )
             self._last_result = result
             return result
@@ -1148,6 +1238,7 @@ class CursorCliAgentBackend(AgentBackend):
                 started_at=started,
                 completed_at=_now_iso(),
                 error_message=f"Cursor CLI invocation failed: {exc}",
+                **invocation_diagnostics(),
             )
             self._last_result = result
             return result
@@ -1178,6 +1269,7 @@ class CursorCliAgentBackend(AgentBackend):
                 started_at=started,
                 completed_at=_now_iso(),
                 error_message=f"Cursor CLI exited with code {exit_code}.",
+                **invocation_diagnostics(stdout),
             )
             self._last_result = result
             return result
@@ -1194,6 +1286,7 @@ class CursorCliAgentBackend(AgentBackend):
                 started_at=started,
                 completed_at=_now_iso(),
                 error_message="Cursor CLI produced no usable response text.",
+                **invocation_diagnostics(stdout),
             )
             self._last_result = result
             return result
@@ -1209,6 +1302,7 @@ class CursorCliAgentBackend(AgentBackend):
             transport_label=self.backend_id,
             started_at=started,
             completed_at=_now_iso(),
+            **invocation_diagnostics(stdout),
         )
         self._last_result = result
         return result
@@ -1656,7 +1750,10 @@ __all__ = [
     "CURSOR_AGENT_CLI_COMMAND",
     "CURSOR_AGENT_CLI_SAFE_ARGS",
     "CURSOR_AGENT_CLI_MODEL_LABEL",
+    "INPUT_MODE_FILE_POINTER_ALWAYS",
     "INPUT_MODE_PROMPT_ARG",
+    "PROMPT_MODE_FILE_POINTER",
+    "PROMPT_MODE_INLINE",
     "PLACEHOLDER_PROMPT",
     "PROMPT_ARG_MAX_CHARS",
     "assess_cursor_cli_safety",

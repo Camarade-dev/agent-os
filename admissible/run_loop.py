@@ -518,6 +518,12 @@ _CONTINUATION_INSTRUCTION = (
     "simulate or claim its result."
 )
 
+_DIRECT_LOCAL_PROPOSAL_INSTRUCTION = (
+    "Propose the next smallest structured local file operation needed to advance the goal. "
+    "Return every proposed file operation in an ADMISSIBLE_STRUCTURED_OPERATION block; do not "
+    "execute it or claim it ran."
+)
+
 # Cursor/frontier-agent guidance for decision-only proposals (resolving a
 # plan gate, an architecture/framework choice, or another question with no
 # concrete command/file/dependency side effect). Without a recognizable
@@ -996,6 +1002,9 @@ def generate_instruction_packet(
         f"{goal_intake.get('deliverable', 'unspecified deliverable')}"
     )
 
+    open_gates_summary = _open_gates_summary(
+        goal_intake, plan_audit, resolved_plan_gates=resolved_plan_gates
+    )
     packet = AgentInstructionPacket(
         packet_id=f"packet_turn{turn_number:02d}_{uuid.uuid4().hex[:8]}",
         turn_number=turn_number,
@@ -1007,10 +1016,12 @@ def generate_instruction_packet(
         may_propose=list(_MAY_PROPOSE_BY_LEVEL.get(autonomy_level, _DEFAULT_MAY_PROPOSE)),
         must_not=list(_MUST_NOT),
         evidence_needed=_evidence_needed(queue),
-        continuation_instruction=_CONTINUATION_INSTRUCTION,
-        open_gates_summary=_open_gates_summary(
-            goal_intake, plan_audit, resolved_plan_gates=resolved_plan_gates
+        continuation_instruction=(
+            _CONTINUATION_INSTRUCTION
+            if open_gates_summary
+            else _DIRECT_LOCAL_PROPOSAL_INSTRUCTION
         ),
+        open_gates_summary=open_gates_summary,
         queue_summary=_queue_summary(queue),
         packet_text="",
         response_format_guidance=list(_RESPONSE_FORMAT_GUIDANCE),

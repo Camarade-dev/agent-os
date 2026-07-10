@@ -41,7 +41,7 @@ shapes.
 - **`AgentInvocationResult`** — `status` (`success` / `unavailable` / `timeout` / `failed` /
   `malformed` / `blocked_by_configuration`), `response_text`, `raw_stdout` / `raw_stderr`,
   `exit_code`, `model_label`, `transport_label`, `started_at` / `completed_at`,
-  `error_message`.
+  `error_message`, plus prompt/file/hash/length/duration diagnostics for callable CLI runs.
 - **`AgentBackend`** — `backend_id`, `label`, `availability()`, `invoke(request)`,
   `status_snapshot()`.
 
@@ -69,7 +69,7 @@ shape.
 | `ADMISSIBLE_CURSOR_CLI_COMMAND` | Path to the Cursor CLI executable |
 | `ADMISSIBLE_CURSOR_CLI_ARGS` | argv template (JSON list, e.g. `["agent","--instructions","{instruction_file}"]`) |
 | `ADMISSIBLE_CURSOR_CLI_VERSION_ARGS` | version/help probe args (default `["--version"]`) |
-| `ADMISSIBLE_CURSOR_CLI_INPUT_MODE` | `instruction_file` (default) or `stdin` |
+| `ADMISSIBLE_CURSOR_CLI_INPUT_MODE` | Generic backends: `instruction_file`, `stdin`, or `prompt_arg`; Cursor Agent is normalized to `file_pointer_always` |
 | `ADMISSIBLE_CURSOR_CLI_OUTPUT_MODE` | `stdout` (default) or `response_file` |
 | `ADMISSIBLE_CURSOR_CLI_MODEL_LABEL` | display label for the model |
 
@@ -90,11 +90,14 @@ Safe preset (`cursor_agent_cli_preset_env()` / `CursorCliConfig.cursor_agent_pre
 
 - command: `cursor-agent`
 - args: `--print --output-format text --mode plan --workspace {agent_workspace} --trust {prompt}`
-- `{prompt}` is substituted with the full instruction text as a **single argv element**
-  (`shell=False`, never shell-interpreted). If the instruction exceeds
-  `PROMPT_ARG_MAX_CHARS`, it is written to the agent-workspace instruction file and the
-  `{prompt}` becomes a short pointer: *"Read the instruction file at &lt;path&gt; and output
-  only the Admissible structured response. Do not modify any files; propose only."*
+- input mode: `file_pointer_always`. The complete governed instruction is always written to
+  `<agent_workspace>/.admissible/next-agent-instruction.md`. `{prompt}` is always one short
+  adapter argv element containing the absolute instruction path. It requires the complete
+  proposal on stdout, forbids all file writes (including `.admissible/agent-response.md`),
+  and requires every `ADMISSIBLE_STRUCTURED_OPERATION` block directly on stdout.
+- Cursor Agent does **not** use `PROMPT_ARG_MAX_CHARS`. Medium and long instructions follow
+  the same pointer contract. Threshold-based inline support remains available only to generic
+  headless backends.
 - output: `--output-format text` → stdout is captured verbatim as `response_text` and ingested
   through the unchanged extraction/admission path; stdout is never treated as executed.
 
@@ -151,6 +154,9 @@ subprocess.run(argv, shell=False, timeout=..., cwd=agent_workspace_path,
   proposals.
 - `timeout` enforced; timeouts are reported as `timeout`, not raised.
 - stdout/stderr capped to `max_output_bytes`.
+- Durable diagnostics record `prompt_mode=file_pointer`, the absolute instruction path,
+  instruction sha256, adapter/full-instruction/stdout lengths, exit code, and invocation
+  duration.
 - `cwd` is the **agent** workspace, never the target workspace — and the backend refuses to
   run when the agent workspace resolves to the target workspace.
 - Unit tests inject `runner` or patch `subprocess.run`; a real Cursor CLI is never spawned in
@@ -214,7 +220,7 @@ The fix persists the response in durable run state, not on the transport:
   `invocation_id`, `instruction_id`, `backend_id`, `session_id`, `turn_number`,
   `status` (`invoking` / `response_ready` / `consumed` / `timeout` / `failed` /
   `malformed`), `response_text`, `response_sha256`, stdout/stderr summaries,
-  timestamps, `consumed_at`.
+  timestamps, `consumed_at`, and the callable transport diagnostics listed above.
 
 State transitions per turn (callable backend):
 
@@ -261,28 +267,34 @@ stale/duplicate handling is preserved. When a callable backend cannot make progr
 (`blocked_by_configuration` / `unavailable` / `timeout` / `failed`) the loop **pauses with a
 clear reason** rather than spinning.
 
-## What remains before a fully live Cursor CLI high-autonomy run
+## Live Cursor Agent contract and operator retry
 
-As of slice ADMISSIBLE_RUN_033 the Cursor Agent CLI shape (`cursor-agent`, read-only plan
-mode) is configured and validated, and the loop runs against a **mocked** `cursor-agent` in
-tests. The remaining step before the *first real* live run is an operator-side smoke:
+Slice `ADMISSIBLE_RUN_035_CURSOR_AGENT_FILE_POINTER_AND_EXPLICIT_GOAL_SCOPE_FIX` incorporates
+the first live-run transport evidence: a short smoke prompt returned normally; a 4,495-character
+raw positional instruction exited 0 with newline-only stdout; a short prompt pointing to that
+same instruction file returned the complete structured proposal. The supported contract is
+therefore file-pointer input plus stdout output.
 
-1. Configure the safe preset env vars (above) so the backend reports `available`.
-2. Run the manual one-off smoke (below) to confirm the local `cursor-agent` returns text in
-   plan mode. **This is operator-only — it is never run from tests.**
-3. Then start a high-autonomy run selecting the Cursor Agent CLI backend against a separate
-   target workspace.
+For a paused empty-stdout invocation, retry is operator-driven:
 
-### Manual operator smoke (do not run from tests)
+1. Confirm the persisted invocation diagnostics show `prompt_mode=file_pointer`, the expected
+   instruction path/hash, exit code, stdout length, and duration.
+2. Confirm the safe preset still reports available and the instruction file contains the full
+   governed packet.
+3. In the Control Surface, click **Resume**, then **Step once** (or re-enable auto-run). Resume
+   is the explicit operator retry authority; ordinary ticks while paused never re-invoke.
+4. Verify the new invocation reaches `response_ready`, then `response_consumed`, exactly once.
+
+### Optional manual operator smoke (do not run from tests)
 
 ```
 cursor-agent --print --output-format text --mode plan --workspace <agent_workspace> --trust "Reply with exactly: ADMISSIBLE_CURSOR_AGENT_SMOKE_OK"
 ```
 
 If it prints `ADMISSIBLE_CURSOR_AGENT_SMOKE_OK`, the local CLI is wired correctly for
-Admissible's read-only proposal path. Until an operator runs a real session, the file bridge
-remains the semi-autonomous default and the fixture / mocked-subprocess backends cover the
-loop in tests.
+Admissible's read-only proposal path. This only checks CLI availability; governed instructions
+still use the file-pointer adapter. The fixture and mocked-subprocess backends cover the loop
+in tests and never invoke the real CLI/provider.
 
 ## Tests
 
@@ -294,8 +306,11 @@ loop in tests.
 - `tests/test_admissible_cursor_agent_cli_backend.py` — the `cursor-agent` safe preset,
   safety validation (rejects `--force`/`--yolo`/`--sandbox disabled`, requires
   `--print` + plan mode, `cursor-agent` not `cursor agent`, `{agent_workspace}` workspace),
-  subprocess mechanics, prompt-arg + long-prompt file pointer, stdout→ingest, and a two-turn
+  subprocess mechanics, stable file-pointer prompt, stdout→ingest, and a two-turn
   high-autonomy loop driven by a mocked Cursor Agent CLI.
+- `tests/test_admissible_cursor_agent_file_pointer_contract.py` — medium/long stable pointer
+  transport, paths with spaces as one argv element under `shell=False`, adapter write bans,
+  persisted diagnostics, stdout ingest, and empty-stdout pause without automatic reinvocation.
 - `tests/test_admissible_workspace_first_ui.py` — `agent_backend_control` state view, Start
   gating (missing target, agent-os repo target), top-level workspace/backend markup, and the
   truthful truth-boundary wording.

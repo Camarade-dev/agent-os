@@ -99,11 +99,16 @@ def generate_plan_candidate(goal_intake: GoalIntake) -> PlanCandidate:
     ]
 
     architecture_gate = goal_intake.architecture_choice_burden != "low"
+    architecture_description = (
+        f"Use the architecture explicitly selected by the goal for: {goal_intake.deliverable}."
+        if goal_intake.explicit_architecture_choice
+        else f"Choose an architecture/approach for: {goal_intake.deliverable}."
+    )
     steps.append(
         PlanStep(
             step_id="step_2_choose_architecture",
             step_type="choose_architecture",
-            description=f"Choose an architecture/approach for: {goal_intake.deliverable}.",
+            description=architecture_description,
             requires_gate=architecture_gate,
             gate_reason=(
                 "Architecture choice is ambiguous (no explicit framework/stack named); "
@@ -157,23 +162,44 @@ def generate_plan_candidate(goal_intake: GoalIntake) -> PlanCandidate:
             requires_gate=False,
         )
     )
-    steps.append(
-        PlanStep(
-            step_id="step_7_no_deploy_without_authorization",
-            step_type="deployment_gate",
-            description="Do not deploy, publish, or push beyond the local workspace unless authorized.",
-            requires_gate=True,
-            gate_reason="Deployment/publish/push requires explicit human authorization.",
+    if goal_intake.explicit_deployment_boundary == "local_only_no_deploy":
+        steps.append(
+            PlanStep(
+                step_id="step_7_local_only_boundary",
+                step_type="deployment_gate",
+                description=(
+                    "Honor the user's explicit local-only boundary; do not deploy, publish, "
+                    "host, or push."
+                ),
+                requires_gate=False,
+            )
         )
-    )
+    else:
+        steps.append(
+            PlanStep(
+                step_id="step_7_no_deploy_without_authorization",
+                step_type="deployment_gate",
+                description="Do not deploy, publish, or push beyond the local workspace unless authorized.",
+                requires_gate=True,
+                gate_reason="Deployment/publish/push requires explicit human authorization.",
+            )
+        )
 
     assumptions = [
         "The raw prompt is treated as the full scope; unstated requirements are not assumed.",
         "No side-effecting action (dependency install, deploy, delete) proceeds without a gate.",
     ]
+    if goal_intake.explicit_dependency_preference == "zero_dependencies":
+        assumptions.append("The user explicitly requires zero dependencies and no package manager.")
+    if goal_intake.explicit_deployment_boundary == "local_only_no_deploy":
+        assumptions.append("The user explicitly requires local-only work with no deployment.")
     non_goals = [
         "This plan does not deploy, publish, or push outside the local workspace.",
-        "This plan does not install dependencies without explicit human approval.",
+        (
+            "This plan does not install dependencies."
+            if goal_intake.explicit_dependency_preference == "zero_dependencies"
+            else "This plan does not install dependencies without explicit human approval."
+        ),
     ]
 
     return PlanCandidate(
@@ -231,7 +257,23 @@ def audit_plan(plan: PlanCandidate, goal_intake: GoalIntake) -> PlanAudit:
             required_gates.append(dependency_step.step_id)
 
     deploy_step = steps_by_type.get("deployment_gate")
-    if deploy_step is None or not deploy_step.requires_gate:
+    deployment_is_explicitly_local = (
+        goal_intake.explicit_deployment_boundary == "local_only_no_deploy"
+    )
+    if deployment_is_explicitly_local:
+        if deploy_step is None:
+            reasons.append(
+                "Goal explicitly requires local-only/no-deploy behavior but the plan does not "
+                "preserve that boundary."
+            )
+            verdict_candidates.append(PLAN_VERDICT_BLOCKED)
+        elif deploy_step.requires_gate:
+            reasons.append(
+                "Goal already explicitly resolves the deployment boundary as local-only; the "
+                "plan must not request a redundant human approval."
+            )
+            verdict_candidates.append(PLAN_VERDICT_BLOCKED)
+    elif deploy_step is None or not deploy_step.requires_gate:
         reasons.append(
             "Plan has no explicit, gated deployment/publish/push boundary. A plan that "
             "can reach production without a human gate is unsafe by default."
@@ -254,8 +296,8 @@ def audit_plan(plan: PlanCandidate, goal_intake: GoalIntake) -> PlanAudit:
 
     if not reasons:
         reasons.append(
-            "Plan gates architecture, dependency, and deployment decisions, and "
-            "includes local verification."
+            "Plan honors explicit goal constraints, gates any remaining ambiguous decisions, "
+            "and includes local verification."
         )
 
     return PlanAudit(
