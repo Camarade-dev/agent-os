@@ -1,0 +1,77 @@
+{
+  "schema_version": "admissible_live_regression_fixture_v1",
+  "source_session": "pixel-wanderer-cli-010",
+  "claim_boundary": "Minimized deterministic state derived from the exported live run; it is not a claim that the original task completed.",
+  "goal_text": "Build a complete local browser game called Pixel Wanderer.\n\nMandatory deliverables:\n- index.html\n- style.css\n- game.js\n- LOCAL_DEV.md\n\nMandatory behavior:\n- a player-controlled dot;\n- Arrow-key and WASD movement;\n- collectible items;\n- a visible score;\n- restart with the R key;\n- local usage instructions.\n\nPrefer the next smallest coherent bounded batch. Avoid optional polish before completion.",
+  "budget": {
+    "max_turns": 12,
+    "observed_model_invocations": 2,
+    "observed_explicit_retries": 1,
+    "observed_executed_writes": 4,
+    "observed_verification_checks": 8,
+    "observed_verified_pass": 5,
+    "observed_verified_fail": 3,
+    "remaining_work_turn_budget": 6
+  },
+  "executed_writes": [
+    {"path": "index.html", "sha256": "index010"},
+    {"path": "style.css", "sha256": "style010"},
+    {"path": "game.js", "sha256": "game010"},
+    {"path": "README.md", "sha256": "readme010"}
+  ],
+  "missing_mandatory_path": "LOCAL_DEV.md",
+  "proposal_coverage_observed": {
+    "required_paths": ["index.html", "style.css", "game.js", "LOCAL_DEV.md"],
+    "proposed_required_paths": ["index.html", "style.css", "game.js"],
+    "missing_required_paths": ["LOCAL_DEV.md"],
+    "additional_paths": ["README.md"],
+    "coverage_complete": false
+  },
+  "aggregate_pseudo_gate": {
+    "action_type": "plan_gate_resolution",
+    "decision": "REQUIRE_HUMAN_APPROVAL",
+    "prose": "Approve bounded execution of the four structured write_file operations below",
+    "lifecycle_status": "admitted_not_executed",
+    "human_decision_recorded": true,
+    "counted_as_active_blocker_before_fix": true
+  },
+  "acceptance_criteria_final": [
+    {"criterion_id": "required_files", "status": "verified_fail", "note": "Missing required files: LOCAL_DEV.md"},
+    {"criterion_id": "index_assets", "status": "verified_pass"},
+    {"criterion_id": "index_game_ui", "status": "verified_pass"},
+    {"criterion_id": "style_non_empty", "status": "verified_pass"},
+    {"criterion_id": "game_controls", "status": "verified_fail", "note": "Legacy matcher missed keys.w style bindings"},
+    {"criterion_id": "game_collectible_score", "status": "verified_pass"},
+    {"criterion_id": "game_restart", "status": "verified_pass"},
+    {"criterion_id": "local_usage", "status": "verified_fail", "note": "LOCAL_DEV.md missing"}
+  ],
+  "verification_results": [
+    {"criterion_id": "required_files", "status": "fail", "message": "Missing required files: LOCAL_DEV.md"},
+    {"criterion_id": "game_controls", "status": "fail", "subchecks": {"arrow_controls": "pass", "wasd_controls": "pass"}, "legacy_contains_check": "failed on literal 'w' substrings"},
+    {"criterion_id": "local_usage", "status": "fail", "failure_class": "file_missing", "target_path": "LOCAL_DEV.md"}
+  ],
+  "game_js_cli010_snippet": "if (keys.ArrowUp || keys.w || keys.W) dy -= 1; if (keys.ArrowDown || keys.s || keys.S) dy += 1;",
+  "final_state_before_fix": {
+    "mode": "paused",
+    "current_step": "internal_livelock",
+    "outcome": null,
+    "pending_useful_operation_count": null,
+    "active_blocked_count": null,
+    "blocking_reason": null,
+    "pending_executable_operations": 0,
+    "repair_phase": "none"
+  },
+  "environment_diagnostics_collision": {
+    "SYSTEMROOT": "C:\\WINDOWS",
+    "SystemRoot": "C:\\WINDOWS"
+  },
+  "human_decisions": {
+    "raw_human_decision_count": 1,
+    "genuine_human_intervention_count_after_fix": 0
+  },
+  "repair_expected_scope": {
+    "write_paths": ["LOCAL_DEV.md"],
+    "conditional_paths": ["game.js"],
+    "preserve_paths": ["index.html", "style.css"]
+  }
+}

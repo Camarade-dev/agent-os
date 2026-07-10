@@ -412,3 +412,11 @@ browser exports are UTF-8; HTTP and HTML declare UTF-8 explicitly.
 Concurrent Step/auto-run requests return `tick_already_in_progress` and never invoke the
 backend twice. The browser disables Start, Step, Retry, and Auto-run while a request is in
 flight, prevents Step and auto-run overlap, and displays “Backend invocation in progress.”
+
+## Portable environment diagnostics (Run 040)
+
+Invocation records expose canonical environment path keys (`SystemRoot`, `SystemDrive`,
+`ProgramData`, `USERPROFILE`, …) with case-insensitive deduplication before persistence and
+export. When multiple spellings observed the same value, aliases are stored in
+`environment_path_aliases` rather than duplicate JSON object keys — keeping exports parseable
+by PowerShell as well as Python.

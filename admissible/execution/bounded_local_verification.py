@@ -38,6 +38,8 @@ ALLOWED_VERIFICATION_CHECKS = frozenset(
         "file_contains",
         "file_not_empty",
         "all_required_files_present",
+        "game_controls_check",
+        "local_usage_check",
     }
 )
 
@@ -71,6 +73,54 @@ _HTML_ASSET_ATTR_PATTERN = re.compile(
     r"""(?:href|src)\s*=\s*["']([^"']+)["']""",
     re.IGNORECASE,
 )
+
+_GAME_CONTROL_SUBCHECKS = (
+    ("arrow_up", "ArrowUp"),
+    ("arrow_down", "ArrowDown"),
+    ("arrow_left", "ArrowLeft"),
+    ("arrow_right", "ArrowRight"),
+    ("w", "w"),
+    ("a", "a"),
+    ("s", "s"),
+    ("d", "d"),
+)
+
+
+def _js_key_present(content: str, key: str) -> bool:
+    """Detect common JavaScript key-binding representations without executing code."""
+
+    patterns = [
+        rf"['\"]{re.escape(key)}['\"]",
+        rf"\bkeys\.{re.escape(key)}\b",
+        rf"\bkeys\[['\"]{re.escape(key)}['\"]\]",
+        rf"\be\.key\s*===?\s*['\"]{re.escape(key)}['\"]",
+        rf"\bevent\.key\s*===?\s*['\"]{re.escape(key)}['\"]",
+    ]
+    if len(key) == 1:
+        upper = key.upper()
+        patterns.extend(
+            [
+                rf"\bkeys\.{re.escape(upper)}\b",
+                rf"\bkeys\[['\"]{re.escape(upper)}['\"]\]",
+                rf"\be\.key\s*===?\s*['\"]{re.escape(upper)}['\"]",
+                rf"\bevent\.key\s*===?\s*['\"]{re.escape(upper)}['\"]",
+            ]
+        )
+    return any(re.search(pattern, content) for pattern in patterns)
+
+
+def _game_controls_subcheck_results(content: str) -> tuple[dict[str, str], list[str], list[str]]:
+    subchecks: dict[str, str] = {}
+    passed: list[str] = []
+    missing: list[str] = []
+    for subcheck_id, key in _GAME_CONTROL_SUBCHECKS:
+        present = _js_key_present(content, key)
+        subchecks[subcheck_id] = "pass" if present else "fail"
+        if present:
+            passed.append(subcheck_id)
+        else:
+            missing.append(subcheck_id)
+    return subchecks, passed, missing
 
 
 class BoundedVerificationError(ValueError):
@@ -265,6 +315,11 @@ def validate_verification_request(request: VerificationRequest) -> None:
         raise BoundedVerificationError(
             "file_contains requires contains and/or contains_any text",
             diagnostic="missing_verification_expectation",
+        )
+    if check_id in ("game_controls_check", "local_usage_check") and len(request.target_paths) != 1:
+        raise BoundedVerificationError(
+            f"{check_id} requires exactly one target path",
+            diagnostic="invalid_verification_target",
         )
 
 
@@ -604,11 +659,17 @@ def _check_file_contains(
         ),
         timestamp=timestamp,
         evidence_payload={
+            "failure_class": None if passed else "content_missing",
             "path": rel_path,
             "contains": list(request.contains),
             "contains_any": list(request.contains_any),
             "missing": missing_all,
             "contains_any_matched": any_match,
+            "repair_hint": (
+                None
+                if passed
+                else f"Add expected markers to {rel_path}: {', '.join(missing_all)}"
+            ),
         },
         criterion_id=request.criterion_id,
     )
@@ -669,7 +730,134 @@ def _check_all_required_files_present(
             else f"Missing required files: {', '.join(missing)}"
         ),
         timestamp=timestamp,
-        evidence_payload={"checked_paths": list(request.target_paths), "missing_paths": missing},
+        evidence_payload={
+            "failure_class": None if passed else "file_missing",
+            "checked_paths": list(request.target_paths),
+            "missing_paths": missing,
+            "repair_hint": (
+                None
+                if passed
+                else f"Create missing mandatory file(s): {', '.join(missing)}"
+            ),
+        },
+        criterion_id=request.criterion_id,
+    )
+
+
+def _check_game_controls(
+    workspace: Path, request: VerificationRequest, *, timestamp: str
+) -> VerificationResult:
+    rel_path, target = _generic_target(workspace, request)
+    if not target.is_file():
+        return VerificationResult(
+            check_id=request.check_id,
+            check_name=_check_display_name(request.check_id),
+            target_paths=[rel_path],
+            status="fail",
+            message=f"File is missing: {rel_path}",
+            timestamp=timestamp,
+            evidence_payload={
+                "failure_class": "file_missing",
+                "path": rel_path,
+                "missing": ["arrow_up", "arrow_down", "arrow_left", "arrow_right", "w", "a", "s", "d"],
+                "subchecks": {name: "fail" for name, _ in _GAME_CONTROL_SUBCHECKS},
+                "passed_subchecks": {},
+                "failed_subchecks": {
+                    "arrow_controls": "fail",
+                    "wasd_controls": "fail",
+                },
+                "repair_hint": f"Add Arrow and WASD controls to {rel_path}.",
+            },
+            criterion_id=request.criterion_id,
+        )
+    content = target.read_text(encoding="utf-8", errors="replace")
+    subchecks, passed, missing = _game_controls_subcheck_results(content)
+    arrow_pass = all(subchecks[name] == "pass" for name in ("arrow_up", "arrow_down", "arrow_left", "arrow_right"))
+    wasd_pass = all(subchecks[name] == "pass" for name in ("w", "a", "s", "d"))
+    grouped = {
+        "arrow_controls": "pass" if arrow_pass else "fail",
+        "wasd_controls": "pass" if wasd_pass else "fail",
+    }
+    passed_group = {key: value for key, value in grouped.items() if value == "pass"}
+    failed_group = {key: value for key, value in grouped.items() if value == "fail"}
+    passed = not missing
+    return VerificationResult(
+        check_id=request.check_id,
+        check_name=_check_display_name(request.check_id),
+        target_paths=[rel_path],
+        status="pass" if passed else "fail",
+        message=(
+            f"Game controls present in {rel_path}."
+            if passed
+            else f"Expected controls missing from {rel_path}."
+        ),
+        timestamp=timestamp,
+        evidence_payload={
+            "failure_class": None if passed else "content_missing",
+            "path": rel_path,
+            "subchecks": subchecks,
+            "passed_subchecks": passed_group,
+            "failed_subchecks": failed_group,
+            "missing": missing,
+            "repair_hint": (
+                None
+                if passed
+                else f"Add missing control bindings to {rel_path}: {', '.join(missing)}"
+            ),
+        },
+        criterion_id=request.criterion_id,
+    )
+
+
+def _check_local_usage(
+    workspace: Path, request: VerificationRequest, *, timestamp: str
+) -> VerificationResult:
+    rel_path, target = _generic_target(workspace, request)
+    marker_groups = [list(request.contains)] if request.contains else []
+    if not marker_groups:
+        marker_groups = [["open", "index.html"]]
+    if not target.is_file():
+        return VerificationResult(
+            check_id=request.check_id,
+            check_name=_check_display_name(request.check_id),
+            target_paths=[rel_path],
+            status="fail",
+            message=f"Local usage file is missing: {rel_path}",
+            timestamp=timestamp,
+            evidence_payload={
+                "failure_class": "file_missing",
+                "path": rel_path,
+                "accepted_marker_groups": marker_groups,
+                "missing_groups": marker_groups,
+                "repair_hint": f"Create {rel_path} with local open/index.html usage instructions.",
+            },
+            criterion_id=request.criterion_id,
+        )
+    content = target.read_text(encoding="utf-8", errors="replace")
+    missing_groups = [group for group in marker_groups if not all(marker in content for marker in group)]
+    passed = not missing_groups
+    return VerificationResult(
+        check_id=request.check_id,
+        check_name=_check_display_name(request.check_id),
+        target_paths=[rel_path],
+        status="pass" if passed else "fail",
+        message=(
+            f"Local usage markers present in {rel_path}."
+            if passed
+            else f"Local usage markers missing from {rel_path}."
+        ),
+        timestamp=timestamp,
+        evidence_payload={
+            "failure_class": None if passed else "content_missing",
+            "path": rel_path,
+            "accepted_marker_groups": marker_groups,
+            "missing_groups": missing_groups,
+            "repair_hint": (
+                None
+                if passed
+                else f"Add local usage instructions to {rel_path} including: {', '.join(marker_groups[0])}"
+            ),
+        },
         criterion_id=request.criterion_id,
     )
 
@@ -780,6 +968,10 @@ def run_single_verification_check(
         )
     if request.check_id == "all_required_files_present":
         return _check_all_required_files_present(workspace, request, timestamp=ts)
+    if request.check_id == "game_controls_check":
+        return _check_game_controls(workspace, request, timestamp=ts)
+    if request.check_id == "local_usage_check":
+        return _check_local_usage(workspace, request, timestamp=ts)
 
     raise BoundedVerificationError(
         f"verification check is not implemented: {request.check_id!r}",

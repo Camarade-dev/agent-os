@@ -7,7 +7,7 @@ from pathlib import Path
 
 from admissible.agent_transport import FixtureAgentTransport
 from admissible.control_surface import ControlSurfaceController
-from admissible.governed_run import derive_acceptance_criteria_from_goal
+from admissible.governed_run import FINAL_OUTCOMES, derive_acceptance_criteria_from_goal
 
 FIXTURE = (
     Path(__file__).resolve().parent
@@ -48,10 +48,11 @@ def _passing_four_operations() -> list[dict]:
             "operation": "write_file",
             "path": "game.js",
             "content": (
-                "let score=0; const collectibles=[]; function restart(){score=0;}\n"
-                "document.addEventListener('keydown',e=>{"
-                "if(e.key==='r'||e.key==='R')restart();"
-                "if(e.key==='ArrowUp'||e.key==='w'||e.key==='a'||e.key==='s'||e.key==='d'){}});\n"
+                "const keys={}; addEventListener('keydown',e=>keys[e.key]=true);"
+                "if(keys.ArrowUp||keys.w){} if(keys.ArrowDown||keys.s){}"
+                "if(keys.ArrowLeft||keys.a){} if(keys.ArrowRight||keys.d){}"
+                "let score=0; const collectibles=[]; function restart(){score=0;}"
+                "addEventListener('keydown',e=>{if(e.key==='r'||e.key==='R')restart();});\n"
             ),
         },
         {
@@ -117,12 +118,13 @@ class TestLiveAcceptanceInitialization(unittest.TestCase):
                 closure_reserve_turns=2,
             )
             controller.ingest_agent_response(_response(operations))
-            for _ in range(8):
+            for _ in range(30):
+                state = controller.tick_high_autonomy_run()
+                summary = state["high_autonomy_summary"]
+                if summary.get("outcome") in FINAL_OUTCOMES:
+                    break
                 ha = controller._high_autonomy_state()
                 if ha is None or not ha.active:
-                    break
-                state = controller.tick_high_autonomy_run()
-                if state["high_autonomy_summary"].get("outcome") == "completed":
                     break
             summary = state["high_autonomy_summary"]
             self.assertEqual(summary["outcome"], "completed")

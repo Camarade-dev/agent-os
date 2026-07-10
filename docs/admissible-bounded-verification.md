@@ -146,3 +146,16 @@ useful admitted operation. A changed criterion-relevant file moves the criterion
 The Pixel Wanderer regression expresses its file presence, HTML asset/canvas/score, non-empty
 CSS, keyboard control, collectible/score, restart, and local-usage requirements entirely with
 these generic checks; production logic contains no Pixel Wanderer special case.
+
+## Compound diagnostics and repair re-verification (Run 040)
+
+Compound criteria such as `game_controls` expose per-component subchecks (`arrow_up` … `d`,
+grouped as `arrow_controls` / `wasd_controls`) with `failure_class`, target path, passed/failed
+subchecks, missing components, and a bounded repair hint. The matcher recognizes string
+literals, `keys.X`, bracket access, and `e.key ===` comparisons without executing JavaScript.
+
+`local_usage_check` distinguishes `file_missing` from `content_missing` and reports accepted
+marker groups versus missing groups.
+
+After a targeted repair executes, the controller re-runs only failed criteria (plus dependent
+aggregates) before attempting another repair round or final closure.

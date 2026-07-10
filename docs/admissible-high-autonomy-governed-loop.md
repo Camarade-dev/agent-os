@@ -281,3 +281,27 @@ unique file states, duplicate no-ops, and overwrites; reads/lists; verification 
 human interventions, suppressed pseudo-gates, superseded gates, and active blockers; and
 work/verification/closure budget usage. `active_blocked_count` is the one definition used by
 the persisted run, export, summary, governed overview, and UI.
+
+## Run 040 verification repair, pseudo-gates, and portable export
+
+`ADMISSIBLE_RUN_040_VERIFICATION_REPAIR_CLOSURE_PSEUDO_GATE_AND_EXPORT_FIX` closes the
+`pixel-wanderer-cli-010` regression without broadening executor authority.
+
+- **Proposal coverage:** after extraction, compare mandatory goal paths against proposed and
+  already-satisfied paths. Safe partial batches may execute; missing mandatory paths trigger
+  `repair_needed` rather than rejecting the whole batch. README does not satisfy LOCAL_DEV.md.
+- **Repair-needed state machine:** `verification_failed_repairable → repair_needed →
+  writing_repair_instruction → awaiting_repair_response → repair_executing → repair_verifying`.
+  Repair packets contain only failed mandatory criteria, diagnostics, satisfied hashes, exact
+  missing paths, boundaries, and remaining budget. Default `max_repair_rounds=2`.
+- **Verification fail ≠ internal mismatch:** ordinary failed acceptance criteria must not become
+  `internal_livelock`. Livelock is reserved for contradictory execution state.
+- **Aggregate pseudo-gate suppression:** prose such as “Approve bounded execution of the four
+  structured write_file operations below” is suppressed when concrete sibling operations exist.
+  Stale persisted gates are repaired on session load. Metrics distinguish
+  `raw_human_decision_count`, `genuine_human_intervention_count`, and
+  `retrospectively_suppressed_pseudo_gate_decision_count`.
+- **Non-null projections:** `outcome` defaults to `in_progress`; counts default to `0`;
+  `blocking_reason` defaults to empty string. Legacy null session fields migrate on load/export.
+- **Portable JSON:** environment diagnostic keys are canonicalized case-insensitively before
+  export; source aliases are recorded separately, never as duplicate object keys.

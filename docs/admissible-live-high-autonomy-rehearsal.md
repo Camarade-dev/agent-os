@@ -193,3 +193,11 @@ Expected operator-visible behavior:
 
 Step and auto-run are single-flight at both browser and server layers. A concurrent request
 returns `tick_already_in_progress`; it does not call Cursor Agent again.
+
+## Run 040 live closure rehearsal notes
+
+The `pixel-wanderer-cli-010` fixture captures partial deliverable coverage (README instead of
+LOCAL_DEV.md), aggregate pseudo-gate leakage, missing repair transition, null exported
+projections, and environment-key collisions. Deterministic replay after RUN_040 completes via
+targeted repair without a third provider turn. See
+`benchmark/reports/admissible_pixel_wanderer_cli_010_live_audit.md`.

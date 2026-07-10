@@ -87,11 +87,16 @@ from admissible.long_run_envelope_builder import plan_gate_closes_gates
 from admissible.governed_run import (
     active_blocking_action_ids,
     build_agent_response_extraction_report,
+    build_proposal_coverage_report,
     canonical_operation_fingerprint,
     canonical_operation_identity,
+    canonicalize_session_export_payload,
+    classify_optional_write_paths,
     current_file_sha256,
+    DEFAULT_OUTCOME_IN_PROGRESS,
     extract_completion_candidate,
     latest_file_hashes,
+    migrate_session_projection_fields,
     normalize_workspace_relative_path,
     repair_inconsistent_executable_lifecycle,
     ResponseExtractionFailed,
@@ -616,6 +621,7 @@ def _is_pseudo_gate_for_concrete_allow(
     *,
     concrete_allow_paths: set[str],
     response_restates_local_write_approval: bool = False,
+    response_text: str = "",
 ) -> bool:
     """Whether model prose merely restates approval for an ALLOW operation."""
 
@@ -628,6 +634,20 @@ def _is_pseudo_gate_for_concrete_allow(
         str(envelope.candidate.get(key) or "")
         for key in ("operation_text", "tool_or_command", "raw_output")
     ).lower()
+    combined = f"{response_text}\n{text}".lower()
+    if concrete_allow_paths and len(concrete_allow_paths) >= 2:
+        aggregate_patterns = (
+            r"approve\s+bounded\s+execution\s+of\s+the\s+(?:\d+|four|three|two|\w+)\s+structured\s+write",
+            r"approve\s+bounded\s+execution\s+of\s+the\s+(?:\d+|four|three|two|\w+)\s+structured\s+write_file",
+        )
+        if any(re.search(pattern, combined) for pattern in aggregate_patterns):
+            return True
+        if "approve" in combined and (
+            "operations below" in combined
+            or "operations above" in combined
+            or "write_file operations below" in combined
+        ):
+            return True
     if response_restates_local_write_approval and re.search(
         r"^(?:action_gate_|verdict\s+class:|closes\s+gates?:|side\s+effects?\s+if\s+approved:|proposal:|human\s+decision\s+required:)",
         str(envelope.candidate.get("operation_text") or "").strip(),
@@ -689,6 +709,67 @@ def _supersede_covered_gates(
         )
         count += 1
     return count
+
+
+def _repair_stale_aggregate_pseudo_gates(session: "ControlSession") -> int:
+    """Suppress persisted aggregate approval pseudo-gates on session load."""
+
+    sibling_paths: set[str] = set()
+    for item in session.queue:
+        envelope = session.run_envelopes.get(item.action_id)
+        if item.decision != "ALLOW" or not envelope:
+            continue
+        for operation in envelope.candidate.get("structured_operations") or []:
+            try:
+                sibling_paths.add(
+                    normalize_workspace_relative_path(str(operation.get("path") or "."))
+                )
+            except ValueError:
+                continue
+    if len(sibling_paths) < 2:
+        return 0
+    repaired = 0
+    now = _now_iso()
+    for item in session.queue:
+        if item.action_type != "plan_gate_resolution" or item.suppressed_pseudo_gate:
+            continue
+        if item.superseded_at:
+            continue
+        text = "\n".join(
+            str(getattr(item, field, "") or "")
+            for field in ("tool_or_command", "action_type")
+        ).lower()
+        envelope = session.run_envelopes.get(item.action_id)
+        if envelope:
+            text = f"{text}\n{envelope.candidate.get('operation_text') or ''}".lower()
+        if not re.search(
+            r"approve\s+bounded\s+execution\s+of\s+the\s+(?:\d+|four|three|two|\w+)\s+structured\s+write",
+            text,
+        ):
+            continue
+        item.suppressed_pseudo_gate = True
+        item.lifecycle_status = LIFECYCLE_SUPERSEDED
+        item.supersession_reason = "retrospective_aggregate_pseudo_gate_suppressed"
+        item.superseded_at = now
+        sibling_ids = [
+            row.action_id
+            for row in session.queue
+            if row.decision == "ALLOW"
+            and row.action_id != item.action_id
+            and not row.superseded_at
+        ]
+        session.governance_records.append(
+            {
+                "record_id": f"governance_{uuid.uuid4().hex[:12]}",
+                "event_type": "retrospective_pseudo_gate_suppressed",
+                "action_id": item.action_id,
+                "reason": "aggregate_batch_approval_prose_with_concrete_sibling_operations",
+                "sibling_action_ids": sibling_ids,
+                "timestamp": now,
+            }
+        )
+        repaired += 1
+    return repaired
 
 
 def _operation_record(
@@ -2067,11 +2148,12 @@ class ControlSurfaceController:
                 turns_remaining=ha_state.turns_remaining,
             )
             self._session.high_autonomy_run = ha_state.to_dict()
-        return self._session.to_dict()
+        payload = self._session.to_dict()
+        return canonicalize_session_export_payload(payload)
 
     def state_view(self) -> dict[str, Any]:
         """Session state plus derived, non-persisted UI fields."""
-        view = self.session_dict()
+        view = migrate_session_projection_fields(self.session_dict())
         workspace_path = self._session.bounded_executor_workspace
         view["queue"] = [
             {
@@ -2182,6 +2264,7 @@ class ControlSurfaceController:
             workspace_path=self._session.bounded_executor_workspace,
             governance_records=self._session.governance_records,
         )
+        _repair_stale_aggregate_pseudo_gates(self._session)
         self._persist()
         return self.state_view()
 
@@ -2774,8 +2857,14 @@ class ControlSurfaceController:
                 validate_verification_request(request)
         elif profile == "acceptance_ledger":
             criteria = list((self._session.high_autonomy_run or {}).get("acceptance_criteria") or [])
+            criterion_filter = {
+                str(item) for item in (body.get("criterion_ids") or []) if str(item).strip()
+            }
             requests = []
             for criterion in criteria:
+                criterion_id = str(criterion.get("criterion_id") or "")
+                if criterion_filter and criterion_id not in criterion_filter:
+                    continue
                 for raw_request in criterion.get("verification") or []:
                     request_data = dict(raw_request)
                     request_data.setdefault("criterion_id", criterion.get("criterion_id"))
@@ -3041,6 +3130,7 @@ class ControlSurfaceController:
                 run_env,
                 concrete_allow_paths=concrete_allow_paths,
                 response_restates_local_write_approval=response_restates_local_write_approval,
+                response_text=action_text,
             ):
                 self._session.governance_records.append(
                     {
@@ -3049,6 +3139,12 @@ class ControlSurfaceController:
                         "action_id": run_env.action_id,
                         "source_action_id": run_env.action_id,
                         "reason": "model_approval_prose_restates_separately_allowed_operation",
+                        "sibling_action_ids": [
+                            entry.action_id
+                            for entry in run_envelopes
+                            if entry.decision.get("decision") == "ALLOW"
+                            and entry.action_id != run_env.action_id
+                        ],
                         "timestamp": _now_iso(),
                     }
                 )
@@ -3177,6 +3273,32 @@ class ControlSurfaceController:
             session=self._session,
             workspace_path=self._session.bounded_executor_workspace,
         )
+        goal_text = str(long_run_prompt or "")
+        avoid_optional = "avoid optional polish" in goal_text.lower()
+        coverage_report = build_proposal_coverage_report(
+            goal_text=goal_text,
+            structured_operations=all_structured_operations,
+            satisfied_paths=latest_file_hashes(self._session.operation_records),
+            avoid_optional_polish=avoid_optional,
+        )
+        extraction_report["proposal_coverage"] = coverage_report
+        optional_classifications = classify_optional_write_paths(coverage_report)
+        for record in self._session.operation_records:
+            path = str(record.get("path") or "")
+            if path in optional_classifications:
+                record["classification"] = optional_classifications[path]
+        if self._session.high_autonomy_run is not None:
+            self._session.high_autonomy_run["last_proposal_coverage_report"] = coverage_report
+        if not coverage_report.get("coverage_complete"):
+            self._session.governance_records.append(
+                {
+                    "record_id": f"governance_{uuid.uuid4().hex[:12]}",
+                    "event_type": "proposal_coverage_incomplete",
+                    "missing_required_paths": list(coverage_report.get("missing_required_paths") or []),
+                    "additional_paths": list(coverage_report.get("additional_paths") or []),
+                    "timestamp": _now_iso(),
+                }
+            )
         if extraction_report.get("extraction_failed"):
             failed_record = AgentResponseRecord(
                 record_id=f"agent_response_{uuid.uuid4().hex[:12]}",

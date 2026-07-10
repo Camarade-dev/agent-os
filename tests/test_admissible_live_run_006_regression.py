@@ -7,6 +7,7 @@ from pathlib import Path
 
 from admissible.agent_transport import FixtureAgentTransport
 from admissible.control_surface import ControlSurfaceController
+from admissible.governed_run import FINAL_OUTCOMES
 
 
 FIXTURE = (
@@ -59,9 +60,9 @@ class TestAdmissibleLiveRun006Regression(unittest.TestCase):
                 acceptance_criteria=fixture["acceptance_criteria"],
             )
             state = controller.state_view()
-            for _ in range(8):
+            for _ in range(30):
                 state = controller.tick_high_autonomy_run()
-                if state["high_autonomy_summary"]["outcome"]:
+                if state["high_autonomy_summary"]["outcome"] in FINAL_OUTCOMES:
                     break
 
             summary = state["high_autonomy_summary"]

@@ -17,13 +17,21 @@ if TYPE_CHECKING:
 from admissible.high_autonomy_policy import HighAutonomyPolicy, open_executable_low_risk_actions
 from admissible.governed_run import (
     DEFAULT_CLOSURE_RESERVE_TURNS,
+    DEFAULT_MAX_REPAIR_ROUNDS,
     DEFAULT_MAX_STRUCTURED_OPERATIONS_PER_RESPONSE,
     DEFAULT_MAX_TOTAL_PROPOSED_WRITE_BYTES,
+    DEFAULT_OUTCOME_IN_PROGRESS,
+    FINAL_OUTCOMES,
     ResponseExtractionFailed,
     acceptance_counts,
     active_blocking_action_ids,
     build_canonical_metrics,
+    build_repair_instruction_text,
+    build_repair_packet,
+    failed_mandatory_criteria,
+    latest_file_hashes,
     make_acceptance_ledger,
+    migrate_high_autonomy_projection,
     repair_inconsistent_executable_lifecycle,
 )
 from admissible.run_loop import (
@@ -55,6 +63,7 @@ HA_NEXT_WAIT_FOR_RESPONSE = "wait_for_agent_response"
 HA_NEXT_INGEST_RESPONSE = "ingest_response"
 HA_NEXT_AUTO_EXECUTE = "auto_execute_low_risk"
 HA_NEXT_WRITE_RECOVERY = "write_recovery_instruction"
+HA_NEXT_WRITE_REPAIR = "write_repair_instruction"
 HA_NEXT_VERIFY = "run_bounded_verification"
 HA_NEXT_HUMAN_APPROVAL = "human_approval_required"
 HA_NEXT_STOP = "stop"
@@ -62,6 +71,14 @@ HA_NEXT_STOP = "stop"
 HA_STEP_INTERNAL_LIVELOCK = "internal_livelock"
 HA_STEP_RESPONSE_EXTRACTION_FAILED = "response_extraction_failed"
 HA_STEP_INTERNAL_EXECUTION_MISMATCH = "internal_execution_state_mismatch"
+
+REPAIR_PHASE_NONE = "none"
+REPAIR_PHASE_VERIFICATION_FAILED_REPAIRABLE = "verification_failed_repairable"
+REPAIR_PHASE_REPAIR_NEEDED = "repair_needed"
+REPAIR_PHASE_WRITING_REPAIR_INSTRUCTION = "writing_repair_instruction"
+REPAIR_PHASE_AWAITING_REPAIR_RESPONSE = "awaiting_repair_response"
+REPAIR_PHASE_REPAIR_EXECUTING = "repair_executing"
+REPAIR_PHASE_REPAIR_VERIFYING = "repair_verifying"
 
 DEFAULT_MAX_TURNS = 12
 DEFAULT_MALFORMED_RETRY_LIMIT = 1
@@ -182,11 +199,17 @@ class HighAutonomyRunState:
     acceptance_criteria: list[dict[str, Any]] = field(default_factory=list)
     completion_candidate: dict[str, Any] | None = None
     completion_candidate_received_at: str | None = None
-    outcome: str | None = None
+    outcome: str | None = DEFAULT_OUTCOME_IN_PROGRESS
     outcome_reason: str | None = None
     completed_criteria: list[str] = field(default_factory=list)
     unmet_criteria: list[str] = field(default_factory=list)
     pending_useful_operations: list[str] = field(default_factory=list)
+    repair_phase: str = REPAIR_PHASE_NONE
+    repair_round_count: int = 0
+    max_repair_rounds: int = DEFAULT_MAX_REPAIR_ROUNDS
+    repair_packet: dict[str, Any] | None = None
+    repair_history: list[dict[str, Any]] = field(default_factory=list)
+    last_proposal_coverage_report: dict[str, Any] | None = None
     # Durable invocation lineage and visible retry/cost markers.
     invocation_history: list[dict[str, Any]] = field(default_factory=list)
     operator_retry_count: int = 0
@@ -209,8 +232,9 @@ class HighAutonomyRunState:
     def from_dict(cls, data: dict[str, Any] | None) -> "HighAutonomyRunState":
         if not data:
             return cls()
+        migrated = migrate_high_autonomy_projection(data)
         known = {f.name for f in cls.__dataclass_fields__.values()}
-        filtered = {key: value for key, value in data.items() if key in known}
+        filtered = {key: value for key, value in migrated.items() if key in known}
         return cls(**filtered)
 
 
@@ -495,6 +519,7 @@ def build_high_autonomy_summary(
         HA_NEXT_INGEST_RESPONSE: "Controller will ingest the agent response on the next tick.",
         HA_NEXT_AUTO_EXECUTE: "Controller will auto-execute low-risk local writes.",
         HA_NEXT_WRITE_RECOVERY: "Controller will request a local-only recovery step.",
+        HA_NEXT_WRITE_REPAIR: "Controller will request a targeted verification repair.",
         HA_NEXT_VERIFY: "Controller will run bounded verification.",
         HA_NEXT_HUMAN_APPROVAL: "Approve or refuse the human-critical action.",
         HA_NEXT_STOP: "Run is stopping.",
@@ -532,6 +557,22 @@ def build_high_autonomy_summary(
     elif ha_state.current_step == HA_STEP_RESPONSE_EXTRACTION_FAILED:
         doing_now = "Response extraction failed — local fix required"
         needed_now = "Repair extraction integration, then re-extract the preserved response locally."
+    elif ha_state.repair_phase in (
+        REPAIR_PHASE_REPAIR_NEEDED,
+        REPAIR_PHASE_WRITING_REPAIR_INSTRUCTION,
+    ):
+        failed_count = len((ha_state.repair_packet or {}).get("failed_criteria") or [])
+        doing_now = f"Preparing a targeted repair for {failed_count} failed criteria"
+        needed_now = "No human action required"
+    elif ha_state.repair_phase == REPAIR_PHASE_AWAITING_REPAIR_RESPONSE:
+        doing_now = "Waiting for targeted repair response"
+        needed_now = "No human action required"
+    elif ha_state.repair_phase == REPAIR_PHASE_REPAIR_EXECUTING:
+        doing_now = "Executing targeted repair operations"
+        needed_now = "No human action required"
+    elif ha_state.repair_phase == REPAIR_PHASE_REPAIR_VERIFYING:
+        doing_now = "Re-verifying repaired criteria"
+        needed_now = "No human action required"
 
     verification_readiness = ha_state.verification_readiness or verification.get(
         "readiness", "not_run"
@@ -543,12 +584,21 @@ def build_high_autonomy_summary(
     acceptance = acceptance_counts(ha_state.acceptance_criteria)
     metrics = dict(ha_state.metrics or {})
     outcome_labels = {
+        "in_progress": "In progress",
         "completed": "Completed",
         "incomplete": "Incomplete",
         "failed": "Failed",
         "stopped_by_budget": "Budget exhausted",
         "stopped_by_operator": "Stopped by operator",
     }
+    projected_outcome = ha_state.outcome or DEFAULT_OUTCOME_IN_PROGRESS
+    blocking_reason = ""
+    if ha_state.human_required_reason:
+        blocking_reason = ha_state.human_required_reason
+    elif ha_state.repair_phase not in (REPAIR_PHASE_NONE, ""):
+        blocking_reason = ""
+    elif ha_state.unmet_criteria:
+        blocking_reason = f"Unmet criteria: {', '.join(ha_state.unmet_criteria)}"
     return {
         "schema_version": HIGH_AUTONOMY_SCHEMA_VERSION,
         "active": ha_state.active,
@@ -606,9 +656,17 @@ def build_high_autonomy_summary(
         "stale_response_blocked": ha_state.stale_response_blocked,
         "auto_tick_safe": _auto_tick_safe(ha_state),
         "live_rehearsal_status": live_status,
-        "outcome": ha_state.outcome,
-        "outcome_label": outcome_labels.get(ha_state.outcome, "In progress"),
+        "outcome": projected_outcome,
+        "outcome_label": outcome_labels.get(projected_outcome, "In progress"),
         "outcome_reason": ha_state.outcome_reason,
+        "pending_useful_operation_count": len(ha_state.pending_useful_operations),
+        "active_blocked_count": metrics.get("active_blocked_count", 0),
+        "blocking_reason": blocking_reason,
+        "repair_phase": ha_state.repair_phase,
+        "repair_round_count": ha_state.repair_round_count,
+        "max_repair_rounds": ha_state.max_repair_rounds,
+        "repair_packet": ha_state.repair_packet,
+        "last_proposal_coverage_report": ha_state.last_proposal_coverage_report,
         "acceptance_criteria": [dict(item) for item in ha_state.acceptance_criteria],
         "acceptance_verified_count": acceptance["verified"],
         "acceptance_total_count": acceptance["total"],
@@ -724,6 +782,8 @@ def _transport_has_pending_response(transport: "AgentTransport | None") -> bool:
         return False
     if hasattr(transport, "has_pending_response"):
         return bool(transport.has_pending_response())
+    if hasattr(transport, "_pending_response"):
+        return getattr(transport, "_pending_response", None) is not None
     if hasattr(transport, "_pending_text"):
         return getattr(transport, "_pending_text", None) is not None
     if hasattr(transport, "_response_index") and hasattr(transport, "_responses"):
@@ -1066,6 +1126,8 @@ def _ingest_success_state(
     ha_state.mode = HA_MODE_REVIEWING
     ha_state.awaiting_instruction_after_review = not executable
     ha_state.malformed_retry_count = 0
+    if ha_state.repair_phase == REPAIR_PHASE_AWAITING_REPAIR_RESPONSE:
+        ha_state.repair_phase = REPAIR_PHASE_REPAIR_EXECUTING
     ha_state.last_event = event
     ha_state.last_tick_step = "ingest_response"
     controller._session.transcript.append(
@@ -1305,6 +1367,89 @@ def _open_human_critical_actions(
     return open_actions
 
 
+def _remaining_work_turn_budget(ha_state: HighAutonomyRunState) -> int:
+    return max(
+        ha_state.max_turns - ha_state.closure_reserve_turns - ha_state.work_turns_used,
+        0,
+    )
+
+
+def _latest_verification_record(controller: "ControlSurfaceController") -> dict[str, Any] | None:
+    records = controller._session.run_loop.verification_records
+    return records[-1] if records else None
+
+
+def _repairable_verification_failures(ha_state: HighAutonomyRunState) -> list[dict[str, Any]]:
+    return failed_mandatory_criteria(ha_state.acceptance_criteria)
+
+
+def _can_start_repair(
+    controller: "ControlSurfaceController",
+    ha_state: HighAutonomyRunState,
+) -> bool:
+    if ha_state.human_critical_pending:
+        return False
+    if ha_state.repair_phase in (
+        REPAIR_PHASE_REPAIR_EXECUTING,
+        REPAIR_PHASE_REPAIR_VERIFYING,
+        REPAIR_PHASE_AWAITING_REPAIR_RESPONSE,
+    ):
+        return False
+    if int((ha_state.metrics or {}).get("active_blocked_count", 0)) > 0:
+        return False
+    if not _repairable_verification_failures(ha_state):
+        return False
+    if ha_state.repair_round_count >= ha_state.max_repair_rounds:
+        return False
+    if _remaining_work_turn_budget(ha_state) <= 0 and ha_state.current_turn >= ha_state.max_turns:
+        return False
+    if ha_state.current_turn >= ha_state.max_turns:
+        return False
+    return _verification_is_final(controller)
+
+
+def _enter_repair_needed(
+    controller: "ControlSurfaceController",
+    ha_state: HighAutonomyRunState,
+) -> None:
+    goal_text = str((controller._session.goal_intake or {}).get("prompt") or "")
+    ha_state.repair_round_count += 1
+    ha_state.repair_phase = REPAIR_PHASE_REPAIR_NEEDED
+    ha_state.repair_packet = build_repair_packet(
+        criteria=ha_state.acceptance_criteria,
+        verification_record=_latest_verification_record(controller),
+        satisfied_file_hashes=latest_file_hashes(controller._session.operation_records),
+        goal_text=goal_text,
+        remaining_turn_budget=_remaining_work_turn_budget(ha_state),
+        repair_round=ha_state.repair_round_count,
+        max_repair_rounds=ha_state.max_repair_rounds,
+    )
+    ha_state.repair_history.append(
+        {
+            "repair_round": ha_state.repair_round_count,
+            "failed_criteria": list(ha_state.repair_packet.get("failed_criteria") or []),
+            "started_at": _now_iso(),
+        }
+    )
+    controller._session.governance_records.append(
+        {
+            "record_id": f"governance_{uuid.uuid4().hex[:12]}",
+            "event_type": "repair_round_started",
+            "repair_round": ha_state.repair_round_count,
+            "failed_criteria": list(ha_state.repair_packet.get("failed_criteria") or []),
+            "timestamp": _now_iso(),
+        }
+    )
+    ha_state.mode = HA_MODE_RECOVERING
+    ha_state.next_action = HA_NEXT_WRITE_REPAIR
+    ha_state.last_event = (
+        f"Verification found {len(ha_state.repair_packet.get('failed_criteria') or [])} "
+        "repairable failed criteria; preparing targeted repair."
+    )
+    ha_state.current_step = None
+    ha_state.no_progress_tick_count = 0
+
+
 def _sync_counters(
     controller: "ControlSurfaceController",
     ha_state: HighAutonomyRunState,
@@ -1542,8 +1687,8 @@ def _try_finalize_outcome(
         return True
 
     if ha_state.current_turn >= ha_state.max_turns:
-        # Response ingest, admitted execution, and deterministic verification
-        # are planned before this function is allowed to close the run.
+        # Response ingest, admitted execution, deterministic verification,
+        # and repair are planned before this function is allowed to close the run.
         if _pending_ready_invocation(ha_state) is not None:
             return False
         if ha_state.mode == HA_MODE_WAITING_FOR_AGENT:
@@ -1554,6 +1699,19 @@ def _try_finalize_outcome(
             return False
         if _has_acceptance_verification_plan(ha_state) and not verification_final:
             return False
+        if _can_start_repair(controller, ha_state):
+            return False
+        if _repairable_verification_failures(ha_state) and verification_final:
+            _set_final_outcome(
+                ha_state,
+                outcome="incomplete",
+                reason=(
+                    "Mandatory acceptance criteria remain failed after verification; "
+                    f"repair rounds exhausted or unavailable ({ha_state.repair_round_count}/"
+                    f"{ha_state.max_repair_rounds})."
+                ),
+            )
+            return True
         _set_final_outcome(
             ha_state,
             outcome="stopped_by_budget",
@@ -1586,6 +1744,21 @@ def _plan_next_action(
     # the already-consumed response and never re-entering human_required.
     if ha_state.refusal_recovery_pending:
         return HA_NEXT_WRITE_RECOVERY
+
+    if ha_state.repair_phase in (
+        REPAIR_PHASE_REPAIR_NEEDED,
+        REPAIR_PHASE_VERIFICATION_FAILED_REPAIRABLE,
+    ) and _can_start_repair(controller, ha_state):
+        return HA_NEXT_WRITE_REPAIR
+
+    if ha_state.repair_phase == REPAIR_PHASE_AWAITING_REPAIR_RESPONSE:
+        if _pending_ready_invocation(ha_state) is not None:
+            return HA_NEXT_INGEST_RESPONSE
+        if _transport_has_pending_response(transport):
+            return HA_NEXT_INGEST_RESPONSE
+        if _is_callable_backend(ha_state):
+            return HA_NEXT_NONE
+        return HA_NEXT_WAIT_FOR_RESPONSE
 
     # A callable backend response that is already dispatched-and-persisted must be
     # ingested next, even after the controller/transport were reconstructed and
@@ -1640,6 +1813,7 @@ def _plan_next_action(
     if (
         acceptance_needs_verification
         and ready_count == 0
+        and ha_state.repair_phase in (REPAIR_PHASE_NONE, "")
         and (
             ha_state.evidence_count > 0
             or ha_state.current_turn
@@ -1651,6 +1825,24 @@ def _plan_next_action(
     ):
         return HA_NEXT_VERIFY
 
+    if (
+        ha_state.repair_phase in (
+            REPAIR_PHASE_REPAIR_EXECUTING,
+            REPAIR_PHASE_REPAIR_VERIFYING,
+        )
+        and ready_count == 0
+        and not _transport_has_pending_response(transport)
+    ):
+        return HA_NEXT_VERIFY
+
+    if (
+        _verification_is_final(controller)
+        and _can_start_repair(controller, ha_state)
+        and ready_count == 0
+        and not _transport_has_pending_response(transport)
+    ):
+        return HA_NEXT_WRITE_REPAIR
+
     if policy.should_run_verification(
         evidence_count=ha_state.evidence_count,
         verification_readiness=ha_state.verification_readiness,
@@ -1661,7 +1853,7 @@ def _plan_next_action(
         return HA_NEXT_VERIFY
 
     if (
-        ha_state.outcome is not None
+        ha_state.outcome in FINAL_OUTCOMES
         and ready_count == 0
         and not _transport_has_pending_response(transport)
     ):
@@ -2146,6 +2338,45 @@ def tick_high_autonomy_run(
         _save_ha_state(controller, ha_state)
         controller._persist()
 
+    elif planned == HA_NEXT_WRITE_REPAIR:
+        if not ha_state.repair_packet and _can_start_repair(controller, ha_state):
+            _enter_repair_needed(controller, ha_state)
+        ha_state.repair_phase = REPAIR_PHASE_WRITING_REPAIR_INSTRUCTION
+        repair_text = build_repair_instruction_text(ha_state.repair_packet or {})
+        controller.generate_next_continuation_instruction_packet(instruction_text=repair_text)
+        turn_now = controller._session.run_loop.current_turn
+        work_limit = max(ha_state.max_turns - ha_state.closure_reserve_turns, 0)
+        if turn_now <= work_limit:
+            ha_state.work_turns_used += 1
+        else:
+            ha_state.phase = "closure"
+            ha_state.closure_phase_status = "completion_first"
+            ha_state.closure_turns_used += 1
+        if transport is None:
+            _pause_for_unavailable_transport(ha_state, step_result)
+        else:
+            bridge_result = transport.write_instruction(
+                repair_text,
+                turn_number=turn_now,
+                session_id=controller._session.session_id,
+                instruction_id=_latest_instruction_id(controller),
+            )
+            step_result.update({"bridge": bridge_result, "repair_round": ha_state.repair_round_count})
+            _finalize_write_instruction(
+                controller,
+                ha_state,
+                transport,
+                step_result,
+                turn_number=turn_now,
+                event="Wrote targeted verification repair instruction automatically.",
+                event_type="high_autonomy_repair_instruction_written",
+                tick_step="write_repair_instruction",
+            )
+        ha_state.repair_phase = REPAIR_PHASE_AWAITING_REPAIR_RESPONSE
+        ha_state.mode = HA_MODE_WAITING_FOR_AGENT
+        _save_ha_state(controller, ha_state)
+        controller._persist()
+
     elif planned == HA_NEXT_INGEST_RESPONSE:
         if _is_callable_backend(ha_state):
             _tick_ingest_callable(controller, ha_state, transport, step_result)
@@ -2192,6 +2423,10 @@ def tick_high_autonomy_run(
                 continue
 
         ha_state.mode = HA_MODE_AUTO_EXECUTING if executed_ids else HA_MODE_REVIEWING
+        if ha_state.repair_phase == REPAIR_PHASE_AWAITING_REPAIR_RESPONSE and executed_ids:
+            ha_state.repair_phase = REPAIR_PHASE_REPAIR_EXECUTING
+        elif ha_state.repair_phase == REPAIR_PHASE_REPAIR_EXECUTING and executed_ids:
+            ha_state.repair_phase = REPAIR_PHASE_REPAIR_VERIFYING
         if executed_ids:
             ha_state.awaiting_instruction_after_review = False
             ha_state.last_event = (
@@ -2249,16 +2484,66 @@ def tick_high_autonomy_run(
             else "tiny_game_demo"
         )
         ha_state.closure_phase_status = "verifying"
-        controller.verify_bounded_local_workspace(
-            {"workspace_path": workspace, "profile": verification_profile}
-        )
+        verify_body: dict[str, Any] = {
+            "workspace_path": workspace,
+            "profile": verification_profile,
+        }
+        failed_ids = [
+            str(item.get("criterion_id"))
+            for item in _repairable_verification_failures(ha_state)
+        ]
+        if ha_state.repair_phase in (
+            REPAIR_PHASE_REPAIR_EXECUTING,
+            REPAIR_PHASE_REPAIR_VERIFYING,
+        ) and failed_ids:
+            verify_body["criterion_ids"] = failed_ids
+        controller.verify_bounded_local_workspace(verify_body)
         refreshed = controller._high_autonomy_state()
-        ha_state.acceptance_criteria = refreshed.acceptance_criteria
+        if refreshed is not None:
+            ha_state.acceptance_criteria = refreshed.acceptance_criteria
         ha_state.mode = HA_MODE_VERIFYING
         ha_state.last_event = "Ran bounded verification as a controller step."
         ha_state.last_tick_step = "verify"
         step_result["verified"] = True
         step_result["verification_profile"] = verification_profile
+        if ha_state.repair_phase in (
+            REPAIR_PHASE_REPAIR_EXECUTING,
+            REPAIR_PHASE_AWAITING_REPAIR_RESPONSE,
+        ):
+            ha_state.repair_phase = REPAIR_PHASE_REPAIR_VERIFYING
+        if (
+            _verification_is_final(controller)
+            and _repairable_verification_failures(ha_state)
+            and _can_start_repair(controller, ha_state)
+        ):
+            ha_state.repair_phase = REPAIR_PHASE_VERIFICATION_FAILED_REPAIRABLE
+            _enter_repair_needed(controller, ha_state)
+        elif (
+            _verification_is_final(controller)
+            and _repairable_verification_failures(ha_state)
+            and not _can_start_repair(controller, ha_state)
+        ):
+            ha_state.repair_phase = REPAIR_PHASE_NONE
+            _set_final_outcome(
+                ha_state,
+                outcome="incomplete",
+                reason=(
+                    "Mandatory acceptance criteria remain failed after verification; "
+                    "repair is unavailable or repair rounds are exhausted."
+                ),
+            )
+        elif _mandatory_acceptance_complete(ha_state):
+            ha_state.repair_phase = REPAIR_PHASE_NONE
+            ha_state.repair_packet = None
+            for criterion_id in ha_state.completed_criteria:
+                controller._session.governance_records.append(
+                    {
+                        "record_id": f"governance_{uuid.uuid4().hex[:12]}",
+                        "event_type": "criterion_repaired",
+                        "criterion_id": criterion_id,
+                        "timestamp": _now_iso(),
+                    }
+                )
         _save_ha_state(controller, ha_state)
         controller._persist()
 
@@ -2292,8 +2577,16 @@ def tick_high_autonomy_run(
         step_result.get("executed_action_ids")
         or step_result.get("ingested")
         or step_result.get("verified")
-        or planned in (HA_NEXT_WRITE_INSTRUCTION, HA_NEXT_WRITE_RECOVERY, HA_NEXT_HUMAN_APPROVAL)
-        or ha_state.last_tick_step in ("invoke_agent", "ingest_response", "verify", "finalize_outcome")
+        or planned in (
+            HA_NEXT_WRITE_INSTRUCTION,
+            HA_NEXT_WRITE_RECOVERY,
+            HA_NEXT_WRITE_REPAIR,
+            HA_NEXT_HUMAN_APPROVAL,
+        )
+        or ha_state.repair_phase
+        not in (REPAIR_PHASE_NONE, "", None)
+        or ha_state.last_tick_step
+        in ("invoke_agent", "ingest_response", "verify", "finalize_outcome", "write_repair_instruction")
     )
     if progressed or fingerprint != ha_state.last_progress_fingerprint:
         ha_state.no_progress_tick_count = 0
@@ -2301,7 +2594,19 @@ def tick_high_autonomy_run(
         ha_state.no_progress_tick_count += 1
     ha_state.last_progress_fingerprint = fingerprint
     if ha_state.no_progress_tick_count >= MAX_NO_PROGRESS_TICKS:
-        _pause_for_no_progress_livelock(controller, ha_state, fingerprint=fingerprint)
+        if _can_start_repair(controller, ha_state):
+            _enter_repair_needed(controller, ha_state)
+        elif _repairable_verification_failures(ha_state) and _verification_is_final(controller):
+            _set_final_outcome(
+                ha_state,
+                outcome="incomplete",
+                reason=(
+                    "Mandatory acceptance criteria failed verification with no executable "
+                    "action remaining; repair unavailable."
+                ),
+            )
+        else:
+            _pause_for_no_progress_livelock(controller, ha_state, fingerprint=fingerprint)
     _save_ha_state(controller, ha_state)
     controller._persist()
     step_result["last_tick_step"] = ha_state.last_tick_step

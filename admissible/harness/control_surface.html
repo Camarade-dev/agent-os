@@ -1437,10 +1437,11 @@ function renderHighAutonomy(state) {
   body.innerHTML = `
     <div class="ha-outcome-summary" style="margin:0 0 .75rem;padding:.65rem;border:1px solid var(--cs-border);border-radius:6px;">
       <p style="margin:0 0 .35rem;"><strong>Outcome:</strong> ${escapeHtml(outcomeLabel)}</p>
-      <p style="margin:.15rem 0;"><strong>Progress:</strong> acceptance criteria ${escapeHtml(ha.acceptance_verified_count || 0)}/${escapeHtml(ha.acceptance_total_count || 0)} verified</p>
+      <p style="margin:.15rem 0;"><strong>Progress:</strong> acceptance criteria ${escapeHtml(ha.acceptance_verified_count || 0)}/${escapeHtml(ha.acceptance_total_count || 0)} verified${ha.repair_round_count ? ` · Repair round: ${escapeHtml(ha.repair_round_count)}/${escapeHtml(ha.max_repair_rounds || 2)}` : ""}</p>
       <p style="margin:.15rem 0;"><strong>Usage:</strong> ${escapeHtml(metrics.model_invocation_count || 0)} model invocation(s) · ${escapeHtml(metrics.backend_retry_count || 0)} retr${(metrics.backend_retry_count || 0) === 1 ? "y" : "ies"} · ${escapeHtml(metrics.genuine_human_intervention_count || 0)} human interruption(s)</p>
       <p style="margin:.15rem 0;"><strong>Execution:</strong> ${escapeHtml(metrics.useful_write_count || 0)} useful write(s) · ${escapeHtml(metrics.duplicate_noop_count || 0)} duplicate(s) avoided · ${escapeHtml((metrics.read_count || 0) + (metrics.list_count || 0))} read/list operation(s) · ${escapeHtml(metrics.verification_check_count || 0)} verification check(s)</p>
-      <p style="margin:.15rem 0;"><strong>Remaining:</strong> ${escapeHtml(pendingUsefulCount)} pending useful operation(s) · ${escapeHtml(activeBlockerCount)} active blocker(s)${unmet.length ? ` · unmet criteria: ${escapeHtml(unmet.join(", "))}` : ""}</p>
+      <p style="margin:.15rem 0;"><strong>Remaining:</strong> ${escapeHtml(ha.pending_useful_operation_count ?? pendingUsefulCount)} pending useful operation(s) · ${escapeHtml(ha.active_blocked_count ?? activeBlockerCount)} active blocker(s)${unmet.length ? ` · unmet criteria: ${escapeHtml(unmet.join(", "))}` : ""}</p>
+      ${ha.repair_phase && ha.repair_phase !== "none" ? `<p style="margin:.15rem 0;"><strong>Repair:</strong> ${escapeHtml(ha.doing_now || ha.repair_phase)}</p>` : ""}
     </div>
     <dl class="ha-status-grid">
       <div class="ha-status-row"><dt>Target workspace</dt><dd>${escapeHtml(ha.workspace_path || control.target_workspace_path || "—")}</dd></div>

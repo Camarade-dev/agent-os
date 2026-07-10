@@ -1216,10 +1216,11 @@ def _validate_path_like_env(name: str, value: str) -> bool:
 
 def _safe_environment_paths(resolved: dict[str, str]) -> dict[str, str]:
     """Expose known OS/profile path values for Advanced diagnostics (no secrets)."""
+    from admissible.governed_run import canonicalize_environment_paths
+
     expose = (
         "SystemDrive",
         "SystemRoot",
-        "SYSTEMROOT",
         "WINDIR",
         "USERPROFILE",
         "APPDATA",
@@ -1232,7 +1233,12 @@ def _safe_environment_paths(resolved: dict[str, str]) -> dict[str, str]:
         "HOMEDRIVE",
         "HOMEPATH",
     )
-    return {key: resolved[key] for key in expose if key in resolved}
+    filtered = {key: resolved[key] for key in expose if key in resolved}
+    for key, value in resolved.items():
+        if key not in filtered:
+            filtered[key] = value
+    canonical, _aliases = canonicalize_environment_paths(filtered)
+    return canonical
 
 
 def build_cursor_agent_safe_environment(

@@ -408,6 +408,10 @@ class FixtureAgentTransport(AgentTransport):
             "instruction_id": instruction_id,
         }
 
+    def has_pending_response(self) -> bool:
+        """True when a scripted response is queued but not yet read."""
+        return self._pending_response is not None
+
     def read_response_if_changed(self) -> AgentTransportReadResult:
         if self._pending_response is None:
             self.note_status(TRANSPORT_STATUS_WAITING)

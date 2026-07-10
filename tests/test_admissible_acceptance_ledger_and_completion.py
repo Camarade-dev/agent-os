@@ -58,7 +58,7 @@ class TestAdmissibleAcceptanceLedgerAndCompletion(unittest.TestCase):
             + "\n```\n"
         )
         state = self.controller.state_view()
-        self.assertIsNone(state["high_autonomy_summary"]["outcome"])
+        self.assertEqual(state["high_autonomy_summary"]["outcome"], "in_progress")
         self.assertTrue(state["high_autonomy_summary"]["completion_candidate"]["advisory_only"])
         self.assertTrue(
             all(item["status"] == "open" for item in state["high_autonomy_summary"]["acceptance_criteria"])

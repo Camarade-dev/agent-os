@@ -39,6 +39,20 @@ ACCEPTANCE_STATUSES = frozenset(
 FINAL_OUTCOMES = frozenset(
     {"completed", "incomplete", "failed", "stopped_by_budget", "stopped_by_operator"}
 )
+DEFAULT_MAX_REPAIR_ROUNDS = 2
+DEFAULT_OUTCOME_IN_PROGRESS = "in_progress"
+
+_KNOWN_ENV_CANONICAL_KEYS = {
+    "systemroot": "SystemRoot",
+    "systemdrive": "SystemDrive",
+    "programdata": "ProgramData",
+    "userprofile": "USERPROFILE",
+    "appdata": "APPDATA",
+    "localappdata": "LOCALAPPDATA",
+    "temp": "TEMP",
+    "tmp": "TMP",
+    "windir": "WINDIR",
+}
 
 _UTF8_MOJIBAKE_MARKERS = ("â€", "â€™", "â€œ", "Â·", "ï¿½")
 
@@ -274,6 +288,25 @@ def apply_verification_results_to_ledger(
             refs.append(evidence_id)
         notes = criterion.setdefault("verification_notes", [])
         notes.extend(str(result.get("message") or result.get("check_id")) for result in matches)
+        diagnostics = criterion.setdefault("verification_diagnostics", [])
+        for result in matches:
+            payload = dict(result.get("evidence_payload") or {})
+            if payload.get("subchecks") or payload.get("failure_class"):
+                diagnostics.append(
+                    {
+                        "criterion_id": criterion_id,
+                        "status": result.get("status"),
+                        "failure_class": payload.get("failure_class"),
+                        "target_path": payload.get("path")
+                        or (result.get("target_paths") or [None])[0],
+                        "subchecks": payload.get("subchecks") or {},
+                        "passed_subchecks": payload.get("passed_subchecks") or {},
+                        "failed_subchecks": payload.get("failed_subchecks") or {},
+                        "missing": payload.get("missing") or payload.get("missing_paths") or [],
+                        "repair_hint": payload.get("repair_hint"),
+                        "message": result.get("message"),
+                    }
+                )
 
 
 def latest_file_hashes(operation_records: Iterable[dict[str, Any]]) -> dict[str, str]:
@@ -398,14 +431,32 @@ def build_canonical_metrics(
         "verification_fail_count": sum(
             1 for item in verification_results if item.get("status") == "fail"
         ),
-        "genuine_human_intervention_count": len(decisions)
-        + sum(
+        "raw_human_decision_count": len(decisions),
+        "genuine_human_intervention_count": count_genuine_human_interventions(
+            decisions, governance
+        ),
+        "retrospectively_suppressed_pseudo_gate_decision_count": sum(
             1
             for item in governance
-            if item.get("event_type") == "acceptance_criterion_waived"
+            if item.get("event_type")
+            in ("retrospective_pseudo_gate_suppressed", "pseudo_gate_suppressed")
         ),
         "suppressed_pseudo_gate_count": sum(
             1 for item in governance if item.get("event_type") == "pseudo_gate_suppressed"
+        ),
+        "proposal_coverage_failure_count": sum(
+            1
+            for item in governance
+            if item.get("event_type") == "proposal_coverage_incomplete"
+        ),
+        "unmatched_optional_write_count": sum(
+            1 for item in operations if item.get("classification") == "deferred_optional"
+        ),
+        "repair_round_count": sum(
+            1 for item in governance if item.get("event_type") == "repair_round_started"
+        ),
+        "repaired_criterion_count": sum(
+            1 for item in governance if item.get("event_type") == "criterion_repaired"
         ),
         "superseded_gate_count": sum(
             1 for item in governance if item.get("event_type") == "gate_superseded"
@@ -522,9 +573,8 @@ def derive_acceptance_criteria_from_goal(goal_text: str) -> list[dict[str, Any]]
                 "mandatory": True,
                 "verification": [
                     {
-                        "check_id": "file_contains",
+                        "check_id": "game_controls_check",
                         "target_paths": js_targets[:1],
-                        "contains": ["Arrow", "'w'", "'a'", "'s'", "'d'"],
                     }
                 ],
             }
@@ -570,7 +620,7 @@ def derive_acceptance_criteria_from_goal(goal_text: str) -> list[dict[str, Any]]
                 "mandatory": True,
                 "verification": [
                     {
-                        "check_id": "file_contains",
+                        "check_id": "local_usage_check",
                         "target_paths": doc_targets[:1],
                         "contains": ["open", "index.html"],
                     }
@@ -802,6 +852,314 @@ def repair_inconsistent_executable_lifecycle(
     return repairs
 
 
+def extract_required_paths_from_goal(goal_text: str) -> list[str]:
+    """Return explicit mandatory deliverable paths declared in a goal."""
+
+    return _extract_goal_deliverable_filenames(goal_text)
+
+
+def build_proposal_coverage_report(
+    *,
+    goal_text: str,
+    structured_operations: list[dict[str, Any]],
+    satisfied_paths: dict[str, str] | None = None,
+    avoid_optional_polish: bool = False,
+) -> dict[str, Any]:
+    """Compare mandatory goal paths against a proposed structured batch."""
+
+    required_paths = extract_required_paths_from_goal(goal_text)
+    already_satisfied_paths = sorted(path for path in (satisfied_paths or {}) if path)
+    proposed_paths = sorted(
+        {
+            normalize_workspace_relative_path(str(operation.get("path") or ""))
+            for operation in structured_operations
+            if str(operation.get("operation") or "").strip() == "write_file"
+            and str(operation.get("path") or "").strip()
+        }
+    )
+    proposed_required_paths = [path for path in proposed_paths if path in required_paths]
+    missing_required_paths = [
+        path for path in required_paths if path not in proposed_paths and path not in already_satisfied_paths
+    ]
+    additional_paths = [path for path in proposed_paths if path not in required_paths]
+    coverage_complete = not missing_required_paths
+    return {
+        "required_paths": required_paths,
+        "already_satisfied_paths": already_satisfied_paths,
+        "proposed_required_paths": proposed_required_paths,
+        "missing_required_paths": missing_required_paths,
+        "additional_paths": additional_paths,
+        "coverage_complete": coverage_complete,
+        "avoid_optional_polish": avoid_optional_polish,
+    }
+
+
+def classify_optional_write_paths(
+    coverage_report: dict[str, Any],
+) -> dict[str, str]:
+    """Map unmatched proposal paths to deferred_optional when polish is discouraged."""
+
+    if not coverage_report.get("avoid_optional_polish"):
+        return {}
+    return {path: "deferred_optional" for path in coverage_report.get("additional_paths") or []}
+
+
+def failed_mandatory_criteria(criteria: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in criteria
+        if item.get("mandatory", True) and item.get("status") == "verified_fail"
+    ]
+
+
+def build_repair_packet(
+    *,
+    criteria: list[dict[str, Any]],
+    verification_record: dict[str, Any] | None,
+    satisfied_file_hashes: dict[str, str],
+    goal_text: str,
+    remaining_turn_budget: int,
+    repair_round: int,
+    max_repair_rounds: int = DEFAULT_MAX_REPAIR_ROUNDS,
+) -> dict[str, Any]:
+    """Targeted repair scope containing only failed mandatory criteria."""
+
+    failed = failed_mandatory_criteria(criteria)
+    failed_ids = [str(item.get("criterion_id") or "") for item in failed]
+    diagnostics: list[dict[str, Any]] = []
+    for result in (verification_record or {}).get("results") or []:
+        criterion_id = result.get("criterion_id")
+        if criterion_id in failed_ids and result.get("status") == "fail":
+            payload = dict(result.get("evidence_payload") or {})
+            diagnostics.append(
+                {
+                    "criterion_id": criterion_id,
+                    "failure_class": payload.get("failure_class") or "verification_fail",
+                    "target_path": payload.get("path")
+                    or (result.get("target_paths") or [None])[0],
+                    "passed_subchecks": payload.get("passed_subchecks") or {},
+                    "failed_subchecks": payload.get("failed_subchecks") or payload.get("subchecks") or {},
+                    "missing": payload.get("missing") or payload.get("missing_paths") or [],
+                    "repair_hint": payload.get("repair_hint") or result.get("message"),
+                    "message": result.get("message"),
+                }
+            )
+    required_paths = extract_required_paths_from_goal(goal_text)
+    missing_mandatory_paths = [
+        path
+        for path in required_paths
+        if path not in satisfied_file_hashes
+    ]
+    return {
+        "failed_criteria": failed_ids,
+        "verification_diagnostics": diagnostics,
+        "satisfied_file_hashes": dict(satisfied_file_hashes),
+        "missing_mandatory_paths": missing_mandatory_paths,
+        "repair_boundaries": {
+            "preserve_passing_artifacts": True,
+            "structured_operations_only": True,
+            "no_optional_polish": True,
+            "exact_mandatory_paths": missing_mandatory_paths,
+        },
+        "remaining_turn_budget": remaining_turn_budget,
+        "repair_round": repair_round,
+        "max_repair_rounds": max_repair_rounds,
+    }
+
+
+def build_repair_instruction_text(repair_packet: dict[str, Any]) -> str:
+    """Compose a bounded repair instruction from a repair packet."""
+
+    lines = [
+        "TARGETED REPAIR REQUEST: deterministic verification found repairable failures.",
+        "Propose the smallest coherent structured repair batch only.",
+        "Preserve passing artifacts; do not rewrite passing files unless required.",
+        "Use exact mandatory paths; no optional polish; structured operations only.",
+        "",
+        "Failed mandatory criteria:",
+    ]
+    for entry in repair_packet.get("verification_diagnostics") or []:
+        lines.append(
+            f"- {entry.get('criterion_id')}: {entry.get('message') or entry.get('repair_hint')}"
+        )
+    missing_paths = repair_packet.get("missing_mandatory_paths") or []
+    if missing_paths:
+        lines.extend(["", "Exact mandatory paths still missing:"])
+        lines.extend(f"- {path}" for path in missing_paths)
+    lines.extend(
+        [
+            "",
+            "Repair boundaries:",
+            json.dumps(repair_packet.get("repair_boundaries") or {}, ensure_ascii=False, sort_keys=True),
+            "",
+            f"Repair round: {repair_packet.get('repair_round')}/{repair_packet.get('max_repair_rounds')}",
+        ]
+    )
+    return "\n".join(lines).strip()
+
+
+def count_genuine_human_interventions(
+    human_decisions: Iterable[Any],
+    governance_records: Iterable[dict[str, Any]],
+) -> int:
+    """Count human decisions excluding retrospectively suppressed pseudo-gates."""
+
+    suppressed_action_ids = {
+        str(item.get("action_id") or "")
+        for item in governance_records
+        if item.get("event_type")
+        in ("pseudo_gate_suppressed", "retrospective_pseudo_gate_suppressed")
+    }
+    waived = sum(
+        1
+        for item in governance_records
+        if item.get("event_type") == "acceptance_criterion_waived"
+    )
+    genuine = 0
+    for raw in human_decisions:
+        record = raw if isinstance(raw, dict) else raw.to_dict()
+        action_id = str(record.get("action_id") or "")
+        if action_id and action_id in suppressed_action_ids:
+            continue
+        genuine += 1
+    return genuine + waived
+
+
+def canonicalize_environment_paths(
+    paths: dict[str, str] | None,
+) -> tuple[dict[str, str], dict[str, list[str]]]:
+    """Case-insensitively dedupe environment path keys for portable JSON export."""
+
+    if not paths:
+        return {}, {}
+    canonical: dict[str, str] = {}
+    aliases: dict[str, list[str]] = {}
+    for key, value in paths.items():
+        canonical_key = _KNOWN_ENV_CANONICAL_KEYS.get(key.lower(), key)
+        if canonical_key in canonical and canonical[canonical_key] != value:
+            aliases.setdefault(canonical_key, []).append(key)
+            continue
+        if canonical_key not in canonical:
+            canonical[canonical_key] = value
+        if key != canonical_key:
+            aliases.setdefault(canonical_key, []).append(key)
+    for key in list(aliases):
+        aliases[key] = sorted(set(aliases[key]))
+    return canonical, aliases
+
+
+def validate_portable_json_no_case_colliding_keys(value: Any, *, path: str = "$") -> list[str]:
+    """Return paths to objects whose keys collide case-insensitively."""
+
+    violations: list[str] = []
+    if isinstance(value, dict):
+        lowered: dict[str, list[str]] = {}
+        for key in value:
+            lowered.setdefault(str(key).lower(), []).append(str(key))
+        for keys in lowered.values():
+            if len(keys) > 1:
+                violations.append(f"{path}: {keys}")
+        for key, child in value.items():
+            violations.extend(
+                validate_portable_json_no_case_colliding_keys(child, path=f"{path}.{key}")
+            )
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            violations.extend(
+                validate_portable_json_no_case_colliding_keys(child, path=f"{path}[{index}]")
+            )
+    return violations
+
+
+def migrate_high_autonomy_projection(ha_data: dict[str, Any] | None) -> dict[str, Any]:
+    """Normalize legacy null/missing projection fields on load."""
+
+    data = dict(ha_data or {})
+    if data.get("outcome") is None:
+        data["outcome"] = DEFAULT_OUTCOME_IN_PROGRESS if data.get("active") else data.get("outcome")
+    if data.get("outcome") is None:
+        data["outcome"] = DEFAULT_OUTCOME_IN_PROGRESS
+    metrics = dict(data.get("metrics") or {})
+    data["metrics"] = metrics
+    data.setdefault("repair_phase", "none")
+    data.setdefault("repair_round_count", 0)
+    data.setdefault("max_repair_rounds", DEFAULT_MAX_REPAIR_ROUNDS)
+    data.setdefault("repair_history", [])
+    if data.get("pending_useful_operation_count") is None:
+        data["pending_useful_operation_count"] = len(data.get("pending_useful_operations") or [])
+    if data.get("active_blocked_count") is None:
+        data["active_blocked_count"] = int(metrics.get("active_blocked_count", 0))
+    if data.get("blocking_reason") is None:
+        data["blocking_reason"] = ""
+    if data.get("verification_readiness") is None:
+        data["verification_readiness"] = "not_run"
+    if data.get("next_action") is None:
+        data["next_action"] = "none"
+    return data
+
+
+def migrate_session_projection_fields(session_data: dict[str, Any]) -> dict[str, Any]:
+    """Apply non-null projection defaults to exported/imported session payloads."""
+
+    data = dict(session_data)
+    ha = data.get("high_autonomy_run")
+    if isinstance(ha, dict):
+        data["high_autonomy_run"] = migrate_high_autonomy_projection(ha)
+    projected = dict(data.get("projected_run_fields") or {})
+    ha_migrated = data.get("high_autonomy_run") or {}
+    metrics = dict((ha_migrated.get("metrics") if isinstance(ha_migrated, dict) else {}) or {})
+    projected.setdefault(
+        "outcome",
+        (ha_migrated.get("outcome") if isinstance(ha_migrated, dict) else None)
+        or DEFAULT_OUTCOME_IN_PROGRESS,
+    )
+    projected.setdefault(
+        "pending_useful_operation_count",
+        len((ha_migrated.get("pending_useful_operations") if isinstance(ha_migrated, dict) else []) or []),
+    )
+    projected.setdefault(
+        "active_blocked_count",
+        int(metrics.get("active_blocked_count", 0)),
+    )
+    projected.setdefault("blocking_reason", projected.get("blocking_reason") or "")
+    projected.setdefault(
+        "verification_readiness",
+        (ha_migrated.get("verification_readiness") if isinstance(ha_migrated, dict) else None)
+        or "not_run",
+    )
+    projected.setdefault(
+        "next_action",
+        (ha_migrated.get("next_action") if isinstance(ha_migrated, dict) else None) or "none",
+    )
+    data["projected_run_fields"] = projected
+    return data
+
+
+def canonicalize_session_export_payload(session_data: dict[str, Any]) -> dict[str, Any]:
+    """Prepare a session dict for portable JSON export."""
+
+    data = migrate_session_projection_fields(session_data)
+    ha = data.get("high_autonomy_run")
+    if isinstance(ha, dict):
+        history = list(ha.get("invocation_history") or [])
+        for item in history:
+            env_paths = item.get("environment_paths")
+            if isinstance(env_paths, dict):
+                canonical, aliases = canonicalize_environment_paths(env_paths)
+                item["environment_paths"] = canonical
+                if aliases:
+                    item["environment_path_aliases"] = aliases
+        pending = ha.get("pending_agent_invocation")
+        if isinstance(pending, dict) and isinstance(pending.get("environment_paths"), dict):
+            canonical, aliases = canonicalize_environment_paths(pending["environment_paths"])
+            pending["environment_paths"] = canonical
+            if aliases:
+                pending["environment_path_aliases"] = aliases
+        ha["invocation_history"] = history
+        data["high_autonomy_run"] = ha
+    return data
+
+
 __all__ = [
     "ACCEPTANCE_STATUSES",
     "COMPLETION_CANDIDATE_MARKER",
@@ -815,17 +1173,31 @@ __all__ = [
     "apply_verification_results_to_ledger",
     "build_agent_response_extraction_report",
     "build_canonical_metrics",
+    "build_proposal_coverage_report",
+    "build_repair_instruction_text",
+    "build_repair_packet",
+    "canonicalize_environment_paths",
+    "canonicalize_session_export_payload",
     "canonical_operation_fingerprint",
     "canonical_operation_identity",
+    "classify_optional_write_paths",
+    "count_genuine_human_interventions",
     "current_file_sha256",
+    "DEFAULT_MAX_REPAIR_ROUNDS",
+    "DEFAULT_OUTCOME_IN_PROGRESS",
     "derive_acceptance_criteria_from_goal",
     "extract_completion_candidate",
+    "extract_required_paths_from_goal",
+    "failed_mandatory_criteria",
     "has_utf8_mojibake",
     "latest_file_hashes",
     "make_acceptance_ledger",
+    "migrate_high_autonomy_projection",
+    "migrate_session_projection_fields",
     "normalize_workspace_relative_path",
     "repair_inconsistent_executable_lifecycle",
     "ResponseExtractionFailed",
     "sha256_text",
     "validate_coherent_batch_limits",
+    "validate_portable_json_no_case_colliding_keys",
 ]
