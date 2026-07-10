@@ -39,6 +39,7 @@ ALLOWED_VERIFICATION_CHECKS = frozenset(
         "file_not_empty",
         "all_required_files_present",
         "game_controls_check",
+        "game_restart_check",
         "local_usage_check",
     }
 )
@@ -809,6 +810,162 @@ def _check_game_controls(
     )
 
 
+_GAME_RESTART_RESET_FN_RE = re.compile(
+    r"\b(?:resetGame|restartGame|initGame|reset|init)\s*\(",
+    re.I,
+)
+_GAME_RESTART_INLINE_RESET_RE = re.compile(
+    r"\b(?:score|player|collectibles?)\s*=\s*(?:0|\[\]|null|Object\.create\(null\)|\{\})",
+    re.I,
+)
+
+
+def _r_key_binding_present(content: str) -> bool:
+    patterns = [
+        r"""e\.key\s*===?\s*['"]r['"]""",
+        r"""e\.key\s*===?\s*['"]R['"]""",
+        r"""event\.key\s*===?\s*['"]r['"]""",
+        r"""event\.key\s*===?\s*['"]R['"]""",
+        r"""e\.code\s*===?\s*['"]KeyR['"]""",
+        r"""event\.code\s*===?\s*['"]KeyR['"]""",
+        r"""case\s+['"]r['"]\s*:""",
+        r"""case\s+['"]R['"]\s*:""",
+        r"""case\s+['"]KeyR['"]\s*:""",
+        r"""['"]r['"]\s*:\s*(?:true|reset|restart|init)""",
+        r"""['"]R['"]\s*:\s*(?:true|reset|restart|init)""",
+    ]
+    return any(re.search(pattern, content) for pattern in patterns)
+
+
+def _restart_handler_present(content: str) -> bool:
+    if _GAME_RESTART_RESET_FN_RE.search(content):
+        return True
+    if re.search(r"if\s*\([^)]*(?:key|code)[^)]*['\"]r['\"]", content, re.I):
+        return True
+    return False
+
+
+def _player_state_reset_present(content: str) -> bool:
+    patterns = [
+        r"player\.(?:x|y)\s*=",
+        r"placePlayer\s*\(",
+        r"player\s*=\s*\{",
+    ]
+    return any(re.search(pattern, content) for pattern in patterns)
+
+
+def _score_reset_present(content: str) -> bool:
+    patterns = [
+        r"score\s*=\s*0",
+        r"setScore\s*\(\s*0\s*\)",
+        r"updateScoreDisplay\s*\(",
+        r"scoreEl\.textContent\s*=\s*['\"]0['\"]",
+    ]
+    return any(re.search(pattern, content) for pattern in patterns)
+
+
+def _collectible_or_game_state_reset_present(content: str) -> bool:
+    patterns = [
+        r"collectibles?\s*=\s*\[\]",
+        r"spawnCollectibles?\s*\(",
+        r"initCollectibles?\s*\(",
+        r"initGems\s*\(",
+        r"init\s*\(",
+    ]
+    return any(re.search(pattern, content) for pattern in patterns)
+
+
+def _game_restart_subcheck_results(content: str) -> tuple[dict[str, str], list[str], list[str]]:
+    checks = {
+        "r_key_binding_present": _r_key_binding_present(content),
+        "restart_handler_present": _restart_handler_present(content),
+        "player_state_reset_present": _player_state_reset_present(content),
+        "score_reset_present": _score_reset_present(content),
+        "collectible_or_game_state_reset_present": _collectible_or_game_state_reset_present(
+            content
+        ),
+    }
+    subchecks = {name: "pass" if passed else "fail" for name, passed in checks.items()}
+    passed = [name for name, ok in checks.items() if ok]
+    missing = [name for name, ok in checks.items() if not ok]
+    return subchecks, passed, missing
+
+
+def _check_game_restart(
+    workspace: Path, request: VerificationRequest, *, timestamp: str
+) -> VerificationResult:
+    rel_path, target = _generic_target(workspace, request)
+    if not target.is_file():
+        return VerificationResult(
+            check_id=request.check_id,
+            check_name=_check_display_name(request.check_id),
+            target_paths=[rel_path],
+            status="fail",
+            message=f"File is missing: {rel_path}",
+            timestamp=timestamp,
+            evidence_payload={
+                "failure_class": "file_missing",
+                "path": rel_path,
+                "subchecks": {name: "fail" for name in (
+                    "r_key_binding_present",
+                    "restart_handler_present",
+                    "player_state_reset_present",
+                    "score_reset_present",
+                    "collectible_or_game_state_reset_present",
+                )},
+                "failed_subchecks": {
+                    "r_key_binding_present": "fail",
+                    "restart_handler_present": "fail",
+                    "player_state_reset_present": "fail",
+                    "score_reset_present": "fail",
+                    "collectible_or_game_state_reset_present": "fail",
+                },
+                "repair_hint": f"Add R-key restart handling to {rel_path}.",
+            },
+            criterion_id=request.criterion_id,
+        )
+    content = target.read_text(encoding="utf-8", errors="replace")
+    subchecks, passed, missing = _game_restart_subcheck_results(content)
+    mandatory = (
+        "r_key_binding_present",
+        "restart_handler_present",
+        "score_reset_present",
+    )
+    passed_mandatory = all(name in passed for name in mandatory)
+    passed_all = not missing
+    status = "pass" if passed_mandatory else "fail"
+    matched_patterns = [name for name in passed]
+    return VerificationResult(
+        check_id=request.check_id,
+        check_name=_check_display_name(request.check_id),
+        target_paths=[rel_path],
+        status=status,
+        message=(
+            f"Restart behavior present in {rel_path}."
+            if status == "pass"
+            else f"Restart behavior incomplete in {rel_path}."
+        ),
+        timestamp=timestamp,
+        evidence_payload={
+            "failure_class": None if status == "pass" else "content_missing",
+            "path": rel_path,
+            "subchecks": subchecks,
+            "passed_subchecks": {name: "pass" for name in passed},
+            "failed_subchecks": {name: "fail" for name in missing},
+            "matched_patterns": matched_patterns,
+            "repair_hint": (
+                None
+                if status == "pass"
+                else (
+                    f"Add R-key restart to {rel_path}: bind r/R and reset score/player/collectibles "
+                    f"(missing: {', '.join(missing)})"
+                )
+            ),
+        },
+        criterion_id=request.criterion_id,
+    )
+
+
 def _check_local_usage(
     workspace: Path, request: VerificationRequest, *, timestamp: str
 ) -> VerificationResult:
@@ -970,6 +1127,8 @@ def run_single_verification_check(
         return _check_all_required_files_present(workspace, request, timestamp=ts)
     if request.check_id == "game_controls_check":
         return _check_game_controls(workspace, request, timestamp=ts)
+    if request.check_id == "game_restart_check":
+        return _check_game_restart(workspace, request, timestamp=ts)
     if request.check_id == "local_usage_check":
         return _check_local_usage(workspace, request, timestamp=ts)
 

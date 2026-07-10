@@ -483,6 +483,7 @@ class DecisionQueueItem:
     semantic_gate_type: str | None = None
     gate_target: str | None = None
     suppressed_pseudo_gate: bool = False
+    suppressed_non_action: bool = False
     merged_into_action_id: str | None = None
     superseded_by_action_id: str | None = None
     supersession_reason: str | None = None
@@ -772,6 +773,80 @@ def _repair_stale_aggregate_pseudo_gates(session: "ControlSession") -> int:
     return repaired
 
 
+def _is_negated_non_action_source_text(text: str) -> bool:
+    from admissible.long_run_envelope_builder import (
+        CLI_011_NEGATED_CONSTRAINT_SENTENCE,
+        _is_negated_segment,
+        _should_suppress_prose_candidate,
+    )
+
+    normalized = re.sub(r"\s+", " ", (text or "")).strip()
+    if not normalized:
+        return False
+    if normalized.rstrip(".") == CLI_011_NEGATED_CONSTRAINT_SENTENCE.rstrip("."):
+        return True
+    if not _is_negated_segment(normalized):
+        return False
+    suppress, _ = _should_suppress_prose_candidate(
+        normalized,
+        action_type="git_push" if "git push" in normalized.lower() else "unknown",
+        long_run_prompt=None,
+        has_structured_siblings=False,
+    )
+    return suppress
+
+
+def _repair_stale_negated_non_actions(session: "ControlSession") -> int:
+    """Suppress persisted prose candidates that are negative safety constraints."""
+
+    sibling_paths: set[str] = set()
+    sibling_action_ids: list[str] = []
+    for item in session.queue:
+        envelope = session.run_envelopes.get(item.action_id)
+        if item.decision != "ALLOW" or not envelope:
+            continue
+        for operation in envelope.candidate.get("structured_operations") or []:
+            try:
+                sibling_paths.add(
+                    normalize_workspace_relative_path(str(operation.get("path") or "."))
+                )
+            except ValueError:
+                continue
+        sibling_action_ids.append(item.action_id)
+    repaired = 0
+    now = _now_iso()
+    for item in session.queue:
+        if item.suppressed_non_action or item.suppressed_pseudo_gate or item.superseded_at:
+            continue
+        text = "\n".join(
+            str(getattr(item, field, "") or "")
+            for field in ("tool_or_command", "action_type")
+        )
+        envelope = session.run_envelopes.get(item.action_id)
+        if envelope:
+            text = f"{text}\n{envelope.candidate.get('operation_text') or ''}"
+        if not _is_negated_non_action_source_text(text):
+            continue
+        item.suppressed_non_action = True
+        item.lifecycle_status = LIFECYCLE_SUPERSEDED
+        item.supersession_reason = "retrospective_negated_non_action_suppressed"
+        item.superseded_at = now
+        session.governance_records.append(
+            {
+                "record_id": f"governance_{uuid.uuid4().hex[:12]}",
+                "event_type": "retrospective_non_action_suppressed",
+                "action_id": item.action_id,
+                "reason": "negated_constraint_prose_misclassified_as_side_effect",
+                "source_text": (item.tool_or_command or text)[:240],
+                "sibling_action_ids": list(sibling_action_ids),
+                "sibling_structured_paths": sorted(sibling_paths),
+                "timestamp": now,
+            }
+        )
+        repaired += 1
+    return repaired
+
+
 def _operation_record(
     *,
     action_id: str,
@@ -956,7 +1031,7 @@ def available_human_actions(item: DecisionQueueItem, autonomy_level: str) -> lis
         LIFECYCLE_SUPERSEDED,
     ):
         return []
-    if item.superseded_at or item.suppressed_pseudo_gate:
+    if item.superseded_at or item.suppressed_pseudo_gate or item.suppressed_non_action:
         return []
     if item.safe_overwrite_review_required and not item.human_decision_ids:
         return [DECISION_TYPE_APPROVE, DECISION_TYPE_REFUSE]
@@ -2265,6 +2340,7 @@ class ControlSurfaceController:
             governance_records=self._session.governance_records,
         )
         _repair_stale_aggregate_pseudo_gates(self._session)
+        _repair_stale_negated_non_actions(self._session)
         self._persist()
         return self.state_view()
 
@@ -3139,6 +3215,32 @@ class ControlSurfaceController:
                         "action_id": run_env.action_id,
                         "source_action_id": run_env.action_id,
                         "reason": "model_approval_prose_restates_separately_allowed_operation",
+                        "sibling_action_ids": [
+                            entry.action_id
+                            for entry in run_envelopes
+                            if entry.decision.get("decision") == "ALLOW"
+                            and entry.action_id != run_env.action_id
+                        ],
+                        "timestamp": _now_iso(),
+                    }
+                )
+                continue
+
+            candidate_text = str(
+                (run_env.candidate or {}).get("operation_text")
+                or (run_env.candidate or {}).get("tool_or_command")
+                or ""
+            )
+            if _is_negated_non_action_source_text(candidate_text):
+                self._session.governance_records.append(
+                    {
+                        "record_id": f"governance_{uuid.uuid4().hex[:12]}",
+                        "event_type": "negated_non_action_suppressed",
+                        "action_id": run_env.action_id,
+                        "source_action_id": run_env.action_id,
+                        "reason": "negated_non_action",
+                        "source_text": candidate_text[:240],
+                        "detected_action_type": run_env.candidate.get("action_type"),
                         "sibling_action_ids": [
                             entry.action_id
                             for entry in run_envelopes

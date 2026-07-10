@@ -22,7 +22,7 @@
     },
     "negative_only_boundaries.txt": {
       "description": "Every action-bearing sentence is negated/conditional on approval; nothing should be extracted as a positive proposal.",
-      "min_candidate_count": 1,
+      "min_candidate_count": 0,
       "expected_action_types": [],
       "expected_decisions": [],
       "forbidden_action_types": ["install_dependency", "git_push", "deploy_code", "prepare_deploy"],

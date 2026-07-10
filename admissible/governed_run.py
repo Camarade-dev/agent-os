@@ -327,7 +327,9 @@ def active_blocking_action_ids(queue: Iterable[Any]) -> list[str]:
     ids: list[str] = []
     for raw in queue:
         item = raw if isinstance(raw, dict) else raw.to_dict()
-        if item.get("superseded_at") or item.get("suppressed_pseudo_gate"):
+        if item.get("superseded_at") or item.get("suppressed_pseudo_gate") or item.get(
+            "suppressed_non_action"
+        ):
             continue
         if item.get("operation_outcome") in (
             "executed_mutation",
@@ -346,6 +348,9 @@ def active_blocking_action_ids(queue: Iterable[Any]) -> list[str]:
             "refused_closed",
             "superseded",
             "ready_for_next_agent_instruction",
+            "admitted_not_executed",
+            "closed",
+            "no_longer_needs_attention",
         ):
             continue
         decision = item.get("decision")
@@ -440,6 +445,22 @@ def build_canonical_metrics(
             for item in governance
             if item.get("event_type")
             in ("retrospective_pseudo_gate_suppressed", "pseudo_gate_suppressed")
+        ),
+        "retrospectively_suppressed_non_action_decision_count": sum(
+            1
+            for item in governance
+            if item.get("event_type")
+            in ("retrospective_non_action_suppressed", "negated_non_action_suppressed")
+        ),
+        "negated_non_action_suppression_count": sum(
+            1
+            for item in governance
+            if item.get("event_type") == "negated_non_action_suppressed"
+        ),
+        "goal_boundary_suppression_or_refusal_count": sum(
+            1
+            for item in governance
+            if item.get("event_type") == "goal_boundary_suppression_or_refusal"
         ),
         "suppressed_pseudo_gate_count": sum(
             1 for item in governance if item.get("event_type") == "pseudo_gate_suppressed"
@@ -604,9 +625,8 @@ def derive_acceptance_criteria_from_goal(goal_text: str) -> list[dict[str, Any]]
                 "mandatory": True,
                 "verification": [
                     {
-                        "check_id": "file_contains",
+                        "check_id": "game_restart_check",
                         "target_paths": js_targets[:1],
-                        "contains": ["restart", "R"],
                     }
                 ],
             }
@@ -767,6 +787,11 @@ def build_agent_response_extraction_report(
         else "not_present"
     )
 
+    from admissible.long_run_envelope_builder import build_from_raw_output
+
+    builder_out = build_from_raw_output(raw_text)
+    polarity = builder_out.get("extraction_polarity_diagnostics") or {}
+
     return {
         "structured_marker_count": structured_marker_count,
         "structured_block_count": len(blocks),
@@ -777,6 +802,8 @@ def build_agent_response_extraction_report(
         "surviving_action_count": len(extracted_action_ids),
         "completion_candidate_status": completion_status,
         "extraction_failed": structured_marker_count > 0 and len(extracted_action_ids) == 0,
+        "extraction_polarity_diagnostics": polarity,
+        "suppressed_prose_candidates": builder_out.get("suppressed_prose_candidates") or [],
     }
 
 
@@ -1008,7 +1035,12 @@ def count_genuine_human_interventions(
         str(item.get("action_id") or "")
         for item in governance_records
         if item.get("event_type")
-        in ("pseudo_gate_suppressed", "retrospective_pseudo_gate_suppressed")
+        in (
+            "pseudo_gate_suppressed",
+            "retrospective_pseudo_gate_suppressed",
+            "retrospective_non_action_suppressed",
+            "negated_non_action_suppressed",
+        )
     }
     waived = sum(
         1
@@ -1071,6 +1103,44 @@ def validate_portable_json_no_case_colliding_keys(value: Any, *, path: str = "$"
     return violations
 
 
+def reconcile_invocation_history(
+    ha_data: dict[str, Any] | None,
+    transcript: Iterable[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Backfill missing invocation_history rows from transcript metadata."""
+
+    data = dict(ha_data or {})
+    history = list(data.get("invocation_history") or [])
+    known_ids = {str(item.get("invocation_id") or "") for item in history if item.get("invocation_id")}
+    for entry in transcript or []:
+        payload = entry.get("payload") if isinstance(entry, dict) else None
+        if not isinstance(payload, dict):
+            continue
+        invocation_id = str(payload.get("invocation_id") or "").strip()
+        if not invocation_id or invocation_id in known_ids:
+            continue
+        event_type = str(entry.get("event_type") or entry.get("type") or "")
+        if "instruction_written" not in event_type and "response_ingested" not in event_type:
+            continue
+        history.append(
+            {
+                "invocation_id": invocation_id,
+                "status": "response_ready" if "response_ingested" in event_type else "invoked",
+                "turn_number": payload.get("turn"),
+                "reconciled_from_transcript": True,
+                "timestamp": entry.get("timestamp"),
+            }
+        )
+        known_ids.add(invocation_id)
+    pending = data.get("pending_agent_invocation")
+    if isinstance(pending, dict):
+        invocation_id = str(pending.get("invocation_id") or "").strip()
+        if invocation_id and invocation_id not in known_ids:
+            history.append(dict(pending))
+    data["invocation_history"] = history
+    return data
+
+
 def migrate_high_autonomy_projection(ha_data: dict[str, Any] | None) -> dict[str, Any]:
     """Normalize legacy null/missing projection fields on load."""
 
@@ -1104,6 +1174,7 @@ def migrate_session_projection_fields(session_data: dict[str, Any]) -> dict[str,
     data = dict(session_data)
     ha = data.get("high_autonomy_run")
     if isinstance(ha, dict):
+        ha = reconcile_invocation_history(ha, data.get("transcript"))
         data["high_autonomy_run"] = migrate_high_autonomy_projection(ha)
     projected = dict(data.get("projected_run_fields") or {})
     ha_migrated = data.get("high_autonomy_run") or {}

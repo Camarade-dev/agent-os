@@ -1586,10 +1586,23 @@ function renderAdvancedRunRecords(state) {
   const body = document.getElementById("advanced-run-records-body");
   if (!body) return;
   const haRun = state.high_autonomy_run || {};
+  const metrics = (state.high_autonomy_summary || {}).metrics || state.canonical_run_metrics || {};
   const invocations = haRun.invocation_history || [];
+  const invocationCount = Math.max(invocations.length, metrics.model_invocation_count || 0);
   const operations = state.operation_records || [];
+  const constraints = [];
+  for (const record of state.run_loop?.response_records || []) {
+    const diag = record.extraction_report?.extraction_polarity_diagnostics;
+    for (const mention of (diag?.constraint_mentions || [])) {
+      constraints.push(mention);
+    }
+  }
+  const constraintHtml = constraints.length
+    ? `<p class="no-action-note">Constraint acknowledged: ${escapeHtml(constraints[0])}</p>`
+    : "";
   body.innerHTML = `
-    <details><summary>Invocation diagnostics (${escapeHtml(invocations.length)})</summary>
+    ${constraintHtml}
+    <details><summary>Invocation diagnostics (${escapeHtml(invocationCount)})</summary>
       <pre>${escapeHtml(JSON.stringify(invocations, null, 2))}</pre></details>
     <details><summary>Operation history (${escapeHtml(operations.length)})</summary>
       <pre>${escapeHtml(JSON.stringify(operations, null, 2))}</pre></details>`;
@@ -1887,7 +1900,12 @@ function filteredQueue(state) {
   const queue = state.queue || [];
   switch (queueFilter) {
     case "attention":
-      return queue.filter((item) => ATTENTION_DECISIONS.has(item.decision));
+      return queue.filter(
+        (item) =>
+          ATTENTION_DECISIONS.has(item.decision) &&
+          !item.suppressed_non_action &&
+          !item.suppressed_pseudo_gate
+      );
     case "allowed_local":
       return queue.filter((item) => item.decision === "ALLOW");
     case "executed":

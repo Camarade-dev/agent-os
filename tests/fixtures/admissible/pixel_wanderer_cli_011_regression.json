@@ -1,0 +1,551 @@
+{
+  "schema_version": "admissible_live_regression_fixture_v1",
+  "source_session": "pixel-wanderer-cli-011",
+  "claim_boundary": "Minimized deterministic state derived from the exported live run; it is not a claim that the original task completed.",
+  "goal_text": "Build a complete local browser game called Pixel Wanderer as a high-autonomy governed run.\n\nArchitecture and scope are already decided:\nUse plain HTML, CSS, and JavaScript only.\nUse zero dependencies and no framework.\nKeep the entire project local-only.\nDo not deploy, publish, host, push, or access the network.\nDo not use shell commands, package managers, external assets, secrets, or files outside the target workspace.\n\nAcceptance criteria:\nindex.html, style.css, and game.js;\na player-controlled dot;\nArrow keys and WASD movement;\ncollectible items and a visible score;\nrestart with the R key;\na short LOCAL_DEV.md explaining how to open the game locally;\nbounded local verification at the end.\n\nWork through the task in small governed steps until the acceptance criteria are complete. Propose structured local file operations only. Admissible may automatically execute admitted low-risk writes inside the target workspace. Stop for a human only when a genuinely human-critical action is unavoidable.",
+  "budget": {
+    "max_turns": 12,
+    "observed_model_invocations": 1,
+    "observed_executed_writes": 4,
+    "observed_verification_checks": 8,
+    "observed_verified_pass": 7,
+    "observed_verified_fail": 1,
+    "remaining_work_turn_budget": 11
+  },
+  "negative_constraint_sentence": "No shell commands, npm/pip installs, git push, deploy, or network calls.",
+  "false_git_push_candidate": {
+    "action_type": "git_push",
+    "decision": "REQUIRE_HUMAN_APPROVAL",
+    "prose": "No shell commands, npm/pip installs, git push, deploy, or network calls.",
+    "lifecycle_status": "admitted_not_executed",
+    "execution_status": "admitted_not_executed",
+    "human_decision_recorded": true,
+    "counted_as_active_blocker_before_fix": true
+  },
+  "executed_writes": [
+    {
+      "path": "index.html"
+    },
+    {
+      "path": "style.css"
+    },
+    {
+      "path": "game.js"
+    },
+    {
+      "path": "LOCAL_DEV.md"
+    }
+  ],
+  "acceptance_criteria_final": [
+    {
+      "criterion_id": "required_files",
+      "evidence_refs": [
+        "operation_28d7e18f6c1b",
+        "operation_572a069d9fdf",
+        "operation_4f1e0ca370f0",
+        "operation_b0550d3a6a88",
+        "verification_528e74043264"
+      ],
+      "mandatory": true,
+      "source_text": "All required deliverable files are present.",
+      "status": "verified_pass",
+      "verification": [
+        {
+          "check_id": "all_required_files_present",
+          "target_paths": [
+            "index.html",
+            "style.css",
+            "game.js",
+            "LOCAL_DEV.md"
+          ]
+        }
+      ],
+      "verification_diagnostics": [],
+      "verification_notes": [
+        "All 4 required files are present."
+      ]
+    },
+    {
+      "criterion_id": "index_assets",
+      "evidence_refs": [
+        "operation_28d7e18f6c1b",
+        "verification_528e74043264"
+      ],
+      "mandatory": true,
+      "source_text": "HTML references the required local CSS and JS.",
+      "status": "verified_pass",
+      "verification": [
+        {
+          "check_id": "file_contains",
+          "contains": [
+            "style.css",
+            "game.js"
+          ],
+          "target_paths": [
+            "index.html"
+          ]
+        }
+      ],
+      "verification_diagnostics": [],
+      "verification_notes": [
+        "Expected text is present in index.html."
+      ]
+    },
+    {
+      "criterion_id": "index_game_ui",
+      "evidence_refs": [
+        "operation_28d7e18f6c1b",
+        "verification_528e74043264"
+      ],
+      "mandatory": true,
+      "source_text": "HTML contains a game canvas and visible score element.",
+      "status": "verified_pass",
+      "verification": [
+        {
+          "check_id": "file_contains",
+          "contains": [
+            "<canvas",
+            "score"
+          ],
+          "target_paths": [
+            "index.html"
+          ]
+        }
+      ],
+      "verification_diagnostics": [],
+      "verification_notes": [
+        "Expected text is present in index.html."
+      ]
+    },
+    {
+      "criterion_id": "style_non_empty",
+      "evidence_refs": [
+        "operation_4f1e0ca370f0",
+        "verification_528e74043264"
+      ],
+      "mandatory": true,
+      "source_text": "CSS deliverable is non-empty.",
+      "status": "verified_pass",
+      "verification": [
+        {
+          "check_id": "file_not_empty",
+          "target_paths": [
+            "style.css"
+          ]
+        }
+      ],
+      "verification_diagnostics": [],
+      "verification_notes": [
+        "File is non-empty: style.css (440 bytes)"
+      ]
+    },
+    {
+      "criterion_id": "game_controls",
+      "evidence_refs": [
+        "operation_572a069d9fdf",
+        "verification_528e74043264"
+      ],
+      "mandatory": true,
+      "source_text": "JavaScript handles Arrow keys and WASD movement.",
+      "status": "verified_pass",
+      "verification": [
+        {
+          "check_id": "game_controls_check",
+          "target_paths": [
+            "game.js"
+          ]
+        }
+      ],
+      "verification_diagnostics": [
+        {
+          "criterion_id": "game_controls",
+          "failed_subchecks": {},
+          "failure_class": null,
+          "message": "Game controls present in game.js.",
+          "missing": [],
+          "passed_subchecks": {
+            "arrow_controls": "pass",
+            "wasd_controls": "pass"
+          },
+          "repair_hint": null,
+          "status": "pass",
+          "subchecks": {
+            "a": "pass",
+            "arrow_down": "pass",
+            "arrow_left": "pass",
+            "arrow_right": "pass",
+            "arrow_up": "pass",
+            "d": "pass",
+            "s": "pass",
+            "w": "pass"
+          },
+          "target_path": "game.js"
+        }
+      ],
+      "verification_notes": [
+        "Game controls present in game.js."
+      ]
+    },
+    {
+      "criterion_id": "game_collectible_score",
+      "evidence_refs": [
+        "operation_572a069d9fdf",
+        "verification_528e74043264"
+      ],
+      "mandatory": true,
+      "source_text": "JavaScript contains collectible and score behavior.",
+      "status": "verified_pass",
+      "verification": [
+        {
+          "check_id": "file_contains",
+          "contains": [
+            "collectible",
+            "score"
+          ],
+          "target_paths": [
+            "game.js"
+          ]
+        }
+      ],
+      "verification_diagnostics": [],
+      "verification_notes": [
+        "Expected text is present in game.js."
+      ]
+    },
+    {
+      "criterion_id": "game_restart",
+      "evidence_refs": [
+        "operation_572a069d9fdf",
+        "verification_528e74043264"
+      ],
+      "mandatory": true,
+      "source_text": "JavaScript supports R-key restart behavior.",
+      "status": "verified_fail",
+      "verification": [
+        {
+          "check_id": "file_contains",
+          "contains": [
+            "restart",
+            "R"
+          ],
+          "target_paths": [
+            "game.js"
+          ]
+        }
+      ],
+      "verification_diagnostics": [
+        {
+          "criterion_id": "game_restart",
+          "failed_subchecks": {},
+          "failure_class": "content_missing",
+          "message": "Expected text is missing from game.js.",
+          "missing": [
+            "restart"
+          ],
+          "passed_subchecks": {},
+          "repair_hint": "Add expected markers to game.js: restart",
+          "status": "fail",
+          "subchecks": {},
+          "target_path": "game.js"
+        }
+      ],
+      "verification_notes": [
+        "Expected text is missing from game.js."
+      ]
+    },
+    {
+      "criterion_id": "local_usage",
+      "evidence_refs": [
+        "operation_b0550d3a6a88",
+        "verification_528e74043264"
+      ],
+      "mandatory": true,
+      "source_text": "Local usage documentation exists and contains run instructions.",
+      "status": "verified_pass",
+      "verification": [
+        {
+          "check_id": "local_usage_check",
+          "contains": [
+            "open",
+            "index.html"
+          ],
+          "target_paths": [
+            "LOCAL_DEV.md"
+          ]
+        }
+      ],
+      "verification_diagnostics": [],
+      "verification_notes": [
+        "Local usage markers present in LOCAL_DEV.md."
+      ]
+    }
+  ],
+  "verification_results": [
+    {
+      "criterion_id": "required_files",
+      "evidence_refs": [
+        "operation_28d7e18f6c1b",
+        "operation_572a069d9fdf",
+        "operation_4f1e0ca370f0",
+        "operation_b0550d3a6a88",
+        "verification_528e74043264"
+      ],
+      "mandatory": true,
+      "source_text": "All required deliverable files are present.",
+      "status": "verified_pass",
+      "verification": [
+        {
+          "check_id": "all_required_files_present",
+          "target_paths": [
+            "index.html",
+            "style.css",
+            "game.js",
+            "LOCAL_DEV.md"
+          ]
+        }
+      ],
+      "verification_diagnostics": [],
+      "verification_notes": [
+        "All 4 required files are present."
+      ]
+    },
+    {
+      "criterion_id": "index_assets",
+      "evidence_refs": [
+        "operation_28d7e18f6c1b",
+        "verification_528e74043264"
+      ],
+      "mandatory": true,
+      "source_text": "HTML references the required local CSS and JS.",
+      "status": "verified_pass",
+      "verification": [
+        {
+          "check_id": "file_contains",
+          "contains": [
+            "style.css",
+            "game.js"
+          ],
+          "target_paths": [
+            "index.html"
+          ]
+        }
+      ],
+      "verification_diagnostics": [],
+      "verification_notes": [
+        "Expected text is present in index.html."
+      ]
+    },
+    {
+      "criterion_id": "index_game_ui",
+      "evidence_refs": [
+        "operation_28d7e18f6c1b",
+        "verification_528e74043264"
+      ],
+      "mandatory": true,
+      "source_text": "HTML contains a game canvas and visible score element.",
+      "status": "verified_pass",
+      "verification": [
+        {
+          "check_id": "file_contains",
+          "contains": [
+            "<canvas",
+            "score"
+          ],
+          "target_paths": [
+            "index.html"
+          ]
+        }
+      ],
+      "verification_diagnostics": [],
+      "verification_notes": [
+        "Expected text is present in index.html."
+      ]
+    },
+    {
+      "criterion_id": "style_non_empty",
+      "evidence_refs": [
+        "operation_4f1e0ca370f0",
+        "verification_528e74043264"
+      ],
+      "mandatory": true,
+      "source_text": "CSS deliverable is non-empty.",
+      "status": "verified_pass",
+      "verification": [
+        {
+          "check_id": "file_not_empty",
+          "target_paths": [
+            "style.css"
+          ]
+        }
+      ],
+      "verification_diagnostics": [],
+      "verification_notes": [
+        "File is non-empty: style.css (440 bytes)"
+      ]
+    },
+    {
+      "criterion_id": "game_controls",
+      "evidence_refs": [
+        "operation_572a069d9fdf",
+        "verification_528e74043264"
+      ],
+      "mandatory": true,
+      "source_text": "JavaScript handles Arrow keys and WASD movement.",
+      "status": "verified_pass",
+      "verification": [
+        {
+          "check_id": "game_controls_check",
+          "target_paths": [
+            "game.js"
+          ]
+        }
+      ],
+      "verification_diagnostics": [
+        {
+          "criterion_id": "game_controls",
+          "failed_subchecks": {},
+          "failure_class": null,
+          "message": "Game controls present in game.js.",
+          "missing": [],
+          "passed_subchecks": {
+            "arrow_controls": "pass",
+            "wasd_controls": "pass"
+          },
+          "repair_hint": null,
+          "status": "pass",
+          "subchecks": {
+            "a": "pass",
+            "arrow_down": "pass",
+            "arrow_left": "pass",
+            "arrow_right": "pass",
+            "arrow_up": "pass",
+            "d": "pass",
+            "s": "pass",
+            "w": "pass"
+          },
+          "target_path": "game.js"
+        }
+      ],
+      "verification_notes": [
+        "Game controls present in game.js."
+      ]
+    },
+    {
+      "criterion_id": "game_collectible_score",
+      "evidence_refs": [
+        "operation_572a069d9fdf",
+        "verification_528e74043264"
+      ],
+      "mandatory": true,
+      "source_text": "JavaScript contains collectible and score behavior.",
+      "status": "verified_pass",
+      "verification": [
+        {
+          "check_id": "file_contains",
+          "contains": [
+            "collectible",
+            "score"
+          ],
+          "target_paths": [
+            "game.js"
+          ]
+        }
+      ],
+      "verification_diagnostics": [],
+      "verification_notes": [
+        "Expected text is present in game.js."
+      ]
+    },
+    {
+      "criterion_id": "game_restart",
+      "evidence_refs": [
+        "operation_572a069d9fdf",
+        "verification_528e74043264"
+      ],
+      "mandatory": true,
+      "source_text": "JavaScript supports R-key restart behavior.",
+      "status": "verified_fail",
+      "verification": [
+        {
+          "check_id": "file_contains",
+          "contains": [
+            "restart",
+            "R"
+          ],
+          "target_paths": [
+            "game.js"
+          ]
+        }
+      ],
+      "verification_diagnostics": [
+        {
+          "criterion_id": "game_restart",
+          "failed_subchecks": {},
+          "failure_class": "content_missing",
+          "message": "Expected text is missing from game.js.",
+          "missing": [
+            "restart"
+          ],
+          "passed_subchecks": {},
+          "repair_hint": "Add expected markers to game.js: restart",
+          "status": "fail",
+          "subchecks": {},
+          "target_path": "game.js"
+        }
+      ],
+      "verification_notes": [
+        "Expected text is missing from game.js."
+      ]
+    },
+    {
+      "criterion_id": "local_usage",
+      "evidence_refs": [
+        "operation_b0550d3a6a88",
+        "verification_528e74043264"
+      ],
+      "mandatory": true,
+      "source_text": "Local usage documentation exists and contains run instructions.",
+      "status": "verified_pass",
+      "verification": [
+        {
+          "check_id": "local_usage_check",
+          "contains": [
+            "open",
+            "index.html"
+          ],
+          "target_paths": [
+            "LOCAL_DEV.md"
+          ]
+        }
+      ],
+      "verification_diagnostics": [],
+      "verification_notes": [
+        "Local usage markers present in LOCAL_DEV.md."
+      ]
+    }
+  ],
+  "game_js_cli011_content": "(function () {\n  'use strict';\n\n  const canvas = document.getElementById('game');\n  if (!canvas) return;\n\n  const ctx = canvas.getContext('2d');\n  const scoreEl = document.getElementById('score');\n  const TILE = 16;\n  const COLLECTIBLE_SIZE = 10;\n  const COLLECTIBLE_COUNT = 8;\n\n  let player;\n  let collectibles;\n  let score;\n  const keys = {};\n\n  function init() {\n    player = { x: 320, y: 240, speed: 2, w: 12, h: 12 };\n    score = 0;\n    collectibles = spawnCollectibles();\n    updateScoreDisplay();\n  }\n\n  function overlaps(a, b, margin) {\n    margin = margin || 0;\n    return (\n      a.x - margin < b.x + b.w &&\n      a.x + a.w + margin > b.x &&\n      a.y - margin < b.y + b.h &&\n      a.y + a.h + margin > b.y\n    );\n  }\n\n  function spawnCollectibles() {\n    const items = [];\n    const pad = 24;\n    let attempts = 0;\n    while (items.length < COLLECTIBLE_COUNT && attempts < 200) {\n      attempts += 1;\n      const c = {\n        x: pad + Math.random() * (canvas.width - pad * 2 - COLLECTIBLE_SIZE),\n        y: pad + Math.random() * (canvas.height - pad * 2 - COLLECTIBLE_SIZE),\n        w: COLLECTIBLE_SIZE,\n        h: COLLECTIBLE_SIZE,\n      };\n      if (!overlaps(c, player, 20) && !items.some((item) => overlaps(c, item, 12))) {\n        items.push(c);\n      }\n    }\n    return items;\n  }\n\n  function updateScoreDisplay() {\n    if (scoreEl) scoreEl.textContent = 'Score: ' + score;\n  }\n\n  window.addEventListener('keydown', (e) => {\n    keys[e.key] = true;\n    if (e.key === 'r' || e.key === 'R') init();\n  });\n\n  window.addEventListener('keyup', (e) => {\n    keys[e.key] = false;\n  });\n\n  function update() {\n    if (keys['ArrowUp'] || keys['w'] || keys['W']) player.y -= player.speed;\n    if (keys['ArrowDown'] || keys['s'] || keys['S']) player.y += player.speed;\n    if (keys['ArrowLeft'] || keys['a'] || keys['A']) player.x -= player.speed;\n    if (keys['ArrowRight'] || keys['d'] || keys['D']) player.x += player.speed;\n\n    player.x = Math.max(0, Math.min(canvas.width - player.w, player.x));\n    player.y = Math.max(0, Math.min(canvas.height - player.h, player.y));\n\n    for (let i = collectibles.length - 1; i >= 0; i--) {\n      if (overlaps(player, collectibles[i])) {\n        collectibles.splice(i, 1);\n        score += 1;\n        updateScoreDisplay();\n      }\n    }\n\n    if (collectibles.length === 0) collectibles = spawnCollectibles();\n  }\n\n  function draw() {\n    ctx.fillStyle = '#16213e';\n    ctx.fillRect(0, 0, canvas.width, canvas.height);\n\n    for (let x = 0; x < canvas.width; x += TILE) {\n      for (let y = 0; y < canvas.height; y += TILE) {\n        if ((x / TILE + y / TILE) % 2 === 0) {\n          ctx.fillStyle = '#1a2744';\n          ctx.fillRect(x, y, TILE, TILE);\n        }\n      }\n    }\n\n    ctx.fillStyle = '#f5c542';\n    collectibles.forEach((c) => ctx.fillRect(c.x, c.y, c.w, c.h));\n\n    ctx.fillStyle = '#e94560';\n    ctx.fillRect(player.x, player.y, player.w, player.h);\n  }\n\n  function loop() {\n    update();\n    draw();\n    requestAnimationFrame(loop);\n  }\n\n  init();\n  loop();\n})();\n",
+  "game_restart_audit": {
+    "r_key_binding_present": true,
+    "restart_handler_present": true,
+    "player_state_reset_present": true,
+    "score_reset_present": true,
+    "collectible_or_game_state_reset_present": true,
+    "legacy_literal_restart_string_present": false,
+    "classification": "present_matcher_missed"
+  },
+  "final_state_before_fix": {
+    "outcome": "incomplete",
+    "active_blocked_count": 1,
+    "genuine_human_intervention_count": 1,
+    "raw_human_decision_count": 1,
+    "repair_round_count": 0,
+    "pending_useful_operation_count": 0
+  },
+  "human_decisions": {
+    "raw_human_decision_count": 1,
+    "genuine_human_intervention_count_after_fix": 0,
+    "retrospectively_suppressed_non_action_decision_count": 1
+  },
+  "agent_response_excerpt": "## Governed Proposal — Turn 1\n\n**Task:** `software_build: browser local game` (Pixel Wanderer)  \n**Autonomy:** L4_HIGH_AUTONOMY_HARD_GATES  \n**Workspace state:** Empty — no deliverable files exist yet; all acceptance criteria are open.\n\n### Batch rationale\n\nThis is turn 1 with no prior executed operations. The required final artifacts and behavior are fully specified (`index.html`, `style.css`, `game.js`, `LOCAL_DEV.md`). Per the continuation instruction, independent low-risk final file creates should be batched when acceptance criteria are already known.\n\nThis batch proposes **4 bounded `write_file` operations** (within the limit of 8 ops / 262144 bytes) to create all mandatory deliverables in one coherent step. No shell commands, dependency installs, network calls, or deployments are proposed.\n\n**Nothing in this response has been executed.** These operations require separate Admissible admission and bounded-executor approval.\n\n---\n\n### Proposed operation 1: create `index.html`\n\nSatisfies: `required_files`, `index_assets`, `index_game_ui`\n\nADMISSIBLE_STRUCTURED_OPERATION:\n```json\n{\"operation\": \"write_file\", \"path\": \"index.html\", \"content\": \"<!DOCTYPE html>\\n<html lang=\\\"en\\\">\\n<he"
+}

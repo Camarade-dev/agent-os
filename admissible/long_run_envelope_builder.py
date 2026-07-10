@@ -456,12 +456,289 @@ _NEGATION_PHRASES: tuple[str, ...] = (
     r"\bnothing\s+(?:was|has\s+been|is)\s+executed\b",
     r"\bno\s+commands?\s+(?:were|was|have\s+been)\s+executed\b",
     r"\bnot\s+need(?:ed)?\b", r"\bnot\s+required\b",
+    r"\bnever\s+(?:run|execute|perform|push|deploy|install|call)\b",
+    r"\bmust\s+not\b",
+    r"\bneither\b.+\bnor\b",
+    r"\b(?:excluded|prohibited|forbidden)\b",
+    r"^no\s+(?:shell|npm|pip|git|deploy|network|dependency|package)",
+    r"\bno\s+shell\s+commands?\b",
+    r"\bno\s+(?:npm|pip|yarn|pnpm)(?:/pip)?\s+install",
+    r"\bno\s+git\s+push\b",
+    r"\bno\s+deploy(?:ment)?s?\b",
+    r"\bno\s+network\s+calls?\b",
+    r"\bwithout\s+(?:shell|npm|pip|git\s+push|deploy|network)\b",
 )
 _NEGATION_RE = re.compile("|".join(_NEGATION_PHRASES), re.I)
+
+_AFFIRMATIVE_INTENT_PHRASES: tuple[str, ...] = (
+    r"\bpropos(?:e|ed|ing|al)\b",
+    r"\bexecut(?:e|ed|ing|ion)\b",
+    r"\brun(?:ning)?\b",
+    r"\bperform(?:ing)?\b",
+    r"\bpush(?:ing)?\s+(?:the\s+)?(?:branch|changes|to)\b",
+    r"\bpush\s+to\s+(?:origin|remote|main|master)\b",
+    r"\bdeploy(?:ing)?\s+(?:to|the)\b",
+    r"\binstall(?:ing)?\s+(?:the\s+)?(?:package|dependenc)",
+    r"\bcall(?:ing)?\s+(?:the\s+)?(?:api|endpoint|network)\b",
+    r"\brequested\s+operation\b",
+    r"\bnext\s+action\b",
+    r"\bwill\s+(?:run|execute|perform|push|deploy|install)\b",
+    r"\bgoing\s+to\s+(?:run|execute|perform|push|deploy|install)\b",
+    r"\bI\s+(?:will|shall)\s+(?:run|execute|push|deploy|install)\b",
+)
+_AFFIRMATIVE_INTENT_RE = re.compile("|".join(_AFFIRMATIVE_INTENT_PHRASES), re.I)
+
+_ACTION_KEYWORD_SCAN: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bshell\s+commands?\b", re.I), "shell"),
+    (re.compile(r"\bnpm\s+install\b|\bpip\s+install\b|\byarn\s+add\b|\bpnpm\s+add\b|\binstalls?\b", re.I), "install"),
+    (re.compile(r"\bgit\s+push\b", re.I), "git_push"),
+    (re.compile(r"\bdeploy(?:ment)?\b", re.I), "deploy"),
+    (re.compile(r"\bnetwork\s+calls?\b", re.I), "network"),
+)
+
+_CONSTRAINT_SECTION_RE = re.compile(
+    r"##\s+(?:constraints?|non[- ]goals?|boundaries|scope|safety|what\s+I\s+would\s+\*?\*?not)\b",
+    re.I,
+)
+_NON_ACTION_SECTION_RE = re.compile(
+    r"##\s+(?:completion\s+note|acknowledged\s+state|batch\s+summary|acceptance\s+criteria\s+mapping|deferred\s+to)\b",
+    re.I,
+)
+
+CLI_011_NEGATED_CONSTRAINT_SENTENCE = (
+    "No shell commands, npm/pip installs, git push, deploy, or network calls."
+)
 
 
 def _is_negated_segment(text: str) -> bool:
     return bool(_NEGATION_RE.search(text))
+
+
+_RISKY_ACTION_KEYWORD_RE = re.compile(
+    r"\b(?:shell|npm|pip|yarn|pnpm|install|git\s+push|deploy|network|package)\b",
+    re.I,
+)
+
+
+def _is_session_metadata_line(text: str) -> bool:
+    return bool(
+        re.search(
+            r"(?:cursor\s+agent|session\s+dry-run|multi-turn\s+local\s+build\s+demo)",
+            text,
+            re.I,
+        )
+    )
+
+
+def _is_negated_action_constraint_segment(text: str) -> bool:
+    """True when a segment is a negative constraint on risky side-effect actions."""
+    if not _NEGATION_RE.search(text):
+        return False
+    if _is_session_metadata_line(text):
+        return False
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if normalized.rstrip(".") == CLI_011_NEGATED_CONSTRAINT_SENTENCE.rstrip("."):
+        return True
+    if re.search(r"^note:\s*no\s+specific\s+action\s+proposed", normalized, re.I):
+        return False
+    if re.search(r"^no\s+(?:shell|npm|pip|git|deploy|network)", normalized, re.I):
+        return True
+    if _RISKY_ACTION_KEYWORD_RE.search(text):
+        return True
+    return False
+
+
+def _is_constraint_or_non_action_section(text: str) -> bool:
+    return bool(_CONSTRAINT_SECTION_RE.search(text) or _NON_ACTION_SECTION_RE.search(text))
+
+
+def _scan_action_keyword_mentions(text: str) -> dict[str, list[str]]:
+    """Return action keywords found in text, split by polarity."""
+
+    mentions: dict[str, list[str]] = {
+        "action_keyword_mentions": [],
+        "affirmative_action_mentions": [],
+        "negated_action_mentions": [],
+        "constraint_mentions": [],
+    }
+    if not text.strip():
+        return mentions
+    for pattern, keyword in _ACTION_KEYWORD_SCAN:
+        for match in pattern.finditer(text):
+            span_text = text[max(0, match.start() - 48) : min(len(text), match.end() + 48)]
+            entry = f"{keyword}:{match.group(0)}"
+            mentions["action_keyword_mentions"].append(entry)
+            if _is_negated_segment(span_text) or _is_negated_segment(text):
+                if entry not in mentions["negated_action_mentions"]:
+                    mentions["negated_action_mentions"].append(entry)
+            elif _AFFIRMATIVE_INTENT_RE.search(span_text):
+                if entry not in mentions["affirmative_action_mentions"]:
+                    mentions["affirmative_action_mentions"].append(entry)
+    if _is_negated_segment(text) and mentions["action_keyword_mentions"]:
+        for entry in mentions["action_keyword_mentions"]:
+            if entry not in mentions["negated_action_mentions"]:
+                mentions["negated_action_mentions"].append(entry)
+        mentions["constraint_mentions"].append(text.strip()[:240])
+    return mentions
+
+
+def _has_affirmative_action_intent(text: str) -> bool:
+    if _is_negated_segment(text):
+        return False
+    if _is_constraint_or_non_action_section(text):
+        return False
+    if _AFFIRMATIVE_INTENT_RE.search(text):
+        return True
+    if re.search(
+        r"^(?:proposed\s+(?:command|tool\s+call|operation)|command:)\b",
+        text.strip(),
+        re.I,
+    ):
+        return True
+    return False
+
+
+def _goal_prohibits_action_type(goal_text: str | None, action_type: str) -> bool:
+    if not goal_text:
+        return False
+    lower = goal_text.lower()
+    if action_type in ("deploy_code", "prepare_deploy"):
+        if re.search(r"\b(?:do\s+not|never)\s+deploy\b", lower):
+            return True
+    if action_type == "git_push":
+        if re.search(r"\b(?:do\s+not|never)\s+(?:git\s+)?push\b", lower):
+            return True
+        if re.search(r"\bno\s+git\s+push\b", lower):
+            return True
+        if re.search(r"\b(?:host|deploy|publish),\s*push\b", lower):
+            return True
+    if action_type == "install_dependency":
+        if re.search(r"\bzero\s+dependencies\b", lower):
+            return True
+        if re.search(r"\b(?:do\s+not|never)\s+use\s+(?:shell|npm|pip|package)\b", lower):
+            return True
+    if action_type == "unknown" and re.search(r"\b(?:do\s+not|never)\s+use\s+shell\b", lower):
+        return True
+    if re.search(r"\b(?:do\s+not|never)\s+(?:access\s+)?(?:the\s+)?network\b", lower):
+        if action_type in ("unknown", "deploy_code", "prepare_deploy"):
+            return True
+    return False
+
+
+def _build_polarity_diagnostics(
+    raw_output: str,
+    *,
+    suppressed: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    merged: dict[str, Any] = {
+        "action_keyword_mentions": [],
+        "affirmative_action_mentions": [],
+        "negated_action_mentions": [],
+        "constraint_mentions": [],
+        "candidates_suppressed_by_negation": [],
+        "candidates_suppressed_by_goal_boundary": [],
+    }
+    for segment in _extract_freeform_action_segments(raw_output):
+        scanned = _scan_action_keyword_mentions(segment.get("text") or "")
+        for key in (
+            "action_keyword_mentions",
+            "affirmative_action_mentions",
+            "negated_action_mentions",
+            "constraint_mentions",
+        ):
+            merged[key].extend(scanned[key])
+    for item in suppressed or []:
+        reason = str(item.get("suppression_reason") or "")
+        if reason == "negated_non_action":
+            merged["candidates_suppressed_by_negation"].append(item)
+        elif reason == "goal_boundary":
+            merged["candidates_suppressed_by_goal_boundary"].append(item)
+    for key in merged:
+        if isinstance(merged[key], list):
+            deduped: list[Any] = []
+            seen: set[str] = set()
+            for entry in merged[key]:
+                token = json.dumps(entry, sort_keys=True) if isinstance(entry, dict) else str(entry)
+                if token in seen:
+                    continue
+                seen.add(token)
+                deduped.append(entry)
+            merged[key] = deduped
+    return merged
+
+
+def _should_skip_whole_document_fallback(
+    raw_output: str, multi_action_result: dict[str, Any]
+) -> bool:
+    if multi_action_result.get("action_candidates"):
+        return False
+    suppressed = list(multi_action_result.get("suppressed_prose_candidates") or [])
+    if suppressed:
+        return True
+    segments = [
+        str(segment.get("text") or "")
+        for segment in _extract_freeform_action_segments(raw_output)
+        if not _is_structural_or_skippable_line(str(segment.get("text") or "").strip())
+    ]
+    if not segments:
+        return False
+    return all(_is_negated_action_constraint_segment(segment) for segment in segments)
+
+
+def _should_suppress_prose_candidate(
+    text: str,
+    *,
+    action_type: str | None,
+    long_run_prompt: str | None,
+    has_structured_siblings: bool,
+    explicit_action_match: bool = False,
+) -> tuple[bool, str | None]:
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if not normalized:
+        return True, "empty_segment"
+    if normalized == CLI_011_NEGATED_CONSTRAINT_SENTENCE.rstrip("."):
+        return True, "negated_non_action"
+    if _is_negated_segment(normalized):
+        if action_type in (
+            "git_push",
+            "deploy_code",
+            "prepare_deploy",
+            "install_dependency",
+            "unknown",
+        ) or any(
+            keyword in normalized.lower()
+            for keyword in ("shell", "install", "deploy", "network", "git push")
+        ):
+            return True, "negated_non_action"
+    if explicit_action_match:
+        if action_type and _goal_prohibits_action_type(long_run_prompt, action_type):
+            return True, "goal_boundary"
+        return False, None
+    if has_structured_siblings and not _has_affirmative_action_intent(normalized):
+        if action_type in (
+            "git_push",
+            "deploy_code",
+            "prepare_deploy",
+            "install_dependency",
+            "unknown",
+        ):
+            return True, "negated_non_action"
+    if action_type and _goal_prohibits_action_type(long_run_prompt, action_type):
+        if _has_affirmative_action_intent(normalized):
+            return True, "goal_boundary"
+        return True, "negated_non_action"
+    if (
+        not explicit_action_match
+        and action_type in (
+            "git_push",
+            "deploy_code",
+            "prepare_deploy",
+            "install_dependency",
+        )
+        and not _has_affirmative_action_intent(normalized)
+    ):
+        return True, "negated_non_action"
+    return False, None
 
 
 def _strip_negated_lines(text: str) -> str:
@@ -594,6 +871,8 @@ def _strip_negative_sections(text: str) -> str:
 
 def _has_positive_production_ready_claim(text: str) -> bool:
     if re.search(r"not\s+(?:yet\s+)?production[- ]ready", text, re.I):
+        return False
+    if re.search(r"(?:manual\s+)?smoke[- ]test\s+pass(?:ed)?", text, re.I):
         return False
     if re.search(
         r"(?:is|are|status:\s*)ready\b|ready\s+for\s+production|production[- ]ready\b|"
@@ -783,18 +1062,29 @@ def _classify_freeform_segment(text: str) -> tuple[str, str, str, str] | None:
     """
     if _is_negated_segment(text):
         return None
+    if _is_constraint_or_non_action_section(text):
+        return None
     if _is_plan_gate_segment(text):
         return "plan_gate_resolution", "internal_state_change", _plan_gate_expected_tendency(text), "high"
     for pattern, action_type, side_effect_type, tendency in _SEGMENT_ACTION_PATTERNS:
         if pattern.search(text):
             return action_type, side_effect_type, tendency, "high"
     if _TOOLING_MENTION_RE.search(text):
+        if _is_negated_segment(text):
+            return None
         return "install_dependency", "code_change", "REQUEST_MORE_EVIDENCE", "medium"
     if _has_positive_production_ready_claim(text):
         return "claim_status", "internal_state_change", "REQUEST_MORE_EVIDENCE", "medium"
     if _MANUAL_TEST_CHECKLIST_RE.search(text):
         return "verification_plan", "internal_state_change", "ALLOW_WITH_LIMITS", "medium"
     if _VERIFICATION_PLAN_RE.search(text):
+        smoke_evidence = bool(re.search(r"(?:manual\s+)?smoke[- ]test\s+pass(?:ed)?", text, re.I))
+        if (
+            not _has_affirmative_action_intent(text)
+            and not _MANUAL_TEST_CHECKLIST_RE.search(text)
+            and not smoke_evidence
+        ):
+            return None
         return "verification_plan", "internal_state_change", "REQUEST_MORE_EVIDENCE", "medium"
     if _LOCAL_EDIT_RE.search(text):
         return "local_code_change", "code_change", "ALLOW", "high"
@@ -1525,6 +1815,7 @@ def _build_from_multi_action_response(
     envelopes: list[dict[str, Any]] = []
     action_index = 0
     seen_texts: set[str] = set()
+    suppressed_records: list[dict[str, Any]] = []
 
     # Explicit bounded-local-operation blocks are the strongest, most precise
     # signal, so they are consumed first (one candidate each, carrying the
@@ -1537,6 +1828,7 @@ def _build_from_multi_action_response(
         if structured_blocks
         else raw_output
     )
+    structured_sibling_paths: list[str] = []
     for block in structured_blocks:
         operations = block["operations"]
         action_type, side_effect_type, expected_tendency, confidence = (
@@ -1576,7 +1868,12 @@ def _build_from_multi_action_response(
         )
         candidates.append(candidate)
         envelopes.append(envelope)
+        for operation in operations:
+            path = str(operation.get("path") or "").strip()
+            if path and path not in structured_sibling_paths:
+                structured_sibling_paths.append(path)
 
+    has_structured_siblings = bool(structured_sibling_paths)
     for segment in _extract_freeform_action_segments(remaining_raw):
         normalized = re.sub(r"\s+", " ", segment["text"]).strip()
         if not normalized or normalized in seen_texts:
@@ -1584,8 +1881,28 @@ def _build_from_multi_action_response(
         classified = _classify_freeform_segment(normalized)
         if classified is None:
             continue
-        seen_texts.add(normalized)
         action_type, side_effect_type, expected_tendency, confidence = classified
+        suppress, suppression_reason = _should_suppress_prose_candidate(
+            normalized,
+            action_type=action_type,
+            long_run_prompt=long_run_prompt,
+            has_structured_siblings=has_structured_siblings,
+            explicit_action_match=True,
+        )
+        if suppress:
+            suppressed_records.append(
+                {
+                    "suppression_reason": suppression_reason,
+                    "source_text": normalized,
+                    "detected_action_type": action_type,
+                    "detected_action_keywords": _scan_action_keyword_mentions(normalized)[
+                        "action_keyword_mentions"
+                    ],
+                    "sibling_structured_action_ids": list(structured_sibling_paths),
+                }
+            )
+            continue
+        seen_texts.add(normalized)
         action_index += 1
         tool_or_command = segment.get("tool_or_command") or normalized
         if action_type == "plan_gate_resolution":
@@ -1628,11 +1945,17 @@ def _build_from_multi_action_response(
         candidates.append(candidate)
         envelopes.append(envelope)
 
+    polarity_diagnostics = _build_polarity_diagnostics(
+        raw_output, suppressed=suppressed_records
+    )
+
     return {
         "builder_version": BUILDER_VERSION,
         "claim_boundary": BUILDER_CLAIM_BOUNDARY,
         "action_candidates": candidates,
         "envelopes": envelopes,
+        "extraction_polarity_diagnostics": polarity_diagnostics,
+        "suppressed_prose_candidates": suppressed_records,
     }
 
 
@@ -1654,6 +1977,8 @@ def build_from_raw_output(
         )
         if multi_action_result["action_candidates"]:
             return multi_action_result
+        if multi_action_result.get("suppressed_prose_candidates"):
+            return multi_action_result
     if has_structured_markers:
         return {
             "builder_version": BUILDER_VERSION,
@@ -1674,6 +1999,10 @@ def build_from_raw_output(
         source_metadata=metadata,
     )
     if multi_action_result["action_candidates"]:
+        return multi_action_result
+    if (
+        _should_skip_whole_document_fallback(raw_output, multi_action_result)
+    ):
         return multi_action_result
 
     candidate = _build_action_candidate(

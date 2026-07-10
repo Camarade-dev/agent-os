@@ -200,6 +200,8 @@ def queue_item_needs_attention(item: dict[str, Any]) -> bool:
     lifecycle = item.get("lifecycle_status", LIFECYCLE_NEEDS_HUMAN_INPUT)
     if lifecycle in LIFECYCLE_NO_LONGER_NEEDS_ATTENTION:
         return False
+    if item.get("suppressed_pseudo_gate") or item.get("suppressed_non_action"):
+        return False
     if item.get("execution_status") == _EXECUTION_STATUS_ADMITTED_NOT_EXECUTED:
         return False
     return True

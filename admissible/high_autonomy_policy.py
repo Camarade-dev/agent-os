@@ -85,6 +85,22 @@ class HighAutonomyPolicy:
         action_type = getattr(item, "action_type", None) or (
             item.get("action_type") if isinstance(item, dict) else ""
         )
+        if getattr(item, "suppressed_non_action", False) or (
+            isinstance(item, dict) and item.get("suppressed_non_action")
+        ):
+            return HighAutonomyActionClassification(
+                action_id=str(action_id),
+                category="blocked_not_completed",
+                reason="Negated non-action constraint; not a genuine blocker.",
+            )
+        if getattr(item, "suppressed_pseudo_gate", False) or (
+            isinstance(item, dict) and item.get("suppressed_pseudo_gate")
+        ):
+            return HighAutonomyActionClassification(
+                action_id=str(action_id),
+                category="blocked_not_completed",
+                reason="Retrospectively suppressed pseudo-gate.",
+            )
         tool_or_command = (
             getattr(item, "tool_or_command", None)
             or (item.get("tool_or_command") if isinstance(item, dict) else "")
