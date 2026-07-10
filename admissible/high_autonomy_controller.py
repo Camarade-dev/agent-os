@@ -14,15 +14,17 @@ from typing import Any, TYPE_CHECKING
 if TYPE_CHECKING:
     from admissible.agent_transport import AgentTransport
 
-from admissible.high_autonomy_policy import HighAutonomyPolicy
+from admissible.high_autonomy_policy import HighAutonomyPolicy, open_executable_low_risk_actions
 from admissible.governed_run import (
     DEFAULT_CLOSURE_RESERVE_TURNS,
     DEFAULT_MAX_STRUCTURED_OPERATIONS_PER_RESPONSE,
     DEFAULT_MAX_TOTAL_PROPOSED_WRITE_BYTES,
+    ResponseExtractionFailed,
     acceptance_counts,
     active_blocking_action_ids,
     build_canonical_metrics,
     make_acceptance_ledger,
+    repair_inconsistent_executable_lifecycle,
 )
 from admissible.run_loop import (
     CONTINUATION_STATUS_EVIDENCE_GROUNDED,
@@ -57,8 +59,13 @@ HA_NEXT_VERIFY = "run_bounded_verification"
 HA_NEXT_HUMAN_APPROVAL = "human_approval_required"
 HA_NEXT_STOP = "stop"
 
+HA_STEP_INTERNAL_LIVELOCK = "internal_livelock"
+HA_STEP_RESPONSE_EXTRACTION_FAILED = "response_extraction_failed"
+HA_STEP_INTERNAL_EXECUTION_MISMATCH = "internal_execution_state_mismatch"
+
 DEFAULT_MAX_TURNS = 12
 DEFAULT_MALFORMED_RETRY_LIMIT = 1
+MAX_NO_PROGRESS_TICKS = 2
 
 # Terminal persisted invocation statuses — pause until explicit operator retry.
 _TERMINAL_INVOCATION_RECORD_STATUSES = frozenset(
@@ -187,6 +194,13 @@ class HighAutonomyRunState:
     automatic_empty_success_retry_used: bool = False
     pending_retry_of_invocation_id: str | None = None
     metrics: dict[str, int] = field(default_factory=dict)
+    current_step: str | None = None
+    no_progress_tick_count: int = 0
+    auto_tick_safe: bool = True
+    last_progress_fingerprint: str | None = None
+    extraction_failure_count: int = 0
+    local_reextraction_attempt_count: int = 0
+    pending_executable_selection_failures: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -202,6 +216,187 @@ class HighAutonomyRunState:
 
 def _transcript_entry(event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
     return {"timestamp": _now_iso(), "event_type": event_type, "payload": payload}
+
+
+def _append_coalesced_transcript(
+    controller: "ControlSurfaceController",
+    event_type: str,
+    payload: dict[str, Any],
+) -> None:
+    """Coalesce repeated identical transcript events."""
+
+    transcript = controller._session.transcript
+    if transcript:
+        last = transcript[-1]
+        if last.get("event_type") == event_type and last.get("payload") == payload:
+            coalesced = last.setdefault("coalesced", {"first_at": last.get("timestamp")})
+            coalesced["last_at"] = _now_iso()
+            coalesced["repetition_count"] = int(coalesced.get("repetition_count") or 1) + 1
+            return
+    transcript.append(_transcript_entry(event_type, payload))
+
+
+def _executable_actions(
+    controller: "ControlSurfaceController",
+    policy: HighAutonomyPolicy,
+) -> list[dict[str, Any]]:
+    session = controller._session
+    return open_executable_low_risk_actions(
+        queue=session.queue,
+        run_envelopes=session.run_envelopes,
+        workspace_path=session.bounded_executor_workspace,
+        policy=policy,
+    )
+
+
+def _non_executable_pending_reasons(
+    controller: "ControlSurfaceController",
+    policy: HighAutonomyPolicy,
+) -> list[dict[str, Any]]:
+    session = controller._session
+    executable_ids = {entry["action_id"] for entry in _executable_actions(controller, policy)}
+    reasons: list[dict[str, Any]] = []
+    for item in session.queue:
+        action_id = getattr(item, "action_id", "")
+        if action_id in executable_ids:
+            continue
+        if getattr(item, "execution_status", None) != "proposed_only":
+            continue
+        if getattr(item, "superseded_at", None):
+            continue
+        envelope = session.run_envelopes.get(action_id)
+        classification = policy.classify_action(
+            item=item,
+            envelope=envelope,
+            workspace_path=session.bounded_executor_workspace,
+        )
+        if classification.category == "auto_executable":
+            continue
+        if item.decision == "ALLOW" and item.operational_admissibility_action == "execute":
+            reasons.append(
+                {
+                    "action_id": action_id,
+                    "reason": classification.reason,
+                    "lifecycle_status": item.lifecycle_status,
+                }
+            )
+    return reasons
+
+
+def _build_progress_fingerprint(
+    controller: "ControlSurfaceController",
+    ha_state: HighAutonomyRunState,
+    policy: HighAutonomyPolicy,
+) -> str:
+    import json as _json
+
+    executable = _executable_actions(controller, policy)
+    view = controller.state_view()
+    timeline = view.get("run_timeline") or {}
+    latest_response_id = None
+    records = controller._session.run_loop.response_records
+    if records:
+        latest_response_id = records[-1].record_id
+    payload = {
+        "current_step": ha_state.current_step or ha_state.last_tick_step,
+        "mode": ha_state.mode,
+        "pending_executable_action_ids": [entry["action_id"] for entry in executable],
+        "pending_useful_operation_ids": list(ha_state.pending_useful_operations),
+        "latest_response_id": latest_response_id,
+        "latest_invocation_id": ha_state.last_invocation_id,
+        "executed_count": timeline.get("executed_count", 0),
+        "acceptance_statuses": [
+            (item.get("criterion_id"), item.get("status"))
+            for item in ha_state.acceptance_criteria
+        ],
+        "phase": ha_state.phase,
+        "outcome": ha_state.outcome,
+    }
+    return _json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _pause_for_response_extraction_failed(
+    controller: "ControlSurfaceController",
+    ha_state: HighAutonomyRunState,
+    *,
+    reason: str,
+    invocation_id: str | None = None,
+) -> None:
+    ha_state.mode = HA_MODE_PAUSED
+    ha_state.paused = True
+    ha_state.auto_tick_safe = False
+    ha_state.current_step = HA_STEP_RESPONSE_EXTRACTION_FAILED
+    ha_state.extraction_failure_count += 1
+    ha_state.stop_reason = reason
+    ha_state.last_event = reason
+    ha_state.last_tick_step = HA_STEP_RESPONSE_EXTRACTION_FAILED
+    ha_state.next_action = HA_NEXT_NONE
+    ha_state.awaiting_instruction_after_review = False
+    _append_coalesced_transcript(
+        controller,
+        "high_autonomy_response_extraction_failed",
+        {"reason": reason, "invocation_id": invocation_id},
+    )
+
+
+def _pause_for_internal_execution_mismatch(
+    controller: "ControlSurfaceController",
+    ha_state: HighAutonomyRunState,
+    *,
+    pending_ids: list[str],
+    selection_failures: list[dict[str, Any]],
+) -> None:
+    ha_state.mode = HA_MODE_PAUSED
+    ha_state.paused = True
+    ha_state.auto_tick_safe = False
+    ha_state.current_step = HA_STEP_INTERNAL_EXECUTION_MISMATCH
+    reason = (
+        "Internal execution state mismatch — no provider call required. "
+        f"Pending executable action(s): {', '.join(pending_ids) or 'none'}."
+    )
+    ha_state.stop_reason = reason
+    ha_state.human_required_reason = reason
+    ha_state.last_event = reason
+    ha_state.last_tick_step = HA_STEP_INTERNAL_EXECUTION_MISMATCH
+    ha_state.next_action = HA_NEXT_NONE
+    ha_state.pending_executable_selection_failures = selection_failures
+    _append_coalesced_transcript(
+        controller,
+        "high_autonomy_internal_execution_state_mismatch",
+        {
+            "pending_executable_action_ids": pending_ids,
+            "selection_failures": selection_failures,
+        },
+    )
+
+
+def _pause_for_no_progress_livelock(
+    controller: "ControlSurfaceController",
+    ha_state: HighAutonomyRunState,
+    *,
+    fingerprint: str,
+) -> None:
+    ha_state.mode = HA_MODE_PAUSED
+    ha_state.paused = True
+    ha_state.auto_tick_safe = False
+    ha_state.current_step = HA_STEP_INTERNAL_LIVELOCK
+    reason = (
+        "Internal execution state mismatch — no provider call required. "
+        f"Repeated no-progress fingerprint observed ({ha_state.no_progress_tick_count} tick(s))."
+    )
+    ha_state.stop_reason = reason
+    ha_state.human_required_reason = reason
+    ha_state.last_event = reason
+    ha_state.last_tick_step = HA_STEP_INTERNAL_LIVELOCK
+    ha_state.next_action = HA_NEXT_NONE
+    _append_coalesced_transcript(
+        controller,
+        "high_autonomy_internal_livelock",
+        {
+            "fingerprint": fingerprint,
+            "no_progress_tick_count": ha_state.no_progress_tick_count,
+        },
+    )
 
 
 def _build_refusal_recovery_text(
@@ -325,6 +520,19 @@ def build_high_autonomy_summary(
             doing_now = callable_doing.get(backend_step, "Agent response ready — ingesting next.")
             needed_now = "Controller will ingest the agent response on the next tick."
 
+    if ha_state.current_step in (
+        HA_STEP_INTERNAL_EXECUTION_MISMATCH,
+        HA_STEP_INTERNAL_LIVELOCK,
+    ):
+        doing_now = "Internal execution state mismatch — no provider call required"
+        needed_now = (
+            "Resolve the pending executable local action(s) or re-run local extraction; "
+            "do not retry Cursor Agent for this condition."
+        )
+    elif ha_state.current_step == HA_STEP_RESPONSE_EXTRACTION_FAILED:
+        doing_now = "Response extraction failed — local fix required"
+        needed_now = "Repair extraction integration, then re-extract the preserved response locally."
+
     verification_readiness = ha_state.verification_readiness or verification.get(
         "readiness", "not_run"
     )
@@ -407,6 +615,14 @@ def build_high_autonomy_summary(
         "completed_criteria": list(ha_state.completed_criteria),
         "unmet_criteria": list(ha_state.unmet_criteria),
         "pending_useful_operations": list(ha_state.pending_useful_operations),
+        "remaining_useful_operations": list(ha_state.pending_useful_operations),
+        "unique_instruction_turns": len(state_view.get("run_loop", {}).get("turns") or []),
+        "total_model_invocations": metrics.get("model_invocation_count", 0),
+        "explicit_retry_count": metrics.get("backend_retry_count", 0),
+        "extraction_failure_count": ha_state.extraction_failure_count,
+        "local_reextraction_attempt_count": ha_state.local_reextraction_attempt_count,
+        "no_progress_tick_count": ha_state.no_progress_tick_count,
+        "current_step": ha_state.current_step,
         "phase": ha_state.phase,
         "closure_phase_status": ha_state.closure_phase_status,
         "turns_remaining": ha_state.turns_remaining,
@@ -436,6 +652,8 @@ def _auto_tick_safe(ha_state: HighAutonomyRunState) -> bool:
     backend tick still advances at most one safe step regardless.
     """
     if not ha_state.active or ha_state.paused:
+        return False
+    if not ha_state.auto_tick_safe:
         return False
     if ha_state.human_critical_pending:
         return False
@@ -840,17 +1058,24 @@ def _ingest_success_state(
     response_sha256: str | None,
     event: str,
     invocation_id: str | None = None,
+    policy: HighAutonomyPolicy | None = None,
 ) -> None:
+    policy = policy or HighAutonomyPolicy()
+    executable = _executable_actions(controller, policy)
     ha_state.last_response_cursor = response_sha256
     ha_state.mode = HA_MODE_REVIEWING
-    ha_state.awaiting_instruction_after_review = True
+    ha_state.awaiting_instruction_after_review = not executable
     ha_state.malformed_retry_count = 0
     ha_state.last_event = event
     ha_state.last_tick_step = "ingest_response"
     controller._session.transcript.append(
         _transcript_entry(
             "high_autonomy_response_ingested",
-            {"turn": controller._session.run_loop.current_turn, "invocation_id": invocation_id},
+            {
+                "turn": controller._session.run_loop.current_turn,
+                "invocation_id": invocation_id,
+                "executable_action_count": len(executable),
+            },
         )
     )
 
@@ -901,6 +1126,18 @@ def _tick_ingest_callable(
     ha_state.transport_status = "ingesting_response"
     try:
         controller.ingest_agent_response(record.response_text)
+    except ResponseExtractionFailed as exc:
+        _mark_invocation_consumed(ha_state, record)
+        _pause_for_response_extraction_failed(
+            controller,
+            ha_state,
+            reason=str(exc),
+            invocation_id=record.invocation_id,
+        )
+        step_result["response_extraction_failed"] = True
+        _save_ha_state(controller, ha_state)
+        controller._persist()
+        return
     except ValueError as exc:
         # A response that parsed into no admissible operations: consume it (never
         # re-ingest) and take the existing bounded retry, else fail.
@@ -945,6 +1182,7 @@ def _tick_ingest_callable(
             f"(invocation {record.invocation_id})."
         ),
         invocation_id=record.invocation_id,
+        policy=HighAutonomyPolicy(),
     )
     step_result["ingested"] = True
     step_result["invocation_id"] = record.invocation_id
@@ -1102,7 +1340,14 @@ def _sync_counters(
     # loop must not re-trigger a human_required pause on the next tick.
     open_human_critical = _open_human_critical_actions(controller, policy)
 
-    ha_state.pending_low_risk_action_count = pending_auto
+    ha_state.pending_low_risk_action_count = len(
+        open_executable_low_risk_actions(
+            queue=session.queue,
+            run_envelopes=session.run_envelopes,
+            workspace_path=workspace,
+            policy=policy,
+        )
+    )
     active_blockers = active_blocking_action_ids(session.queue)
     ha_state.blocked_action_count = len(active_blockers)
     ha_state.evidence_count = (view.get("run_timeline") or {}).get("evidence_count", 0)
@@ -1165,16 +1410,12 @@ def _sync_counters(
         and item.get("status") not in ("verified_pass", "waived")
     ]
     ha_state.pending_useful_operations = [
-        item.action_id
-        for item in session.queue
-        if item.execution_status == "proposed_only"
-        and not getattr(item, "superseded_at", None)
-        and policy.classify_action(
-            item=item,
-            envelope=session.run_envelopes.get(item.action_id),
+        entry["action_id"] for entry in open_executable_low_risk_actions(
+            queue=session.queue,
+            run_envelopes=session.run_envelopes,
             workspace_path=workspace,
-        ).category
-        == "auto_executable"
+            policy=policy,
+        )
     ]
     del counts
 
@@ -1288,6 +1529,7 @@ def _try_finalize_outcome(
         and ha_state.mode == HA_MODE_VERIFYING
         and no_pending_useful
         and no_human_critical
+        and ha_state.turns_remaining <= ha_state.closure_reserve_turns
     ):
         _set_final_outcome(
             ha_state,
@@ -1355,9 +1597,22 @@ def _plan_next_action(
     view = controller.state_view()
     timeline = view.get("run_timeline") or {}
     continuation = view.get("continuation_instruction") or {}
-    ready_count = timeline.get("ready_to_execute_local_count", 0)
+    ready_count = max(
+        timeline.get("ready_to_execute_local_count", 0),
+        ha_state.pending_low_risk_action_count,
+        len(
+            open_executable_low_risk_actions(
+                queue=controller._session.queue,
+                run_envelopes=controller._session.run_envelopes,
+                workspace_path=controller._session.bounded_executor_workspace,
+                policy=policy,
+            )
+        ),
+    )
 
     if ha_state.mode == HA_MODE_WAITING_FOR_AGENT:
+        if ready_count > 0:
+            return HA_NEXT_AUTO_EXECUTE
         if _is_callable_backend(ha_state):
             if _pending_ready_invocation(ha_state) is not None:
                 return HA_NEXT_INGEST_RESPONSE
@@ -1385,6 +1640,11 @@ def _plan_next_action(
     if (
         acceptance_needs_verification
         and ready_count == 0
+        and (
+            ha_state.evidence_count > 0
+            or ha_state.current_turn
+            >= ha_state.max_turns - ha_state.closure_reserve_turns
+        )
         and ha_state.mode
         in (HA_MODE_REVIEWING, HA_MODE_RUNNING, HA_MODE_AUTO_EXECUTING, HA_MODE_VERIFYING)
         and not _transport_has_pending_response(transport)
@@ -1411,6 +1671,8 @@ def _plan_next_action(
         ha_state.mode == HA_MODE_RUNNING
         and not view.get("session_diagnostics", {}).get("bridge_awaiting_response")
     ):
+        if ready_count > 0:
+            return HA_NEXT_AUTO_EXECUTE
         cont_status = continuation.get("status")
         if cont_status == CONTINUATION_STATUS_PENDING_LOCAL_EXECUTION:
             return HA_NEXT_AUTO_EXECUTE
@@ -1706,6 +1968,15 @@ def tick_high_autonomy_run(
         view["high_autonomy_tick"] = {"step": "noop", "reason": ha_state.mode}
         return view
 
+    if not ha_state.auto_tick_safe:
+        view = controller.state_view()
+        view["high_autonomy_summary"] = build_high_autonomy_summary(ha_state=ha_state, state_view=view)
+        view["high_autonomy_tick"] = {
+            "step": "noop",
+            "reason": ha_state.current_step or "auto_tick_unsafe",
+        }
+        return view
+
     # A reconstructed controller (fresh HTTP request / server restart) has no
     # in-memory transport; rebuild it best-effort. A callable backend can still
     # ingest an already-persisted response even when this stays None.
@@ -1885,44 +2156,87 @@ def tick_high_autonomy_run(
         workspace = controller._session.bounded_executor_workspace
         session = controller._session
         executed_ids: list[str] = []
-        for item in list(session.queue):
+        failed_selections: list[dict[str, Any]] = []
+        executable_entries = open_executable_low_risk_actions(
+            queue=session.queue,
+            run_envelopes=session.run_envelopes,
+            workspace_path=workspace,
+            policy=policy,
+        )
+        executable_ids = [entry["action_id"] for entry in executable_entries]
+        for action_id in executable_ids:
             if len(executed_ids) >= policy.max_auto_executions_per_turn:
                 break
-            envelope = session.run_envelopes.get(item.action_id)
-            if not policy.is_auto_executable(item=item, envelope=envelope, workspace_path=workspace):
-                continue
-            if item.execution_status != "proposed_only":
+            item = controller._find_queue_item(action_id)
+            if item is None or item.execution_status != "proposed_only":
                 continue
             try:
                 controller.execute_bounded_local(
-                    item.action_id, {"workspace_path": workspace}
+                    action_id, {"workspace_path": workspace}
                 )
-                executed_ids.append(item.action_id)
-                refreshed_item = controller._find_queue_item(item.action_id)
+                executed_ids.append(action_id)
+                refreshed_item = controller._find_queue_item(action_id)
                 if refreshed_item and refreshed_item.operation_outcome in (
                     "executed_mutation",
                     "executed_read",
                     "executed_list",
                 ):
                     ha_state.auto_executed_action_count += 1
-            except Exception:
+            except Exception as exc:
+                failed_selections.append(
+                    {
+                        "action_id": action_id,
+                        "reason": str(exc),
+                    }
+                )
                 continue
 
         ha_state.mode = HA_MODE_AUTO_EXECUTING if executed_ids else HA_MODE_REVIEWING
         if executed_ids:
-            if ha_state.recovery_attempted:
-                ha_state.awaiting_instruction_after_review = False
-            else:
-                ha_state.awaiting_instruction_after_review = True
+            ha_state.awaiting_instruction_after_review = False
             ha_state.last_event = (
                 f"Auto-executed {len(executed_ids)} low-risk local write(s)."
             )
+            remaining_executable = open_executable_low_risk_actions(
+                queue=controller._session.queue,
+                run_envelopes=controller._session.run_envelopes,
+                workspace_path=workspace,
+                policy=policy,
+            )
+            if not remaining_executable:
+                if _mandatory_acceptance_complete(ha_state):
+                    ha_state.awaiting_instruction_after_review = False
+                elif not _has_acceptance_verification_plan(ha_state) and (
+                    ha_state.turns_remaining > ha_state.closure_reserve_turns
+                ):
+                    ha_state.awaiting_instruction_after_review = True
+                    ha_state.mode = HA_MODE_REVIEWING
+        elif executable_ids:
+            _pause_for_internal_execution_mismatch(
+                controller,
+                ha_state,
+                pending_ids=executable_ids,
+                selection_failures=failed_selections or _non_executable_pending_reasons(
+                    controller, policy
+                ),
+            )
+            step_result["internal_execution_state_mismatch"] = True
+            _save_ha_state(controller, ha_state)
+            controller._persist()
+            view = controller.state_view()
+            view["high_autonomy_summary"] = build_high_autonomy_summary(
+                ha_state=ha_state, state_view=view
+            )
+            view["high_autonomy_tick"] = step_result
+            return view
         else:
             ha_state.last_event = "No low-risk actions to auto-execute."
         ha_state.last_tick_step = "auto_execute"
         step_result["executed_action_ids"] = executed_ids
-        controller._session.transcript.append(
-            _transcript_entry("high_autonomy_auto_executed", {"action_ids": executed_ids})
+        _append_coalesced_transcript(
+            controller,
+            "high_autonomy_auto_executed",
+            {"action_ids": executed_ids},
         )
         _save_ha_state(controller, ha_state)
         controller._persist()
@@ -1973,6 +2287,21 @@ def tick_high_autonomy_run(
     if _is_callable_backend(ha_state) and ha_state.backend_step:
         ha_state.transport_status = ha_state.backend_step
     ha_state.next_action = _plan_next_action(controller, ha_state, policy, transport)
+    fingerprint = _build_progress_fingerprint(controller, ha_state, policy)
+    progressed = (
+        step_result.get("executed_action_ids")
+        or step_result.get("ingested")
+        or step_result.get("verified")
+        or planned in (HA_NEXT_WRITE_INSTRUCTION, HA_NEXT_WRITE_RECOVERY, HA_NEXT_HUMAN_APPROVAL)
+        or ha_state.last_tick_step in ("invoke_agent", "ingest_response", "verify", "finalize_outcome")
+    )
+    if progressed or fingerprint != ha_state.last_progress_fingerprint:
+        ha_state.no_progress_tick_count = 0
+    elif planned in (HA_NEXT_AUTO_EXECUTE, HA_NEXT_NONE) or step_result.get("reason") == "no_ready_response":
+        ha_state.no_progress_tick_count += 1
+    ha_state.last_progress_fingerprint = fingerprint
+    if ha_state.no_progress_tick_count >= MAX_NO_PROGRESS_TICKS:
+        _pause_for_no_progress_livelock(controller, ha_state, fingerprint=fingerprint)
     _save_ha_state(controller, ha_state)
     controller._persist()
     step_result["last_tick_step"] = ha_state.last_tick_step

@@ -247,3 +247,90 @@ class HighAutonomyPolicy:
         if verification_readiness in ("pass", "fail"):
             return False
         return True
+
+
+def _queue_item_field(item: Any, key: str, default: Any = None) -> Any:
+    if isinstance(item, dict):
+        return item.get(key, default)
+    return getattr(item, key, default)
+
+
+def open_executable_low_risk_actions(
+    *,
+    queue: Iterable[Any],
+    run_envelopes: dict[str, Any],
+    workspace_path: str | None,
+    policy: HighAutonomyPolicy | None = None,
+) -> list[dict[str, Any]]:
+    """Canonical source of truth for auto-executable low-risk actions.
+
+    An action is executable when it is admitted ALLOW-tier local file work,
+    has supported bounded operations, belongs to the configured workspace, is
+    not executed/no-op/failed/blocked/superseded, and is not awaiting human
+    authority or evidence.
+    """
+
+    policy = policy or HighAutonomyPolicy()
+    results: list[dict[str, Any]] = []
+    for item in queue:
+        action_id = str(_queue_item_field(item, "action_id") or "")
+        if not action_id:
+            continue
+        if _queue_item_field(item, "superseded_at"):
+            continue
+        decision = _queue_item_field(item, "decision")
+        if decision != "ALLOW":
+            continue
+        if _queue_item_field(item, "operational_admissibility_action") != "execute":
+            continue
+        required_approval = _queue_item_field(item, "required_approval")
+        if required_approval not in (None, "none", "unknown", ""):
+            continue
+        execution_status = _queue_item_field(item, "execution_status") or "proposed_only"
+        if execution_status != "proposed_only":
+            continue
+        operation_outcome = _queue_item_field(item, "operation_outcome")
+        if operation_outcome in (
+            "executed_mutation",
+            "executed_read",
+            "executed_list",
+            "duplicate_noop",
+            "already_satisfied_noop",
+            "blocked",
+            "failed",
+        ):
+            continue
+        lifecycle = _queue_item_field(item, "lifecycle_status")
+        if lifecycle in ("closed", "refused_closed", "superseded", "resolved_gate"):
+            continue
+        envelope = run_envelopes.get(action_id)
+        if isinstance(envelope, dict):
+            class _Envelope:
+                def __init__(self, data: dict[str, Any]) -> None:
+                    self.candidate = data.get("candidate") or {}
+                    self.decision = data.get("decision") or {}
+                    self.envelope = data.get("envelope") or {}
+            envelope_obj: Any = _Envelope(envelope)
+        else:
+            envelope_obj = envelope
+        classification = policy.classify_action(
+            item=item, envelope=envelope_obj, workspace_path=workspace_path
+        )
+        if classification.category != "auto_executable":
+            results.append(
+                {
+                    "action_id": action_id,
+                    "executable": False,
+                    "reason": classification.reason,
+                }
+            )
+            continue
+        results.append(
+            {
+                "action_id": action_id,
+                "executable": True,
+                "reason": classification.reason,
+                "lifecycle_status": lifecycle,
+            }
+        )
+    return [entry for entry in results if entry.get("executable")]

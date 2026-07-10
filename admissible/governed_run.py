@@ -184,6 +184,8 @@ def make_acceptance_ledger(
 
     raw_items: list[str | dict[str, Any]] = list(criteria or [])
     if not raw_items:
+        raw_items = derive_acceptance_criteria_from_goal(goal_text)
+    if not raw_items:
         raw_items = [
             {
                 "criterion_id": "goal_deliverable",
@@ -420,6 +422,386 @@ def has_utf8_mojibake(text: str) -> bool:
     return any(marker in text for marker in _UTF8_MOJIBAKE_MARKERS)
 
 
+def derive_acceptance_criteria_from_goal(goal_text: str) -> list[dict[str, Any]]:
+    """Derive verifiable acceptance criteria from explicit goal deliverables/behaviors.
+
+    Generic templates only — no product-specific names.  Returns an empty list
+    when the goal does not contain enough explicit structure to verify.
+    """
+
+    text = (goal_text or "").strip()
+    if not text:
+        return []
+
+    lower = text.lower()
+    deliverable_names = _extract_goal_deliverable_filenames(text)
+    if len(deliverable_names) < 2:
+        return []
+
+    criteria: list[dict[str, Any]] = []
+    if deliverable_names:
+        criteria.append(
+            {
+                "criterion_id": "required_files",
+                "source_text": "All required deliverable files are present.",
+                "mandatory": True,
+                "verification": [
+                    {
+                        "check_id": "all_required_files_present",
+                        "target_paths": deliverable_names,
+                    }
+                ],
+            }
+        )
+
+    html_targets = [name for name in deliverable_names if name.endswith(".html")]
+    css_targets = [name for name in deliverable_names if name.endswith(".css")]
+    js_targets = [name for name in deliverable_names if name.endswith(".js")]
+    doc_targets = [
+        name
+        for name in deliverable_names
+        if name.endswith(".md") or "dev" in name.lower() or "usage" in name.lower()
+    ]
+
+    if html_targets and css_targets and js_targets:
+        criteria.append(
+            {
+                "criterion_id": "index_assets",
+                "source_text": "HTML references the required local CSS and JS.",
+                "mandatory": True,
+                "verification": [
+                    {
+                        "check_id": "file_contains",
+                        "target_paths": html_targets[:1],
+                        "contains": [css_targets[0], js_targets[0]],
+                    }
+                ],
+            }
+        )
+
+    if html_targets and (
+        "canvas" in lower
+        or "score" in lower
+        or "game" in lower
+    ):
+        criteria.append(
+            {
+                "criterion_id": "index_game_ui",
+                "source_text": "HTML contains a game canvas and visible score element.",
+                "mandatory": True,
+                "verification": [
+                    {
+                        "check_id": "file_contains",
+                        "target_paths": html_targets[:1],
+                        "contains": ["<canvas", "score"],
+                    }
+                ],
+            }
+        )
+
+    if css_targets:
+        criteria.append(
+            {
+                "criterion_id": "style_non_empty",
+                "source_text": "CSS deliverable is non-empty.",
+                "mandatory": True,
+                "verification": [
+                    {
+                        "check_id": "file_not_empty",
+                        "target_paths": css_targets[:1],
+                    }
+                ],
+            }
+        )
+
+    if js_targets and ("arrow" in lower or "wasd" in lower or "movement" in lower):
+        criteria.append(
+            {
+                "criterion_id": "game_controls",
+                "source_text": "JavaScript handles Arrow keys and WASD movement.",
+                "mandatory": True,
+                "verification": [
+                    {
+                        "check_id": "file_contains",
+                        "target_paths": js_targets[:1],
+                        "contains": ["Arrow", "'w'", "'a'", "'s'", "'d'"],
+                    }
+                ],
+            }
+        )
+
+    if js_targets and ("collectible" in lower or "score" in lower):
+        criteria.append(
+            {
+                "criterion_id": "game_collectible_score",
+                "source_text": "JavaScript contains collectible and score behavior.",
+                "mandatory": True,
+                "verification": [
+                    {
+                        "check_id": "file_contains",
+                        "target_paths": js_targets[:1],
+                        "contains": ["collectible", "score"],
+                    }
+                ],
+            }
+        )
+
+    if js_targets and ("restart" in lower or " r key" in lower or "press `r`" in lower):
+        criteria.append(
+            {
+                "criterion_id": "game_restart",
+                "source_text": "JavaScript supports R-key restart behavior.",
+                "mandatory": True,
+                "verification": [
+                    {
+                        "check_id": "file_contains",
+                        "target_paths": js_targets[:1],
+                        "contains": ["restart", "R"],
+                    }
+                ],
+            }
+        )
+
+    if doc_targets and ("usage" in lower or "local" in lower or "run" in lower):
+        criteria.append(
+            {
+                "criterion_id": "local_usage",
+                "source_text": "Local usage documentation exists and contains run instructions.",
+                "mandatory": True,
+                "verification": [
+                    {
+                        "check_id": "file_contains",
+                        "target_paths": doc_targets[:1],
+                        "contains": ["open", "index.html"],
+                    }
+                ],
+            }
+        )
+
+    return criteria
+
+
+def _extract_goal_deliverable_filenames(goal_text: str) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(
+        r"(?:^|[\s\-•*])\s*([A-Za-z0-9_.-]+\.(?:html?|css|js|mjs|md|txt))\s*(?:$|[\s,;])",
+        goal_text,
+        re.MULTILINE | re.IGNORECASE,
+    ):
+        name = match.group(1)
+        if name not in seen:
+            seen.add(name)
+            names.append(name)
+    for match in re.finditer(r"`([A-Za-z0-9_.-]+\.(?:html?|css|js|mjs|md|txt))`", goal_text):
+        name = match.group(1)
+        if name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+BLOCK_OUTCOME_PARSED_AND_QUEUED = "parsed_and_queued"
+BLOCK_OUTCOME_PARSED_DUPLICATE = "parsed_duplicate"
+BLOCK_OUTCOME_PARSED_ALREADY_SATISFIED = "parsed_already_satisfied"
+BLOCK_OUTCOME_REJECTED_WITH_REASON = "rejected_with_reason"
+BLOCK_OUTCOME_MALFORMED_WITH_REASON = "malformed_with_reason"
+
+
+class ResponseExtractionFailed(ValueError):
+    """Raised when structured markers were present but no actions survived ingestion."""
+
+
+def build_agent_response_extraction_report(
+    raw_text: str,
+    *,
+    built: list[dict[str, Any]] | None = None,
+    completion_candidate: dict[str, Any] | None = None,
+    session: Any | None = None,
+    workspace_path: str | None = None,
+) -> dict[str, Any]:
+    """Build a durable diagnostic for one agent response extraction pass."""
+
+    from admissible.long_run_envelope_builder import (
+        STRUCTURED_OPERATION_MARKER,
+        _STRUCTURED_OPERATION_MARKER_RE,
+        _scan_balanced_json,
+        _operations_from_payload,
+    )
+    from admissible.execution.bounded_local_executor import _forbidden_write_content_reason
+    import json as _json
+
+    marker_matches = list(_STRUCTURED_OPERATION_MARKER_RE.finditer(raw_text))
+    structured_marker_count = len(marker_matches)
+    blocks: list[dict[str, Any]] = []
+    parsed_operation_count = 0
+    rejected_operation_count = 0
+
+    for index, marker in enumerate(marker_matches, start=1):
+        block_id = f"block_{index:03d}"
+        scanned = _scan_balanced_json(raw_text, marker.end())
+        if scanned is None:
+            blocks.append(
+                {
+                    "block_id": block_id,
+                    "outcome": BLOCK_OUTCOME_MALFORMED_WITH_REASON,
+                    "reason": "no_balanced_json_after_marker",
+                    "operations": [],
+                }
+            )
+            rejected_operation_count += 1
+            continue
+        json_text, _end = scanned
+        try:
+            payload = _json.loads(json_text)
+        except _json.JSONDecodeError as exc:
+            blocks.append(
+                {
+                    "block_id": block_id,
+                    "outcome": BLOCK_OUTCOME_MALFORMED_WITH_REASON,
+                    "reason": f"json_decode_error: {exc.msg}",
+                    "operations": [],
+                }
+            )
+            rejected_operation_count += 1
+            continue
+        operations = _operations_from_payload(payload)
+        if not operations:
+            blocks.append(
+                {
+                    "block_id": block_id,
+                    "outcome": BLOCK_OUTCOME_MALFORMED_WITH_REASON,
+                    "reason": "empty_or_unrecognized_operation_payload",
+                    "operations": [],
+                }
+            )
+            rejected_operation_count += 1
+            continue
+        block_outcomes: list[dict[str, Any]] = []
+        for operation in operations:
+            name = str(operation.get("operation") or "").strip()
+            path = str(operation.get("path") or ".")
+            content_guard_reason = None
+            if name == "write_file":
+                content = operation.get("content")
+                if not isinstance(content, str):
+                    content_guard_reason = "write_file_missing_string_content"
+                else:
+                    content_guard_reason = _forbidden_write_content_reason(path, content)
+            block_outcomes.append(
+                {
+                    "operation": name,
+                    "path": path,
+                    "content_guard_decision": (
+                        "rejected" if content_guard_reason else "allowed"
+                    ),
+                    "content_guard_reason": content_guard_reason,
+                }
+            )
+        blocks.append(
+            {
+                "block_id": block_id,
+                "outcome": BLOCK_OUTCOME_PARSED_AND_QUEUED,
+                "reason": None,
+                "operations": block_outcomes,
+            }
+        )
+        parsed_operation_count += len(operations)
+
+    extracted_action_ids = [entry["action_id"] for entry in built or [] if entry.get("action_id")]
+    completion_status = (
+        "parsed"
+        if completion_candidate is not None
+        else "absent"
+        if STRUCTURED_OPERATION_MARKER not in raw_text
+        else "not_present"
+    )
+
+    return {
+        "structured_marker_count": structured_marker_count,
+        "structured_block_count": len(blocks),
+        "parsed_operation_count": parsed_operation_count,
+        "rejected_operation_count": rejected_operation_count,
+        "blocks": blocks,
+        "extracted_action_ids": extracted_action_ids,
+        "surviving_action_count": len(extracted_action_ids),
+        "completion_candidate_status": completion_status,
+        "extraction_failed": structured_marker_count > 0 and len(extracted_action_ids) == 0,
+    }
+
+
+def repair_inconsistent_executable_lifecycle(
+    queue: Iterable[Any],
+    *,
+    run_envelopes: dict[str, Any] | None = None,
+    workspace_path: str | None = None,
+    governance_records: list[dict[str, Any]] | None = None,
+) -> int:
+    """Normalize stranded ALLOW executable actions back to ``ready_to_execute``."""
+
+    del workspace_path  # retained for import/load call-site compatibility
+
+    forbidden_lifecycle_for_unexecuted_allow = {
+        "ready_for_next_agent_instruction",
+        "closed",
+        "completed",
+        "refused_closed",
+        "resolved_gate",
+    }
+    supported_operations = {"write_file", "read_file", "list_directory"}
+    repairs = 0
+    records = governance_records if governance_records is not None else []
+    envelopes = run_envelopes or {}
+
+    for raw in queue:
+        item = raw if isinstance(raw, dict) else raw.to_dict()
+        action_id = str(item.get("action_id") or "")
+        if not action_id:
+            continue
+        if item.get("decision") != "ALLOW":
+            continue
+        if item.get("operational_admissibility_action") != "execute":
+            continue
+        execution_status = str(item.get("execution_status") or "proposed_only")
+        if execution_status not in ("proposed_only", ""):
+            continue
+        if item.get("execution_record"):
+            continue
+        envelope = envelopes.get(action_id) or {}
+        candidate = (
+            envelope.get("candidate")
+            if isinstance(envelope, dict)
+            else getattr(envelope, "candidate", {})
+        ) or {}
+        operations = candidate.get("structured_operations") or []
+        if not any(
+            str(operation.get("operation") or "").strip() in supported_operations
+            for operation in operations
+        ):
+            continue
+        lifecycle = item.get("lifecycle_status")
+        if lifecycle == "ready_to_execute":
+            continue
+        if lifecycle not in forbidden_lifecycle_for_unexecuted_allow:
+            continue
+        if not isinstance(raw, dict):
+            raw.lifecycle_status = "ready_to_execute"
+        else:
+            raw["lifecycle_status"] = "ready_to_execute"
+        repairs += 1
+        records.append(
+            {
+                "record_id": f"governance_repair_{sha256_text(action_id)[:12]}",
+                "event_type": "executable_lifecycle_repaired",
+                "action_id": action_id,
+                "previous_lifecycle_status": lifecycle,
+                "repaired_lifecycle_status": "ready_to_execute",
+                "reason": "allow_execute_without_execution_record",
+            }
+        )
+    return repairs
+
+
 __all__ = [
     "ACCEPTANCE_STATUSES",
     "COMPLETION_CANDIDATE_MARKER",
@@ -431,15 +813,19 @@ __all__ = [
     "acceptance_counts",
     "active_blocking_action_ids",
     "apply_verification_results_to_ledger",
+    "build_agent_response_extraction_report",
     "build_canonical_metrics",
     "canonical_operation_fingerprint",
     "canonical_operation_identity",
     "current_file_sha256",
+    "derive_acceptance_criteria_from_goal",
     "extract_completion_candidate",
     "has_utf8_mojibake",
     "latest_file_hashes",
     "make_acceptance_ledger",
     "normalize_workspace_relative_path",
+    "repair_inconsistent_executable_lifecycle",
+    "ResponseExtractionFailed",
     "sha256_text",
     "validate_coherent_batch_limits",
 ]

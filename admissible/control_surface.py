@@ -86,12 +86,15 @@ from admissible.plan_audit import (
 from admissible.long_run_envelope_builder import plan_gate_closes_gates
 from admissible.governed_run import (
     active_blocking_action_ids,
+    build_agent_response_extraction_report,
     canonical_operation_fingerprint,
     canonical_operation_identity,
     current_file_sha256,
     extract_completion_candidate,
     latest_file_hashes,
     normalize_workspace_relative_path,
+    repair_inconsistent_executable_lifecycle,
+    ResponseExtractionFailed,
     sha256_text,
     validate_coherent_batch_limits,
 )
@@ -127,6 +130,7 @@ from admissible.run_loop import (
     default_lifecycle_status,
     derive_evidence_attention_state,
     generate_instruction_packet,
+    initial_lifecycle_status_for_queue_item,
     normalize_evidence_satisfies,
     queue_item_needs_attention,
     reevaluate_envelope_with_evidence,
@@ -522,7 +526,9 @@ def _build_queue_item(envelope: RunEnvelope) -> DecisionQueueItem:
         attestation_eligible=is_local_allow_without_missing_evidence(decision, candidate),
         execution_record=candidate.get("execution_record"),
         human_decision_ids=[],
-        lifecycle_status=default_lifecycle_status(decision_label),
+        lifecycle_status=initial_lifecycle_status_for_queue_item(
+            decision_label, candidate=candidate
+        ),
     )
 
 
@@ -2170,6 +2176,12 @@ class ControlSurfaceController:
 
     def import_session(self, data: dict[str, Any]) -> dict[str, Any]:
         self._session = ControlSession.from_dict(data)
+        repair_inconsistent_executable_lifecycle(
+            self._session.queue,
+            run_envelopes=self._session.run_envelopes,
+            workspace_path=self._session.bounded_executor_workspace,
+            governance_records=self._session.governance_records,
+        )
         self._persist()
         return self.state_view()
 
@@ -3158,6 +3170,43 @@ class ControlSurfaceController:
             self._session.queue.append(item)
             new_action_ids.append(run_env.action_id)
 
+        extraction_report = build_agent_response_extraction_report(
+            raw_text,
+            built=built,
+            completion_candidate=completion_candidate,
+            session=self._session,
+            workspace_path=self._session.bounded_executor_workspace,
+        )
+        if extraction_report.get("extraction_failed"):
+            failed_record = AgentResponseRecord(
+                record_id=f"agent_response_{uuid.uuid4().hex[:12]}",
+                turn_number=turn_number,
+                created_at=_now_iso(),
+                raw_text=raw_text,
+                source_trust="unverified_agent_output",
+                actor="external_frontier_agent",
+                action_ids=[],
+                builder_version=None,
+                extraction_report=extraction_report,
+            )
+            run_loop.response_records.append(failed_record)
+            if run_loop.turns and run_loop.turns[-1].agent_response_record_id is None:
+                run_loop.turns[-1].agent_response_record_id = failed_record.record_id
+            self._session.transcript.append(
+                _transcript_entry(
+                    "agent_response_extraction_failed",
+                    {
+                        "record_id": failed_record.record_id,
+                        "turn_number": turn_number,
+                        "extraction_report": extraction_report,
+                    },
+                )
+            )
+            self._persist()
+            raise ResponseExtractionFailed(
+                "response_extraction_failed: structured markers present but zero actions survived"
+            )
+
         if completion_candidate is not None and self._session.high_autonomy_run is not None:
             known_criterion_ids = {
                 str(item.get("criterion_id"))
@@ -3184,6 +3233,7 @@ class ControlSurfaceController:
             actor="external_frontier_agent",
             action_ids=new_action_ids,
             builder_version=(built[0]["candidate"].get("builder_version") if built else None),
+            extraction_report=extraction_report,
         )
         run_loop.response_records.append(record)
         if run_loop.turns and run_loop.turns[-1].agent_response_record_id is None:
@@ -3197,6 +3247,7 @@ class ControlSurfaceController:
                     "turn_number": turn_number,
                     "action_ids": new_action_ids,
                     "action_count": len(new_action_ids),
+                    "extraction_report": extraction_report,
                     "completion_candidate": completion_candidate,
                     "note": (
                         "Raw response is unverified agent output; action candidates were "
@@ -3207,7 +3258,49 @@ class ControlSurfaceController:
             )
         )
         self._persist()
+        ha_state = self._high_autonomy_state()
+        if ha_state is not None and ha_state.active:
+            from admissible.high_autonomy_controller import (
+                _ingest_success_state,
+                _save_ha_state,
+                _sync_counters,
+            )
+            from admissible.high_autonomy_policy import HighAutonomyPolicy
+            from admissible.governed_run import sha256_text as _sha256_text
+
+            policy = HighAutonomyPolicy()
+            _ingest_success_state(
+                self,
+                ha_state,
+                response_sha256=_sha256_text(raw_text),
+                event="Agent response ingested via control surface.",
+                policy=policy,
+            )
+            _sync_counters(self, ha_state, policy)
+            _save_ha_state(self, ha_state)
+            self._persist()
         return self.state_view()
+
+    def reextract_last_agent_response(self) -> dict[str, Any]:
+        """Re-run local extraction on the latest stored agent response without a provider call."""
+
+        run_loop = self._session.run_loop
+        if not run_loop.response_records:
+            raise ValueError("No agent response is available for local re-extraction.")
+        record = run_loop.response_records[-1]
+        if record.action_ids:
+            raise ValueError(
+                "Local re-extraction applies only to responses that previously yielded zero actions."
+            )
+        ha = self._session.high_autonomy_run
+        if isinstance(ha, dict):
+            ha["local_reextraction_attempt_count"] = int(
+                ha.get("local_reextraction_attempt_count") or 0
+            ) + 1
+        run_loop.response_records.pop()
+        if run_loop.turns:
+            run_loop.turns[-1].agent_response_record_id = None
+        return self.ingest_agent_response(record.raw_text)
 
     # -- high-autonomy governed loop (slice ADMISSIBLE_RUN_029) ---------------
 
@@ -3307,7 +3400,7 @@ class ControlSurfaceController:
 
         return stop_high_autonomy_run(self, reason=reason)
 
-    def tick_high_autonomy_run(self) -> dict[str, Any]:
+    def tick_high_autonomy_run(self, *, policy: Any = None) -> dict[str, Any]:
         from admissible.high_autonomy_controller import tick_high_autonomy_run
         if not self._high_autonomy_tick_lock.acquire(blocking=False):
             state = self.state_view()
@@ -3318,7 +3411,7 @@ class ControlSurfaceController:
             state["tick_already_in_progress"] = True
             return state
         try:
-            return tick_high_autonomy_run(self)
+            return tick_high_autonomy_run(self, policy=policy)
         finally:
             self._high_autonomy_tick_lock.release()
 

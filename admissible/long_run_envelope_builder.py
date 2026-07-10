@@ -477,9 +477,21 @@ def _strip_negated_lines(text: str) -> str:
     )
 
 
+# Require a genuine production-readiness report shape.  The old broad
+# ``proposed operations`` substring falsely matched progress-ledger table rows
+# such as ``Re-proposed operations`` in otherwise normal structured-write
+# responses (pixel-wanderer-cli-007 turns 1–4).
 _PRODUCTION_READINESS_MARKER_RE = re.compile(
-    r"proposed operations|production[- ]readiness assessment",
+    r"production[- ]readiness assessment",
     re.I,
+)
+_PRODUCTION_READINESS_TABLE_RE = re.compile(
+    r"^\|\s*\d+[a-z]?\s*\|\s*.+\s*\|\s*.+\s*\|$",
+    re.MULTILINE,
+)
+_PROPOSED_OPERATIONS_HEADING_RE = re.compile(
+    r"^##\s+Proposed operations\b",
+    re.MULTILINE | re.IGNORECASE,
 )
 _TABLE_ROW_RE = re.compile(
     r"^\|\s*(\d+[a-z]?)\s*\|\s*(.+?)\s*\|\s*.+?\s*\|$",
@@ -561,7 +573,19 @@ def _extract_notes(raw_output: str) -> list[str]:
 
 
 def _is_production_readiness_report(raw_output: str) -> bool:
-    return bool(_PRODUCTION_READINESS_MARKER_RE.search(raw_output))
+    if _STRUCTURED_OPERATION_MARKER_RE.search(raw_output):
+        return False
+    if _PRODUCTION_READINESS_MARKER_RE.search(raw_output):
+        return True
+    if _PROPOSED_OPERATIONS_HEADING_RE.search(raw_output) and _PRODUCTION_READINESS_TABLE_RE.search(
+        raw_output
+    ):
+        return True
+    if _PRODUCTION_READINESS_TABLE_RE.search(raw_output) and _PHASE_HEADING_RE.search(
+        raw_output
+    ):
+        return True
+    return False
 
 
 def _strip_negative_sections(text: str) -> str:
@@ -1620,6 +1644,23 @@ def build_from_raw_output(
 ) -> dict[str, Any]:
     """Parse raw agent output into action candidates and evaluable envelopes."""
     metadata = dict(source_metadata or {})
+    has_structured_markers = bool(_STRUCTURED_OPERATION_MARKER_RE.search(raw_output))
+    structured_blocks = extract_structured_operation_blocks(raw_output)
+    if structured_blocks:
+        multi_action_result = _build_from_multi_action_response(
+            raw_output,
+            long_run_prompt=long_run_prompt,
+            source_metadata=metadata,
+        )
+        if multi_action_result["action_candidates"]:
+            return multi_action_result
+    if has_structured_markers:
+        return {
+            "builder_version": BUILDER_VERSION,
+            "claim_boundary": BUILDER_CLAIM_BOUNDARY,
+            "action_candidates": [],
+            "envelopes": [],
+        }
     if _is_production_readiness_report(raw_output):
         return _build_from_production_readiness_report(
             raw_output,

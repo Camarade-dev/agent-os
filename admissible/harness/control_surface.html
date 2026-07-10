@@ -1406,6 +1406,14 @@ function renderHighAutonomy(state) {
   const outcomeLabel = ha.outcome_label || "In progress";
   const unmet = ha.unmet_criteria || [];
   const activeBlockerCount = metrics.active_blocked_count ?? ha.blocked_action_count ?? 0;
+  const pendingUsefulCount = (ha.pending_useful_operations || ha.remaining_useful_operations || []).length;
+  const internalStatePause = ["internal_execution_state_mismatch", "internal_livelock", "response_extraction_failed"].includes(ha.current_step);
+  const internalStateBanner = internalStatePause
+    ? `<div class="ha-backend-error" style="margin:.65rem 0;padding:.55rem .65rem;border:1px solid var(--cs-border-strong);border-radius:6px;background:var(--cs-input-bg);">
+         <p style="margin:0;font-weight:600;">${escapeHtml(ha.doing_now || "Internal execution state mismatch — no provider call required")}</p>
+         <p style="margin:.35rem 0 0;color:var(--cs-muted);">${escapeHtml(ha.needed_now || "Resolve pending local execution or re-extract locally; do not retry Cursor Agent for this condition.")}</p>
+       </div>`
+    : "";
   const backendError = ha.backend_error || {};
   const backendErrorRow = ha.backend_retry_required && ha.is_callable_backend
     ? `<div class="ha-backend-error" style="margin:.65rem 0;padding:.55rem .65rem;border:1px solid var(--cs-border-strong);border-radius:6px;background:var(--cs-input-bg);">
@@ -1432,7 +1440,7 @@ function renderHighAutonomy(state) {
       <p style="margin:.15rem 0;"><strong>Progress:</strong> acceptance criteria ${escapeHtml(ha.acceptance_verified_count || 0)}/${escapeHtml(ha.acceptance_total_count || 0)} verified</p>
       <p style="margin:.15rem 0;"><strong>Usage:</strong> ${escapeHtml(metrics.model_invocation_count || 0)} model invocation(s) · ${escapeHtml(metrics.backend_retry_count || 0)} retr${(metrics.backend_retry_count || 0) === 1 ? "y" : "ies"} · ${escapeHtml(metrics.genuine_human_intervention_count || 0)} human interruption(s)</p>
       <p style="margin:.15rem 0;"><strong>Execution:</strong> ${escapeHtml(metrics.useful_write_count || 0)} useful write(s) · ${escapeHtml(metrics.duplicate_noop_count || 0)} duplicate(s) avoided · ${escapeHtml((metrics.read_count || 0) + (metrics.list_count || 0))} read/list operation(s) · ${escapeHtml(metrics.verification_check_count || 0)} verification check(s)</p>
-      <p style="margin:.15rem 0;"><strong>Remaining:</strong> ${escapeHtml(activeBlockerCount)} active blocker(s)${unmet.length ? ` · unmet criteria: ${escapeHtml(unmet.join(", "))}` : ""}</p>
+      <p style="margin:.15rem 0;"><strong>Remaining:</strong> ${escapeHtml(pendingUsefulCount)} pending useful operation(s) · ${escapeHtml(activeBlockerCount)} active blocker(s)${unmet.length ? ` · unmet criteria: ${escapeHtml(unmet.join(", "))}` : ""}</p>
     </div>
     <dl class="ha-status-grid">
       <div class="ha-status-row"><dt>Target workspace</dt><dd>${escapeHtml(ha.workspace_path || control.target_workspace_path || "—")}</dd></div>
@@ -1450,6 +1458,7 @@ function renderHighAutonomy(state) {
       <div class="ha-status-row"><dt>Verification</dt><dd>${escapeHtml(ha.verification_readiness || "not_run")}${ha.verification_passed ? " ✓" : ""}</dd></div>
       <div class="ha-status-row"><dt>Human action required</dt><dd>${escapeHtml(humanAction)}</dd></div>
     </dl>
+    ${internalStateBanner}
     ${backendErrorRow}
     ${ha.human_action_required && blockingActions.length ? `
       <div class="ha-blocking-actions">
@@ -1537,8 +1546,14 @@ function renderAutoRunStatusLine(ha) {
     return;
   }
   let state;
+  const internalStatePause = ["internal_execution_state_mismatch", "internal_livelock", "response_extraction_failed"].includes(ha.current_step);
   if (ha.human_action_required) {
     state = "stopped — human action required";
+    line.classList.add("autorun-human");
+  } else if (internalStatePause || !ha.auto_tick_safe) {
+    state = internalStatePause
+      ? "stopped — internal execution state mismatch"
+      : "stopped (state no longer safe)";
     line.classList.add("autorun-human");
   } else if (autoRunActive && ha.auto_tick_safe) {
     state = "active";
@@ -1549,7 +1564,7 @@ function renderAutoRunStatusLine(ha) {
     state = "paused";
   }
   const parts = [`Auto-run: ${state}`];
-  if (requestInFlight) parts.push("Backend invocation in progress");
+  if (requestInFlight && !internalStatePause) parts.push("Backend invocation in progress");
   if (lastTickResult) parts.push(`Last tick: ${lastTickResult}`);
   // Only the file bridge waits on an external response file. A callable backend
   // shows its in-process step instead (never "waiting for a response file").

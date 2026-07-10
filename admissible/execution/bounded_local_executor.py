@@ -225,6 +225,11 @@ def _forbidden_write_content_reason(path: str, content: str) -> str | None:
             return "forbidden network call in write content"
         return None
 
+    if extension == ".md":
+        if _has_network_side_effect(content):
+            return "forbidden network call in write content"
+        return None
+
     if _looks_like_forbidden_natural_language(content):
         return "forbidden operation string in write content"
     return None

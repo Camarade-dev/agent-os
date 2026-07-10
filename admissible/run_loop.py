@@ -71,6 +71,7 @@ LIFECYCLE_BLOCKED_BY_NON_EVIDENCE_GATE = "blocked_by_non_evidence_gate"
 LIFECYCLE_APPROVAL_SUPPLIED_PENDING_REEVALUATION = "approval_supplied_pending_reevaluation"
 LIFECYCLE_LIMITED_SCOPE_SELECTED = "limited_scope_selected"
 LIFECYCLE_READY_FOR_NEXT_AGENT_INSTRUCTION = "ready_for_next_agent_instruction"
+LIFECYCLE_READY_TO_EXECUTE = "ready_to_execute"
 LIFECYCLE_CLOSED = "closed"
 # Derived terminal/intermediate statuses produced when a human decision is applied
 # (slice ADMISSIBLE_STATE_LIFECYCLE_001_HUMAN_DECISION_APPLICATION).
@@ -91,6 +92,7 @@ LIFECYCLE_STATUSES = frozenset(
         LIFECYCLE_APPROVAL_SUPPLIED_PENDING_REEVALUATION,
         LIFECYCLE_LIMITED_SCOPE_SELECTED,
         LIFECYCLE_READY_FOR_NEXT_AGENT_INSTRUCTION,
+        LIFECYCLE_READY_TO_EXECUTE,
         LIFECYCLE_CLOSED,
         LIFECYCLE_RESOLVED_GATE,
         LIFECYCLE_REFUSED_CLOSED,
@@ -124,6 +126,23 @@ _DEFAULT_LIFECYCLE_BY_DECISION: dict[str, str] = {
 def default_lifecycle_status(decision_label: str) -> str:
     """Return the default v0 lifecycle status for a rules-only decision label."""
     return _DEFAULT_LIFECYCLE_BY_DECISION.get(decision_label, LIFECYCLE_NEEDS_HUMAN_INPUT)
+
+
+def initial_lifecycle_status_for_queue_item(
+    decision_label: str,
+    *,
+    candidate: dict[str, Any] | None = None,
+) -> str:
+    """Lifecycle at ingest for a newly queued action.
+
+    ALLOW structured local file operations that are executable by the bounded
+    executor start in ``ready_to_execute`` rather than
+    ``ready_for_next_agent_instruction``, which is reserved for actions that
+    genuinely advanced the work turn without a pending side effect.
+    """
+    if decision_label == "ALLOW" and candidate and candidate.get("structured_operations"):
+        return LIFECYCLE_READY_TO_EXECUTE
+    return default_lifecycle_status(decision_label)
 
 
 def lifecycle_status_after_evidence_without_envelope(
@@ -667,6 +686,7 @@ class AgentResponseRecord:
     actor: str
     action_ids: list[str]
     builder_version: str | None = None
+    extraction_report: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1386,8 +1406,14 @@ def build_run_timeline(
             admitted_ids.append(action_id)
             if executed:
                 executed_ids.append(action_id)
-            elif is_local_file_operation:
-                ready_to_execute_local_count += 1
+            elif is_local_file_operation and execution_status == "proposed_only":
+                if lifecycle_status in (
+                    LIFECYCLE_READY_TO_EXECUTE,
+                    LIFECYCLE_READY_FOR_NEXT_AGENT_INSTRUCTION,
+                    LIFECYCLE_NEEDS_HUMAN_INPUT,
+                    LIFECYCLE_ADMITTED_NOT_EXECUTED,
+                ) or decision == "ALLOW":
+                    ready_to_execute_local_count += 1
 
     run_turn_by_number = {turn.turn_number: turn for turn in run_loop.turns}
     turn_numbers = sorted(set(run_turn_by_number) | set(ops_by_turn))
