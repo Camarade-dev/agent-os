@@ -126,9 +126,41 @@ absent (the CLI uses its default model). A blocked config makes the backend repo
 
 No provider credentials are hard-coded anywhere. To configure a backend you set the command
 path + argv template for a CLI you have already authenticated separately; Admissible passes
-the child process only a small OS-essential environment allowlist (PATH, HOME/USERPROFILE,
-SYSTEMROOT, TEMP, …), so API keys and unrelated secrets in the parent environment are **not**
-leaked to the spawned agent.
+the child process only a **Windows-aware safe environment allowlist** (PATH, PATHEXT, COMSPEC,
+SystemRoot/WINDIR, SystemDrive, USERPROFILE/HOME, APPDATA, LOCALAPPDATA, ProgramData,
+ALLUSERSPROFILE, PUBLIC, TEMP/TMP, locale/TERM vars), so API keys and unrelated secrets in
+the parent environment are **not** leaked to the spawned agent.
+
+### Windows-safe Cursor Agent environment (slice ADMISSIBLE_RUN_036)
+
+Live evidence showed that Admissible's earlier minimal allowlist omitted Windows profile
+variables (`SystemDrive`, `APPDATA`, `LOCALAPPDATA`, `ProgramData`, …). When Cursor Agent
+inherited that sanitized environment, nested references such as
+`%SystemDrive%\ProgramData\Microsoft\Windows\Caches` were **not expanded**, producing invalid
+literal paths and empty stdout even though the same command succeeded from PowerShell with
+the normal inherited environment.
+
+`build_cursor_agent_safe_environment()` now:
+
+- preserves the allowlisted variables using **case-insensitive** parent lookup with stable
+  canonical output names;
+- expands nested `%NAME%` references recursively (bounded, no shell, no `cmd /c`);
+- **blocks** invocation when a path-like value still contains an unresolved `%NAME%` token;
+- validates path-like variables after expansion;
+- persists safe diagnostics (`environment_status`, `environment_variable_names`,
+  `unresolved_environment_variables`, `cursor_profile_environment_present`,
+  `program_data_path_present`, scoped `environment_paths`) — never the full environment or
+  secret values;
+- does **not** forward `CURSOR_API_KEY` or other unrelated application secrets.
+
+`probe_cursor_agent_cli_environment()` runs `cursor-agent --version` with the **same** safe
+env and `cwd` as a real invocation (`shell=False`, no model call). Use it for operator smoke
+tests and unit diagnostics — it is not run automatically on every tick.
+
+Why manual PowerShell worked but Admissible did not: PowerShell inherits the full Windows
+profile environment; Admissible deliberately strips secrets and only forwards the allowlist.
+Without `SystemDrive` / profile paths present and expanded, Cursor Agent could not resolve
+its local profile/cache locations.
 
 ### Safe configuration ladder
 
@@ -252,10 +284,16 @@ so a reconstructed controller ingests the pending response without re-invoking.
 `invoking_agent` → `response_ready` → `ingesting_response` → `response_consumed`
 and never display "waiting for a response file".
 
-**Failure behavior:** `timeout` / `failed` / empty-stdout invocations pause with a
-concise backend error (no spin, no repeated model billing); a response that
-parses into no admissible operations takes the existing bounded malformed retry,
-then fails.
+**Failure behavior:** terminal callable statuses (`malformed`, `failed`, `timeout`,
+`blocked_by_configuration`, `unavailable`, empty stdout / no usable response) pause
+immediately with `last_tick_step=backend_error`, `backend_retry_required=true`, and
+`auto_tick_safe=false`. The UI shows backend diagnostics (invocation id, exit code,
+duration, stdout bytes, stderr summary, environment status) and **never** uses file-bridge
+wording such as "Agent must write `.admissible/agent-response.md`". **Resume alone does not
+re-invoke** — the operator must click **Retry backend invocation**, then **Step once** to
+dispatch a new instruction. Ordinary ticks never alternate between `wait_for_agent_response`
+and `ingest_response` after a terminal failure. A response that parses into no admissible
+operations still takes the existing bounded malformed retry during *ingest*, then fails.
 
 ## Safety around model output (unchanged guarantees)
 

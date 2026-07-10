@@ -51,6 +51,15 @@ HA_NEXT_STOP = "stop"
 DEFAULT_MAX_TURNS = 12
 DEFAULT_MALFORMED_RETRY_LIMIT = 1
 
+# Terminal persisted invocation statuses — pause until explicit operator retry.
+_TERMINAL_INVOCATION_RECORD_STATUSES = frozenset(
+    {
+        "timeout",
+        "failed",
+        "malformed",
+    }
+)
+
 # Mirrors admissible.agent_transport.TRANSPORT_STATUS_MALFORMED_RETRY; kept as a
 # local literal so the controller never needs a module-level transport import.
 _TRANSPORT_STATUS_MALFORMED_RETRY = "malformed_response_retry"
@@ -128,6 +137,8 @@ class HighAutonomyRunState:
     last_consumed_invocation_id: str | None = None
     last_consumed_response_sha256: str | None = None
     backend_step: str | None = None
+    backend_retry_required: bool = False
+    backend_reinvoke_pending: bool = False
     # Live-rehearsal transport/bridge fields (display-only; not an authority).
     transport_status: str = "idle"
     workspace_path: str | None = None
@@ -261,7 +272,11 @@ def build_high_autonomy_summary(
     # never tells the operator to wait for `.admissible/agent-response.md`.
     is_callable_backend = ha_state.transport_kind == "callable_backend"
     backend_step = ha_state.backend_step
-    if is_callable_backend:
+    backend_error = _callable_backend_error_summary(ha_state) if is_callable_backend else {}
+    if is_callable_backend and _callable_terminal_failure_pending(ha_state):
+        doing_now = "Cursor Agent invocation stopped before producing a usable proposal."
+        needed_now = "Review diagnostics, then explicitly retry the backend invocation."
+    elif is_callable_backend:
         callable_doing = {
             "invoking_agent": "Invoking the agent backend.",
             "response_ready": "Agent response ready — ingesting next.",
@@ -318,6 +333,8 @@ def build_high_autonomy_summary(
         "pending_invocation_status": pending_invocation.get("status"),
         "agent_workspace_path": ha_state.agent_workspace_path,
         "backend_block_reason": ha_state.backend_block_reason,
+        "backend_retry_required": ha_state.backend_retry_required,
+        "backend_error": backend_error,
         # Live transport/bridge status (display-only) for the auto-tick UI.
         "transport_status": ha_state.transport_status,
         "workspace_path": ha_state.workspace_path,
@@ -356,6 +373,8 @@ def _auto_tick_safe(ha_state: HighAutonomyRunState) -> bool:
     if not ha_state.active or ha_state.paused:
         return False
     if ha_state.human_critical_pending:
+        return False
+    if _callable_terminal_failure_pending(ha_state):
         return False
     return ha_state.mode in _AUTO_TICK_SAFE_MODES
 
@@ -405,6 +424,8 @@ def build_live_high_autonomy_rehearsal_status(
 def _primary_button(ha_state: HighAutonomyRunState) -> str:
     if not ha_state.active or ha_state.mode == HA_MODE_OFF:
         return "start"
+    if _callable_terminal_failure_pending(ha_state):
+        return "retry_backend"
     if ha_state.mode == HA_MODE_HUMAN_REQUIRED:
         return "approve_or_refuse"
     if ha_state.paused:
@@ -418,9 +439,13 @@ def _transport_has_pending_response(transport: "AgentTransport | None") -> bool:
     """True when the transport still has an unread agent response queued."""
     if transport is None:
         return False
+    if hasattr(transport, "has_pending_response"):
+        return bool(transport.has_pending_response())
+    if hasattr(transport, "_pending_text"):
+        return getattr(transport, "_pending_text", None) is not None
     if hasattr(transport, "_response_index") and hasattr(transport, "_responses"):
         return transport._response_index < len(transport._responses)
-    return True
+    return False
 
 
 def _capture_transport_status(
@@ -453,6 +478,42 @@ def _capture_transport_status(
 
 def _is_callable_backend(ha_state: HighAutonomyRunState) -> bool:
     return ha_state.transport_kind == "callable_backend"
+
+
+def _pending_invocation_record(ha_state: HighAutonomyRunState) -> Any | None:
+    from admissible.agent_backend import AgentInvocationRecord
+
+    return AgentInvocationRecord.from_dict(ha_state.pending_agent_invocation)
+
+
+def _callable_terminal_failure_pending(ha_state: HighAutonomyRunState) -> bool:
+    """True when a callable backend failed terminally and awaits explicit retry."""
+    if not _is_callable_backend(ha_state):
+        return False
+    if not ha_state.backend_retry_required:
+        return False
+    record = _pending_invocation_record(ha_state)
+    if record is None:
+        return False
+    return record.status in _TERMINAL_INVOCATION_RECORD_STATUSES
+
+
+def _callable_backend_error_summary(ha_state: HighAutonomyRunState) -> dict[str, Any]:
+    """Display-only diagnostics for a terminal callable-backend failure."""
+    record = _pending_invocation_record(ha_state)
+    if record is None:
+        return {}
+    return {
+        "backend_step": ha_state.backend_step or record.status,
+        "invocation_id": record.invocation_id,
+        "exit_code": record.exit_code,
+        "invocation_duration_ms": record.invocation_duration_ms,
+        "stdout_length": record.stdout_length,
+        "stderr_summary": record.stderr_summary,
+        "error_message": record.error_message,
+        "environment_status": record.environment_status,
+        "retry_required": ha_state.backend_retry_required,
+    }
 
 
 def _pending_ready_invocation(ha_state: HighAutonomyRunState) -> Any | None:
@@ -571,16 +632,15 @@ def _pause_for_unavailable_transport(
     ha_state: HighAutonomyRunState, step_result: dict[str, Any]
 ) -> None:
     """Pause when a callable backend/transport cannot be rebuilt after reconstruction."""
-    reason = (
-        "Agent backend/transport is unavailable after reconstruction; reselect the backend "
-        "and target workspace to continue."
-    )
+    reason = "Callable agent backend unavailable"
     ha_state.mode = HA_MODE_PAUSED
     ha_state.paused = True
     ha_state.backend_block_reason = reason
+    ha_state.backend_retry_required = True
+    ha_state.backend_step = "unavailable"
     ha_state.next_action = HA_NEXT_NONE
-    ha_state.last_event = f"High-autonomy run paused: {reason}"
-    ha_state.last_tick_step = "backend_unavailable"
+    ha_state.last_event = reason
+    ha_state.last_tick_step = "backend_error"
     step_result["backend_block"] = {"status": "unavailable", "reason": reason}
 
 
@@ -634,13 +694,17 @@ def _finalize_write_instruction(
         ha_state.paused = True
         ha_state.backend_block_reason = reason
         ha_state.backend_step = record.status
+        ha_state.backend_retry_required = True
         ha_state.transport_status = record.status
         ha_state.next_action = HA_NEXT_NONE
-        ha_state.last_event = f"High-autonomy run paused: {reason}"
-        ha_state.last_tick_step = "backend_blocked"
+        ha_state.last_event = (
+            "Cursor Agent invocation stopped before producing a usable proposal."
+        )
+        ha_state.last_tick_step = "backend_error"
         step_result["backend_block"] = {"status": record.status, "reason": reason}
         return
     ha_state.backend_block_reason = None
+    ha_state.backend_retry_required = False
     ha_state.backend_step = CALLABLE_STEP_RESPONSE_READY
     ha_state.transport_status = "response_ready"
     ha_state.last_invocation_id = record.invocation_id
@@ -702,11 +766,19 @@ def _tick_ingest_callable(
 
     record = _pending_ready_invocation(ha_state)
     if record is None:
-        # Already consumed, or nothing persisted: never re-invoke, never spin.
+        # Already consumed, terminal failure, or nothing persisted: never re-invoke.
         ha_state.last_tick_step = "noop_waiting"
         step_result["reason"] = "no_ready_response"
-        if ha_state.mode == HA_MODE_WAITING_FOR_AGENT:
-            ha_state.mode = HA_MODE_RUNNING
+        if _callable_terminal_failure_pending(ha_state):
+            ha_state.mode = HA_MODE_PAUSED
+            ha_state.paused = True
+            ha_state.next_action = HA_NEXT_NONE
+        elif ha_state.mode == HA_MODE_WAITING_FOR_AGENT and not _is_callable_backend(ha_state):
+            ha_state.mode = HA_MODE_WAITING_FOR_AGENT
+        elif ha_state.mode == HA_MODE_WAITING_FOR_AGENT:
+            ha_state.mode = HA_MODE_PAUSED
+            ha_state.paused = True
+            ha_state.next_action = HA_NEXT_NONE
         _save_ha_state(controller, ha_state)
         controller._persist()
         return
@@ -942,6 +1014,10 @@ def _plan_next_action(
 ) -> str:
     if ha_state.paused or ha_state.mode in (HA_MODE_STOPPED, HA_MODE_FAILED, HA_MODE_OFF):
         return HA_NEXT_NONE
+    if _callable_terminal_failure_pending(ha_state):
+        return HA_NEXT_NONE
+    if ha_state.backend_reinvoke_pending:
+        return HA_NEXT_WRITE_INSTRUCTION
     if ha_state.mode == HA_MODE_HUMAN_REQUIRED or ha_state.human_critical_pending:
         return HA_NEXT_HUMAN_APPROVAL
     # After a human refuses the open human-critical action(s), the next safe step
@@ -963,6 +1039,12 @@ def _plan_next_action(
     ready_count = timeline.get("ready_to_execute_local_count", 0)
 
     if ha_state.mode == HA_MODE_WAITING_FOR_AGENT:
+        if _is_callable_backend(ha_state):
+            if _pending_ready_invocation(ha_state) is not None:
+                return HA_NEXT_INGEST_RESPONSE
+            if _callable_terminal_failure_pending(ha_state):
+                return HA_NEXT_NONE
+            return HA_NEXT_NONE
         if not _transport_has_pending_response(transport):
             if ha_state.verification_readiness in ("pass", "fail"):
                 return HA_NEXT_STOP
@@ -1004,7 +1086,9 @@ def _plan_next_action(
             if ha_state.current_turn < ha_state.max_turns:
                 if _transport_has_pending_response(transport):
                     return HA_NEXT_WRITE_INSTRUCTION
-                if not ha_state.recovery_attempted:
+                if not ha_state.recovery_attempted and not _callable_terminal_failure_pending(
+                    ha_state
+                ):
                     return HA_NEXT_WRITE_INSTRUCTION
 
     if ha_state.current_turn >= ha_state.max_turns:
@@ -1167,6 +1251,17 @@ def resume_high_autonomy_run(controller: "ControlSurfaceController") -> dict[str
     ha_state = _ha_state(controller)
     if not ha_state or not ha_state.active:
         raise ValueError("No active high-autonomy run to resume.")
+    if _callable_terminal_failure_pending(ha_state):
+        view = controller.state_view()
+        view["high_autonomy_summary"] = build_high_autonomy_summary(
+            ha_state=ha_state, state_view=view
+        )
+        view["high_autonomy_resume_blocked"] = {
+            "reason": (
+                "Backend invocation failed; explicit retry is required before the run can continue."
+            )
+        }
+        return view
     ha_state.paused = False
     ha_state.mode = HA_MODE_RUNNING
     ha_state.last_event = "High-autonomy run resumed."
@@ -1178,6 +1273,36 @@ def resume_high_autonomy_run(controller: "ControlSurfaceController") -> dict[str
         controller, ha_state, HighAutonomyPolicy(), controller._high_autonomy_transport
     )
     _save_ha_state(controller, ha_state)
+    view["high_autonomy_summary"] = build_high_autonomy_summary(ha_state=ha_state, state_view=view)
+    return view
+
+
+def retry_callable_backend_invocation(
+    controller: "ControlSurfaceController",
+) -> dict[str, Any]:
+    """Clear a terminal callable-backend failure and allow one explicit re-invocation."""
+    ha_state = _ha_state(controller)
+    if not ha_state or not ha_state.active:
+        raise ValueError("No active high-autonomy run.")
+    if not _is_callable_backend(ha_state):
+        raise ValueError("Retry is only available for callable agent backends.")
+    if not _callable_terminal_failure_pending(ha_state):
+        raise ValueError("No terminal backend failure awaiting retry.")
+
+    ha_state.pending_agent_invocation = None
+    ha_state.backend_retry_required = False
+    ha_state.backend_block_reason = None
+    ha_state.backend_step = None
+    ha_state.paused = False
+    ha_state.mode = HA_MODE_RUNNING
+    ha_state.last_event = "Operator cleared terminal backend failure; ready to re-invoke."
+    ha_state.last_tick_step = "backend_retry_cleared"
+    _ensure_high_autonomy_transport(controller, ha_state)
+    ha_state.backend_reinvoke_pending = True
+    ha_state.next_action = HA_NEXT_WRITE_INSTRUCTION
+    _save_ha_state(controller, ha_state)
+    controller._persist()
+    view = controller.state_view()
     view["high_autonomy_summary"] = build_high_autonomy_summary(ha_state=ha_state, state_view=view)
     return view
 
@@ -1247,6 +1372,7 @@ def tick_high_autonomy_run(
         return view
 
     if planned == HA_NEXT_WRITE_INSTRUCTION:
+        ha_state.backend_reinvoke_pending = False
         view_before = controller.state_view()
         continuation = view_before.get("continuation_instruction") or {}
         instruction_text = continuation.get("instruction_text")

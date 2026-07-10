@@ -46,7 +46,9 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import subprocess
+import sys
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -86,13 +88,14 @@ AGENT_INVOKE_STATUS_CODES = frozenset(
 
 # Statuses that mean "the loop cannot make progress with this backend right now".
 # The controller pauses/halts on these instead of spinning; they never
-# auto-advance a turn.
+# auto-advance a turn or re-invoke without an explicit operator retry.
 AGENT_INVOKE_TERMINAL_STATUSES = frozenset(
     {
         AGENT_INVOKE_UNAVAILABLE,
         AGENT_INVOKE_BLOCKED_BY_CONFIGURATION,
         AGENT_INVOKE_TIMEOUT,
         AGENT_INVOKE_FAILED,
+        AGENT_INVOKE_MALFORMED,
     }
 )
 
@@ -184,25 +187,60 @@ PROMPT_ARG_MAX_CHARS = 6000
 # Environment variables passed through to a spawned Cursor CLI. Deliberately a
 # small OS-essential allowlist so provider keys and unrelated secrets in the
 # parent environment are never leaked to the child process.
-_ENV_PASSTHROUGH_ALLOWLIST = (
+_ENV_PRESERVE_CANONICAL: tuple[str, ...] = (
     "PATH",
-    "HOME",
-    "USERPROFILE",
-    "HOMEDRIVE",
-    "HOMEPATH",
-    "SYSTEMROOT",
+    "PATHEXT",
+    "COMSPEC",
     "SystemRoot",
+    "SYSTEMROOT",
     "WINDIR",
     "TEMP",
     "TMP",
     "TMPDIR",
+    "SystemDrive",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "HOME",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "ProgramData",
+    "ALLUSERSPROFILE",
+    "PUBLIC",
     "LANG",
     "LC_ALL",
     "LC_CTYPE",
     "TERM",
-    "PATHEXT",
-    "COMSPEC",
 )
+
+_ENV_CANONICAL_BY_LOWER = {name.lower(): name for name in _ENV_PRESERVE_CANONICAL}
+
+# Path-like variables validated after %NAME% expansion (HOMEPATH may stay drive-relative).
+_PATH_LIKE_ENV_VARS = frozenset(
+    {
+        "SystemRoot",
+        "SYSTEMROOT",
+        "WINDIR",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "ProgramData",
+        "ALLUSERSPROFILE",
+        "PUBLIC",
+        "TEMP",
+        "TMP",
+    }
+)
+
+_DRIVE_LETTER_VARS = frozenset({"SystemDrive", "HOMEDRIVE"})
+
+_WIN_PERCENT_REF = re.compile(r"%([^%]+)%")
+
+_ENV_EXPANSION_MAX_ROUNDS = 64
+_MAX_ENV_VALUE_LEN = 8192
+
+# Legacy alias kept for tests that referenced the old name.
+_ENV_PASSTHROUGH_ALLOWLIST = _ENV_PRESERVE_CANONICAL
 
 
 def _now_iso() -> str:
@@ -272,6 +310,13 @@ class AgentInvocationResult:
     full_instruction_length: int | None = None
     stdout_length: int | None = None
     invocation_duration_ms: float | None = None
+    environment_status: str | None = None
+    environment_platform: str | None = None
+    environment_variable_names: list[str] | None = None
+    unresolved_environment_variables: list[str] | None = None
+    cursor_profile_environment_present: bool | None = None
+    program_data_path_present: bool | None = None
+    environment_paths: dict[str, str] | None = None
 
     @property
     def ok(self) -> bool:
@@ -303,6 +348,23 @@ class AgentInvocationResult:
             "full_instruction_length": self.full_instruction_length,
             "stdout_length": self.stdout_length,
             "invocation_duration_ms": self.invocation_duration_ms,
+            "environment_status": self.environment_status,
+            "environment_platform": self.environment_platform,
+            "environment_variable_names": (
+                list(self.environment_variable_names)
+                if self.environment_variable_names is not None
+                else None
+            ),
+            "unresolved_environment_variables": (
+                list(self.unresolved_environment_variables)
+                if self.unresolved_environment_variables is not None
+                else None
+            ),
+            "cursor_profile_environment_present": self.cursor_profile_environment_present,
+            "program_data_path_present": self.program_data_path_present,
+            "environment_paths": (
+                dict(self.environment_paths) if self.environment_paths is not None else None
+            ),
         }
 
 
@@ -377,6 +439,13 @@ class AgentInvocationRecord:
     full_instruction_length: int | None = None
     stdout_length: int | None = None
     invocation_duration_ms: float | None = None
+    environment_status: str | None = None
+    environment_platform: str | None = None
+    environment_variable_names: list[str] | None = None
+    unresolved_environment_variables: list[str] | None = None
+    cursor_profile_environment_present: bool | None = None
+    program_data_path_present: bool | None = None
+    environment_paths: dict[str, str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -402,6 +471,23 @@ class AgentInvocationRecord:
             "full_instruction_length": self.full_instruction_length,
             "stdout_length": self.stdout_length,
             "invocation_duration_ms": self.invocation_duration_ms,
+            "environment_status": self.environment_status,
+            "environment_platform": self.environment_platform,
+            "environment_variable_names": (
+                list(self.environment_variable_names)
+                if self.environment_variable_names is not None
+                else None
+            ),
+            "unresolved_environment_variables": (
+                list(self.unresolved_environment_variables)
+                if self.unresolved_environment_variables is not None
+                else None
+            ),
+            "cursor_profile_environment_present": self.cursor_profile_environment_present,
+            "program_data_path_present": self.program_data_path_present,
+            "environment_paths": (
+                dict(self.environment_paths) if self.environment_paths is not None else None
+            ),
         }
 
     @classmethod
@@ -452,6 +538,13 @@ def build_invocation_record(
         full_instruction_length=result.full_instruction_length,
         stdout_length=result.stdout_length,
         invocation_duration_ms=result.invocation_duration_ms,
+        environment_status=result.environment_status,
+        environment_platform=result.environment_platform,
+        environment_variable_names=result.environment_variable_names,
+        unresolved_environment_variables=result.unresolved_environment_variables,
+        cursor_profile_environment_present=result.cursor_profile_environment_present,
+        program_data_path_present=result.program_data_path_present,
+        environment_paths=result.environment_paths,
     )
 
 
@@ -973,9 +1066,235 @@ class CursorCliConfig:
         }
 
 
-def _sanitized_env(base: dict[str, str] | None = None) -> dict[str, str]:
+def _parent_env_lookup(source: dict[str, str], canonical_name: str) -> str | None:
+    """Look up an environment value case-insensitively (Windows-safe)."""
+    if canonical_name in source:
+        return source[canonical_name]
+    lower = canonical_name.lower()
+    for key, value in source.items():
+        if key.lower() == lower:
+            return value
+    return None
+
+
+def _canonical_env_name(name: str) -> str:
+    return _ENV_CANONICAL_BY_LOWER.get(name.lower(), name)
+
+
+def _expand_percent_refs_once(value: str, resolved: dict[str, str]) -> str:
+    """Expand ``%NAME%`` references using already-resolved env values (no shell)."""
+
+    def repl(match: re.Match[str]) -> str:
+        ref = match.group(1)
+        canonical = _canonical_env_name(ref)
+        return resolved.get(canonical, match.group(0))
+
+    result = _WIN_PERCENT_REF.sub(repl, value)
+    if len(result) > _MAX_ENV_VALUE_LEN:
+        return value
+    return result
+
+
+def _unresolved_percent_refs(value: str) -> list[str]:
+    return [_canonical_env_name(m.group(1)) for m in _WIN_PERCENT_REF.finditer(value)]
+
+
+def _is_absolute_windows_path(value: str) -> bool:
+    value = value.strip()
+    if not value:
+        return False
+    if value.startswith("\\\\"):
+        return True
+    if len(value) >= 2 and value[1] == ":":
+        return True
+    if value.startswith("\\"):
+        return True
+    return False
+
+
+def _is_drive_letter(value: str) -> bool:
+    value = value.strip()
+    return len(value) == 2 and value[1] == ":" and value[0].isalpha()
+
+
+def _validate_path_like_env(name: str, value: str) -> bool:
+    if name in _DRIVE_LETTER_VARS:
+        return _is_drive_letter(value)
+    if name == "HOMEPATH":
+        return value.startswith("\\") or _is_absolute_windows_path(value)
+    return _is_absolute_windows_path(value)
+
+
+def _safe_environment_paths(resolved: dict[str, str]) -> dict[str, str]:
+    """Expose known OS/profile path values for Advanced diagnostics (no secrets)."""
+    expose = (
+        "SystemDrive",
+        "SystemRoot",
+        "SYSTEMROOT",
+        "WINDIR",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "ProgramData",
+        "ALLUSERSPROFILE",
+        "PUBLIC",
+        "TEMP",
+        "TMP",
+        "HOMEDRIVE",
+        "HOMEPATH",
+    )
+    return {key: resolved[key] for key in expose if key in resolved}
+
+
+def build_cursor_agent_safe_environment(
+    base: dict[str, str] | None = None,
+) -> tuple[dict[str, str] | None, dict[str, Any]]:
+    """Build a Windows-aware safe subprocess environment for Cursor Agent.
+
+    Preserves only the allowlisted OS/profile variables from the parent process,
+    expands nested ``%NAME%`` references without invoking a shell, validates
+    path-like values, and blocks when required values still contain unresolved
+    tokens. Never forwards API keys, tokens, or unrelated application variables.
+    """
     source = dict(os.environ if base is None else base)
-    return {key: source[key] for key in _ENV_PASSTHROUGH_ALLOWLIST if key in source}
+    resolved: dict[str, str] = {}
+    for canonical in _ENV_PRESERVE_CANONICAL:
+        raw = _parent_env_lookup(source, canonical)
+        if raw is not None:
+            resolved[canonical] = raw
+
+    for _ in range(_ENV_EXPANSION_MAX_ROUNDS):
+        changed = False
+        for key, value in list(resolved.items()):
+            expanded = _expand_percent_refs_once(value, resolved)
+            if expanded != value:
+                resolved[key] = expanded
+                changed = True
+        if not changed:
+            break
+
+    unresolved: set[str] = set()
+    path_validation_errors: list[str] = []
+    for key, value in resolved.items():
+        for ref in _unresolved_percent_refs(value):
+            unresolved.add(ref)
+        if key in _PATH_LIKE_ENV_VARS or key in _DRIVE_LETTER_VARS:
+            if _unresolved_percent_refs(value):
+                path_validation_errors.append(key)
+            elif not _validate_path_like_env(key, value):
+                path_validation_errors.append(key)
+
+    program_data = resolved.get("ProgramData", "")
+    diagnostics: dict[str, Any] = {
+        "environment_status": "ok",
+        "environment_platform": sys.platform,
+        "environment_variable_names": sorted(resolved.keys()),
+        "unresolved_environment_variables": sorted(unresolved),
+        "cursor_profile_environment_present": (
+            "APPDATA" in resolved and "LOCALAPPDATA" in resolved
+        ),
+        "program_data_path_present": bool(program_data)
+        and not _WIN_PERCENT_REF.search(program_data),
+        "environment_paths": _safe_environment_paths(resolved),
+    }
+
+    if unresolved or path_validation_errors:
+        diagnostics["environment_status"] = "blocked"
+        diagnostics["path_validation_errors"] = sorted(set(path_validation_errors))
+        return None, diagnostics
+
+    return resolved, diagnostics
+
+
+def _sanitized_env(base: dict[str, str] | None = None) -> dict[str, str]:
+    """Legacy entry point — delegates to ``build_cursor_agent_safe_environment``."""
+    env, _diag = build_cursor_agent_safe_environment(base)
+    if env is None:
+        # Best-effort fallback for callers that ignore diagnostics; invoke() blocks properly.
+        source = dict(os.environ if base is None else base)
+        return {
+            key: _parent_env_lookup(source, key)  # type: ignore[misc]
+            for key in _ENV_PRESERVE_CANONICAL
+            if _parent_env_lookup(source, key) is not None
+        }
+    return env
+
+
+def probe_cursor_agent_cli_environment(
+    config: "CursorCliConfig",
+    *,
+    agent_workspace_path: str | Path,
+    env_base: dict[str, str] | None = None,
+    runner: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """Probe ``cursor-agent --version`` with the same safe env/cwd as ``invoke``.
+
+    Does not call a model. Intended for tests and operator diagnostics only.
+    """
+    availability_msg: str | None = None
+    if not config.ready():
+        availability_msg = config.missing_reason()
+    command = config.resolved_command()
+    env, env_diag = build_cursor_agent_safe_environment(env_base)
+    agent_workspace = Path(str(agent_workspace_path)).resolve()
+    result: dict[str, Any] = {
+        "configured": config.configured,
+        "ready": config.ready(),
+        "missing_reason": availability_msg,
+        "command": command,
+        "agent_workspace_path": str(agent_workspace),
+        **env_diag,
+    }
+    if availability_msg or not command:
+        result["probe_status"] = "blocked_by_configuration"
+        result["error_message"] = availability_msg or "Cursor CLI command not configured."
+        return result
+    if env is None:
+        result["probe_status"] = "blocked_by_environment"
+        result["error_message"] = (
+            "Cursor Agent environment blocked: unresolved variables "
+            f"{env_diag.get('unresolved_environment_variables')!r}."
+        )
+        return result
+
+    argv = [command, *config.version_probe_args]
+    run = runner if runner is not None else subprocess.run
+    try:
+        completed = run(
+            argv,
+            shell=False,
+            cwd=str(agent_workspace),
+            capture_output=True,
+            text=True,
+            timeout=30.0,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        result["probe_status"] = "timeout"
+        result["error_message"] = str(exc)
+        return result
+    except (OSError, ValueError) as exc:
+        result["probe_status"] = "failed"
+        result["error_message"] = str(exc)
+        return result
+
+    stdout = (getattr(completed, "stdout", "") or "").strip()
+    stderr = (getattr(completed, "stderr", "") or "").strip()
+    exit_code = getattr(completed, "returncode", None)
+    result.update(
+        {
+            "probe_status": "ok" if exit_code == 0 and stdout else "failed",
+            "exit_code": exit_code,
+            "stdout_length": len(stdout),
+            "stderr_summary": _summary(stderr),
+            "stdout_preview": stdout[:200] if stdout else None,
+        }
+    )
+    if exit_code != 0:
+        result["error_message"] = f"Version probe exited with code {exit_code}."
+    elif not stdout:
+        result["error_message"] = "Version probe produced empty stdout."
+    return result
 
 
 def _agent_bridge_dir(agent_workspace: Path) -> Path:
@@ -1182,8 +1501,23 @@ class CursorCliAgentBackend(AgentBackend):
         )
         instruction_sha256 = _sha256_text(request.instruction_text)
 
-        def invocation_diagnostics(stdout: str = "") -> dict[str, Any]:
-            return {
+        safe_env, env_diag = build_cursor_agent_safe_environment(self._env_base)
+        env_fields = {
+            "environment_status": env_diag.get("environment_status"),
+            "environment_platform": env_diag.get("environment_platform"),
+            "environment_variable_names": env_diag.get("environment_variable_names"),
+            "unresolved_environment_variables": env_diag.get(
+                "unresolved_environment_variables"
+            ),
+            "cursor_profile_environment_present": env_diag.get(
+                "cursor_profile_environment_present"
+            ),
+            "program_data_path_present": env_diag.get("program_data_path_present"),
+            "environment_paths": env_diag.get("environment_paths"),
+        }
+
+        def invocation_diagnostics(stdout: str = "", **extra: Any) -> dict[str, Any]:
+            base = {
                 "prompt_mode": prompt_mode,
                 "instruction_file_path": str(instruction_file),
                 "instruction_sha256": instruction_sha256,
@@ -1194,6 +1528,9 @@ class CursorCliAgentBackend(AgentBackend):
                 "stdout_length": len(stdout),
                 "invocation_duration_ms": duration_ms(),
             }
+            base.update(env_fields)
+            base.update(extra)
+            return base
 
         argv = self._build_argv(
             request,
@@ -1204,6 +1541,26 @@ class CursorCliAgentBackend(AgentBackend):
         stdin_text = (
             request.instruction_text if self.config.input_mode == INPUT_MODE_STDIN else None
         )
+        if safe_env is None:
+            unresolved = env_diag.get("unresolved_environment_variables") or []
+            self._last_status = AGENT_INVOKE_BLOCKED_BY_CONFIGURATION
+            result = AgentInvocationResult(
+                status=AGENT_INVOKE_BLOCKED_BY_CONFIGURATION,
+                model_label=self.config.model_label,
+                transport_label=self.backend_id,
+                started_at=started,
+                completed_at=_now_iso(),
+                error_message=(
+                    "Cursor Agent subprocess environment blocked: unresolved variables "
+                    f"{unresolved!r}."
+                ),
+                full_instruction_length=len(request.instruction_text),
+                invocation_duration_ms=duration_ms(),
+                **env_fields,
+            )
+            self._last_result = result
+            return result
+
         runner = self._resolve_runner()
         try:
             completed = runner(
@@ -1214,7 +1571,7 @@ class CursorCliAgentBackend(AgentBackend):
                 capture_output=True,
                 text=True,
                 input=stdin_text,
-                env=_sanitized_env(self._env_base),
+                env=safe_env,
             )
         except subprocess.TimeoutExpired as exc:
             self._last_status = AGENT_INVOKE_TIMEOUT
@@ -1787,4 +2144,7 @@ __all__ = [
     "ensure_agent_workspace",
     "looks_like_agent_os_repo",
     "describe_available_backends",
+    "build_cursor_agent_safe_environment",
+    "probe_cursor_agent_cli_environment",
+    "_sanitized_env",
 ]

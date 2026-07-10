@@ -1371,6 +1371,22 @@ function renderHighAutonomy(state) {
     ingesting_response: "Ingesting response",
     response_consumed: "Response consumed",
   };
+  const backendError = ha.backend_error || {};
+  const backendErrorRow = ha.backend_retry_required && ha.is_callable_backend
+    ? `<div class="ha-backend-error" style="margin:.65rem 0;padding:.55rem .65rem;border:1px solid var(--cs-border-strong);border-radius:6px;background:var(--cs-input-bg);">
+         <p style="margin:0 0 .35rem;font-weight:600;">Cursor Agent invocation stopped before producing a usable proposal.</p>
+         <dl class="ha-status-grid" style="margin:0;">
+           <div class="ha-status-row"><dt>Backend step</dt><dd>${escapeHtml(backendError.backend_step || ha.backend_step || "—")}</dd></div>
+           <div class="ha-status-row"><dt>Invocation id</dt><dd>${escapeHtml(backendError.invocation_id || ha.last_invocation_id || "—")}</dd></div>
+           <div class="ha-status-row"><dt>Exit code</dt><dd>${escapeHtml(backendError.exit_code ?? "—")}</dd></div>
+           <div class="ha-status-row"><dt>Duration</dt><dd>${escapeHtml(backendError.invocation_duration_ms != null ? backendError.invocation_duration_ms + " ms" : "—")}</dd></div>
+           <div class="ha-status-row"><dt>Stdout bytes</dt><dd>${escapeHtml(backendError.stdout_length ?? "—")}</dd></div>
+           <div class="ha-status-row"><dt>Stderr / error</dt><dd>${escapeHtml(truncate(backendError.stderr_summary || backendError.error_message || ha.backend_block_reason || "—", 240))}</dd></div>
+           <div class="ha-status-row"><dt>Environment status</dt><dd>${escapeHtml(backendError.environment_status || "—")}</dd></div>
+           <div class="ha-status-row"><dt>Retry required</dt><dd>Yes — explicit operator retry only (no automatic re-invocation)</dd></div>
+         </dl>
+       </div>`
+    : "";
   const backendStepRow = ha.is_callable_backend
     ? `<div class="ha-status-row"><dt>Backend step</dt><dd>${escapeHtml(callableStepLabels[ha.backend_step] || ha.backend_step || ha.transport_status || "—")}</dd></div>
        <div class="ha-status-row"><dt>Last invocation id</dt><dd>${escapeHtml(ha.last_invocation_id || "—")}</dd></div>`
@@ -1391,6 +1407,7 @@ function renderHighAutonomy(state) {
       <div class="ha-status-row"><dt>Verification</dt><dd>${escapeHtml(ha.verification_readiness || "not_run")}${ha.verification_passed ? " ✓" : ""}</dd></div>
       <div class="ha-status-row"><dt>Human action required</dt><dd>${escapeHtml(humanAction)}</dd></div>
     </dl>
+    ${backendErrorRow}
     ${ha.human_action_required && blockingActions.length ? `
       <div class="ha-blocking-actions">
         <p class="ha-blocking-title">Blocking human-critical action(s) — ${blockingActions.length}:</p>
@@ -1447,6 +1464,10 @@ function renderHighAutonomy(state) {
     primary =
       btn("btn-ha-approve", "Approve human-critical action") +
       btn("btn-ha-refuse", "Refuse human-critical action", "secondary");
+  } else if (primaryAction === "retry_backend") {
+    primary =
+      btn("btn-ha-retry-backend", "Retry backend invocation") +
+      btn("btn-ha-stop", "Stop", "secondary");
   } else {
     primary = btn("btn-ha-start", "Start high-autonomy run");
   }
@@ -1486,7 +1507,9 @@ function renderAutoRunStatusLine(ha) {
   if (lastTickResult) parts.push(`Last tick: ${lastTickResult}`);
   // Only the file bridge waits on an external response file. A callable backend
   // shows its in-process step instead (never "waiting for a response file").
-  if (ha.is_callable_backend) {
+  if (ha.backend_retry_required && ha.is_callable_backend) {
+    parts.push("Backend retry required");
+  } else if (ha.is_callable_backend) {
     if (ha.backend_step === "response_ready") parts.push("Agent response ready");
     else if (ha.backend_step === "ingesting_response") parts.push("Ingesting response");
     else if (ha.backend_step === "invoking_agent") parts.push("Invoking agent CLI");
@@ -2786,6 +2809,11 @@ document.getElementById("high-autonomy-actions").addEventListener("click", async
   }
   if (target.id === "btn-ha-resume") {
     await runAction(() => apiPost("/api/session/high_autonomy/resume", {}));
+    return;
+  }
+  if (target.id === "btn-ha-retry-backend") {
+    stopAutoRun();
+    await runAction(() => apiPost("/api/session/high_autonomy/retry_backend", {}));
     return;
   }
   if (target.id === "btn-ha-stop") {

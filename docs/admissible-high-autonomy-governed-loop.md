@@ -217,4 +217,9 @@ stop**.
   recovery: refusal clears all open actions, exits `human_required`, writes a local-only
   recovery instruction, and approval records intent without inventing an executor.
 - `tests/test_admissible_model_agnostic_agent_transport.py` — the callable `AgentBackend`
-  loop (Cursor CLI + fixture backend) and target/agent workspace separation.
+  shape, workspace safety, and Cursor CLI configuration.
+- `tests/test_admissible_cursor_agent_windows_environment.py` — Windows-safe subprocess env
+  builder and probe parity (slice ADMISSIBLE_RUN_036).
+- `tests/test_admissible_callable_terminal_pause.py` — terminal callable-backend pause,
+  exactly-once/no-rebilling, and disjoint file-bridge vs callable UI wording
+  (slice ADMISSIBLE_RUN_036).

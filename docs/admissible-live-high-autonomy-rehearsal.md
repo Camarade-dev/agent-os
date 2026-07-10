@@ -67,8 +67,15 @@ writing the response file. That is the only integration.
 > never passed as a raw positional prompt, regardless of length. Cursor Agent must return the
 > complete proposal on stdout and must not write any file or
 > `.admissible/agent-response.md`. Empty stdout pauses with persisted path/hash/length/exit/
-> duration diagnostics and does not re-invoke on ordinary ticks. An operator may explicitly
-> retry with **Resume** then **Step once**.
+> duration/environment diagnostics and does not re-invoke on ordinary ticks. **Resume alone
+> does not retry** — use **Retry backend invocation**, then **Step once**.
+>
+> **Update (slice ADMISSIBLE_RUN_036):** Admissible now forwards a Windows-aware safe profile
+> environment to `cursor-agent` (SystemDrive, APPDATA, LOCALAPPDATA, ProgramData, … with
+> bounded `%NAME%` expansion). Manual PowerShell runs worked because they inherited the full
+> profile; the earlier minimal allowlist left literal `%SystemDrive%` paths and empty stdout.
+> Terminal callable failures pause cleanly (`backend_error`, explicit retry required) and never
+> oscillate into file-bridge waiting states.
 
 ## Automatic instruction dispatch (hardened file bridge)
 
