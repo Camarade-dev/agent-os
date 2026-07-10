@@ -1363,12 +1363,24 @@ function renderHighAutonomy(state) {
     ? (ha.human_required_reason || "A human-critical action requires approval.")
     : "None";
   const blockingReason = ha.backend_block_reason || blocking || "Nothing blocking.";
+  // Callable backends invoke the agent in-process and show a backend *step*
+  // (Invoking / Response ready / Ingesting); the file bridge waits on a file.
+  const callableStepLabels = {
+    invoking_agent: "Invoking agent CLI",
+    response_ready: "Response ready",
+    ingesting_response: "Ingesting response",
+    response_consumed: "Response consumed",
+  };
+  const backendStepRow = ha.is_callable_backend
+    ? `<div class="ha-status-row"><dt>Backend step</dt><dd>${escapeHtml(callableStepLabels[ha.backend_step] || ha.backend_step || ha.transport_status || "—")}</dd></div>
+       <div class="ha-status-row"><dt>Last invocation id</dt><dd>${escapeHtml(ha.last_invocation_id || "—")}</dd></div>`
+    : `<div class="ha-status-row"><dt>Backend status</dt><dd>${escapeHtml(ha.transport_status || "—")}</dd></div>`;
   body.innerHTML = `
     <dl class="ha-status-grid">
       <div class="ha-status-row"><dt>Target workspace</dt><dd>${escapeHtml(ha.workspace_path || control.target_workspace_path || "—")}</dd></div>
       <div class="ha-status-row"><dt>Agent backend</dt><dd>${escapeHtml(ha.backend_id || control.backends && selectedBackendId() || "—")} <span style="color:var(--cs-muted);">(${escapeHtml(ha.transport_kind || "—")})</span></dd></div>
       <div class="ha-status-row"><dt>Agent workspace</dt><dd>${escapeHtml(ha.agent_workspace_path || control.agent_workspace_path || "—")}</dd></div>
-      <div class="ha-status-row"><dt>Backend status</dt><dd>${escapeHtml(ha.transport_status || "—")}</dd></div>
+      ${backendStepRow}
       <div class="ha-status-row"><dt>Doing now</dt><dd>${escapeHtml(ha.doing_now || "—")}</dd></div>
       <div class="ha-status-row"><dt>Needed now</dt><dd>${escapeHtml(ha.needed_now || "—")}</dd></div>
       <div class="ha-status-row"><dt>Current step</dt><dd>${escapeHtml(ha.next_action || "—")}</dd></div>
@@ -1472,7 +1484,15 @@ function renderAutoRunStatusLine(ha) {
   }
   const parts = [`Auto-run: ${state}`];
   if (lastTickResult) parts.push(`Last tick: ${lastTickResult}`);
-  if (ha.waiting_for_agent) parts.push("Waiting for Cursor response");
+  // Only the file bridge waits on an external response file. A callable backend
+  // shows its in-process step instead (never "waiting for a response file").
+  if (ha.is_callable_backend) {
+    if (ha.backend_step === "response_ready") parts.push("Agent response ready");
+    else if (ha.backend_step === "ingesting_response") parts.push("Ingesting response");
+    else if (ha.backend_step === "invoking_agent") parts.push("Invoking agent CLI");
+  } else if (ha.waiting_for_agent) {
+    parts.push("Waiting for external agent response file");
+  }
   if (ha.human_action_required) parts.push("Human action required");
   line.textContent = parts.join(" · ");
 }

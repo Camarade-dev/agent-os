@@ -50,6 +50,16 @@ writing the response file. That is the only integration.
 >
 > Operator smoke before the first real live run (never run from tests):
 > `cursor-agent --print --output-format text --mode plan --workspace <agent_workspace> --trust "Reply with exactly: ADMISSIBLE_CURSOR_AGENT_SMOKE_OK"`.
+>
+> **Update (slice ADMISSIBLE_RUN_034):** a callable backend's response is now persisted in
+> durable run state (an `AgentInvocationRecord`), not on the in-memory transport, so it
+> survives the browser/server tick lifecycle (a fresh controller per request or a restart) and
+> is ingested **exactly once**. The earlier live hang — a Cursor Agent response dispatched on
+> one tick, then lost on the next when the controller/transport were reconstructed
+> (`ingest_response` → `noop_waiting` forever) — is fixed. Callable backends now show
+> `invoking_agent` → `response_ready` → `ingesting_response` → `response_consumed` and never
+> "waiting for a response file"; only the file bridge waits on an external file. See
+> [the durable handoff section](admissible-model-agnostic-agent-transport.md#durable-callable-response-handoff-across-ticks-slice-admissible_run_034).
 
 ## Automatic instruction dispatch (hardened file bridge)
 

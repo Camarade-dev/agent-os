@@ -287,6 +287,134 @@ class AgentInvocationResult:
         }
 
 
+# -- durable callable-invocation record (slice ADMISSIBLE_RUN_034) -----------
+# A callable backend's response must survive controller/transport reconstruction
+# between HTTP ticks. The in-memory transport is NOT a safe home for a pending
+# response; this record is persisted in the run state so the browser/server
+# lifecycle (a fresh controller per request or after a restart) can still ingest
+# the response exactly once.
+INVOCATION_STATUS_INVOKING = "invoking"
+INVOCATION_STATUS_RESPONSE_READY = "response_ready"
+INVOCATION_STATUS_CONSUMED = "consumed"
+INVOCATION_STATUS_TIMEOUT = "timeout"
+INVOCATION_STATUS_FAILED = "failed"
+INVOCATION_STATUS_MALFORMED = "malformed"
+
+# Display-only callable-backend step labels (never shown for the file bridge).
+CALLABLE_STEP_INVOKING = "invoking_agent"
+CALLABLE_STEP_RESPONSE_READY = "response_ready"
+CALLABLE_STEP_INGESTING = "ingesting_response"
+CALLABLE_STEP_CONSUMED = "response_consumed"
+
+# Maps a raw invocation result status onto the persisted-record status.
+_RESULT_TO_RECORD_STATUS = {
+    AGENT_INVOKE_SUCCESS: INVOCATION_STATUS_RESPONSE_READY,
+    AGENT_INVOKE_TIMEOUT: INVOCATION_STATUS_TIMEOUT,
+    AGENT_INVOKE_FAILED: INVOCATION_STATUS_FAILED,
+    AGENT_INVOKE_MALFORMED: INVOCATION_STATUS_MALFORMED,
+    AGENT_INVOKE_UNAVAILABLE: INVOCATION_STATUS_FAILED,
+    AGENT_INVOKE_BLOCKED_BY_CONFIGURATION: INVOCATION_STATUS_FAILED,
+}
+
+_SUMMARY_MAX_CHARS = 500
+
+
+def _summary(text: str | None) -> str | None:
+    if not text:
+        return None
+    text = text.strip()
+    return text if len(text) <= _SUMMARY_MAX_CHARS else text[:_SUMMARY_MAX_CHARS] + "…"
+
+
+@dataclass
+class AgentInvocationRecord:
+    """Durable, persisted record of one callable-backend invocation.
+
+    Stored in the run state (not on the in-memory transport) so a response
+    dispatched on tick N can be ingested on tick N+1 even after the controller,
+    backend, and transport are reconstructed. Exactly-once is enforced by
+    ``invocation_id`` + ``response_sha256``.
+    """
+
+    invocation_id: str
+    instruction_id: str | None
+    backend_id: str
+    session_id: str | None
+    turn_number: int | None
+    status: str
+    response_text: str | None = None
+    response_sha256: str | None = None
+    stdout_summary: str | None = None
+    stderr_summary: str | None = None
+    exit_code: int | None = None
+    error_message: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+    consumed_at: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "invocation_id": self.invocation_id,
+            "instruction_id": self.instruction_id,
+            "backend_id": self.backend_id,
+            "session_id": self.session_id,
+            "turn_number": self.turn_number,
+            "status": self.status,
+            "response_text": self.response_text,
+            "response_sha256": self.response_sha256,
+            "stdout_summary": self.stdout_summary,
+            "stderr_summary": self.stderr_summary,
+            "exit_code": self.exit_code,
+            "error_message": self.error_message,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "consumed_at": self.consumed_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "AgentInvocationRecord | None":
+        if not data:
+            return None
+        known = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
+        return cls(**{k: v for k, v in data.items() if k in known})
+
+
+def build_invocation_record(
+    result: AgentInvocationResult,
+    *,
+    backend_id: str,
+    instruction_id: str | None,
+    session_id: str | None,
+    turn_number: int | None,
+    invocation_id: str | None = None,
+) -> AgentInvocationRecord:
+    """Normalize a raw ``AgentInvocationResult`` into a durable persisted record."""
+    import uuid
+
+    status = _RESULT_TO_RECORD_STATUS.get(result.status, INVOCATION_STATUS_FAILED)
+    response_text = result.response_text if status == INVOCATION_STATUS_RESPONSE_READY else None
+    if status == INVOCATION_STATUS_RESPONSE_READY and not (response_text or "").strip():
+        # An "ok" result with empty text is really malformed.
+        status = INVOCATION_STATUS_MALFORMED
+        response_text = None
+    return AgentInvocationRecord(
+        invocation_id=invocation_id or f"invoke_{uuid.uuid4().hex[:12]}",
+        instruction_id=instruction_id,
+        backend_id=backend_id,
+        session_id=session_id,
+        turn_number=turn_number,
+        status=status,
+        response_text=response_text,
+        response_sha256=_sha256_text(response_text) if response_text else None,
+        stdout_summary=_summary(result.raw_stdout),
+        stderr_summary=_summary(result.raw_stderr),
+        exit_code=result.exit_code,
+        error_message=result.error_message,
+        started_at=result.started_at,
+        completed_at=result.completed_at,
+    )
+
+
 @dataclass
 class AgentBackendAvailability:
     """Display-only availability snapshot for a backend."""
@@ -1535,8 +1663,20 @@ __all__ = [
     "cursor_agent_cli_safe_args_template",
     "cursor_agent_cli_preset_env",
     "is_cursor_agent_command",
+    "INVOCATION_STATUS_INVOKING",
+    "INVOCATION_STATUS_RESPONSE_READY",
+    "INVOCATION_STATUS_CONSUMED",
+    "INVOCATION_STATUS_TIMEOUT",
+    "INVOCATION_STATUS_FAILED",
+    "INVOCATION_STATUS_MALFORMED",
+    "CALLABLE_STEP_INVOKING",
+    "CALLABLE_STEP_RESPONSE_READY",
+    "CALLABLE_STEP_INGESTING",
+    "CALLABLE_STEP_CONSUMED",
     "AgentInvocationRequest",
     "AgentInvocationResult",
+    "AgentInvocationRecord",
+    "build_invocation_record",
     "AgentBackendAvailability",
     "AgentBackend",
     "FixtureAgentBackend",

@@ -199,6 +199,58 @@ wording is:
 - **Only admitted low-risk local writes may be auto-executed in high-autonomy mode**
 - **Human-critical actions still stop**
 
+## Durable callable-response handoff across ticks (slice ADMISSIBLE_RUN_034)
+
+A callable backend is invoked *synchronously* during the write step, so the
+response exists at the end of tick N. But the Control Surface reconstructs the
+controller / backend / transport between HTTP ticks (a fresh controller per
+request, or after a server restart). If the pending response lived only on the
+in-memory transport, it was lost on reconstruction and the loop waited forever
+(`ingest_response` → `noop_waiting`, indefinitely).
+
+The fix persists the response in durable run state, not on the transport:
+
+- **`AgentInvocationRecord`** (in the run state, serialized with the session):
+  `invocation_id`, `instruction_id`, `backend_id`, `session_id`, `turn_number`,
+  `status` (`invoking` / `response_ready` / `consumed` / `timeout` / `failed` /
+  `malformed`), `response_text`, `response_sha256`, stdout/stderr summaries,
+  timestamps, `consumed_at`.
+
+State transitions per turn (callable backend):
+
+```
+tick N     : build instruction → invoke backend once → persist record
+             (status=response_ready, sha256) → end tick in "response_ready"
+             (NOT the file-bridge "waiting for a response file")
+tick N+1   : load persisted record after reconstruction → ingest exactly once
+             through the existing extraction/admission path → mark "consumed"
+             → continue to admission / auto-execution
+```
+
+**Exactly-once guarantees:**
+
+- one backend invocation per instruction (the planner ingests a `response_ready`
+  record instead of re-planning a write, so it never re-invokes);
+- one ingestion per `invocation_id` + `response_sha256` (a `consumed` record is
+  never re-ingested);
+- repeated ticks after `response_ready` do not re-invoke; repeated ticks after
+  consumption do not re-ingest.
+
+**Reconstruction:** a fresh controller has no in-memory transport. The transport
+is rebuilt best-effort from `backend_id` + workspace when a *new* invocation is
+needed; ingesting an already-persisted response needs no live transport at all,
+so a reconstructed controller ingests the pending response without re-invoking.
+
+**Callable vs file bridge:** only the file bridge is
+`waiting_for_external_response`. Callable backends move through
+`invoking_agent` → `response_ready` → `ingesting_response` → `response_consumed`
+and never display "waiting for a response file".
+
+**Failure behavior:** `timeout` / `failed` / empty-stdout invocations pause with a
+concise backend error (no spin, no repeated model billing); a response that
+parses into no admissible operations takes the existing bounded malformed retry,
+then fails.
+
 ## Safety around model output (unchanged guarantees)
 
 Regardless of backend, response text goes through the existing
@@ -247,3 +299,8 @@ loop in tests.
 - `tests/test_admissible_workspace_first_ui.py` — `agent_backend_control` state view, Start
   gating (missing target, agent-os repo target), top-level workspace/backend markup, and the
   truthful truth-boundary wording.
+- `tests/test_admissible_callable_backend_response_persistence.py` — durable handoff: a real
+  controller reconstructed between dispatch and ingest still ingests the persisted response
+  exactly once; no re-invoke / no re-ingest across repeated ticks; export/import retains the
+  pending response; invocation record turn/instruction/sha alignment; callable UI never says
+  "waiting for a response file"; file-bridge semantics unchanged.

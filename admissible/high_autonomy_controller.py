@@ -119,6 +119,15 @@ class HighAutonomyRunState:
     backend_id: str | None = None
     agent_workspace_path: str | None = None
     backend_block_reason: str | None = None
+    # Durable callable-backend response handoff (slice ADMISSIBLE_RUN_034).
+    # A callable backend's response is persisted here — NOT only on the in-memory
+    # transport — so it survives controller/transport reconstruction between HTTP
+    # ticks and is ingested exactly once. Empty for the file-bridge transport.
+    pending_agent_invocation: dict[str, Any] | None = None
+    last_invocation_id: str | None = None
+    last_consumed_invocation_id: str | None = None
+    last_consumed_response_sha256: str | None = None
+    backend_step: str | None = None
     # Live-rehearsal transport/bridge fields (display-only; not an authority).
     transport_status: str = "idle"
     workspace_path: str | None = None
@@ -247,12 +256,29 @@ def build_high_autonomy_summary(
         HA_NEXT_STOP: "Run is stopping.",
     }.get(ha_state.next_action, ha_state.next_action)
 
+    # Callable backends invoke the agent in-process; they never wait for an
+    # external response file. Override the file-bridge-centric phrasing so the UI
+    # never tells the operator to wait for `.admissible/agent-response.md`.
+    is_callable_backend = ha_state.transport_kind == "callable_backend"
+    backend_step = ha_state.backend_step
+    if is_callable_backend:
+        callable_doing = {
+            "invoking_agent": "Invoking the agent backend.",
+            "response_ready": "Agent response ready — ingesting next.",
+            "ingesting_response": "Ingesting the agent response.",
+            "response_consumed": "Reviewing the ingested agent response.",
+        }
+        if ha_state.mode == HA_MODE_WAITING_FOR_AGENT:
+            doing_now = callable_doing.get(backend_step, "Agent response ready — ingesting next.")
+            needed_now = "Controller will ingest the agent response on the next tick."
+
     verification_readiness = ha_state.verification_readiness or verification.get(
         "readiness", "not_run"
     )
     live_status = build_live_high_autonomy_rehearsal_status(
         ha_state=ha_state, state_view=state_view
     )
+    pending_invocation = ha_state.pending_agent_invocation or {}
     return {
         "schema_version": HIGH_AUTONOMY_SCHEMA_VERSION,
         "active": ha_state.active,
@@ -286,6 +312,10 @@ def build_high_autonomy_summary(
         "tick_count": ha_state.tick_count,
         "transport_kind": ha_state.transport_kind,
         "backend_id": ha_state.backend_id,
+        "is_callable_backend": is_callable_backend,
+        "backend_step": backend_step,
+        "last_invocation_id": ha_state.last_invocation_id,
+        "pending_invocation_status": pending_invocation.get("status"),
         "agent_workspace_path": ha_state.agent_workspace_path,
         "backend_block_reason": ha_state.backend_block_reason,
         # Live transport/bridge status (display-only) for the auto-tick UI.
@@ -293,7 +323,10 @@ def build_high_autonomy_summary(
         "workspace_path": ha_state.workspace_path,
         "instruction_path": ha_state.instruction_path,
         "response_path": ha_state.response_path,
-        "waiting_for_agent": ha_state.mode == HA_MODE_WAITING_FOR_AGENT,
+        # A callable backend never waits on an external response file; only the
+        # file bridge does. This flag drives the "Waiting for … response file" UI.
+        "waiting_for_agent": ha_state.mode == HA_MODE_WAITING_FOR_AGENT
+        and not is_callable_backend,
         "stale_response_blocked": ha_state.stale_response_blocked,
         "auto_tick_safe": _auto_tick_safe(ha_state),
         "live_rehearsal_status": live_status,
@@ -381,8 +414,10 @@ def _primary_button(ha_state: HighAutonomyRunState) -> str:
     return "pause"
 
 
-def _transport_has_pending_response(transport: "AgentTransport") -> bool:
+def _transport_has_pending_response(transport: "AgentTransport | None") -> bool:
     """True when the transport still has an unread agent response queued."""
+    if transport is None:
+        return False
     if hasattr(transport, "_response_index") and hasattr(transport, "_responses"):
         return transport._response_index < len(transport._responses)
     return True
@@ -413,34 +448,376 @@ def _capture_transport_status(
     ha_state.stale_response_blocked = snap.get("status") == TRANSPORT_STATUS_STALE_BLOCKED
 
 
-def _callable_backend_terminal_block(transport: "AgentTransport") -> Any | None:
-    """Return the last invocation result when a callable backend cannot progress.
+# -- durable callable-backend response handoff (slice ADMISSIBLE_RUN_034) -----
 
-    Only callable-backend transports expose ``last_invocation_result``. A
-    terminal block (blocked_by_configuration / unavailable / timeout / failed)
-    means the loop must pause with a clear reason rather than spin re-planning
-    an ingest that will never arrive.
+
+def _is_callable_backend(ha_state: HighAutonomyRunState) -> bool:
+    return ha_state.transport_kind == "callable_backend"
+
+
+def _pending_ready_invocation(ha_state: HighAutonomyRunState) -> Any | None:
+    """Return the persisted ``response_ready`` invocation record, if one awaits ingest.
+
+    Reads the durable record from the run state (not the in-memory transport), so
+    a response dispatched before a controller/transport reconstruction is still
+    found. Exactly-once: a record already consumed (by id or sha) is ignored.
     """
-    result = getattr(transport, "last_invocation_result", None)
-    if result is not None and getattr(result, "is_terminal_block", False):
-        return result
-    return None
+    from admissible.agent_backend import (
+        INVOCATION_STATUS_RESPONSE_READY,
+        AgentInvocationRecord,
+    )
+
+    record = AgentInvocationRecord.from_dict(ha_state.pending_agent_invocation)
+    if record is None or record.status != INVOCATION_STATUS_RESPONSE_READY:
+        return None
+    if record.invocation_id and record.invocation_id == ha_state.last_consumed_invocation_id:
+        return None
+    if (
+        record.response_sha256
+        and record.response_sha256 == ha_state.last_consumed_response_sha256
+    ):
+        return None
+    if not (record.response_text or "").strip():
+        return None
+    return record
 
 
-def _pause_for_backend_block(
+def _persist_invocation_from_transport(
+    controller: "ControlSurfaceController",
     ha_state: HighAutonomyRunState,
-    block: Any,
-    step_result: dict[str, Any],
+    transport: "AgentTransport",
+    *,
+    instruction_id: str | None,
+    turn_number: int | None,
+) -> Any:
+    """Persist the transport's last invocation result into the durable run state.
+
+    Returns the built ``AgentInvocationRecord``. This is what makes a callable
+    backend's response survive reconstruction: the source of truth is the run
+    state, never the in-memory transport field.
+    """
+    from admissible.agent_backend import build_invocation_record
+
+    result = getattr(transport, "last_invocation_result", None)
+    record = build_invocation_record(
+        result,
+        backend_id=ha_state.backend_id or getattr(transport, "backend_id", "callable"),
+        instruction_id=instruction_id,
+        session_id=controller._session.session_id,
+        turn_number=turn_number,
+    )
+    ha_state.pending_agent_invocation = record.to_dict()
+    ha_state.last_invocation_id = record.invocation_id
+    return record
+
+
+def _mark_invocation_consumed(ha_state: HighAutonomyRunState, record: Any) -> None:
+    """Record exactly-once consumption of a persisted invocation record."""
+    from admissible.agent_backend import CALLABLE_STEP_CONSUMED, INVOCATION_STATUS_CONSUMED
+
+    ha_state.last_consumed_invocation_id = record.invocation_id
+    ha_state.last_consumed_response_sha256 = record.response_sha256
+    record.status = INVOCATION_STATUS_CONSUMED
+    record.consumed_at = _now_iso()
+    ha_state.pending_agent_invocation = record.to_dict()
+    ha_state.backend_step = CALLABLE_STEP_CONSUMED
+
+
+def _ensure_high_autonomy_transport(
+    controller: "ControlSurfaceController", ha_state: HighAutonomyRunState
+) -> "AgentTransport | None":
+    """Return the live transport, rebuilding it best-effort after reconstruction.
+
+    A reconstructed controller (fresh process / fresh HTTP controller) has no
+    in-memory ``_high_autonomy_transport``. The file bridge rebuilds trivially
+    from the workspace; a callable backend rebuilds from ``backend_id`` + env
+    config. Rebuilding can legitimately fail (e.g. the CLI is no longer
+    configured); callers must tolerate ``None`` and only need a live transport to
+    *invoke* — ingest of an already-persisted response never needs one.
+    """
+    existing = controller._high_autonomy_transport
+    if existing is not None:
+        return existing
+    workspace = ha_state.workspace_path
+    if not workspace:
+        return None
+    try:
+        if _is_callable_backend(ha_state):
+            from admissible.agent_backend import CallableBackendTransport
+
+            backend = _build_backend_from_id(ha_state.backend_id or "", workspace)
+            if backend is None:
+                # file_bridge id resolved to no callable backend.
+                from admissible.agent_transport import FileBridgeAgentTransport
+
+                transport: "AgentTransport" = FileBridgeAgentTransport(workspace)
+            else:
+                transport = CallableBackendTransport(
+                    backend,
+                    target_workspace_path=workspace,
+                    agent_workspace_path=ha_state.agent_workspace_path or workspace,
+                )
+        else:
+            from admissible.agent_transport import FileBridgeAgentTransport
+
+            transport = FileBridgeAgentTransport(workspace)
+    except Exception:
+        return None
+    controller._high_autonomy_transport = transport
+    return transport
+
+
+def _pause_for_unavailable_transport(
+    ha_state: HighAutonomyRunState, step_result: dict[str, Any]
 ) -> None:
-    """Pause the run on a callable-backend terminal block (never auto-approve)."""
-    reason = block.error_message or f"Agent backend returned status {block.status!r}."
+    """Pause when a callable backend/transport cannot be rebuilt after reconstruction."""
+    reason = (
+        "Agent backend/transport is unavailable after reconstruction; reselect the backend "
+        "and target workspace to continue."
+    )
     ha_state.mode = HA_MODE_PAUSED
     ha_state.paused = True
     ha_state.backend_block_reason = reason
     ha_state.next_action = HA_NEXT_NONE
     ha_state.last_event = f"High-autonomy run paused: {reason}"
-    ha_state.last_tick_step = "backend_blocked"
-    step_result["backend_block"] = {"status": block.status, "reason": reason}
+    ha_state.last_tick_step = "backend_unavailable"
+    step_result["backend_block"] = {"status": "unavailable", "reason": reason}
+
+
+def _finalize_write_instruction(
+    controller: "ControlSurfaceController",
+    ha_state: HighAutonomyRunState,
+    transport: "AgentTransport",
+    step_result: dict[str, Any],
+    *,
+    turn_number: int | None,
+    event: str,
+    event_type: str,
+    tick_step: str,
+) -> None:
+    """Set run state after a ``write_instruction``, persisting callable responses.
+
+    File bridge: mark WAITING for an external response file (unchanged). Callable
+    backend: the backend was already invoked synchronously by ``write_instruction``
+    — persist its result durably so it survives reconstruction. A ``response_ready``
+    result marks the next tick to ingest; any other status pauses concisely (no
+    spin, no repeated billing).
+    """
+    if not _is_callable_backend(ha_state):
+        ha_state.backend_block_reason = None
+        ha_state.mode = HA_MODE_WAITING_FOR_AGENT
+        ha_state.awaiting_instruction_after_review = False
+        ha_state.last_event = event
+        ha_state.last_tick_step = tick_step
+        controller._session.transcript.append(
+            _transcript_entry(event_type, {"turn": turn_number, "bridge": step_result.get("bridge")})
+        )
+        return
+
+    from admissible.agent_backend import (
+        CALLABLE_STEP_RESPONSE_READY,
+        INVOCATION_STATUS_RESPONSE_READY,
+    )
+
+    record = _persist_invocation_from_transport(
+        controller,
+        ha_state,
+        transport,
+        instruction_id=_latest_instruction_id(controller),
+        turn_number=turn_number,
+    )
+    step_result["invocation_id"] = record.invocation_id
+    step_result["invocation_status"] = record.status
+    if record.status != INVOCATION_STATUS_RESPONSE_READY:
+        reason = record.error_message or f"Agent invocation status {record.status!r}."
+        ha_state.mode = HA_MODE_PAUSED
+        ha_state.paused = True
+        ha_state.backend_block_reason = reason
+        ha_state.backend_step = record.status
+        ha_state.transport_status = record.status
+        ha_state.next_action = HA_NEXT_NONE
+        ha_state.last_event = f"High-autonomy run paused: {reason}"
+        ha_state.last_tick_step = "backend_blocked"
+        step_result["backend_block"] = {"status": record.status, "reason": reason}
+        return
+    ha_state.backend_block_reason = None
+    ha_state.backend_step = CALLABLE_STEP_RESPONSE_READY
+    ha_state.transport_status = "response_ready"
+    ha_state.last_invocation_id = record.invocation_id
+    ha_state.mode = HA_MODE_WAITING_FOR_AGENT
+    ha_state.awaiting_instruction_after_review = False
+    ha_state.last_event = (
+        f"Invoked {ha_state.backend_id or 'agent'} for turn {turn_number}; response ready to ingest."
+    )
+    ha_state.last_tick_step = "invoke_agent"
+    controller._session.transcript.append(
+        _transcript_entry(
+            event_type, {"turn": turn_number, "invocation_id": record.invocation_id}
+        )
+    )
+
+
+def _ingest_success_state(
+    controller: "ControlSurfaceController",
+    ha_state: HighAutonomyRunState,
+    *,
+    response_sha256: str | None,
+    event: str,
+    invocation_id: str | None = None,
+) -> None:
+    ha_state.last_response_cursor = response_sha256
+    ha_state.mode = HA_MODE_REVIEWING
+    ha_state.awaiting_instruction_after_review = True
+    ha_state.malformed_retry_count = 0
+    ha_state.last_event = event
+    ha_state.last_tick_step = "ingest_response"
+    controller._session.transcript.append(
+        _transcript_entry(
+            "high_autonomy_response_ingested",
+            {"turn": controller._session.run_loop.current_turn, "invocation_id": invocation_id},
+        )
+    )
+
+
+def _fail_malformed(
+    controller: "ControlSurfaceController",
+    ha_state: HighAutonomyRunState,
+    exc: Exception,
+) -> None:
+    ha_state.mode = HA_MODE_FAILED
+    ha_state.active = False
+    ha_state.stop_reason = f"Malformed agent response: {exc}"
+    ha_state.last_event = ha_state.stop_reason
+    ha_state.last_tick_step = "failed"
+
+
+def _tick_ingest_callable(
+    controller: "ControlSurfaceController",
+    ha_state: HighAutonomyRunState,
+    transport: "AgentTransport | None",
+    step_result: dict[str, Any],
+) -> None:
+    """Ingest a callable backend's persisted response exactly once (reconstruction-safe)."""
+    from admissible.agent_backend import CALLABLE_STEP_INGESTING
+
+    record = _pending_ready_invocation(ha_state)
+    if record is None:
+        # Already consumed, or nothing persisted: never re-invoke, never spin.
+        ha_state.last_tick_step = "noop_waiting"
+        step_result["reason"] = "no_ready_response"
+        if ha_state.mode == HA_MODE_WAITING_FOR_AGENT:
+            ha_state.mode = HA_MODE_RUNNING
+        _save_ha_state(controller, ha_state)
+        controller._persist()
+        return
+
+    ha_state.backend_step = CALLABLE_STEP_INGESTING
+    ha_state.transport_status = "ingesting_response"
+    try:
+        controller.ingest_agent_response(record.response_text)
+    except ValueError as exc:
+        # A response that parsed into no admissible operations: consume it (never
+        # re-ingest) and take the existing bounded retry, else fail.
+        _mark_invocation_consumed(ha_state, record)
+        if ha_state.malformed_retry_count < DEFAULT_MALFORMED_RETRY_LIMIT and transport is not None:
+            ha_state.malformed_retry_count += 1
+            retry_text = (
+                "MALFORMED RESPONSE: your prior response could not be ingested. "
+                f"Error: {exc}. Reply with structured operations only."
+            )
+            transport.note_status(_TRANSPORT_STATUS_MALFORMED_RETRY, error=str(exc))
+            transport.write_instruction(
+                retry_text,
+                turn_number=controller._session.run_loop.current_turn,
+                session_id=controller._session.session_id,
+                instruction_id=_latest_instruction_id(controller),
+            )
+            _finalize_write_instruction(
+                controller,
+                ha_state,
+                transport,
+                step_result,
+                turn_number=controller._session.run_loop.current_turn,
+                event="Malformed response — sent one bounded retry instruction.",
+                event_type="high_autonomy_malformed_retry",
+                tick_step="malformed_retry",
+            )
+            step_result["retry"] = True
+        else:
+            _fail_malformed(controller, ha_state, exc)
+        _save_ha_state(controller, ha_state)
+        controller._persist()
+        return
+
+    _mark_invocation_consumed(ha_state, record)
+    _ingest_success_state(
+        controller,
+        ha_state,
+        response_sha256=record.response_sha256,
+        event=(
+            f"Ingested turn {controller._session.run_loop.current_turn} response "
+            f"(invocation {record.invocation_id})."
+        ),
+        invocation_id=record.invocation_id,
+    )
+    step_result["ingested"] = True
+    step_result["invocation_id"] = record.invocation_id
+    _save_ha_state(controller, ha_state)
+    controller._persist()
+
+
+def _tick_ingest_file_bridge(
+    controller: "ControlSurfaceController",
+    ha_state: HighAutonomyRunState,
+    transport: "AgentTransport",
+    step_result: dict[str, Any],
+) -> None:
+    """File-bridge ingest: read a fresh external response file (unchanged behavior)."""
+    read_result = transport.read_response_if_changed()
+    if not read_result.changed or not read_result.text:
+        ha_state.mode = HA_MODE_WAITING_FOR_AGENT
+        ha_state.last_tick_step = "noop_waiting"
+        step_result["reason"] = "no_new_response"
+        _save_ha_state(controller, ha_state)
+        controller._persist()
+        return
+    try:
+        controller.ingest_agent_response(read_result.text)
+    except ValueError as exc:
+        if ha_state.malformed_retry_count < DEFAULT_MALFORMED_RETRY_LIMIT:
+            ha_state.malformed_retry_count += 1
+            retry_text = (
+                "MALFORMED RESPONSE: your prior response could not be ingested. "
+                f"Error: {exc}. Reply with structured operations only."
+            )
+            transport.note_status(_TRANSPORT_STATUS_MALFORMED_RETRY, error=str(exc))
+            transport.write_instruction(
+                retry_text,
+                turn_number=controller._session.run_loop.current_turn,
+                session_id=controller._session.session_id,
+            )
+            ha_state.mode = HA_MODE_WAITING_FOR_AGENT
+            ha_state.last_event = "Malformed response — sent one bounded retry instruction."
+            ha_state.last_tick_step = "malformed_retry"
+            step_result["retry"] = True
+        else:
+            _fail_malformed(controller, ha_state, exc)
+        _save_ha_state(controller, ha_state)
+        controller._persist()
+        return
+    transport.mark_response_consumed(
+        turn_number=controller._session.run_loop.current_turn,
+        response_sha256=read_result.cursor or "",
+    )
+    _ingest_success_state(
+        controller,
+        ha_state,
+        response_sha256=read_result.cursor,
+        event=f"Ingested turn {controller._session.run_loop.current_turn} response automatically.",
+    )
+    step_result["ingested"] = True
+    _save_ha_state(controller, ha_state)
+    controller._persist()
 
 
 def _latest_instruction_id(controller: "ControlSurfaceController") -> str | None:
@@ -561,7 +938,7 @@ def _plan_next_action(
     controller: "ControlSurfaceController",
     ha_state: HighAutonomyRunState,
     policy: HighAutonomyPolicy,
-    transport: "AgentTransport",
+    transport: "AgentTransport | None",
 ) -> str:
     if ha_state.paused or ha_state.mode in (HA_MODE_STOPPED, HA_MODE_FAILED, HA_MODE_OFF):
         return HA_NEXT_NONE
@@ -572,6 +949,13 @@ def _plan_next_action(
     # the already-consumed response and never re-entering human_required.
     if ha_state.refusal_recovery_pending:
         return HA_NEXT_WRITE_RECOVERY
+
+    # A callable backend response that is already dispatched-and-persisted must be
+    # ingested next, even after the controller/transport were reconstructed and
+    # the in-memory transport lost its pending text. Durable state is the source
+    # of truth; this guarantees exactly-once ingest across the HTTP tick lifecycle.
+    if _pending_ready_invocation(ha_state) is not None:
+        return HA_NEXT_INGEST_RESPONSE
 
     view = controller.state_view()
     timeline = view.get("run_timeline") or {}
@@ -834,8 +1218,11 @@ def tick_high_autonomy_run(
         view["high_autonomy_tick"] = {"step": "noop", "reason": ha_state.mode}
         return view
 
-    transport = controller._high_autonomy_transport
-    if transport is None:
+    # A reconstructed controller (fresh HTTP request / server restart) has no
+    # in-memory transport; rebuild it best-effort. A callable backend can still
+    # ingest an already-persisted response even when this stays None.
+    transport = _ensure_high_autonomy_transport(controller, ha_state)
+    if transport is None and not _is_callable_backend(ha_state):
         raise ValueError("High-autonomy transport is not configured.")
 
     policy = policy or HighAutonomyPolicy()
@@ -873,29 +1260,28 @@ def tick_high_autonomy_run(
             packet_view = controller.generate_next_instruction_packet()
             instruction_text = packet_view["run_loop"]["instruction_packets"][-1]["packet_text"]
 
-        bridge_result = transport.write_instruction(
-            instruction_text,
-            turn_number=controller._session.run_loop.current_turn,
-            session_id=controller._session.session_id,
-            instruction_id=_latest_instruction_id(controller),
-        )
-        step_result.update({"bridge": bridge_result, "turn": controller._session.run_loop.current_turn})
-        block = _callable_backend_terminal_block(transport)
-        if block is not None:
-            _pause_for_backend_block(ha_state, block, step_result)
+        turn_now = controller._session.run_loop.current_turn
+        if transport is None:
+            _pause_for_unavailable_transport(ha_state, step_result)
             _save_ha_state(controller, ha_state)
             controller._persist()
         else:
-            ha_state.backend_block_reason = None
-            ha_state.mode = HA_MODE_WAITING_FOR_AGENT
-            ha_state.last_event = f"Wrote turn {controller._session.run_loop.current_turn} instruction automatically."
-            ha_state.awaiting_instruction_after_review = False
-            ha_state.last_tick_step = "write_instruction"
-            controller._session.transcript.append(
-                _transcript_entry(
-                    "high_autonomy_instruction_written",
-                    {"turn": controller._session.run_loop.current_turn, "bridge": bridge_result},
-                )
+            bridge_result = transport.write_instruction(
+                instruction_text,
+                turn_number=turn_now,
+                session_id=controller._session.session_id,
+                instruction_id=_latest_instruction_id(controller),
+            )
+            step_result.update({"bridge": bridge_result, "turn": turn_now})
+            _finalize_write_instruction(
+                controller,
+                ha_state,
+                transport,
+                step_result,
+                turn_number=turn_now,
+                event=f"Wrote turn {turn_now} instruction automatically.",
+                event_type="high_autonomy_instruction_written",
+                tick_step="write_instruction",
             )
             _save_ha_state(controller, ha_state)
             controller._persist()
@@ -921,91 +1307,38 @@ def tick_high_autonomy_run(
             recovery_event = "Wrote local-only recovery instruction automatically."
             recovery_event_type = "high_autonomy_recovery_instruction_written"
         controller.generate_next_continuation_instruction_packet(instruction_text=recovery_text)
-        bridge_result = transport.write_instruction(
-            recovery_text,
-            turn_number=controller._session.run_loop.current_turn,
-            session_id=controller._session.session_id,
-            instruction_id=_latest_instruction_id(controller),
-        )
         ha_state.recovery_pending = False
         ha_state.refusal_recovery_pending = False
         ha_state.recovery_attempted = True
-        step_result.update({"bridge": bridge_result, "refusal_recovery": is_refusal_recovery})
-        block = _callable_backend_terminal_block(transport)
-        if block is not None:
-            _pause_for_backend_block(ha_state, block, step_result)
+        turn_now = controller._session.run_loop.current_turn
+        if transport is None:
+            _pause_for_unavailable_transport(ha_state, step_result)
         else:
-            ha_state.backend_block_reason = None
-            ha_state.mode = HA_MODE_WAITING_FOR_AGENT
-            ha_state.last_event = recovery_event
-            ha_state.last_tick_step = "write_recovery_instruction"
-            controller._session.transcript.append(
-                _transcript_entry(recovery_event_type, {"bridge": bridge_result})
+            bridge_result = transport.write_instruction(
+                recovery_text,
+                turn_number=turn_now,
+                session_id=controller._session.session_id,
+                instruction_id=_latest_instruction_id(controller),
+            )
+            step_result.update({"bridge": bridge_result, "refusal_recovery": is_refusal_recovery})
+            _finalize_write_instruction(
+                controller,
+                ha_state,
+                transport,
+                step_result,
+                turn_number=turn_now,
+                event=recovery_event,
+                event_type=recovery_event_type,
+                tick_step="write_recovery_instruction",
             )
         _save_ha_state(controller, ha_state)
         controller._persist()
 
     elif planned == HA_NEXT_INGEST_RESPONSE:
-        read_result = transport.read_response_if_changed()
-        if not read_result.changed or not read_result.text:
-            ha_state.mode = HA_MODE_WAITING_FOR_AGENT
-            ha_state.last_tick_step = "noop_waiting"
-            step_result["reason"] = "no_new_response"
-            _save_ha_state(controller, ha_state)
-            controller._persist()
+        if _is_callable_backend(ha_state):
+            _tick_ingest_callable(controller, ha_state, transport, step_result)
         else:
-            try:
-                controller.ingest_agent_response(read_result.text)
-                ha_state.last_response_cursor = read_result.cursor
-                ha_state.mode = HA_MODE_REVIEWING
-                ha_state.awaiting_instruction_after_review = True
-                ha_state.malformed_retry_count = 0
-                ha_state.last_event = (
-                    f"Ingested turn {controller._session.run_loop.current_turn} response automatically."
-                )
-                ha_state.last_tick_step = "ingest_response"
-                step_result["ingested"] = True
-                transport.mark_response_consumed(
-                    turn_number=controller._session.run_loop.current_turn,
-                    response_sha256=read_result.cursor or "",
-                )
-                controller._session.transcript.append(
-                    _transcript_entry(
-                        "high_autonomy_response_ingested",
-                        {"turn": controller._session.run_loop.current_turn},
-                    )
-                )
-                _save_ha_state(controller, ha_state)
-                controller._persist()
-            except ValueError as exc:
-                if ha_state.malformed_retry_count < DEFAULT_MALFORMED_RETRY_LIMIT:
-                    ha_state.malformed_retry_count += 1
-                    retry_text = (
-                        "MALFORMED RESPONSE: your prior response could not be ingested. "
-                        f"Error: {exc}. Reply with structured operations only."
-                    )
-                    transport.note_status(
-                        _TRANSPORT_STATUS_MALFORMED_RETRY, error=str(exc)
-                    )
-                    transport.write_instruction(
-                        retry_text,
-                        turn_number=controller._session.run_loop.current_turn,
-                        session_id=controller._session.session_id,
-                    )
-                    ha_state.mode = HA_MODE_WAITING_FOR_AGENT
-                    ha_state.last_event = "Malformed response — sent one bounded retry instruction."
-                    ha_state.last_tick_step = "malformed_retry"
-                    step_result["retry"] = True
-                    _save_ha_state(controller, ha_state)
-                    controller._persist()
-                else:
-                    ha_state.mode = HA_MODE_FAILED
-                    ha_state.active = False
-                    ha_state.stop_reason = f"Malformed agent response: {exc}"
-                    ha_state.last_event = ha_state.stop_reason
-                    ha_state.last_tick_step = "failed"
-                    _save_ha_state(controller, ha_state)
-                    controller._persist()
+            _tick_ingest_file_bridge(controller, ha_state, transport, step_result)
 
     elif planned == HA_NEXT_AUTO_EXECUTE:
         workspace = controller._session.bounded_executor_workspace
@@ -1072,7 +1405,12 @@ def tick_high_autonomy_run(
         controller._persist()
 
     _sync_counters(controller, ha_state, policy)
-    _capture_transport_status(ha_state, transport)
+    if transport is not None:
+        _capture_transport_status(ha_state, transport)
+    # For callable backends the durable backend_step (invoking/response_ready/
+    # ingesting/consumed) is the honest status — never the raw file-bridge status.
+    if _is_callable_backend(ha_state) and ha_state.backend_step:
+        ha_state.transport_status = ha_state.backend_step
     ha_state.next_action = _plan_next_action(controller, ha_state, policy, transport)
     _save_ha_state(controller, ha_state)
     controller._persist()
