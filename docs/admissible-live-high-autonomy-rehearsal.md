@@ -1,5 +1,7 @@
 # Admissible Live High-Autonomy Cursor Rehearsal (v0)
 
+Before another live rehearsal, contract, ledger, exact-path, architecture, instruction, and verification-plan coverage must all be complete. Unsupported runtime criteria produce a visible verification capability gap, not success.
+
 Slice: `ADMISSIBLE_RUN_030_LIVE_HIGH_AUTONOMY_REHEARSAL_HARDENING`
 
 Builds on [the high-autonomy governed loop](admissible-high-autonomy-governed-loop.md).

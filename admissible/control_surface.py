@@ -1070,6 +1070,7 @@ class ControlSession:
     run_envelopes: dict[str, RunEnvelope]
     source_trace_path: str | None = None
     goal_intake: dict[str, Any] | None = None
+    mission_contract: dict[str, Any] | None = None
     plan_candidate: dict[str, Any] | None = None
     plan_audit: dict[str, Any] | None = None
     bounded_executor_workspace: str | None = None
@@ -1091,6 +1092,7 @@ class ControlSession:
             "run_envelopes": {aid: env.to_dict() for aid, env in self.run_envelopes.items()},
             "source_trace_path": self.source_trace_path,
             "goal_intake": self.goal_intake,
+            "mission_contract": self.mission_contract,
             "plan_candidate": self.plan_candidate,
             "plan_audit": self.plan_audit,
             "bounded_executor_workspace": self.bounded_executor_workspace,
@@ -1103,6 +1105,9 @@ class ControlSession:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ControlSession":
+        from admissible.mission_contract import migrate_legacy_false_completion
+
+        data = migrate_legacy_false_completion(data)
         schema_version = data.get("schema_version")
         if schema_version != CONTROL_SESSION_SCHEMA_VERSION:
             raise ValueError(
@@ -1125,6 +1130,7 @@ class ControlSession:
             },
             source_trace_path=data.get("source_trace_path"),
             goal_intake=data.get("goal_intake"),
+            mission_contract=data.get("mission_contract"),
             plan_candidate=data.get("plan_candidate"),
             plan_audit=data.get("plan_audit"),
             bounded_executor_workspace=data.get("bounded_executor_workspace"),
@@ -2372,16 +2378,21 @@ class ControlSurfaceController:
     # -- goal intake / plan / audit --------------------------------------
 
     def submit_goal(self, prompt: str) -> dict[str, Any]:
+        from admissible.mission_contract import build_mission_contract
+
         intake = analyze_goal(prompt)
+        contract = build_mission_contract(prompt)
         plan = generate_plan_candidate(intake)
         audit = audit_plan(plan, intake)
 
         self._session.goal_intake = intake.to_dict()
+        self._session.mission_contract = contract.to_dict()
         self._session.plan_candidate = plan.to_dict()
         self._session.plan_audit = audit.to_dict()
 
         self._session.transcript.append(_transcript_entry("user_prompt", {"prompt": prompt}))
         self._session.transcript.append(_transcript_entry("goal_intake", intake.to_dict()))
+        self._session.transcript.append(_transcript_entry("mission_contract", contract.to_dict()))
         self._session.transcript.append(_transcript_entry("plan_proposal", plan.to_dict()))
         self._session.transcript.append(_transcript_entry("plan_audit", audit.to_dict()))
         self._session.transcript.append(

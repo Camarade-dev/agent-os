@@ -141,7 +141,10 @@ def _lower(text: str) -> str:
 
 
 def _find_matches(text_lower: str, words: tuple[str, ...]) -> list[str]:
-    return [w for w in words if w in text_lower]
+    return [
+        w for w in words
+        if re.search(r"(?<![A-Za-z0-9_])" + re.escape(w) + r"(?![A-Za-z0-9_])", text_lower)
+    ]
 
 
 def _find_explicit_matches(text_lower: str, words: tuple[str, ...]) -> list[str]:
@@ -190,9 +193,15 @@ def _is_negated(text_lower: str, word: str) -> bool:
 
 def _detect_task_type(text_lower: str, signals: dict[str, list[str]]) -> str:
     bugfix_hits = _find_matches(text_lower, _BUGFIX_WORDS)
-    if bugfix_hits:
+    build_hits = _find_matches(text_lower, _BUILD_VERBS)
+    top_level_build = bool(re.match(r"\s*(?:please\s+)?(?:build|create|implement|develop|make|write)\b", text_lower))
+    # Structural creation intent outranks incidental references to bugs, errors,
+    # or debug support elsewhere in a new-build mission.
+    if bugfix_hits and not (top_level_build or build_hits):
         signals["task_type"] = bugfix_hits
         return "bug_fix"
+    if bugfix_hits:
+        signals["task_type_ignored_lexical_signals"] = bugfix_hits
 
     refactor_hits = _find_matches(text_lower, _REFACTOR_WORDS)
     if refactor_hits:
@@ -200,7 +209,6 @@ def _detect_task_type(text_lower: str, signals: dict[str, list[str]]) -> str:
         return "refactor"
 
     deploy_hits = [w for w in _DEPLOY_WORDS if w in text_lower and not _is_negated(text_lower, w)]
-    build_hits = _find_matches(text_lower, _BUILD_VERBS)
     explain_hits = _find_matches(text_lower, _EXPLAIN_WORDS)
     build_directive = re.search(
         r"(?:^|[.!?\n]\s*|[-*]\s+)(?:please\s+)?"
@@ -319,14 +327,29 @@ def _detect_complexity(
     complexity_hits = _find_matches(text_lower, _HIGH_COMPLEXITY_WORDS)
     simplicity_hits = _find_matches(text_lower, _SIMPLICITY_WORDS)
     feature_count = _count_features(text_lower)
+    numbered_criteria = len(re.findall(r"(?m)^\s*\d+[.)]\s+\S", text_lower))
+    mandatory_paths = len(set(re.findall(
+        r"(?<![\w.-])(?:[a-z0-9_.-]+/)*[a-z0-9_.-]+\.(?:html?|css|js|ts|py|json|md)(?![\w.-])",
+        text_lower,
+    )))
+    behavioral_bullets = len(re.findall(r"(?m)^\s*[-*]\s+\S", text_lower))
     signals["global_complexity"] = complexity_hits + simplicity_hits + [
-        f"feature_count={feature_count}"
+        f"feature_count={feature_count}",
+        f"explicit_numbered_criteria={numbered_criteria}",
+        f"mandatory_paths={mandatory_paths}",
+        f"structural_bullets={behavioral_bullets}",
     ]
 
     if task_type == "bug_fix" and not complexity_hits:
         return "low"
 
     if complexity_hits:
+        return "high"
+
+    if numbered_criteria >= 8 or mandatory_paths >= 6 or behavioral_bullets >= 12:
+        signals["global_complexity_ignored_lexical_signals"] = [
+            hit for hit in simplicity_hits if hit in ("small", "local-only", "local only")
+        ]
         return "high"
 
     score = feature_count - (2 * len(simplicity_hits))

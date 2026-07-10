@@ -1404,6 +1404,8 @@ function renderHighAutonomy(state) {
   };
   const metrics = ha.metrics || state.canonical_run_metrics || {};
   const outcomeLabel = ha.outcome_label || "In progress";
+  const contractCoverage = ha.contract_ledger_coverage_report || {};
+  const verificationCoverage = ha.verification_plan_coverage_report || {};
   const unmet = ha.unmet_criteria || [];
   const activeBlockerCount = metrics.active_blocked_count ?? ha.blocked_action_count ?? 0;
   const pendingUsefulCount = (ha.pending_useful_operations || ha.remaining_useful_operations || []).length;
@@ -1437,6 +1439,8 @@ function renderHighAutonomy(state) {
   body.innerHTML = `
     <div class="ha-outcome-summary" style="margin:0 0 .75rem;padding:.65rem;border:1px solid var(--cs-border);border-radius:6px;">
       <p style="margin:0 0 .35rem;"><strong>Outcome:</strong> ${escapeHtml(outcomeLabel)}</p>
+      <p style="margin:.15rem 0;"><strong>Contract:</strong> ${escapeHtml(contractCoverage.represented_acceptance_criterion_count || 0)}/${escapeHtml(contractCoverage.explicit_acceptance_criterion_count || 0)} criteria represented · ${escapeHtml(contractCoverage.represented_path_count || 0)}/${escapeHtml(contractCoverage.mandatory_path_count || 0)} paths represented</p>
+      <p style="margin:.15rem 0;"><strong>Verification:</strong> ${escapeHtml(ha.acceptance_verified_count || 0)}/${escapeHtml(verificationCoverage.mandatory_criterion_count || ha.acceptance_total_count || 0)} passed · ${escapeHtml((ha.unmet_criteria || []).length)} not yet verified</p>
       <p style="margin:.15rem 0;"><strong>Progress:</strong> acceptance criteria ${escapeHtml(ha.acceptance_verified_count || 0)}/${escapeHtml(ha.acceptance_total_count || 0)} verified${ha.repair_round_count ? ` · Repair round: ${escapeHtml(ha.repair_round_count)}/${escapeHtml(ha.max_repair_rounds || 2)}` : ""}</p>
       <p style="margin:.15rem 0;"><strong>Usage:</strong> ${escapeHtml(metrics.model_invocation_count || 0)} model invocation(s) · ${escapeHtml(metrics.backend_retry_count || 0)} retr${(metrics.backend_retry_count || 0) === 1 ? "y" : "ies"} · ${escapeHtml(metrics.genuine_human_intervention_count || 0)} human interruption(s)</p>
       <p style="margin:.15rem 0;"><strong>Execution:</strong> ${escapeHtml(metrics.useful_write_count || 0)} useful write(s) · ${escapeHtml(metrics.duplicate_noop_count || 0)} duplicate(s) avoided · ${escapeHtml((metrics.read_count || 0) + (metrics.list_count || 0))} read/list operation(s) · ${escapeHtml(metrics.verification_check_count || 0)} verification check(s)</p>

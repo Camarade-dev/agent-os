@@ -1,0 +1,15 @@
+{
+  "fixture_version": "admissible_neon_serpents_cli_001_contract_regression_v1",
+  "session_id": "neon-serpents-cli-001",
+  "goal_text": "Build a complete polished new browser game called Neon Serpents.\n\nArchitecture:\n- Use plain HTML, CSS, and JavaScript, Canvas 2D, zero dependencies, and no framework.\n\nMandatory deliverables:\n- index.html\n- style.css\n- src/main.js\n- src/game.js\n- src/entities.js\n- src/bots.js\n- src/render.js\n- LOCAL_DEV.md\n\nAcceptance criteria:\n1. The game opens locally from index.html with no install or network access.\n2. The implementation uses Canvas 2D and the required source-module architecture.\n3. The arena is large, bounded, and uses a readable motion background.\n4. The camera follows the player smoothly through the large world.\n5. Pointer steering controls the player serpent.\n6. Boost changes speed and has a visible resource tradeoff.\n7. At least 12 active bots navigate the arena.\n8. Collision causes death and a bounded respawn lifecycle.\n9. Collectibles and growth update during play.\n10. A live leaderboard updates from active entities.\n11. Restart creates exactly one fresh game loop with no duplicate loops.\n12. Repeated restarts remain stable.\n13. A debug API exposes player, bot, camera, lifecycle, and approximate FPS fields.\n14. A debug overlay renders the named debug fields.\n15. LOCAL_DEV.md documents local opening, controls, architecture, and debugging.\n\nConstraints:\n- Do not use shell commands, installs, package managers, network, deploy, publish, hosting, or git operations.\n- Only write inside the configured workspace.\n- Prefer the smallest coherent bounded batch, without narrowing the complete mission.",
+  "historical_goal_intake": {"task_type": "bug_fix", "global_complexity": "low", "explicit_dependency_preference": null},
+  "historical_derived_ledger": ["required_files", "index_game_ui", "style_non_empty", "local_usage"],
+  "historical_required_paths": ["index.html", "style.css", "LOCAL_DEV.md"],
+  "historical_dependency_gate": "step_2b_install_dependencies",
+  "historical_agent_response_excerpt": "Task: bug_fix browser local game. All four acceptance criteria remain open. Target deliverables: index.html, style.css, game.js, LOCAL_DEV.md.",
+  "historical_executed_writes": ["index.html", "style.css", "game.js", "LOCAL_DEV.md"],
+  "historical_weak_verification_passes": ["required_files", "index_game_ui", "style_non_empty", "local_usage"],
+  "historical_raw_human_decisions": 3,
+  "historical_outcome": "completed",
+  "expected_canonical_outcome": "verification_capability_gap"
+}

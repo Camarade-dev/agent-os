@@ -6,6 +6,8 @@ One safe step per ``tick_high_autonomy_run`` call. No hidden background loops.
 from __future__ import annotations
 
 import uuid
+import hashlib
+import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -210,6 +212,11 @@ class HighAutonomyRunState:
     repair_packet: dict[str, Any] | None = None
     repair_history: list[dict[str, Any]] = field(default_factory=list)
     last_proposal_coverage_report: dict[str, Any] | None = None
+    contract_ledger_coverage_report: dict[str, Any] | None = None
+    verification_plan_coverage_report: dict[str, Any] | None = None
+    proposal_contract_conformance_report: dict[str, Any] | None = None
+    instruction_fidelity_report: dict[str, Any] | None = None
+    completion_eligibility_report: dict[str, Any] | None = None
     # Durable invocation lineage and visible retry/cost markers.
     invocation_history: list[dict[str, Any]] = field(default_factory=list)
     operator_retry_count: int = 0
@@ -585,8 +592,13 @@ def build_high_autonomy_summary(
     metrics = dict(ha_state.metrics or {})
     outcome_labels = {
         "in_progress": "In progress",
-        "completed": "Completed",
-        "incomplete": "Incomplete",
+        "completed": "RUN COMPLETED — every mandatory contract criterion is satisfied.",
+        "incomplete": "RUN INCOMPLETE — mandatory contract requirements remain unsatisfied.",
+        "contract_incomplete": "MISSION CONTRACT INCOMPLETE — Admissible cannot safely continue or complete.",
+        "acceptance_ledger_incomplete": "MISSION CONTRACT INCOMPLETE — acceptance ledger coverage is incomplete.",
+        "verification_plan_incomplete": "VERIFICATION CAPABILITY GAP — the verification plan is incomplete.",
+        "verification_capability_gap": "VERIFICATION CAPABILITY GAP — implementation may exist, but mandatory behavior has not been verified.",
+        "awaiting_human_observation": "HUMAN ACTION REQUIRED — mandatory observation is pending.",
         "failed": "Failed",
         "stopped_by_budget": "Budget exhausted",
         "stopped_by_operator": "Stopped by operator",
@@ -667,6 +679,11 @@ def build_high_autonomy_summary(
         "max_repair_rounds": ha_state.max_repair_rounds,
         "repair_packet": ha_state.repair_packet,
         "last_proposal_coverage_report": ha_state.last_proposal_coverage_report,
+        "contract_ledger_coverage_report": ha_state.contract_ledger_coverage_report,
+        "verification_plan_coverage_report": ha_state.verification_plan_coverage_report,
+        "proposal_contract_conformance_report": ha_state.proposal_contract_conformance_report,
+        "instruction_fidelity_report": ha_state.instruction_fidelity_report,
+        "completion_eligibility_report": ha_state.completion_eligibility_report,
         "acceptance_criteria": [dict(item) for item in ha_state.acceptance_criteria],
         "acceptance_verified_count": acceptance["verified"],
         "acceptance_total_count": acceptance["total"],
@@ -1122,6 +1139,17 @@ def _ingest_success_state(
 ) -> None:
     policy = policy or HighAutonomyPolicy()
     executable = _executable_actions(controller, policy)
+    from admissible.mission_contract import proposal_contract_conformance
+    proposed_paths: list[str] = []
+    for envelope in controller._session.run_envelopes.values():
+        for operation in envelope.candidate.get("structured_operations") or []:
+            path = operation.get("path")
+            if path and str(operation.get("operation")) == "write_file":
+                proposed_paths.append(str(path))
+    if controller._session.mission_contract:
+        ha_state.proposal_contract_conformance_report = proposal_contract_conformance(
+            controller._session.mission_contract, proposed_paths
+        )
     ha_state.last_response_cursor = response_sha256
     ha_state.mode = HA_MODE_REVIEWING
     ha_state.awaiting_instruction_after_review = not executable
@@ -1589,6 +1617,26 @@ def _sync_counters(
         closure_turns_used=ha_state.closure_turns_used,
         turns_remaining=ha_state.turns_remaining,
     )
+    contract = controller._session.mission_contract or {}
+    coverage = ha_state.contract_ledger_coverage_report or {}
+    verification_plan = ha_state.verification_plan_coverage_report or {}
+    conformance = ha_state.proposal_contract_conformance_report or {}
+    eligibility = ha_state.completion_eligibility_report or {}
+    ha_state.metrics.update({
+        "mission_contract_requirement_count": len(contract.get("mandatory_requirements") or []),
+        "explicit_acceptance_criterion_count": len(contract.get("explicit_acceptance_criteria") or []),
+        "represented_acceptance_criterion_count": int(coverage.get("represented_acceptance_criterion_count") or 0),
+        "mandatory_path_count": len(contract.get("mandatory_paths") or []),
+        "represented_mandatory_path_count": int(coverage.get("represented_path_count") or 0),
+        "contract_coverage_ratio": coverage.get("coverage_ratio", 0.0),
+        "verification_disposition_count": int(verification_plan.get("criteria_with_disposition_count") or 0),
+        "unsupported_verification_count": len(verification_plan.get("unsupported_criterion_ids") or []),
+        "proposal_contract_violation_count": len(conformance.get("missing_required_paths") or []) + len(conformance.get("architecture_constraints_violated") or []),
+        "misplaced_substitute_count": len(conformance.get("likely_misplaced_substitutes") or []),
+        "goal_resolved_gate_count": sum(1 for value in (contract.get("explicit_dependency_policy"), contract.get("explicit_architecture_decisions"), contract.get("explicit_execution_boundaries")) if value),
+        "completion_eligibility_failure_count": len(eligibility.get("failed_invariants") or []),
+        "legacy_false_completion_repair_count": int(bool(eligibility.get("legacy_false_completion_repaired"))),
+    })
 
 
 def _has_acceptance_verification_plan(ha_state: HighAutonomyRunState) -> bool:
@@ -1633,12 +1681,24 @@ def _try_finalize_outcome(
 ) -> bool:
     """Finalize only from verified governance state, never model prose alone."""
 
+    from admissible.mission_contract import evaluate_completion_eligibility
+
     no_human_critical = not ha_state.human_critical_pending
     no_pending_useful = not ha_state.pending_useful_operations
     no_active_blockers = int((ha_state.metrics or {}).get("active_blocked_count", 0)) == 0
     verification_final = _verification_is_final(controller)
+    contract = controller._session.mission_contract or {}
+    eligibility_state = ha_state.to_dict()
+    eligibility_state["active_blockers"] = (
+        list(ha_state.human_required_action_ids) if ha_state.human_critical_pending else []
+    )
+    eligibility_state["contract_ledger_coverage_report"] = ha_state.contract_ledger_coverage_report
+    eligibility_state["verification_plan_coverage_report"] = ha_state.verification_plan_coverage_report
+    report = evaluate_completion_eligibility(eligibility_state, contract) if contract else {"eligible": False, "failed_invariants": ["contract_incomplete"]}
+    ha_state.completion_eligibility_report = report
     if (
-        _mandatory_acceptance_complete(ha_state)
+        report.get("eligible")
+        and _mandatory_acceptance_complete(ha_state)
         and no_human_critical
         and no_pending_useful
         and no_active_blockers
@@ -1954,6 +2014,11 @@ def start_high_autonomy_run(
     - neither — defaults to the legacy Cursor GUI file bridge (semi-autonomous).
     """
     from admissible.agent_transport import FileBridgeAgentTransport
+    from admissible.mission_contract import (
+        contract_acceptance_ledger,
+        ledger_coverage_report,
+        verification_plan_coverage_report,
+    )
 
     if not controller._session.goal_intake:
         raise ValueError("Submit a goal before starting a high-autonomy run.")
@@ -1994,6 +2059,19 @@ def start_high_autonomy_run(
 
     snap = transport.status_snapshot()
     transport_kind = _resolve_transport_kind(transport)
+    contract = controller._session.mission_contract or {}
+    ledger = (
+        make_acceptance_ledger(acceptance_criteria, goal_text=str((controller._session.goal_intake or {}).get("prompt") or ""))
+        if acceptance_criteria is not None
+        else contract_acceptance_ledger(contract)
+    )
+    if not ledger:
+        ledger = make_acceptance_ledger(None, goal_text=str((controller._session.goal_intake or {}).get("prompt") or ""))
+    for criterion in ledger:
+        if not criterion.get("verification_disposition"):
+            criterion["verification_disposition"] = (
+                "deterministic_structural" if criterion.get("verification") else "evidence_required"
+            )
     ha_state = HighAutonomyRunState(
         active=True,
         mode=HA_MODE_RUNNING,
@@ -2013,11 +2091,14 @@ def start_high_autonomy_run(
         max_total_proposed_write_bytes=max_total_proposed_write_bytes,
         turns_remaining=max_turns,
         automatic_empty_success_retries=automatic_empty_success_retries,
-        acceptance_criteria=make_acceptance_ledger(
-            acceptance_criteria,
-            goal_text=str((controller._session.goal_intake or {}).get("prompt") or ""),
-        ),
+        acceptance_criteria=ledger,
+        contract_ledger_coverage_report=ledger_coverage_report(contract, ledger),
+        verification_plan_coverage_report=verification_plan_coverage_report(ledger),
     )
+    artifact_root = Path(ha_state.agent_workspace_path or workspace_path)
+    artifact_path = artifact_root / ".admissible" / "mission-contract.json"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(json.dumps(contract, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="")
     controller._high_autonomy_transport = transport
     _save_ha_state(controller, ha_state)
     controller._session.transcript.append(
@@ -2242,6 +2323,43 @@ def tick_high_autonomy_run(
         else:
             packet_view = controller.generate_next_instruction_packet()
             instruction_text = packet_view["run_loop"]["instruction_packets"][-1]["packet_text"]
+
+        contract = controller._session.mission_contract or {}
+        if contract:
+            open_ids = [
+                item["criterion_id"] for item in ha_state.acceptance_criteria
+                if item.get("mandatory", True) and item.get("status") not in ("verified_pass", "waived")
+            ]
+            missing_paths = list(contract.get("mandatory_paths") or [])
+            architecture = [x.get("source_text") for x in contract.get("explicit_architecture_decisions") or []]
+            contract_json = json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            contract_sha = hashlib.sha256(contract_json.encode("utf-8")).hexdigest()
+            fidelity_header = (
+                "MISSION CONTRACT AUTHORITY\n"
+                ".admissible/mission-contract.json is the immutable canonical mission contract.\n"
+                f"Mission-contract SHA-256: {contract_sha}\n"
+                f"Raw-goal SHA-256: {contract.get('raw_goal_sha256')}\n"
+                f"Open mandatory criterion IDs: {', '.join(open_ids) or 'none'}\n"
+                f"Exact mandatory paths: {', '.join(missing_paths) or 'none'}\n"
+                f"Architecture constraints: {' | '.join(str(x) for x in architecture) or 'none explicit'}\n"
+                f"Verification capability status: unsupported={', '.join((ha_state.verification_plan_coverage_report or {}).get('unsupported_criterion_ids') or []) or 'none'}; human_observation={', '.join((ha_state.verification_plan_coverage_report or {}).get('human_observation_criterion_ids') or []) or 'none'}\n"
+                "The progress ledger is a projection of the contract and cannot narrow the mission. "
+                "Omitted contract requirements remain mandatory. Proposed substitutes do not change exact required paths.\n\n"
+            )
+            instruction_text = fidelity_header + str(instruction_text or "")
+            from admissible.mission_contract import instruction_fidelity_report
+            ha_state.instruction_fidelity_report = instruction_fidelity_report(contract, instruction_text)
+            if not ha_state.instruction_fidelity_report.get("fidelity_complete"):
+                ha_state.outcome = "contract_incomplete"
+                ha_state.outcome_reason = "Mandatory mission-contract fields were omitted from the agent packet."
+                ha_state.active = False
+                ha_state.mode = HA_MODE_STOPPED
+                _save_ha_state(controller, ha_state)
+                controller._persist()
+                view = controller.state_view()
+                view["high_autonomy_summary"] = build_high_autonomy_summary(ha_state=ha_state, state_view=view)
+                view["high_autonomy_tick"] = {"step": "contract_fidelity_pause"}
+                return view
 
         turn_now = controller._session.run_loop.current_turn
         if not is_backend_retry:

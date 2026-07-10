@@ -1,5 +1,7 @@
 # Admissible Model-Agnostic Agent Transport (v0)
 
+Every transport instruction references immutable `.admissible/mission-contract.json` authority and checks packet fidelity before provider invocation. Transport output is an agent proposal, never mission authority.
+
 Slice: `ADMISSIBLE_RUN_032_MODEL_AGNOSTIC_AGENT_TRANSPORT_AND_WORKSPACE_FIRST_UI`
 
 Builds on [the high-autonomy governed loop](admissible-high-autonomy-governed-loop.md) and

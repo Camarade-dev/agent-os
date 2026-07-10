@@ -1,5 +1,7 @@
 # Admissible bounded verification (slice ADMISSIBLE_EXECUTION_025)
 
+Bounded verification assigns dispositions without deleting unsupported requirements. Passing available checks cannot authorize completion while mandatory contract behavior remains unsupported, unobserved, ambiguous, or unverified; see [admissible-mission-contract.md](admissible-mission-contract.md).
+
 Bounded verification is **not** shell authority. It is a tiny, explicit,
 allowlisted read-only check layer that Admissible can run after bounded local
 file execution to attach **verification evidence** to a governed run.

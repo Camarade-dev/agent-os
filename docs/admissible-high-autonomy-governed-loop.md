@@ -1,5 +1,7 @@
 # Admissible High-Autonomy Governed Loop (v0)
 
+Mission authority and completion are governed by the immutable contract described in [admissible-mission-contract.md](admissible-mission-contract.md). A progress ledger is only a projection and cannot narrow explicit requirements.
+
 Slice: `ADMISSIBLE_RUN_029_HIGH_AUTONOMY_GOVERNED_LOOP_V0`
 
 ## Why this slice exists

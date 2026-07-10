@@ -1,0 +1,6 @@
+{
+  "cli": "Build a new local CLI.\n\nMandatory deliverables:\n- package/cli.py\n- package/parser.py\n\nAcceptance criteria:\n1. --help exits zero.\n2. Invalid input exits two.\n3. JSON output follows the documented schema.\n4. UTF-8 input round-trips.\n5. No network access occurs.\n6. Tests cover success and failure.",
+  "data": "Create a data transformation.\n\nAcceptance criteria:\n1. Input rows follow schema id:string,value:number.\n2. Output rows follow schema id:string,total:number.\n3. Row count is preserved.\n4. Totals equal the numeric input sum.",
+  "docs": "Create a documentation package.\n\nMandatory deliverables:\n- docs/guide/start.md\n- docs/reference/schema.md\n\nAcceptance criteria:\n1. The guide contains Setup and Usage sections.\n2. The guide links to docs/reference/schema.md.\n3. The reference links back to docs/guide/start.md.",
+  "repair": "Fix the crash in the existing project.\n\nConstraints:\n- Modify only src/parser.py and tests/test_parser.py.\n\nAcceptance criteria:\n1. Empty input no longer crashes.\n2. Existing valid input behavior is unchanged."
+}
