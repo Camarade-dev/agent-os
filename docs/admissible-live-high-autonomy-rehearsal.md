@@ -216,3 +216,53 @@ for a criterion the Mission Contract marks as needing real runtime behavior. See
 for the verifier this gate depends on, and
 `tests/test_admissible_neon_runtime_regression.py` for the deterministic replay that proves the
 gate holds without a real browser.
+
+## Run 044: the runtime-verification step is now automatic, not a manual replay
+
+RUN_043 above was a real, tested verifier that nothing yet *called* — a live rehearsal could
+only prove runtime-verified completion by manually replaying
+`build_runtime_verification_plan` → `execute_runtime_verification_plan` →
+`apply_runtime_evidence_to_ledger`, exactly as
+`tests/test_admissible_neon_runtime_regression.py` still does at the plan/evidence layer in
+isolation. RUN_044 closes that gap: `tick_high_autonomy_run` itself now auto-triggers this
+pipeline once static verification is final and nothing else is pending — no manual replay step,
+no extra operator action, and no additional model/provider turn consumed by it. See
+[admissible-high-autonomy-governed-loop.md](admissible-high-autonomy-governed-loop.md#run-044-runtime-verification-orchestration)
+and
+[admissible-bounded-browser-runtime-verification.md](admissible-bounded-browser-runtime-verification.md#run_044-wiring-into-the-high-autonomy-governed-run).
+
+A pending subjective (`human_observation_required`) criterion now pauses the run in its own
+`awaiting_human_observation` mode — distinct from the `human_required` pause described above,
+which is reserved for genuinely dangerous actions (shell, secrets, destructive writes). The
+Control Surface panel shows the exact pending criterion text and objective evidence already
+recorded, with **Record observed pass** / **Record observed fail** / **Waive (requires
+rationale)** actions
+(`POST /api/session/high_autonomy/runtime/human_observation`) — never a generic approval
+button. An interrupted runtime attempt (a process restart mid-run) is never auto-resumed; the
+panel exposes an explicit **Retry interrupted runtime attempt** action instead
+(`POST /api/session/high_autonomy/runtime/retry`), which preserves the interrupted attempt's
+id, plan sha, and criteria as lineage on the new attempt.
+
+### Exact gate before the next live Neon run
+
+Everything above is proven with `FixtureBrowserRuntimeProvider` (deterministic, in-process) and
+with one real-Chromium controller smoke
+(`tests/test_admissible_runtime_live_controller_smoke.py`, opt-in, `-m browser_runtime`) using a
+minimal single-criterion fixture. Before the next live Neon Serpents rehearsal specifically:
+
+1. A real build of Neon Serpents must actually exist in the target workspace (all 8 mandatory
+   paths), with `window.__NEON__.snapshot()` returning at least the 8 declared fields.
+2. Run the live rehearsal with **no** `set_runtime_provider()` override, so the controller uses
+   its real default (`admissible.runtime_verification_orchestrator.default_runtime_provider()`
+   → `ChromiumCdpRuntimeProvider`), and confirm the four objectively-checkable criteria
+   (bot count, restart/no-duplicate-loop, debug interface, debug overlay) reach
+   `verified_pass` from real `BrowserRuntimeEvidence`, not a fixture.
+3. Confirm the two subjective criteria (camera smoothness, readable background) reach
+   `awaiting_human_observation`, and record a genuine human observation for each before
+   claiming the run `completed`.
+4. Confirm the three criteria with no derivable observable (collision/respawn, live
+   leaderboard, repeated restarts) remain `unsupported_verifier` and are either accepted as a
+   permanent, documented gap or given an explicit human waiver — never silently passed.
+5. Confirm zero external network requests were recorded on the real run, and that the browser
+   process, temporary profile, and loopback server were all torn down (`resource_cleanup`),
+   with no orphan process left behind.

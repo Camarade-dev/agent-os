@@ -52,6 +52,17 @@ def _plan_sha256(plan: BrowserRuntimeVerificationPlan) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+# Dispositions the runtime aggregator actually has an opinion about. A
+# criterion plan_builder passed through unchanged (still
+# deterministic_static/deterministic_structural/evidence_required/
+# ambiguous_requirement, with no runtime steps ever generated for it) is not
+# runtime's concern; aggregating a "gap" for it here would let one browser
+# session overwrite an unrelated static-verification criterion's disposition
+# (RUN_044 integration fix -- this was reachable as soon as a real Mission
+# Contract mixed runtime-checkable and purely-static criteria).
+_RUNTIME_RELEVANT_DISPOSITIONS = frozenset({"deterministic_runtime", "unsupported_verifier"})
+
+
 def _aggregate_criterion_results(plan: BrowserRuntimeVerificationPlan, assertions: list[dict[str, Any]], *, executed: bool) -> list[dict[str, Any]]:
     by_criterion: dict[str, list[dict[str, Any]]] = {}
     for entry in assertions:
@@ -61,6 +72,8 @@ def _aggregate_criterion_results(plan: BrowserRuntimeVerificationPlan, assertion
 
     results = []
     for criterion in plan.criteria:
+        if criterion.disposition not in _RUNTIME_RELEVANT_DISPOSITIONS and not criterion.human_observation_required:
+            continue
         cid = criterion.criterion_id
         matched = by_criterion.get(cid, [])
         if criterion.human_observation_required:
@@ -129,9 +142,14 @@ def build_capability_gap_evidence(
     )
 
 
+TERMINATION_CANCELLED = "cancelled"
+
+
 def execute_runtime_verification_plan(
     provider: BrowserRuntimeProvider,
     plan: BrowserRuntimeVerificationPlan,
+    *,
+    cancel_event: Any = None,
 ) -> RuntimeExecutionResult:
     """Run one bounded verification session end-to-end.
 
@@ -140,6 +158,11 @@ def execute_runtime_verification_plan(
     touched. Returns evidence plus the raw (never-serialized) screenshot
     bytes so a caller can persist them via
     :mod:`admissible.browser_runtime.evidence_store`.
+
+    ``cancel_event`` is an optional cooperative cancellation signal (any
+    object with an ``is_set()`` method, e.g. ``threading.Event``), checked
+    between steps only (RUN_044 PART E.16/PART L.58 explicit cancellation).
+    Passing nothing preserves the exact prior behavior.
     """
 
     capability = provider.detect_capability()
@@ -152,6 +175,9 @@ def execute_runtime_verification_plan(
     provider_error: str | None = None
     try:
         for step in plan.steps:
+            if cancel_event is not None and cancel_event.is_set():
+                termination_reason = TERMINATION_CANCELLED
+                break
             if session.elapsed_ms() >= plan.max_duration_ms:
                 termination_reason = TERMINATION_DURATION_EXCEEDED
                 break

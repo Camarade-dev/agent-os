@@ -58,6 +58,13 @@ HA_MODE_HUMAN_REQUIRED = "human_required"
 HA_MODE_PAUSED = "paused"
 HA_MODE_STOPPED = "stopped"
 HA_MODE_FAILED = "failed"
+# RUN_044: runtime-verification-specific modes, kept distinct from
+# HA_MODE_VERIFYING (static bounded verification) and HA_MODE_HUMAN_REQUIRED
+# (human-authority approval) so the Control Surface can show a distinct
+# banner and so a pending human observation is never counted as a human-
+# authority interruption.
+HA_MODE_RUNTIME_VERIFYING = "runtime_verifying"
+HA_MODE_AWAITING_HUMAN_OBSERVATION = "awaiting_human_observation"
 
 HA_NEXT_NONE = "none"
 HA_NEXT_WRITE_INSTRUCTION = "write_instruction"
@@ -69,6 +76,13 @@ HA_NEXT_WRITE_REPAIR = "write_repair_instruction"
 HA_NEXT_VERIFY = "run_bounded_verification"
 HA_NEXT_HUMAN_APPROVAL = "human_approval_required"
 HA_NEXT_STOP = "stop"
+# RUN_044: runtime orchestration next-actions. None of these are a model/
+# provider turn (PART E.15); prepare+capability-check+start are one fast
+# synchronous tick, poll/apply are later bounded, non-blocking ticks.
+HA_NEXT_START_RUNTIME_VERIFICATION = "start_runtime_verification"
+HA_NEXT_POLL_RUNTIME_VERIFICATION = "poll_runtime_verification"
+HA_NEXT_APPLY_RUNTIME_EVIDENCE = "apply_runtime_evidence"
+HA_NEXT_AWAIT_HUMAN_OBSERVATION = "await_human_observation"
 
 HA_STEP_INTERNAL_LIVELOCK = "internal_livelock"
 HA_STEP_RESPONSE_EXTRACTION_FAILED = "response_extraction_failed"
@@ -231,6 +245,29 @@ class HighAutonomyRunState:
     extraction_failure_count: int = 0
     local_reextraction_attempt_count: int = 0
     pending_executable_selection_failures: list[dict[str, Any]] = field(default_factory=list)
+    # RUN_044: bounded browser-runtime verification orchestration (durable
+    # run-level fields; see admissible.runtime_verification_orchestrator and
+    # admissible.runtime_orchestration_models for the attempt schema itself).
+    runtime_verification_required: bool = False
+    runtime_verification_status: str = "not_applicable"
+    active_runtime_attempt_id: str | None = None
+    # Full durable snapshot of the in-flight attempt/plan (beyond just the id)
+    # so a reconstructed controller can resume polling/applying across ticks
+    # and process restarts without holding anything only in memory.
+    active_runtime_attempt: dict[str, Any] | None = None
+    active_runtime_plan: dict[str, Any] | None = None
+    runtime_attempt_history: list[dict[str, Any]] = field(default_factory=list)
+    last_runtime_plan_sha256: str | None = None
+    last_runtime_evidence_id: str | None = None
+    runtime_criterion_ids: list[str] = field(default_factory=list)
+    runtime_pending_criterion_ids: list[str] = field(default_factory=list)
+    runtime_failed_criterion_ids: list[str] = field(default_factory=list)
+    runtime_gap_criterion_ids: list[str] = field(default_factory=list)
+    human_observation_pending_criterion_ids: list[str] = field(default_factory=list)
+    human_observation_records: list[dict[str, Any]] = field(default_factory=list)
+    runtime_capability_report: dict[str, Any] | None = None
+    runtime_coverage_report: dict[str, Any] | None = None
+    runtime_repair_kind: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -342,6 +379,12 @@ def _build_progress_fingerprint(
         ],
         "phase": ha_state.phase,
         "outcome": ha_state.outcome,
+        # RUN_044: an attempt resolving (queued -> running -> evidence_ready
+        # -> evidence_applied) is real progress even when nothing else above
+        # changes tick-to-tick.
+        "active_runtime_attempt_id": ha_state.active_runtime_attempt_id,
+        "runtime_verification_status": ha_state.runtime_verification_status,
+        "last_runtime_evidence_id": ha_state.last_runtime_evidence_id,
     }
     return _json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
@@ -517,6 +560,8 @@ def build_high_autonomy_summary(
         HA_MODE_PAUSED: "Paused by operator.",
         HA_MODE_STOPPED: "Governed run reached a final outcome.",
         HA_MODE_FAILED: "Failed.",
+        HA_MODE_RUNTIME_VERIFYING: "Running bounded browser-runtime verification.",
+        HA_MODE_AWAITING_HUMAN_OBSERVATION: "Awaiting human observation of subjective criteria.",
     }.get(ha_state.mode, ha_state.mode)
 
     needed_now = {
@@ -530,6 +575,10 @@ def build_high_autonomy_summary(
         HA_NEXT_VERIFY: "Controller will run bounded verification.",
         HA_NEXT_HUMAN_APPROVAL: "Approve or refuse the human-critical action.",
         HA_NEXT_STOP: "Run is stopping.",
+        HA_NEXT_START_RUNTIME_VERIFICATION: "Controller will start bounded browser-runtime verification.",
+        HA_NEXT_POLL_RUNTIME_VERIFICATION: "Controller is waiting on the active runtime verification worker.",
+        HA_NEXT_APPLY_RUNTIME_EVIDENCE: "Controller will apply runtime verification evidence.",
+        HA_NEXT_AWAIT_HUMAN_OBSERVATION: "Record a human observation for the pending subjective criteria.",
     }.get(ha_state.next_action, ha_state.next_action)
 
     # Callable backends invoke the agent in-process; they never wait for an
@@ -580,6 +629,14 @@ def build_high_autonomy_summary(
     elif ha_state.repair_phase == REPAIR_PHASE_REPAIR_VERIFYING:
         doing_now = "Re-verifying repaired criteria"
         needed_now = "No human action required"
+    elif ha_state.mode == HA_MODE_RUNTIME_VERIFYING:
+        attempt = ha_state.active_runtime_attempt or {}
+        doing_now = f"Runtime verification ({attempt.get('provider_id') or 'browser'}): {ha_state.runtime_verification_status}"
+        needed_now = "No human action required"
+    elif ha_state.mode == HA_MODE_AWAITING_HUMAN_OBSERVATION:
+        pending = ", ".join(ha_state.human_observation_pending_criterion_ids) or "none"
+        doing_now = f"Awaiting human observation for: {pending}"
+        needed_now = "Record an observed pass/fail, or an explicit waiver, for each pending criterion."
 
     verification_readiness = ha_state.verification_readiness or verification.get(
         "readiness", "not_run"
@@ -598,12 +655,23 @@ def build_high_autonomy_summary(
         "acceptance_ledger_incomplete": "MISSION CONTRACT INCOMPLETE — acceptance ledger coverage is incomplete.",
         "verification_plan_incomplete": "VERIFICATION CAPABILITY GAP — the verification plan is incomplete.",
         "verification_capability_gap": "VERIFICATION CAPABILITY GAP — implementation may exist, but mandatory behavior has not been verified.",
+        "runtime_observability_gap": "RUNTIME OBSERVABILITY GAP — mandatory behavior has no safe runtime observable.",
+        "verification_plan_incomplete": "VERIFICATION CAPABILITY GAP — the runtime plan failed validation.",
         "awaiting_human_observation": "HUMAN ACTION REQUIRED — mandatory observation is pending.",
         "failed": "Failed",
         "stopped_by_budget": "Budget exhausted",
         "stopped_by_operator": "Stopped by operator",
     }
     projected_outcome = ha_state.outcome or DEFAULT_OUTCOME_IN_PROGRESS
+    from admissible.browser_runtime.terminal_ui import select_runtime_banner
+
+    runtime_banner_status = {
+        HA_MODE_RUNTIME_VERIFYING: "runtime_verifying",
+        HA_MODE_AWAITING_HUMAN_OBSERVATION: "awaiting_human_observation",
+    }.get(ha_state.mode, ha_state.runtime_verification_status)
+    runtime_banner = select_runtime_banner(
+        runtime_banner_status, completion_eligible=(ha_state.outcome == "completed")
+    )
     blocking_reason = ""
     if ha_state.human_required_reason:
         blocking_reason = ha_state.human_required_reason
@@ -703,6 +771,22 @@ def build_high_autonomy_summary(
         "turns_remaining": ha_state.turns_remaining,
         "metrics": metrics,
         "completion_candidate": ha_state.completion_candidate,
+        # RUN_044: runtime-verification + human-observation projection.
+        "runtime_banner": runtime_banner,
+        "runtime_verification_required": ha_state.runtime_verification_required,
+        "runtime_verification_status": ha_state.runtime_verification_status,
+        "active_runtime_attempt_id": ha_state.active_runtime_attempt_id,
+        "active_runtime_attempt": ha_state.active_runtime_attempt,
+        "runtime_attempt_history": list(ha_state.runtime_attempt_history),
+        "last_runtime_plan_sha256": ha_state.last_runtime_plan_sha256,
+        "last_runtime_evidence_id": ha_state.last_runtime_evidence_id,
+        "runtime_criterion_ids": list(ha_state.runtime_criterion_ids),
+        "runtime_pending_criterion_ids": list(ha_state.runtime_pending_criterion_ids),
+        "runtime_failed_criterion_ids": list(ha_state.runtime_failed_criterion_ids),
+        "runtime_gap_criterion_ids": list(ha_state.runtime_gap_criterion_ids),
+        "runtime_coverage_report": ha_state.runtime_coverage_report,
+        "human_observation_pending_criterion_ids": list(ha_state.human_observation_pending_criterion_ids),
+        "human_observation_records": list(ha_state.human_observation_records),
     }
 
 
@@ -715,6 +799,12 @@ _AUTO_TICK_SAFE_MODES = frozenset(
         HA_MODE_AUTO_EXECUTING,
         HA_MODE_RECOVERING,
         HA_MODE_VERIFYING,
+        # RUN_044: auto-run may keep safely polling an active runtime worker
+        # (PART H.35, PART K.55) -- it is a documented wait state, not a
+        # provider/model turn. HA_MODE_AWAITING_HUMAN_OBSERVATION is
+        # deliberately NOT included: only an explicit human action can
+        # resume that state.
+        HA_MODE_RUNTIME_VERIFYING,
     }
 )
 
@@ -1478,6 +1568,73 @@ def _enter_repair_needed(
     ha_state.no_progress_tick_count = 0
 
 
+def _enter_runtime_repair_needed(
+    controller: "ControlSurfaceController",
+    ha_state: HighAutonomyRunState,
+    packet: dict[str, Any],
+) -> None:
+    """RUN_044 analogue of :func:`_enter_repair_needed` for a runtime-sourced packet.
+
+    The packet itself is built by ``admissible.browser_runtime.repair``
+    (kept inside the sealed browser_runtime subsystem); this only performs
+    the same ha_state/governance bookkeeping the static repair path already
+    does, so a runtime repair composes with the existing repair loop instead
+    of inventing a parallel one.
+    """
+
+    ha_state.repair_round_count += 1
+    ha_state.repair_phase = REPAIR_PHASE_REPAIR_NEEDED
+    ha_state.repair_packet = packet
+    ha_state.runtime_repair_kind = packet.get("kind")
+    failed = list(packet.get("failed_criteria") or packet.get("gap_criteria") or [])
+    ha_state.repair_history.append(
+        {
+            "repair_round": ha_state.repair_round_count,
+            "failed_criteria": failed,
+            "kind": packet.get("kind"),
+            "started_at": _now_iso(),
+        }
+    )
+    controller._session.governance_records.append(
+        {
+            "record_id": f"governance_{uuid.uuid4().hex[:12]}",
+            "event_type": "runtime_repair_round_started",
+            "repair_round": ha_state.repair_round_count,
+            "failed_criteria": failed,
+            "kind": packet.get("kind"),
+            "timestamp": _now_iso(),
+        }
+    )
+    ha_state.mode = HA_MODE_RECOVERING
+    ha_state.next_action = HA_NEXT_WRITE_REPAIR
+    ha_state.last_event = (
+        f"Runtime verification found {len(failed)} repairable {packet.get('kind')} "
+        "criteria; preparing targeted repair."
+    )
+    ha_state.current_step = None
+    ha_state.no_progress_tick_count = 0
+
+
+# RUN_044: runtime_verification_status values in which an in-process worker
+# may legitimately still be preparing/running/awaiting application -- these
+# never count as no-progress and never finalize the run.
+_RUNTIME_IN_FLIGHT_STATUSES = frozenset(
+    {
+        "runtime_verification_pending",
+        "preparing_runtime_plan",
+        "runtime_capability_check",
+        "runtime_verification_queued",
+        "runtime_verifying",
+        "runtime_evidence_ready",
+        "applying_runtime_evidence",
+    }
+)
+
+
+def _runtime_pipeline_in_flight(ha_state: HighAutonomyRunState) -> bool:
+    return ha_state.runtime_verification_status in _RUNTIME_IN_FLIGHT_STATUSES
+
+
 def _sync_counters(
     controller: "ControlSurfaceController",
     ha_state: HighAutonomyRunState,
@@ -1638,6 +1795,63 @@ def _sync_counters(
         "legacy_false_completion_repair_count": int(bool(eligibility.get("legacy_false_completion_repaired"))),
     })
 
+    refresh_runtime_projection_and_metrics(ha_state)
+
+
+def refresh_runtime_projection_and_metrics(ha_state: HighAutonomyRunState) -> None:
+    """RUN_044: refresh runtime/human-observation projection fields + metrics.
+
+    Derived purely from already-persisted ``ha_state`` fields (the ledger,
+    ``runtime_attempt_history``, ``human_observation_records``,
+    ``runtime_coverage_report``), so it is safe and cheap to call from every
+    place that projects ``ha_state.metrics`` for display -- not just from a
+    tick. In particular, ``ControlSurfaceController.session_dict()``
+    recomputes ``ha_state.metrics`` from scratch via
+    :func:`~admissible.governed_run.build_canonical_metrics` on every call
+    (including outside of a tick, e.g. right after recording a human
+    observation); without also calling this here, that recompute would
+    silently drop every RUN_044 metric between ticks.
+    """
+
+    from admissible.runtime_verification_orchestrator import build_runtime_metrics
+
+    ha_state.runtime_pending_criterion_ids = [
+        str(item.get("criterion_id"))
+        for item in ha_state.acceptance_criteria
+        if item.get("verification_disposition") == "deterministic_runtime"
+        and item.get("status") not in ("verified_pass", "waived")
+    ]
+    ha_state.runtime_failed_criterion_ids = [
+        str(item.get("criterion_id"))
+        for item in ha_state.acceptance_criteria
+        if item.get("verification_disposition") == "deterministic_runtime"
+        and item.get("status") == "verified_fail"
+    ]
+    unobservable_ids = set((ha_state.runtime_coverage_report or {}).get("unobservable_criterion_ids") or [])
+    ha_state.runtime_gap_criterion_ids = [
+        str(item.get("criterion_id"))
+        for item in ha_state.acceptance_criteria
+        if str(item.get("criterion_id")) in unobservable_ids
+        and item.get("status") not in ("verified_pass", "waived")
+    ]
+    ha_state.human_observation_pending_criterion_ids = [
+        str(item.get("criterion_id"))
+        for item in ha_state.acceptance_criteria
+        if item.get("verification_disposition") == "human_observation_required"
+        and item.get("status") not in ("verified_pass", "verified_fail", "waived")
+    ]
+    human_records = ha_state.human_observation_records
+    ha_state.metrics = dict(ha_state.metrics or {})
+    ha_state.metrics.update(build_runtime_metrics(ha_state.runtime_attempt_history))
+    ha_state.metrics.update(
+        {
+            "human_observation_count": len(human_records),
+            "human_observation_pass_count": sum(1 for r in human_records if r.get("disposition") == "pass"),
+            "human_observation_fail_count": sum(1 for r in human_records if r.get("disposition") == "fail"),
+            "human_observation_waiver_count": sum(1 for r in human_records if r.get("disposition") == "waive"),
+        }
+    )
+
 
 def _has_acceptance_verification_plan(ha_state: HighAutonomyRunState) -> bool:
     return any(
@@ -1687,6 +1901,15 @@ def _try_finalize_outcome(
     no_pending_useful = not ha_state.pending_useful_operations
     no_active_blockers = int((ha_state.metrics or {}).get("active_blocked_count", 0)) == 0
     verification_final = _verification_is_final(controller)
+    # RUN_044: an active runtime worker or a pending human observation is a
+    # documented wait state (PART H.34-35), never grounds for finalizing —
+    # neither "completed" (evidence has not landed yet) nor
+    # "stopped_by_budget"/"incomplete" (runtime verification does not consume
+    # provider-turn budget, so budget exhaustion alone must not cut it off).
+    if _runtime_pipeline_in_flight(ha_state) or (
+        ha_state.mode == HA_MODE_AWAITING_HUMAN_OBSERVATION and ha_state.human_observation_pending_criterion_ids
+    ):
+        return False
     contract = controller._session.mission_contract or {}
     eligibility_state = ha_state.to_dict()
     eligibility_state["active_blockers"] = (
@@ -1730,6 +1953,7 @@ def _try_finalize_outcome(
 
     if (
         not _has_acceptance_verification_plan(ha_state)
+        and not ha_state.runtime_verification_required
         and verification_final
         and ha_state.mode == HA_MODE_VERIFYING
         and no_pending_useful
@@ -1785,6 +2009,80 @@ def _try_finalize_outcome(
     return False
 
 
+def _active_runtime_attempt(ha_state: HighAutonomyRunState) -> Any | None:
+    from admissible.runtime_orchestration_models import RuntimeVerificationAttempt
+
+    if not ha_state.active_runtime_attempt or not ha_state.active_runtime_attempt_id:
+        return None
+    return RuntimeVerificationAttempt.from_dict(ha_state.active_runtime_attempt)
+
+
+def _active_runtime_plan_obj(ha_state: HighAutonomyRunState) -> Any | None:
+    from admissible.browser_runtime.models import BrowserRuntimeVerificationPlan
+
+    if not ha_state.active_runtime_plan:
+        return None
+    return BrowserRuntimeVerificationPlan.from_dict(ha_state.active_runtime_plan)
+
+
+def _plan_runtime_next_action(
+    controller: "ControlSurfaceController",
+    ha_state: HighAutonomyRunState,
+) -> str | None:
+    """RUN_044 PART C/H: the next runtime-verification step, or ``None``.
+
+    ``None`` means the runtime pipeline has nothing to do right now (not
+    required, or genuinely waiting on an explicit human/operator action);
+    the caller falls through to the rest of the static-verification/closure
+    decision tree.
+    """
+
+    from admissible.runtime_orchestration_models import (
+        STATUS_CANCELLED,
+        STATUS_EVIDENCE_READY,
+        STATUS_FAILED,
+        STATUS_INTERRUPTED,
+        STATUS_PREPARED,
+        STATUS_QUEUED,
+        STATUS_RUNNING,
+        STATUS_UNAVAILABLE,
+    )
+
+    if ha_state.active_runtime_attempt_id:
+        attempt = _active_runtime_attempt(ha_state)
+        if attempt is not None:
+            if attempt.status == STATUS_PREPARED:
+                # An explicit retry (or a prepare that hasn't started yet)
+                # already validated a plan+attempt; start that one instead
+                # of building an unrelated second attempt (preserves PART
+                # G.29 lineage: retry_of_attempt_id, plan sha, criteria).
+                return HA_NEXT_START_RUNTIME_VERIFICATION
+            if attempt.status in (STATUS_QUEUED, STATUS_RUNNING):
+                return HA_NEXT_POLL_RUNTIME_VERIFICATION
+            if attempt.status in (STATUS_EVIDENCE_READY, STATUS_UNAVAILABLE, STATUS_FAILED):
+                return HA_NEXT_APPLY_RUNTIME_EVIDENCE
+            if attempt.status in (STATUS_INTERRUPTED, STATUS_CANCELLED):
+                return None  # requires an explicit operator retry (PART G.25 / PART L.58)
+
+    if ha_state.mode == HA_MODE_AWAITING_HUMAN_OBSERVATION and ha_state.human_observation_pending_criterion_ids:
+        return None  # a human must record an observation; not auto-resumable
+
+    contract = controller._session.mission_contract or {}
+    workspace = controller._session.bounded_executor_workspace
+    if not contract or not workspace:
+        return None
+
+    from admissible.runtime_verification_orchestrator import assess_runtime_need
+
+    assessment = assess_runtime_need(contract, ha_state.acceptance_criteria, workspace_root=workspace)
+    ha_state.runtime_coverage_report = assessment.coverage_report
+    ha_state.runtime_criterion_ids = list(assessment.runtime_criterion_ids)
+    ha_state.runtime_verification_required = assessment.required
+    if not assessment.required:
+        return None
+    return HA_NEXT_START_RUNTIME_VERIFICATION
+
+
 def _plan_next_action(
     controller: "ControlSurfaceController",
     ha_state: HighAutonomyRunState,
@@ -1804,6 +2102,13 @@ def _plan_next_action(
     # the already-consumed response and never re-entering human_required.
     if ha_state.refusal_recovery_pending:
         return HA_NEXT_WRITE_RECOVERY
+    # RUN_044 PART J: distinct from human-authority approval above -- a
+    # pending subjective observation is a stable wait state, never routed
+    # through HA_NEXT_WAIT_FOR_RESPONSE (which would wrongly flip the mode
+    # to "waiting for agent") and never a livelock (excluded from the
+    # no-progress-tick counter).
+    if ha_state.mode == HA_MODE_AWAITING_HUMAN_OBSERVATION and ha_state.human_observation_pending_criterion_ids:
+        return HA_NEXT_AWAIT_HUMAN_OBSERVATION
 
     if ha_state.repair_phase in (
         REPAIR_PHASE_REPAIR_NEEDED,
@@ -1885,6 +2190,22 @@ def _plan_next_action(
     ):
         return HA_NEXT_VERIFY
 
+    # RUN_044: after static verification has run at least once and there is
+    # nothing else more urgent to do, delegate to the runtime orchestrator.
+    # This fires independently of _has_acceptance_verification_plan (a
+    # criterion needing only a browser check never had a static `verification`
+    # array in the first place), so runtime-checkable criteria never get
+    # silently skipped into a premature "no verification contract" incomplete.
+    if (
+        ready_count == 0
+        and ha_state.repair_phase in (REPAIR_PHASE_NONE, "")
+        and not _transport_has_pending_response(transport)
+        and _verification_is_final(controller)
+    ):
+        runtime_next = _plan_runtime_next_action(controller, ha_state)
+        if runtime_next is not None:
+            return runtime_next
+
     if (
         ha_state.repair_phase in (
             REPAIR_PHASE_REPAIR_EXECUTING,
@@ -1893,6 +2214,13 @@ def _plan_next_action(
         and ready_count == 0
         and not _transport_has_pending_response(transport)
     ):
+        if ha_state.runtime_repair_kind in ("runtime_verification_failure", "runtime_instrumentation_gap"):
+            # Delegate to the same active-attempt-aware dispatch the general
+            # runtime branch above uses: a repair-verify re-entry must poll/
+            # apply an already-started attempt rather than blindly starting
+            # a second one every tick (RUN_044 exactly-once/single-flight).
+            runtime_next = _plan_runtime_next_action(controller, ha_state)
+            return runtime_next or HA_NEXT_START_RUNTIME_VERIFICATION
         return HA_NEXT_VERIFY
 
     if (
@@ -2460,7 +2788,19 @@ def tick_high_autonomy_run(
         if not ha_state.repair_packet and _can_start_repair(controller, ha_state):
             _enter_repair_needed(controller, ha_state)
         ha_state.repair_phase = REPAIR_PHASE_WRITING_REPAIR_INSTRUCTION
-        repair_text = build_repair_instruction_text(ha_state.repair_packet or {})
+        repair_kind = (ha_state.repair_packet or {}).get("kind")
+        if repair_kind in ("runtime_verification_failure", "runtime_instrumentation_gap"):
+            # RUN_044: a runtime-sourced repair packet was built by
+            # admissible.browser_runtime.repair (see _enter_runtime_repair_needed);
+            # only that module's own text builder understands its shape
+            # (assertion diagnostics, console/page exceptions, missing
+            # observables) -- the generic governed_run builder expects a
+            # different packet shape.
+            from admissible.browser_runtime.repair import build_runtime_repair_instruction_text
+
+            repair_text = build_runtime_repair_instruction_text(ha_state.repair_packet or {})
+        else:
+            repair_text = build_repair_instruction_text(ha_state.repair_packet or {})
         controller.generate_next_continuation_instruction_packet(instruction_text=repair_text)
         turn_now = controller._session.run_loop.current_turn
         work_limit = max(ha_state.max_turns - ha_state.closure_reserve_turns, 0)
@@ -2665,6 +3005,299 @@ def tick_high_autonomy_run(
         _save_ha_state(controller, ha_state)
         controller._persist()
 
+    elif planned == HA_NEXT_START_RUNTIME_VERIFICATION:
+        from admissible.runtime_orchestration_models import STATUS_PREPARED, STATUS_QUEUED, STATUS_RUNNING
+        from admissible.runtime_verification_orchestrator import (
+            assess_runtime_need,
+            default_runtime_provider,
+            prepare_runtime_attempt,
+            start_runtime_attempt,
+        )
+
+        contract = controller._session.mission_contract or {}
+        workspace = controller._session.bounded_executor_workspace
+        provider = controller._runtime_provider_override or default_runtime_provider()
+        existing_attempt = _active_runtime_attempt(ha_state)
+
+        if existing_attempt is not None and existing_attempt.status == STATUS_PREPARED:
+            # An explicit retry (PART G.29) already validated a plan+attempt;
+            # start that one as-is instead of building an unrelated second
+            # attempt, so retry_of_attempt_id/plan sha/criteria lineage
+            # survives into the started attempt.
+            attempt = existing_attempt
+            plan_for_start = _active_runtime_plan_obj(ha_state)
+            prepare_transition = None
+        else:
+            assessment = assess_runtime_need(contract, ha_state.acceptance_criteria, workspace_root=workspace)
+            ha_state.runtime_coverage_report = assessment.coverage_report
+            ha_state.runtime_criterion_ids = list(assessment.runtime_criterion_ids)
+            ha_state.runtime_verification_required = assessment.required
+            attempt = None
+            plan_for_start = None
+            if not assessment.required or assessment.plan is None:
+                ha_state.last_event = "Runtime verification is not required; nothing to start."
+                ha_state.last_tick_step = "runtime_no_op"
+                step_result["runtime_verification"] = {"required": False}
+            else:
+                attempt, prepare_transition = prepare_runtime_attempt(
+                    session_id=controller._session.session_id,
+                    mission_contract=contract,
+                    ledger=ha_state.acceptance_criteria,
+                    plan=assessment.plan,
+                    provider=provider,
+                    operation_records=controller._session.operation_records,
+                )
+                plan_for_start = assessment.plan
+
+        if attempt is None:
+            if prepare_transition is not None:
+                ha_state.runtime_verification_status = "runtime_observability_gap"
+                ha_state.last_event = prepare_transition.event_message
+                ha_state.last_tick_step = "runtime_plan_rejected"
+                step_result["runtime_verification"] = prepare_transition.to_dict()
+                _set_final_outcome(
+                    ha_state,
+                    outcome="verification_plan_incomplete",
+                    reason=prepare_transition.event_message,
+                )
+        else:
+            ha_state.active_runtime_attempt_id = attempt.attempt_id
+            ha_state.active_runtime_plan = plan_for_start.to_dict()
+            ha_state.last_runtime_plan_sha256 = attempt.runtime_plan_sha256
+            start_transition = start_runtime_attempt(
+                attempt=attempt, plan=plan_for_start, provider=provider, control_root=workspace
+            )
+            ha_state.active_runtime_attempt = attempt.to_dict()
+            ha_state.runtime_verification_status = (
+                "runtime_verifying"
+                if attempt.status in (STATUS_QUEUED, STATUS_RUNNING)
+                else start_transition.semantic_status
+            )
+            ha_state.mode = HA_MODE_RUNTIME_VERIFYING
+            ha_state.last_event = start_transition.event_message
+            ha_state.last_tick_step = "start_runtime_verification"
+            ha_state.no_progress_tick_count = 0
+            step_result["runtime_verification"] = start_transition.to_dict()
+        _save_ha_state(controller, ha_state)
+        controller._persist()
+
+    elif planned == HA_NEXT_POLL_RUNTIME_VERIFICATION:
+        from admissible.runtime_verification_orchestrator import poll_runtime_attempt
+
+        attempt = _active_runtime_attempt(ha_state)
+        workspace = controller._session.bounded_executor_workspace
+        if attempt is None:
+            ha_state.last_event = "No active runtime attempt to poll."
+            ha_state.last_tick_step = "runtime_poll_noop"
+        else:
+            transition = poll_runtime_attempt(attempt=attempt, control_root=workspace)
+            ha_state.active_runtime_attempt = attempt.to_dict()
+            ha_state.runtime_verification_status = (
+                "runtime_verifying" if attempt.status in ("queued", "running") else attempt.status
+            )
+            ha_state.last_event = transition.event_message
+            ha_state.last_tick_step = "poll_runtime_verification"
+            step_result["runtime_verification"] = transition.to_dict()
+        ha_state.mode = HA_MODE_RUNTIME_VERIFYING
+        _save_ha_state(controller, ha_state)
+        controller._persist()
+
+    elif planned == HA_NEXT_APPLY_RUNTIME_EVIDENCE:
+        from admissible.browser_runtime.repair import (
+            build_instrumentation_repair_packet,
+            build_runtime_repair_packet,
+        )
+        from admissible.runtime_orchestration_models import STATUS_FAILED
+        from admissible.runtime_verification_orchestrator import apply_runtime_evidence, find_persisted_evidence
+
+        attempt = _active_runtime_attempt(ha_state)
+        plan_obj = _active_runtime_plan_obj(ha_state)
+        workspace = controller._session.bounded_executor_workspace
+        contract = controller._session.mission_contract or {}
+
+        def _archive_attempt(semantic_status: str, *, extra: dict[str, Any] | None = None) -> None:
+            extra = extra or {}
+            ha_state.runtime_attempt_history.append(
+                {
+                    "attempt_id": attempt.attempt_id,
+                    "session_id": attempt.session_id,
+                    "runtime_plan_sha256": attempt.runtime_plan_sha256,
+                    "retry_of_attempt_id": attempt.retry_of_attempt_id,
+                    "evidence_id": attempt.evidence_id,
+                    "semantic_status": semantic_status,
+                    "cleanup_status": attempt.cleanup_status,
+                    "criterion_ids": list(attempt.criterion_ids),
+                    "started_at": attempt.started_at,
+                    "completed_at": attempt.completed_at,
+                    **extra,
+                }
+            )
+            ha_state.active_runtime_attempt_id = None
+            ha_state.active_runtime_attempt = None
+            ha_state.active_runtime_plan = None
+            ha_state.runtime_verification_status = semantic_status
+
+        if attempt is None or plan_obj is None:
+            ha_state.last_event = "No active runtime attempt to apply evidence for."
+            ha_state.last_tick_step = "runtime_apply_noop"
+            step_result["runtime_verification"] = {"applied": False}
+        elif attempt.status == STATUS_FAILED:
+            # Defensive path only: execute_runtime_verification_plan already
+            # catches provider exceptions into evidence, so a bare worker
+            # exception is not expected in normal operation. No evidence
+            # object exists here, so decide repair/finalize directly.
+            _archive_attempt("runtime_verification_fail")
+            ha_state.mode = HA_MODE_RUNNING
+            if ha_state.repair_round_count < ha_state.max_repair_rounds:
+                packet = {
+                    "kind": "runtime_verification_failure",
+                    "failed_criteria": list(attempt.criterion_ids),
+                    "unchanged_passing_criteria": [],
+                    "assertion_diagnostics": [{"message": attempt.failure_message}],
+                    "console_entries": [],
+                    "page_exceptions": [],
+                    "blocked_external_request_attempts": [],
+                    "missing_observables": [],
+                    "repair_boundaries": {
+                        "preserve_passing_artifacts": True,
+                        "structured_operations_only": True,
+                        "no_optional_polish": True,
+                    },
+                    "repair_round": ha_state.repair_round_count + 1,
+                    "max_repair_rounds": ha_state.max_repair_rounds,
+                    "remaining_repair_budget": max(0, ha_state.max_repair_rounds - ha_state.repair_round_count - 1),
+                }
+                _enter_runtime_repair_needed(controller, ha_state, packet)
+            else:
+                _set_final_outcome(
+                    ha_state,
+                    outcome="incomplete",
+                    reason=(
+                        "Runtime verification worker failed and repair rounds are exhausted: "
+                        f"{attempt.failure_message}"
+                    ),
+                )
+            step_result["runtime_verification"] = {"applied": False, "worker_failed": True}
+        else:
+            evidence = find_persisted_evidence(workspace, attempt.evidence_id)
+            if evidence is None:
+                attempt.status = "interrupted"
+                ha_state.active_runtime_attempt = attempt.to_dict()
+                ha_state.runtime_verification_status = "interrupted"
+                ha_state.last_event = "Runtime evidence file could not be found; treating as interrupted."
+                step_result["runtime_verification"] = {"applied": False, "evidence_missing": True}
+            else:
+                transition = apply_runtime_evidence(
+                    ledger=ha_state.acceptance_criteria,
+                    plan=plan_obj,
+                    evidence=evidence,
+                    mission_contract=contract,
+                    attempt=attempt,
+                )
+                extra = transition.extra or {}
+                if extra.get("contract_ledger_coverage_report") is not None:
+                    ha_state.contract_ledger_coverage_report = extra["contract_ledger_coverage_report"]
+                if extra.get("verification_plan_coverage_report") is not None:
+                    ha_state.verification_plan_coverage_report = extra["verification_plan_coverage_report"]
+                ha_state.last_event = transition.event_message
+                step_result["runtime_verification"] = transition.to_dict()
+
+                if not transition.changed:
+                    # Exactly-once guard tripped: a stable no-op (test #10).
+                    ha_state.runtime_verification_status = transition.semantic_status
+                else:
+                    ha_state.last_runtime_evidence_id = evidence.evidence_id
+                    fail_ids = extra.get("fail_criterion_ids") or []
+                    gap_ids = extra.get("gap_criterion_ids") or []
+                    human_ids = extra.get("human_observation_criterion_ids") or []
+                    _archive_attempt(
+                        transition.semantic_status,
+                        extra={
+                            "policy_violation": bool(extra.get("policy_violation")),
+                            "duration_ms": extra.get("duration_ms", 0),
+                            "assertion_count": extra.get("assertion_count", 0),
+                            "assertion_pass_count": extra.get("assertion_pass_count", 0),
+                            "assertion_fail_count": extra.get("assertion_fail_count", 0),
+                            "input_event_count": extra.get("input_event_count", 0),
+                            "snapshot_count": extra.get("snapshot_count", 0),
+                            "screenshot_count": extra.get("screenshot_count", 0),
+                            "external_request_attempt_count": extra.get("external_request_attempt_count", 0),
+                        },
+                    )
+
+                    if transition.semantic_status == "runtime_verification_capability_gap":
+                        ha_state.mode = HA_MODE_RUNNING
+                        _set_final_outcome(
+                            ha_state,
+                            outcome="verification_capability_gap",
+                            reason=(
+                                "Browser runtime is unavailable; mandatory runtime-verified "
+                                "criteria cannot be checked."
+                            ),
+                        )
+                    elif transition.semantic_status == "runtime_verification_fail" and fail_ids and (
+                        ha_state.repair_round_count < ha_state.max_repair_rounds
+                    ):
+                        packet = build_runtime_repair_packet(
+                            evidence=evidence,
+                            repair_round=ha_state.repair_round_count + 1,
+                            max_repair_rounds=ha_state.max_repair_rounds,
+                        )
+                        _enter_runtime_repair_needed(controller, ha_state, packet)
+                    elif transition.semantic_status == "runtime_verification_fail":
+                        ha_state.mode = HA_MODE_RUNNING
+                        _set_final_outcome(
+                            ha_state,
+                            outcome="incomplete",
+                            reason=(
+                                "Mandatory runtime-verified criteria remain failed after "
+                                "verification; repair rounds exhausted or unavailable "
+                                f"({ha_state.repair_round_count}/{ha_state.max_repair_rounds})."
+                            ),
+                        )
+                    elif transition.semantic_status == "runtime_observability_gap" and (
+                        extra.get("instrumentation_fixable_gap_ids")
+                        and plan_obj.debug_interface
+                        and ha_state.repair_round_count < ha_state.max_repair_rounds
+                    ):
+                        packet = build_instrumentation_repair_packet(
+                            evidence=evidence,
+                            debug_interface=plan_obj.debug_interface,
+                            repair_round=ha_state.repair_round_count + 1,
+                            max_repair_rounds=ha_state.max_repair_rounds,
+                        )
+                        _enter_runtime_repair_needed(controller, ha_state, packet)
+                    elif transition.semantic_status == "runtime_observability_gap":
+                        ha_state.mode = HA_MODE_RUNNING
+                        _set_final_outcome(
+                            ha_state,
+                            outcome="runtime_observability_gap",
+                            reason=(
+                                "Mandatory runtime-verified criteria have no safe observable "
+                                "and instrumentation repair is unavailable or exhausted."
+                            ),
+                        )
+                    elif transition.semantic_status == "awaiting_human_observation":
+                        ha_state.mode = HA_MODE_AWAITING_HUMAN_OBSERVATION
+                        ha_state.last_event = (
+                            f"Awaiting human observation for {len(human_ids)} subjective criteria."
+                        )
+                    else:
+                        ha_state.mode = HA_MODE_RUNNING
+        ha_state.last_tick_step = "apply_runtime_evidence"
+        _save_ha_state(controller, ha_state)
+        controller._persist()
+
+    elif planned == HA_NEXT_AWAIT_HUMAN_OBSERVATION:
+        ha_state.mode = HA_MODE_AWAITING_HUMAN_OBSERVATION
+        ha_state.last_event = (
+            f"Awaiting human observation for {len(ha_state.human_observation_pending_criterion_ids)} "
+            "subjective criteria."
+        )
+        ha_state.last_tick_step = "await_human_observation"
+        _save_ha_state(controller, ha_state)
+        controller._persist()
+
     elif planned == HA_NEXT_HUMAN_APPROVAL:
         ha_state.mode = HA_MODE_HUMAN_REQUIRED
         ha_state.human_required_reason = ha_state.human_required_reason or (
@@ -2700,11 +3333,21 @@ def tick_high_autonomy_run(
             HA_NEXT_WRITE_RECOVERY,
             HA_NEXT_WRITE_REPAIR,
             HA_NEXT_HUMAN_APPROVAL,
+            HA_NEXT_START_RUNTIME_VERIFICATION,
+            HA_NEXT_APPLY_RUNTIME_EVIDENCE,
         )
         or ha_state.repair_phase
         not in (REPAIR_PHASE_NONE, "", None)
         or ha_state.last_tick_step
-        in ("invoke_agent", "ingest_response", "verify", "finalize_outcome", "write_repair_instruction")
+        in (
+            "invoke_agent",
+            "ingest_response",
+            "verify",
+            "finalize_outcome",
+            "write_repair_instruction",
+            "start_runtime_verification",
+            "apply_runtime_evidence",
+        )
     )
     if progressed or fingerprint != ha_state.last_progress_fingerprint:
         ha_state.no_progress_tick_count = 0
@@ -2935,3 +3578,199 @@ def refuse_human_critical_action(
     view = controller.state_view()
     view["high_autonomy_summary"] = build_high_autonomy_summary(ha_state=ha_state, state_view=view)
     return view
+
+
+# --- RUN_044: narrowly-scoped runtime orchestration API surface -------------
+# Only these four operations are exposed to the Control Surface (PART L.58):
+# read status, retry an interrupted attempt, cancel an active attempt, record
+# a human observation. None of them accept an arbitrary runtime plan,
+# selector, JavaScript, browser argument, or URL from the caller (PART L.59-60)
+# -- the plan always comes from admissible.mission_contract + the current
+# acceptance ledger via admissible.runtime_verification_orchestrator.
+
+
+def runtime_verification_status_view(controller: "ControlSurfaceController") -> dict[str, Any]:
+    """PART L.58: read-only runtime-verification status projection."""
+
+    ha_state = _ha_state(controller)
+    return {
+        "runtime_verification_required": ha_state.runtime_verification_required,
+        "runtime_verification_status": ha_state.runtime_verification_status,
+        "active_runtime_attempt_id": ha_state.active_runtime_attempt_id,
+        "active_runtime_attempt": ha_state.active_runtime_attempt,
+        "runtime_attempt_history": list(ha_state.runtime_attempt_history),
+        "last_runtime_plan_sha256": ha_state.last_runtime_plan_sha256,
+        "last_runtime_evidence_id": ha_state.last_runtime_evidence_id,
+        "runtime_criterion_ids": list(ha_state.runtime_criterion_ids),
+        "runtime_pending_criterion_ids": list(ha_state.runtime_pending_criterion_ids),
+        "runtime_failed_criterion_ids": list(ha_state.runtime_failed_criterion_ids),
+        "runtime_gap_criterion_ids": list(ha_state.runtime_gap_criterion_ids),
+        "human_observation_pending_criterion_ids": list(ha_state.human_observation_pending_criterion_ids),
+        "human_observation_records": list(ha_state.human_observation_records),
+        "runtime_coverage_report": ha_state.runtime_coverage_report,
+    }
+
+
+def retry_interrupted_runtime_attempt(controller: "ControlSurfaceController") -> dict[str, Any]:
+    """PART G.29 / PART L.58: explicitly retry an interrupted runtime attempt.
+
+    Never auto-triggered by a tick (PART G.25); requires an explicit
+    operator/API call, and preserves lineage to the interrupted attempt
+    (prior attempt id, plan sha, affected criteria, artifact hashes).
+    """
+
+    ha_state = _ha_state(controller)
+    if not ha_state or not ha_state.active:
+        raise ValueError("No active high-autonomy run.")
+    from admissible.runtime_orchestration_models import STATUS_INTERRUPTED
+
+    attempt = _active_runtime_attempt(ha_state)
+    if attempt is None or attempt.status != STATUS_INTERRUPTED:
+        raise ValueError("No interrupted runtime attempt to retry.")
+    plan_obj = _active_runtime_plan_obj(ha_state)
+    if plan_obj is None:
+        raise ValueError("No persisted runtime plan to retry against.")
+
+    from admissible.runtime_verification_orchestrator import build_retry_attempt, default_runtime_provider
+
+    contract = controller._session.mission_contract or {}
+    provider = controller._runtime_provider_override or default_runtime_provider()
+    new_attempt, transition = build_retry_attempt(
+        interrupted=attempt,
+        session_id=controller._session.session_id,
+        mission_contract=contract,
+        ledger=ha_state.acceptance_criteria,
+        plan=plan_obj,
+        provider=provider,
+        operation_records=controller._session.operation_records,
+        reason="interrupted_attempt_retry",
+    )
+    if new_attempt is None:
+        raise ValueError(transition.event_message)
+
+    # Archive the superseded interrupted attempt into history before
+    # replacing it, so the full attempt lineage stays observable even though
+    # the new attempt also carries retry_of_attempt_id back to it.
+    ha_state.runtime_attempt_history.append(
+        {
+            "attempt_id": attempt.attempt_id,
+            "session_id": attempt.session_id,
+            "runtime_plan_sha256": attempt.runtime_plan_sha256,
+            "retry_of_attempt_id": attempt.retry_of_attempt_id,
+            "semantic_status": "interrupted",
+            "cleanup_status": attempt.cleanup_status,
+            "criterion_ids": list(attempt.criterion_ids),
+            "started_at": attempt.started_at,
+            "completed_at": attempt.completed_at,
+        }
+    )
+    ha_state.active_runtime_attempt_id = new_attempt.attempt_id
+    ha_state.active_runtime_attempt = new_attempt.to_dict()
+    ha_state.last_runtime_plan_sha256 = new_attempt.runtime_plan_sha256
+    ha_state.runtime_verification_status = "runtime_verification_pending"
+    ha_state.mode = HA_MODE_RUNTIME_VERIFYING
+    ha_state.last_event = transition.event_message
+    controller._session.governance_records.append(
+        {
+            "record_id": f"governance_{uuid.uuid4().hex[:12]}",
+            "event_type": "runtime_attempt_retry_requested",
+            "attempt_id": new_attempt.attempt_id,
+            "retry_of_attempt_id": attempt.attempt_id,
+            "timestamp": _now_iso(),
+        }
+    )
+    _save_ha_state(controller, ha_state)
+    controller._persist()
+    return controller.state_view()
+
+
+def cancel_active_runtime_attempt(controller: "ControlSurfaceController") -> dict[str, Any]:
+    """PART L.58: explicitly cancel an active runtime attempt and clean up."""
+
+    ha_state = _ha_state(controller)
+    if not ha_state or not ha_state.active:
+        raise ValueError("No active high-autonomy run.")
+    attempt = _active_runtime_attempt(ha_state)
+    if attempt is None:
+        raise ValueError("No active runtime attempt to cancel.")
+
+    from admissible.runtime_verification_orchestrator import cancel_runtime_attempt
+
+    transition = cancel_runtime_attempt(attempt=attempt)
+    ha_state.runtime_attempt_history.append(
+        {
+            "attempt_id": attempt.attempt_id,
+            "session_id": attempt.session_id,
+            "runtime_plan_sha256": attempt.runtime_plan_sha256,
+            "retry_of_attempt_id": attempt.retry_of_attempt_id,
+            "semantic_status": "cancelled",
+            "cleanup_status": attempt.cleanup_status,
+            "criterion_ids": list(attempt.criterion_ids),
+            "started_at": attempt.started_at,
+            "completed_at": attempt.completed_at,
+        }
+    )
+    ha_state.active_runtime_attempt_id = None
+    ha_state.active_runtime_attempt = None
+    ha_state.active_runtime_plan = None
+    ha_state.runtime_verification_status = "cancelled"
+    ha_state.mode = HA_MODE_RUNNING
+    ha_state.last_event = transition.event_message
+    controller._session.governance_records.append(
+        {
+            "record_id": f"governance_{uuid.uuid4().hex[:12]}",
+            "event_type": "runtime_attempt_cancelled",
+            "attempt_id": attempt.attempt_id,
+            "timestamp": _now_iso(),
+        }
+    )
+    _save_ha_state(controller, ha_state)
+    controller._persist()
+    return controller.state_view()
+
+
+def record_human_observation_decision(
+    controller: "ControlSurfaceController",
+    *,
+    criterion_id: str,
+    actor: str,
+    disposition: str,
+    note: str,
+    evidence_refs: list[str] | None = None,
+) -> dict[str, Any]:
+    """PART J.47-51: record one human observation, distinct from human authority.
+
+    Never counted in ``human_critical_pending``/``human_required_*``; tracked
+    separately via ``human_observation_records`` and its own metrics
+    (``human_observation_count`` etc., PART J.51).
+    """
+
+    ha_state = _ha_state(controller)
+    if not ha_state or not ha_state.active:
+        raise ValueError("No active high-autonomy run.")
+
+    from admissible.runtime_verification_orchestrator import record_human_observation
+
+    record, transition = record_human_observation(
+        ledger=ha_state.acceptance_criteria,
+        criterion_id=criterion_id,
+        actor=actor,
+        disposition=disposition,
+        note=note,
+        evidence_refs=evidence_refs,
+    )
+    ha_state.human_observation_records.append(record.to_dict())
+    controller._session.governance_records.append(
+        {
+            "record_id": f"governance_{uuid.uuid4().hex[:12]}",
+            "event_type": "human_observation_recorded",
+            "criterion_id": criterion_id,
+            "disposition": disposition,
+            "actor": actor,
+            "timestamp": _now_iso(),
+        }
+    )
+    ha_state.last_event = transition.event_message
+    _save_ha_state(controller, ha_state)
+    controller._persist()
+    return controller.state_view()

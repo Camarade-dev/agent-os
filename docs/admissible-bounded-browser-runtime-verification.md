@@ -376,6 +376,176 @@ installed Chrome and Edge on this development machine and passed,
 including the policy-violation containment scenario, with verified
 zero-orphan-process cleanup.
 
+## RUN_044: wiring into the high-autonomy governed run
+
+RUN_043 (everything above) is a standalone, sealed verifier: it never runs
+itself, never decides *when* it should run, and never touches
+`admissible.high_autonomy_controller`. RUN_044 adds exactly one thing on
+top: **orchestration** — deciding when runtime verification is required,
+starting/polling/applying it as a bounded background step of the governed
+run, and closing the loop back into completion eligibility. See
+[admissible-high-autonomy-governed-loop.md](admissible-high-autonomy-governed-loop.md)
+for the full description; this section only records the boundary and why
+it is drawn where it is.
+
+**Orchestration boundary.** Two new top-level modules own this, both
+*outside* `admissible/browser_runtime/`:
+
+- `admissible/runtime_orchestration_models.py` — the durable
+  `RuntimeVerificationAttempt` schema, the `RuntimeOrchestrationTransition`
+  object the orchestrator hands back to the controller, and
+  `HumanObservationRecord`.
+- `admissible/runtime_verification_orchestrator.py` — `assess_runtime_need`,
+  `prepare_runtime_attempt`, `start_runtime_attempt`, `poll_runtime_attempt`,
+  `apply_runtime_evidence`, `cancel_runtime_attempt`,
+  `reconcile_runtime_state_on_load`, `record_human_observation`, plus the
+  single-flight background-worker registry.
+
+Browser discovery, CDP operations, HTTP serving, DSL interpretation,
+evidence collection, and provider cleanup all stay inside
+`admissible/browser_runtime/`, completely unmodified in shape by RUN_044
+(two integration-defect fixes below aside). `high_autonomy_controller.py`
+never imports `chromium_provider`, `cdp_client`, `server`, or `dsl`; it only
+calls the five orchestrator functions above and persists whatever
+`RuntimeOrchestrationTransition`/`RuntimeVerificationAttempt` it gets back.
+This is deliberate: a runtime check is not a model turn, and the controller
+that already owns the (very large) model-turn state machine must not also
+own browser-provider lifecycle — that would make one file responsible for
+two unrelated bounded-execution domains.
+
+**Two integration-defect fixes surfaced by actually wiring this up**
+(RUN_043's own tests never exercised these paths, since they always call
+`execute_runtime_verification_plan` once against a freshly-built ledger and
+read the in-memory `evidence` object directly):
+
+1. `_aggregate_criterion_results` (`runner.py`) used to report
+   `runtime_observability_gap` for *every* criterion in the plan that had
+   no matched assertion — including criteria plan_builder deliberately left
+   untouched (still `deterministic_structural`/`evidence_required`, no
+   runtime steps ever generated for them). One browser session could
+   therefore silently overwrite an unrelated static criterion's status.
+   Fixed by only aggregating criteria whose disposition is
+   `deterministic_runtime`/`unsupported_verifier`, or which are
+   `human_observation_required`.
+2. `BrowserRuntimeEvidence.from_dict()` never listed `policy_violations` in
+   its bounded-field reconstruction, even though `to_dict()` always
+   serialized it — evidence read back from disk (which the orchestrator's
+   persistence/recovery and exactly-once-apply paths always do) silently
+   lost every recorded policy violation. Fixed by adding it to
+   `_BOUNDED_FIELDS` in `models.py`.
+3. `plan_builder._classify` never re-attempted a criterion whose
+   `verification_disposition` was already `deterministic_runtime` (it only
+   re-attempts `unsupported_verifier`/matching `evidence_required` text),
+   so rebuilding the plan for a retry or repair rerun against an
+   already-touched ledger produced zero steps for that criterion. Fixed by
+   adding `deterministic_runtime` to the re-attempt set.
+
+**Single-flight and the async tick lifecycle.** One in-process background
+worker per session at most (`_WORKERS: dict[session_id, _RuntimeWorker]` in
+the orchestrator module — process-global, not tied to any one
+`ControlSurfaceController` instance, so it survives controller
+reconstruction within the same process). `HighAutonomyRunState` persists
+`active_runtime_attempt`/`active_runtime_plan` (full snapshots, not just an
+id) so a fresh tick — or a fresh controller loaded from the same session
+file — can resume polling without holding anything only in memory:
+
+- **Tick A** (`HA_NEXT_START_RUNTIME_VERIFICATION`): validate the plan
+  (PART D.12: contract sha, authorized workspace, exact entrypoint, DSL
+  validation, ceilings, known criterion ids), persist the attempt,
+  capability-check (synchronous — a negative result never launches a
+  browser and returns immediately), then start the worker thread and
+  return. Never blocks on the browser run.
+- **Later ticks** (`HA_NEXT_POLL_RUNTIME_VERIFICATION`): non-blocking check
+  on the owned worker; `runtime_verifying` stays displayed until the worker
+  finishes. No later tick may start a second attempt while one is active —
+  enforced both by the controller's existing `_high_autonomy_tick_lock`
+  (single-flight per session across HTTP requests) and, independently, by
+  the orchestrator's own worker-registry check (so it stays correct even if
+  two independent `ControlSurfaceController` objects act on the same
+  session).
+- **Completion tick** (`HA_NEXT_APPLY_RUNTIME_EVIDENCE`): persist evidence
+  via `evidence_store.write_runtime_evidence`, apply it to the ledger
+  exactly once (guarded by `attempt.status == evidence_applied`; a repeated
+  apply is a stable no-op that touches neither the ledger nor any metric),
+  then let the existing `_try_finalize_outcome` re-evaluate completion in
+  the same tick.
+
+**Persistence and recovery.** On session load, if a persisted attempt is
+`queued`/`running` but no owned worker exists for that session, and no
+matching evidence file exists on disk yet, it is marked `interrupted` —
+never assumed to have passed — with `cleanup_status:
+"unknown_process_state_not_tracked"` (there is no durable PID to
+re-attach to and re-verify; RUN_043's evidence schema does not carry one).
+If matching evidence *does* already exist on disk (the process crashed
+after writing it but before applying it), it is recovered and applied
+without relaunching the browser. An interrupted attempt is never
+auto-resumed; `retry_runtime_verification_attempt()` starts a fresh attempt
+with `retry_of_attempt_id` pointing at the interrupted one, plus the same
+plan sha and criterion ids, and the interrupted attempt is archived into
+`runtime_attempt_history` before the new one starts.
+
+**Runtime repair.** A `runtime_verification_fail` result builds a packet via
+`browser_runtime.repair.build_runtime_repair_packet` (assertion diagnostics,
+console/page exceptions, blocked requests); a `runtime_observability_gap`
+result builds a packet via `build_instrumentation_repair_packet`, but only
+when at least one gap criterion's `unsupported_reason` is one plan_builder
+assigns for a *missing declared mapping* (a field/control the contract's
+own debug interface could plausibly add) — never for a criterion
+plan_builder found no derivable observable for at all (e.g. "collision
+causes death"), where more instrumentation would not help and would only
+burn a repair round. Either packet reuses the exact same
+`REPAIR_PHASE_*`/`repair_round_count`/`max_repair_rounds` bookkeeping the
+pre-existing static-verification repair loop already uses; the controller
+only picks which text-builder renders the instruction
+(`build_runtime_repair_instruction_text` vs. `build_repair_instruction_text`)
+based on the packet's `kind`.
+
+**Human observation vs. human authority.** A pending
+`human_observation_required` criterion sets `mode =
+awaiting_human_observation` — never `human_critical_pending`, never
+`HA_MODE_HUMAN_REQUIRED`. It is excluded from `_AUTO_TICK_SAFE_MODES` (a
+human must act) but is also excluded from the no-progress-tick counter (it
+is a stable wait state, not a livelock).
+`ControlSurfaceController.record_human_observation(criterion_id, actor=,
+disposition=, note=, evidence_refs=)` accepts `pass`/`fail`/`waive`
+(waiving requires a non-empty rationale) and is tracked via
+`human_observation_records` and `human_observation_count`/
+`_pass_count`/`_fail_count`/`_waiver_count` — never through
+`genuine_human_intervention_count` or any other human-authority metric.
+
+**Completion eligibility, capability gaps, observability gaps.**
+`evaluate_completion_eligibility()` remains the sole authority for
+`completed`; the orchestrator only ever applies evidence and lets the
+existing check re-run. Browser unavailability finalizes immediately as
+`verification_capability_gap` (no model turn can fix a missing browser, so
+there is no reason to wait out the turn budget first). A permanent
+observability gap (no instrumentation-fixable criterion, or repair rounds
+exhausted) finalizes as `runtime_observability_gap`. Neither is ever
+`internal_livelock`, `human_authority_blocker`, or `completed`.
+
+**Cancellation and cleanup.** `cancel_runtime_verification_attempt()` signals
+the worker's cooperative cancellation event (checked between DSL steps —
+`execute_runtime_verification_plan`'s optional `cancel_event` parameter),
+waits briefly for it to unwind, and records `cleanup_status` from the
+resulting evidence's `resource_cleanup`. Cleanup failure
+(`browser_process_terminated`/`http_server_stopped` false) is recorded on
+the attempt and counted in `runtime_cleanup_failure_count`, never hidden.
+
+**Neon fixture expected result (before any human observation).** Running
+the RUN_042 Neon Mission Contract through the full controller with
+`FixtureBrowserRuntimeProvider` and every declared debug field present:
+15/15 criteria and 8/8 exact paths stay represented; exactly one runtime
+attempt is created and applied; the 4 objectively-checkable criteria (bot
+count, restart/no-duplicate-loop, debug interface, debug overlay) become
+`verified_pass`; the 2 subjective criteria (camera smoothness, readable
+background) become `human_observation_pending`; the 3 criteria with no
+derivable observable at all (collision/respawn, live leaderboard, repeated
+restarts) remain `unsupported_verifier` — explicit, visible gaps, never
+silently dropped or auto-passed; the run never reaches `completed` on its
+own (both the pending human observations and the two remaining static-only
+criteria block it honestly); and zero agent instructions are written for
+any of this. See `tests/test_admissible_neon_runtime_end_to_end.py`.
+
 ## Known limitations
 
 - Windows Chrome's `--version` flag is swallowed by single-instance
@@ -409,6 +579,21 @@ zero-orphan-process cleanup.
 - `tests/test_admissible_runtime_terminal_ui.py`
 - `tests/test_admissible_neon_runtime_regression.py`
 - `tests/test_admissible_browser_runtime_live_smoke.py` (opt-in, `-m browser_runtime`)
+
+RUN_044 orchestration tests (see
+[admissible-high-autonomy-governed-loop.md](admissible-high-autonomy-governed-loop.md)
+for the full list): `tests/test_admissible_runtime_orchestrator.py`,
+`tests/test_admissible_runtime_controller_integration.py`,
+`tests/test_admissible_runtime_single_flight.py`,
+`tests/test_admissible_runtime_exactly_once_evidence.py`,
+`tests/test_admissible_runtime_persistence_recovery.py`,
+`tests/test_admissible_runtime_async_tick_flow.py`,
+`tests/test_admissible_runtime_repair_orchestration.py`,
+`tests/test_admissible_runtime_human_observation.py`,
+`tests/test_admissible_runtime_control_surface_api.py`,
+`tests/test_admissible_runtime_control_surface_ui.py`,
+`tests/test_admissible_neon_runtime_end_to_end.py`,
+`tests/test_admissible_runtime_live_controller_smoke.py` (opt-in, `-m browser_runtime`).
 
 ## Related docs
 

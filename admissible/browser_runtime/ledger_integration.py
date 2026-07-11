@@ -43,7 +43,15 @@ def apply_runtime_plan_to_ledger(ledger: list[dict[str, Any]], plan: BrowserRunt
             continue
         item["verification_disposition"] = criterion.disposition
         if criterion.disposition == "deterministic_runtime" and criterion.assertion_ids:
-            item["verification"] = [f"{_RUNTIME_EVIDENCE_SOURCE}:{aid}" for aid in criterion.assertion_ids]
+            # Kept separate from `item["verification"]` (a list of
+            # VerificationRequest-shaped dicts the static bounded-verification
+            # path reads via `.get("target_paths")`): these are opaque
+            # `source:assertion_id` reference tags, not executable static
+            # checks, so writing them into `verification` would crash the
+            # static path (RUN_044 integration fix).
+            item["runtime_verification_refs"] = [
+                f"{_RUNTIME_EVIDENCE_SOURCE}:{aid}" for aid in criterion.assertion_ids
+            ]
         item["runtime_required_observables"] = list(criterion.required_observables)
         item["runtime_unsupported_reason"] = criterion.unsupported_reason
     return ledger

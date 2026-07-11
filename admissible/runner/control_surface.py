@@ -145,6 +145,8 @@ class _ControlSurfaceRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(200, self.controller.state_view())
             elif parsed.path == "/api/session/export":
                 self._send_json(200, self.controller.session_dict())
+            elif parsed.path == "/api/session/high_autonomy/runtime_status":
+                self._send_json(200, self.controller.runtime_verification_status())
             else:
                 self._send_json(404, {"error": f"not found: {parsed.path}"})
         except Exception as exc:  # local dev tool: surface the error, keep serving
@@ -263,6 +265,25 @@ class _ControlSurfaceRequestHandler(BaseHTTPRequestHandler):
                 result = self.controller.refuse_high_autonomy_human_action(
                     str(body.get("action_id") or ""),
                     rationale=str(body.get("rationale") or ""),
+                )
+            elif parsed.path == "/api/session/high_autonomy/runtime/retry":
+                # No caller-supplied plan/selector/JS/URL/entrypoint (PART
+                # L.59-60): the retry always reuses the persisted plan+attempt
+                # lineage via admissible.runtime_verification_orchestrator.
+                result = self.controller.retry_runtime_verification_attempt()
+            elif parsed.path == "/api/session/high_autonomy/runtime/cancel":
+                result = self.controller.cancel_runtime_verification_attempt()
+            elif parsed.path == "/api/session/high_autonomy/runtime/human_observation":
+                result = self.controller.record_human_observation(
+                    str(body.get("criterion_id") or ""),
+                    actor=str(body.get("actor") or "operator"),
+                    disposition=str(body.get("disposition") or ""),
+                    note=str(body.get("note") or ""),
+                    evidence_refs=(
+                        [str(x) for x in body.get("evidence_refs") or []]
+                        if body.get("evidence_refs") is not None
+                        else None
+                    ),
                 )
             else:
                 self._send_json(404, {"error": f"not found: {parsed.path}"})

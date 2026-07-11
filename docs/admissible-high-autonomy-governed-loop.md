@@ -225,6 +225,19 @@ stop**.
 - `tests/test_admissible_callable_terminal_pause.py` — terminal callable-backend pause,
   exactly-once/no-rebilling, and disjoint file-bridge vs callable UI wording
   (slice ADMISSIBLE_RUN_036).
+- RUN_044 runtime-orchestration tests (see the Run 044 section below):
+  `tests/test_admissible_runtime_orchestrator.py`,
+  `tests/test_admissible_runtime_controller_integration.py`,
+  `tests/test_admissible_runtime_single_flight.py`,
+  `tests/test_admissible_runtime_exactly_once_evidence.py`,
+  `tests/test_admissible_runtime_persistence_recovery.py`,
+  `tests/test_admissible_runtime_async_tick_flow.py`,
+  `tests/test_admissible_runtime_repair_orchestration.py`,
+  `tests/test_admissible_runtime_human_observation.py`,
+  `tests/test_admissible_runtime_control_surface_api.py`,
+  `tests/test_admissible_runtime_control_surface_ui.py`,
+  `tests/test_admissible_neon_runtime_end_to_end.py`,
+  `tests/test_admissible_runtime_live_controller_smoke.py` (opt-in, `-m browser_runtime`).
 
 ## Run 038 closure and governance contract
 
@@ -317,3 +330,87 @@ the persisted run, export, summary, governed overview, and UI.
   admission class keeps a runtime-verification action from ever being represented as a shell
   action. See
   [admissible-bounded-browser-runtime-verification.md](admissible-bounded-browser-runtime-verification.md).
+
+## Run 044: runtime-verification orchestration
+
+`ADMISSIBLE_RUN_044_HIGH_AUTONOMY_RUNTIME_ORCHESTRATION_AND_END_TO_END_CLOSURE`
+wires RUN_043's bounded browser-runtime verifier into this controller's own
+tick loop, without turning `high_autonomy_controller.py` into a bigger
+monolith and without embedding any browser-provider logic in it.
+
+**Orchestration boundary.** Two new modules, both peers of
+`high_autonomy_controller.py` (not inside `browser_runtime/`):
+`admissible/runtime_orchestration_models.py` (the durable
+`RuntimeVerificationAttempt` attempt schema and the
+`RuntimeOrchestrationTransition` the orchestrator hands back) and
+`admissible/runtime_verification_orchestrator.py` (the narrow
+`assess_runtime_need` / `prepare_runtime_attempt` / `start_runtime_attempt`
+/ `poll_runtime_attempt` / `apply_runtime_evidence` /
+`cancel_runtime_attempt` / `reconcile_runtime_state_on_load` /
+`record_human_observation` API, plus the single-flight background-worker
+registry). The controller only calls these five/six functions and persists
+what comes back — it never imports anything from
+`admissible/browser_runtime/` except the read-only vocabulary in
+`state_machine.py`/`terminal_ui.py`. See
+[admissible-bounded-browser-runtime-verification.md](admissible-bounded-browser-runtime-verification.md#run_044-wiring-into-the-high-autonomy-governed-run)
+for the full detail, including two RUN_043 integration-defect fixes this
+wiring surfaced (a criterion-status-aggregation bug and a
+`policy_violations` deserialization gap) and a plan_builder re-attempt fix
+needed for retries/repairs to regenerate real steps.
+
+**New `HighAutonomyRunState` fields:** `runtime_verification_required`,
+`runtime_verification_status`, `active_runtime_attempt_id`,
+`active_runtime_attempt`, `active_runtime_plan`, `runtime_attempt_history`,
+`last_runtime_plan_sha256`, `last_runtime_evidence_id`,
+`runtime_criterion_ids`, `runtime_pending_criterion_ids`,
+`runtime_failed_criterion_ids`, `runtime_gap_criterion_ids`,
+`runtime_coverage_report`, `runtime_repair_kind`,
+`human_observation_pending_criterion_ids`, `human_observation_records`.
+
+**New tick next-actions:** `start_runtime_verification` (Tick A: validate +
+persist + capability-check + start the worker, returns promptly),
+`poll_runtime_verification` (non-blocking check, never starts a second
+attempt), `apply_runtime_evidence` (persists evidence, applies it exactly
+once, re-evaluates completion in the same tick),
+`await_human_observation` (a stable wait state, distinct from
+`human_approval_required`). None of these is a model/provider turn.
+
+**New modes:** `runtime_verifying` (added to the auto-tick-safe set — a
+frontend polling loop may keep calling tick while a runtime worker is
+active, the same as it already could during `verifying`) and
+`awaiting_human_observation` (deliberately *not* auto-tick-safe: only an
+explicit `record_human_observation` call resumes it, and it is excluded
+from the no-progress-tick counter so it never degrades into
+`internal_livelock`).
+
+**New Control Surface API** (thin delegation, no arbitrary plan/selector/
+JavaScript/URL/entrypoint ever accepted):
+`GET /api/session/high_autonomy/runtime_status`,
+`POST /api/session/high_autonomy/runtime/retry`,
+`POST /api/session/high_autonomy/runtime/cancel`,
+`POST /api/session/high_autonomy/runtime/human_observation` (accepts only
+`criterion_id`/`actor`/`disposition`/`note`/`evidence_refs`).
+
+**Canonical metrics added:** `runtime_plan_count`, `runtime_attempt_count`,
+`runtime_retry_count`, `runtime_pass_count`, `runtime_fail_count`,
+`runtime_capability_gap_count`, `runtime_observability_gap_count`,
+`runtime_policy_violation_count`, `runtime_assertion_count`,
+`runtime_assertion_pass_count`, `runtime_assertion_fail_count`,
+`runtime_duration_ms_total`, `runtime_input_event_count`,
+`runtime_snapshot_count`, `runtime_screenshot_count`,
+`runtime_external_request_attempt_count`, `runtime_cleanup_failure_count`,
+`human_observation_count`, `human_observation_pass_count`,
+`human_observation_fail_count`, `human_observation_waiver_count`. These are
+recomputed both by `_sync_counters` (every tick) and by
+`ControlSurfaceController.session_dict()` (every state read, including
+outside a tick — otherwise `session_dict()`'s own base-metrics recompute
+would silently drop them between ticks).
+
+**Completion eligibility is unchanged in authority:**
+`evaluate_completion_eligibility()` is still the only place `completed` is
+decided; the orchestrator only ever mutates the ledger and asks
+`_try_finalize_outcome` to look again. A runtime pass, a runtime failure
+entering repair, a capability gap, an observability gap, and a pending
+human observation are all distinguishable outcomes/modes — none of them is
+ever silently reported as `completed`, `internal_livelock`, or
+`human_authority_blocker`.

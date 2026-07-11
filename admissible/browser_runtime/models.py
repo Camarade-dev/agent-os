@@ -206,6 +206,11 @@ _BOUNDED_FIELDS = (
     "debug_snapshots",
     "input_events",
     "screenshots",
+    # RUN_044 integration fix: to_dict() always serialized this field, but
+    # from_dict() never listed it, so evidence read back from disk (as the
+    # orchestrator's persistence/recovery and exactly-once apply paths do)
+    # silently lost every recorded policy violation.
+    "policy_violations",
 )
 
 

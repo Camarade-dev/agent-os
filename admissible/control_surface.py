@@ -2167,6 +2167,11 @@ class ControlSurfaceController:
         self._session = self._new_session()
         self._high_autonomy_transport: Any = None
         self._high_autonomy_tick_lock = threading.Lock()
+        # RUN_044: an injectable BrowserRuntimeProvider for tests/opt-in real
+        # browser smokes. Never set from an HTTP request body -- the runtime
+        # plan itself always comes from validated Mission Contract
+        # orchestration, never arbitrary API input (PART L.59-60).
+        self._runtime_provider_override: Any = None
 
     def _high_autonomy_state(self) -> Any:
         from admissible.high_autonomy_controller import HighAutonomyRunState
@@ -2207,7 +2212,10 @@ class ControlSurfaceController:
         """Canonical, round-trippable session state (used for export/import)."""
         if self._session.high_autonomy_run is not None:
             from admissible.governed_run import build_canonical_metrics
-            from admissible.high_autonomy_controller import HighAutonomyRunState
+            from admissible.high_autonomy_controller import (
+                HighAutonomyRunState,
+                refresh_runtime_projection_and_metrics,
+            )
 
             ha_state = HighAutonomyRunState.from_dict(self._session.high_autonomy_run)
             ha_state.turns_remaining = max(
@@ -2228,6 +2236,12 @@ class ControlSurfaceController:
                 closure_turns_used=ha_state.closure_turns_used,
                 turns_remaining=ha_state.turns_remaining,
             )
+            # RUN_044: session_dict() is called far more often than just at
+            # tick boundaries (e.g. right after recording a human
+            # observation); without this, the base-metrics recompute above
+            # would silently drop every runtime_*/human_observation_* metric
+            # until the next tick.
+            refresh_runtime_projection_and_metrics(ha_state)
             self._session.high_autonomy_run = ha_state.to_dict()
         payload = self._session.to_dict()
         return canonicalize_session_export_payload(payload)
@@ -3629,6 +3643,50 @@ class ControlSurfaceController:
         self._session.high_autonomy_run = ha_state.to_dict()
         self._persist()
         return self.state_view()
+
+    def set_runtime_provider(self, provider: Any) -> None:
+        """Inject a BrowserRuntimeProvider (tests, or an opt-in real-browser smoke).
+
+        Never settable from an HTTP request body: the runtime plan itself
+        always comes from validated Mission Contract orchestration, not
+        arbitrary API input (RUN_044 PART L.59-60).
+        """
+        self._runtime_provider_override = provider
+
+    def runtime_verification_status(self) -> dict[str, Any]:
+        from admissible.high_autonomy_controller import runtime_verification_status_view
+
+        return runtime_verification_status_view(self)
+
+    def retry_runtime_verification_attempt(self) -> dict[str, Any]:
+        from admissible.high_autonomy_controller import retry_interrupted_runtime_attempt
+
+        return retry_interrupted_runtime_attempt(self)
+
+    def cancel_runtime_verification_attempt(self) -> dict[str, Any]:
+        from admissible.high_autonomy_controller import cancel_active_runtime_attempt
+
+        return cancel_active_runtime_attempt(self)
+
+    def record_human_observation(
+        self,
+        criterion_id: str,
+        *,
+        actor: str,
+        disposition: str,
+        note: str,
+        evidence_refs: list[str] | None = None,
+    ) -> dict[str, Any]:
+        from admissible.high_autonomy_controller import record_human_observation_decision
+
+        return record_human_observation_decision(
+            self,
+            criterion_id=criterion_id,
+            actor=actor,
+            disposition=disposition,
+            note=note,
+            evidence_refs=evidence_refs,
+        )
 
     def stop_high_autonomy_run(self, *, reason: str = "Stopped by operator.") -> dict[str, Any]:
         from admissible.high_autonomy_controller import stop_high_autonomy_run

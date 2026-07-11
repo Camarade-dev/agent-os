@@ -112,7 +112,15 @@ class _Builder:
         # upgrading a criterion that has no executable check today to a real
         # runtime assertion is strictly additive rigor, never a regression.
         # Everything else passes through with its settled disposition.
-        should_attempt = current_disposition == "unsupported_verifier" or (
+        #
+        # "deterministic_runtime" is also always re-attempted: RUN_044
+        # rebuilds this plan from scratch on every attempt/retry against the
+        # same durable ledger, and a criterion this module itself already
+        # wrote that disposition onto (via apply_runtime_plan_to_ledger) must
+        # keep regenerating its real steps on rebuild, never fall through to
+        # the zero-step passthrough branch below just because the ledger
+        # already carries the disposition it produced last time.
+        should_attempt = current_disposition in ("unsupported_verifier", "deterministic_runtime") or (
             current_disposition == "evidence_required" and _RUNTIME_CHECKABLE_HINT_RE.search(text)
         )
         if not should_attempt:

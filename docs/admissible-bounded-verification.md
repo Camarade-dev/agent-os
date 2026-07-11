@@ -173,3 +173,15 @@ a strict declarative step DSL with no arbitrary-JavaScript step — that complem
 replaces this static layer. A criterion's disposition may be `deterministic_runtime`, in which
 case only real runtime evidence (never a static proxy) can move it to `verified_pass`. See
 [admissible-bounded-browser-runtime-verification.md](admissible-bounded-browser-runtime-verification.md).
+
+## Runtime verification is triggered automatically after this static pass (Run 044)
+
+This bounded static layer still runs first and unchanged — `verify_bounded_local_workspace()`
+is exactly the same explicit, allowlisted, read-only check layer described above. What RUN_044
+adds is what happens *after*: once this static pass has run at least once and nothing else is
+pending, `admissible.high_autonomy_controller` asks
+`admissible.runtime_verification_orchestrator.assess_runtime_need()` whether any still-open
+mandatory criterion's disposition is `deterministic_runtime`, and if so drives one bounded
+runtime-verification attempt as its own tick step — never as a substitute for this static pass,
+and never able to mark a criterion this layer's `verification_disposition` still governs. See
+[admissible-high-autonomy-governed-loop.md](admissible-high-autonomy-governed-loop.md#run-044-runtime-verification-orchestration).

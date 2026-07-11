@@ -26,3 +26,19 @@ verification disposition now draws from one canonical vocabulary,
 `deterministic_runtime` were added in this slice. See
 [admissible-bounded-browser-runtime-verification.md](admissible-bounded-browser-runtime-verification.md)
 for the full runtime verifier this feeds.
+
+## Runtime evidence still flows through this same authority (Run 044)
+
+RUN_044 wires that runtime verifier into the high-autonomy governed run
+(see
+[admissible-high-autonomy-governed-loop.md](admissible-high-autonomy-governed-loop.md#run-044-runtime-verification-orchestration)),
+but adds no second completion authority. `evaluate_completion_eligibility()`
+is still the only function that ever decides `completed`; the runtime
+orchestrator only ever writes runtime evidence onto the same acceptance
+ledger a static or human-observation path would use
+(`apply_runtime_evidence_to_ledger`), so every existing invariant here
+(unsupported/gap criteria block completion, a static-disposition criterion
+can never be terminally satisfied by a runtime pass alone, a policy
+violation withholds an otherwise-passing runtime result) is enforced for
+free through this one gate — never re-implemented or weakened by the
+orchestrator.

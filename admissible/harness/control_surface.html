@@ -1436,7 +1436,59 @@ function renderHighAutonomy(state) {
     ? `<div class="ha-status-row"><dt>Backend step</dt><dd>${escapeHtml(callableStepLabels[ha.backend_step] || ha.backend_step || ha.transport_status || "—")}</dd></div>
        <div class="ha-status-row"><dt>Last invocation id</dt><dd>${escapeHtml(ha.last_invocation_id || "—")}</dd></div>`
     : `<div class="ha-status-row"><dt>Backend status</dt><dd>${escapeHtml(ha.transport_status || "—")}</dd></div>`;
+
+  // RUN_044: bounded browser-runtime verification banner + attempt/human-
+  // observation panels. A runtime check is never a model/provider turn, so
+  // none of this ever shows "invoking agent" or "human authority required".
+  const runtimeBanner = ha.runtime_banner || "";
+  const attempt = ha.active_runtime_attempt || {};
+  const runtimeInFlight = ["prepared", "capability_checking", "queued", "running"].includes(attempt.status);
+  const runtimeInterrupted = attempt.status === "interrupted";
+  const runtimeBannerClass = runtimeBanner === "RUN COMPLETED" ? "ha-runtime-banner-ok"
+    : (runtimeBanner === "RUNTIME VERIFICATION FAILED" || runtimeBanner === "BROWSER VERIFICATION UNAVAILABLE") ? "ha-runtime-banner-bad"
+    : "ha-runtime-banner-info";
+  const runtimeBannerRow = (ha.runtime_verification_required || attempt.attempt_id)
+    ? `<div class="ha-runtime-banner ${runtimeBannerClass}" style="margin:0 0 .65rem;padding:.5rem .65rem;border:1px solid var(--cs-border);border-radius:6px;font-weight:600;">${escapeHtml(runtimeBanner || "RUNTIME VERIFICATION PREPARING")}</div>`
+    : "";
+  const runtimeAttemptRow = attempt.attempt_id
+    ? `<div class="ha-runtime-attempt" style="margin:0 0 .65rem;padding:.55rem .65rem;border:1px solid var(--cs-border);border-radius:6px;">
+         <dl class="ha-status-grid" style="margin:0;">
+           <div class="ha-status-row"><dt>Provider</dt><dd>${escapeHtml(attempt.provider_id || "—")}</dd></div>
+           <div class="ha-status-row"><dt>Attempt id</dt><dd>${escapeHtml(attempt.attempt_id)}</dd></div>
+           <div class="ha-status-row"><dt>Status</dt><dd>${escapeHtml(attempt.status || "—")}</dd></div>
+           <div class="ha-status-row"><dt>Criteria under verification</dt><dd>${escapeHtml((attempt.criterion_ids || []).join(", ") || "—")}</dd></div>
+           <div class="ha-status-row"><dt>Cleanup</dt><dd>${escapeHtml(attempt.cleanup_status || "pending")}</dd></div>
+           ${attempt.retry_of_attempt_id ? `<div class="ha-status-row"><dt>Retry of</dt><dd>${escapeHtml(attempt.retry_of_attempt_id)}</dd></div>` : ""}
+           ${attempt.failure_message ? `<div class="ha-status-row"><dt>Failure</dt><dd>${escapeHtml(attempt.failure_message)}</dd></div>` : ""}
+         </dl>
+         ${runtimeInterrupted ? `<button type="button" class="secondary" id="btn-ha-runtime-retry" style="margin-top:.5rem;">Retry interrupted runtime attempt</button>` : ""}
+         ${runtimeInFlight ? `<button type="button" class="secondary" id="btn-ha-runtime-cancel" style="margin-top:.5rem;">Cancel runtime verification</button>` : ""}
+       </div>`
+    : "";
+  const pendingObservationIds = ha.human_observation_pending_criterion_ids || [];
+  const observedCriteria = new Map((ha.acceptance_criteria || []).map((c) => [c.criterion_id, c]));
+  const humanObservationRow = pendingObservationIds.length
+    ? `<div class="ha-human-observation" style="margin:0 0 .65rem;padding:.55rem .65rem;border:1px solid var(--cs-border-strong);border-radius:6px;">
+         <p class="ha-blocking-title">Awaiting human observation — ${pendingObservationIds.length} subjective criterion/criteria:</p>
+         <ul class="ha-blocking-list">
+           ${pendingObservationIds.map((cid) => {
+             const c = observedCriteria.get(cid) || {};
+             return `<li data-observation-criterion="${escapeHtml(cid)}">
+               <p style="margin:.2rem 0;"><code>${escapeHtml(cid)}</code> — ${escapeHtml(c.source_text || "")}</p>
+               <p style="margin:.15rem 0;color:var(--cs-muted);font-size:.82rem;">Objective evidence so far: ${escapeHtml((c.verification_notes || []).slice(-1)[0] || "none recorded")}</p>
+               <button type="button" class="btn-ha-observe" data-criterion="${escapeHtml(cid)}" data-disposition="pass">Record observed pass</button>
+               <button type="button" class="btn-ha-observe secondary" data-criterion="${escapeHtml(cid)}" data-disposition="fail">Record observed fail</button>
+               <button type="button" class="btn-ha-observe secondary" data-criterion="${escapeHtml(cid)}" data-disposition="waive">Waive (requires rationale)</button>
+             </li>`;
+           }).join("")}
+         </ul>
+       </div>`
+    : "";
+
   body.innerHTML = `
+    ${runtimeBannerRow}
+    ${runtimeAttemptRow}
+    ${humanObservationRow}
     <div class="ha-outcome-summary" style="margin:0 0 .75rem;padding:.65rem;border:1px solid var(--cs-border);border-radius:6px;">
       <p style="margin:0 0 .35rem;"><strong>Outcome:</strong> ${escapeHtml(outcomeLabel)}</p>
       <p style="margin:.15rem 0;"><strong>Contract:</strong> ${escapeHtml(contractCoverage.represented_acceptance_criterion_count || 0)}/${escapeHtml(contractCoverage.explicit_acceptance_criterion_count || 0)} criteria represented · ${escapeHtml(contractCoverage.represented_path_count || 0)}/${escapeHtml(contractCoverage.mandatory_path_count || 0)} paths represented</p>
@@ -2952,6 +3004,42 @@ document.getElementById("high-autonomy-actions").addEventListener("click", async
     const path = isRefuse ? "/api/session/high_autonomy/refuse" : "/api/session/high_autonomy/approve";
     const payload = pending ? { action_id: pending } : {};
     await runAction(() => apiPost(path, payload));
+    return;
+  }
+  if (target.id === "btn-ha-runtime-retry") {
+    await runAction(() => apiPost("/api/session/high_autonomy/runtime/retry", {}));
+    return;
+  }
+  if (target.id === "btn-ha-runtime-cancel") {
+    await runAction(() => apiPost("/api/session/high_autonomy/runtime/cancel", {}));
+    return;
+  }
+  if (target.classList.contains("btn-ha-observe")) {
+    const criterionId = target.dataset.criterion || "";
+    const disposition = target.dataset.disposition || "";
+    if (!criterionId || !disposition) return;
+    let note = "";
+    if (disposition === "waive") {
+      note = window.prompt("Explicit rationale for waiving this subjective criterion (required):", "") || "";
+      if (!note.trim()) {
+        showError("Waiving a human-observation criterion requires an explicit rationale.");
+        return;
+      }
+    } else {
+      note = window.prompt(
+        `Optional note for this observed ${disposition === "pass" ? "pass" : "fail"} (e.g. what was visually confirmed):`,
+        ""
+      ) || "";
+    }
+    await runAction(() =>
+      apiPost("/api/session/high_autonomy/runtime/human_observation", {
+        criterion_id: criterionId,
+        actor: "operator",
+        disposition,
+        note,
+      })
+    );
+    return;
   }
 });
 
