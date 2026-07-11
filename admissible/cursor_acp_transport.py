@@ -166,6 +166,14 @@ ACP_METHOD_SESSION_NEW = "session/new"
 ACP_METHOD_SESSION_PROMPT = "session/prompt"
 ACP_METHOD_SESSION_CANCEL = "session/cancel"
 ACP_METHOD_SESSION_UPDATE = "session/update"
+# session/set_mode confirmed live in RUN_048: session/new returns a `modes` block
+# whose default `currentModeId` is "agent" (full tool/write access). Admissible
+# requires proposal-only, so the ACP backend forces read-only plan mode — the
+# ACP analogue of the one-shot transport's ``--mode plan``.
+ACP_METHOD_SESSION_SET_MODE = "session/set_mode"
+ACP_MODE_PLAN = "plan"
+ACP_MODE_AGENT = "agent"
+ACP_MODE_ASK = "ask"
 
 # Protocol versions this spike is willing to speak (confirmed live: 1).
 SUPPORTED_PROTOCOL_VERSIONS = frozenset({1})
@@ -266,6 +274,9 @@ class AcpInvocationTelemetry:
     request_id: str | None = None
     session_id: str | None = None
     protocol_version: int | None = None
+    session_mode_before: str | None = None
+    session_mode_enforced: str | None = None
+    plan_mode_enforced: bool = False
     handshake_duration_ms: float | None = None
     accepted_at: str | None = None
     first_progress_at: str | None = None
@@ -293,6 +304,9 @@ class AcpInvocationTelemetry:
             "request_id": self.request_id,
             "session_id": self.session_id,
             "protocol_version": self.protocol_version,
+            "session_mode_before": self.session_mode_before,
+            "session_mode_enforced": self.session_mode_enforced,
+            "plan_mode_enforced": self.plan_mode_enforced,
             "handshake_duration_ms": self.handshake_duration_ms,
             "accepted_at": self.accepted_at,
             "first_progress_at": self.first_progress_at,
@@ -693,6 +707,9 @@ class _AcpInvocationRun:
             return self._session_setup_failure(session)
         self.telemetry.session_id = _extract_session_id(session.result)
 
+        # -- enforce read-only plan mode (proposal-only invariant) ------
+        self._enforce_plan_mode(session.result)
+
         # -- session/prompt (unique request id) -------------------------
         prompt_params = {
             "sessionId": self.telemetry.session_id,
@@ -901,6 +918,42 @@ class _AcpInvocationRun:
                 "No automatic retry."
             ),
         )
+
+    def _enforce_plan_mode(self, session_result: dict[str, Any]) -> None:
+        """Force the ACP session into read-only ``plan`` mode so the agent only
+        *proposes* (never executes) — the ACP analogue of the one-shot's
+        ``--mode plan``. Best-effort: a server that does not support
+        ``session/set_mode`` leaves the mode unchanged and the fact is recorded
+        honestly (``plan_mode_enforced=False``) rather than silently assumed."""
+        modes = session_result.get("modes") if isinstance(session_result, dict) else None
+        if not isinstance(modes, dict):
+            self.telemetry.plan_mode_enforced = False
+            return
+        current = modes.get("currentModeId") or modes.get("current_mode_id")
+        self.telemetry.session_mode_before = current
+        available = {
+            m.get("id")
+            for m in (modes.get("availableModes") or [])
+            if isinstance(m, dict)
+        }
+        if ACP_MODE_PLAN not in available and current != ACP_MODE_PLAN:
+            self.telemetry.plan_mode_enforced = False
+            return
+        if current == ACP_MODE_PLAN:
+            self.telemetry.session_mode_enforced = ACP_MODE_PLAN
+            self.telemetry.plan_mode_enforced = True
+            return
+        res = self._request(
+            ACP_METHOD_SESSION_SET_MODE,
+            {"sessionId": self.telemetry.session_id, "modeId": ACP_MODE_PLAN},
+            request_id=3,
+            timeout=self.timeouts.request_acceptance_seconds,
+        )
+        if res.kind == _RPC_OK:
+            self.telemetry.session_mode_enforced = ACP_MODE_PLAN
+            self.telemetry.plan_mode_enforced = True
+        else:
+            self.telemetry.plan_mode_enforced = False
 
     def _request_cancel(self) -> None:
         if self._conn is None or self.telemetry.session_id is None:

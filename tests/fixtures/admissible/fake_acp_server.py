@@ -65,11 +65,16 @@ class FakeAcpProcess:
         force_needed: bool = False,
         drip_interval: float = 0.02,
         pid: int = 424242,
+        session_mode: str = "agent",
+        set_mode_supported: bool = True,
     ) -> None:
         self.scenario = scenario
         self.protocol_version = protocol_version
         self.progress_count = max(1, progress_count)
         self.response_text = response_text
+        self.session_mode = session_mode
+        self.set_mode_supported = set_mode_supported
+        self.set_mode_requested = None
         self._leak = leak_on_terminate
         self._force_needed = force_needed
         self._drip_interval = drip_interval
@@ -224,6 +229,8 @@ class FakeAcpProcess:
             elif method == "session/new":
                 if not self._handle_session_new(msg_id):
                     return
+            elif method == "session/set_mode":
+                self._handle_set_mode(msg_id, msg.get("params") or {})
             elif method == "session/prompt":
                 if not self._handle_prompt(msg_id, msg.get("params") or {}):
                     return
@@ -265,8 +272,38 @@ class FakeAcpProcess:
         if self.scenario == SCENARIO_DISCONNECT_BEFORE_ACCEPTANCE:
             self._emit_eof()
             return False
-        self._emit({"jsonrpc": "2.0", "id": msg_id, "result": {"sessionId": self._session_id}})
+        self._emit(
+            {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {
+                    "sessionId": self._session_id,
+                    "modes": {
+                        "currentModeId": self.session_mode,
+                        "availableModes": [
+                            {"id": "agent", "name": "Agent"},
+                            {"id": "plan", "name": "Plan"},
+                            {"id": "ask", "name": "Ask"},
+                        ],
+                    },
+                },
+            }
+        )
         return True
+
+    def _handle_set_mode(self, msg_id: Any, params: dict[str, Any]) -> None:
+        self.set_mode_requested = params.get("modeId")
+        if self.set_mode_supported:
+            self.session_mode = params.get("modeId") or self.session_mode
+            self._emit({"jsonrpc": "2.0", "id": msg_id, "result": {}})
+        else:
+            self._emit(
+                {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "error": {"code": -32601, "message": "session/set_mode not supported"},
+                }
+            )
 
     def _handle_prompt(self, req_id: Any, params: dict[str, Any]) -> bool:
         scenario = self.scenario

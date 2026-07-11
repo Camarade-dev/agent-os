@@ -1,0 +1,306 @@
+{
+  "fixture": "run048_four_call_matrix",
+  "slice": "ADMISSIBLE_RUN_048_CURSOR_ACP_REAL_MODEL_PROBES_AND_DEFAULT_DECISION",
+  "description": "Sanitized result of the four real model-bearing probes (2 ACP, 2 one-shot). Transcripts reduced to their method/update sequence; all sensitive data redacted by the harness. Response bodies are the exact deterministic probe strings, not sensitive.",
+  "cursor_agent_version": "2026.07.09-a3815c0",
+  "protocol_version": 1,
+  "model_selector": "cursor-agent default (unpinned / Auto)",
+  "budget": {
+    "max_model_calls": 4,
+    "used_model_calls": 4
+  },
+  "calls": [
+    {
+      "label": "A1_acp_tiny",
+      "transport": "cursor_acp",
+      "backend_id": "cursor_acp",
+      "model_selector": "cursor-agent default (unpinned)",
+      "instruction_id": "run048_A1_acp_tiny_c81315a8",
+      "instruction_sha256": "5c108a3751eaf40346d90b1884270d20ec327a9d10b740000688b71ab92a6560",
+      "request_id": "req-d594335546f6",
+      "session_id": "c055921a-d519-4564-8437-42cbceb4ef0b",
+      "handshake_ms": 753.764,
+      "total_duration_ms": 11092.0,
+      "progress_event_count": 7,
+      "stdout_bytes": 0,
+      "response_bytes": 28,
+      "response_sha256": "4a882739e5fbd6fa2a478c54ea000008135c2a59bd51f8cc668b6fd6dd8c8295",
+      "response_preview": "ADMISSIBLE_ACP_TINY_PROBE_OK",
+      "exit_code": null,
+      "invoke_status": "success",
+      "acp_invocation_state": "completed",
+      "parse_status": "usable",
+      "structured_operation_count": 0,
+      "cleanup_complete": true,
+      "remaining_process_ids": [],
+      "transport_health_state": "healthy",
+      "transcript_sequence": [
+        {
+          "dir": "c2s",
+          "method": "initialize",
+          "id_kind": "int"
+        },
+        {
+          "dir": "s2c",
+          "result_keys": [
+            "agentCapabilities",
+            "authMethods",
+            "protocolVersion"
+          ],
+          "stopReason": null
+        },
+        {
+          "dir": "c2s",
+          "method": "session/new",
+          "id_kind": "int"
+        },
+        {
+          "dir": "s2c",
+          "result_keys": [
+            "configOptions",
+            "models",
+            "modes",
+            "sessionId"
+          ],
+          "stopReason": null
+        },
+        {
+          "dir": "c2s",
+          "method": "session/prompt",
+          "id_kind": "req"
+        },
+        {
+          "dir": "s2c",
+          "update": "available_commands_update"
+        },
+        {
+          "dir": "s2c",
+          "update": "session_info_update"
+        },
+        {
+          "dir": "s2c",
+          "update": "agent_thought_chunk"
+        },
+        {
+          "dir": "s2c",
+          "update": "agent_thought_chunk"
+        },
+        {
+          "dir": "s2c",
+          "update": "agent_message_chunk"
+        },
+        {
+          "dir": "s2c",
+          "update": "agent_message_chunk"
+        },
+        {
+          "dir": "s2c",
+          "update": "agent_message_chunk"
+        },
+        {
+          "dir": "s2c",
+          "result_keys": [
+            "stopReason"
+          ],
+          "stopReason": "end_turn"
+        }
+      ]
+    },
+    {
+      "label": "A2_oneshot_tiny",
+      "transport": "cursor_cli_oneshot",
+      "backend_id": "cursor_cli_oneshot",
+      "model_selector": "cursor-agent default (unpinned)",
+      "instruction_id": "run048_A2_oneshot_tiny_8ba0aae8",
+      "instruction_sha256": "5c108a3751eaf40346d90b1884270d20ec327a9d10b740000688b71ab92a6560",
+      "request_id": null,
+      "session_id": null,
+      "handshake_ms": null,
+      "total_duration_ms": 16605.6,
+      "progress_event_count": 0,
+      "stdout_bytes": 29,
+      "response_bytes": 29,
+      "response_sha256": "b06ae1c6c1aa554b52360cb27d61f518d8147b48ae766b387c770f0a8e313821",
+      "response_preview": "ADMISSIBLE_ACP_TINY_PROBE_OK\n",
+      "exit_code": 0,
+      "invoke_status": "success",
+      "acp_invocation_state": null,
+      "parse_status": "usable",
+      "structured_operation_count": 0,
+      "cleanup_complete": true,
+      "remaining_process_ids": [],
+      "transport_health_state": "unknown"
+    },
+    {
+      "label": "B1_acp_struct",
+      "transport": "cursor_acp",
+      "backend_id": "cursor_acp",
+      "model_selector": "cursor-agent default (unpinned)",
+      "instruction_id": "run048_B1_acp_struct_e7ffa368",
+      "instruction_sha256": "bb9aa16084bb56ff5d123b0318b7dd5cb208a455de31d50a7c8c0656a4d752d7",
+      "request_id": "req-1144036cdbb6",
+      "session_id": "ebde5b03-cb4c-41a0-9feb-416c0bf00ccd",
+      "handshake_ms": 836.729,
+      "total_duration_ms": 12921.6,
+      "progress_event_count": 16,
+      "stdout_bytes": 0,
+      "response_bytes": 128,
+      "response_sha256": "d54c2b33bb98b3dd140f6807b102f70b723dde16694cd9a0b8b04ba05e0871ea",
+      "response_preview": "ADMISSIBLE_STRUCTURED_OPERATION:\n```json\n{\"operation\": \"write_file\", \"path\": \"probe.txt\", \"content\": \"ACP structured probe\"}\n```",
+      "exit_code": null,
+      "invoke_status": "success",
+      "acp_invocation_state": "completed",
+      "parse_status": "usable",
+      "structured_operation_count": 1,
+      "cleanup_complete": true,
+      "remaining_process_ids": [],
+      "transport_health_state": "healthy",
+      "transcript_sequence": [
+        {
+          "dir": "c2s",
+          "method": "initialize",
+          "id_kind": "int"
+        },
+        {
+          "dir": "s2c",
+          "result_keys": [
+            "agentCapabilities",
+            "authMethods",
+            "protocolVersion"
+          ],
+          "stopReason": null
+        },
+        {
+          "dir": "c2s",
+          "method": "session/new",
+          "id_kind": "int"
+        },
+        {
+          "dir": "s2c",
+          "result_keys": [
+            "configOptions",
+            "models",
+            "modes",
+            "sessionId"
+          ],
+          "stopReason": null
+        },
+        {
+          "dir": "c2s",
+          "method": "session/set_mode",
+          "id_kind": "int"
+        },
+        {
+          "dir": "s2c",
+          "update": "current_mode_update"
+        },
+        {
+          "dir": "s2c",
+          "result_keys": [],
+          "stopReason": null
+        },
+        {
+          "dir": "c2s",
+          "method": "session/prompt",
+          "id_kind": "req"
+        },
+        {
+          "dir": "s2c",
+          "update": "available_commands_update"
+        },
+        {
+          "dir": "s2c",
+          "update": "session_info_update"
+        },
+        {
+          "dir": "s2c",
+          "update": "agent_thought_chunk"
+        },
+        {
+          "dir": "s2c",
+          "update": "agent_thought_chunk"
+        },
+        {
+          "dir": "s2c",
+          "update": "agent_thought_chunk"
+        },
+        {
+          "dir": "s2c",
+          "update": "agent_thought_chunk"
+        },
+        {
+          "dir": "s2c",
+          "update": "agent_message_chunk"
+        },
+        {
+          "dir": "s2c",
+          "update": "agent_message_chunk"
+        },
+        {
+          "dir": "s2c",
+          "update": "agent_message_chunk"
+        },
+        {
+          "dir": "s2c",
+          "update": "agent_message_chunk"
+        },
+        {
+          "dir": "s2c",
+          "update": "agent_message_chunk"
+        },
+        {
+          "dir": "s2c",
+          "update": "agent_message_chunk"
+        },
+        {
+          "dir": "s2c",
+          "update": "agent_message_chunk"
+        },
+        {
+          "dir": "s2c",
+          "update": "agent_message_chunk"
+        },
+        {
+          "dir": "s2c",
+          "update": "agent_message_chunk"
+        },
+        {
+          "dir": "s2c",
+          "update": "agent_message_chunk"
+        },
+        {
+          "dir": "s2c",
+          "result_keys": [
+            "stopReason"
+          ],
+          "stopReason": "end_turn"
+        }
+      ]
+    },
+    {
+      "label": "B2_oneshot_struct",
+      "transport": "cursor_cli_oneshot",
+      "backend_id": "cursor_cli_oneshot",
+      "model_selector": "cursor-agent default (unpinned)",
+      "instruction_id": "run048_B2_oneshot_struct_db20713a",
+      "instruction_sha256": "bb9aa16084bb56ff5d123b0318b7dd5cb208a455de31d50a7c8c0656a4d752d7",
+      "request_id": null,
+      "session_id": null,
+      "handshake_ms": null,
+      "total_duration_ms": 15782.9,
+      "progress_event_count": 0,
+      "stdout_bytes": 129,
+      "response_bytes": 129,
+      "response_sha256": "b308e7c130c41554f3bcb88ea6eaf8dd1eae09b6c6eabf3c9ae71d7e16e9a526",
+      "response_preview": "ADMISSIBLE_STRUCTURED_OPERATION:\n```json\n{\"operation\": \"write_file\", \"path\": \"probe.txt\", \"content\": \"ACP structured probe\"}\n```\n",
+      "exit_code": 0,
+      "invoke_status": "success",
+      "acp_invocation_state": null,
+      "parse_status": "usable",
+      "structured_operation_count": 1,
+      "cleanup_complete": true,
+      "remaining_process_ids": [],
+      "transport_health_state": "unknown"
+    }
+  ]
+}

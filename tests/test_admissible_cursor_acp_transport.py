@@ -340,6 +340,44 @@ class TestAcpBudgetAndSelector(_AcpTestBase):
         self.assertEqual(set(acp_view), {"file_bridge", "cursor_cli", "fixture"})
 
 
+class TestAcpPlanModeEnforcement(_AcpTestBase):
+    """RUN_048 finding: session/new defaults to agent (write-capable) mode; the
+    backend must force read-only plan mode for the proposal-only invariant."""
+
+    def test_agent_mode_is_forced_to_plan(self) -> None:
+        factory = fake.fake_process_factory(
+            fake.SCENARIO_SUCCESS, response_text="ok", session_mode="agent"
+        )
+        backend = CursorAcpBackend(process_factory=factory, timeouts=_fast_timeouts())
+        result = backend.invoke(self._request())
+        proc = factory.created[0]
+        self.assertEqual(result.status, AGENT_INVOKE_SUCCESS)
+        self.assertEqual(proc.set_mode_requested, "plan")  # client requested plan mode
+        self.assertTrue(result.acp_telemetry["plan_mode_enforced"])
+        self.assertEqual(result.acp_telemetry["session_mode_before"], "agent")
+
+    def test_unsupported_set_mode_is_graceful(self) -> None:
+        factory = fake.fake_process_factory(
+            fake.SCENARIO_SUCCESS, response_text="ok",
+            session_mode="agent", set_mode_supported=False,
+        )
+        backend = CursorAcpBackend(process_factory=factory, timeouts=_fast_timeouts())
+        result = backend.invoke(self._request())
+        # still completes, but honestly records that plan mode was not enforced
+        self.assertEqual(result.status, AGENT_INVOKE_SUCCESS)
+        self.assertFalse(result.acp_telemetry["plan_mode_enforced"])
+
+    def test_already_plan_mode_skips_set_mode(self) -> None:
+        factory = fake.fake_process_factory(
+            fake.SCENARIO_SUCCESS, response_text="ok", session_mode="plan"
+        )
+        backend = CursorAcpBackend(process_factory=factory, timeouts=_fast_timeouts())
+        result = backend.invoke(self._request())
+        proc = factory.created[0]
+        self.assertIsNone(proc.set_mode_requested)  # no redundant set_mode
+        self.assertTrue(result.acp_telemetry["plan_mode_enforced"])
+
+
 class TestAcpTranscriptFixture(unittest.TestCase):
     def test_confirmed_handshake_transcript_parses(self) -> None:
         import json
