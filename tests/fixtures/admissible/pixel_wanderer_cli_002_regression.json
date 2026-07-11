@@ -1,0 +1,68 @@
+{
+  "schema_version": "admissible_live_regression_fixture_v1",
+  "source_session": "control_session_89d4376c8c43",
+  "claim_boundary": "Minimized deterministic state derived from the exported live run; it is not a claim that the original task completed.",
+  "run_identity_defect": {
+    "workspace_basename": "neon-serpents-cli-002",
+    "actual_mission": "Pixel Wanderer",
+    "note": "The target workspace was named neon-serpents-cli-002 (leftover from an earlier, unrelated slice) but the submitted goal was a Pixel Wanderer local browser game. The workspace folder name is not mission authority, but the operator had no on-screen signal of the real goal/contract before the run got stuck, which is why RUN_045 PART H adds a Run Identity panel driven only by the raw goal / Mission Contract, never the workspace label."
+  },
+  "goal_text": "Build a complete local browser game called Pixel Wanderer as a high-autonomy governed run.\n\nArchitecture and scope are already decided:\nUse plain HTML, CSS, and JavaScript only.\nUse zero dependencies and no framework.\nKeep the entire project local-only.\nDo not deploy, publish, host, push, or access the network.\nDo not use shell commands, package managers, external assets, secrets, or files outside the target workspace.\n\nAcceptance criteria:\nindex.html, style.css, and game.js;\na player-controlled dot;\nArrow keys and WASD movement;\ncollectible items and a visible score;\nrestart with the R key;\na short LOCAL_DEV.md explaining how to open the game locally;\nbounded local verification at the end.\n\nWork through the task in small governed steps until the acceptance criteria are complete. Propose structured local file operations only. Admissible may automatically execute admitted low-risk writes inside the target workspace. Stop for a human only when a genuinely human-critical action is unavoidable.",
+  "backend": {
+    "transport_kind": "callable_backend",
+    "backend_id": "cursor-agent-cli"
+  },
+  "budget": {
+    "max_turns": 12,
+    "observed_model_invocations": 2,
+    "observed_executed_writes": 5,
+    "remaining_work_turn_budget": 9
+  },
+  "repair_that_executed": {
+    "criterion_id": "game_restart",
+    "runtime_repair_kind": null,
+    "repair_round_count": 1,
+    "write_path": "game.js",
+    "note": "A targeted static-repair instruction was written, the callable backend ran it, the response was ingested, and the repair write executed (added the missing R-key restart handler). This is the same repair shape as the cli_011 fixture -- the defect is not in the repair itself."
+  },
+  "stuck_state_before_fix": {
+    "mode": "waiting_for_agent",
+    "next_action": "none",
+    "repair_phase": "repair_verifying",
+    "backend_step": "response_consumed",
+    "pending_invocation_status": "consumed",
+    "backend_retry_required": false,
+    "backend_reinvoke_pending": false,
+    "transport_has_pending_response": false,
+    "runtime_worker_active": false,
+    "pending_useful_operation_count": 0,
+    "active_blocked_count": 0
+  },
+  "root_cause": {
+    "location": "admissible/high_autonomy_controller.py:_plan_next_action, mode == HA_MODE_WAITING_FOR_AGENT branch",
+    "description": "Once a callable-backend response had been consumed and no retry/reinvoke was pending, the branch unconditionally returned HA_NEXT_NONE. It never checked whether repair_phase had just finished a post-write phase (repair_executing/repair_verifying) that requires scheduling a static or runtime re-verification. The pre-existing repair_phase check further down in the function could never run because the callable-backend fallback already returned first.",
+    "class": "general state-machine/liveness defect in the post-repair transition, not specific to Pixel Wanderer, game controls, or the browser runtime"
+  },
+  "state_invariant_violation": {
+    "code": "waiting_for_agent_without_pending_condition",
+    "message": "mode=waiting_for_agent persisted with no legitimate pending backend/runtime/human condition."
+  },
+  "expected_state_after_fix": {
+    "mode": "verifying",
+    "next_action": "run_bounded_verification",
+    "repair_round_count_unchanged": true,
+    "governance_record_type": "state_invariant_reconciliation",
+    "no_model_turn_consumed": true,
+    "no_human_intervention_consumed": true
+  },
+  "game_js_cli002_missing_restart_content": "(function () {\n  'use strict';\n\n  const canvas = document.getElementById('game');\n  if (!canvas) return;\n\n  const ctx = canvas.getContext('2d');\n  const scoreEl = document.getElementById('score');\n  const TILE = 16;\n  const COLLECTIBLE_SIZE = 10;\n  const COLLECTIBLE_COUNT = 6;\n\n  let player;\n  let collectibles;\n  let score;\n  const keys = {};\n\n  function init() {\n    player = { x: 320, y: 240, speed: 2, w: 12, h: 12 };\n    score = 0;\n    collectibles = spawnCollectibles();\n    updateScoreDisplay();\n  }\n\n  function overlaps(a, b, margin) {\n    margin = margin || 0;\n    return (\n      a.x - margin < b.x + b.w &&\n      a.x + a.w + margin > b.x &&\n      a.y - margin < b.y + b.h &&\n      a.y + a.h + margin > b.y\n    );\n  }\n\n  function spawnCollectibles() {\n    const items = [];\n    const pad = 24;\n    let attempts = 0;\n    while (items.length < COLLECTIBLE_COUNT && attempts < 200) {\n      attempts += 1;\n      const c = {\n        x: pad + Math.random() * (canvas.width - pad * 2 - COLLECTIBLE_SIZE),\n        y: pad + Math.random() * (canvas.height - pad * 2 - COLLECTIBLE_SIZE),\n        w: COLLECTIBLE_SIZE,\n        h: COLLECTIBLE_SIZE,\n      };\n      if (!overlaps(c, player, 20) && !items.some((item) => overlaps(c, item, 12))) {\n        items.push(c);\n      }\n    }\n    return items;\n  }\n\n  function updateScoreDisplay() {\n    if (scoreEl) scoreEl.textContent = 'Score: ' + score;\n  }\n\n  window.addEventListener('keydown', (e) => {\n    keys[e.key] = true;\n  });\n\n  window.addEventListener('keyup', (e) => {\n    keys[e.key] = false;\n  });\n\n  function update() {\n    if (keys['ArrowUp'] || keys['w'] || keys['W']) player.y -= player.speed;\n    if (keys['ArrowDown'] || keys['s'] || keys['S']) player.y += player.speed;\n    if (keys['ArrowLeft'] || keys['a'] || keys['A']) player.x -= player.speed;\n    if (keys['ArrowRight'] || keys['d'] || keys['D']) player.x += player.speed;\n\n    player.x = Math.max(0, Math.min(canvas.width - player.w, player.x));\n    player.y = Math.max(0, Math.min(canvas.height - player.h, player.y));\n\n    for (let i = collectibles.length - 1; i >= 0; i--) {\n      if (overlaps(player, collectibles[i])) {\n        collectibles.splice(i, 1);\n        score += 1;\n        updateScoreDisplay();\n      }\n    }\n\n    if (collectibles.length === 0) collectibles = spawnCollectibles();\n  }\n\n  function draw() {\n    ctx.fillStyle = '#16213e';\n    ctx.fillRect(0, 0, canvas.width, canvas.height);\n\n    ctx.fillStyle = '#f5c542';\n    collectibles.forEach((c) => ctx.fillRect(c.x, c.y, c.w, c.h));\n\n    ctx.fillStyle = '#e94560';\n    ctx.fillRect(player.x, player.y, player.w, player.h);\n  }\n\n  function loop() {\n    update();\n    draw();\n    requestAnimationFrame(loop);\n  }\n\n  init();\n  loop();\n})();\n",
+  "game_js_cli002_repair_patch": "if (e.key === 'r' || e.key === 'R') init();",
+  "final_state_before_fix": {
+    "outcome": null,
+    "mode": "waiting_for_agent",
+    "current_step": "internal_livelock_masqueraded_as_wait",
+    "repair_round_count": 1,
+    "genuine_human_intervention_count": 0,
+    "raw_human_decision_count": 0
+  }
+}

@@ -414,3 +414,117 @@ entering repair, a capability gap, an observability gap, and a pending
 human observation are all distinguishable outcomes/modes — none of them is
 ever silently reported as `completed`, `internal_livelock`, or
 `human_authority_blocker`.
+
+## Run 045: post-repair verification liveness, wait invariants, and run identity
+
+`ADMISSIBLE_RUN_045_POST_REPAIR_VERIFICATION_LIVENESS_WAIT_INVARIANTS_AND_RUN_IDENTITY`
+fixes a real livelock observed in an exported live session
+(`control_session_89d4376c8c43`, minimized as
+[`tests/fixtures/admissible/pixel_wanderer_cli_002_regression.json`](../tests/fixtures/admissible/pixel_wanderer_cli_002_regression.json)):
+after a successful targeted repair (the repair write had already executed),
+the run got stuck at `mode=waiting_for_agent`, `repair_phase=repair_verifying`,
+`next_action=none` — every subsequent auto-run tick returned a reasonless
+wait forever instead of scheduling the re-verification that was due. This is
+a general state-machine/liveness defect in the post-repair transition, not
+specific to Pixel Wanderer, game controls, or the browser runtime.
+
+**Root cause.** In `_plan_next_action`'s `mode == HA_MODE_WAITING_FOR_AGENT`
+branch, once a callable-backend response had been consumed
+(`backend_step=response_consumed`, `pending_invocation_status=consumed`) with
+no retry/reinvoke pending, the branch unconditionally returned
+`HA_NEXT_NONE`. It never checked whether `repair_phase` had just finished a
+post-write phase (`repair_executing`/`repair_verifying`) that requires
+scheduling a static or runtime re-verification — so the pre-existing
+repair-phase check further down in the same function could never run; the
+callable-backend fallback had already returned first. The file-bridge
+fallback had the identical shape of bug.
+
+**Fix.** `_plan_next_action` now computes
+`repair_needs_post_write_verification(ha_state.repair_phase)` once up front
+and gates both the callable-backend and file-bridge `waiting_for_agent`
+fallbacks on it: when a repair-verification is due, the function falls
+through instead of returning early, and the existing repair-phase branch
+schedules `run_bounded_verification` or `start_runtime_verification` via the
+new `plan_post_repair_verification()` helper.
+
+**New module `admissible/high_autonomy_state_invariants.py`** — pure and
+standalone, like `admissible.browser_runtime.state_machine` (RUN_043) and
+`admissible.runtime_verification_orchestrator` (RUN_044); it never mutates
+`HighAutonomyRunState` directly, only classifies already-gathered signals:
+
+- `classify_waiting_for_agent_condition` / `waiting_for_agent_is_valid` — the
+  one closed, typed vocabulary of legitimate reasons `waiting_for_agent` may
+  still hold (`backend_invocation_running`, `runtime_worker_running`,
+  `evidence_file_pending`, `human_authority_decision`, `human_observation`,
+  `explicit_operator_retry`). Anything outside this vocabulary is an
+  invariant violation, never a silent indefinite wait.
+- `repair_needs_post_write_verification` / `plan_post_repair_verification` —
+  the canonical post-repair-write routing decision (PART C), used both by
+  the controller's normal planner and by session-load reconciliation so
+  there is exactly one place this logic lives.
+- `reconcile_contradictory_state` — detects and deterministically repairs
+  the exact contradictory combination above on session load and before
+  every tick (`_reconcile_high_autonomy_state`, called at the top of
+  `tick_high_autonomy_run` before `_sync_counters`). Recovery is a pure
+  relabeling of already-persisted state: it consumes no model turn, no
+  repair round, and no human-intervention metric, and it always leaves a
+  `state_invariant_reconciliation` governance record for audit.
+- `check_state_invariants` — the full invariant sweep (waiting-for-agent
+  validity, repair-verifying-without-scheduled-verification,
+  next_action=none-without-justification) used by diagnostics/tests.
+
+**New durable `HighAutonomyRunState` fields:** `wait_reason`,
+`wait_condition_type`, `wait_condition_id`, `wait_started_at`,
+`wait_timeout_at`, `expected_state_change`, `wait_poll_count`,
+`technical_pause_active`, `technical_pause_reason`,
+`state_invariant_violations`, `last_reconciliation`.
+
+**Bounded wait/livelock semantics.** A `waiting_for_agent` state with no
+legitimate typed wait condition is fingerprinted; if it recurs on a second
+consecutive tick with the same fingerprint (reasonless wait, not a
+documented runtime-worker/backend-invocation wait), the run enters a new
+`technical_pause` mode via `_pause_for_technical_state_invariant` — distinct
+from the pre-existing `internal_livelock` no-progress pause, and distinct
+from any genuine human-authority pause. Legitimate waits (a real callable
+invocation in flight, a real runtime worker running) are exempt and remain
+safe indefinitely.
+
+**Auto-run frontend correctness.** The harness previously showed "Backend
+invocation in progress" during any in-flight tick HTTP request, even when
+no backend invocation existed — misleading during an ordinary tick or a
+runtime-verification poll. `computeProgressBanner(ha)` now derives one of
+six mutually exclusive labels (`TECHNICAL PAUSE`, `RUNTIME VERIFICATION
+RUNNING`, `BACKEND INVOCATION RUNNING` only when
+`ha.backend_step === "invoking_agent"`, `ADVANCING STATE` for a plain tick,
+`AUTO-RUN ACTIVE`, `AUTO-RUN PAUSED`). A generation-token counter
+(`autoRunGeneration`) is incremented on every `stopAutoRun()`; the async
+`autoRunLoop(generation)` checks the token at entry and after every await,
+so a stale in-flight request from a previous auto-run cannot resume the
+loop after Pause — Pause is authoritative.
+
+**Run Identity UX.** Workspace names are not mission authority (this
+session's workspace was named `neon-serpents-cli-002` while the actual goal
+was Pixel Wanderer, with no on-screen signal of the mismatch). A new
+server-computed `run_identity` projection (`_run_identity()` in
+`control_surface.py`) and a new "Run Identity" panel in the harness surface
+the authoritative goal's first line, the raw-goal SHA-256, the Mission
+Contract SHA-256, the target workspace, the backend, and the created
+timestamp — sourced only from the raw goal and Mission Contract, never
+inferred from the workspace folder name — plus a non-blocking diagnostic
+warning when the workspace folder name shares no token with a project name
+mentioned in the goal. The panel is visible as soon as a goal is submitted,
+before the first backend invocation.
+
+**Unbulleted acceptance-section parsing.** A line under an "Acceptance
+criteria:" heading with no `-`/`*`/numeric prefix is no longer silently
+dropped by `build_mission_contract()`; it is recorded as an explicit,
+mandatory requirement (`mandatory_requirements`, trailing `;`/`,`/`.`
+stripped). It is intentionally routed to `mandatory_requirements` rather
+than `explicit_acceptance_criteria` — promoting it to a criterion would
+have discarded the generic 8-criteria `derive_acceptance_criteria_from_goal`
+inference (and its verification-check wiring) that cli_011-shaped goals
+already depend on. `ledger_coverage_report()` gained
+`inferred_acceptance_criterion_count`, `total_ledger_criterion_count`, and
+`criteria_are_inferred` so the UI can show "N/M inferred criteria
+represented" instead of a misleading "0/0" when no explicit
+acceptance-criteria section was matched.

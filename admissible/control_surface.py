@@ -1396,6 +1396,62 @@ def _apply_human_decision_lifecycle(
         )
 
 
+_PROJECT_NAME_RE = re.compile(
+    r"\bcalled\s+([A-Z][A-Za-z0-9]*(?:\s+[A-Z][A-Za-z0-9]*){0,3})"
+)
+
+
+def _run_identity(session: "ControlSession") -> dict[str, Any]:
+    """RUN_045 PART H: an immutable, always-visible run-identity projection.
+
+    Never infers or changes the goal from the workspace folder name --
+    ``workspace_mismatch_warning`` is a diagnostic-only signal (a heuristic
+    generic "called <Proper Noun>" phrase extraction, not contract
+    authority) so an operator never overlooks a workspace whose label
+    doesn't match what was actually submitted.
+    """
+
+    import hashlib
+
+    contract = session.mission_contract or {}
+    goal_intake = session.goal_intake or {}
+    raw_goal = str(contract.get("raw_goal") or goal_intake.get("prompt") or "")
+    first_line = next((line.strip() for line in raw_goal.splitlines() if line.strip()), "")
+    contract_sha256 = None
+    if contract:
+        payload = json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        contract_sha256 = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    workspace = session.bounded_executor_workspace or ""
+    workspace_basename = Path(workspace).name if workspace else ""
+    project_name_match = _PROJECT_NAME_RE.search(raw_goal)
+    extracted_project_name = project_name_match.group(1) if project_name_match else None
+
+    mismatch_warning = None
+    if extracted_project_name and workspace_basename:
+        normalized_name_tokens = {t for t in re.split(r"[^a-z0-9]+", extracted_project_name.lower()) if t}
+        normalized_ws_tokens = {t for t in re.split(r"[^a-z0-9]+", workspace_basename.lower()) if t and len(t) > 2}
+        if normalized_ws_tokens and not (normalized_name_tokens & normalized_ws_tokens):
+            mismatch_warning = (
+                "Workspace label may not match the authoritative mission. "
+                "Review the goal before starting."
+            )
+
+    return {
+        "goal_first_line": first_line,
+        "extracted_project_name": extracted_project_name,
+        "raw_goal_sha256": contract.get("raw_goal_sha256"),
+        "mission_contract_sha256": contract_sha256,
+        "workspace_path": workspace,
+        "workspace_basename": workspace_basename,
+        "created_at": session.created_at,
+        "workspace_mismatch_warning": mismatch_warning,
+        "explicit_acceptance_criterion_count": len(contract.get("explicit_acceptance_criteria") or []),
+        "inferred_acceptance_criterion_count": len(contract.get("inferred_acceptance_criteria") or []),
+        "mandatory_requirement_count": len(contract.get("mandatory_requirements") or []),
+    }
+
+
 def _mission_summary(session: "ControlSession") -> dict[str, Any]:
     """Display-only aggregate for the UI's "Mission Summary" panel.
 
@@ -2267,6 +2323,7 @@ class ControlSurfaceController:
             AUTONOMY_PROFILES[level].to_dict() for level in AUTONOMY_LEVEL_ORDER
         ]
         view["mission_summary"] = _mission_summary(self._session)
+        view["run_identity"] = _run_identity(self._session)
         view["needs_attention"] = _needs_attention(self._session)
         view["session_diagnostics"] = _session_diagnostics(
             self._session,

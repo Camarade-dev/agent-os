@@ -392,6 +392,16 @@
     </form>
   </section>
 
+  <section class="panel run-identity-panel" id="run-identity-panel" hidden>
+    <h2>Run Identity</h2>
+    <p class="hint" style="font-size:.76rem;color:var(--cs-muted);margin:0 0 .5rem;">
+      The authoritative goal and Mission Contract for this session — never inferred from the
+      workspace folder name. Review this before the first agent invocation.
+    </p>
+    <dl class="ha-status-grid" id="run-identity-grid"></dl>
+    <div id="run-identity-mismatch-warning" hidden></div>
+  </section>
+
   <section class="panel high-autonomy-panel" id="high-autonomy-panel">
     <h2>High-Autonomy Governed Run</h2>
     <p class="narrative-hint">
@@ -730,8 +740,17 @@ let lastTickResult = "";
 let requestInFlight = false;
 const AUTO_RUN_INTERVAL_MS = 1500;
 
+// RUN_045 PART F: a monotonically increasing token identifying the current
+// auto-run "generation". Pause increments it; any in-flight loop iteration
+// started under an earlier generation checks this (both before and after
+// its await) and quietly stops instead of rescheduling itself -- so a late
+// async response from a loop the user already paused can never resurrect
+// auto-run or double-schedule a timer.
+let autoRunGeneration = 0;
+
 function stopAutoRun() {
   autoRunActive = false;
+  autoRunGeneration += 1;
   if (autoRunTimer) {
     clearTimeout(autoRunTimer);
     autoRunTimer = null;
@@ -743,10 +762,13 @@ function summarizeTick(state) {
   return tick.last_tick_step || tick.step || tick.planned || "—";
 }
 
-async function autoRunLoop() {
-  if (!autoRunActive) return;
+async function autoRunLoop(generation) {
+  // RUN_045 PART F: this loop instance belongs to exactly one generation. If
+  // Pause (or a new Start) bumped the counter since this iteration was
+  // scheduled, stop silently -- never reschedule, never touch autoRunActive.
+  if (generation !== autoRunGeneration || !autoRunActive) return;
   if (requestInFlight) {
-    autoRunTimer = setTimeout(autoRunLoop, AUTO_RUN_INTERVAL_MS);
+    autoRunTimer = setTimeout(() => autoRunLoop(generation), AUTO_RUN_INTERVAL_MS);
     return;
   }
   autoRunTimer = null;
@@ -757,25 +779,33 @@ async function autoRunLoop() {
     state = await apiPost("/api/session/high_autonomy/tick", {});
     clearError();
   } catch (err) {
+    requestInFlight = false;
+    if (generation !== autoRunGeneration) return; // paused while the request was in flight
     showError(err.message);
     stopAutoRun();
-    requestInFlight = false;
     await refresh();
     return;
-  } finally {
-    requestInFlight = false;
+  }
+  requestInFlight = false;
+  if (generation !== autoRunGeneration) {
+    // Paused (or a new generation started) while this tick was in flight.
+    // The response already happened server-side and is safe to display,
+    // but this stale loop must never reschedule itself.
+    if (!autoRunActive) render(lastState || state);
+    return;
   }
   lastTickResult = summarizeTick(state);
   render(state);
   const ha = (state && state.high_autonomy_summary) || {};
   // auto_tick_safe is false for human_required / paused / stopped / failed /
-  // off, so the loop stops on any human-critical pause or terminal state.
-  if (!autoRunActive || !ha.auto_tick_safe || !ha.workspace_path) {
+  // technical_pause / off, so the loop stops on any human-critical pause,
+  // technical-invariant pause, or terminal state.
+  if (!autoRunActive || generation !== autoRunGeneration || !ha.auto_tick_safe || !ha.workspace_path) {
     stopAutoRun();
     render(state);
     return;
   }
-  autoRunTimer = setTimeout(autoRunLoop, AUTO_RUN_INTERVAL_MS);
+  autoRunTimer = setTimeout(() => autoRunLoop(generation), AUTO_RUN_INTERVAL_MS);
 }
 
 function startAutoRun() {
@@ -788,14 +818,19 @@ function startAutoRun() {
     showError("A human-critical action requires approval; auto-run is disabled.");
     return;
   }
+  if (ha.technical_pause_active || ha.mode === "technical_pause") {
+    showError("Technical pause: a reasonless wait was detected. Review state, then Step manually.");
+    return;
+  }
   if (requestInFlight) {
-    showError("Backend invocation in progress.");
+    showError("A governed-state tick is already in progress; try again in a moment.");
     return;
   }
   if (autoRunActive) return;
   autoRunActive = true;
+  autoRunGeneration += 1;
   render(lastState);
-  autoRunLoop();
+  autoRunLoop(autoRunGeneration);
 }
 
 function escapeHtml(value) {
@@ -811,6 +846,26 @@ function truncate(value, maxLen) {
   const s = value === null || value === undefined ? "" : String(value);
   if (s.length <= maxLen) return s;
   return s.slice(0, maxLen - 1) + "…";
+}
+
+// RUN_045 PART I: a mission contract's acceptance ledger is frequently
+// populated from *inferred* criteria (no bulleted/numbered "Acceptance
+// criteria:" section), not explicit ones -- showing only
+// "0/0 criteria represented" in that case reads as a broken/empty contract
+// even when every ledger criterion is fully populated and being verified.
+// Distinguish explicit vs. inferred vs. total so that distinction is never
+// silently hidden.
+function contractCriteriaLine(coverage) {
+  const explicitTotal = coverage.explicit_acceptance_criterion_count || 0;
+  const inferredTotal = coverage.inferred_acceptance_criterion_count || 0;
+  const ledgerTotal = coverage.total_ledger_criterion_count ?? (explicitTotal || inferredTotal);
+  if (explicitTotal > 0) {
+    return `${escapeHtml(coverage.represented_acceptance_criterion_count || 0)}/${escapeHtml(explicitTotal)} explicit criteria represented`;
+  }
+  if (coverage.criteria_are_inferred && inferredTotal > 0) {
+    return `${escapeHtml(ledgerTotal)}/${escapeHtml(inferredTotal)} inferred criteria represented (no explicit acceptance-criteria section matched)`;
+  }
+  return `${escapeHtml(coverage.represented_acceptance_criterion_count || 0)}/${escapeHtml(explicitTotal)} criteria represented`;
 }
 
 function displayToolOrCommand(item) {
@@ -882,7 +937,7 @@ async function refresh() {
 
 async function runAction(fn) {
   if (requestInFlight) {
-    showError("Backend invocation in progress.");
+    showError("A request is already in progress; try again in a moment.");
     return lastState;
   }
   requestInFlight = true;
@@ -1428,7 +1483,10 @@ function renderHighAutonomy(state) {
            <div class="ha-status-row"><dt>Stdout bytes</dt><dd>${escapeHtml(backendError.stdout_length ?? "—")}</dd></div>
            <div class="ha-status-row"><dt>Stderr / error</dt><dd>${escapeHtml(truncate(backendError.stderr_summary || backendError.error_message || ha.backend_block_reason || "—", 240))}</dd></div>
            <div class="ha-status-row"><dt>Environment status</dt><dd>${escapeHtml(backendError.environment_status || "—")}</dd></div>
-           <div class="ha-status-row"><dt>Retry required</dt><dd>Yes — explicit operator retry only (no automatic re-invocation)</dd></div>
+           <div class="ha-status-row"><dt>Automatic retry used</dt><dd>${backendError.automatic_empty_success_retry_used ? "Yes — one automatic same-instruction retry already used" : "No"}</dd></div>
+           <div class="ha-status-row"><dt>Manual retry count</dt><dd>${escapeHtml(backendError.manual_retry_count ?? 0)}</dd></div>
+           <div class="ha-status-row"><dt>Latest usable response</dt><dd>${escapeHtml(backendError.latest_usable_response_invocation_id || "—")}</dd></div>
+           <div class="ha-status-row"><dt>Retry required</dt><dd>Yes — explicit operator retry only (no further automatic re-invocation)</dd></div>
          </dl>
        </div>`
     : "";
@@ -1491,7 +1549,7 @@ function renderHighAutonomy(state) {
     ${humanObservationRow}
     <div class="ha-outcome-summary" style="margin:0 0 .75rem;padding:.65rem;border:1px solid var(--cs-border);border-radius:6px;">
       <p style="margin:0 0 .35rem;"><strong>Outcome:</strong> ${escapeHtml(outcomeLabel)}</p>
-      <p style="margin:.15rem 0;"><strong>Contract:</strong> ${escapeHtml(contractCoverage.represented_acceptance_criterion_count || 0)}/${escapeHtml(contractCoverage.explicit_acceptance_criterion_count || 0)} criteria represented · ${escapeHtml(contractCoverage.represented_path_count || 0)}/${escapeHtml(contractCoverage.mandatory_path_count || 0)} paths represented</p>
+      <p style="margin:.15rem 0;"><strong>Contract:</strong> ${contractCriteriaLine(contractCoverage)} · ${escapeHtml(contractCoverage.represented_path_count || 0)}/${escapeHtml(contractCoverage.mandatory_path_count || 0)} paths represented</p>
       <p style="margin:.15rem 0;"><strong>Verification:</strong> ${escapeHtml(ha.acceptance_verified_count || 0)}/${escapeHtml(verificationCoverage.mandatory_criterion_count || ha.acceptance_total_count || 0)} passed · ${escapeHtml((ha.unmet_criteria || []).length)} not yet verified</p>
       <p style="margin:.15rem 0;"><strong>Progress:</strong> acceptance criteria ${escapeHtml(ha.acceptance_verified_count || 0)}/${escapeHtml(ha.acceptance_total_count || 0)} verified${ha.repair_round_count ? ` · Repair round: ${escapeHtml(ha.repair_round_count)}/${escapeHtml(ha.max_repair_rounds || 2)}` : ""}</p>
       <p style="margin:.15rem 0;"><strong>Usage:</strong> ${escapeHtml(metrics.model_invocation_count || 0)} model invocation(s) · ${escapeHtml(metrics.backend_retry_count || 0)} retr${(metrics.backend_retry_count || 0) === 1 ? "y" : "ies"} · ${escapeHtml(metrics.genuine_human_intervention_count || 0)} human interruption(s)</p>
@@ -1594,6 +1652,19 @@ function renderHighAutonomy(state) {
   actions.innerHTML = primary + autoRunControls;
 }
 
+// RUN_045 PART F: six mutually exclusive progress banners. A plain tick
+// HTTP request in flight is never labeled "backend invocation" -- that
+// label is reserved for an actual queued/running callable-backend
+// invocation (ha.backend_step === "invoking_agent").
+function computeProgressBanner(ha) {
+  if (ha.technical_pause_active || ha.mode === "technical_pause") return "TECHNICAL PAUSE";
+  if (ha.mode === "runtime_verifying") return "RUNTIME VERIFICATION RUNNING";
+  if (ha.is_callable_backend && ha.backend_step === "invoking_agent") return "BACKEND INVOCATION RUNNING";
+  if (requestInFlight) return "ADVANCING STATE";
+  if (autoRunActive && ha.auto_tick_safe) return "AUTO-RUN ACTIVE";
+  return "AUTO-RUN PAUSED";
+}
+
 function renderAutoRunStatusLine(ha) {
   const line = document.getElementById("high-autonomy-autorun-line");
   if (!line) return;
@@ -1620,8 +1691,7 @@ function renderAutoRunStatusLine(ha) {
   } else {
     state = "paused";
   }
-  const parts = [`Auto-run: ${state}`];
-  if (requestInFlight && !internalStatePause) parts.push("Backend invocation in progress");
+  const parts = [`Auto-run: ${state}`, computeProgressBanner(ha)];
   if (lastTickResult) parts.push(`Last tick: ${lastTickResult}`);
   // Only the file bridge waits on an external response file. A callable backend
   // shows its in-process step instead (never "waiting for a response file").
@@ -2289,6 +2359,44 @@ function renderGoalIntake(state) {
   `;
 }
 
+function renderRunIdentity(state) {
+  const panel = document.getElementById("run-identity-panel");
+  const grid = document.getElementById("run-identity-grid");
+  const warningBox = document.getElementById("run-identity-mismatch-warning");
+  const identity = state.run_identity;
+  const intake = state.goal_intake;
+  if (!identity || !intake) {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  const ha = state.high_autonomy || {};
+  const control = state.control || {};
+  const backendLabel = ha.backend_id || (control.backends && selectedBackendId()) || "—";
+  const criteriaBasis = identity.explicit_acceptance_criterion_count
+    ? `${identity.explicit_acceptance_criterion_count} explicit`
+    : identity.inferred_acceptance_criterion_count
+    ? `${identity.inferred_acceptance_criterion_count} inferred (no explicit acceptance-criteria section matched)`
+    : "none parsed";
+  grid.innerHTML = `
+    <div class="ha-status-row"><dt>Goal</dt><dd>${escapeHtml(identity.goal_first_line || "—")}</dd></div>
+    <div class="ha-status-row"><dt>Raw-goal SHA</dt><dd class="mono" style="word-break:break-all;">${escapeHtml(identity.raw_goal_sha256 || "—")}</dd></div>
+    <div class="ha-status-row"><dt>Mission Contract SHA</dt><dd class="mono" style="word-break:break-all;">${escapeHtml(identity.mission_contract_sha256 || "—")}</dd></div>
+    <div class="ha-status-row"><dt>Target workspace</dt><dd>${escapeHtml(identity.workspace_path || "—")}</dd></div>
+    <div class="ha-status-row"><dt>Backend</dt><dd>${escapeHtml(backendLabel)}</dd></div>
+    <div class="ha-status-row"><dt>Created</dt><dd>${escapeHtml(identity.created_at || "—")}</dd></div>
+    <div class="ha-status-row"><dt>Acceptance basis</dt><dd>${escapeHtml(criteriaBasis)} · ${escapeHtml(identity.mandatory_requirement_count || 0)} mandatory requirement(s)</dd></div>
+  `;
+  if (identity.workspace_mismatch_warning) {
+    warningBox.hidden = false;
+    warningBox.className = "truth-boundary-banner";
+    warningBox.innerHTML = `<strong>⚠ Workspace/goal mismatch:</strong> ${escapeHtml(identity.workspace_mismatch_warning)} (workspace folder: <code>${escapeHtml(identity.workspace_basename || "—")}</code>, goal mentions: <code>${escapeHtml(identity.extracted_project_name || "—")}</code>)`;
+  } else {
+    warningBox.hidden = true;
+    warningBox.innerHTML = "";
+  }
+}
+
 function renderPlanAudit(state) {
   const body = document.getElementById("plan-audit-body");
   const plan = state.plan_candidate;
@@ -2574,6 +2682,7 @@ function render(state) {
   renderBridgeGating(state);
   renderManualFallback(state);
   renderBridgeFromState(state);
+  renderRunIdentity(state);
   renderHighAutonomy(state);
   renderAdvancedRunRecords(state);
   renderGovernedRun(state);

@@ -55,6 +55,18 @@ def _normalize_goal(text: str) -> str:
     return "\n".join(line.rstrip() for line in text.replace("\r\n", "\n").replace("\r", "\n").strip().split("\n"))
 
 
+def _strip_trailing_line_punctuation(text: str) -> str:
+    """Strip harmless trailing `;`/`,`/`.` from one heading-scoped line.
+
+    Never alters interior punctuation or semantic content -- only a single
+    run of these three characters (and any trailing whitespace) at the very
+    end of the line, e.g. the ``;`` separators a plain (non-bulleted) list
+    of requirements often uses between lines.
+    """
+
+    return re.sub(r"[;,.]+\s*$", "", text).strip()
+
+
 def _heading(line: str) -> str | None:
     value = re.sub(r"^[#\s]+|[:\s]+$", "", line).strip().lower()
     for role, names in _HEADINGS.items():
@@ -135,6 +147,27 @@ def build_mission_contract(raw_goal: str, *, created_at: str | None = None) -> M
         elif section == "acceptance" and bullet:
             counters["criterion"] += 1
             criteria.append(_entry(f"explicit_ac_{counters['criterion']:03d}", text, source="explicit", order=counters["criterion"], mandatory=True))
+        elif section == "acceptance":
+            # RUN_045 PART I: a heading-scoped line under "Acceptance
+            # criteria:" is a separate explicit requirement even without a
+            # -/*/numeric prefix -- never silently dropped. Recorded as an
+            # explicit *requirement* rather than an *acceptance criterion*
+            # so it never displaces the generic verification-check wiring
+            # `derive_acceptance_criteria_from_goal` already attaches when a
+            # goal has no bulleted/numbered acceptance criteria at all
+            # (contract_acceptance_ledger prefers explicit acceptance
+            # criteria, then inferred ones, then requirements last) --
+            # RUN_038-044 replay fixtures rely on that inferred path.
+            counters["requirement"] += 1
+            requirements.append(
+                _entry(
+                    f"requirement_{counters['requirement']:03d}",
+                    _strip_trailing_line_punctuation(text),
+                    source="explicit",
+                    order=counters["requirement"],
+                    mandatory=True,
+                )
+            )
         elif section in ("requirements", "completion") and bullet:
             counters["requirement"] += 1
             requirements.append(_entry(f"requirement_{counters['requirement']:03d}", text, source="explicit", order=counters["requirement"], mandatory=True))
@@ -237,7 +270,14 @@ def ledger_coverage_report(contract: dict[str, Any], ledger: list[dict[str, Any]
     omitted_paths = [x for x in paths if x not in represented_paths]
     total = len(requirement_ids) + len(criterion_ids) + len(paths) + len(arch)
     represented_total = len(requirement_ids)-len(omitted_req) + len(criterion_ids)-len(omitted_ac) + len(paths)-len(omitted_paths) + len(arch)
-    return {"explicit_requirement_count": len(reqs), "represented_requirement_count": len(reqs)-len(omitted_req), "omitted_requirement_ids": omitted_req, "explicit_acceptance_criterion_count": len(criteria), "represented_acceptance_criterion_count": len(criteria)-len(omitted_ac), "omitted_acceptance_criterion_ids": omitted_ac, "mandatory_path_count": len(paths), "represented_path_count": len(paths)-len(omitted_paths), "omitted_paths": omitted_paths, "architecture_decision_count": len(arch), "represented_architecture_decision_count": len(arch), "omitted_architecture_decisions": [], "coverage_ratio": represented_total / total if total else 1.0, "coverage_complete": represented_total == total}
+    # RUN_045 PART I: the ledger criterion count actually driving verification
+    # is often *inferred* (derive_acceptance_criteria_from_goal), not
+    # explicit -- "explicit_acceptance_criterion_count" alone reads as "0/0"
+    # even when the ledger is fully populated and being verified. Report the
+    # inferred and total-ledger counts alongside it so a caller/UI can show
+    # the real picture instead of a bare, misleading 0/0.
+    inferred = list(contract.get("inferred_acceptance_criteria") or [])
+    return {"explicit_requirement_count": len(reqs), "represented_requirement_count": len(reqs)-len(omitted_req), "omitted_requirement_ids": omitted_req, "explicit_acceptance_criterion_count": len(criteria), "represented_acceptance_criterion_count": len(criteria)-len(omitted_ac), "omitted_acceptance_criterion_ids": omitted_ac, "inferred_acceptance_criterion_count": len(inferred), "total_ledger_criterion_count": len(ledger), "criteria_are_inferred": inferred_projection, "mandatory_path_count": len(paths), "represented_path_count": len(paths)-len(omitted_paths), "omitted_paths": omitted_paths, "architecture_decision_count": len(arch), "represented_architecture_decision_count": len(arch), "omitted_architecture_decisions": [], "coverage_ratio": represented_total / total if total else 1.0, "coverage_complete": represented_total == total}
 
 
 def verification_plan_coverage_report(ledger: list[dict[str, Any]]) -> dict[str, Any]:

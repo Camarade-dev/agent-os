@@ -65,6 +65,11 @@ HA_MODE_FAILED = "failed"
 # authority interruption.
 HA_MODE_RUNTIME_VERIFYING = "runtime_verifying"
 HA_MODE_AWAITING_HUMAN_OBSERVATION = "awaiting_human_observation"
+# RUN_045 PART E: a run that produced the same reasonless-wait fingerprint
+# twice in a row stops here -- distinct from human_required (no human
+# authority decision is pending) and from internal_livelock (that label is
+# reserved for contradictory *execution* state, not a stuck wait).
+HA_MODE_TECHNICAL_PAUSE = "technical_pause"
 
 HA_NEXT_NONE = "none"
 HA_NEXT_WRITE_INSTRUCTION = "write_instruction"
@@ -268,6 +273,23 @@ class HighAutonomyRunState:
     runtime_capability_report: dict[str, Any] | None = None
     runtime_coverage_report: dict[str, Any] | None = None
     runtime_repair_kind: str | None = None
+    # RUN_045 PART B.4: every `wait` transition must identify a durable,
+    # typed reason -- never a generic reasonless wait (see
+    # admissible.high_autonomy_state_invariants.SUPPORTED_WAIT_CONDITIONS).
+    wait_reason: str | None = None
+    wait_condition_type: str | None = None
+    wait_condition_id: str | None = None
+    wait_started_at: str | None = None
+    wait_timeout_at: str | None = None
+    expected_state_change: str | None = None
+    wait_poll_count: int = 0
+    # RUN_045 PART E: technical-pause state (distinct from human_required /
+    # internal_livelock) for a run that produced the same reasonless-wait
+    # fingerprint twice in a row.
+    technical_pause_active: bool = False
+    technical_pause_reason: str | None = None
+    state_invariant_violations: list[dict[str, Any]] = field(default_factory=list)
+    last_reconciliation: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -473,6 +495,43 @@ def _pause_for_no_progress_livelock(
     )
 
 
+def _pause_for_technical_state_invariant(
+    controller: "ControlSurfaceController",
+    ha_state: HighAutonomyRunState,
+    *,
+    fingerprint: str,
+    violation_code: str,
+) -> None:
+    """RUN_045 PART E: a reasonless wait (mode=waiting_for_agent with no
+    legitimate pending condition) that repeated the same fingerprint twice.
+
+    Distinct from `_pause_for_no_progress_livelock`/`internal_livelock`,
+    which stays reserved for a genuine contradictory *execution* state
+    (queue/operation mismatch) -- this is specifically a stuck *wait*, and
+    auto-run must stop without ever invoking the backend again.
+    """
+
+    ha_state.mode = HA_MODE_TECHNICAL_PAUSE
+    ha_state.paused = True
+    ha_state.auto_tick_safe = False
+    ha_state.technical_pause_active = True
+    reason = (
+        "Technical pause — a reasonless wait (no legitimate pending backend/runtime/"
+        f"human condition) repeated the same fingerprint twice ({violation_code})."
+    )
+    ha_state.technical_pause_reason = reason
+    ha_state.stop_reason = reason
+    ha_state.last_event = reason
+    ha_state.last_tick_step = "technical_pause"
+    ha_state.next_action = HA_NEXT_NONE
+    ha_state.current_step = None
+    _append_coalesced_transcript(
+        controller,
+        "high_autonomy_technical_pause",
+        {"fingerprint": fingerprint, "violation_code": violation_code},
+    )
+
+
 def _build_refusal_recovery_text(
     *,
     refused_actions: list[dict[str, Any]],
@@ -562,6 +621,7 @@ def build_high_autonomy_summary(
         HA_MODE_FAILED: "Failed.",
         HA_MODE_RUNTIME_VERIFYING: "Running bounded browser-runtime verification.",
         HA_MODE_AWAITING_HUMAN_OBSERVATION: "Awaiting human observation of subjective criteria.",
+        HA_MODE_TECHNICAL_PAUSE: "Technical pause — a reasonless wait was detected twice.",
     }.get(ha_state.mode, ha_state.mode)
 
     needed_now = {
@@ -787,6 +847,18 @@ def build_high_autonomy_summary(
         "runtime_coverage_report": ha_state.runtime_coverage_report,
         "human_observation_pending_criterion_ids": list(ha_state.human_observation_pending_criterion_ids),
         "human_observation_records": list(ha_state.human_observation_records),
+        # RUN_045: typed wait/technical-pause/state-invariant visibility.
+        "wait_reason": ha_state.wait_reason,
+        "wait_condition_type": ha_state.wait_condition_type,
+        "wait_condition_id": ha_state.wait_condition_id,
+        "wait_started_at": ha_state.wait_started_at,
+        "wait_timeout_at": ha_state.wait_timeout_at,
+        "expected_state_change": ha_state.expected_state_change,
+        "wait_poll_count": ha_state.wait_poll_count,
+        "technical_pause_active": ha_state.technical_pause_active,
+        "technical_pause_reason": ha_state.technical_pause_reason,
+        "state_invariant_violations": list(ha_state.state_invariant_violations),
+        "last_reconciliation": ha_state.last_reconciliation,
     }
 
 
@@ -967,6 +1039,10 @@ def _callable_backend_error_summary(ha_state: HighAutonomyRunState) -> dict[str,
         "estimated_cost": record.estimated_cost,
         "operator_retry_count": record.operator_retry_count,
         "retry_required": ha_state.backend_retry_required,
+        # RUN_045 PART G: process-success vs. usable-response diagnostics.
+        "automatic_empty_success_retry_used": ha_state.automatic_empty_success_retry_used,
+        "manual_retry_count": record.operator_retry_count,
+        "latest_usable_response_invocation_id": ha_state.last_consumed_invocation_id,
     }
 
 
@@ -2148,6 +2224,17 @@ def _plan_next_action(
         ),
     )
 
+    # RUN_045 PART B/C: whether a repair write already landed and a rerun is
+    # due. Computed once, up front, so both the waiting_for_agent guard below
+    # and the repair-phase branch further down agree on the same decision --
+    # this is the exact condition the cli-002 livelock got stuck on.
+    from admissible.high_autonomy_state_invariants import (
+        plan_post_repair_verification,
+        repair_needs_post_write_verification,
+    )
+
+    repair_verification_pending = repair_needs_post_write_verification(ha_state.repair_phase)
+
     if ha_state.mode == HA_MODE_WAITING_FOR_AGENT:
         if ready_count > 0:
             return HA_NEXT_AUTO_EXECUTE
@@ -2156,11 +2243,22 @@ def _plan_next_action(
                 return HA_NEXT_INGEST_RESPONSE
             if _callable_terminal_failure_pending(ha_state):
                 return HA_NEXT_NONE
-            return HA_NEXT_NONE
-        if not _transport_has_pending_response(transport):
+            if not repair_verification_pending:
+                return HA_NEXT_NONE
+            # else: fall through -- a repair write already executed and
+            # nothing is actually pending from the callable backend
+            # (backend_step=response_consumed, no retry required); do not
+            # keep reporting next_action=none forever (RUN_045).
+        elif _transport_has_pending_response(transport):
+            return HA_NEXT_INGEST_RESPONSE
+        elif not repair_verification_pending:
             if ha_state.verification_readiness in ("pass", "fail"):
                 return HA_NEXT_STOP
-        return HA_NEXT_INGEST_RESPONSE
+            return HA_NEXT_INGEST_RESPONSE
+        # else: repair_verification_pending with no pending transport
+        # response -- fall through to the repair-aware verification
+        # routing below instead of ingesting a response that will never
+        # arrive (RUN_045: the cli-002 livelock).
 
     if ready_count > 0 and ha_state.mode in (HA_MODE_REVIEWING, HA_MODE_RUNNING, HA_MODE_AUTO_EXECUTING):
         return HA_NEXT_AUTO_EXECUTE
@@ -2212,16 +2310,34 @@ def _plan_next_action(
             REPAIR_PHASE_REPAIR_VERIFYING,
         )
         and ready_count == 0
-        and not _transport_has_pending_response(transport)
+        and (
+            _is_callable_backend(ha_state)
+            or not _transport_has_pending_response(transport)
+        )
     ):
-        if ha_state.runtime_repair_kind in ("runtime_verification_failure", "runtime_instrumentation_gap"):
+        # A callable backend's pending-response state is already fully
+        # accounted for above (the unconditional `_pending_ready_invocation`
+        # and `_callable_terminal_failure_pending` checks earlier in this
+        # function) via the durable invocation record, not the transport
+        # object. `_transport_has_pending_response` inspects a file-bridge-
+        # style staging attribute (`CallableBackendTransport._pending_text`)
+        # that a callable backend's own durable-record ingest path never
+        # clears, so it would otherwise report a stale "still pending"
+        # forever after the very first response and block this repair-
+        # verification hand-off indefinitely (RUN_045).
+        post_repair_action = plan_post_repair_verification(
+            repair_phase=ha_state.repair_phase,
+            runtime_repair_kind=ha_state.runtime_repair_kind,
+        )
+        if post_repair_action == HA_NEXT_START_RUNTIME_VERIFICATION:
             # Delegate to the same active-attempt-aware dispatch the general
             # runtime branch above uses: a repair-verify re-entry must poll/
             # apply an already-started attempt rather than blindly starting
             # a second one every tick (RUN_044 exactly-once/single-flight).
             runtime_next = _plan_runtime_next_action(controller, ha_state)
             return runtime_next or HA_NEXT_START_RUNTIME_VERIFICATION
-        return HA_NEXT_VERIFY
+        if post_repair_action == HA_NEXT_VERIFY:
+            return HA_NEXT_VERIFY
 
     if (
         _verification_is_final(controller)
@@ -2553,6 +2669,86 @@ def stop_high_autonomy_run(
     return view
 
 
+def _waiting_for_agent_signals(
+    controller: "ControlSurfaceController",
+    ha_state: HighAutonomyRunState,
+    transport: "AgentTransport | None",
+) -> Any:
+    from admissible.high_autonomy_state_invariants import WaitingForAgentSignals
+    from admissible.runtime_orchestration_models import STATUS_QUEUED, STATUS_RUNNING
+
+    attempt = _active_runtime_attempt(ha_state)
+    runtime_worker_active = attempt is not None and attempt.status in (STATUS_QUEUED, STATUS_RUNNING)
+    pending_invocation_status = None
+    if ha_state.pending_agent_invocation:
+        pending_invocation_status = ha_state.pending_agent_invocation.get("status")
+    return WaitingForAgentSignals(
+        is_callable_backend=_is_callable_backend(ha_state),
+        backend_step=ha_state.backend_step,
+        pending_invocation_status=pending_invocation_status,
+        backend_retry_required=bool(ha_state.backend_retry_required),
+        backend_reinvoke_pending=bool(ha_state.backend_reinvoke_pending),
+        transport_has_pending_response=_transport_has_pending_response(transport),
+        runtime_worker_active=runtime_worker_active,
+    )
+
+
+def _reconcile_high_autonomy_state(
+    controller: "ControlSurfaceController",
+    ha_state: HighAutonomyRunState,
+    transport: "AgentTransport | None",
+) -> bool:
+    """RUN_045 PART D: detect + repair one contradictory persisted state
+    combination before planning/ticking (on session load and before every
+    tick). Returns True when a repair was applied, and persists a recovery
+    governance record. Never consumes a model turn, a repair round, or a
+    human-intervention metric -- it only relabels already-persisted state
+    that was never legitimately reachable.
+    """
+
+    from admissible.high_autonomy_state_invariants import ReconciliationSignals, reconcile_contradictory_state
+
+    signals = ReconciliationSignals(
+        mode=ha_state.mode,
+        repair_phase=ha_state.repair_phase,
+        runtime_repair_kind=ha_state.runtime_repair_kind,
+        pending_useful_operation_count=len(ha_state.pending_useful_operations),
+        active_blocked_count=int((ha_state.metrics or {}).get("active_blocked_count", 0)),
+        waiting_for_agent_signals=_waiting_for_agent_signals(controller, ha_state, transport),
+    )
+    result = reconcile_contradictory_state(signals)
+    if not result.changed:
+        return False
+
+    old_mode, old_next_action = ha_state.mode, ha_state.next_action
+    mode_map = {"verifying": HA_MODE_VERIFYING, "runtime_verifying": HA_MODE_RUNTIME_VERIFYING}
+    if result.new_mode is not None:
+        ha_state.mode = mode_map.get(result.new_mode, ha_state.mode)
+    if result.new_next_action is not None:
+        ha_state.next_action = result.new_next_action
+    ha_state.state_invariant_violations = [
+        {"code": v.code, "message": v.message, "detail": dict(v.detail)} for v in result.violations
+    ]
+    record = {
+        "record_id": f"governance_{uuid.uuid4().hex[:12]}",
+        "event_type": "state_invariant_reconciliation",
+        "violations": list(ha_state.state_invariant_violations),
+        "old_mode": old_mode,
+        "old_next_action": old_next_action,
+        "new_mode": ha_state.mode,
+        "new_next_action": ha_state.next_action,
+        "triggering_invocation_id": ha_state.last_consumed_invocation_id,
+        "timestamp": _now_iso(),
+    }
+    controller._session.governance_records.append(record)
+    ha_state.last_reconciliation = record
+    ha_state.current_step = None
+    ha_state.no_progress_tick_count = 0
+    _save_ha_state(controller, ha_state)
+    controller._persist()
+    return True
+
+
 def tick_high_autonomy_run(
     controller: "ControlSurfaceController",
     *,
@@ -2585,6 +2781,12 @@ def tick_high_autonomy_run(
     if transport is None and not _is_callable_backend(ha_state):
         raise ValueError("High-autonomy transport is not configured.")
 
+    # RUN_045 PART D: reconcile one known-invalid persisted state combination
+    # (on session load and before every tick) before planning/ticking at all.
+    # Never consumes a model turn, a repair round, or a human-intervention
+    # metric -- it only relabels already-persisted state.
+    _reconcile_high_autonomy_state(controller, ha_state, transport)
+
     policy = policy or HighAutonomyPolicy()
     _sync_counters(controller, ha_state, policy)
     if _try_finalize_outcome(controller, ha_state):
@@ -2606,6 +2808,11 @@ def tick_high_autonomy_run(
     ha_state.last_tick_at = _now_iso()
     ha_state.tick_count += 1
     step_result: dict[str, Any] = {"planned": planned}
+    if planned != HA_NEXT_WAIT_FOR_RESPONSE:
+        # RUN_045: leaving the wait state clears its durable bookkeeping so
+        # a later, unrelated wait starts its own fresh poll count/fingerprint.
+        ha_state.wait_started_at = None
+        ha_state.wait_poll_count = 0
 
     if planned == HA_NEXT_STOP:
         if ha_state.outcome is None:
@@ -3311,6 +3518,24 @@ def tick_high_autonomy_run(
     elif planned == HA_NEXT_WAIT_FOR_RESPONSE:
         ha_state.mode = HA_MODE_WAITING_FOR_AGENT
         ha_state.last_tick_step = "wait"
+        # RUN_045 PART B.4: every wait transition identifies a durable,
+        # typed reason. When no legitimate condition is found here (a
+        # rare/defensive case, since _plan_next_action only reaches this
+        # branch when one exists or when genuinely awaiting a first
+        # instruction), record that honestly rather than a blank reason.
+        from admissible.high_autonomy_state_invariants import classify_waiting_for_agent_condition
+
+        condition = classify_waiting_for_agent_condition(
+            _waiting_for_agent_signals(controller, ha_state, transport)
+        )
+        if condition is not None:
+            ha_state.wait_condition_type, ha_state.wait_condition_id = condition
+            ha_state.wait_reason = condition[0]
+        else:
+            ha_state.wait_condition_type, ha_state.wait_condition_id = (None, None)
+            ha_state.wait_reason = "awaiting_first_instruction_or_response"
+        ha_state.wait_started_at = ha_state.wait_started_at or _now_iso()
+        ha_state.wait_poll_count += 1
         _save_ha_state(controller, ha_state)
         controller._persist()
 
@@ -3367,7 +3592,28 @@ def tick_high_autonomy_run(
                 ),
             )
         else:
-            _pause_for_no_progress_livelock(controller, ha_state, fingerprint=fingerprint)
+            # RUN_045 PART E: a reasonless wait (mode=waiting_for_agent with
+            # no legitimate pending backend/runtime/human condition) is a
+            # distinct, typed technical pause -- never internal_livelock,
+            # which stays reserved for a genuine contradictory execution
+            # state.
+            from admissible.high_autonomy_state_invariants import classify_waiting_for_agent_condition
+
+            reasonless_wait = ha_state.mode == HA_MODE_WAITING_FOR_AGENT and (
+                classify_waiting_for_agent_condition(
+                    _waiting_for_agent_signals(controller, ha_state, transport)
+                )
+                is None
+            )
+            if reasonless_wait:
+                _pause_for_technical_state_invariant(
+                    controller,
+                    ha_state,
+                    fingerprint=fingerprint,
+                    violation_code="waiting_for_agent_without_pending_condition",
+                )
+            else:
+                _pause_for_no_progress_livelock(controller, ha_state, fingerprint=fingerprint)
     _save_ha_state(controller, ha_state)
     controller._persist()
     step_result["last_tick_step"] = ha_state.last_tick_step
