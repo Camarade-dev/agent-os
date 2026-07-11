@@ -1,0 +1,142 @@
+{
+  "schema_version": "admissible_callable_transport_forensic_fixture_v1",
+  "source_session": "repair_probe_rehearsal_run046",
+  "claim_boundary": "Reconstructed from the RUN_046 task brief's canonical Repair Probe rehearsal narrative, not a raw exported session file. Fields explicitly stated in the narrative are marked \"reported\"; fields the narrative did not specify (exact duration/byte counts for every attempt, intermediate-attempt classifications) are left null and marked \"unspecified_in_narrative\" so this fixture never invents evidence it does not have.",
+  "backend": {
+    "transport_kind": "callable_backend",
+    "backend_id": "cursor_cli"
+  },
+  "goal_excerpt": {
+    "heading_as_written": "MANDATORY ACCEPTANCE CRITERIA",
+    "note": "The operator's goal used this heading with eight numbered items. mission_contract._HEADINGS['acceptance'] only exact-matches ('acceptance criteria', 'completion criteria', 'critères d'acceptation'); 'mandatory acceptance criteria' never matches, so build_mission_contract() never sets section='acceptance' for these lines and they are silently dropped (not even routed to mandatory_requirements). explicit_acceptance_criteria ends up empty and derive_acceptance_criteria_from_goal's generic 8-criterion template (required_files, index_assets, index_game_ui, style_non_empty, game_controls, game_collectible_score, game_restart, local_usage) is silently substituted as the verification contract instead."
+  },
+  "invocations": [
+    {
+      "invocation_id": "invoke_turn1_attempt1",
+      "phase": "initial_implementation",
+      "turn_number": 1,
+      "attempt_number": 1,
+      "retry_of_invocation_id": null,
+      "instruction_id": "instr_turn1",
+      "data_confidence": "reported",
+      "process_exit_code": 0,
+      "duration_seconds": 32.0,
+      "duration_seconds_precision": "approximately",
+      "stdout_byte_count": 1,
+      "stderr_byte_count": null,
+      "classification": "empty_success",
+      "status": "empty_success",
+      "usable_response": false,
+      "controller_action": "technical_pause_required_explicit_retry",
+      "note": "Cursor process exit code 0, duration approximately 32 seconds, stdout length 1 byte, no usable response. Admissible correctly entered a technical pause and required an explicit operator retry -- it did not spin or silently re-invoke."
+    },
+    {
+      "invocation_id": "invoke_turn1_attempt2",
+      "phase": "initial_implementation",
+      "turn_number": 1,
+      "attempt_number": 2,
+      "retry_of_invocation_id": "invoke_turn1_attempt1",
+      "instruction_id": "instr_turn1",
+      "data_confidence": "reported_outcome_only",
+      "process_exit_code": null,
+      "duration_seconds": null,
+      "stdout_byte_count": null,
+      "stderr_byte_count": null,
+      "classification": "success",
+      "status": "success",
+      "usable_response": true,
+      "controller_action": "operator_explicit_retry",
+      "note": "A later explicit operator retry eventually produced the initial implementation. Exact duration/byte counts for this attempt are unspecified_in_narrative."
+    },
+    {
+      "invocation_id": "invoke_repair_attempt1",
+      "phase": "repair_turn",
+      "turn_number": 2,
+      "attempt_number": 1,
+      "retry_of_invocation_id": null,
+      "instruction_id": "instr_repair_targeted",
+      "data_confidence": "unspecified_in_narrative",
+      "process_exit_code": null,
+      "duration_seconds": null,
+      "stdout_byte_count": null,
+      "stderr_byte_count": null,
+      "classification": null,
+      "status": null,
+      "usable_response": false,
+      "controller_action": "targeted_repair_instruction_prepared",
+      "note": "Bounded verification had failed on game_controls and local_usage; a targeted repair instruction was prepared and this first repair attempt was invoked. The narrative does not specify this attempt's individual outcome."
+    },
+    {
+      "invocation_id": "invoke_repair_attempt2",
+      "phase": "repair_turn",
+      "turn_number": 2,
+      "attempt_number": 2,
+      "retry_of_invocation_id": "invoke_repair_attempt1",
+      "instruction_id": "instr_repair_targeted",
+      "data_confidence": "unspecified_in_narrative",
+      "process_exit_code": null,
+      "duration_seconds": null,
+      "stdout_byte_count": null,
+      "stderr_byte_count": null,
+      "classification": null,
+      "status": null,
+      "usable_response": false,
+      "controller_action": "explicit_operator_retry",
+      "note": "One of several explicit retries attempted for the repair instruction. Individual outcome unspecified_in_narrative."
+    },
+    {
+      "invocation_id": "invoke_repair_attempt3",
+      "phase": "repair_turn",
+      "turn_number": 2,
+      "attempt_number": 3,
+      "retry_of_invocation_id": "invoke_repair_attempt2",
+      "instruction_id": "instr_repair_targeted",
+      "data_confidence": "unspecified_in_narrative",
+      "process_exit_code": null,
+      "duration_seconds": null,
+      "stdout_byte_count": null,
+      "stderr_byte_count": null,
+      "classification": null,
+      "status": null,
+      "usable_response": false,
+      "controller_action": "explicit_operator_retry",
+      "note": "One of several explicit retries attempted for the repair instruction. Individual outcome unspecified_in_narrative."
+    },
+    {
+      "invocation_id": "invoke_repair_attempt4",
+      "phase": "repair_turn",
+      "turn_number": 2,
+      "attempt_number": 4,
+      "retry_of_invocation_id": "invoke_repair_attempt3",
+      "instruction_id": "instr_repair_targeted",
+      "data_confidence": "reported",
+      "process_exit_code": null,
+      "duration_seconds": 120.0,
+      "duration_seconds_precision": "exact_configured_timeout",
+      "stdout_byte_count": null,
+      "stderr_byte_count": null,
+      "classification": "timeout_after_partial_output_or_before_any_output_unknown",
+      "status": "timeout",
+      "usable_response": false,
+      "controller_action": "paused_no_further_automatic_retry",
+      "note": "The latest invocation timed out after 120 seconds; no usable repair response was received. Admissible correctly paused rather than looping. Whether any partial stdout existed before the timeout is unspecified_in_narrative -- this is exactly the ambiguity PART C's incremental-capture harness exists to resolve for future occurrences, since the production adapter today only reports raw_stdout/raw_stderr as None on TimeoutExpired (no partial-output capture)."
+    }
+  ],
+  "session_metrics": {
+    "total_invocations": 6,
+    "total_retries": 4,
+    "data_confidence": "reported"
+  },
+  "bounded_verification_result": {
+    "failed_criteria": ["game_controls", "local_usage"],
+    "controlled_instruction_intended_failure_count": 1,
+    "observed_failure_count": 2,
+    "data_confidence": "reported"
+  },
+  "run_identity_projection_observed": {
+    "backend_field_displayed": "—",
+    "actual_governed_backend_id": "cursor_cli",
+    "data_confidence": "reported",
+    "note": "control_surface.py's _run_identity() never includes a backend field at all; the Run Identity panel's renderRunIdentity() in control_surface.html independently derives a backend label from state.high_autonomy.backend_id and state.control.backends -- but the server response never sets top-level keys named high_autonomy or control (session_dict()/state_view() only ever sets high_autonomy_summary and agent_backend_control). Both lookups are therefore always undefined, so the panel always falls back to the em dash placeholder regardless of which backend actually governed the run."
+  }
+}
