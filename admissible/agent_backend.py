@@ -113,6 +113,10 @@ AGENT_AVAILABILITY_EXTERNAL = "external_manual"
 BACKEND_ID_FIXTURE = "fixture"
 BACKEND_ID_FILE_BRIDGE = "file_bridge"
 BACKEND_ID_CURSOR_CLI = "cursor_cli"
+# Explicit transport-specific ids so Run Identity / health can distinguish the
+# legacy one-shot stdout transport from the RUN_047 ACP transport (PART C.11).
+BACKEND_ID_CURSOR_ONESHOT = "cursor_cli_oneshot"
+BACKEND_ID_CURSOR_ACP = "cursor_acp"
 
 DEFAULT_MAX_OUTPUT_BYTES = 512 * 1024
 DEFAULT_TIMEOUT_SECONDS = 120.0
@@ -377,6 +381,17 @@ class AgentInvocationResult:
     cursor_profile_environment_present: bool | None = None
     program_data_path_present: bool | None = None
     environment_paths: dict[str, str] | None = None
+    # -- transport-provenance / ACP telemetry (slice ADMISSIBLE_RUN_047) -----
+    # ``transport_kind`` distinguishes ``cursor_cli_oneshot`` from ``cursor_acp``
+    # (PART H.34); ``acp_*`` and ``managed_process_result`` carry the durable
+    # ACP lifecycle proof when the ACP transport produced this result.
+    transport_kind: str | None = None
+    acp_request_id: str | None = None
+    acp_session_id: str | None = None
+    acp_protocol_version: int | None = None
+    acp_invocation_state: str | None = None
+    acp_telemetry: dict[str, Any] | None = None
+    managed_process_result: dict[str, Any] | None = None
 
     @property
     def ok(self) -> bool:
@@ -427,6 +442,17 @@ class AgentInvocationResult:
             "program_data_path_present": self.program_data_path_present,
             "environment_paths": (
                 dict(self.environment_paths) if self.environment_paths is not None else None
+            ),
+            "transport_kind": self.transport_kind,
+            "acp_request_id": self.acp_request_id,
+            "acp_session_id": self.acp_session_id,
+            "acp_protocol_version": self.acp_protocol_version,
+            "acp_invocation_state": self.acp_invocation_state,
+            "acp_telemetry": dict(self.acp_telemetry) if self.acp_telemetry is not None else None,
+            "managed_process_result": (
+                dict(self.managed_process_result)
+                if self.managed_process_result is not None
+                else None
             ),
         }
 
@@ -518,6 +544,14 @@ class AgentInvocationRecord:
     retry_of_invocation_id: str | None = None
     estimated_cost: str = "unknown"
     operator_retry_count: int = 0
+    # -- transport provenance / ACP exactly-once key (slice ADMISSIBLE_RUN_047)
+    transport_kind: str | None = None
+    acp_request_id: str | None = None
+    acp_session_id: str | None = None
+    acp_protocol_version: int | None = None
+    acp_invocation_state: str | None = None
+    acp_telemetry: dict[str, Any] | None = None
+    managed_process_result: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -567,6 +601,17 @@ class AgentInvocationRecord:
             "retry_of_invocation_id": self.retry_of_invocation_id,
             "estimated_cost": self.estimated_cost,
             "operator_retry_count": self.operator_retry_count,
+            "transport_kind": self.transport_kind,
+            "acp_request_id": self.acp_request_id,
+            "acp_session_id": self.acp_session_id,
+            "acp_protocol_version": self.acp_protocol_version,
+            "acp_invocation_state": self.acp_invocation_state,
+            "acp_telemetry": dict(self.acp_telemetry) if self.acp_telemetry is not None else None,
+            "managed_process_result": (
+                dict(self.managed_process_result)
+                if self.managed_process_result is not None
+                else None
+            ),
         }
 
     @classmethod
@@ -634,6 +679,13 @@ def build_invocation_record(
         retry_of_invocation_id=retry_of_invocation_id,
         estimated_cost=estimated_cost,
         operator_retry_count=operator_retry_count,
+        transport_kind=result.transport_kind,
+        acp_request_id=result.acp_request_id,
+        acp_session_id=result.acp_session_id,
+        acp_protocol_version=result.acp_protocol_version,
+        acp_invocation_state=result.acp_invocation_state,
+        acp_telemetry=result.acp_telemetry,
+        managed_process_result=result.managed_process_result,
     )
 
 
@@ -1421,17 +1473,29 @@ class CursorCliAgentBackend(AgentBackend):
         *,
         runner: Callable[..., Any] | None = None,
         env: dict[str, str] | None = None,
+        managed_oneshot: Callable[..., Any] | None = None,
     ) -> None:
         self.config = config if config is not None else CursorCliConfig.from_env()
-        # ``runner`` is resolved lazily to ``subprocess.run`` so tests that
-        # patch ``subprocess.run`` take effect even when runner is left default.
+        # ``runner`` is the legacy ``subprocess.run``-compatible test seam. When
+        # a runner is injected (unit tests) it is used verbatim. When it is not
+        # (production), the one-shot runs through the RUN_047 managed-process
+        # lifecycle so a timeout terminates the whole ``.CMD`` -> PowerShell ->
+        # Node tree and cannot orphan ``node.exe`` (the RUN_046 defect).
         self._runner = runner
         self._env_base = env
+        self._managed_oneshot = managed_oneshot
         self._last_status: str | None = None
         self._last_result: AgentInvocationResult | None = None
 
     def _resolve_runner(self) -> Callable[..., Any]:
         return self._runner if self._runner is not None else subprocess.run
+
+    def _resolve_managed_oneshot(self) -> Callable[..., Any]:
+        if self._managed_oneshot is not None:
+            return self._managed_oneshot
+        from admissible.managed_process import run_managed_oneshot
+
+        return run_managed_oneshot
 
     def availability(self) -> AgentBackendAvailability:
         cfg = self.config
@@ -1614,6 +1678,12 @@ class CursorCliAgentBackend(AgentBackend):
             "environment_paths": env_diag.get("environment_paths"),
         }
 
+        # Transport provenance for the one-shot path (PART A.5 / H.34): every
+        # result carries the explicit one-shot transport id and, once the
+        # managed run completes, its lifecycle proof (cleanup verification).
+        managed_result_dict: dict[str, Any] | None = None
+        transport_kind_value = BACKEND_ID_CURSOR_ONESHOT
+
         def invocation_diagnostics(stdout: str = "", **extra: Any) -> dict[str, Any]:
             base = {
                 "prompt_mode": prompt_mode,
@@ -1630,6 +1700,8 @@ class CursorCliAgentBackend(AgentBackend):
                 "full_instruction_length": len(request.instruction_text),
                 "stdout_length": len(stdout),
                 "invocation_duration_ms": duration_ms(),
+                "transport_kind": transport_kind_value,
+                "managed_process_result": managed_result_dict,
             }
             base.update(env_fields)
             base.update(extra)
@@ -1683,50 +1755,108 @@ class CursorCliAgentBackend(AgentBackend):
             self._last_result = result
             return result
 
-        runner = self._resolve_runner()
-        try:
-            completed = runner(
-                argv,
-                shell=False,
-                cwd=str(agent_workspace),
-                timeout=request.timeout_seconds,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                input=stdin_text,
-                env=safe_env,
-            )
-        except subprocess.TimeoutExpired as exc:
-            self._last_status = AGENT_INVOKE_TIMEOUT
-            result = AgentInvocationResult(
-                status=AGENT_INVOKE_TIMEOUT,
-                model_label=self.config.model_label,
-                transport_label=self.backend_id,
-                started_at=started,
-                completed_at=_now_iso(),
-                error_message=f"Cursor CLI timed out after {request.timeout_seconds}s: {exc}",
-                **invocation_diagnostics(),
-            )
-            self._last_result = result
-            return result
-        except (OSError, ValueError) as exc:
-            self._last_status = AGENT_INVOKE_FAILED
-            result = AgentInvocationResult(
-                status=AGENT_INVOKE_FAILED,
-                model_label=self.config.model_label,
-                transport_label=self.backend_id,
-                started_at=started,
-                completed_at=_now_iso(),
-                error_message=f"Cursor CLI invocation failed: {exc}",
-                **invocation_diagnostics(),
-            )
-            self._last_result = result
-            return result
-
-        stdout = _cap_text(getattr(completed, "stdout", "") or "", request.max_output_bytes)
-        stderr = _cap_text(getattr(completed, "stderr", "") or "", request.max_output_bytes)
-        exit_code = getattr(completed, "returncode", None)
+        if self._runner is not None:
+            # -- legacy injected-runner path (unit tests) -------------------
+            # subprocess.run-compatible; no real process is spawned, so no
+            # managed cleanup is needed. Behavior is unchanged from RUN_046.
+            try:
+                completed = self._runner(
+                    argv,
+                    shell=False,
+                    cwd=str(agent_workspace),
+                    timeout=request.timeout_seconds,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    input=stdin_text,
+                    env=safe_env,
+                )
+            except subprocess.TimeoutExpired as exc:
+                self._last_status = AGENT_INVOKE_TIMEOUT
+                result = AgentInvocationResult(
+                    status=AGENT_INVOKE_TIMEOUT,
+                    model_label=self.config.model_label,
+                    transport_label=self.backend_id,
+                    started_at=started,
+                    completed_at=_now_iso(),
+                    error_message=f"Cursor CLI timed out after {request.timeout_seconds}s: {exc}",
+                    **invocation_diagnostics(),
+                )
+                self._last_result = result
+                return result
+            except (OSError, ValueError) as exc:
+                self._last_status = AGENT_INVOKE_FAILED
+                result = AgentInvocationResult(
+                    status=AGENT_INVOKE_FAILED,
+                    model_label=self.config.model_label,
+                    transport_label=self.backend_id,
+                    started_at=started,
+                    completed_at=_now_iso(),
+                    error_message=f"Cursor CLI invocation failed: {exc}",
+                    **invocation_diagnostics(),
+                )
+                self._last_result = result
+                return result
+            stdout = _cap_text(getattr(completed, "stdout", "") or "", request.max_output_bytes)
+            stderr = _cap_text(getattr(completed, "stderr", "") or "", request.max_output_bytes)
+            exit_code = getattr(completed, "returncode", None)
+        else:
+            # -- managed one-shot path (production) -------------------------
+            # Spawns via the RUN_047 managed-process lifecycle so a timeout
+            # terminates the whole ``.CMD`` -> PowerShell -> Node tree and
+            # verifies cleanup — the RUN_046 orphan-process defect fix. On a
+            # timeout the result carries the cleanup proof and does not
+            # silently retry (a terminal status the controller pauses on).
+            run_oneshot = self._resolve_managed_oneshot()
+            try:
+                oneshot = run_oneshot(
+                    argv,
+                    cwd=str(agent_workspace),
+                    env=safe_env,
+                    timeout_seconds=request.timeout_seconds,
+                    input_text=stdin_text,
+                    max_capture_bytes=request.max_output_bytes,
+                )
+            except (OSError, ValueError) as exc:
+                self._last_status = AGENT_INVOKE_FAILED
+                result = AgentInvocationResult(
+                    status=AGENT_INVOKE_FAILED,
+                    model_label=self.config.model_label,
+                    transport_label=self.backend_id,
+                    started_at=started,
+                    completed_at=_now_iso(),
+                    error_message=f"Cursor CLI invocation failed: {exc}",
+                    **invocation_diagnostics(),
+                )
+                self._last_result = result
+                return result
+            managed_result_dict = oneshot.process_result.to_dict()
+            if oneshot.timed_out:
+                self._last_status = AGENT_INVOKE_TIMEOUT
+                stdout = _cap_text(oneshot.stdout or "", request.max_output_bytes)
+                stderr = _cap_text(oneshot.stderr or "", request.max_output_bytes)
+                result = AgentInvocationResult(
+                    status=AGENT_INVOKE_TIMEOUT,
+                    raw_stdout=stdout or None,
+                    raw_stderr=stderr or None,
+                    model_label=self.config.model_label,
+                    transport_label=self.backend_id,
+                    started_at=started,
+                    completed_at=_now_iso(),
+                    error_message=(
+                        f"Cursor CLI timed out after {request.timeout_seconds}s; managed "
+                        "process tree terminated ("
+                        + ("cleanup verified" if oneshot.cleanup_proven else "CLEANUP UNPROVEN")
+                        + ")."
+                    ),
+                    **invocation_diagnostics(stdout),
+                )
+                self._last_result = result
+                return result
+            stdout = _cap_text(oneshot.stdout or "", request.max_output_bytes)
+            stderr = _cap_text(oneshot.stderr or "", request.max_output_bytes)
+            exit_code = oneshot.returncode
 
         if self.config.output_mode == OUTPUT_MODE_RESPONSE_FILE:
             response_text = (
@@ -2171,6 +2301,17 @@ def describe_available_backends(env: dict[str, str] | None = None) -> list[dict[
     cursor_config = CursorCliConfig.from_env(env)
     cursor = CursorCliAgentBackend(config=cursor_config)
     cursor_availability = cursor.availability()
+    # Which *transport* ``cursor_cli`` resolves to (one-shot vs ACP) so the UI
+    # can name the exact transport (PART H.34). Kept cheap — only reads the env
+    # var; this runs in the hot state-view path, so no extra executable
+    # discovery or backend construction here.
+    from admissible.cursor_acp_transport import (
+        TRANSPORT_LABEL_ACP,
+        TRANSPORT_LABEL_ONESHOT,
+        select_transport,
+    )
+
+    selected_transport = select_transport(env)
     return [
         {
             "backend_id": BACKEND_ID_FILE_BRIDGE,
@@ -2197,6 +2338,13 @@ def describe_available_backends(env: dict[str, str] | None = None) -> list[dict[
             "safety_mode": cursor_config.safety_mode(),
             "is_cursor_agent": cursor_config.is_cursor_agent,
             "availability": cursor_availability.to_dict(),
+            # exact transport that ``cursor_cli`` resolves to at run start
+            "transport": selected_transport,
+            "transport_label": (
+                TRANSPORT_LABEL_ACP
+                if selected_transport == "acp"
+                else TRANSPORT_LABEL_ONESHOT
+            ),
         },
         {
             "backend_id": BACKEND_ID_FIXTURE,

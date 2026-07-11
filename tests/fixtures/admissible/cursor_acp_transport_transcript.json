@@ -1,0 +1,131 @@
+{
+  "fixture": "cursor_acp_transport_transcript",
+  "slice": "ADMISSIBLE_RUN_047_CURSOR_ACP_TRANSPORT_AND_MANAGED_PROCESS_LIFECYCLE",
+  "description": "Bounded ACP protocol transcript. The `initialize` exchange is derived from the real, non-model `cursor-agent acp` handshake observed live in RUN_046 (cursor-agent 2026.07.09-a3815c0), with sensitive/host-specific data removed. Everything past the handshake is spec-derived (Agent Client Protocol method names confirmed in the installed CLI's bundled source, but field layouts NOT yet confirmed live) and is labeled accordingly.",
+  "framing": "newline-delimited JSON-RPC 2.0 over stdio (one JSON object per line)",
+  "protocol_version_confirmed_live": 1,
+  "sensitive_data_removed": [
+    "host paths",
+    "auth tokens / session cookies",
+    "account identifiers",
+    "any model-generated content"
+  ],
+  "messages": [
+    {
+      "seq": 1,
+      "direction": "client_to_server",
+      "provenance": "confirmed_live",
+      "note": "The exact `initialize` request the RUN_046 handshake probe sent.",
+      "payload": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "protocolVersion": 1, "clientCapabilities": {} }
+      }
+    },
+    {
+      "seq": 2,
+      "direction": "server_to_client",
+      "provenance": "confirmed_live",
+      "note": "Well-formed JSON-RPC 2.0 response; id matched; ~1.1s round-trip. Capability values are the real ones observed (no host/account data).",
+      "payload": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+          "protocolVersion": 1,
+          "agentCapabilities": {
+            "loadSession": true,
+            "mcpCapabilities": { "http": true, "sse": true },
+            "promptCapabilities": { "audio": false, "embeddedContext": false, "image": true },
+            "sessionCapabilities": { "list": {} }
+          },
+          "authMethods": ["cursor_login"]
+        }
+      }
+    },
+    {
+      "seq": 3,
+      "direction": "client_to_server",
+      "provenance": "spec_derived_unconfirmed",
+      "note": "`session/new` method name confirmed in bundled source; param layout is from the Agent Client Protocol spec, NOT confirmed live.",
+      "payload": {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "session/new",
+        "params": { "cwd": "<isolated-agent-workspace>", "mcpServers": [] }
+      }
+    },
+    {
+      "seq": 4,
+      "direction": "server_to_client",
+      "provenance": "spec_derived_unconfirmed",
+      "note": "Expected `session/new` result shape (sessionId). Field name not confirmed live.",
+      "payload": {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "result": { "sessionId": "<session-id>" }
+      }
+    },
+    {
+      "seq": 5,
+      "direction": "client_to_server",
+      "provenance": "spec_derived_unconfirmed",
+      "note": "`session/prompt` with a client-assigned unique request id (string). The prompt text is the governed Admissible instruction.",
+      "payload": {
+        "jsonrpc": "2.0",
+        "id": "req-<uuid>",
+        "method": "session/prompt",
+        "params": {
+          "sessionId": "<session-id>",
+          "prompt": [{ "type": "text", "text": "<governed instruction text>" }]
+        }
+      }
+    },
+    {
+      "seq": 6,
+      "direction": "server_to_client",
+      "provenance": "spec_derived_unconfirmed",
+      "note": "Progress notification. Admissible accumulates `agent_message_chunk` text into the canonical response and stores only a bounded summary for every other update kind (never raw token/thought streams).",
+      "payload": {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+          "sessionId": "<session-id>",
+          "update": {
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "<response text delta>" }
+          }
+        }
+      }
+    },
+    {
+      "seq": 7,
+      "direction": "server_to_client",
+      "provenance": "spec_derived_unconfirmed",
+      "note": "Terminal result for the prompt request id. Admissible treats the first terminal for a request id as authoritative and ignores replays (exactly-once).",
+      "payload": {
+        "jsonrpc": "2.0",
+        "id": "req-<uuid>",
+        "result": { "stopReason": "end_turn" }
+      }
+    },
+    {
+      "seq": 8,
+      "direction": "client_to_server",
+      "provenance": "spec_derived_unconfirmed",
+      "note": "Targeted cancellation (sent on idle/absolute timeout before the managed process tree is terminated). Method name confirmed in bundled source.",
+      "payload": {
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": { "sessionId": "<session-id>" }
+      }
+    }
+  ],
+  "unknowns": [
+    "Exact `session/new` / `session/prompt` request+result field layouts (only `initialize` confirmed live).",
+    "Whether `session/prompt` returns a distinct acceptance ack before progress, or acceptance is implicit in the first `session/update`.",
+    "Whether `session/cancel` is a request (expects a response) or a notification.",
+    "Auth (`cursor_login`) semantics for a headless server beyond the bare handshake.",
+    "Behavior/removal risk of the hidden `acp` command across future CLI versions."
+  ]
+}

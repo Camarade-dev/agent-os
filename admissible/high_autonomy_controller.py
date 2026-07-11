@@ -2397,33 +2397,57 @@ def _resolve_transport_kind(transport: "AgentTransport") -> str:
     return "file_bridge"
 
 
-def _build_backend_from_id(backend_id: str, workspace_path: str) -> Any:
-    """Resolve a selectable backend id to a callable backend, or None.
+def _build_backend_from_id(
+    backend_id: str, workspace_path: str, *, apply_transport_selection: bool = False
+) -> Any:
+    """Resolve a selectable/concrete backend id to a callable backend, or None.
 
     ``file_bridge`` stays a pull/external transport (returns None so the default
-    FileBridgeAgentTransport is used). ``cursor_cli`` builds a callable backend
-    from the environment config and is rejected up front when not available, so
-    a run never starts only to immediately pause. ``fixture`` is test-only and
-    not selectable from the HTTP surface.
+    FileBridgeAgentTransport is used). ``cursor_cli`` builds a callable Cursor
+    backend; which *transport* it uses (legacy one-shot stdout vs the RUN_047
+    ACP transport) is chosen by ``ADMISSIBLE_CURSOR_TRANSPORT`` **only at run
+    start** (``apply_transport_selection``). The concrete transport id
+    (``cursor_cli`` one-shot or ``cursor_acp``) is then persisted, so a
+    reconstructed controller rebuilds the *same* transport and never silently
+    switches transports mid-run (PART H.32). If ACP is selected but unavailable,
+    this raises a technical capability gap rather than silently falling back to
+    one-shot (PART H.33). ``fixture`` is test-only and not selectable from the
+    HTTP surface.
     """
     from admissible.agent_backend import (
         AGENT_AVAILABILITY_AVAILABLE,
+        BACKEND_ID_CURSOR_ACP,
         BACKEND_ID_CURSOR_CLI,
+        BACKEND_ID_CURSOR_ONESHOT,
         BACKEND_ID_FILE_BRIDGE,
         BACKEND_ID_FIXTURE,
         CursorCliAgentBackend,
     )
+    from admissible.cursor_acp_transport import (
+        TRANSPORT_ACP,
+        CursorAcpBackend,
+        select_transport,
+    )
+
+    def _require_available(backend: Any, label: str) -> Any:
+        availability = backend.availability()
+        if availability.status != AGENT_AVAILABILITY_AVAILABLE:
+            raise ValueError(f"{label} is not available: {availability.message}")
+        return backend
 
     if not backend_id or backend_id == BACKEND_ID_FILE_BRIDGE:
         return None
+    if backend_id == BACKEND_ID_CURSOR_ACP:
+        # Explicit/persisted ACP id: never falls back to one-shot.
+        return _require_available(CursorAcpBackend(), "Cursor Agent ACP transport")
+    if backend_id == BACKEND_ID_CURSOR_ONESHOT:
+        return _require_available(CursorCliAgentBackend(), "Cursor CLI one-shot transport")
     if backend_id == BACKEND_ID_CURSOR_CLI:
-        backend = CursorCliAgentBackend()
-        availability = backend.availability()
-        if availability.status != AGENT_AVAILABILITY_AVAILABLE:
-            raise ValueError(
-                f"Cursor CLI backend is not available: {availability.message}"
-            )
-        return backend
+        if apply_transport_selection and select_transport() == TRANSPORT_ACP:
+            # Operator explicitly selected the ACP transport; a capability gap
+            # is surfaced, never silently downgraded to one-shot.
+            return _require_available(CursorAcpBackend(), "Cursor Agent ACP transport")
+        return _require_available(CursorCliAgentBackend(), "Cursor CLI backend")
     if backend_id == BACKEND_ID_FIXTURE:
         raise ValueError("The fixture backend is test-only and cannot be started from the UI.")
     raise ValueError(f"Unknown agent backend id: {backend_id!r}")
@@ -2477,7 +2501,9 @@ def start_high_autonomy_run(
     controller.set_autonomy("L4_HIGH_AUTONOMY_HARD_GATES")
 
     if transport is None and backend is None and backend_id:
-        backend = _build_backend_from_id(backend_id, workspace_path)
+        backend = _build_backend_from_id(
+            backend_id, workspace_path, apply_transport_selection=True
+        )
 
     resolved_agent_workspace: str | None = None
     if transport is None and backend is not None:
