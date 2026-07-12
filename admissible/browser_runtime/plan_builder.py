@@ -27,7 +27,12 @@ _MIN_TOKEN_LEN = 2
 _RUNTIME_CHECKABLE_HINT_RE = re.compile(
     r"\bno uncaught errors?\b"
     r"|\bexternal\b.*\b(?:network|request|api|access)\b|\bno external\b"
-    r"|\?debug=1\b|\bdebug(?:ging)? interface\b|\bdebug overlay\b",
+    r"|\?debug=1\b|\bdebug(?:ging)? interface\b|\bdebug overlay\b"
+    r"|\buncaught\s+page\s+exceptions?\b|\bmaterial\s+console\s+errors?\b",
+    re.I,
+)
+_POINTER_STEERING_RE = re.compile(
+    r"\bpointer[\-\s]driven\b|\bmoving the mouse\b|\bpointer changes\b|\bcontinuous.*\bsteering\b",
     re.I,
 )
 
@@ -121,7 +126,17 @@ class _Builder:
         # the zero-step passthrough branch below just because the ledger
         # already carries the disposition it produced last time.
         should_attempt = current_disposition in ("unsupported_verifier", "deterministic_runtime") or (
-            current_disposition == "evidence_required" and _RUNTIME_CHECKABLE_HINT_RE.search(text)
+            current_disposition == "evidence_required"
+            and (
+                _RUNTIME_CHECKABLE_HINT_RE.search(text)
+                or (
+                    self.required_fields
+                    and (
+                        _extract_signals_for_text(text).get("numeric_thresholds")
+                        or _POINTER_STEERING_RE.search(text)
+                    )
+                )
+            )
         )
         if not should_attempt:
             self.criteria.append(
@@ -137,7 +152,7 @@ class _Builder:
             )
             return
 
-        if mc.infer_verification_disposition(text) == "human_observation_required":
+        if mc.infer_verification_disposition(text) == "human_observation_required" and not _POINTER_STEERING_RE.search(text):
             self.criteria.append(
                 BrowserRuntimeCriterionPlan(
                     criterion_id=cid,
@@ -156,6 +171,7 @@ class _Builder:
         required_observables: list[str] = []
         supported = False
         unsupported_reason: str | None = None
+        human_subaspect = mc.infer_human_observation_subaspect(text)
 
         if signals.get("runtime_stability_requirements"):
             aid = f"{cid}_no_uncaught_errors"
@@ -163,6 +179,10 @@ class _Builder:
             self.steps.append({"type": "assert_console_clean", "criterion_id": cid, "assertion_id": f"{cid}_console_clean"})
             assertion_ids += [aid, f"{cid}_console_clean"]
             supported = True
+            if re.search(r"\bexternal\b.*\b(network|request|api|access)\b|\bno external\b", text, re.I):
+                ext_aid = f"{cid}_no_external_requests"
+                self.steps.append({"type": "assert_no_external_requests", "criterion_id": cid, "assertion_id": ext_aid})
+                assertion_ids.append(ext_aid)
 
         elif re.search(r"\bexternal\b.*\b(network|request|api|access)\b|\bno external\b", text, re.I):
             aid = f"{cid}_no_external_requests"
@@ -257,6 +277,32 @@ class _Builder:
                 assertion_ids.append(aid)
                 supported = True
 
+        elif _POINTER_STEERING_RE.search(text):
+            field = _find_matching_field({"player", "heading", "x", "y"}, self.required_fields)
+            self.steps.append({"type": "pointer_move", "x": 200, "y": 200, "criterion_id": cid, "assertion_id": f"{cid}_pointer_move"})
+            assertion_ids.append(f"{cid}_pointer_move")
+            if field is None:
+                unsupported_reason = "control_effect_not_mapped_to_declared_snapshot_field"
+                required_observables.append("player_heading_or_position_field")
+                self.missing_control_mappings.append(cid)
+            else:
+                self._ensure_contract_snapshot()
+                after_name = f"{cid}_after_pointer"
+                self.steps.append({"type": "debug_snapshot", "name": after_name, "criterion_id": cid})
+                aid = f"{cid}_pointer_effect"
+                self.steps.append(
+                    {
+                        "type": "compare_snapshot_path_changed",
+                        "before_snapshot": "contract",
+                        "after_snapshot": after_name,
+                        "path": field,
+                        "criterion_id": cid,
+                        "assertion_id": aid,
+                    }
+                )
+                assertion_ids.append(aid)
+                supported = True
+
         elif re.search(r"\?debug=1\b|\bdebug(?:ging)? interface\b|\bdebug overlay\b", text, re.I) and self.debug_interface is not None:
             query_flag = "debug=1" if "?debug=1" in (signals.get("query_flags") or self.intent.get("query_flags") or []) else ""
             if query_flag:
@@ -266,18 +312,70 @@ class _Builder:
             self.steps.append({"type": "debug_snapshot", "name": f"{cid}_debug_overlay", "criterion_id": cid, "assertion_id": aid})
             assertion_ids.append(aid)
             if self.required_fields:
-                field_aid = f"{cid}_debug_overlay_fields"
+                for field_name in self.required_fields:
+                    field_aid = f"{cid}_debug_field_{field_name}"
+                    self.steps.append(
+                        {
+                            "type": "assert_json_path_present",
+                            "snapshot": f"{cid}_debug_overlay",
+                            "path": field_name,
+                            "criterion_id": cid,
+                            "assertion_id": field_aid,
+                        }
+                    )
+                    assertion_ids.append(field_aid)
+            if "loopCount" in self.required_fields and re.search(r"\bloopCount\b.*\bmust increase\b|\bmust increase\b.*\bloop\b", text, re.I):
+                self.steps.append({"type": "wait_bounded", "duration_ms": 300, "criterion_id": cid})
+                loop_after = f"{cid}_loop_tick"
+                self.steps.append({"type": "debug_snapshot", "name": loop_after, "criterion_id": cid})
+                loop_aid = f"{cid}_loop_count_increased"
+                self.steps.append(
+                    {
+                        "type": "compare_snapshot_path_increased",
+                        "before_snapshot": f"{cid}_debug_overlay",
+                        "after_snapshot": loop_after,
+                        "path": "loopCount",
+                        "criterion_id": cid,
+                        "assertion_id": loop_aid,
+                    }
+                )
+                assertion_ids.append(loop_aid)
+            if "debugVisible" in self.required_fields and "?debug=1" in text:
+                vis_aid = f"{cid}_debug_visible"
+                self.steps.append(
+                    {
+                        "type": "assert_json_path_equals",
+                        "snapshot": f"{cid}_debug_overlay",
+                        "path": "debugVisible",
+                        "expected": True,
+                        "criterion_id": cid,
+                        "assertion_id": vis_aid,
+                    }
+                )
+                assertion_ids.append(vis_aid)
+            supported = True
+
+        elif self.required_fields and self.debug_interface is not None:
+            mentioned_fields = [
+                field_name
+                for field_name in self.required_fields
+                if re.search(rf"\b{re.escape(field_name)}\b", text, re.I)
+            ]
+            mentioned_field = max(mentioned_fields, key=len) if mentioned_fields else None
+            if mentioned_field is not None:
+                self._ensure_contract_snapshot()
+                aid = f"{cid}_field_{mentioned_field}"
                 self.steps.append(
                     {
                         "type": "assert_json_path_present",
-                        "snapshot": f"{cid}_debug_overlay",
-                        "path": self.required_fields[0],
+                        "snapshot": "contract",
+                        "path": mentioned_field,
                         "criterion_id": cid,
-                        "assertion_id": field_aid,
+                        "assertion_id": aid,
                     }
                 )
-                assertion_ids.append(field_aid)
-            supported = True
+                assertion_ids.append(aid)
+                supported = True
 
         else:
             unsupported_reason = "no_safe_observable_derivable"
@@ -308,7 +406,7 @@ class _Builder:
                 required_observables=required_observables,
                 supported=final_disposition != "unsupported_verifier",
                 unsupported_reason=unsupported_reason,
-                human_observation_required=False,
+                human_observation_required=human_subaspect,
             )
         )
 

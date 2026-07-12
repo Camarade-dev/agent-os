@@ -543,9 +543,20 @@ def contract_acceptance_ledger(contract: MissionContract | dict[str, Any]) -> li
     return ledger
 
 
+def infer_human_observation_subaspect(text: str) -> bool:
+    """True when the text carries a subjective smoothness/polish aspect."""
+
+    lower = text.lower()
+    return any(x in lower for x in ("smooth", "visual", "readable", "polished", "approximately", "fps"))
+
+
 def infer_verification_disposition(text: str) -> str:
     lower = text.lower()
-    if any(x in lower for x in ("smooth", "visual", "readable", "polished", "approximately", "fps")):
+    # Objective pointer-steering checks stay runtime-shaped even when the same
+    # criterion also mentions subjective smoothness (Neon criterion 4).
+    if _POINTER_STEERING_RE.search(text):
+        return "evidence_required"
+    if infer_human_observation_subaspect(text):
         return "human_observation_required"
     if any(x in lower for x in ("runtime", "restart", "collision", "active", "live ", "camera", "respawn")):
         return "unsupported_verifier"
@@ -653,7 +664,17 @@ _PRESS_KEY_RE = re.compile(r"\bpress\s+([A-Za-z0-9])\s+to\s+([a-zA-Z][a-zA-Z \-]
 _PAUSE_RESUME_RE = re.compile(r"\bpause\s+and\s+resume\s+with\s+([A-Za-z0-9])\b", re.I)
 _DOM_TOKEN_RE = re.compile(r"(?<![\w])([#.][A-Za-z_][A-Za-z0-9_\-]*)")
 _NO_DUPLICATE_LOOPS_RE = re.compile(r"\bmust\s+not\s+create\s+duplicate\s+animation\s+loops?\b", re.I)
-_NO_UNCAUGHT_ERRORS_RE = re.compile(r"\bno\s+uncaught\s+errors?\b", re.I)
+_NO_UNCAUGHT_ERRORS_RE = re.compile(
+    r"\bno\s+uncaught\s+errors?\b"
+    r"|\buncaught\s+page\s+exceptions?\b"
+    r"|\bmaterial\s+console\s+errors?\b",
+    re.I,
+)
+_SUBREQUIREMENT_FIELD_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*:", re.M)
+_POINTER_STEERING_RE = re.compile(
+    r"\bpointer[\-\s]driven\b|\bmoving the mouse\b|\bpointer changes\b|\bcontinuous.*\bsteering\b",
+    re.I,
+)
 _REPEATED_RESTART_RE = re.compile(r"\bremain\s+playable\s+after\s+repeated\s+restart\s+cycles\b", re.I)
 _LEADERBOARD_UPDATES_RE = re.compile(r"\bleaderboard\s+updates?\s+during\s+play\b", re.I)
 _DEBUG_FLAG_OVERLAY_RE = re.compile(r"\?debug=1\b")
@@ -718,6 +739,13 @@ def extract_runtime_observability_intent(contract: dict[str, Any] | "MissionCont
             cleaned = re.sub(r"^[`']|[`']$", "", cleaned)
             if cleaned:
                 required_snapshot_fields.append(cleaned)
+    for criterion in list(data.get("explicit_acceptance_criteria") or []):
+        for sub in list(criterion.get("subrequirements") or []):
+            sub_text = str(sub.get("source_text") or "").strip()
+            field_match = _SUBREQUIREMENT_FIELD_RE.match(sub_text)
+            if field_match:
+                required_snapshot_fields.append(field_match.group(1))
+    required_snapshot_fields = list(dict.fromkeys(required_snapshot_fields))
 
     query_flags = sorted(set(_QUERY_FLAG_RE.findall(joined)))
     if _DEBUG_FLAG_OVERLAY_RE.search(joined) and "?debug=1" not in query_flags:

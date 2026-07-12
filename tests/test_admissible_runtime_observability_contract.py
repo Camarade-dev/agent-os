@@ -84,6 +84,18 @@ def test_no_duplicate_matches_when_a_requirement_line_also_appears_in_raw_goal()
     assert len(intent["numeric_thresholds"]) == 1
 
 
+def test_extracts_snapshot_fields_from_structured_subrequirements():
+    goal = (
+        "Build a demo.\n\n"
+        "Acceptance criteria:\n"
+        "1. Expose window.__DEMO__.snapshot() returning exactly these fields:\n"
+        "   - alpha: number\n"
+        "   - beta: string\n"
+    )
+    intent = _intent_for(goal)
+    assert intent["required_snapshot_fields"] == ["alpha", "beta"]
+
+
 def test_extraction_never_hardcodes_a_specific_game_or_field_name():
     # The same generic patterns fire regardless of the domain noun used.
     dashboard_intent = _intent_for("Requirements:\n- At least 5 charts must render.\n")
