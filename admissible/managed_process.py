@@ -548,11 +548,27 @@ def _default_spawn(
 class _StreamPump:
     """Read a text stream line-by-line into a queue, recording first-byte time
     and bounded byte accounting. Never retains an unbounded buffer for the
-    interactive path (the client drains the queue as it reads)."""
+    interactive path (the client drains the queue as it reads).
 
-    def __init__(self, stream: Any, *, max_bytes: int) -> None:
+    ``byte_count`` is the *true* total bytes observed on the stream, tracked
+    unconditionally -- it does not freeze once the retention cap is hit. Only
+    the retained text (``drained_text()``) is capped; a caller that needs
+    authoritative facts about content beyond the retained prefix (e.g. Cursor's
+    NDJSON terminal event) should use ``on_line`` to observe every line as it
+    is read, since a bounded prefix capture can never be relied on to contain
+    it (ADMISSIBLE_NARROW_FIX_CURSOR_NDJSON_TERMINAL_EVENT_CAPTURE).
+    """
+
+    def __init__(
+        self,
+        stream: Any,
+        *,
+        max_bytes: int,
+        on_line: Callable[[str], None] | None = None,
+    ) -> None:
         self._stream = stream
         self._max_bytes = max_bytes
+        self._on_line = on_line
         self.queue: Queue[str | None] = Queue()
         self.byte_count = 0
         self.truncated = False
@@ -573,12 +589,19 @@ class _StreamPump:
                 if self.first_at is None:
                     self.first_at = _now_iso()
                 encoded = len(line.encode("utf-8", errors="replace"))
-                if self.byte_count + encoded > self._max_bytes:
+                # Always account for the true total, even past the retention
+                # cap -- a diagnostic-capture limit must never masquerade as
+                # "this is how much output there really was".
+                self.byte_count += encoded
+                if self.byte_count > self._max_bytes:
                     self.truncated = True
-                else:
-                    self.byte_count += encoded
-                    if self._retain:
-                        self._retained.append(line)
+                elif self._retain:
+                    self._retained.append(line)
+                if self._on_line is not None:
+                    try:
+                        self._on_line(line)
+                    except Exception:
+                        pass
                 self.queue.put(line)
         except Exception:
             pass
@@ -643,6 +666,7 @@ class ManagedProcess:
         force_seconds: float = _DEFAULT_FORCE_SECONDS,
         spawn: SpawnFn | None = None,
         containment: ContainmentStrategy | None = None,
+        on_stdout_line: Callable[[str], None] | None = None,
     ) -> None:
         self.argv = list(argv)
         self.cwd = cwd
@@ -653,6 +677,12 @@ class ManagedProcess:
         self.force_seconds = force_seconds
         self._spawn = spawn or _default_spawn
         self._containment = containment or default_containment_strategy()
+        # Generic per-line observer (PART: ADMISSIBLE_NARROW_FIX_CURSOR_NDJSON_
+        # TERMINAL_EVENT_CAPTURE). Nothing here is protocol-specific -- it just
+        # forwards raw stdout lines as they are read, so a caller (e.g. the
+        # Cursor NDJSON parser) can incrementally observe the *complete*
+        # stream regardless of the bounded retention cap below.
+        self._on_stdout_line = on_stdout_line
 
         self._proc: Any = None
         self._stdout_pump: _StreamPump | None = None
@@ -703,7 +733,9 @@ class ManagedProcess:
         except Exception:
             self._observed_descendants = []
         self._stdout_pump = _StreamPump(
-            getattr(self._proc, "stdout", None), max_bytes=self.max_capture_bytes
+            getattr(self._proc, "stdout", None),
+            max_bytes=self.max_capture_bytes,
+            on_line=self._on_stdout_line,
         )
         self._stderr_pump = _StreamPump(
             getattr(self._proc, "stderr", None), max_bytes=self.max_capture_bytes
@@ -875,10 +907,14 @@ def run_managed_oneshot(
     max_capture_bytes: int = _DEFAULT_MAX_CAPTURE_BYTES,
     spawn: SpawnFn | None = None,
     containment: ContainmentStrategy | None = None,
+    on_stdout_line: Callable[[str], None] | None = None,
 ) -> ManagedOneshotResult:
     """Run ``argv`` to completion with a hard timeout and *guaranteed* tree
     cleanup. On timeout the whole process tree is terminated (not just the
     direct child) and cleanup is verified — the RUN_046 orphan-process fix.
+
+    ``on_stdout_line``, when given, is called with every stdout line as it is
+    read, independent of ``max_capture_bytes`` -- see ``_StreamPump``.
     """
     proc = ManagedProcess(
         argv,
@@ -888,6 +924,7 @@ def run_managed_oneshot(
         max_capture_bytes=max_capture_bytes,
         spawn=spawn,
         containment=containment,
+        on_stdout_line=on_stdout_line,
     )
     proc.start()
     if input_text is not None:

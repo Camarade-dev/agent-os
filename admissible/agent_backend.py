@@ -70,7 +70,9 @@ from admissible.cursor_stream_json import (
     CLASSIFICATION_EMPTY_SUCCESS,
     CLASSIFICATION_TERMINAL_ERROR,
     CLASSIFICATION_TERMINAL_RESULT_WITHOUT_STRUCTURED_PROPOSAL,
+    CLASSIFICATION_TRANSPORT_OUTPUT_TRUNCATED,
     CLASSIFICATION_TRANSPORT_PARSE_ERROR,
+    IncrementalStreamJsonAccumulator,
     parse_cursor_stream_json,
 )
 
@@ -93,6 +95,13 @@ AGENT_INVOKE_TERMINAL_ERROR = "terminal_error"
 AGENT_INVOKE_TERMINAL_RESULT_WITHOUT_STRUCTURED_PROPOSAL = (
     "terminal_result_without_structured_proposal"
 )
+# Slice ADMISSIBLE_NARROW_FIX_CURSOR_NDJSON_TERMINAL_EVENT_CAPTURE: the terminal
+# event could not be preserved because a hard transport safety limit was
+# exceeded (raw capture truncated before any terminal event was observed, or
+# the terminal event's own `result` text exceeded its dedicated safety limit).
+# Kept distinct from AGENT_INVOKE_TRANSPORT_PARSE_ERROR so an operator can tell
+# a capture-limit artifact apart from a genuinely malformed/absent response.
+AGENT_INVOKE_TRANSPORT_OUTPUT_TRUNCATED = "transport_output_truncated"
 
 AGENT_INVOKE_STATUS_CODES = frozenset(
     {
@@ -106,6 +115,7 @@ AGENT_INVOKE_STATUS_CODES = frozenset(
         AGENT_INVOKE_TRANSPORT_PARSE_ERROR,
         AGENT_INVOKE_TERMINAL_ERROR,
         AGENT_INVOKE_TERMINAL_RESULT_WITHOUT_STRUCTURED_PROPOSAL,
+        AGENT_INVOKE_TRANSPORT_OUTPUT_TRUNCATED,
     }
 )
 
@@ -123,6 +133,7 @@ AGENT_INVOKE_TERMINAL_STATUSES = frozenset(
         AGENT_INVOKE_TRANSPORT_PARSE_ERROR,
         AGENT_INVOKE_TERMINAL_ERROR,
         AGENT_INVOKE_TERMINAL_RESULT_WITHOUT_STRUCTURED_PROPOSAL,
+        AGENT_INVOKE_TRANSPORT_OUTPUT_TRUNCATED,
     }
 )
 
@@ -1787,6 +1798,16 @@ class CursorCliAgentBackend(AgentBackend):
         # managed run completes, its lifecycle proof (cleanup verification).
         managed_result_dict: dict[str, Any] | None = None
         transport_kind_value = BACKEND_ID_CURSOR_ONESHOT
+        # PART: ADMISSIBLE_NARROW_FIX_CURSOR_NDJSON_TERMINAL_EVENT_CAPTURE. Fed
+        # one raw stdout line at a time via the managed-process on_stdout_line
+        # hook (below) so the terminal event / canonical result / diagnostic
+        # counts stay accurate even though the raw `stdout` capture itself is
+        # bounded and may be truncated before the (last-written) terminal
+        # event. Only built for the NDJSON preset; unused (and harmless) for
+        # any other Cursor CLI configuration.
+        stream_accumulator = (
+            IncrementalStreamJsonAccumulator() if self.config.is_cursor_agent else None
+        )
 
         def invocation_diagnostics(stdout: str = "", **extra: Any) -> dict[str, Any]:
             base = {
@@ -1921,6 +1942,9 @@ class CursorCliAgentBackend(AgentBackend):
                     timeout_seconds=request.timeout_seconds,
                     input_text=stdin_text,
                     max_capture_bytes=request.max_output_bytes,
+                    on_stdout_line=(
+                        stream_accumulator.feed_line if stream_accumulator is not None else None
+                    ),
                 )
             except (OSError, ValueError) as exc:
                 self._last_status = AGENT_INVOKE_FAILED
@@ -2023,9 +2047,26 @@ class CursorCliAgentBackend(AgentBackend):
             # assistant/tool/thinking events (including any `createPlan`
             # tool-call/interaction-query workflow) never become the
             # canonical response and never reach the operation extractor.
-            parse_result = parse_cursor_stream_json(stdout)
+            #
+            # ADMISSIBLE_NARROW_FIX_CURSOR_NDJSON_TERMINAL_EVENT_CAPTURE: the
+            # managed one-shot path classifies from `stream_accumulator`
+            # (fed every raw line as it streamed, live, via the managed-
+            # process on_stdout_line hook) rather than by re-parsing the
+            # bounded `stdout` capture below -- a prefix-only capture can
+            # drop the terminal event simply because it is written last.
+            if stream_accumulator is not None and self._runner is None:
+                parse_result = stream_accumulator.finalize(
+                    raw_output_truncated=bool(oneshot.process_result.output_truncated)
+                )
+                parse_result.diagnostics["total_stdout_byte_count"] = (
+                    oneshot.process_result.stdout_bytes
+                )
+            else:
+                parse_result = parse_cursor_stream_json(stdout)
             stream_diag = {"stream_json_diagnostics": parse_result.diagnostics}
-            if parse_result.classification == CLASSIFICATION_TRANSPORT_PARSE_ERROR:
+            if parse_result.classification == CLASSIFICATION_TRANSPORT_OUTPUT_TRUNCATED:
+                status = AGENT_INVOKE_TRANSPORT_OUTPUT_TRUNCATED
+            elif parse_result.classification == CLASSIFICATION_TRANSPORT_PARSE_ERROR:
                 status = AGENT_INVOKE_TRANSPORT_PARSE_ERROR
             elif parse_result.classification == CLASSIFICATION_TERMINAL_ERROR:
                 status = AGENT_INVOKE_TERMINAL_ERROR

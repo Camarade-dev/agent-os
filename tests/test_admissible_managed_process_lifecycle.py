@@ -297,7 +297,19 @@ class TestOneshotAdapterUsesManagedCleanup(unittest.TestCase):
     def _managed_oneshot(self, *, timed_out, cleanup_complete, stdout=""):
         from admissible.managed_process import ManagedOneshotResult, ManagedProcessResult
 
-        def fake(argv, *, cwd, env, timeout_seconds, input_text=None, max_capture_bytes=0):
+        def fake(
+            argv,
+            *,
+            cwd,
+            env,
+            timeout_seconds,
+            input_text=None,
+            max_capture_bytes=0,
+            on_stdout_line=None,
+        ):
+            if on_stdout_line is not None:
+                for line in stdout.splitlines():
+                    on_stdout_line(line)
             mpr = ManagedProcessResult(
                 process_id=999,
                 observed_descendant_ids=[1000, 1001],
@@ -308,6 +320,7 @@ class TestOneshotAdapterUsesManagedCleanup(unittest.TestCase):
                 cleanup_complete=cleanup_complete,
                 remaining_process_ids=[] if cleanup_complete else [1001],
                 platform_strategy="windows_job_object",
+                stdout_bytes=len(stdout.encode("utf-8")),
             )
             return ManagedOneshotResult(
                 returncode=None if timed_out else 0,

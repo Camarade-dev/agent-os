@@ -3464,6 +3464,8 @@ class ControlSurfaceController:
             structured_operations=all_structured_operations,
             satisfied_paths=latest_file_hashes(self._session.operation_records),
             avoid_optional_polish=avoid_optional,
+            mandatory_paths=(self._session.mission_contract or {}).get("mandatory_paths"),
+            operation_limit=int(ha_config.get("max_structured_operations_per_response") or 8),
         )
         extraction_report["proposal_coverage"] = coverage_report
         optional_classifications = classify_optional_write_paths(coverage_report)

@@ -538,7 +538,19 @@ class TestManagedCleanupAndTargetMutationPreserved(unittest.TestCase):
                 }
             )
 
-            def fake_managed_oneshot(argv, *, cwd, env, timeout_seconds, input_text=None, max_capture_bytes=0):
+            def fake_managed_oneshot(
+                argv,
+                *,
+                cwd,
+                env,
+                timeout_seconds,
+                input_text=None,
+                max_capture_bytes=0,
+                on_stdout_line=None,
+            ):
+                if on_stdout_line is not None:
+                    for line in ndjson_stdout.splitlines():
+                        on_stdout_line(line)
                 mpr = ManagedProcessResult(
                     process_id=4242,
                     observed_descendant_ids=[4243],
@@ -549,6 +561,7 @@ class TestManagedCleanupAndTargetMutationPreserved(unittest.TestCase):
                     cleanup_complete=True,
                     remaining_process_ids=[],
                     platform_strategy="windows_job_object",
+                    stdout_bytes=len(ndjson_stdout.encode("utf-8")),
                 )
                 return ManagedOneshotResult(
                     returncode=0, stdout=ndjson_stdout, stderr="", timed_out=False, process_result=mpr

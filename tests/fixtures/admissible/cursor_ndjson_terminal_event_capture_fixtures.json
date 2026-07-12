@@ -1,0 +1,18 @@
+{
+  "_description": "Fixtures for ADMISSIBLE_NARROW_FIX_CURSOR_NDJSON_TERMINAL_EVENT_CAPTURE. cli_005_live_failure_replay is the sanitized metadata from the real Cursor one-shot invocation cited in the task brief (managed process completed cleanly, exit 0, stderr empty, but the NDJSON terminal `result` event fell past the ~512 KiB stdout capture prefix). Only the recorded metadata is reproduced here -- the real stdout bytes are not available/sanitized.",
+
+  "cli_005_live_failure_replay": {
+    "description": "Recorded metadata from the cited real invocation: exit code 0, zero stderr bytes, ~524253 stdout bytes against a ~524288-byte (512 KiB) capture limit, output_truncated true, clean managed-process completion (zero remaining processes), and no terminal `result` event present in the retained prefix. Note stdout_bytes (524253) sits just UNDER the capture_limit_bytes (524288) -- itself evidence of the pre-fix _StreamPump root-cause bug, where byte_count freezes near (not at, and never above) the cap once truncation begins instead of tracking the true uncapped total; the real total emitted by the process was almost certainly larger and simply went uncounted. Old classification was reported as 'malformed'; corrected classification must be transport_output_truncated (not malformed, not a generic transport_parse_error) because a terminal event was never independently preserved.",
+    "exit_code": 0,
+    "stderr_bytes": 0,
+    "stdout_bytes": 524253,
+    "retained_stdout_bytes": 524247,
+    "capture_limit_bytes": 524288,
+    "output_truncated": true,
+    "cleanup_complete": true,
+    "remaining_process_ids": [],
+    "terminal_event_found_in_retained_prefix": false,
+    "old_reported_classification": "malformed",
+    "corrected_classification": "transport_output_truncated"
+  }
+}

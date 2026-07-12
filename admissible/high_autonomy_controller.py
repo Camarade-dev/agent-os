@@ -247,6 +247,13 @@ class HighAutonomyRunState:
     no_progress_tick_count: int = 0
     auto_tick_safe: bool = True
     last_progress_fingerprint: str | None = None
+    # PART 4 (verification idempotency): semantic fingerprint of the last
+    # static verification pass that actually ran to completion (workspace
+    # content + plan/profile + targeted criteria + repair round). Lets a
+    # reselection of run_bounded_verification against unchanged state be
+    # deduplicated instead of re-executed. Deliberately excludes evidence
+    # IDs/timestamps.
+    last_static_verification_fingerprint: str | None = None
     extraction_failure_count: int = 0
     local_reextraction_attempt_count: int = 0
     pending_executable_selection_failures: list[dict[str, Any]] = field(default_factory=list)
@@ -1506,6 +1513,16 @@ def _tick_ingest_file_bridge(
         turn_number=controller._session.run_loop.current_turn,
         response_sha256=read_result.cursor or "",
     )
+    # `ingest_agent_response` already loaded its own fresh HighAutonomyRunState
+    # and persisted it (proposal-coverage report, contract-conformance report,
+    # completion-candidate fields, etc.) -- resync this function's `ha_state`
+    # (loaded by the caller *before* that call) onto the just-persisted state
+    # in place before the redundant _ingest_success_state/_save_ha_state below
+    # run again, or that persisted-but-not-yet-reflected-here update would be
+    # silently clobbered back to its pre-ingest value.
+    refreshed = controller._high_autonomy_state()
+    if refreshed is not None:
+        ha_state.__dict__.update(refreshed.__dict__)
     _ingest_success_state(
         controller,
         ha_state,
@@ -1634,6 +1651,7 @@ def _enter_repair_needed(
         remaining_turn_budget=_remaining_work_turn_budget(ha_state),
         repair_round=ha_state.repair_round_count,
         max_repair_rounds=ha_state.max_repair_rounds,
+        mandatory_paths=(controller._session.mission_contract or {}).get("mandatory_paths"),
     )
     ha_state.repair_history.append(
         {
@@ -1961,6 +1979,84 @@ def _mandatory_acceptance_complete(ha_state: HighAutonomyRunState) -> bool:
     )
 
 
+def _static_verification_fingerprint(
+    controller: "ControlSurfaceController",
+    ha_state: HighAutonomyRunState,
+    verify_body: dict[str, Any],
+) -> str:
+    """Semantic identity of one static (bounded local) verification pass.
+
+    PART 4 of the partial-batch/repair-livelock fix: workspace content
+    relevant to the plan, plan/profile identity, targeted criterion IDs, and
+    repair round when repair-scoped -- deliberately excludes evidence IDs
+    and timestamps so an identical rerun against unchanged state hashes
+    identically and can be deduplicated instead of re-executed.
+    """
+
+    workspace_state = latest_file_hashes(controller._session.operation_records)
+    criterion_ids = verify_body.get("criterion_ids")
+    if criterion_ids:
+        resolved_criterion_ids = sorted(str(item) for item in criterion_ids)
+    else:
+        resolved_criterion_ids = sorted(
+            str(item.get("criterion_id"))
+            for item in ha_state.acceptance_criteria
+            if item.get("verification")
+        )
+    repair_scope = (
+        ha_state.repair_round_count
+        if ha_state.repair_phase not in (REPAIR_PHASE_NONE, "", None)
+        else None
+    )
+    payload = {
+        "workspace_file_hashes": workspace_state,
+        "profile": verify_body.get("profile"),
+        "criterion_ids": resolved_criterion_ids,
+        "repair_round": repair_scope,
+        "repair_phase": ha_state.repair_phase,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _resolve_repair_round(
+    controller: "ControlSurfaceController",
+    ha_state: HighAutonomyRunState,
+) -> None:
+    """Close a repair round whose targeted criteria have verified_pass.
+
+    PART 3: distinct from :func:`_mandatory_acceptance_complete`, which
+    requires *every* mandatory criterion to reach a terminal status and
+    governs whole-run completion. A repair round only ever targets the
+    criteria that failed when it opened (``repair_packet.failed_criteria``);
+    once those verify clean the round is resolved even though unrelated
+    mandatory criteria remain "open" pending runtime or human verification --
+    otherwise the controller re-selects run_bounded_verification for the
+    same already-resolved target forever.
+    """
+
+    resolved_round = ha_state.repair_round_count
+    resolved_criteria = list((ha_state.repair_packet or {}).get("failed_criteria") or [])
+    ha_state.repair_phase = REPAIR_PHASE_NONE
+    ha_state.repair_packet = None
+    if ha_state.repair_history:
+        last_round = ha_state.repair_history[-1]
+        if last_round.get("repair_round") == resolved_round and "resolved_at" not in last_round:
+            last_round["resolved_at"] = _now_iso()
+            last_round["resolution"] = "verified_pass"
+    controller._session.governance_records.append(
+        {
+            "record_id": f"governance_{uuid.uuid4().hex[:12]}",
+            "event_type": "repair_round_resolved",
+            "repair_round": resolved_round,
+            "resolved_criteria": resolved_criteria,
+            "timestamp": _now_iso(),
+        }
+    )
+    ha_state.last_event = (
+        f"Repair round {resolved_round} verified resolved; targeted criteria passed."
+    )
+
+
 def _verification_is_final(controller: "ControlSurfaceController") -> bool:
     records = controller._session.run_loop.verification_records
     return bool(records and records[-1].get("overall_status") in ("pass", "fail"))
@@ -2285,15 +2381,29 @@ def _plan_next_action(
         if cont_status == CONTINUATION_STATUS_EVIDENCE_GROUNDED and continuation.get("available"):
             return HA_NEXT_WRITE_RECOVERY
 
+    # Only a criterion that actually carries a static `verification` plan can
+    # ever be resolved by run_bounded_verification -- a runtime/human-only
+    # mandatory criterion staying "open" forever must not keep re-selecting
+    # verification once every statically-checkable criterion has already run
+    # (PART 4: otherwise the controller never reaches runtime assessment).
     acceptance_needs_verification = _has_acceptance_verification_plan(ha_state) and any(
         item.get("status") in ("open", "evidence_available")
         for item in ha_state.acceptance_criteria
-        if item.get("mandatory", True)
+        if item.get("mandatory", True) and item.get("verification")
     )
+    # A response that intentionally obeyed the per-response operation limit
+    # and still leaves mandatory deliverables for a subsequent governed batch
+    # must not be treated as ready for the complete acceptance-ledger pass
+    # (PART 1) -- deferring is safe; the pending paths are not a regression,
+    # just not written yet.
+    governed_partial_batch_pending = bool(
+        (ha_state.last_proposal_coverage_report or {}).get("governed_partial_batch")
+    ) and ha_state.current_turn < ha_state.max_turns - ha_state.closure_reserve_turns
     if (
         acceptance_needs_verification
         and ready_count == 0
         and ha_state.repair_phase in (REPAIR_PHASE_NONE, "")
+        and not governed_partial_batch_pending
         and (
             ha_state.evidence_count > 0
             or ha_state.current_turn
@@ -2364,7 +2474,7 @@ def _plan_next_action(
     ):
         return HA_NEXT_WRITE_REPAIR
 
-    if policy.should_run_verification(
+    if not governed_partial_batch_pending and policy.should_run_verification(
         evidence_count=ha_state.evidence_count,
         verification_readiness=ha_state.verification_readiness,
         ready_to_execute_local_count=ready_count,
@@ -3166,7 +3276,20 @@ def tick_high_autonomy_run(
             if not remaining_executable:
                 if _mandatory_acceptance_complete(ha_state):
                     ha_state.awaiting_instruction_after_review = False
-                elif not _has_acceptance_verification_plan(ha_state) and (
+                elif (
+                    not _has_acceptance_verification_plan(ha_state)
+                    # PART 1: a batch that intentionally hit the governed
+                    # per-response operation limit still has mandatory
+                    # deliverables pending for a subsequent batch -- request
+                    # the next governed instruction instead of stalling,
+                    # since verification is deferred until every mandatory
+                    # path exists.
+                    or bool(
+                        (ha_state.last_proposal_coverage_report or {}).get(
+                            "governed_partial_batch"
+                        )
+                    )
+                ) and (
                     ha_state.turns_remaining > ha_state.closure_reserve_turns
                 ):
                     ha_state.awaiting_instruction_after_review = True
@@ -3222,15 +3345,44 @@ def tick_high_autonomy_run(
             REPAIR_PHASE_REPAIR_VERIFYING,
         ) and failed_ids:
             verify_body["criterion_ids"] = failed_ids
-        controller.verify_bounded_local_workspace(verify_body)
-        refreshed = controller._high_autonomy_state()
-        if refreshed is not None:
-            ha_state.acceptance_criteria = refreshed.acceptance_criteria
-        ha_state.mode = HA_MODE_VERIFYING
-        ha_state.last_event = "Ran bounded verification as a controller step."
-        ha_state.last_tick_step = "verify"
-        step_result["verified"] = True
-        step_result["verification_profile"] = verification_profile
+
+        fingerprint = _static_verification_fingerprint(controller, ha_state, verify_body)
+        already_verified = _verification_is_final(controller) and (
+            fingerprint == ha_state.last_static_verification_fingerprint
+            # PART 3/5: a repair round can already be resolved purely from
+            # persisted state -- e.g. a session loaded from a stale
+            # pre-fix snapshot whose repair-round-targeted criteria already
+            # verified_pass, but repair_phase was never advanced past
+            # repair_verifying. No prior in-process fingerprint is required
+            # to recognize that nothing new needs checking.
+            or (
+                ha_state.repair_phase == REPAIR_PHASE_REPAIR_VERIFYING
+                and not _repairable_verification_failures(ha_state)
+            )
+        )
+        if already_verified:
+            # PART 4: an identical verification (same workspace content,
+            # plan/profile, targeted criteria, repair round) already ran to
+            # completion -- reuse that result instead of re-running checks
+            # and appending another verification/evidence record.
+            ha_state.last_event = (
+                "Verification fingerprint unchanged since the last pass; reused prior result."
+            )
+            ha_state.last_tick_step = "verify_deduplicated"
+            step_result["verified"] = False
+            step_result["verification_deduplicated"] = True
+            ha_state.last_static_verification_fingerprint = fingerprint
+        else:
+            controller.verify_bounded_local_workspace(verify_body)
+            refreshed = controller._high_autonomy_state()
+            if refreshed is not None:
+                ha_state.acceptance_criteria = refreshed.acceptance_criteria
+            ha_state.mode = HA_MODE_VERIFYING
+            ha_state.last_event = "Ran bounded verification as a controller step."
+            ha_state.last_tick_step = "verify"
+            step_result["verified"] = True
+            step_result["verification_profile"] = verification_profile
+            ha_state.last_static_verification_fingerprint = fingerprint
         if ha_state.repair_phase in (
             REPAIR_PHASE_REPAIR_EXECUTING,
             REPAIR_PHASE_AWAITING_REPAIR_RESPONSE,
@@ -3269,6 +3421,17 @@ def tick_high_autonomy_run(
                         "timestamp": _now_iso(),
                     }
                 )
+        elif (
+            _verification_is_final(controller)
+            and ha_state.repair_phase == REPAIR_PHASE_REPAIR_VERIFYING
+            and not _repairable_verification_failures(ha_state)
+        ):
+            # PART 3: the repair round's targeted criteria verified clean,
+            # but unrelated mandatory criteria are still "open" pending
+            # runtime/human verification -- close this round exactly once
+            # instead of looping run_bounded_verification against the same
+            # already-resolved target (see _resolve_repair_round).
+            _resolve_repair_round(controller, ha_state)
         _save_ha_state(controller, ha_state)
         controller._persist()
 

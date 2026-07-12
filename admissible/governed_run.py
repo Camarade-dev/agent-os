@@ -965,10 +965,23 @@ def build_proposal_coverage_report(
     structured_operations: list[dict[str, Any]],
     satisfied_paths: dict[str, str] | None = None,
     avoid_optional_polish: bool = False,
+    mandatory_paths: list[str] | None = None,
+    operation_limit: int | None = None,
 ) -> dict[str, Any]:
-    """Compare mandatory goal paths against a proposed structured batch."""
+    """Compare mandatory goal paths against a proposed structured batch.
 
-    required_paths = extract_required_paths_from_goal(goal_text)
+    ``mandatory_paths``, when given, is the Mission Contract's authoritative
+    canonical deliverable set and is used verbatim instead of re-deriving
+    paths from ``goal_text`` -- the raw-text regex fallback
+    (:func:`extract_required_paths_from_goal`) has no way to honor the
+    contract's negated-path handling (e.g. a root-level ``game.js`` mentioned
+    only to be rejected) and would otherwise resurface rejected substitutes
+    as if they were required.
+    """
+
+    required_paths = (
+        list(mandatory_paths) if mandatory_paths else extract_required_paths_from_goal(goal_text)
+    )
     already_satisfied_paths = sorted(path for path in (satisfied_paths or {}) if path)
     proposed_paths = sorted(
         {
@@ -984,6 +997,17 @@ def build_proposal_coverage_report(
     ]
     additional_paths = [path for path in proposed_paths if path not in required_paths]
     coverage_complete = not missing_required_paths
+    proposed_write_count = sum(
+        1
+        for operation in structured_operations
+        if str(operation.get("operation") or "").strip() == "write_file"
+    )
+    # PART 1: a batch that hit the effective per-response operation limit
+    # while mandatory deliverables remain is an intentionally partial,
+    # governed batch -- not a regression -- so callers can defer the full
+    # acceptance-ledger verification instead of treating it as a failure.
+    batch_hit_operation_limit = bool(operation_limit) and proposed_write_count >= operation_limit
+    governed_partial_batch = batch_hit_operation_limit and not coverage_complete
     return {
         "required_paths": required_paths,
         "already_satisfied_paths": already_satisfied_paths,
@@ -992,6 +1016,7 @@ def build_proposal_coverage_report(
         "additional_paths": additional_paths,
         "coverage_complete": coverage_complete,
         "avoid_optional_polish": avoid_optional_polish,
+        "governed_partial_batch": governed_partial_batch,
     }
 
 
@@ -1022,6 +1047,7 @@ def build_repair_packet(
     remaining_turn_budget: int,
     repair_round: int,
     max_repair_rounds: int = DEFAULT_MAX_REPAIR_ROUNDS,
+    mandatory_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     """Targeted repair scope containing only failed mandatory criteria."""
 
@@ -1045,7 +1071,13 @@ def build_repair_packet(
                     "message": result.get("message"),
                 }
             )
-    required_paths = extract_required_paths_from_goal(goal_text)
+    # PART 2: prefer the Mission Contract's canonical deliverables -- the
+    # raw-text regex fallback cannot distinguish a required path from a
+    # rejected root-level substitute mentioned only to be rejected (e.g.
+    # "A root-level game.js ... does not satisfy ...").
+    required_paths = (
+        list(mandatory_paths) if mandatory_paths else extract_required_paths_from_goal(goal_text)
+    )
     missing_mandatory_paths = [
         path
         for path in required_paths
