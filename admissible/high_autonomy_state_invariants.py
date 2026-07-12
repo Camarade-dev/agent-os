@@ -156,6 +156,12 @@ class ReconciliationSignals:
     pending_useful_operation_count: int
     active_blocked_count: int
     waiting_for_agent_signals: WaitingForAgentSignals
+    # RUN_054: true when a `repair_needed` packet already has an authoritative,
+    # non-empty repair target list and every other repair gate (budget,
+    # round count, no active blocker, final verification) is satisfied -- the
+    # controller's own planner will dispatch it normally on this same tick, so
+    # reconciliation must not treat it as an irreconcilable wait.
+    repair_dispatchable: bool = False
 
 
 @dataclass(frozen=True)
@@ -164,6 +170,10 @@ class ReconciliationResult:
     new_mode: str | None = None
     new_next_action: str | None = None
     violations: tuple[StateInvariantViolation, ...] = ()
+    # RUN_054: true when no legitimate next action could be derived at all --
+    # the caller must fail closed (technical pause) rather than re-persist
+    # the same invalid wait.
+    fail_closed: bool = False
 
 
 def reconcile_contradictory_state(signals: ReconciliationSignals) -> ReconciliationResult:
@@ -205,11 +215,39 @@ def reconcile_contradictory_state(signals: ReconciliationSignals) -> Reconciliat
             new_next_action=post_repair_action,
             violations=(violation,),
         )
-    # No repair-verification pending either: the only honest recovery is to
-    # let the next tick re-plan from scratch rather than freeze in an
-    # unjustified wait. Reset next_action to a neutral "none" (not "wait")
-    # and leave mode alone for the controller's normal planner to resolve --
-    # still recorded as a detected+handled violation.
+
+    if signals.repair_dispatchable:
+        # RUN_054: repair_phase=repair_needed with an authoritative, non-empty
+        # target list (e.g. a runtime_instrumentation_gap packet's
+        # gap_criteria) is not an irreconcilable wait -- the controller's own
+        # planner dispatches the normal governed repair instruction on this
+        # same tick. Leave state untouched so that dispatch owns it instead
+        # of racing/duplicating it here.
+        return ReconciliationResult(changed=False)
+
+    if signals.repair_phase not in ("none", ""):
+        # RUN_054: an in-flight repair phase (repair_needed/
+        # verification_failed_repairable/writing_repair_instruction/
+        # awaiting_repair_response) that is not dispatchable and has no
+        # post-repair verification pending either can never resolve itself
+        # by waiting again -- e.g. repair budget genuinely exhausted with no
+        # other pending signal. Fail closed on this single pass instead of
+        # re-persisting the same invalid wait (and re-emitting the same
+        # violation) forever.
+        return ReconciliationResult(
+            changed=True,
+            new_mode=None,
+            new_next_action="none",
+            violations=(violation,),
+            fail_closed=True,
+        )
+
+    # No repair phase at all: preserve the original PART D behavior -- just
+    # relabel next_action to a neutral "none" and let the ordinary
+    # no-progress-tick threshold (`_pause_for_no_progress_livelock` /
+    # `_pause_for_technical_state_invariant`, which require the same
+    # fingerprint to repeat) decide whether/how to pause, unchanged from
+    # before this fix.
     return ReconciliationResult(changed=True, new_mode=None, new_next_action="none", violations=(violation,))
 
 

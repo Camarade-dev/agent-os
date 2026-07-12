@@ -35,7 +35,11 @@ class FixtureBrowserRuntimeProvider(BaseBrowserRuntimeProvider):
       ``debug_snapshot`` step.
     - ``click_rules`` / ``key_rules``: {trigger: {"dom": patch, "snapshot": patch}}
       shallow-merged into the live DOM/snapshot state when that click
-      selector or key is dispatched.
+      selector or key is dispatched. ``key_rules`` applies on ``key_down``
+      (and the down-half of ``key_press``); ``key_up_rules`` is the
+      analogous table applied on ``key_up`` (and the up-half of
+      ``key_press``), for scenarios where release matters (e.g. a boost key
+      that must patch the snapshot back on release).
     - ``console_entries`` / ``page_exceptions`` / ``dialogs`` / ``popups`` /
       ``downloads`` / ``external_request_attempts``: pre-seeded evidence,
       as if collected during the run.
@@ -119,6 +123,10 @@ class FixtureBrowserRuntimeProvider(BaseBrowserRuntimeProvider):
     def _do_key_event(self, session: RuntimeSession, action: str, key: str) -> bool:
         if action == "down":
             rule = (self.scenario.get("key_rules") or {}).get(key)
+            if rule:
+                self._apply_patch(session, rule)
+        elif action == "up":
+            rule = (self.scenario.get("key_up_rules") or {}).get(key)
             if rule:
                 self._apply_patch(session, rule)
         return True

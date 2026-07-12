@@ -35,6 +35,13 @@ _POINTER_STEERING_RE = re.compile(
     r"\bpointer[\-\s]driven\b|\bmoving the mouse\b|\bpointer changes\b|\bcontinuous.*\bsteering\b",
     re.I,
 )
+# RUN_053: word-boundary matched -- never a bare substring, so a criterion
+# whose text merely NAMES a nested field called "boosting" (e.g. the debug
+# interface's own "player: object containing ... boosting" subrequirement)
+# is never misclassified as a dynamic boost-control criterion itself.
+_BOOST_WORD_RE = re.compile(r"\bboost\b", re.I)
+_PAUSE_RESUME_WORD_RE = re.compile(r"\b(?:pause|resume)\b", re.I)
+_RESTART_WORD_RE = re.compile(r"\brestart\b", re.I)
 
 
 def _tokenize_field(name: str) -> set[str]:
@@ -74,18 +81,56 @@ def _plan_sha256(mission_contract: dict[str, Any]) -> str:
 
 
 class _Builder:
-    def __init__(self, contract: dict[str, Any], ledger: list[dict[str, Any]]) -> None:
+    def __init__(self, contract: dict[str, Any], ledger: list[dict[str, Any]], *, workspace_root: str | None = None) -> None:
         self.contract = contract
         self.ledger = ledger
         self.intent = mc.extract_runtime_observability_intent(contract)
         self.debug_interface = self.intent.get("declared_debug_interface")
         self.required_fields: list[str] = list(self.intent.get("required_snapshot_fields") or [])
+        # RUN_053: nested sub-fields (e.g. "player.boosting") kept separate
+        # from `required_fields` -- callers that assert "exactly these
+        # top-level fields exist" (the debug-overlay presence loop) must
+        # never also see a nested path as if it were its own top-level field.
+        # Used only via `_nested_field_candidates()` in the boost/pause
+        # classify branches below.
+        self.nested_fields: list[str] = list(self.intent.get("nested_snapshot_fields") or [])
         self.steps: list[dict[str, Any]] = []
         self.criteria: list[BrowserRuntimeCriterionPlan] = []
         self._contract_snapshot_taken = False
         self.missing_debug_fields: list[str] = []
         self.missing_dom_observables: list[str] = []
         self.missing_control_mappings: list[str] = []
+        # RUN_053: a Mission Contract criterion often only says a control
+        # must be "documented" without naming the literal key -- the actual
+        # binding lives in the deliverable the agent already wrote (e.g. a
+        # LOCAL_DEV.md controls table). Read-only, best-effort; empty when no
+        # workspace/doc is available yet (matches every pre-existing test
+        # fixture, none of which write a real controls doc).
+        self.documented_controls: list[dict[str, Any]] = mc.extract_documented_control_bindings(
+            workspace_root, list(contract.get("mandatory_paths") or [])
+        )
+
+    def _controls_for_text(self, text: str) -> list[dict[str, Any]]:
+        """Documented controls whose action keyword also appears in this
+        criterion's own text -- never offered to an unrelated criterion."""
+
+        lower = text.lower()
+        matches = []
+        for control in self.documented_controls:
+            action = control.get("action")
+            if action == "boost" and _BOOST_WORD_RE.search(lower):
+                matches.append(control)
+            elif action == "pause_resume" and _PAUSE_RESUME_WORD_RE.search(lower):
+                matches.append(control)
+            elif action == "restart" and _RESTART_WORD_RE.search(lower):
+                matches.append(control)
+        return matches
+
+    def _nested_field_candidates(self) -> list[str]:
+        """Top-level fields first (so an existing exact top-level match, e.g.
+        ac_004's "player", is never displaced), then nested sub-fields."""
+
+        return self.required_fields + self.nested_fields
 
     def _ensure_contract_snapshot(self) -> None:
         if self._contract_snapshot_taken or not self.debug_interface:
@@ -167,13 +212,150 @@ class _Builder:
             return
 
         signals = _extract_signals_for_text(text)
+        # RUN_053: fall back to documented controls (discovered from the
+        # deliverable's own docs, e.g. a LOCAL_DEV.md controls table) only
+        # when this criterion's own text carries no "press X to Y" phrasing
+        # of its own -- contract-text-derived controls always take priority.
+        if not signals.get("named_controls"):
+            doc_controls = self._controls_for_text(text)
+            if doc_controls:
+                signals = dict(signals)
+                signals["named_controls"] = doc_controls
         assertion_ids: list[str] = []
         required_observables: list[str] = []
         supported = False
         unsupported_reason: str | None = None
         human_subaspect = mc.infer_human_observation_subaspect(text)
 
-        if signals.get("runtime_stability_requirements"):
+        boost_controls = [c for c in signals.get("named_controls") or [] if c.get("action") == "boost"]
+        pause_resume_controls = [c for c in signals.get("named_controls") or [] if c.get("action") == "pause_resume"]
+
+        # RUN_053: a boost/pause-resume-shaped criterion is always claimed by
+        # its dedicated branch below -- including when no documented control
+        # was discoverable -- so it is explicitly flagged as a control-mapping
+        # gap instead of silently falling through to a later, unrelated
+        # generic branch (e.g. the "any declared field mentioned by name"
+        # fallback, which would otherwise weakly "pass" boost merely because
+        # its sentence happens to contain the word "player").
+        if _BOOST_WORD_RE.search(text):
+            # PART 2.A: Space (or whatever key is documented) key_down/key_up
+            # establishes the boolean boost-state transition. A boolean alone
+            # never proves "visibly increases speed" or "bounded cost" (the
+            # rest of criterion 7's text) -- when no distinct speed/cost
+            # field is declared, that sub-aspect is recorded as a genuine
+            # instrumentation gap rather than folded into a false pass.
+            if not boost_controls:
+                unsupported_reason = "control_effect_not_mapped_to_declared_snapshot_field"
+                required_observables.append("boosting_control_key")
+                self.missing_control_mappings.append(cid)
+            else:
+                key = boost_controls[0]["key"]
+                boost_field = _find_matching_field({"boost", "boosting"}, self._nested_field_candidates())
+                self.steps.append({"type": "key_down", "key": key, "criterion_id": cid})
+                self.steps.append({"type": "wait_bounded", "duration_ms": 150, "criterion_id": cid})
+                if boost_field is not None:
+                    self._ensure_contract_snapshot()
+                down_snap = f"{cid}_boost_down"
+                self.steps.append({"type": "debug_snapshot", "name": down_snap, "criterion_id": cid})
+                self.steps.append({"type": "key_up", "key": key, "criterion_id": cid})
+                self.steps.append({"type": "wait_bounded", "duration_ms": 150, "criterion_id": cid})
+                up_snap = f"{cid}_boost_up"
+                self.steps.append({"type": "debug_snapshot", "name": up_snap, "criterion_id": cid})
+                if boost_field is not None and self._contract_snapshot_taken:
+                    down_aid = f"{cid}_boost_active"
+                    up_aid = f"{cid}_boost_released"
+                    self.steps.append(
+                        {"type": "assert_json_path_equals", "snapshot": down_snap, "path": boost_field, "expected": True, "criterion_id": cid, "assertion_id": down_aid}
+                    )
+                    self.steps.append(
+                        {"type": "assert_json_path_equals", "snapshot": up_snap, "path": boost_field, "expected": False, "criterion_id": cid, "assertion_id": up_aid}
+                    )
+                    assertion_ids += [down_aid, up_aid]
+                    supported = True
+                    cost_field = _find_matching_field({"speed", "cost"}, self.required_fields)
+                    if cost_field is None:
+                        # A real gap, not a silent pass: the boolean toggle is
+                        # verified, but "visibly increases speed" / "bounded
+                        # gameplay cost" has no declared observable yet.
+                        unsupported_reason = "threshold_subject_not_mapped_to_declared_snapshot_field"
+                        required_observables.append("boost_speed_or_cost_field")
+                        self.missing_debug_fields.append("boost_speed_or_cost")
+                else:
+                    unsupported_reason = "control_effect_not_mapped_to_declared_snapshot_field"
+                    required_observables.append("boosting_state_field")
+                    self.missing_control_mappings.append(cid)
+
+        elif (
+            _PAUSE_RESUME_WORD_RE.search(text)
+            and signals.get("temporal_requirements")
+            and "no_duplicate_animation_loops" in signals["temporal_requirements"]
+        ):
+            # PART 2.B: pause/resume + loop-liveness are safely, deterministically
+            # triggerable. Restart-after-death is deliberately NOT attempted here
+            # (it requires the player to already be dead, and forcing death is
+            # explicitly prohibited) -- that sub-aspect is routed to human
+            # observation while the pause/resume/loop-alive evidence is kept.
+            phase_field = _find_matching_field({"phase", "state"}, self.required_fields)
+            loop_field = _find_matching_field({"loop", "animation"}, self.required_fields)
+            if not pause_resume_controls:
+                unsupported_reason = "control_effect_not_mapped_to_declared_snapshot_field"
+                required_observables.append("pause_resume_control_key")
+                self.missing_control_mappings.append(cid)
+            elif phase_field is None or loop_field is None:
+                unsupported_reason = "loop_counter_field_or_restart_control_not_declared"
+                required_observables.append("phase_and_loop_counter_field")
+                self.missing_control_mappings.append(cid)
+            else:
+                key = pause_resume_controls[0]["key"]
+                self._ensure_contract_snapshot()
+                paused_snap = f"{cid}_paused"
+                resumed_snap = f"{cid}_resumed"
+                self.steps.append({"type": "key_press", "key": key, "criterion_id": cid})
+                self.steps.append({"type": "wait_bounded", "duration_ms": 150, "criterion_id": cid})
+                self.steps.append({"type": "debug_snapshot", "name": paused_snap, "criterion_id": cid})
+                self.steps.append({"type": "key_press", "key": key, "criterion_id": cid})
+                self.steps.append({"type": "wait_bounded", "duration_ms": 200, "criterion_id": cid})
+                self.steps.append({"type": "debug_snapshot", "name": resumed_snap, "criterion_id": cid})
+                # The criterion's own text names the literal lifecycle state
+                # words when it does ("running, paused, dead, ..."); use them
+                # verbatim as expected values only when present, otherwise
+                # fall back to a weaker (still real) "changed" assertion
+                # rather than guessing an enum spelling the contract never
+                # stated.
+                has_paused_word = bool(re.search(r"\bpaused\b", text, re.I))
+                has_running_word = bool(re.search(r"\brunning\b", text, re.I))
+                pause_aid = f"{cid}_phase_paused"
+                resume_aid = f"{cid}_phase_running"
+                if has_paused_word and has_running_word:
+                    self.steps.append(
+                        {"type": "assert_json_path_equals", "snapshot": paused_snap, "path": phase_field, "expected": "paused", "criterion_id": cid, "assertion_id": pause_aid}
+                    )
+                    self.steps.append(
+                        {"type": "assert_json_path_equals", "snapshot": resumed_snap, "path": phase_field, "expected": "running", "criterion_id": cid, "assertion_id": resume_aid}
+                    )
+                else:
+                    self.steps.append(
+                        {"type": "compare_snapshot_path_changed", "before_snapshot": "contract", "after_snapshot": paused_snap, "path": phase_field, "criterion_id": cid, "assertion_id": pause_aid}
+                    )
+                    self.steps.append(
+                        {"type": "compare_snapshot_path_changed", "before_snapshot": paused_snap, "after_snapshot": resumed_snap, "path": phase_field, "criterion_id": cid, "assertion_id": resume_aid}
+                    )
+                loop_aid = f"{cid}_loop_alive_across_pause"
+                self.steps.append(
+                    {"type": "compare_snapshot_path_increased", "before_snapshot": "contract", "after_snapshot": resumed_snap, "path": loop_field, "criterion_id": cid, "assertion_id": loop_aid}
+                )
+                assertion_ids += [pause_aid, resume_aid, loop_aid]
+                supported = True
+                # Restart-after-death always stays a human-observation
+                # sub-aspect of this criterion (never silently dropped, never
+                # blocking the pause/resume evidence above from being kept).
+                # Only set once real pause/resume evidence exists -- when no
+                # phase/loop field was even found, this stays a plain
+                # instrumentation gap instead of a misleading human-review
+                # routing for a criterion nothing was ever observed about.
+                human_subaspect = True
+
+        elif signals.get("runtime_stability_requirements"):
             aid = f"{cid}_no_uncaught_errors"
             self.steps.append({"type": "assert_no_page_exceptions", "criterion_id": cid, "assertion_id": aid})
             self.steps.append({"type": "assert_console_clean", "criterion_id": cid, "assertion_id": f"{cid}_console_clean"})
@@ -376,6 +558,16 @@ class _Builder:
                 )
                 assertion_ids.append(aid)
                 supported = True
+            else:
+                # RUN_053: entering this branch (required_fields + a debug
+                # interface exist) must not silently swallow a criterion that
+                # turned out to mention none of the declared fields -- without
+                # this, `unsupported_reason` stayed None and the final `else`
+                # below was unreachable, so a genuinely unsupported criterion
+                # could keep `unsupported_verifier` disposition but no reason
+                # at all, which the repair-vs-finalize decision then could
+                # never classify as instrumentation-fixable.
+                unsupported_reason = "no_safe_observable_derivable"
 
         else:
             unsupported_reason = "no_safe_observable_derivable"
@@ -466,7 +658,7 @@ def build_runtime_verification_plan(
     back to the first mandatory ``.html``/``.htm`` path, then ``index.html``).
     """
 
-    builder = _Builder(contract, ledger)
+    builder = _Builder(contract, ledger, workspace_root=workspace_root)
     entrypoint = entrypoint_path or builder.intent.get("browser_entrypoint") or "index.html"
     plan = builder.build(
         workspace_root=workspace_root,

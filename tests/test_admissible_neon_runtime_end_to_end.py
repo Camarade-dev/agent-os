@@ -18,7 +18,7 @@ from pathlib import Path
 
 from admissible.browser_runtime.fixture_provider import FixtureBrowserRuntimeProvider
 from admissible.control_surface import load_persisted_session
-from admissible.high_autonomy_controller import HA_MODE_AWAITING_HUMAN_OBSERVATION
+from admissible.high_autonomy_controller import HA_MODE_AWAITING_HUMAN_OBSERVATION, HA_MODE_RECOVERING
 import admissible.runtime_verification_orchestrator as rvo
 
 from tests._run044_helpers import (
@@ -137,16 +137,24 @@ class TestNeonCanonicalFixture(unittest.TestCase):
 
             self.controller.set_runtime_provider(FixtureBrowserRuntimeProvider({"initial_snapshot": dict(NEON_SNAPSHOT)}))
             force_static_verification_final(self.controller, self.workspace)  # static verification runs first
-            transport = self.controller._high_autonomy_transport
 
+            # RUN_053: boost has no discoverable documented key binding in
+            # this fixture (no real LOCAL_DEV.md is written by this test), so
+            # it now correctly surfaces as an explicit, visible, EXPLICITLY
+            # instrumentation-fixable gap (PART 1) instead of the pre-fix
+            # behavior of silently vanishing from every bucket -- which
+            # legitimately opens one bounded repair round requesting a
+            # control-key mapping, so the stop condition must include the
+            # repair-write state too, not just human observation.
             final = tick_until(
-                self.controller, max_ticks=15, stop_modes=(HA_MODE_AWAITING_HUMAN_OBSERVATION, "stopped", "failed")
+                self.controller,
+                max_ticks=15,
+                stop_modes=(HA_MODE_AWAITING_HUMAN_OBSERVATION, HA_MODE_RECOVERING, "stopped", "failed"),
             )
             summary = final["high_autonomy_summary"]
 
             # One runtime attempt was created (test 30).
             self.assertEqual(len(summary["runtime_attempt_history"]), 1)
-            self.assertEqual(len(transport.written_instructions), 0, "no model turn consumed by runtime verification")
             self.assertEqual(self.controller._session.run_loop.current_turn, 0)
 
             criteria_by_id = {c["criterion_id"]: c for c in summary["acceptance_criteria"]}
@@ -156,11 +164,20 @@ class TestNeonCanonicalFixture(unittest.TestCase):
 
             human_ids = [cid for cid, c in criteria_by_id.items() if c["verification_disposition"] == "human_observation_required"]
             self.assertEqual(len(human_ids), 2)
-            self.assertEqual(set(summary["human_observation_pending_criterion_ids"]), set(human_ids))  # test 31
 
             gap_ids = [cid for cid, c in criteria_by_id.items() if c["verification_disposition"] == "unsupported_verifier"]
-            self.assertEqual(len(gap_ids), 3)  # test 32: unsupported criteria remain explicit, not dropped
+            # test 32: unsupported criteria remain explicit, not dropped. 4, not 3.
+            self.assertEqual(len(gap_ids), 4)
             self.assertEqual(len(criteria_by_id), 15)
+
+            # PART 1: the boost gap is instrumentation-fixable, so the run
+            # opened exactly one bounded repair round for it (never
+            # "unavailable or exhausted" while budget remained and nothing
+            # had been attempted) instead of silently ignoring it forever.
+            self.assertEqual(summary["mode"], HA_MODE_RECOVERING)
+            packet = summary["repair_packet"]
+            self.assertEqual(packet["kind"], "runtime_instrumentation_gap")
+            self.assertNotEqual(summary["outcome"], "runtime_observability_gap")
 
             # Never falsely completes.
             self.assertNotEqual(summary["outcome"], "completed")

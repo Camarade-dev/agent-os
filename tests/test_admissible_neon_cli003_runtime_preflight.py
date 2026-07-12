@@ -166,7 +166,16 @@ class TestNeonCli003RuntimePreflight(unittest.TestCase):
                 self.contract, self.ledger, workspace_root=td, entrypoint_path="index.html"
             )
         by_id = {c.criterion_id: c for c in plan.criteria}
-        human_only = {self.ledger[13]["criterion_id"], self.ledger[14]["criterion_id"]}
+        # RUN_053: criterion 5 ("visibly represented as a continuous
+        # multi-segment serpent... body follows the head") is now also
+        # correctly routed to human observation -- it names no numeric
+        # threshold or control, so it stays inherently visual/experiential
+        # rather than silently sitting as untouched "evidence_required".
+        human_only = {
+            self.ledger[4]["criterion_id"],
+            self.ledger[13]["criterion_id"],
+            self.ledger[14]["criterion_id"],
+        }
         for cid in human_only:
             self.assertEqual(by_id[cid].disposition, "human_observation_required")
             self.assertTrue(by_id[cid].human_observation_required)

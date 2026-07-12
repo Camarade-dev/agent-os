@@ -30,6 +30,7 @@ import hashlib
 import json
 import os
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +79,8 @@ __all__ = [
     "start_runtime_attempt",
     "poll_runtime_attempt",
     "apply_runtime_evidence",
+    "classify_runtime_observability_gap_disposition",
+    "RuntimeObservabilityGapDecision",
     "cancel_runtime_attempt",
     "reconcile_runtime_state_on_load",
     "record_human_observation",
@@ -657,6 +660,140 @@ _INSTRUMENTATION_FIXABLE_REASONS = frozenset(
         "no_debug_interface_declared",
     }
 )
+
+# unsupported_reason values that mean plan_builder found no derivable
+# observable at all -- distinct from the instrumentation-fixable set above.
+_NO_SAFE_OBSERVABLE_REASONS = frozenset({"no_safe_observable_derivable"})
+
+# The fixed, ordered evaluation this module records before a runtime
+# observability gap may become a final outcome (RUN_053 PART 1). Every
+# gap decision records exactly this tuple regardless of which action it
+# takes, so the decision is auditable even when it finalizes.
+_GAP_EVALUATION_ORDER = (
+    "safe_debug_observables_checked",
+    "safe_input_controls_checked",
+    "bounded_runtime_plan_repair_considered",
+    "bounded_instrumentation_repair_considered",
+    "human_observation_considered",
+)
+
+
+@dataclass(frozen=True)
+class RuntimeObservabilityGapDecision:
+    """PART 1: what a runtime_observability_gap means, and why.
+
+    ``action`` is one of:
+
+    - ``"repair_available"``: bounded read-only instrumentation repair
+      should be attempted (first time, or a further round after a prior
+      one did not fully resolve the gap).
+    - ``"finalize_repair_exhausted"``: a viable instrumentation repair
+      exists but the repair-round budget is used up.
+    - ``"finalize_no_safe_observable"``: no gap criterion has an
+      instrumentation-fixable reason (either none is derivable at all, or
+      no debug interface exists to extend).
+
+    A gap with zero criteria never reaches this function at all -- that is
+    "repair not required", decided by the caller before calling this.
+    """
+
+    action: str
+    reason: str
+    evaluated_alternatives: tuple[str, ...]
+    instrumentation_fixable_gap_ids: tuple[str, ...]
+    no_safe_observable_gap_ids: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action": self.action,
+            "reason": self.reason,
+            "evaluated_alternatives": list(self.evaluated_alternatives),
+            "instrumentation_fixable_gap_ids": list(self.instrumentation_fixable_gap_ids),
+            "no_safe_observable_gap_ids": list(self.no_safe_observable_gap_ids),
+        }
+
+
+def classify_runtime_observability_gap_disposition(
+    *,
+    gap_results: list[dict[str, Any]],
+    debug_interface: str | None,
+    repair_round_count: int,
+    max_repair_rounds: int,
+) -> RuntimeObservabilityGapDecision:
+    """PART 1: decide what to do about a runtime observability gap, in a
+    fixed evaluation order, before any finalization.
+
+    Never returns "unavailable or exhausted" phrasing when a viable
+    instrumentation repair exists and repair budget remains -- distinct,
+    typed reasons for: repair available (first attempt or a retry after a
+    prior one did not fully resolve it), repair budget exhausted, and no
+    safe observable can exist. "Repair not required" is the caller's own
+    decision (never calling this function when there is no gap) and
+    "existing safe input controls" is evaluated upstream, by the runtime
+    plan builder, before any evidence exists for this function to see --
+    every gap criterion arriving here already reflects whatever safe
+    control the plan builder could discover and attempt.
+    """
+
+    fixable_ids = tuple(
+        r["criterion_id"]
+        for r in gap_results
+        if not r.get("unsupported_reason") or r.get("unsupported_reason") in _INSTRUMENTATION_FIXABLE_REASONS
+    )
+    unfixable_ids = tuple(
+        r["criterion_id"] for r in gap_results if r.get("unsupported_reason") in _NO_SAFE_OBSERVABLE_REASONS
+    )
+
+    if not fixable_ids:
+        return RuntimeObservabilityGapDecision(
+            action="finalize_no_safe_observable",
+            reason=(
+                "Mandatory runtime-verified criteria have no safe observable and none "
+                "can be derived from any declared debug interface: "
+                + ", ".join(unfixable_ids or [r["criterion_id"] for r in gap_results])
+                + "."
+            ),
+            evaluated_alternatives=_GAP_EVALUATION_ORDER,
+            instrumentation_fixable_gap_ids=fixable_ids,
+            no_safe_observable_gap_ids=unfixable_ids,
+        )
+    if not debug_interface:
+        return RuntimeObservabilityGapDecision(
+            action="finalize_no_safe_observable",
+            reason=(
+                "Mandatory runtime-verified criteria have no safe observable: no debug "
+                "interface is declared to extend with read-only instrumentation."
+            ),
+            evaluated_alternatives=_GAP_EVALUATION_ORDER,
+            instrumentation_fixable_gap_ids=fixable_ids,
+            no_safe_observable_gap_ids=unfixable_ids,
+        )
+    if repair_round_count >= max_repair_rounds:
+        return RuntimeObservabilityGapDecision(
+            action="finalize_repair_exhausted",
+            reason=(
+                "Runtime observability gap has a viable read-only instrumentation repair, "
+                f"but repair rounds are exhausted ({repair_round_count}/{max_repair_rounds})."
+            ),
+            evaluated_alternatives=_GAP_EVALUATION_ORDER,
+            instrumentation_fixable_gap_ids=fixable_ids,
+            no_safe_observable_gap_ids=unfixable_ids,
+        )
+    reason = (
+        "Bounded read-only instrumentation repair is available for the observability gap."
+        if repair_round_count == 0
+        else (
+            "A previous repair round did not fully resolve the observability gap; "
+            f"bounded repair budget remains ({repair_round_count}/{max_repair_rounds} used)."
+        )
+    )
+    return RuntimeObservabilityGapDecision(
+        action="repair_available",
+        reason=reason,
+        evaluated_alternatives=_GAP_EVALUATION_ORDER,
+        instrumentation_fixable_gap_ids=fixable_ids,
+        no_safe_observable_gap_ids=unfixable_ids,
+    )
 
 
 def apply_runtime_evidence(

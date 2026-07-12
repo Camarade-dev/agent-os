@@ -280,6 +280,10 @@ class HighAutonomyRunState:
     runtime_capability_report: dict[str, Any] | None = None
     runtime_coverage_report: dict[str, Any] | None = None
     runtime_repair_kind: str | None = None
+    # RUN_053 PART 1: durable audit trail of the last runtime-observability-gap
+    # disposition decision (which alternatives were evaluated, and why),
+    # regardless of whether it led to repair or finalization.
+    runtime_gap_evaluation: dict[str, Any] | None = None
     # RUN_045 PART B.4: every `wait` transition must identify a durable,
     # typed reason -- never a generic reasonless wait (see
     # admissible.high_autonomy_state_invariants.SUPPORTED_WAIT_CONDITIONS).
@@ -539,6 +543,52 @@ def _pause_for_technical_state_invariant(
     )
 
 
+def _pause_for_irreconcilable_wait(
+    controller: "ControlSurfaceController",
+    ha_state: HighAutonomyRunState,
+    *,
+    violation_code: str,
+    repair_phase: str,
+) -> None:
+    """RUN_054 PART D/4: reconciliation found ``mode=waiting_for_agent`` with
+    no legitimate pending condition and could not derive any legitimate next
+    action (no dispatchable repair, no post-repair verification, no runtime/
+    backend/human signal) in this single pass.
+
+    Distinct from `_pause_for_technical_state_invariant` (which requires the
+    *same* reasonless-wait fingerprint twice, via the no-progress-tick
+    counter): this fires on the very first reconciliation pass, because
+    re-persisting `waiting_for_agent` here would otherwise regenerate the
+    identical violation on every subsequent tick forever (no in-between
+    "wait and see if something changes" step is honest when nothing pending
+    exists at all). Once paused, `tick_high_autonomy_run`'s own leading
+    `ha_state.paused` guard short-circuits before reconciliation ever runs
+    again, so repeated ticks against this state append no further governance
+    records or transcript entries (idempotent).
+    """
+
+    ha_state.mode = HA_MODE_TECHNICAL_PAUSE
+    ha_state.paused = True
+    ha_state.auto_tick_safe = False
+    ha_state.technical_pause_active = True
+    reason = (
+        "Technical pause — reconciliation could not derive a legitimate next "
+        f"action for repair_phase={repair_phase!r} with mode=waiting_for_agent "
+        f"and no pending backend/runtime/human condition ({violation_code})."
+    )
+    ha_state.technical_pause_reason = reason
+    ha_state.stop_reason = reason
+    ha_state.last_event = reason
+    ha_state.last_tick_step = "technical_pause"
+    ha_state.next_action = HA_NEXT_NONE
+    ha_state.current_step = None
+    _append_coalesced_transcript(
+        controller,
+        "high_autonomy_technical_pause",
+        {"violation_code": violation_code, "repair_phase": repair_phase, "source": "reconciliation"},
+    )
+
+
 def _build_refusal_recovery_text(
     *,
     refused_actions: list[dict[str, Any]],
@@ -684,8 +734,11 @@ def build_high_autonomy_summary(
         REPAIR_PHASE_REPAIR_NEEDED,
         REPAIR_PHASE_WRITING_REPAIR_INSTRUCTION,
     ):
-        failed_count = len((ha_state.repair_packet or {}).get("failed_criteria") or [])
-        doing_now = f"Preparing a targeted repair for {failed_count} failed criteria"
+        # RUN_054: use the repair kind's own authoritative target list (e.g.
+        # gap_criteria for a runtime_instrumentation_gap packet), not always
+        # failed_criteria -- otherwise this always projects 0 for a gap repair.
+        target_count = len(_repair_packet_target_ids(ha_state.repair_packet))
+        doing_now = f"Preparing a targeted repair for {target_count} criteria"
         needed_now = "No human action required"
     elif ha_state.repair_phase == REPAIR_PHASE_AWAITING_REPAIR_RESPONSE:
         doing_now = "Waiting for targeted repair response"
@@ -857,6 +910,9 @@ def build_high_autonomy_summary(
         "runtime_failed_criterion_ids": list(ha_state.runtime_failed_criterion_ids),
         "runtime_gap_criterion_ids": list(ha_state.runtime_gap_criterion_ids),
         "runtime_coverage_report": ha_state.runtime_coverage_report,
+        # RUN_053 PART 1: durable audit trail of the last runtime-observability-gap
+        # disposition decision, regardless of whether it led to repair or finalization.
+        "runtime_gap_evaluation": ha_state.runtime_gap_evaluation,
         "human_observation_pending_criterion_ids": list(ha_state.human_observation_pending_criterion_ids),
         # RUN_050 state priority: pending ids above are a static ledger
         # projection that exists as soon as a subjective criterion is parsed
@@ -1611,6 +1667,27 @@ def _repairable_verification_failures(ha_state: HighAutonomyRunState) -> list[di
     return failed_mandatory_criteria(ha_state.acceptance_criteria)
 
 
+# RUN_054: a runtime_instrumentation_gap packet's criteria are runtime-
+# observability gaps, never `verified_fail` in the static acceptance ledger
+# (see admissible.browser_runtime.ledger_integration's CRITERION_STATUS_GAP ->
+# "open" mapping) -- `_repairable_verification_failures`/
+# `runtime_failed_criterion_ids` is legitimately always empty for this repair
+# kind and must never gate it.
+_RUNTIME_INSTRUMENTATION_GAP_KIND = "runtime_instrumentation_gap"
+
+
+def _repair_packet_target_ids(repair_packet: dict[str, Any] | None) -> list[str]:
+    """The authoritative repair target criterion ids for a given packet.
+
+    A ``runtime_instrumentation_gap`` packet's targets are its own
+    ``gap_criteria``; every other repair kind keeps using ``failed_criteria``.
+    """
+    packet = repair_packet or {}
+    if packet.get("kind") == _RUNTIME_INSTRUMENTATION_GAP_KIND:
+        return [str(cid) for cid in (packet.get("gap_criteria") or [])]
+    return [str(cid) for cid in (packet.get("failed_criteria") or [])]
+
+
 def _can_start_repair(
     controller: "ControlSurfaceController",
     ha_state: HighAutonomyRunState,
@@ -1625,7 +1702,9 @@ def _can_start_repair(
         return False
     if int((ha_state.metrics or {}).get("active_blocked_count", 0)) > 0:
         return False
-    if not _repairable_verification_failures(ha_state):
+    if not _repairable_verification_failures(ha_state) and not _repair_packet_target_ids(
+        ha_state.repair_packet
+    ):
         return False
     if ha_state.repair_round_count >= ha_state.max_repair_rounds:
         return False
@@ -2839,6 +2918,83 @@ def stop_high_autonomy_run(
     return view
 
 
+def reconcile_premature_runtime_observability_gap(
+    controller: "ControlSurfaceController",
+) -> dict[str, Any]:
+    """RUN_053 PART 5: reopen a ``runtime_observability_gap`` outcome that was
+    finalized before this task's PART 1 fix landed -- i.e. one where no
+    instrumentation repair or recovery was ever attempted
+    (``runtime_repair_kind is None``) and repair budget still remains.
+
+    A finalized run has ``active=False``, so it can never be reached by
+    :func:`tick_high_autonomy_run` (which requires ``active`` to already be
+    True) or :func:`resume_high_autonomy_run` (which requires the same, for
+    a merely-paused run) -- this is the one explicit, operator-triggered
+    entry point for THIS specific stale-finalization defect. Never invokes a
+    provider, browser, or write; never deletes existing runtime/write
+    evidence or acceptance-criteria history; idempotent (a second call once
+    the outcome is no longer ``runtime_observability_gap`` is a no-op).
+    """
+
+    ha_state = _ha_state(controller)
+    if not ha_state or ha_state.outcome != "runtime_observability_gap":
+        return {"reopened": False, "reason": "not_a_runtime_observability_gap_outcome"}
+    if ha_state.runtime_repair_kind is not None or ha_state.repair_round_count >= ha_state.max_repair_rounds:
+        return {
+            "reopened": False,
+            "reason": "a_repair_was_already_attempted_or_budget_is_exhausted_not_a_premature_finalization",
+        }
+
+    # A criterion's `verification_disposition` is otherwise only computed
+    # once, at ledger-build time (`mission_contract.contract_acceptance_ledger`).
+    # A session finalized before this task's mission_contract.py fix landed
+    # (e.g. a boost criterion never recognized as runtime-shaped) would
+    # otherwise stay stuck on its stale disposition forever even after
+    # reopening and rebuilding the runtime plan. Narrowly re-derive only
+    # still-open criteria that carry the generic "evidence_required"
+    # disposition AND no static check was ever attached to them (so a
+    # criterion legitimately resolved a different way, e.g.
+    # deterministic_structural with real checks, is never touched).
+    from admissible.mission_contract import infer_verification_disposition
+
+    for item in ha_state.acceptance_criteria:
+        if item.get("status") in ("verified_pass", "waived", "policy_terminal"):
+            continue
+        if item.get("verification_disposition") != "evidence_required" or item.get("verification"):
+            continue
+        recomputed = infer_verification_disposition(str(item.get("source_text") or ""))
+        if recomputed != "evidence_required":
+            item["verification_disposition"] = recomputed
+
+    record = {
+        "record_id": f"governance_{uuid.uuid4().hex[:12]}",
+        "event_type": "runtime_observability_gap_reconciled",
+        "previous_outcome": ha_state.outcome,
+        "previous_outcome_reason": ha_state.outcome_reason,
+        "repair_round_count": ha_state.repair_round_count,
+        "max_repair_rounds": ha_state.max_repair_rounds,
+        "timestamp": _now_iso(),
+    }
+    controller._session.governance_records.append(record)
+    ha_state.last_reconciliation = record
+    ha_state.outcome = DEFAULT_OUTCOME_IN_PROGRESS
+    ha_state.outcome_reason = None
+    ha_state.active = True
+    ha_state.paused = False
+    ha_state.mode = HA_MODE_RUNNING
+    ha_state.stop_reason = None
+    ha_state.closure_phase_status = "not_started"
+    ha_state.next_action = HA_NEXT_NONE
+    ha_state.current_step = None
+    ha_state.no_progress_tick_count = 0
+    _save_ha_state(controller, ha_state)
+    controller._persist()
+    view = controller.state_view()
+    view["high_autonomy_summary"] = build_high_autonomy_summary(ha_state=ha_state, state_view=view)
+    view["runtime_observability_gap_reconciliation"] = {"reopened": True, "governance_record_id": record["record_id"]}
+    return view
+
+
 def _waiting_for_agent_signals(
     controller: "ControlSurfaceController",
     ha_state: HighAutonomyRunState,
@@ -2878,6 +3034,10 @@ def _reconcile_high_autonomy_state(
 
     from admissible.high_autonomy_state_invariants import ReconciliationSignals, reconcile_contradictory_state
 
+    repair_dispatchable = ha_state.repair_phase in (
+        REPAIR_PHASE_REPAIR_NEEDED,
+        REPAIR_PHASE_VERIFICATION_FAILED_REPAIRABLE,
+    ) and _can_start_repair(controller, ha_state)
     signals = ReconciliationSignals(
         mode=ha_state.mode,
         repair_phase=ha_state.repair_phase,
@@ -2885,10 +3045,46 @@ def _reconcile_high_autonomy_state(
         pending_useful_operation_count=len(ha_state.pending_useful_operations),
         active_blocked_count=int((ha_state.metrics or {}).get("active_blocked_count", 0)),
         waiting_for_agent_signals=_waiting_for_agent_signals(controller, ha_state, transport),
+        repair_dispatchable=repair_dispatchable,
     )
     result = reconcile_contradictory_state(signals)
     if not result.changed:
         return False
+
+    if result.fail_closed:
+        # RUN_054 PART 4: no legitimate next action could be derived in this
+        # pass -- fail closed instead of re-persisting the same invalid wait
+        # (see `_pause_for_irreconcilable_wait`). `ha_state.paused` then makes
+        # every subsequent tick short-circuit before reconciliation runs
+        # again (see `tick_high_autonomy_run`'s leading paused guard), so
+        # this governance record is appended exactly once -- no duplicates
+        # across repeated ticks against the unchanged paused state.
+        violation_code = result.violations[0].code if result.violations else "waiting_for_agent_without_pending_condition"
+        old_mode, old_next_action = ha_state.mode, ha_state.next_action
+        _pause_for_irreconcilable_wait(
+            controller,
+            ha_state,
+            violation_code=violation_code,
+            repair_phase=ha_state.repair_phase,
+        )
+        ha_state.state_invariant_violations = [
+            {"code": v.code, "message": v.message, "detail": dict(v.detail)} for v in result.violations
+        ]
+        record = {
+            "record_id": f"governance_{uuid.uuid4().hex[:12]}",
+            "event_type": "state_invariant_reconciliation_paused",
+            "violations": list(ha_state.state_invariant_violations),
+            "old_mode": old_mode,
+            "old_next_action": old_next_action,
+            "new_mode": ha_state.mode,
+            "new_next_action": ha_state.next_action,
+            "timestamp": _now_iso(),
+        }
+        controller._session.governance_records.append(record)
+        ha_state.last_reconciliation = record
+        _save_ha_state(controller, ha_state)
+        controller._persist()
+        return True
 
     old_mode, old_next_action = ha_state.mode, ha_state.next_action
     mode_map = {"verifying": HA_MODE_VERIFYING, "runtime_verifying": HA_MODE_RUNTIME_VERIFYING}
@@ -3538,7 +3734,11 @@ def tick_high_autonomy_run(
             build_runtime_repair_packet,
         )
         from admissible.runtime_orchestration_models import STATUS_FAILED
-        from admissible.runtime_verification_orchestrator import apply_runtime_evidence, find_persisted_evidence
+        from admissible.runtime_verification_orchestrator import (
+            apply_runtime_evidence,
+            classify_runtime_observability_gap_disposition,
+            find_persisted_evidence,
+        )
 
         attempt = _active_runtime_attempt(ha_state)
         plan_obj = _active_runtime_plan_obj(ha_state)
@@ -3685,28 +3885,38 @@ def tick_high_autonomy_run(
                                 f"({ha_state.repair_round_count}/{ha_state.max_repair_rounds})."
                             ),
                         )
-                    elif transition.semantic_status == "runtime_observability_gap" and (
-                        extra.get("instrumentation_fixable_gap_ids")
-                        and plan_obj.debug_interface
-                        and ha_state.repair_round_count < ha_state.max_repair_rounds
-                    ):
-                        packet = build_instrumentation_repair_packet(
-                            evidence=evidence,
+                    elif transition.semantic_status == "runtime_observability_gap":
+                        # RUN_053 PART 1: a runtime observability gap may only
+                        # become a final outcome after explicitly evaluating,
+                        # in order, safe debug observables / safe input
+                        # controls (both already reflected in `evidence` by
+                        # this point) / bounded runtime-plan repair / bounded
+                        # instrumentation repair / human observation --
+                        # never emitted as "unavailable or exhausted" while
+                        # repair budget remains and no attempt was made.
+                        gap_results = [r for r in evidence.criterion_results if r["status"] == "runtime_observability_gap"]
+                        decision = classify_runtime_observability_gap_disposition(
+                            gap_results=gap_results,
                             debug_interface=plan_obj.debug_interface,
-                            repair_round=ha_state.repair_round_count + 1,
+                            repair_round_count=ha_state.repair_round_count,
                             max_repair_rounds=ha_state.max_repair_rounds,
                         )
-                        _enter_runtime_repair_needed(controller, ha_state, packet)
-                    elif transition.semantic_status == "runtime_observability_gap":
-                        ha_state.mode = HA_MODE_RUNNING
-                        _set_final_outcome(
-                            ha_state,
-                            outcome="runtime_observability_gap",
-                            reason=(
-                                "Mandatory runtime-verified criteria have no safe observable "
-                                "and instrumentation repair is unavailable or exhausted."
-                            ),
-                        )
+                        ha_state.runtime_gap_evaluation = decision.to_dict()
+                        if decision.action == "repair_available":
+                            packet = build_instrumentation_repair_packet(
+                                evidence=evidence,
+                                debug_interface=plan_obj.debug_interface,
+                                repair_round=ha_state.repair_round_count + 1,
+                                max_repair_rounds=ha_state.max_repair_rounds,
+                            )
+                            _enter_runtime_repair_needed(controller, ha_state, packet)
+                        else:
+                            ha_state.mode = HA_MODE_RUNNING
+                            _set_final_outcome(
+                                ha_state,
+                                outcome="runtime_observability_gap",
+                                reason=decision.reason,
+                            )
                     elif transition.semantic_status == "awaiting_human_observation":
                         ha_state.mode = HA_MODE_AWAITING_HUMAN_OBSERVATION
                         ha_state.last_event = (

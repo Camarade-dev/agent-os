@@ -3663,6 +3663,11 @@ class ControlSurfaceController:
 
         return retry_callable_backend_invocation(self)
 
+    def reconcile_premature_runtime_observability_gap(self) -> dict[str, Any]:
+        from admissible.high_autonomy_controller import reconcile_premature_runtime_observability_gap
+
+        return reconcile_premature_runtime_observability_gap(self)
+
     def waive_high_autonomy_acceptance_criterion(
         self, criterion_id: str, *, rationale: str
     ) -> dict[str, Any]:

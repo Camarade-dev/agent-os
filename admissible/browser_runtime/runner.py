@@ -89,7 +89,15 @@ def _aggregate_criterion_results(plan: BrowserRuntimeVerificationPlan, assertion
         elif any(a.get("status") == "fail" for a in matched):
             status = CRITERION_STATUS_FAIL
         elif all(a.get("status") == "pass" for a in matched):
-            status = CRITERION_STATUS_PASS
+            # RUN_053: a criterion can be "supported" (real assertions ran
+            # and passed) while plan_builder ALSO recorded an
+            # unsupported_reason for a sub-aspect no field could cover (e.g.
+            # boost's boolean toggle passed but "increases speed"/"bounded
+            # cost" has no declared observable). Do not claim the full
+            # criterion passes solely because the checked sub-aspect did --
+            # this keeps it a gap (instrumentation-repair-eligible) instead
+            # of a false pass.
+            status = CRITERION_STATUS_GAP if criterion.unsupported_reason else CRITERION_STATUS_PASS
         else:
             status = CRITERION_STATUS_GAP
         results.append(

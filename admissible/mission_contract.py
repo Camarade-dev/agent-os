@@ -8,7 +8,7 @@ import posixpath
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 MISSION_CONTRACT_VERSION = "admissible_mission_contract_v1"
@@ -547,7 +547,24 @@ def infer_human_observation_subaspect(text: str) -> bool:
     """True when the text carries a subjective smoothness/polish aspect."""
 
     lower = text.lower()
-    return any(x in lower for x in ("smooth", "visual", "readable", "polished", "approximately", "fps"))
+    return any(
+        x in lower
+        for x in (
+            "smooth",
+            "visual",
+            "readable",
+            "polished",
+            "approximately",
+            "fps",
+            # RUN_053: a criterion describing a visibly-composed body (e.g. a
+            # multi-segment shape whose parts follow each other) is inherently
+            # an experiential/appearance judgment even when it also names an
+            # objective structural fact (segment count, length) -- narrow
+            # generic phrase shapes, not a game-specific keyword.
+            "multi-segment",
+            "body follow",
+        )
+    )
 
 
 def infer_verification_disposition(text: str) -> str:
@@ -558,7 +575,28 @@ def infer_verification_disposition(text: str) -> str:
         return "evidence_required"
     if infer_human_observation_subaspect(text):
         return "human_observation_required"
-    if any(x in lower for x in ("runtime", "restart", "collision", "active", "live ", "camera", "respawn")):
+    if any(
+        x in lower
+        for x in (
+            "runtime",
+            "restart",
+            "collision",
+            "active",
+            "live ",
+            "camera",
+            "respawn",
+        )
+    ):
+        return "unsupported_verifier"
+    # RUN_053: "boost"/"pause"/"resume" are dynamic lifecycle behaviors
+    # exactly like restart/collision/respawn above -- without this a boost
+    # or pause/resume criterion silently falls through to
+    # "evidence_required" and is never attempted by the runtime plan builder
+    # at all (the exact defect this task fixes). Word-boundary matched
+    # (never a bare substring): a debug-interface criterion whose own text
+    # merely NAMES a nested field called "boosting" must never be
+    # misclassified as a dynamic boost-control criterion itself.
+    if re.search(r"\b(?:boost|pause|resume)\b", lower):
         return "unsupported_verifier"
     if _PATH_RE.search(text) or any(x in lower for x in ("contains", "section", "schema", "cross-link")):
         return "deterministic_structural"
@@ -671,6 +709,7 @@ _NO_UNCAUGHT_ERRORS_RE = re.compile(
     re.I,
 )
 _SUBREQUIREMENT_FIELD_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*:", re.M)
+_OBJECT_CONTAINING_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*object\s+containing\s+(.+)$", re.I | re.M)
 _POINTER_STEERING_RE = re.compile(
     r"\bpointer[\-\s]driven\b|\bmoving the mouse\b|\bpointer changes\b|\bcontinuous.*\bsteering\b",
     re.I,
@@ -739,13 +778,36 @@ def extract_runtime_observability_intent(contract: dict[str, Any] | "MissionCont
             cleaned = re.sub(r"^[`']|[`']$", "", cleaned)
             if cleaned:
                 required_snapshot_fields.append(cleaned)
+    # RUN_053: nested sub-fields (e.g. "player.boosting") of an
+    # already-declared top-level field, kept in their OWN list rather than
+    # merged into ``required_snapshot_fields``: the debug-interface presence
+    # check (and anything else that asserts "exactly these declared
+    # top-level fields exist") must keep asserting only the top-level
+    # snapshot shape, never also claim a nested sub-field as its own
+    # top-level presence check.
+    nested_snapshot_fields: list[str] = []
     for criterion in list(data.get("explicit_acceptance_criteria") or []):
         for sub in list(criterion.get("subrequirements") or []):
             sub_text = str(sub.get("source_text") or "").strip()
             field_match = _SUBREQUIREMENT_FIELD_RE.match(sub_text)
             if field_match:
                 required_snapshot_fields.append(field_match.group(1))
+            # "player: object containing x, y, length, alive, and boosting"
+            # names nested sub-fields of an already-declared top-level field
+            # -- without this, "player.boosting" (or any other nested
+            # observable a criterion later refers to by name, e.g.
+            # "boosting") is never a derivable JSON path, only the opaque
+            # top-level "player" object is.
+            object_match = _OBJECT_CONTAINING_RE.match(sub_text)
+            if object_match:
+                parent = object_match.group(1).strip()
+                for child in re.split(r",|\band\b", object_match.group(2)):
+                    cleaned = child.strip().strip(".").strip()
+                    cleaned = re.sub(r"^[`']|[`']$", "", cleaned)
+                    if cleaned:
+                        nested_snapshot_fields.append(f"{parent}.{cleaned}")
     required_snapshot_fields = list(dict.fromkeys(required_snapshot_fields))
+    nested_snapshot_fields = list(dict.fromkeys(nested_snapshot_fields))
 
     query_flags = sorted(set(_QUERY_FLAG_RE.findall(joined)))
     if _DEBUG_FLAG_OVERLAY_RE.search(joined) and "?debug=1" not in query_flags:
@@ -804,6 +866,7 @@ def extract_runtime_observability_intent(contract: dict[str, Any] | "MissionCont
         "declared_debug_interface": declared_debug_interface,
         "declared_snapshot_method": declared_snapshot_method,
         "required_snapshot_fields": required_snapshot_fields,
+        "nested_snapshot_fields": nested_snapshot_fields,
         "numeric_thresholds": numeric_thresholds,
         "named_controls": named_controls,
         "lifecycle_transitions": lifecycle_transitions,
@@ -812,6 +875,108 @@ def extract_runtime_observability_intent(contract: dict[str, Any] | "MissionCont
         "runtime_stability_requirements": runtime_stability_requirements,
         "human_observation_requirement_count": len(human_observation_texts),
     }
+
+
+_MAX_DOC_CONTROL_SCAN_BYTES = 65_536
+_CONTROLS_TABLE_ROW_RE = re.compile(r"^\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*$", re.M)
+_BOLD_TOKEN_RE = re.compile(r"\*\*([A-Za-z0-9]+)\*\*")
+_TABLE_ROW_SKIP_RE = re.compile(r"^[-:\s]+$")
+
+# Generic (non-game-specific) mapping from a documented control's own action
+# LABEL text to the canonical action tag the runtime plan builder looks for.
+# A row only ever contributes a binding when its label contains one of these
+# words -- an unrecognized action label (e.g. "Steer") is safely ignored
+# rather than guessed at.
+_DOC_CONTROL_ACTION_KEYWORDS: tuple[tuple[str, str], ...] = (
+    ("boost", "boost"),
+    ("pause", "pause_resume"),
+    ("resume", "pause_resume"),
+    ("restart", "restart"),
+)
+
+
+def extract_documented_control_bindings(
+    workspace_root: str | None,
+    mandatory_paths: list[str] | None,
+) -> list[dict[str, Any]]:
+    """Read-only discovery of documented keyboard control bindings (RUN_053).
+
+    A Mission Contract's own acceptance-criteria text often only says a
+    control must be "documented" (e.g. "boost using a documented keyboard or
+    pointer control") without naming the literal key -- the actual binding
+    only exists in the deliverable the agent produced (typically a
+    ``LOCAL_DEV.md``-style controls table: ``| Action | Input |``). This
+    performs one bounded, read-only scan of already-written mandatory
+    documentation files for that table shape (plus the existing "press X to
+    Y" / "pause and resume with X" prose shapes, applied to doc text too),
+    returning entries in the exact same ``named_controls`` shape
+    :func:`extract_runtime_observability_intent` already produces from
+    contract text.
+
+    Never writes, never executes, never raises: a missing/unreadable file or
+    an unrecognized table shape simply yields no bindings for that file.
+    """
+
+    if not workspace_root or not mandatory_paths:
+        return []
+    doc_paths = [
+        p
+        for p in mandatory_paths
+        if isinstance(p, str) and (p.lower().endswith(".md") or "dev" in p.lower() or "usage" in p.lower())
+    ]
+    if not doc_paths:
+        return []
+
+    try:
+        root = Path(workspace_root).resolve()
+    except OSError:
+        return []
+
+    bindings: list[dict[str, Any]] = []
+    for doc_path in doc_paths:
+        normalized = str(doc_path).replace("\\", "/")
+        if normalized.startswith("/") or ".." in normalized.split("/"):
+            continue
+        try:
+            target = (root / normalized).resolve()
+            target.relative_to(root)
+        except (OSError, ValueError):
+            continue
+        try:
+            if not target.is_file():
+                continue
+            content = target.read_text(encoding="utf-8", errors="replace")[:_MAX_DOC_CONTROL_SCAN_BYTES]
+        except OSError:
+            continue
+
+        for match in _PRESS_KEY_RE.finditer(content):
+            bindings.append({"key": match.group(1), "action": match.group(2).strip().lower(), "source_text": match.group(0).strip()})
+        for match in _PAUSE_RESUME_RE.finditer(content):
+            bindings.append({"key": match.group(1), "action": "pause_resume", "source_text": match.group(0).strip()})
+
+        for row in _CONTROLS_TABLE_ROW_RE.finditer(content):
+            label, value = row.group(1).strip(), row.group(2).strip()
+            if _TABLE_ROW_SKIP_RE.match(label) or _TABLE_ROW_SKIP_RE.match(value):
+                continue
+            label_lower = label.lower()
+            action = next((tag for word, tag in _DOC_CONTROL_ACTION_KEYWORDS if word in label_lower), None)
+            if action is None:
+                continue
+            keys = _BOLD_TOKEN_RE.findall(value)
+            if not keys and re.fullmatch(r"[A-Za-z0-9]{1,12}", value):
+                keys = [value]
+            for key in keys:
+                normalized_key = "Escape" if key.lower() in ("esc", "escape") else key
+                bindings.append({"key": normalized_key, "action": action, "source_text": f"{label} | {value}"})
+
+    seen: set[tuple[str, str]] = set()
+    unique: list[dict[str, Any]] = []
+    for entry in bindings:
+        dedupe_key = (entry["key"], entry["action"])
+        if dedupe_key not in seen:
+            seen.add(dedupe_key)
+            unique.append(entry)
+    return unique
 
 
 def migrate_legacy_false_completion(session_data: dict[str, Any]) -> dict[str, Any]:
