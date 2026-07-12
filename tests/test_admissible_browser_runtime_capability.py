@@ -1,9 +1,11 @@
 import os
 import stat
+import subprocess
 import sys
 
 import pytest
 
+from admissible.browser_runtime import discovery
 from admissible.browser_runtime.chromium_provider import (
     ChromiumCdpRuntimeProvider,
     _assert_arguments_are_safe,
@@ -118,3 +120,112 @@ def test_chromium_provider_reports_unavailable_when_discovery_finds_nothing(monk
     assert report.available is False
     assert report.unavailable_reason == "no_allowlisted_browser_executable_found"
     assert report.safety_policy_version
+
+
+# --- Windows version-probe regression coverage (ADMISSIBLE_NARROW_FIX_WINDOWS_BROWSER_VERSION_PROBE) ---
+#
+# Root cause: detect_browser_version() used to try `subprocess.run([exe, "--version"])`
+# first on every platform, including Windows, where a Chromium-family executable
+# given only --version (no --headless, no isolated --user-data-dir) is not
+# guaranteed to print a version and exit -- it can proceed straight to a full
+# normal launch of the user's real profile. The fix makes Windows read the
+# on-disk PE version resource only, and never exec the binary.
+
+
+def _raise_if_called(*args, **kwargs):
+    raise AssertionError(f"subprocess.run must not be called for version probing: args={args!r} kwargs={kwargs!r}")
+
+
+def test_detect_browser_version_on_windows_never_calls_subprocess(tmp_path, monkeypatch):
+    exe = tmp_path / "chrome.exe"
+    exe.write_bytes(b"not-a-real-pe-file")
+    monkeypatch.setattr(discovery.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(discovery.subprocess, "run", _raise_if_called)
+    monkeypatch.setattr(discovery, "_windows_file_version", lambda path: "1.2.3.4")
+
+    version = discovery.detect_browser_version(str(exe))
+
+    assert version == "1.2.3.4"
+
+
+def test_detect_browser_version_on_windows_missing_metadata_yields_none_not_a_launch(tmp_path, monkeypatch):
+    exe = tmp_path / "chrome.exe"
+    exe.write_bytes(b"not-a-real-pe-file")
+    monkeypatch.setattr(discovery.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(discovery.subprocess, "run", _raise_if_called)
+    monkeypatch.setattr(discovery, "_windows_file_version", lambda path: None)
+
+    version = discovery.detect_browser_version(str(exe))
+
+    assert version is None
+
+
+def test_chrome_capability_detected_on_windows_without_executing_chrome(tmp_path, monkeypatch):
+    exe = tmp_path / "chrome.exe"
+    exe.write_bytes(b"stub")
+    monkeypatch.setenv(ENV_EXECUTABLE_OVERRIDE, str(exe))
+    monkeypatch.setattr(discovery.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(discovery.subprocess, "run", _raise_if_called)
+
+    provider = ChromiumCdpRuntimeProvider()
+    report = provider.detect_capability()
+
+    assert report.available is True
+    assert report.executable_basename == "chrome.exe"
+    # A stub file has no real PE version resource; missing metadata must not
+    # make an otherwise valid installed browser unavailable.
+    assert report.browser_version is None
+
+
+def test_edge_capability_detected_on_windows_without_executing_edge(tmp_path, monkeypatch):
+    exe = tmp_path / "msedge.exe"
+    exe.write_bytes(b"stub")
+    monkeypatch.setenv(ENV_EXECUTABLE_OVERRIDE, str(exe))
+    monkeypatch.setattr(discovery.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(discovery.subprocess, "run", _raise_if_called)
+
+    provider = ChromiumCdpRuntimeProvider()
+    report = provider.detect_capability()
+
+    assert report.available is True
+    assert report.executable_basename == "msedge.exe"
+    assert report.browser_version is None
+
+
+def test_non_allowlisted_executable_rejected_without_executing_it(tmp_path, monkeypatch):
+    exe = tmp_path / "totally-not-a-browser.exe"
+    exe.write_bytes(b"stub")
+    monkeypatch.setenv(ENV_EXECUTABLE_OVERRIDE, str(exe))
+    monkeypatch.setattr(discovery.subprocess, "run", _raise_if_called)
+
+    assert discover_browser_executable() is None
+
+
+def test_detect_capability_never_starts_a_process_tree(tmp_path, monkeypatch):
+    exe = tmp_path / "chrome.exe"
+    exe.write_bytes(b"stub")
+    monkeypatch.setenv(ENV_EXECUTABLE_OVERRIDE, str(exe))
+    monkeypatch.setattr(discovery.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(discovery.subprocess, "run", _raise_if_called)
+
+    def _fail_if_started(self):
+        raise AssertionError("ProcessTreeHandle.start must not run during capability detection")
+
+    monkeypatch.setattr(
+        "admissible.browser_runtime.chromium_provider.ProcessTreeHandle.start",
+        _fail_if_started,
+    )
+
+    provider = ChromiumCdpRuntimeProvider()
+    report = provider.detect_capability()
+
+    assert report.available is True
+
+
+def test_offline_admissible_suite_command_guard_blocks_version_probe_popen(monkeypatch):
+    """Proves the tests/conftest.py session guard actually intercepts the
+    exact defect signature (chrome.exe --version via subprocess.Popen),
+    so a regression in this suite fails loudly instead of opening a browser."""
+
+    with pytest.raises(AssertionError, match="blocked an attempt to launch a browser"):
+        subprocess.Popen(["chrome.exe", "--version"])

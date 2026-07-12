@@ -136,12 +136,24 @@ def _windows_file_version(executable_path: str) -> str | None:
 def detect_browser_version(executable_path: str, *, timeout: float = 10.0) -> str | None:
     """Determine the allowlisted browser's version without side effects.
 
-    Prefers the browser's own ``--version`` flag (one bounded, verifier-owned
+    On Windows this never executes the binary: launching a Chromium-family
+    executable with ``--version`` there is not reliably side-effect-free (it
+    can win single-instance forwarding to an already-running instance, or
+    otherwise proceed straight to a full normal launch with the user's real
+    profile, GPU/renderer/network/storage processes and all) rather than
+    printing a version and exiting. So on Windows, version comes only from
+    the on-disk PE version resource, which is a read-only API call and never
+    starts the executable; a missing/unreadable resource yields ``None``
+    (diagnostic-only -- see callers) rather than falling back to executing
+    the binary.
+
+    On other platforms, ``--version`` remains one bounded, verifier-owned
     invocation of the allowlisted binary itself -- no shell, no user-supplied
-    arguments; not a general process executor). On Windows, where an
-    already-running instance can swallow ``--version`` via single-instance
-    forwarding, falls back to reading the on-disk PE version resource.
+    arguments; not a general process executor.
     """
+
+    if platform.system() == "Windows":
+        return _windows_file_version(executable_path)
 
     try:
         completed = subprocess.run(
@@ -157,7 +169,4 @@ def detect_browser_version(executable_path: str, *, timeout: float = 10.0) -> st
             return match.group(1)
     except (OSError, subprocess.SubprocessError):
         pass
-
-    if platform.system() == "Windows":
-        return _windows_file_version(executable_path)
     return None
