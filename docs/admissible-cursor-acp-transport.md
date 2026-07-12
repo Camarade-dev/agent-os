@@ -212,3 +212,53 @@ all of: reliable real handshake; both real ACP model probes returning usable
 terminal responses; no orphan process; cancellation + cleanup through the managed
 lifecycle; canonical extraction working; no exactly-once regression; full
 Admissible suite green — and even then, a separate explicit decision/commit.
+
+---
+
+## 8. RUN_049 update — mandatory fail-closed plan mode + policy-violation rejection
+
+RUN_048 found `_enforce_plan_mode()` was **best-effort**: a server that could
+not confirm `plan` mode still let `session/prompt` proceed in whatever mode
+`session/new` happened to select. RUN_049 makes this **mandatory and
+fail-closed** (`_AcpInvocationRun._enforce_plan_mode()` now returns a bool the
+caller must honor):
+
+- `session/prompt` is **never sent** unless the effective mode is positively
+  confirmed as `plan` — either `session/new` already reported `plan`, or a
+  `session/set_mode` RPC succeeds **and** is corroborated by an observed
+  `current_mode_update` notification whose `currentModeId == "plan"`.
+- Every failure path (`set_mode` unsupported/erroring, RPC-ok-but-no-
+  confirmation-notification, RPC-ok-but-effective-mode-still-`agent`) returns
+  `AGENT_INVOKE_BLOCKED_BY_CONFIGURATION` / `STATE_PROPOSAL_ONLY_CAPABILITY_GAP`
+  with a recorded `plan_mode_failure_reason` — never a silent continuation.
+- **New durable telemetry** on every invocation (`acp_telemetry`):
+  `set_mode_request_id`, `set_mode_terminal_result`,
+  `observed_current_mode_update`, `effective_mode_before_prompt`,
+  `plan_mode_failure_reason`.
+- **Mid-turn policy-violation rejection**: any `session/update` classified as
+  a `tool_call` kind, or a `current_mode_update` reporting a mode other than
+  `plan`, now aborts the turn immediately — `session/cancel` is sent, the
+  managed process is terminated, `TransportHealth.record(OUTCOME_POLICY_VIOLATION)`
+  latches the transport `unhealthy` (same severity as a cleanup failure —
+  requires explicit `operator_recover()`), and the response accumulated so far
+  is discarded, never ingested as a proposal (`STATE_POLICY_VIOLATION`,
+  `policy_violation_reason`).
+
+**Live confirmation (RUN_049, real `cursor-agent` calls, see
+`benchmark/reports/admissible_run049_acp_promotion_and_repair_rehearsal.md`):**
+the real server pairs the `session/set_mode` RPC ack with a `current_mode_update`
+notification exactly as this design assumes — but in **2 of 3** real plan-mode
+calls, the real agent still emitted a `tool_call` event (`"Create Plan"` /
+`"Find"`) while genuinely in confirmed `plan` mode, before producing its text
+response. Both were correctly rejected: zero target-workspace mutation, cleanup
+proven, zero orphan processes. This is why the RUN_049 promotion gate is
+`KEEP_CURSOR_ONESHOT_DEFAULT_ACP_EXPERIMENTAL`, not a promotion — the safety
+invariant held perfectly, but plan mode is not yet "silent-text-only" in
+practice, so the current zero-tool-event gate correctly refuses most real turns
+rather than guessing which tool calls are harmless.
+
+A new workspace-mutation-audit helper
+(`admissible/diagnostics/acp_real_probe.py`: `snapshot_workspace()` /
+`diff_workspace_snapshots()`) sha256-snapshots the *target* workspace
+before/after a real ACP call (excluding `.admissible/`) so "zero pre-execution
+mutation" is a measured fact, not an assumption.

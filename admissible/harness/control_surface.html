@@ -1659,7 +1659,17 @@ function renderHighAutonomy(state) {
 function computeProgressBanner(ha) {
   if (ha.technical_pause_active || ha.mode === "technical_pause") return "TECHNICAL PAUSE";
   if (ha.mode === "runtime_verifying") return "RUNTIME VERIFICATION RUNNING";
+  // RUN_049 PART K.48/51 -- Cursor ACP's own sub-states, mutually exclusive
+  // with the generic "BACKEND INVOCATION RUNNING" label and with each other.
+  const acpState = ha.is_callable_backend && ha.backend_id === "cursor_acp"
+    ? (ha.last_acp_invocation_state || "")
+    : "";
+  if (acpState === "server_starting" || acpState === "handshake_pending") return "ACP SERVER STARTING";
+  if (acpState === "ready" || acpState === "request_submitted") return "ACP MODE CONFIRMATION";
+  if (acpState === "accepted" || acpState === "progress" || acpState === "running") return "ACP REQUEST RUNNING";
+  if (acpState === "completed" || acpState === "response_ready") return "ACP RESPONSE READY";
   if (ha.is_callable_backend && ha.backend_step === "invoking_agent") return "BACKEND INVOCATION RUNNING";
+  if (!ha.active && ha.outcome === "completed") return "RUN COMPLETED";
   if (requestInFlight) return "ADVANCING STATE";
   if (autoRunActive && ha.auto_tick_safe) return "AUTO-RUN ACTIVE";
   return "AUTO-RUN PAUSED";
@@ -2370,9 +2380,25 @@ function renderRunIdentity(state) {
     return;
   }
   panel.hidden = false;
-  const ha = state.high_autonomy || {};
-  const control = state.control || {};
-  const backendLabel = ha.backend_id || (control.backends && selectedBackendId()) || "—";
+  // RUN_049 PART C fix: the server never sets top-level state.high_autonomy /
+  // state.control (only state.high_autonomy_summary / state.agent_backend_control,
+  // used correctly by renderWorkspaceFirst) -- reading the wrong keys made
+  // backendLabel always fall through to "—" regardless of the governing backend.
+  const ha = state.high_autonomy_summary || {};
+  const control = state.agent_backend_control || {};
+  const backends = control.backends || [];
+  // Before the first invocation there is no active run yet -- fall back to
+  // whatever backend is currently selected in the workspace-first picker
+  // (PART C.16: never derive identity from invocation history only).
+  const identityBackendId = (ha.active && ha.backend_id) || selectedBackendId();
+  const identityBackend = backends.find((b) => b.backend_id === identityBackendId) || {};
+  // PART C.17: backend family, transport, model label, and executable
+  // capability state are kept as distinct fields, never conflated into one.
+  const backendFamily = identityBackend.backend_id || identityBackendId || "—";
+  const transportLabel = identityBackend.transport_label || identityBackend.label || "—";
+  const modelLabel = identityBackend.model_label || "—";
+  const capabilityState = (identityBackend.availability && identityBackend.availability.status) || "unknown";
+  const backendLabel = transportLabel;
   const criteriaBasis = identity.explicit_acceptance_criterion_count
     ? `${identity.explicit_acceptance_criterion_count} explicit`
     : identity.inferred_acceptance_criterion_count
@@ -2383,7 +2409,9 @@ function renderRunIdentity(state) {
     <div class="ha-status-row"><dt>Raw-goal SHA</dt><dd class="mono" style="word-break:break-all;">${escapeHtml(identity.raw_goal_sha256 || "—")}</dd></div>
     <div class="ha-status-row"><dt>Mission Contract SHA</dt><dd class="mono" style="word-break:break-all;">${escapeHtml(identity.mission_contract_sha256 || "—")}</dd></div>
     <div class="ha-status-row"><dt>Target workspace</dt><dd>${escapeHtml(identity.workspace_path || "—")}</dd></div>
-    <div class="ha-status-row"><dt>Backend</dt><dd>${escapeHtml(backendLabel)}</dd></div>
+    <div class="ha-status-row"><dt>Backend</dt><dd>${escapeHtml(backendLabel)} <span style="color:var(--cs-muted);">(${escapeHtml(backendFamily)})</span></dd></div>
+    <div class="ha-status-row"><dt>Model</dt><dd>${escapeHtml(modelLabel)}</dd></div>
+    <div class="ha-status-row"><dt>Capability state</dt><dd>${escapeHtml(capabilityState)}</dd></div>
     <div class="ha-status-row"><dt>Created</dt><dd>${escapeHtml(identity.created_at || "—")}</dd></div>
     <div class="ha-status-row"><dt>Acceptance basis</dt><dd>${escapeHtml(criteriaBasis)} · ${escapeHtml(identity.mandatory_requirement_count || 0)} mandatory requirement(s)</dd></div>
   `;

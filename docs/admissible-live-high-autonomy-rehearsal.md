@@ -266,3 +266,40 @@ minimal single-criterion fixture. Before the next live Neon Serpents rehearsal s
 5. Confirm zero external network requests were recorded on the real run, and that the browser
    process, temporary profile, and loopback server were all torn down (`resource_cleanup`),
    with no orphan process left behind.
+
+## Real ACP repair-rehearsal harness (Run 049)
+
+`admissible/diagnostics/acp_repair_rehearsal.py` (diagnostic-only, never
+imported by production code) drives one real controlled repair round through
+the *actual* production `ControlSurfaceController`/high-autonomy lifecycle
+against a deterministic pre-repair state, without depending on a model
+"voluntarily" producing a flawed first implementation:
+
+1. `build_deterministic_pre_repair_session()` uses only a scripted
+   `FixtureAgentBackend` (zero real calls) to write four application files
+   from an explicit `MANDATORY ACCEPTANCE CRITERIA` goal (the RUN_046 Repair
+   Probe wording), then ticks the real controller forward until it reaches
+   `repair_phase == "repair_needed"` with exactly one of eight criteria
+   failing (an R-key restart handler, deliberately omitted) — never a
+   hand-constructed `HighAutonomyRunState`, since the controller's own bounded
+   verification is what proves the 7-pass/1-fail state, not an assertion.
+2. `drive_repair_round()` then performs an explicit, deliberate backend-identity
+   swap (PART J.47: a new `backend_id`, linked to the prior fixture attempt,
+   never a silent reinterpretation) to the real `CursorAcpBackend`, snapshots
+   the target workspace immediately before/after the *first* repair tick (the
+   one that invokes the model) to prove the model turn itself caused zero
+   mutation, and ticks the real controller to a terminal outcome
+   (ingest → admission → bounded write → post-repair static verification →
+   completion re-evaluation).
+
+The mechanism is proven deterministically end-to-end with a second
+`FixtureAgentBackend` standing in for the repair turn
+(`tests/test_admissible_acp_repair_rehearsal.py`, 7 tests, zero real calls) —
+including a "wrong repair" case (an irrelevant file write) that correctly
+never falsely completes — before spending any of the slice's real-call
+budget on the actual `CursorAcpBackend`. See
+`benchmark/reports/admissible_run049_acp_promotion_and_repair_rehearsal.md`
+for the real call's result (the model's plan-mode response tripped the new
+proposal-only tool-event rejection — a correct, safe rejection, not a hard
+failure — so the workspace was never mutated and the repair did not complete
+in this real attempt).

@@ -72,6 +72,27 @@ class TestBackendProgressUiTruth(unittest.TestCase):
         # The old unconditional wording must not still exist alongside it.
         self.assertNotIn('parts.push("Backend invocation in progress")', self.html)
 
+    def test_acp_specific_labels_present_and_gated_on_cursor_acp_backend(self) -> None:
+        # RUN_049 PART K.48/51 -- four additional ACP-specific labels, plus
+        # RUN COMPLETED, layered on top of (never replacing) the original six.
+        for label in (
+            "ACP SERVER STARTING",
+            "ACP MODE CONFIRMATION",
+            "ACP REQUEST RUNNING",
+            "ACP RESPONSE READY",
+            "RUN COMPLETED",
+        ):
+            self.assertIn(label, self.banner_fn)
+        # Every ACP-specific branch is gated on the cursor_acp backend id, so
+        # it never fires for file_bridge/fixture/cursor_cli one-shot runs.
+        acp_lines = [
+            line for line in self.banner_fn.splitlines()
+            if any(lbl in line for lbl in ("ACP SERVER STARTING", "ACP MODE CONFIRMATION", "ACP REQUEST RUNNING", "ACP RESPONSE READY"))
+        ]
+        self.assertEqual(len(acp_lines), 4)
+        for line in acp_lines:
+            self.assertIn("acpState", line)
+
     def test_banner_function_is_a_pure_function_of_ha_and_module_flags(self) -> None:
         # Defense against regressions that thread request-specific args back in.
         signature = re.search(r"function computeProgressBanner\(([^)]*)\)", self.html)

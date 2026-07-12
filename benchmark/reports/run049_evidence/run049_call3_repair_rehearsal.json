@@ -1,0 +1,173 @@
+{
+  "backend_id": "cursor_acp",
+  "pre_swap_backend_id": "fixture",
+  "ticks": [
+    {
+      "elapsed_ms": 11382.3,
+      "mode": "waiting_for_agent",
+      "next_action": "none",
+      "repair_phase": "awaiting_repair_response",
+      "outcome": "in_progress",
+      "current_step": null
+    },
+    {
+      "elapsed_ms": 5.3,
+      "mode": "waiting_for_agent",
+      "next_action": "none",
+      "repair_phase": "awaiting_repair_response",
+      "outcome": "in_progress",
+      "current_step": null
+    },
+    {
+      "elapsed_ms": 3.4,
+      "mode": "waiting_for_agent",
+      "next_action": "none",
+      "repair_phase": "awaiting_repair_response",
+      "outcome": "in_progress",
+      "current_step": null
+    },
+    {
+      "elapsed_ms": 6.2,
+      "mode": "waiting_for_agent",
+      "next_action": "none",
+      "repair_phase": "awaiting_repair_response",
+      "outcome": "in_progress",
+      "current_step": null
+    },
+    {
+      "elapsed_ms": 5.0,
+      "mode": "waiting_for_agent",
+      "next_action": "none",
+      "repair_phase": "awaiting_repair_response",
+      "outcome": "in_progress",
+      "current_step": null
+    },
+    {
+      "elapsed_ms": 4.2,
+      "mode": "waiting_for_agent",
+      "next_action": "none",
+      "repair_phase": "awaiting_repair_response",
+      "outcome": "in_progress",
+      "current_step": null
+    },
+    {
+      "elapsed_ms": 4.5,
+      "mode": "waiting_for_agent",
+      "next_action": "none",
+      "repair_phase": "awaiting_repair_response",
+      "outcome": "in_progress",
+      "current_step": null
+    },
+    {
+      "elapsed_ms": 5.5,
+      "mode": "waiting_for_agent",
+      "next_action": "none",
+      "repair_phase": "awaiting_repair_response",
+      "outcome": "in_progress",
+      "current_step": null
+    },
+    {
+      "elapsed_ms": 4.9,
+      "mode": "waiting_for_agent",
+      "next_action": "none",
+      "repair_phase": "awaiting_repair_response",
+      "outcome": "in_progress",
+      "current_step": null
+    },
+    {
+      "elapsed_ms": 4.9,
+      "mode": "waiting_for_agent",
+      "next_action": "none",
+      "repair_phase": "awaiting_repair_response",
+      "outcome": "in_progress",
+      "current_step": null
+    },
+    {
+      "elapsed_ms": 4.3,
+      "mode": "waiting_for_agent",
+      "next_action": "none",
+      "repair_phase": "awaiting_repair_response",
+      "outcome": "in_progress",
+      "current_step": null
+    },
+    {
+      "elapsed_ms": 3.5,
+      "mode": "waiting_for_agent",
+      "next_action": "none",
+      "repair_phase": "awaiting_repair_response",
+      "outcome": "in_progress",
+      "current_step": null
+    },
+    {
+      "elapsed_ms": 4.4,
+      "mode": "waiting_for_agent",
+      "next_action": "none",
+      "repair_phase": "awaiting_repair_response",
+      "outcome": "in_progress",
+      "current_step": null
+    },
+    {
+      "elapsed_ms": 4.4,
+      "mode": "waiting_for_agent",
+      "next_action": "none",
+      "repair_phase": "awaiting_repair_response",
+      "outcome": "in_progress",
+      "current_step": null
+    },
+    {
+      "elapsed_ms": 5.4,
+      "mode": "waiting_for_agent",
+      "next_action": "none",
+      "repair_phase": "awaiting_repair_response",
+      "outcome": "in_progress",
+      "current_step": null
+    }
+  ],
+  "final_outcome": "in_progress",
+  "final_acceptance_statuses": {
+    "explicit_ac_001": "verified_pass",
+    "explicit_ac_002": "verified_pass",
+    "explicit_ac_003": "verified_pass",
+    "explicit_ac_004": "verified_pass",
+    "explicit_ac_005": "verified_pass",
+    "explicit_ac_006": "verified_pass",
+    "explicit_ac_007": "verified_fail",
+    "explicit_ac_008": "verified_pass"
+  },
+  "all_eight_pass": false,
+  "model_turn_count": 1,
+  "workspace_mutation_before_execution": {
+    "paths_added": [],
+    "paths_removed": [],
+    "paths_modified": [],
+    "clean": true
+  },
+  "workspace_paths_added": [],
+  "workspace_paths_removed": [],
+  "workspace_paths_modified": [],
+  "tool_event_count": 1,
+  "acp_invocation_state": "policy_violation",
+  "acp_request_id": "req-d9a672f6d95a",
+  "acp_session_id": "7ddc181a-60aa-4adf-b12f-08221d257072",
+  "plan_mode_enforced": true,
+  "managed_process_result": {
+    "process_id": 28468,
+    "observed_descendant_ids": [],
+    "started_at": "2026-07-11T22:39:41.236755Z",
+    "first_stdout_at": "2026-07-11T22:39:42.357753Z",
+    "first_stderr_at": null,
+    "exited_at": "2026-07-11T22:39:52.469564Z",
+    "exit_code": 0,
+    "termination_reason": "cancelled",
+    "graceful_termination_attempted": true,
+    "force_termination_attempted": false,
+    "cleanup_complete": true,
+    "cleanup_proven": true,
+    "remaining_process_ids": [],
+    "stdout_bytes": 15618,
+    "stderr_bytes": 0,
+    "output_truncated": false,
+    "platform_strategy": "windows_job_object"
+  },
+  "error_message": "ACP turn rejected: proposal-only safety-invariant violation (tool_call_event:Find). Response discarded, not ingested; no automatic retry."
+}

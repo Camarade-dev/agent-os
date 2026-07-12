@@ -67,6 +67,10 @@ class FakeAcpProcess:
         pid: int = 424242,
         session_mode: str = "agent",
         set_mode_supported: bool = True,
+        set_mode_emits_confirmation: bool = True,
+        set_mode_confirmed_mode: str | None = None,
+        mid_turn_mode_change: str | None = None,
+        emit_tool_call: bool = False,
     ) -> None:
         self.scenario = scenario
         self.protocol_version = protocol_version
@@ -74,6 +78,19 @@ class FakeAcpProcess:
         self.response_text = response_text
         self.session_mode = session_mode
         self.set_mode_supported = set_mode_supported
+        # RUN_049 PART D: RUN_048 confirmed the real server emits a
+        # `current_mode_update` notification alongside the bare `session/set_mode`
+        # RPC ack. `set_mode_emits_confirmation=False` models a server that acks
+        # but never sends that notification; `set_mode_confirmed_mode` models a
+        # server that acks "plan" but the *effective* mode it reports back is
+        # something else -- both must make CursorAcpBackend fail closed.
+        self.set_mode_emits_confirmation = set_mode_emits_confirmation
+        self.set_mode_confirmed_mode = set_mode_confirmed_mode
+        # A mode change away from plan (or a tool-call event), emitted mid-turn
+        # (after the prompt is accepted) -- both must be rejected as proposal-
+        # only policy violations (PART D.23/24).
+        self.mid_turn_mode_change = mid_turn_mode_change
+        self.emit_tool_call = emit_tool_call
         self.set_mode_requested = None
         self._leak = leak_on_terminate
         self._force_needed = force_needed
@@ -294,8 +311,12 @@ class FakeAcpProcess:
     def _handle_set_mode(self, msg_id: Any, params: dict[str, Any]) -> None:
         self.set_mode_requested = params.get("modeId")
         if self.set_mode_supported:
-            self.session_mode = params.get("modeId") or self.session_mode
+            requested = params.get("modeId") or self.session_mode
+            confirmed = self.set_mode_confirmed_mode if self.set_mode_confirmed_mode is not None else requested
+            self.session_mode = confirmed
             self._emit({"jsonrpc": "2.0", "id": msg_id, "result": {}})
+            if self.set_mode_emits_confirmation:
+                self._emit_current_mode_update(confirmed)
         else:
             self._emit(
                 {
@@ -304,6 +325,30 @@ class FakeAcpProcess:
                     "error": {"code": -32601, "message": "session/set_mode not supported"},
                 }
             )
+
+    def _emit_current_mode_update(self, mode: str) -> None:
+        self._emit(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": self._session_id,
+                    "update": {"sessionUpdate": "current_mode_update", "currentModeId": mode},
+                },
+            }
+        )
+
+    def _emit_tool_call_event(self) -> None:
+        self._emit(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": self._session_id,
+                    "update": {"sessionUpdate": "tool_call", "toolName": "write_file"},
+                },
+            }
+        )
 
     def _handle_prompt(self, req_id: Any, params: dict[str, Any]) -> bool:
         scenario = self.scenario
@@ -339,6 +384,10 @@ class FakeAcpProcess:
         # Happy-path family: N progress events, then a terminal result.
         if scenario == SCENARIO_MALFORMED_THEN_SUCCESS:
             self._emit_raw("{ this is not valid json ]")
+        if self.mid_turn_mode_change is not None:
+            self._emit_current_mode_update(self.mid_turn_mode_change)
+        if self.emit_tool_call:
+            self._emit_tool_call_event()
         self._emit_message_chunks(req_id)
         self._emit_terminal_success(req_id)
         if scenario == SCENARIO_DUPLICATE_TERMINAL:

@@ -432,3 +432,20 @@ Object or a POSIX process group). It is not another agent transport — there is
 inside it, and it never accepts an arbitrary command or JavaScript expression from a session,
 plan, or API field. See
 [admissible-bounded-browser-runtime-verification.md](admissible-bounded-browser-runtime-verification.md).
+
+## Run Identity backend/transport projection fix (Run 049)
+
+RUN_046 found `control_surface.html`'s `renderRunIdentity()` read
+`state.high_autonomy`/`state.control` — keys `session_dict()`/`state_view()`
+never set (only `state.high_autonomy_summary`/`state.agent_backend_control`,
+already used correctly one function away, in `renderWorkspaceFirst`). The
+Backend field always showed "—" regardless of which backend actually
+governed the run. Fixed: `renderRunIdentity()` now reads the real keys,
+resolves the identity backend as `(active run's backend_id) || (the
+currently-selected backend in the workspace-first picker)` — never derived
+from invocation history alone — and looks up that backend's entry in
+`agent_backend_control.backends` for its `transport_label` (exactly `"Cursor
+Agent ACP"` or `"Cursor Agent one-shot"`), `model_label` (new field on the
+`cursor_cli` `describe_available_backends()` entry), and `availability.status`
+(executable capability state) — kept as four distinct fields, never
+conflated into one string.

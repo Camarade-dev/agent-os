@@ -31,13 +31,51 @@ VERIFICATION_DISPOSITIONS = frozenset(
 
 _HEADINGS = {
     "deliverables": ("mandatory deliverables", "required files", "deliverables", "livrables obligatoires"),
-    "acceptance": ("acceptance criteria", "completion criteria", "critères d'acceptation"),
     "requirements": ("requirements", "mandatory behavior", "robustness", "observability", "documentation"),
     "architecture": ("architecture", "scope and architecture are already authorized", "technical choices"),
     "boundaries": ("constraints", "authorized scope", "execution boundaries", "working method"),
     "non_goals": ("non-goals", "non goals", "out of scope"),
     "completion": ("completion",),
 }
+
+# Acceptance-heading recognition (RUN_049 PART A) is structural, not an exact
+# string list -- an operator heading like "MANDATORY ACCEPTANCE CRITERIA" or
+# "Final verification criteria" must be recognized generically, across any
+# domain (CLI tool, data pipeline, docs, browser app, repair task), not just
+# the exact spellings a prior goal happened to use.
+_ACCEPTANCE_HEADING_QUALIFIERS = frozenset(
+    {"mandatory", "required", "final", "minimum", "functional", "technical"}
+)
+_ACCEPTANCE_HEADING_CORE_PHRASES = frozenset(
+    {
+        "acceptance criteria",
+        "completion criteria",
+        "verification criteria",
+        "critères d'acceptation",
+    }
+)
+
+
+def _singularize_heading_word(word: str) -> str:
+    if word in ("criterion", "criterions"):
+        return "criteria"
+    return word
+
+
+def _is_acceptance_heading(value: str) -> bool:
+    """True when a normalized heading line structurally means "acceptance criteria".
+
+    Handles case, a trailing colon, markdown `#` markers, surrounding
+    whitespace (all stripped by the caller before this is invoked),
+    singular/plural criterion(s)/criteria, and leading qualifier words
+    (mandatory/required/final/minimum/functional/technical) in any position.
+    """
+
+    if not value:
+        return False
+    words = [_singularize_heading_word(w) for w in value.split(" ") if w]
+    stripped = " ".join(w for w in words if w not in _ACCEPTANCE_HEADING_QUALIFIERS)
+    return stripped in _ACCEPTANCE_HEADING_CORE_PHRASES
 _PATH_RE = re.compile(r"(?<![\w.-])(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:html?|css|js|mjs|cjs|ts|tsx|py|json|ya?ml|md|txt|csv|sql)(?![\w.-])", re.I)
 _BULLET_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)(.+?)\s*$")
 _NUMBERED_RE = re.compile(r"^\s*(\d+)[.)]\s+(.+?)\s*$")
@@ -69,6 +107,9 @@ def _strip_trailing_line_punctuation(text: str) -> str:
 
 def _heading(line: str) -> str | None:
     value = re.sub(r"^[#\s]+|[:\s]+$", "", line).strip().lower()
+    value = re.sub(r"\s+", " ", value)
+    if _is_acceptance_heading(value):
+        return "acceptance"
     for role, names in _HEADINGS.items():
         if value in names:
             return role
@@ -228,6 +269,62 @@ def build_mission_contract(raw_goal: str, *, created_at: str | None = None) -> M
     return MissionContract(MISSION_CONTRACT_VERSION, raw_goal, _sha(raw_goal), _sha(_normalize_goal(raw_goal)), intent, deliverables, paths, [], architecture, dep_policy, boundaries, non_goals, requirements, criteria, inferred, ambiguities, [], diagnostics, completeness, created_at or _now())
 
 
+_EXISTENCE_ASSERTION_RE = re.compile(r"\bexists?\b|\bis\s+present\b|\bpresent\b", re.I)
+
+
+def select_verification_for_criterion_text(source_text: str, mandatory_paths: list[str]) -> list[dict[str, Any]]:
+    """Select concrete allowlisted verification checks for one criterion's own text.
+
+    RUN_049 PART B: once RUN_049 PART A recognizes an operator's own
+    acceptance-heading section, ``build_mission_contract`` no longer falls
+    back to ``derive_acceptance_criteria_from_goal``'s generic whole-goal
+    template -- so an explicit criterion needs its OWN path to a concrete
+    check, or it silently degrades to an unverifiable disposition forever.
+    This mirrors that template's keyword/path-pattern heuristics, but is
+    driven by one criterion's own ``source_text`` plus the contract's
+    already-extracted ``mandatory_paths`` (never a hard-coded product/game
+    name), and never displaces or duplicates the still-independent
+    goal-level inferred template. Returns ``[]`` when the text does not
+    structurally imply a supported check -- callers must not treat that as
+    a pass.
+    """
+
+    lower = (source_text or "").lower()
+    html_targets = [p for p in mandatory_paths if p.lower().endswith((".html", ".htm"))]
+    js_targets = [p for p in mandatory_paths if p.lower().endswith(".js")]
+    doc_targets = [
+        p
+        for p in mandatory_paths
+        if p.lower().endswith(".md") or "dev" in p.lower() or "usage" in p.lower()
+    ]
+    mentioned_paths = [
+        p for p in mandatory_paths if p in source_text or PurePosixPath(p).name in source_text
+    ]
+
+    if mentioned_paths and _EXISTENCE_ASSERTION_RE.search(lower):
+        return [{"check_id": "file_exists", "target_paths": mentioned_paths[:1]}]
+    if js_targets and ("arrow" in lower or "wasd" in lower or "movement" in lower):
+        return [{"check_id": "game_controls_check", "target_paths": js_targets[:1]}]
+    if js_targets and ("collectible" in lower or "collecting" in lower or "score" in lower):
+        return [{"check_id": "file_contains", "target_paths": js_targets[:1], "contains": ["score"]}]
+    # Deliberately narrower than derive_acceptance_criteria_from_goal's
+    # goal-level "restart" OR-branch: a bare "restart" keyword is also how
+    # RUN_042/044's browser-runtime plan builder recognizes a *dynamic*
+    # restart-control criterion (e.g. "Press Z to restart" temporal/loop
+    # requirements) that must stay unsupported_verifier so it is routed to
+    # that live runtime plan builder instead -- see
+    # test_admissible_runtime_plan_builder.py /
+    # test_admissible_neon_runtime_regression.py. The unambiguous "R key"
+    # phrasing this static local-file check actually targets never collides
+    # with that dynamic phrasing.
+    if js_targets and (" r key" in lower or "press `r`" in lower):
+        return [{"check_id": "game_restart_check", "target_paths": js_targets[:1]}]
+    if doc_targets and ("usage" in lower or "local" in lower or "run" in lower):
+        contains = ["open"] + (html_targets[:1] if html_targets else ["index.html"])
+        return [{"check_id": "local_usage_check", "target_paths": doc_targets[:1], "contains": contains}]
+    return []
+
+
 def contract_acceptance_ledger(contract: MissionContract | dict[str, Any]) -> list[dict[str, Any]]:
     data = contract.to_dict() if isinstance(contract, MissionContract) else contract
     sources = list(data.get("explicit_acceptance_criteria") or [])
@@ -235,9 +332,12 @@ def contract_acceptance_ledger(contract: MissionContract | dict[str, Any]) -> li
         sources = list(data.get("inferred_acceptance_criteria") or [])
     if not sources:
         sources = list(data.get("mandatory_requirements") or [])
+    mandatory_paths = list(data.get("mandatory_paths") or [])
     ledger = []
     for item in sources:
         checks = list(item.get("verification") or [])
+        if not checks:
+            checks = select_verification_for_criterion_text(item["source_text"], mandatory_paths)
         ledger.append({"criterion_id": item["id"], "source_text": item["source_text"], "source_type": item.get("source", "explicit_user_requirement"), "mandatory": True, "status": "open", "evidence_refs": [], "verification_notes": [], "verification": checks, "verification_disposition": "deterministic_structural" if checks else infer_verification_disposition(item["source_text"])})
     return ledger
 

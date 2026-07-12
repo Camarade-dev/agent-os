@@ -88,6 +88,7 @@ from admissible.transport_health import (
     OUTCOME_EMPTY_RESPONSE,
     OUTCOME_HANDSHAKE_OK,
     OUTCOME_IDLE_TIMEOUT,
+    OUTCOME_POLICY_VIOLATION,
     OUTCOME_PROTOCOL_ERROR,
     OUTCOME_PROVIDER_ERROR,
     OUTCOME_TOTAL_TIMEOUT,
@@ -128,6 +129,10 @@ STATE_TIMED_OUT_IDLE = "timed_out_idle"
 STATE_TIMED_OUT_TOTAL = "timed_out_total"
 STATE_UNCERTAIN_COMPLETION = "uncertain_completion"
 STATE_CLEANUP_FAILED = "cleanup_failed"
+# RUN_049 PART D: distinct terminal states for the mandatory, fail-closed
+# proposal-only invariant -- never conflated with an ordinary transport error.
+STATE_PROPOSAL_ONLY_CAPABILITY_GAP = "proposal_only_capability_gap"
+STATE_POLICY_VIOLATION = "policy_violation"
 
 ACP_INVOCATION_STATES = frozenset(
     {
@@ -150,6 +155,8 @@ ACP_INVOCATION_STATES = frozenset(
         STATE_TIMED_OUT_TOTAL,
         STATE_UNCERTAIN_COMPLETION,
         STATE_CLEANUP_FAILED,
+        STATE_PROPOSAL_ONLY_CAPABILITY_GAP,
+        STATE_POLICY_VIOLATION,
     }
 )
 
@@ -277,6 +284,14 @@ class AcpInvocationTelemetry:
     session_mode_before: str | None = None
     session_mode_enforced: str | None = None
     plan_mode_enforced: bool = False
+    # RUN_049 PART D.20 -- durable plan-mode confirmation evidence, persisted
+    # regardless of outcome (never only on the success path).
+    set_mode_request_id: str | None = None
+    set_mode_terminal_result: str | None = None
+    observed_current_mode_update: str | None = None
+    effective_mode_before_prompt: str | None = None
+    plan_mode_failure_reason: str | None = None
+    policy_violation_reason: str | None = None
     handshake_duration_ms: float | None = None
     accepted_at: str | None = None
     first_progress_at: str | None = None
@@ -307,6 +322,12 @@ class AcpInvocationTelemetry:
             "session_mode_before": self.session_mode_before,
             "session_mode_enforced": self.session_mode_enforced,
             "plan_mode_enforced": self.plan_mode_enforced,
+            "set_mode_request_id": self.set_mode_request_id,
+            "set_mode_terminal_result": self.set_mode_terminal_result,
+            "observed_current_mode_update": self.observed_current_mode_update,
+            "effective_mode_before_prompt": self.effective_mode_before_prompt,
+            "plan_mode_failure_reason": self.plan_mode_failure_reason,
+            "policy_violation_reason": self.policy_violation_reason,
             "handshake_duration_ms": self.handshake_duration_ms,
             "accepted_at": self.accepted_at,
             "first_progress_at": self.first_progress_at,
@@ -708,7 +729,22 @@ class _AcpInvocationRun:
         self.telemetry.session_id = _extract_session_id(session.result)
 
         # -- enforce read-only plan mode (proposal-only invariant) ------
-        self._enforce_plan_mode(session.result)
+        # RUN_049 PART D.21/22: session/prompt must NEVER be sent unless the
+        # effective mode is positively confirmed as plan -- fail closed with
+        # proposal_only_capability_gap (never a silent continuation in
+        # whatever mode session/new happened to select).
+        if not self._enforce_plan_mode(session.result):
+            self._set_state(STATE_PROPOSAL_ONLY_CAPABILITY_GAP)
+            self.telemetry.retry_safe = True  # session/prompt was never sent
+            self.health.record(OUTCOME_PROTOCOL_ERROR, detail="proposal_only_capability_gap")
+            return self._result(
+                AGENT_INVOKE_BLOCKED_BY_CONFIGURATION,
+                error_message=(
+                    "Cannot confirm the ACP session is in read-only plan mode before "
+                    f"prompting ({self.telemetry.plan_mode_failure_reason}); refusing to "
+                    "submit the prompt (proposal_only_capability_gap)."
+                ),
+            )
 
         # -- session/prompt (unique request id) -------------------------
         prompt_params = {
@@ -769,7 +805,9 @@ class _AcpInvocationRun:
             msg_id = message.get("id")
 
             if method == ACP_METHOD_SESSION_UPDATE:
-                self._handle_update(message.get("params") or {})
+                violation = self._handle_update(message.get("params") or {})
+                if violation is not None:
+                    return self._policy_violation(violation)
                 idle_deadline = time.monotonic() + self.timeouts.idle_no_progress_seconds
                 continue
 
@@ -785,18 +823,40 @@ class _AcpInvocationRun:
             # Unrelated response/notification: refresh idle, keep waiting.
             idle_deadline = time.monotonic() + self.timeouts.idle_no_progress_seconds
 
-    def _handle_update(self, params: dict[str, Any]) -> None:
+    def _handle_update(self, params: dict[str, Any]) -> str | None:
+        """Handle one ``session/update`` notification.
+
+        Returns a policy-violation reason string when this update itself is a
+        proposal-only safety-invariant violation (RUN_049 PART D.23: a
+        tool-call/file-write/shell/network tool event, or a mode change away
+        from plan) — ``None`` otherwise. The caller must reject the turn
+        immediately on a non-``None`` return, never continue draining
+        progress or ingest anything as a valid proposal.
+        """
         if self.telemetry.accepted_at is None:
             self.telemetry.accepted_at = _now_iso()
             self._set_state(STATE_ACCEPTED)
             self.health.record(OUTCOME_ACCEPTED)
         self._set_state(STATE_PROGRESS)
+
+        mode = _extract_current_mode_from_update(params)
+        if mode is not None and mode != ACP_MODE_PLAN:
+            self._add_progress("current_mode_update", f"mode changed to {mode}")
+            return f"mode_changed_away_from_plan:{mode}"
+
         kind, text = _classify_update(params)
+        if kind == "tool_call":
+            # Any tool-call event (file-write, shell/process, network, or
+            # otherwise unclassified) is disallowed in a proposal-only turn —
+            # plan mode must never actually invoke a tool.
+            self._add_progress(kind, text)
+            return f"tool_call_event:{text or 'unknown_tool'}"
         if kind == "message" and text:
             self._append_response_text(text)
             self._add_progress("agent_message_chunk", "model produced response text")
         else:
             self._add_progress(kind, text)
+        return None
 
     # -- terminal outcomes --------------------------------------------------
 
@@ -821,6 +881,33 @@ class _AcpInvocationRun:
         return self._result(
             AGENT_INVOKE_EMPTY_SUCCESS,
             error_message="ACP turn completed but produced no usable response text.",
+        )
+
+    def _policy_violation(self, reason: str) -> AgentInvocationResult:
+        """RUN_049 PART D.23/24/26: a proposal-only safety-invariant violation.
+
+        Cancels the request, terminates the managed process (via the normal
+        ``finally``/``_finalize_process`` path), latches transport health
+        unhealthy (requires explicit operator recovery, never auto-retried),
+        and discards any response text accumulated so far — it is never
+        ingested as a valid proposal.
+        """
+        self._set_state(STATE_CANCELLATION_REQUESTED)
+        self._request_cancel()
+        self._set_state(STATE_POLICY_VIOLATION)
+        self.telemetry.retry_safe = False
+        self.telemetry.terminal_event = f"policy_violation:{reason}"
+        self.telemetry.policy_violation_reason = reason
+        self.health.record(OUTCOME_POLICY_VIOLATION, detail=reason)
+        # Discard: a policy-violating turn's accumulated text is never a valid proposal.
+        self._response_parts = []
+        self._response_bytes = 0
+        return self._result(
+            AGENT_INVOKE_FAILED,
+            error_message=(
+                f"ACP turn rejected: proposal-only safety-invariant violation ({reason}). "
+                "Response discarded, not ingested; no automatic retry."
+            ),
         )
 
     def _provider_error(self, error: dict[str, Any]) -> AgentInvocationResult:
@@ -919,41 +1006,144 @@ class _AcpInvocationRun:
             ),
         )
 
-    def _enforce_plan_mode(self, session_result: dict[str, Any]) -> None:
-        """Force the ACP session into read-only ``plan`` mode so the agent only
-        *proposes* (never executes) — the ACP analogue of the one-shot's
-        ``--mode plan``. Best-effort: a server that does not support
-        ``session/set_mode`` leaves the mode unchanged and the fact is recorded
-        honestly (``plan_mode_enforced=False``) rather than silently assumed."""
+    def _enforce_plan_mode(self, session_result: dict[str, Any]) -> bool:
+        """Mandatory, fail-closed proposal-only mode confirmation (RUN_049 PART D).
+
+        Returns ``True`` only when the effective mode before ``session/prompt``
+        is positively confirmed as ``plan`` — via ``session/new`` already
+        reporting ``plan``, or a ``session/set_mode`` request that both (a)
+        completes without error and (b) is corroborated by an observed
+        ``current_mode_update`` notification carrying ``modeId == "plan"``.
+        Never treats the mode ``session/new`` happened to select as safe
+        (RUN_048 found it defaults to ``agent``, full tool/write access), never
+        treats an RPC-successful-but-uncorroborated ``set_mode`` as sufficient,
+        and never falls back to "assume it worked" — every failure path
+        returns ``False`` so the caller can refuse to send the prompt at all.
+        """
         modes = session_result.get("modes") if isinstance(session_result, dict) else None
         if not isinstance(modes, dict):
             self.telemetry.plan_mode_enforced = False
-            return
+            self.telemetry.plan_mode_failure_reason = "no_modes_block_in_session_new"
+            return False
         current = modes.get("currentModeId") or modes.get("current_mode_id")
         self.telemetry.session_mode_before = current
+        if current == ACP_MODE_PLAN:
+            # session/new itself already reports plan mode -- that response IS
+            # the acknowledgement/current-mode evidence; no further RPC needed.
+            self.telemetry.session_mode_enforced = ACP_MODE_PLAN
+            self.telemetry.effective_mode_before_prompt = ACP_MODE_PLAN
+            self.telemetry.plan_mode_enforced = True
+            return True
         available = {
             m.get("id")
             for m in (modes.get("availableModes") or [])
             if isinstance(m, dict)
         }
-        if ACP_MODE_PLAN not in available and current != ACP_MODE_PLAN:
+        if ACP_MODE_PLAN not in available:
             self.telemetry.plan_mode_enforced = False
-            return
-        if current == ACP_MODE_PLAN:
-            self.telemetry.session_mode_enforced = ACP_MODE_PLAN
-            self.telemetry.plan_mode_enforced = True
-            return
-        res = self._request(
+            self.telemetry.plan_mode_failure_reason = "plan_mode_not_offered_by_server"
+            return False
+
+        set_mode_request_id = "set-mode-" + uuid.uuid4().hex[:8]
+        self.telemetry.set_mode_request_id = set_mode_request_id
+        observed_mode, rpc = self._request_with_mode_capture(
             ACP_METHOD_SESSION_SET_MODE,
             {"sessionId": self.telemetry.session_id, "modeId": ACP_MODE_PLAN},
-            request_id=3,
+            request_id=set_mode_request_id,
             timeout=self.timeouts.request_acceptance_seconds,
         )
-        if res.kind == _RPC_OK:
-            self.telemetry.session_mode_enforced = ACP_MODE_PLAN
-            self.telemetry.plan_mode_enforced = True
-        else:
+        self.telemetry.set_mode_terminal_result = rpc.kind
+        if rpc.kind != _RPC_OK:
             self.telemetry.plan_mode_enforced = False
+            self.telemetry.plan_mode_failure_reason = f"set_mode_{rpc.kind}"
+            return False
+
+        if observed_mode is None:
+            # Give a server that answers the RPC before emitting the
+            # confirmation notification one short bounded chance to do so.
+            observed_mode = self._await_current_mode_update(
+                timeout=min(2.0, self.timeouts.request_acceptance_seconds)
+            )
+        self.telemetry.observed_current_mode_update = observed_mode
+
+        if observed_mode != ACP_MODE_PLAN:
+            self.telemetry.plan_mode_enforced = False
+            self.telemetry.plan_mode_failure_reason = (
+                "no_current_mode_update_observed"
+                if observed_mode is None
+                else f"effective_mode_not_plan:{observed_mode}"
+            )
+            return False
+
+        self.telemetry.session_mode_enforced = ACP_MODE_PLAN
+        self.telemetry.effective_mode_before_prompt = ACP_MODE_PLAN
+        self.telemetry.plan_mode_enforced = True
+        return True
+
+    def _request_with_mode_capture(
+        self, method: str, params: dict[str, Any], *, request_id: Any, timeout: float
+    ) -> tuple[str | None, "_RpcResult"]:
+        """Like ``_request``, but also captures any ``current_mode_update``
+        notification observed while waiting (PART D.20's ``observed
+        current_mode_update`` evidence must never be silently discarded)."""
+        assert self._conn is not None
+        try:
+            self._conn.send(method, params, request_id=request_id)
+        except Exception as exc:
+            return None, _RpcResult(_RPC_EOF, detail=f"send failed: {exc}")
+        observed_mode: str | None = None
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return observed_mode, _RpcResult(_RPC_TIMEOUT)
+            kind, payload = self._conn.read_message(remaining)
+            if kind == MSG_TIMEOUT:
+                return observed_mode, _RpcResult(_RPC_TIMEOUT)
+            if kind == MSG_EOF:
+                return observed_mode, _RpcResult(_RPC_EOF)
+            if kind == MSG_MALFORMED:
+                continue
+            message = payload
+            if message.get("method") == ACP_METHOD_SESSION_UPDATE:
+                mode = _extract_current_mode_from_update(message.get("params") or {})
+                if mode is not None:
+                    observed_mode = mode
+                continue
+            if message.get("id") == request_id:
+                if "error" in message:
+                    return observed_mode, _RpcResult(
+                        _RPC_ERROR, detail=_bounded(str(message.get("error")))
+                    )
+                return observed_mode, _RpcResult(_RPC_OK, result=message.get("result") or {})
+            # unrelated message: keep reading
+
+    def _await_current_mode_update(self, *, timeout: float) -> str | None:
+        """Bounded wait for a ``current_mode_update`` notification only.
+
+        Used right after a set_mode RPC that answered before emitting its
+        confirmation notification. Never blocks past ``timeout``.
+        """
+        assert self._conn is not None
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            kind, payload = self._conn.read_message(remaining)
+            if kind in (MSG_TIMEOUT, MSG_EOF):
+                return None
+            if kind == MSG_MALFORMED:
+                continue
+            message = payload
+            if message.get("method") == ACP_METHOD_SESSION_UPDATE:
+                mode = _extract_current_mode_from_update(message.get("params") or {})
+                if mode is not None:
+                    return mode
+                continue
+            # Anything else here is unexpected pre-prompt traffic; keep waiting
+            # for the bounded window rather than treating it as confirmation.
+            continue
 
     def _request_cancel(self) -> None:
         if self._conn is None or self.telemetry.session_id is None:
@@ -1106,6 +1296,26 @@ def _extract_session_id(result: dict[str, Any]) -> str | None:
     return None
 
 
+def _extract_current_mode_from_update(params: dict[str, Any]) -> str | None:
+    """Extract the confirmed mode id from a ``current_mode_update`` notification.
+
+    Returns ``None`` for any other ``session/update`` kind (progress, thought,
+    tool call, message, ...) -- only an explicit mode-confirmation event ever
+    yields a mode id here (RUN_049 PART D.20's ``observed current_mode_update``).
+    """
+    update = params.get("update") if isinstance(params.get("update"), dict) else params
+    if not isinstance(update, dict):
+        return None
+    kind = str(update.get("sessionUpdate") or update.get("type") or update.get("kind") or "").lower()
+    if "current_mode" not in kind and "currentmode" not in kind:
+        return None
+    for key in ("currentModeId", "current_mode_id", "modeId", "mode_id", "mode"):
+        value = update.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 def _classify_update(params: dict[str, Any]) -> tuple[str, str | None]:
     """Classify a ``session/update`` notification into (kind, bounded_text).
 
@@ -1194,6 +1404,8 @@ __all__ = [
     "STATE_TIMED_OUT_TOTAL",
     "STATE_UNCERTAIN_COMPLETION",
     "STATE_CLEANUP_FAILED",
+    "STATE_PROPOSAL_ONLY_CAPABILITY_GAP",
+    "STATE_POLICY_VIOLATION",
     "ACP_METHOD_INITIALIZE",
     "ACP_METHOD_SESSION_NEW",
     "ACP_METHOD_SESSION_PROMPT",

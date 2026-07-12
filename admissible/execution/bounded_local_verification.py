@@ -86,6 +86,21 @@ _GAME_CONTROL_SUBCHECKS = (
     ("d", "d"),
 )
 
+# ``event.code`` physical-key names (RUN_049 PART B.11) for the same eight
+# bindings -- ``event.key``/``e.key`` is layout-dependent text, ``.code`` is
+# the layout-independent physical key some legitimate implementations use
+# instead, e.g. ``event.code === "KeyW"`` for the WASD keys.
+_GAME_CONTROL_CODE_NAMES = {
+    "ArrowUp": "ArrowUp",
+    "ArrowDown": "ArrowDown",
+    "ArrowLeft": "ArrowLeft",
+    "ArrowRight": "ArrowRight",
+    "w": "KeyW",
+    "a": "KeyA",
+    "s": "KeyS",
+    "d": "KeyD",
+}
+
 
 def _js_key_present(content: str, key: str) -> bool:
     """Detect common JavaScript key-binding representations without executing code."""
@@ -105,6 +120,16 @@ def _js_key_present(content: str, key: str) -> bool:
                 rf"\bkeys\[['\"]{re.escape(upper)}['\"]\]",
                 rf"\be\.key\s*===?\s*['\"]{re.escape(upper)}['\"]",
                 rf"\bevent\.key\s*===?\s*['\"]{re.escape(upper)}['\"]",
+            ]
+        )
+    code_name = _GAME_CONTROL_CODE_NAMES.get(key)
+    if code_name:
+        patterns.extend(
+            [
+                rf"['\"]{re.escape(code_name)}['\"]",
+                rf"\be\.code\s*===?\s*['\"]{re.escape(code_name)}['\"]",
+                rf"\bevent\.code\s*===?\s*['\"]{re.escape(code_name)}['\"]",
+                rf"\bkeys\[['\"]{re.escape(code_name)}['\"]\]",
             ]
         )
     return any(re.search(pattern, content) for pattern in patterns)

@@ -528,3 +528,33 @@ already depend on. `ledger_coverage_report()` gained
 `criteria_are_inferred` so the UI can show "N/M inferred criteria
 represented" instead of a misleading "0/0" when no explicit
 acceptance-criteria section was matched.
+
+**RUN_049 update — generalized acceptance-heading recognition.** Acceptance
+headings are now recognized *structurally* instead of by an exact-match string
+list: `mission_contract._heading()` normalizes case, a trailing colon,
+Markdown `#` markers, whitespace, and singular/plural `criterion`/`criteria`,
+then strips leading qualifier words (`mandatory`, `required`, `final`,
+`minimum`, `functional`, `technical`) before comparing against
+`{"acceptance criteria", "completion criteria", "verification criteria",
+"critères d'acceptation"}`. `"MANDATORY ACCEPTANCE CRITERIA"`,
+`"Final verification criteria"`, and `"## ACCEPTANCE CRITERIA"` all now
+resolve to `section == "acceptance"`; the old exact-match tuple silently
+dropped any of these (RUN_046 root cause).
+
+A direct, confirmed consequence: once a goal's own acceptance heading is
+recognized, `build_mission_contract()` never falls back to
+`derive_acceptance_criteria_from_goal()`'s generic keyword-triggered template
+— so the historical `game_controls`/`local_usage` "two failures instead of
+one" defect (RUN_046 §9.2) no longer occurs for that goal shape. A new
+`mission_contract.select_verification_for_criterion_text()` gives *explicit*
+criteria the same kind of concrete, allowlisted verification check
+(`file_exists`, `game_controls_check`, `game_restart_check`,
+`local_usage_check`, …) the generic template used to attach only to its own
+synthetic criteria — narrowly scoped (an unambiguous "R key" phrase, not a
+bare `restart` keyword) specifically so it never hijacks a browser-runtime
+criterion like "Press Z to restart; the app must not create duplicate
+animation loops" that RUN_042/044's dynamic runtime-verification plan builder
+is supposed to own instead (see
+`tests/test_admissible_runtime_plan_builder.py` /
+`tests/test_admissible_neon_runtime_regression.py`, which regressed and were
+fixed during this exact integration).

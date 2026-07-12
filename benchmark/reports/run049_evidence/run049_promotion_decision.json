@@ -1,0 +1,57 @@
+{
+  "run048_evidence_refs": [
+    "benchmark/reports/admissible_run048_cursor_acp_real_model_probes.md"
+  ],
+  "plan_mode_probe_results": {
+    "call1_tiny": "success",
+    "call2_structured_proposal": "failed"
+  },
+  "repair_rehearsal_result": {
+    "final_outcome": "in_progress",
+    "acp_invocation_state": "policy_violation"
+  },
+  "proposal_only_safety_result": {
+    "call1": "no_violation",
+    "call2_policy_violation_reason": "ACP turn rejected: proposal-only safety-invariant violation (tool_call_event:Create Plan). Response discarded, not ingested; no automatic retry.",
+    "call3_policy_violation_reason": "ACP turn rejected: proposal-only safety-invariant violation (tool_call_event:Find). Response discarded, not ingested; no automatic retry."
+  },
+  "workspace_mutation_result": {
+    "any_pre_execution_mutation": false,
+    "call3_diff": {
+      "paths_added": [],
+      "paths_removed": [],
+      "paths_modified": [],
+      "clean": true
+    }
+  },
+  "tool_event_result": {
+    "call1": 0,
+    "call2": 1,
+    "call3": 1
+  },
+  "exactly_once_result": {
+    "replay_tests": "pass (4/4, tests/test_admissible_acp_real_transcript_replay.py)"
+  },
+  "cleanup_result": {
+    "any_unproven_cleanup": false
+  },
+  "transport_health_result": {
+    "final_state": "unhealthy_after_policy_violations_latched_pending_operator_recovery"
+  },
+  "regression_suite_result": {
+    "admissible_suite": "1539 passed, 1 skipped"
+  },
+  "verdict": "KEEP_CURSOR_ONESHOT_DEFAULT_ACP_EXPERIMENTAL",
+  "failed_conditions": [
+    "both_new_direct_probes_pass",
+    "repair_rehearsal_completes",
+    "zero_tool_or_write_events",
+    "transport_health_healthy"
+  ],
+  "confidence": "n=3 real serial calls this slice (plus n=4 from RUN_048); not a statistical long-run reliability estimate",
+  "limitations": [
+    "Evidence count is not a statistical long-run reliability proof (PART H.39).",
+    "Promotion, if granted, would mean ACP is the safest/most observable available Cursor transport -- not that failure probability has been precisely measured."
+  ],
+  "generated_at": "2026-07-11T22:47:55.522797Z"
+}

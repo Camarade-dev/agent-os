@@ -19,6 +19,7 @@ if str(FIXTURES_DIR) not in sys.path:
 import fake_acp_server as fake  # noqa: E402
 
 from admissible.agent_backend import (  # noqa: E402
+    AGENT_INVOKE_BLOCKED_BY_CONFIGURATION,
     AGENT_INVOKE_EMPTY_SUCCESS,
     AGENT_INVOKE_FAILED,
     AGENT_INVOKE_SUCCESS,
@@ -32,6 +33,8 @@ from admissible.cursor_acp_transport import (  # noqa: E402
     DEFAULT_TRANSPORT,
     STATE_CLEANUP_FAILED,
     STATE_COMPLETED,
+    STATE_POLICY_VIOLATION,
+    STATE_PROPOSAL_ONLY_CAPABILITY_GAP,
     STATE_PROTOCOL_ERROR,
     STATE_UNCERTAIN_COMPLETION,
     TRANSPORT_ACP,
@@ -356,16 +359,58 @@ class TestAcpPlanModeEnforcement(_AcpTestBase):
         self.assertTrue(result.acp_telemetry["plan_mode_enforced"])
         self.assertEqual(result.acp_telemetry["session_mode_before"], "agent")
 
-    def test_unsupported_set_mode_is_graceful(self) -> None:
+    def test_unsupported_set_mode_fails_closed(self) -> None:
+        # RUN_049 PART D.22: a server that cannot confirm plan mode must fail
+        # closed with proposal_only_capability_gap -- never continue and
+        # complete in whatever mode session/new happened to select.
         factory = fake.fake_process_factory(
             fake.SCENARIO_SUCCESS, response_text="ok",
             session_mode="agent", set_mode_supported=False,
         )
         backend = CursorAcpBackend(process_factory=factory, timeouts=_fast_timeouts())
         result = backend.invoke(self._request())
-        # still completes, but honestly records that plan mode was not enforced
-        self.assertEqual(result.status, AGENT_INVOKE_SUCCESS)
+        proc = factory.created[0]
+        self.assertEqual(result.status, AGENT_INVOKE_BLOCKED_BY_CONFIGURATION)
+        self.assertEqual(result.acp_invocation_state, STATE_PROPOSAL_ONLY_CAPABILITY_GAP)
         self.assertFalse(result.acp_telemetry["plan_mode_enforced"])
+        self.assertTrue(result.acp_telemetry["plan_mode_failure_reason"])
+        # session/prompt must never have been sent.
+        self.assertFalse(any(m.get("method") == "session/prompt" for m in proc.sent_messages))
+
+    def test_set_mode_ack_without_confirmation_notification_fails_closed(self) -> None:
+        # RUN_048 confirmed the real server pairs the set_mode RPC ack with a
+        # current_mode_update notification; a server that acks but never
+        # confirms must not be silently trusted.
+        factory = fake.fake_process_factory(
+            fake.SCENARIO_SUCCESS, response_text="ok",
+            session_mode="agent", set_mode_emits_confirmation=False,
+        )
+        backend = CursorAcpBackend(process_factory=factory, timeouts=_fast_timeouts())
+        result = backend.invoke(self._request())
+        proc = factory.created[0]
+        self.assertEqual(result.status, AGENT_INVOKE_BLOCKED_BY_CONFIGURATION)
+        self.assertEqual(result.acp_invocation_state, STATE_PROPOSAL_ONLY_CAPABILITY_GAP)
+        self.assertEqual(
+            result.acp_telemetry["plan_mode_failure_reason"], "no_current_mode_update_observed"
+        )
+        self.assertFalse(any(m.get("method") == "session/prompt" for m in proc.sent_messages))
+
+    def test_set_mode_ack_but_effective_mode_still_agent_fails_closed(self) -> None:
+        # The RPC itself succeeds, but the corroborating current_mode_update
+        # reports the effective mode never actually changed to plan.
+        factory = fake.fake_process_factory(
+            fake.SCENARIO_SUCCESS, response_text="ok",
+            session_mode="agent", set_mode_confirmed_mode="agent",
+        )
+        backend = CursorAcpBackend(process_factory=factory, timeouts=_fast_timeouts())
+        result = backend.invoke(self._request())
+        proc = factory.created[0]
+        self.assertEqual(result.status, AGENT_INVOKE_BLOCKED_BY_CONFIGURATION)
+        self.assertEqual(result.acp_invocation_state, STATE_PROPOSAL_ONLY_CAPABILITY_GAP)
+        self.assertEqual(
+            result.acp_telemetry["plan_mode_failure_reason"], "effective_mode_not_plan:agent"
+        )
+        self.assertFalse(any(m.get("method") == "session/prompt" for m in proc.sent_messages))
 
     def test_already_plan_mode_skips_set_mode(self) -> None:
         factory = fake.fake_process_factory(
@@ -376,6 +421,70 @@ class TestAcpPlanModeEnforcement(_AcpTestBase):
         proc = factory.created[0]
         self.assertIsNone(proc.set_mode_requested)  # no redundant set_mode
         self.assertTrue(result.acp_telemetry["plan_mode_enforced"])
+        self.assertEqual(result.acp_telemetry["effective_mode_before_prompt"], "plan")
+
+
+class TestAcpPolicyViolationRejection(_AcpTestBase):
+    """RUN_049 PART D.23/24 -- reject tool-call events and mode changes away
+    from plan mid-turn; never ingest the response as a valid proposal."""
+
+    def test_tool_call_event_is_rejected_not_ingested(self) -> None:
+        factory = fake.fake_process_factory(
+            fake.SCENARIO_SUCCESS, response_text="should not be ingested",
+            session_mode="plan", emit_tool_call=True,
+        )
+        health = TransportHealth(backend_id=BACKEND_ID_CURSOR_ACP)
+        backend = CursorAcpBackend(process_factory=factory, timeouts=_fast_timeouts(), health=health)
+        result = backend.invoke(self._request())
+        proc = factory.created[0]
+        self.assertEqual(result.status, AGENT_INVOKE_FAILED)
+        self.assertEqual(result.acp_invocation_state, STATE_POLICY_VIOLATION)
+        self.assertIsNone(result.response_text)
+        self.assertTrue(result.acp_telemetry["policy_violation_reason"].startswith("tool_call_event"))
+        self.assertTrue(proc.cancel_received)
+        self.assertEqual(health.state, HEALTH_UNHEALTHY)
+        self.assertTrue(health.requires_operator_recovery)
+        self.assertTrue(health.blocks_automatic_retry)
+
+    def test_mode_change_away_from_plan_mid_turn_is_rejected(self) -> None:
+        factory = fake.fake_process_factory(
+            fake.SCENARIO_SUCCESS, response_text="should not be ingested",
+            session_mode="plan", mid_turn_mode_change="agent",
+        )
+        health = TransportHealth(backend_id=BACKEND_ID_CURSOR_ACP)
+        backend = CursorAcpBackend(process_factory=factory, timeouts=_fast_timeouts(), health=health)
+        result = backend.invoke(self._request())
+        proc = factory.created[0]
+        self.assertEqual(result.status, AGENT_INVOKE_FAILED)
+        self.assertEqual(result.acp_invocation_state, STATE_POLICY_VIOLATION)
+        self.assertIsNone(result.response_text)
+        self.assertEqual(
+            result.acp_telemetry["policy_violation_reason"], "mode_changed_away_from_plan:agent"
+        )
+        self.assertTrue(proc.cancel_received)
+        self.assertEqual(health.state, HEALTH_UNHEALTHY)
+
+    def test_policy_violation_terminates_the_managed_process(self) -> None:
+        factory = fake.fake_process_factory(
+            fake.SCENARIO_SUCCESS, response_text="x", session_mode="plan", emit_tool_call=True,
+        )
+        backend = CursorAcpBackend(process_factory=factory, timeouts=_fast_timeouts())
+        result = backend.invoke(self._request())
+        proc = factory.created[0]
+        self.assertTrue(proc.terminate_called)
+        self.assertIsNotNone(result.managed_process_result)
+
+    def test_operator_recovery_clears_the_policy_violation_latch(self) -> None:
+        health = TransportHealth(backend_id=BACKEND_ID_CURSOR_ACP)
+        factory = fake.fake_process_factory(
+            fake.SCENARIO_SUCCESS, response_text="x", session_mode="plan", emit_tool_call=True,
+        )
+        backend = CursorAcpBackend(process_factory=factory, timeouts=_fast_timeouts(), health=health)
+        backend.invoke(self._request())
+        self.assertTrue(health.requires_operator_recovery)
+        health.operator_recover()
+        self.assertFalse(health.requires_operator_recovery)
+        self.assertFalse(health.blocks_automatic_retry)
 
 
 class TestAcpTranscriptFixture(unittest.TestCase):

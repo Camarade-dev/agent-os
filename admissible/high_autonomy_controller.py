@@ -780,6 +780,11 @@ def build_high_autonomy_summary(
         "backend_step": backend_step,
         "last_invocation_id": ha_state.last_invocation_id,
         "pending_invocation_status": pending_invocation.get("status"),
+        # RUN_049 PART K.48/51 -- the exact ACP sub-state, so the Control
+        # Surface can show ACP-specific progress labels instead of the
+        # generic "backend invocation running" text. ``None`` for any
+        # non-ACP backend.
+        "last_acp_invocation_state": pending_invocation.get("acp_invocation_state"),
         "agent_workspace_path": ha_state.agent_workspace_path,
         "backend_block_reason": ha_state.backend_block_reason,
         "backend_retry_required": ha_state.backend_retry_required,

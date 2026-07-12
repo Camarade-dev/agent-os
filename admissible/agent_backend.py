@@ -2345,6 +2345,10 @@ def describe_available_backends(env: dict[str, str] | None = None) -> list[dict[
                 if selected_transport == "acp"
                 else TRANSPORT_LABEL_ONESHOT
             ),
+            # RUN_049 PART C.17: model label is a distinct identity field from
+            # backend family and transport -- Run Identity must be able to
+            # show all three without conflating them.
+            "model_label": cursor_config.model_label,
         },
         {
             "backend_id": BACKEND_ID_FIXTURE,

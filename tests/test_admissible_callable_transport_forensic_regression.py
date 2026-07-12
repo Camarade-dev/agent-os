@@ -19,11 +19,12 @@ and checks two things:
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
 from admissible.governed_run import derive_acceptance_criteria_from_goal
-from admissible.mission_contract import build_mission_contract
+from admissible.mission_contract import build_mission_contract, contract_acceptance_ledger
 
 FIXTURE = (
     Path(__file__).resolve().parent
@@ -94,34 +95,34 @@ class MandatoryAcceptanceCriteriaHeadingDefectTests(unittest.TestCase):
         "8. LOCAL_DEV.md explains how to run it locally.\n"
     )
 
-    def test_heading_with_extra_leading_word_is_not_recognized_as_acceptance_section(self) -> None:
+    def test_heading_with_extra_leading_word_is_now_recognized_as_acceptance_section(self) -> None:
+        # RUN_049 PART A fix: acceptance-heading recognition is structural
+        # (qualifier words mandatory/required/final/minimum/functional/
+        # technical are stripped, case/colon/markdown-marker/whitespace are
+        # normalized), so "MANDATORY ACCEPTANCE CRITERIA" now recognizes as
+        # section=="acceptance" and the eight numbered lines become explicit
+        # acceptance criteria instead of being silently dropped.
         contract = build_mission_contract(self.GOAL)
-        # Confirmed root cause: mission_contract._HEADINGS["acceptance"] only
-        # exact-matches "acceptance criteria" / "completion criteria" / the
-        # French variant. "mandatory acceptance criteria" is a superset, not a
-        # member, of that tuple, so _heading() returns None for it and the
-        # eight numbered lines are never routed to section == "acceptance".
-        self.assertEqual(contract.explicit_acceptance_criteria, [])
+        self.assertEqual(len(contract.explicit_acceptance_criteria), 8)
+        self.assertEqual(
+            [item["id"] for item in contract.explicit_acceptance_criteria],
+            [f"explicit_ac_{i:03d}" for i in range(1, 9)],
+        )
 
-    def test_dropped_lines_are_not_even_rescued_as_mandatory_requirements(self) -> None:
+    def test_no_lines_need_rescue_as_mandatory_requirements(self) -> None:
         contract = build_mission_contract(self.GOAL)
-        # They are not silently promoted anywhere else either -- with no
-        # recognized section role, build_mission_contract's per-line dispatch
-        # has no branch that matches role=None, so the eight lines vanish
-        # from the contract entirely.
+        # All eight numbered lines are now correctly routed to
+        # explicit_acceptance_criteria; none are needed in (or leak into)
+        # mandatory_requirements.
         self.assertEqual(contract.mandatory_requirements, [])
 
-    def test_generic_inferred_template_is_silently_substituted_instead(self) -> None:
-        contract = build_mission_contract(self.GOAL)
-        # Because explicit_acceptance_criteria ends up empty,
-        # build_mission_contract() falls back to
+    def test_generic_inferred_template_is_no_longer_substituted(self) -> None:
+        # RUN_049 PART A/B fix: because explicit_acceptance_criteria is now
+        # correctly populated, build_mission_contract() never falls back to
         # derive_acceptance_criteria_from_goal()'s generic, keyword-triggered
-        # template -- a *different* contract than the operator actually wrote.
-        inferred_ids = {item["id"] for item in contract.inferred_acceptance_criteria}
-        self.assertTrue(inferred_ids)
-        self.assertNotEqual(
-            inferred_ids, {f"explicit_ac_{i:03d}" for i in range(1, 9)}
-        )
+        # template -- the operator's own 8-item contract is used verbatim.
+        contract = build_mission_contract(self.GOAL)
+        self.assertEqual(contract.inferred_acceptance_criteria, [])
 
     def test_a_recognized_heading_spelling_does_work(self) -> None:
         # Control case: proves the parser mechanism itself is sound and the
@@ -157,31 +158,108 @@ class LocalUsageGameControlsDefectTests(unittest.TestCase):
         self.assertIn("local_usage", ids)
 
 
+class ExplicitCriterionEndToEndVerificationTests(unittest.TestCase):
+    """RUN_049 PART B.13 -- reproduces the fixed Repair Probe result end-to-end.
+
+    Drives real per-criterion verification (mirroring how control_surface.py's
+    ``profile="acceptance_ledger"`` assembles requests from the ledger) against
+    a real workspace, using the exact 8-item MANDATORY ACCEPTANCE CRITERIA goal.
+    Confirms failures are now attributed to the operator's own explicit
+    criterion IDs (never the bogus "game_controls"/"local_usage" substituted
+    IDs) and that exactly the one deliberately-broken criterion fails.
+    """
+
+    GOAL = MandatoryAcceptanceCriteriaHeadingDefectTests.GOAL
+
+    PASSING_GAME_JS = (
+        "const keys = {};\n"
+        "window.addEventListener('keydown', e => { keys[e.key] = true; });\n"
+        "window.addEventListener('keyup', e => { keys[e.key] = false; });\n"
+        "let player = { x: 0, y: 0 };\n"
+        "let score = 0;\n"
+        "function update() {\n"
+        "  if (keys['ArrowUp'] || keys['w'] || keys['W']) player.y -= 1;\n"
+        "  if (keys['ArrowDown'] || keys['s'] || keys['S']) player.y += 1;\n"
+        "  if (keys['ArrowLeft'] || keys['a'] || keys['A']) player.x -= 1;\n"
+        "  if (keys['ArrowRight'] || keys['d'] || keys['D']) player.x += 1;\n"
+        "}\n"
+        "function collectItem() {\n"
+        "  score += 10;\n"
+        "}\n"
+    )
+
+    def _write_workspace(self, tmp_path: Path, *, game_js: str) -> Path:
+        (tmp_path / "index.html").write_text("<!doctype html><html></html>", encoding="utf-8")
+        (tmp_path / "style.css").write_text("body { margin: 0; }", encoding="utf-8")
+        (tmp_path / "game.js").write_text(game_js, encoding="utf-8")
+        (tmp_path / "LOCAL_DEV.md").write_text(
+            "To run locally, open index.html directly in your browser.", encoding="utf-8"
+        )
+        return tmp_path
+
+    def _verify(self, workspace: Path) -> dict[str, str]:
+        from admissible.execution.bounded_local_verification import (
+            VerificationRequest,
+            run_single_verification_check,
+        )
+
+        contract = build_mission_contract(self.GOAL)
+        ledger = contract_acceptance_ledger(contract.to_dict())
+        status_by_criterion: dict[str, str] = {}
+        for criterion in ledger:
+            for raw_request in criterion["verification"]:
+                data = dict(raw_request)
+                data.setdefault("criterion_id", criterion["criterion_id"])
+                request = VerificationRequest.from_dict(data)
+                result = run_single_verification_check(workspace_path=workspace, request=request)
+                status_by_criterion[criterion["criterion_id"]] = result.status
+        return status_by_criterion
+
+    def test_fully_compliant_workspace_passes_all_eight_explicit_criteria(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self._write_workspace(Path(tmp), game_js=self.PASSING_GAME_JS + "\nfunction resetGame() { score = 0; player = { x: 0, y: 0 }; }\nwindow.addEventListener('keydown', e => { if (e.key === 'r' || e.key === 'R') resetGame(); });\n")
+            statuses = self._verify(workspace)
+            self.assertEqual(len(statuses), 8)
+            self.assertTrue(all(status == "pass" for status in statuses.values()), statuses)
+
+    def test_missing_restart_handling_fails_exactly_one_correctly_attributed_criterion(self) -> None:
+        # The historical narrative reported "controlled_instruction_intended_
+        # failure_count: 1" but "observed_failure_count: 2" against bogus IDs
+        # (see repair_probe_callable_transport_forensic_regression.json). With
+        # the PART A/B fix, one deliberately-missing behavior (restart) now
+        # fails exactly one criterion, under the operator's own criterion ID.
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = self._write_workspace(Path(tmp), game_js=self.PASSING_GAME_JS)
+            statuses = self._verify(workspace)
+            failed = [criterion_id for criterion_id, status in statuses.items() if status == "fail"]
+            self.assertEqual(failed, ["explicit_ac_007"])
+            self.assertNotIn("game_controls", statuses)
+            self.assertNotIn("local_usage", statuses)
+
+
 class RunIdentityBackendDashDefectTests(unittest.TestCase):
-    """PART J.26 -- confirmed frontend key-name mismatch, static evidence only."""
+    """RUN_049 PART C -- confirmed frontend key-name mismatch, now fixed."""
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.html = CONTROL_SURFACE_HTML.read_text(encoding="utf-8")
 
-    def test_run_identity_reads_a_top_level_key_the_server_never_sets(self) -> None:
-        # Confirmed root cause: renderRunIdentity() reads state.high_autonomy
-        # and state.control, but session_dict()/state_view() in
-        # control_surface.py only ever populates state.high_autonomy_summary
-        # and state.agent_backend_control. Both lookups are therefore always
-        # undefined, independent of which backend actually governed the run,
-        # which is why the panel always shows the em dash placeholder.
-        self.assertIn("const ha = state.high_autonomy ||", self.html)
-        self.assertIn("const control = state.control ||", self.html)
+    def test_run_identity_no_longer_reads_the_keys_the_server_never_set(self) -> None:
+        # RUN_049 fix: renderRunIdentity() used to read state.high_autonomy
+        # and state.control, which session_dict()/state_view() never set
+        # (only state.high_autonomy_summary / state.agent_backend_control).
+        self.assertNotIn("const ha = state.high_autonomy ||", self.html)
+        self.assertNotIn("const control = state.control ||", self.html)
 
-    def test_the_keys_the_server_actually_sets_are_named_differently(self) -> None:
+    def test_run_identity_now_reads_the_real_server_keys(self) -> None:
         self.assertIn('view["high_autonomy_summary"]', self._python_source())
         self.assertIn('view["agent_backend_control"]', self._python_source())
-        # And renderWorkspaceFirst -- elsewhere in the same file -- correctly
-        # uses the real key names, proving this is an isolated typo/drift in
-        # renderRunIdentity specifically, not a server-side omission.
+        # renderWorkspaceFirst already used the real key names correctly;
+        # renderRunIdentity now matches it instead of drifting from it.
         self.assertIn("state.high_autonomy_summary", self.html)
         self.assertIn("state.agent_backend_control", self.html)
+        self.assertIn("identityBackend.transport_label", self.html)
+        self.assertIn("identityBackend.model_label", self.html)
 
     @staticmethod
     def _python_source() -> str:

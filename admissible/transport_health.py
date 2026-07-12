@@ -47,6 +47,12 @@ OUTCOME_CLEANUP_FAILURE = "cleanup_failure"
 OUTCOME_UNCERTAIN_COMPLETION = "uncertain_completion"
 OUTCOME_HANDSHAKE_OK = "handshake_ok"  # non-model; never improves model health
 OUTCOME_CANCELLED = "cancelled"
+# RUN_049 PART D.24/26: a proposal-only safety-invariant violation (a tool-call/
+# write/network event, or a mode change away from plan, observed before Admissible
+# execution) -- distinct from an ordinary transport failure. Latches unhealthy
+# immediately, the same severity as a cleanup failure, since this is a backend
+# safety invariant rather than a best-effort transport hiccup.
+OUTCOME_POLICY_VIOLATION = "policy_violation"
 
 # Outcomes that count as a *transport* failure toward the cooldown threshold.
 _TRANSPORT_FAILURE_OUTCOMES = frozenset(
@@ -58,6 +64,7 @@ _TRANSPORT_FAILURE_OUTCOMES = frozenset(
         OUTCOME_TOTAL_TIMEOUT,
         OUTCOME_UNCERTAIN_COMPLETION,
         OUTCOME_CLEANUP_FAILURE,
+        OUTCOME_POLICY_VIOLATION,
     }
 )
 
@@ -98,6 +105,8 @@ class TransportHealth:
     last_outcome: str | None = None
     last_updated_at: str | None = None
     cleanup_failure_latched: bool = False
+    policy_violations: int = 0
+    policy_violation_latched: bool = False
     events: deque = field(default_factory=lambda: deque(maxlen=_DEFAULT_HISTORY))
     _seq: int = 0
 
@@ -138,6 +147,9 @@ class TransportHealth:
             self.uncertain_completions += 1
         elif outcome == OUTCOME_HANDSHAKE_OK:
             self.handshakes_ok += 1  # deliberately does NOT touch model health
+        elif outcome == OUTCOME_POLICY_VIOLATION:
+            self.policy_violations += 1
+            self.policy_violation_latched = True
 
         if outcome in _TRANSPORT_FAILURE_OUTCOMES:
             self.consecutive_failures += 1
@@ -146,8 +158,9 @@ class TransportHealth:
         return self.state
 
     def _derive_state(self) -> str:
-        # 1) A leaked process tree latches unhealthy until explicit recovery.
-        if self.cleanup_failure_latched:
+        # 1) A leaked process tree, or a proposal-only policy violation,
+        # latches unhealthy until explicit recovery.
+        if self.cleanup_failure_latched or self.policy_violation_latched:
             return HEALTH_UNHEALTHY
         # 2) An uncertain completion degrades and forbids auto-retry.
         if self.last_outcome == OUTCOME_UNCERTAIN_COMPLETION:
@@ -170,7 +183,7 @@ class TransportHealth:
     @property
     def blocks_automatic_retry(self) -> bool:
         """True when the transport must NOT be auto-retried without operator action."""
-        if self.cleanup_failure_latched:
+        if self.cleanup_failure_latched or self.policy_violation_latched:
             return True
         if self.state in (HEALTH_UNHEALTHY, HEALTH_COOLDOWN):
             return True
@@ -180,16 +193,17 @@ class TransportHealth:
 
     @property
     def requires_operator_recovery(self) -> bool:
-        """A latched cleanup failure requires explicit operator recovery (PART A.6)."""
-        return self.cleanup_failure_latched
+        """A latched cleanup failure or policy violation requires explicit operator recovery (PART A.6, D.26)."""
+        return self.cleanup_failure_latched or self.policy_violation_latched
 
     def operator_recover(self) -> None:
-        """Explicit operator recovery: clear the cleanup latch and cooldown.
+        """Explicit operator recovery: clear the cleanup/policy-violation latch and cooldown.
 
         This is a *technical* reset an operator triggers; it never approves any
         semantic action and never auto-fires.
         """
         self.cleanup_failure_latched = False
+        self.policy_violation_latched = False
         self.consecutive_failures = 0
         self.state = self._derive_state()
 
@@ -210,12 +224,14 @@ class TransportHealth:
                 "cleanup_failures": self.cleanup_failures,
                 "uncertain_completions": self.uncertain_completions,
                 "handshakes_ok": self.handshakes_ok,
+                "policy_violations": self.policy_violations,
             },
             "consecutive_failures": self.consecutive_failures,
             "failure_threshold": self.failure_threshold,
             "last_outcome": self.last_outcome,
             "last_updated_at": self.last_updated_at,
             "cleanup_failure_latched": self.cleanup_failure_latched,
+            "policy_violation_latched": self.policy_violation_latched,
             "recent_events": list(self.events),
         }
 
@@ -238,5 +254,6 @@ __all__ = [
     "OUTCOME_UNCERTAIN_COMPLETION",
     "OUTCOME_HANDSHAKE_OK",
     "OUTCOME_CANCELLED",
+    "OUTCOME_POLICY_VIOLATION",
     "TransportHealth",
 ]
