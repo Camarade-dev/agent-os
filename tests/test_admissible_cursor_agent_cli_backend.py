@@ -12,6 +12,7 @@ writes the target workspace, model output always routed through ingest/admission
 
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import unittest
@@ -24,6 +25,8 @@ from admissible.agent_backend import (
     AGENT_AVAILABILITY_UNSUPPORTED,
     AGENT_INVOKE_BLOCKED_BY_CONFIGURATION,
     AGENT_INVOKE_SUCCESS,
+    AGENT_INVOKE_TERMINAL_RESULT_WITHOUT_STRUCTURED_PROPOSAL,
+    AGENT_INVOKE_TRANSPORT_PARSE_ERROR,
     CURSOR_AGENT_CLI_COMMAND,
     CURSOR_CLI_ARGS_ENV,
     CURSOR_CLI_COMMAND_ENV,
@@ -39,6 +42,13 @@ from admissible.agent_backend import (
 )
 from admissible.control_surface import ControlSurfaceController
 from admissible.runner.extraction_lab import load_fixture
+
+def _ndjson_success(text: str) -> str:
+    """Wrap ``text`` as a minimal one-line NDJSON terminal success event."""
+    return json.dumps(
+        {"type": "result", "subtype": "success", "is_error": False, "result": text}
+    )
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures" / "admissible"
@@ -81,8 +91,12 @@ class TestCursorAgentPresetAndSafety(unittest.TestCase):
     def test_preset_has_required_read_only_flags(self) -> None:
         args = cursor_agent_cli_safe_args_template()
         self.assertIn("--print", args)
+        self.assertIn("--output-format", args)
+        self.assertIn("stream-json", args)
+        self.assertIn("--stream-partial-output", args)
         self.assertIn("--mode", args)
-        self.assertIn("plan", args)
+        self.assertIn("ask", args)
+        self.assertIn("--model", args)
         self.assertIn("--workspace", args)
         self.assertIn("{agent_workspace}", args)
         self.assertIn("{prompt}", args)
@@ -95,42 +109,86 @@ class TestCursorAgentPresetAndSafety(unittest.TestCase):
         for unsafe in (base + ["--force"], base + ["--yolo"]):
             blocking, _ = assess_cursor_cli_safety(CURSOR_AGENT_CLI_COMMAND, unsafe)
             self.assertTrue(blocking)
-        sandbox = ["--print", "--mode", "plan", "--sandbox", "disabled",
-                   "--workspace", "{agent_workspace}", "{prompt}"]
+        sandbox = [
+            "--print", "--output-format", "stream-json", "--stream-partial-output",
+            "--mode", "ask", "--model", "auto", "--sandbox", "disabled",
+            "--workspace", "{agent_workspace}", "{prompt}",
+        ]
         blocking, _ = assess_cursor_cli_safety(CURSOR_AGENT_CLI_COMMAND, sandbox)
         self.assertTrue(any("sandbox" in b.lower() for b in blocking))
 
-    def test_missing_plan_mode_blocks_configuration(self) -> None:
-        no_plan = ["--print", "--workspace", "{agent_workspace}", "{prompt}"]
-        blocking, _ = assess_cursor_cli_safety(CURSOR_AGENT_CLI_COMMAND, no_plan)
-        self.assertTrue(any("plan" in b.lower() for b in blocking))
-        # --plan (short form) is accepted.
-        with_plan = ["--print", "--plan", "--workspace", "{agent_workspace}", "{prompt}"]
-        blocking2, _ = assess_cursor_cli_safety(CURSOR_AGENT_CLI_COMMAND, with_plan)
-        self.assertFalse(any("plan" in b.lower() for b in blocking2))
+    def test_legacy_text_plan_config_fails_preflight_with_actionable_error(self) -> None:
+        """A stale text/plan template must fail closed, not silently launch the wrong mode."""
+        legacy = [
+            "--print", "--output-format", "text", "--mode", "plan",
+            "--workspace", "{agent_workspace}", "--trust", "{prompt}",
+        ]
+        blocking, _ = assess_cursor_cli_safety(CURSOR_AGENT_CLI_COMMAND, legacy)
+        self.assertTrue(blocking)
+        message = " ".join(blocking).lower()
+        # The error must identify observed + required output format, and
+        # observed + required mode.
+        self.assertIn("output format='text'", message)
+        self.assertIn("output format='stream-json'", message)
+        self.assertIn("mode='plan'", message)
+        self.assertIn("mode='ask'", message)
+
+    def test_missing_stream_json_ask_mode_blocks_configuration(self) -> None:
+        no_stream_ask = ["--print", "--workspace", "{agent_workspace}", "--model", "auto", "{prompt}"]
+        blocking, _ = assess_cursor_cli_safety(CURSOR_AGENT_CLI_COMMAND, no_stream_ask)
+        self.assertTrue(any("ndjson" in b.lower() or "stream" in b.lower() for b in blocking))
+        # The full canonical preset (stream-json + ask + stream-partial-output) is accepted.
+        full = cursor_agent_cli_safe_args_template()
+        blocking2, _ = assess_cursor_cli_safety(CURSOR_AGENT_CLI_COMMAND, full)
+        self.assertEqual(blocking2, [])
+
+    def test_missing_stream_partial_output_blocks_configuration(self) -> None:
+        no_partial = [
+            "--print", "--output-format", "stream-json", "--mode", "ask",
+            "--model", "auto", "--workspace", "{agent_workspace}", "{prompt}",
+        ]
+        blocking, _ = assess_cursor_cli_safety(CURSOR_AGENT_CLI_COMMAND, no_partial)
+        self.assertTrue(any("stream-partial-output" in b for b in blocking))
 
     def test_missing_print_blocks_configuration(self) -> None:
-        no_print = ["--mode", "plan", "--workspace", "{agent_workspace}", "{prompt}"]
+        no_print = [
+            "--output-format", "stream-json", "--stream-partial-output", "--mode", "ask",
+            "--model", "auto", "--workspace", "{agent_workspace}", "{prompt}",
+        ]
         blocking, _ = assess_cursor_cli_safety(CURSOR_AGENT_CLI_COMMAND, no_print)
         self.assertTrue(any("--print" in b for b in blocking))
 
     def test_cursor_ide_with_agent_subcommand_blocked(self) -> None:
         blocking, _ = assess_cursor_cli_safety(
-            "cursor", ["agent", "--print", "--mode", "plan", "--workspace", "{agent_workspace}", "{prompt}"]
+            "cursor",
+            [
+                "agent", "--print", "--output-format", "stream-json",
+                "--stream-partial-output", "--mode", "ask", "--model", "auto",
+                "--workspace", "{agent_workspace}", "{prompt}",
+            ],
         )
         self.assertTrue(any("cursor-agent" in b for b in blocking))
 
     def test_workspace_must_use_agent_workspace_placeholder(self) -> None:
-        hardcoded = ["--print", "--mode", "plan", "--workspace", "/tmp/target", "{prompt}"]
+        hardcoded = [
+            "--print", "--output-format", "stream-json", "--stream-partial-output",
+            "--mode", "ask", "--model", "auto", "--workspace", "/tmp/target", "{prompt}",
+        ]
         blocking, _ = assess_cursor_cli_safety(CURSOR_AGENT_CLI_COMMAND, hardcoded)
         self.assertTrue(any("agent_workspace" in b for b in blocking))
 
-    def test_no_model_is_visible_warning_not_block(self) -> None:
-        blocking, warnings = assess_cursor_cli_safety(
+    def test_missing_model_blocks_configuration(self) -> None:
+        no_model = [
+            "--print", "--output-format", "stream-json", "--stream-partial-output",
+            "--mode", "ask", "--workspace", "{agent_workspace}", "{prompt}",
+        ]
+        blocking, _ = assess_cursor_cli_safety(CURSOR_AGENT_CLI_COMMAND, no_model)
+        self.assertTrue(any("--model" in b for b in blocking))
+        # The full canonical preset configures --model and is not blocked on this.
+        blocking2, _ = assess_cursor_cli_safety(
             CURSOR_AGENT_CLI_COMMAND, cursor_agent_cli_safe_args_template()
         )
-        self.assertEqual(blocking, [])
-        self.assertTrue(any("model" in w.lower() for w in warnings))
+        self.assertFalse(any("--model" in b for b in blocking2))
 
 
 class TestCursorAgentInvocation(unittest.TestCase):
@@ -166,7 +224,12 @@ class TestCursorAgentInvocation(unittest.TestCase):
         def runner(argv, **kwargs):
             captured["argv"] = argv
             captured["kwargs"] = kwargs
-            return _FakeCompleted(stdout="ADMISSIBLE PROPOSAL: write_file game.js")
+            return _FakeCompleted(
+                stdout=_ndjson_success(
+                    "ADMISSIBLE PROPOSAL:\nADMISSIBLE_STRUCTURED_OPERATION:\n"
+                    '{"operation": "write_file", "path": "game.js", "content": "x"}'
+                )
+            )
 
         backend = CursorCliAgentBackend(config=self.config, runner=runner)
         with mock.patch.object(subprocess, "run", side_effect=AssertionError("no real cursor")):
@@ -181,10 +244,12 @@ class TestCursorAgentInvocation(unittest.TestCase):
         self.assertNotEqual(
             Path(captured["kwargs"]["cwd"]).resolve(), self.target.resolve()
         )
-        # Read-only plan-mode flags are present, and the short pointer adapter is
-        # one argv element (never shell-interpreted).
+        # Read-only NDJSON streaming Ask-mode flags are present, and the short
+        # pointer adapter is one argv element (never shell-interpreted).
         self.assertIn("--print", captured["argv"])
-        self.assertIn("plan", captured["argv"])
+        self.assertIn("stream-json", captured["argv"])
+        self.assertIn("--stream-partial-output", captured["argv"])
+        self.assertIn("ask", captured["argv"])
         adapter = captured["argv"][-1]
         self.assertIn("Read the complete governed instruction", adapter)
         self.assertNotIn("scaffold the game", adapter)
@@ -199,7 +264,12 @@ class TestCursorAgentInvocation(unittest.TestCase):
 
         def runner(argv, **kwargs):
             captured["argv"] = argv
-            return _FakeCompleted(stdout="proposal")
+            return _FakeCompleted(
+                stdout=_ndjson_success(
+                    "ADMISSIBLE_STRUCTURED_OPERATION:\n"
+                    '{"operation": "write_file", "path": "a.txt", "content": "x"}'
+                )
+            )
 
         backend = CursorCliAgentBackend(config=self.config, runner=runner)
         backend.invoke(self._request("Z" * (PROMPT_ARG_MAX_CHARS + 50)))
@@ -213,7 +283,12 @@ class TestCursorAgentInvocation(unittest.TestCase):
     def test_stdout_is_returned_as_response_text_not_executed(self) -> None:
         def runner(argv, **kwargs):
             # A dangerous-looking proposal must be returned, never executed.
-            return _FakeCompleted(stdout="Proposed: rm -rf / ; write_file game.js")
+            return _FakeCompleted(
+                stdout=_ndjson_success(
+                    "Proposed: rm -rf / ; ADMISSIBLE_STRUCTURED_OPERATION:\n"
+                    '{"operation": "write_file", "path": "game.js", "content": "x"}'
+                )
+            )
 
         backend = CursorCliAgentBackend(config=self.config, runner=runner)
         before = {p.name for p in self.target.iterdir() if p.is_file()}
@@ -223,12 +298,52 @@ class TestCursorAgentInvocation(unittest.TestCase):
         self.assertIn("write_file", result.response_text)
         self.assertEqual(before, after)  # backend wrote no target files
 
+    def test_terminal_result_without_structured_operation_is_not_success(self) -> None:
+        """A createPlan-shaped, progress-only terminal result must not be a usable response."""
+
+        def runner(argv, **kwargs):
+            return _FakeCompleted(
+                stdout="\n".join(
+                    [
+                        json.dumps({"type": "assistant", "text": "Proposing a write_file op..."}),
+                        json.dumps(
+                            {
+                                "type": "tool_call",
+                                "tool_call": {"createPlanToolCall": {"_toolName": "createPlan"}},
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "interaction_query",
+                                "query": {"create_plan_request_query": {}},
+                            }
+                        ),
+                        _ndjson_success("Proposing the write_file operation without executing it."),
+                    ]
+                )
+            )
+
+        backend = CursorCliAgentBackend(config=self.config, runner=runner)
+        result = backend.invoke(self._request())
+        self.assertEqual(result.status, AGENT_INVOKE_TERMINAL_RESULT_WITHOUT_STRUCTURED_PROPOSAL)
+        self.assertIsNone(result.response_text)
+        self.assertTrue(result.stream_json_diagnostics["create_plan_detected"])
+
+    def test_non_ndjson_stdout_is_transport_parse_error(self) -> None:
+        def runner(argv, **kwargs):
+            return _FakeCompleted(stdout="not ndjson at all, just plain prose")
+
+        backend = CursorCliAgentBackend(config=self.config, runner=runner)
+        result = backend.invoke(self._request())
+        self.assertEqual(result.status, AGENT_INVOKE_TRANSPORT_PARSE_ERROR)
+
     def test_unsafe_config_is_unsupported_and_never_runs(self) -> None:
         unsafe = CursorCliConfig.from_env(
             {
                 CURSOR_CLI_COMMAND_ENV: str(self.fake),
                 CURSOR_CLI_ARGS_ENV: (
-                    "--print --mode plan --workspace {agent_workspace} --yolo {prompt}"
+                    "--print --output-format stream-json --stream-partial-output --mode ask "
+                    "--model auto --workspace {agent_workspace} --yolo {prompt}"
                 ),
             }
         )
@@ -253,16 +368,17 @@ class TestCursorAgentBackendDiscovery(unittest.TestCase):
         self.assertIn("Cursor Agent CLI", cursor["label"])
         self.assertTrue(cursor["proposal_only"])
         self.assertIsNotNone(cursor["safety_mode"])
-        self.assertIn("--mode plan", cursor["safety_mode"])
+        self.assertIn("--mode ask", cursor["safety_mode"])
+        self.assertIn("stream-json", cursor["safety_mode"])
 
 
 def _cursor_agent_runner(responses: list[str]):
-    """A fake subprocess runner that returns queued fixture stdout per call."""
+    """A fake subprocess runner that returns queued NDJSON-wrapped stdout per call."""
     queue = list(responses)
 
     def runner(argv, **kwargs):
         text = queue.pop(0) if queue else ""
-        return _FakeCompleted(stdout=text, returncode=0)
+        return _FakeCompleted(stdout=_ndjson_success(text), returncode=0)
 
     return runner
 
@@ -323,7 +439,7 @@ class TestCursorAgentUi(unittest.TestCase):
         self.assertIn("safety_mode", self.html)
         # And a static hint states the read-only, proposal-only plan mode.
         self.assertIn("Cursor Agent CLI runs read-only", self.html)
-        self.assertIn("--print --mode plan", self.html)
+        self.assertIn("--print --output-format stream-json --mode ask", self.html)
         self.assertIn("proposal-only", self.html)
 
 

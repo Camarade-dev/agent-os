@@ -1,0 +1,74 @@
+{
+  "_description": "Sanitized fixtures for ADMISSIBLE_NARROW_FIX_CURSOR_ONESHOT_STREAM_JSON_ASK_AND_OPERATION_LIMIT PART 5. Scenario 1 reconstructs the three real one-byte text-mode empty-success controller invocations (stdout length 1, empty_success). Scenario 2 reconstructs the real stream-json probe: valid NDJSON, a createPlanToolCall + create_plan_request_query interaction workflow, terminal success containing only progress text, zero structured operations. Scenarios 3-4 are constructed Ask-mode-style transcripts exercising the operation-budget boundary. Internal field names (createPlanToolCall, _toolName, create_plan_request_query) match the real installed Cursor CLI's bundled schema (admissible/agent_backend.py comments, RUN_046 forensic audit).",
+
+  "text_mode_empty_success_samples": {
+    "description": "Three real controller invocations under the legacy --output-format text --mode plan preset: exit code 0, stdout length 1, empty stderr. Never valid NDJSON -- caught by the pre-NDJSON whitespace-only stdout check, same as any other empty stdout.",
+    "raw_stdout_samples": [" ", "\n", "\t"],
+    "expected_status": "empty_success"
+  },
+
+  "stream_json_probe_createplan_progress_only": {
+    "description": "Live stream-json --mode plan probe: valid NDJSON, model reads the instruction + Mission Contract, emits progress-only assistant messages, calls Cursor's internal createPlan tool, completes a createPlanRequestQuery, and returns terminal success containing only progress text -- no ADMISSIBLE_STRUCTURED_OPERATION block. Must not be treated as a usable proposal.",
+    "raw_stdout_ndjson_lines": [
+      {"type": "system", "subtype": "init", "session_id": "sanitized-session-1"},
+      {"type": "user", "text": "Read the complete governed instruction from the file at \"<instruction_file>\". Return the complete proposed response directly to stdout as plain text."},
+      {"type": "thinking", "text": "Reading the instruction file and the Mission Contract before proposing anything."},
+      {"type": "assistant", "text": "Reading the governed instruction and Mission Contract now."},
+      {"type": "tool_call", "tool_call": {"readFileToolCall": {"path": "next-agent-instruction.md"}}, "status": "completed"},
+      {"type": "tool_call", "tool_call": {"readFileToolCall": {"path": "mission-contract.json"}}, "status": "completed"},
+      {"type": "assistant", "text": "Formulating a plan before proposing the requested write operations."},
+      {"type": "tool_call", "tool_call": {"createPlanToolCall": {"_toolName": "createPlan"}}, "status": "pending"},
+      {"type": "interaction_query", "query": {"create_plan_request_query": {"id": "sanitized-query-1"}}},
+      {"type": "interaction_query", "query": {"create_plan_request_response": {"id": "sanitized-query-1", "result": "accepted"}}},
+      {
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "result": "Proposing the requested operations after reviewing the Mission Contract. Mission contract mentions 4 writes/response in process guidance; instruction packet allows 8 -- this batch uses 8. See plan for details."
+      }
+    ],
+    "expected_status": "terminal_result_without_structured_proposal",
+    "expected_diagnostics": {
+      "tool_call_event_count": 3,
+      "interaction_query_event_count": 2,
+      "assistant_event_count": 2,
+      "terminal_event_count": 1,
+      "create_plan_detected": true
+    }
+  },
+
+  "ask_mode_valid_transcript_four_operations": {
+    "description": "Corrected NDJSON stream-json --mode ask transcript: progress-only assistant events, no tool calls, terminal success containing exactly four complete ADMISSIBLE_STRUCTURED_OPERATION blocks -- a usable canonical response.",
+    "raw_stdout_ndjson_lines": [
+      {"type": "system", "subtype": "init", "session_id": "sanitized-session-2"},
+      {"type": "user", "text": "Read the complete governed instruction from the file at \"<instruction_file>\". Do not create a plan or use any planning tool."},
+      {"type": "assistant", "text": "Proposing four bounded write_file operations without executing them."},
+      {
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "result": "ADMISSIBLE_STRUCTURED_OPERATION:\n{\"operation\": \"write_file\", \"path\": \"index.html\", \"content\": \"<html></html>\"}\nADMISSIBLE_STRUCTURED_OPERATION:\n{\"operation\": \"write_file\", \"path\": \"style.css\", \"content\": \"body{}\"}\nADMISSIBLE_STRUCTURED_OPERATION:\n{\"operation\": \"write_file\", \"path\": \"game.js\", \"content\": \"const x = 1;\"}\nADMISSIBLE_STRUCTURED_OPERATION:\n{\"operation\": \"write_file\", \"path\": \"README.md\", \"content\": \"# Neon Serpents\"}\nStatus: PROPOSED -- awaiting the bounded execution gate."
+      }
+    ],
+    "expected_status": "success",
+    "expected_operation_count": 4
+  },
+
+  "five_operations_exceeds_effective_maximum": {
+    "description": "A terminal response containing five complete structured operations when the effective per-response maximum (min(system=8, explicit_user=4)) is four. The transport layer parses this as an ordinary successful terminal result; the operation-budget check at admission (validate_coherent_batch_limits / ingest_agent_response) must independently reject it even though nothing in the prompt was violated at the transport level.",
+    "raw_stdout_ndjson_lines": [
+      {"type": "system", "subtype": "init", "session_id": "sanitized-session-3"},
+      {"type": "assistant", "text": "Proposing five bounded write_file operations without executing them."},
+      {
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "result": "ADMISSIBLE_STRUCTURED_OPERATION:\n{\"operation\": \"write_file\", \"path\": \"index.html\", \"content\": \"<html></html>\"}\nADMISSIBLE_STRUCTURED_OPERATION:\n{\"operation\": \"write_file\", \"path\": \"style.css\", \"content\": \"body{}\"}\nADMISSIBLE_STRUCTURED_OPERATION:\n{\"operation\": \"write_file\", \"path\": \"game.js\", \"content\": \"const x = 1;\"}\nADMISSIBLE_STRUCTURED_OPERATION:\n{\"operation\": \"write_file\", \"path\": \"README.md\", \"content\": \"# Neon Serpents\"}\nADMISSIBLE_STRUCTURED_OPERATION:\n{\"operation\": \"write_file\", \"path\": \"LICENSE\", \"content\": \"MIT\"}\nStatus: PROPOSED -- awaiting the bounded execution gate."
+      }
+    ],
+    "expected_status": "success",
+    "expected_operation_count": 5,
+    "effective_maximum": 4,
+    "expected_admission_rejection": true
+  }
+}

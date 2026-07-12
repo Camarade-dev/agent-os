@@ -33,9 +33,22 @@ class TestAdmissibleUtf8RoundTrip(unittest.TestCase):
             agent_ws.mkdir()
             captured: dict = {}
 
+            ndjson_stdout = json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "result": (
+                        UTF8_TEXT
+                        + '\nADMISSIBLE_STRUCTURED_OPERATION:\n'
+                        '{"operation": "write_file", "path": "a.txt", "content": "x"}'
+                    ),
+                }
+            )
+
             def runner(argv, **kwargs):
                 captured.update(kwargs)
-                return SimpleNamespace(returncode=0, stdout=UTF8_TEXT, stderr="")
+                return SimpleNamespace(returncode=0, stdout=ndjson_stdout, stderr="")
 
             backend = CursorCliAgentBackend(
                 config=CursorCliConfig.cursor_agent_preset(command=str(fake)),
@@ -49,7 +62,7 @@ class TestAdmissibleUtf8RoundTrip(unittest.TestCase):
                 )
             )
             self.assertEqual(result.status, AGENT_INVOKE_SUCCESS)
-            self.assertEqual(result.response_text, UTF8_TEXT)
+            self.assertIn(UTF8_TEXT, result.response_text)
             self.assertEqual(captured["encoding"], "utf-8")
             self.assertEqual(captured["errors"], "replace")
             self.assertFalse(captured["shell"])

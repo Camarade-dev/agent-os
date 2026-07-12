@@ -8,6 +8,7 @@ argv line with no CR/LF/TAB/NUL.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import unittest
@@ -31,6 +32,13 @@ class _FakeCompleted:
         self.stdout = stdout
         self.stderr = stderr
         self.returncode = returncode
+
+
+def _ndjson_success(text: str) -> str:
+    """Wrap ``text`` as a minimal one-line NDJSON terminal success event."""
+    return json.dumps(
+        {"type": "result", "subtype": "success", "is_error": False, "result": text}
+    )
 
 
 class TestCursorAgentSingleLineAdapter(unittest.TestCase):
@@ -85,7 +93,12 @@ class TestCursorAgentSingleLineAdapter(unittest.TestCase):
         def runner(argv, **kwargs):
             captured["argv"] = argv
             captured["kwargs"] = kwargs
-            return _FakeCompleted(stdout="proposal")
+            return _FakeCompleted(
+                stdout=_ndjson_success(
+                    "proposal\nADMISSIBLE_STRUCTURED_OPERATION:\n"
+                    '{"operation": "write_file", "path": "a.txt", "content": "x"}'
+                )
+            )
 
         instruction = "Build the bounded local files with ADMISSIBLE_STRUCTURED_OPERATION blocks."
         backend = CursorCliAgentBackend(config=self.config, runner=runner)

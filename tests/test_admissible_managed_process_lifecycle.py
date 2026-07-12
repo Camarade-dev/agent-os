@@ -357,15 +357,28 @@ class TestOneshotAdapterUsesManagedCleanup(unittest.TestCase):
             CursorCliAgentBackend,
         )
 
+        import json
+
+        ndjson_stdout = json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": (
+                    "the response\nADMISSIBLE_STRUCTURED_OPERATION:\n"
+                    '{"operation": "write_file", "path": "a.txt", "content": "x"}'
+                ),
+            }
+        )
         backend = CursorCliAgentBackend(
             config=self.config,
             managed_oneshot=self._managed_oneshot(
-                timed_out=False, cleanup_complete=True, stdout="the response"
+                timed_out=False, cleanup_complete=True, stdout=ndjson_stdout
             ),
         )
         result = backend.invoke(self._request())
         self.assertEqual(result.status, AGENT_INVOKE_SUCCESS)
-        self.assertEqual(result.response_text, "the response")
+        self.assertIn("the response", result.response_text)
         self.assertEqual(result.transport_kind, BACKEND_ID_CURSOR_ONESHOT)
         self.assertIsNotNone(result.managed_process_result)
 

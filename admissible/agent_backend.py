@@ -66,6 +66,13 @@ from admissible.agent_transport import (
     AgentTransport,
     AgentTransportReadResult,
 )
+from admissible.cursor_stream_json import (
+    CLASSIFICATION_EMPTY_SUCCESS,
+    CLASSIFICATION_TERMINAL_ERROR,
+    CLASSIFICATION_TERMINAL_RESULT_WITHOUT_STRUCTURED_PROPOSAL,
+    CLASSIFICATION_TRANSPORT_PARSE_ERROR,
+    parse_cursor_stream_json,
+)
 
 # -- invocation result status codes ------------------------------------------
 AGENT_INVOKE_SUCCESS = "success"
@@ -75,6 +82,17 @@ AGENT_INVOKE_FAILED = "failed"
 AGENT_INVOKE_MALFORMED = "malformed"
 AGENT_INVOKE_EMPTY_SUCCESS = "empty_success"
 AGENT_INVOKE_BLOCKED_BY_CONFIGURATION = "blocked_by_configuration"
+# NDJSON stream-json classifications (slice ADMISSIBLE_NARROW_FIX_CURSOR_ONESHOT_
+# STREAM_JSON_ASK_AND_OPERATION_LIMIT) -- see admissible.cursor_stream_json.
+# Kept distinct from AGENT_INVOKE_MALFORMED/AGENT_INVOKE_FAILED so callers can
+# tell "the transport/NDJSON itself was broken" apart from "the model's
+# terminal text succeeded but was a plan/progress payload, not a proposal"
+# apart from "the CLI itself reported a terminal failure".
+AGENT_INVOKE_TRANSPORT_PARSE_ERROR = "transport_parse_error"
+AGENT_INVOKE_TERMINAL_ERROR = "terminal_error"
+AGENT_INVOKE_TERMINAL_RESULT_WITHOUT_STRUCTURED_PROPOSAL = (
+    "terminal_result_without_structured_proposal"
+)
 
 AGENT_INVOKE_STATUS_CODES = frozenset(
     {
@@ -85,6 +103,9 @@ AGENT_INVOKE_STATUS_CODES = frozenset(
         AGENT_INVOKE_MALFORMED,
         AGENT_INVOKE_EMPTY_SUCCESS,
         AGENT_INVOKE_BLOCKED_BY_CONFIGURATION,
+        AGENT_INVOKE_TRANSPORT_PARSE_ERROR,
+        AGENT_INVOKE_TERMINAL_ERROR,
+        AGENT_INVOKE_TERMINAL_RESULT_WITHOUT_STRUCTURED_PROPOSAL,
     }
 )
 
@@ -99,6 +120,9 @@ AGENT_INVOKE_TERMINAL_STATUSES = frozenset(
         AGENT_INVOKE_FAILED,
         AGENT_INVOKE_MALFORMED,
         AGENT_INVOKE_EMPTY_SUCCESS,
+        AGENT_INVOKE_TRANSPORT_PARSE_ERROR,
+        AGENT_INVOKE_TERMINAL_ERROR,
+        AGENT_INVOKE_TERMINAL_RESULT_WITHOUT_STRUCTURED_PROPOSAL,
     }
 )
 
@@ -132,6 +156,11 @@ CURSOR_CLI_VERSION_ARGS_ENV = "ADMISSIBLE_CURSOR_CLI_VERSION_ARGS"
 CURSOR_CLI_INPUT_MODE_ENV = "ADMISSIBLE_CURSOR_CLI_INPUT_MODE"
 CURSOR_CLI_OUTPUT_MODE_ENV = "ADMISSIBLE_CURSOR_CLI_OUTPUT_MODE"
 CURSOR_CLI_MODEL_LABEL_ENV = "ADMISSIBLE_CURSOR_CLI_MODEL_LABEL"
+# Distinct from CURSOR_CLI_MODEL_LABEL_ENV (a display-only label): this is the
+# literal value substituted for the {model} argv placeholder (e.g. "auto",
+# "sonnet-4-thinking"). Defaults to "auto" so a fresh preset is always usable
+# without requiring an operator to pick a specific model.
+CURSOR_CLI_MODEL_ENV = "ADMISSIBLE_CURSOR_CLI_MODEL"
 
 INPUT_MODE_INSTRUCTION_FILE = "instruction_file"
 INPUT_MODE_STDIN = "stdin"
@@ -151,30 +180,52 @@ PLACEHOLDER_INSTRUCTION_FILE = "{instruction_file}"
 PLACEHOLDER_RESPONSE_FILE = "{response_file}"
 PLACEHOLDER_AGENT_WORKSPACE = "{agent_workspace}"
 PLACEHOLDER_PROMPT = "{prompt}"
+PLACEHOLDER_MODEL = "{model}"
 
 AGENT_BRIDGE_SUBDIR = ".admissible"
 AGENT_INSTRUCTION_FILENAME = "next-agent-instruction.md"
 AGENT_RESPONSE_FILENAME = "agent-response.md"
 
-# -- Cursor Agent CLI safe preset (slice ADMISSIBLE_RUN_033) -----------------
+# -- Cursor Agent CLI safe preset (slice ADMISSIBLE_RUN_033, NDJSON stream-json
+# Ask-mode preset from ADMISSIBLE_NARROW_FIX_CURSOR_ONESHOT_STREAM_JSON_ASK_AND_
+# OPERATION_LIMIT) ------------------------------------------------------------
 # The real local Cursor Agent CLI is ``cursor-agent`` (NOT ``cursor agent`` — the
 # ``cursor`` command is the IDE wrapper and does not expose the real Agent CLI).
-# Admissible only ever drives it in read-only *planning* mode: it analyzes and
-# proposes, it does not edit. The model still proposes; only Admissible's bounded
+# Admissible only ever drives it in a read-only mode: it analyzes and proposes,
+# it does not edit. The model still proposes; only Admissible's bounded
 # executor writes to the target workspace.
+#
+# Canonical live evidence showed two defects in the prior ``--output-format
+# text --mode plan`` preset: (a) ``text`` output is fully buffered and produced
+# three real empty-stdout ``empty_success`` results with no diagnosable event
+# stream; (b) a live ``--output-format stream-json --mode plan`` probe showed
+# the model completing Cursor's own ``createPlan`` tool/interaction-query
+# workflow instead of returning a textual proposal, terminating "successfully"
+# with progress-only text and zero structured operations. The preset below
+# switches to NDJSON streaming (diagnosable event-by-event) and read-only Ask
+# mode (Cursor's own read-only Q&A mode, distinct from plan mode's access to
+# planning tools like ``createPlan``); ``admissible.cursor_stream_json`` still
+# defensively refuses to treat a plan/tool-shaped terminal result as a
+# structured proposal even if a tool call occurs anyway.
 CURSOR_AGENT_CLI_COMMAND = "cursor-agent"
 CURSOR_AGENT_CLI_SAFE_ARGS: tuple[str, ...] = (
     "--print",
     "--output-format",
-    "text",
+    "stream-json",
+    "--stream-partial-output",
     "--mode",
-    "plan",
+    "ask",
+    "--model",
+    PLACEHOLDER_MODEL,
     "--workspace",
     PLACEHOLDER_AGENT_WORKSPACE,
     "--trust",
     PLACEHOLDER_PROMPT,
 )
 CURSOR_AGENT_CLI_MODEL_LABEL = "cursor-agent-default"
+CURSOR_AGENT_CLI_REQUIRED_OUTPUT_FORMAT = "stream-json"
+CURSOR_AGENT_CLI_REQUIRED_MODE = "ask"
+CURSOR_AGENT_CLI_DEFAULT_MODEL = "auto"
 
 # Command basenames recognised as the real Cursor Agent CLI vs the IDE wrapper.
 _CURSOR_AGENT_COMMAND_NAMES = frozenset(
@@ -203,9 +254,11 @@ def build_cursor_agent_file_pointer_adapter(instruction_file: Path) -> str:
     path = str(instruction_file.resolve())
     return (
         f'Read the complete governed instruction from the file at "{path}". '
-        "Return the complete proposed response directly to stdout. "
+        "Return the complete proposed response directly to stdout as plain text. "
         "Do not write or modify any file. "
         "Do not write .admissible/agent-response.md. "
+        "Do not create a plan or use any planning tool; respond directly with the "
+        "requested text instead of a plan proposal. "
         "Include all requested ADMISSIBLE_STRUCTURED_OPERATION blocks directly in stdout. "
         "Follow the response format in the instruction file."
     )
@@ -392,6 +445,10 @@ class AgentInvocationResult:
     acp_invocation_state: str | None = None
     acp_telemetry: dict[str, Any] | None = None
     managed_process_result: dict[str, Any] | None = None
+    # Bounded NDJSON diagnostics from admissible.cursor_stream_json (event-type
+    # counts, createPlan detection, malformed-line counts). Never the source of
+    # the canonical response -- diagnostics only.
+    stream_json_diagnostics: dict[str, Any] | None = None
 
     @property
     def ok(self) -> bool:
@@ -454,6 +511,11 @@ class AgentInvocationResult:
                 if self.managed_process_result is not None
                 else None
             ),
+            "stream_json_diagnostics": (
+                dict(self.stream_json_diagnostics)
+                if self.stream_json_diagnostics is not None
+                else None
+            ),
         }
 
 
@@ -486,6 +548,12 @@ _RESULT_TO_RECORD_STATUS = {
     AGENT_INVOKE_EMPTY_SUCCESS: INVOCATION_STATUS_EMPTY_SUCCESS,
     AGENT_INVOKE_UNAVAILABLE: INVOCATION_STATUS_FAILED,
     AGENT_INVOKE_BLOCKED_BY_CONFIGURATION: INVOCATION_STATUS_FAILED,
+    # Transport-shaped errors are treated like a malformed response (eligible
+    # for the existing bounded malformed-retry path); a terminal CLI-reported
+    # failure is treated like any other hard failure.
+    AGENT_INVOKE_TRANSPORT_PARSE_ERROR: INVOCATION_STATUS_MALFORMED,
+    AGENT_INVOKE_TERMINAL_ERROR: INVOCATION_STATUS_FAILED,
+    AGENT_INVOKE_TERMINAL_RESULT_WITHOUT_STRUCTURED_PROPOSAL: INVOCATION_STATUS_MALFORMED,
 }
 
 _SUMMARY_MAX_CHARS = 500
@@ -999,18 +1067,32 @@ def assess_cursor_cli_safety(
         if "--print" not in lower:
             blocking.append("Cursor Agent CLI must run with --print (non-interactive).")
         mode_value = (_flag_value(tokens, "--mode") or "").lower()
-        if mode_value != "plan" and "--plan" not in lower:
-            blocking.append(
-                "Cursor Agent CLI must run in read-only planning mode (--mode plan or --plan)."
-            )
         output_value = (_flag_value(tokens, "--output-format") or "").lower()
-        if output_value and output_value not in ("text", "json"):
-            warnings.append(
-                f"Cursor Agent --output-format {output_value!r} is not text/json; stdout may "
-                "not ingest cleanly."
+        has_stream_partial = "--stream-partial-output" in lower
+        # The one-shot transport requires NDJSON streaming Ask mode (PART 1 of
+        # ADMISSIBLE_NARROW_FIX_CURSOR_ONESHOT_STREAM_JSON_ASK_AND_OPERATION_LIMIT).
+        # A legacy/operator-supplied template that still points at the old
+        # ``text``/``plan`` preset must fail preflight with an actionable error
+        # naming observed vs. required output format AND mode, rather than
+        # silently launching the wrong mode.
+        if (
+            output_value != CURSOR_AGENT_CLI_REQUIRED_OUTPUT_FORMAT
+            or mode_value != CURSOR_AGENT_CLI_REQUIRED_MODE
+            or not has_stream_partial
+        ):
+            blocking.append(
+                "Cursor Agent CLI one-shot transport requires NDJSON streaming Ask mode: "
+                f"observed output format={output_value or '(not set)'!r}, required output "
+                f"format={CURSOR_AGENT_CLI_REQUIRED_OUTPUT_FORMAT!r}; "
+                f"observed mode={mode_value or '(not set)'!r}, required "
+                f"mode={CURSOR_AGENT_CLI_REQUIRED_MODE!r}; "
+                f"--stream-partial-output is {'present' if has_stream_partial else 'missing (required)'}."
             )
         if "--model" not in lower:
-            warnings.append("No --model configured; Cursor Agent will use its default model.")
+            blocking.append(
+                "Cursor Agent CLI one-shot transport must configure --model explicitly "
+                f"(e.g. {PLACEHOLDER_MODEL} substituted with {CURSOR_AGENT_CLI_DEFAULT_MODEL!r})."
+            )
 
     return blocking, warnings
 
@@ -1020,7 +1102,11 @@ def cursor_agent_cli_safe_args_template() -> list[str]:
     return list(CURSOR_AGENT_CLI_SAFE_ARGS)
 
 
-def cursor_agent_cli_preset_env(command: str = CURSOR_AGENT_CLI_COMMAND) -> dict[str, str]:
+def cursor_agent_cli_preset_env(
+    command: str = CURSOR_AGENT_CLI_COMMAND,
+    *,
+    model: str = CURSOR_AGENT_CLI_DEFAULT_MODEL,
+) -> dict[str, str]:
     """Environment variables that configure the safe Cursor Agent CLI preset."""
     return {
         CURSOR_CLI_COMMAND_ENV: command,
@@ -1028,6 +1114,7 @@ def cursor_agent_cli_preset_env(command: str = CURSOR_AGENT_CLI_COMMAND) -> dict
         CURSOR_CLI_INPUT_MODE_ENV: INPUT_MODE_FILE_POINTER_ALWAYS,
         CURSOR_CLI_OUTPUT_MODE_ENV: OUTPUT_MODE_STDOUT,
         CURSOR_CLI_MODEL_LABEL_ENV: CURSOR_AGENT_CLI_MODEL_LABEL,
+        CURSOR_CLI_MODEL_ENV: model,
     }
 
 
@@ -1048,6 +1135,9 @@ class CursorCliConfig:
     input_mode: str
     output_mode: str
     model_label: str
+    # The literal value substituted for the {model} argv placeholder (e.g.
+    # "auto"). Distinct from ``model_label``, which is a display-only string.
+    model: str
     configured: bool
 
     @classmethod
@@ -1077,6 +1167,9 @@ class CursorCliConfig:
             input_mode = INPUT_MODE_FILE_POINTER_ALWAYS
             output_mode = OUTPUT_MODE_STDOUT
         model_label = (env.get(CURSOR_CLI_MODEL_LABEL_ENV) or "cursor-cli").strip() or "cursor-cli"
+        model = (env.get(CURSOR_CLI_MODEL_ENV) or CURSOR_AGENT_CLI_DEFAULT_MODEL).strip() or (
+            CURSOR_AGENT_CLI_DEFAULT_MODEL
+        )
         return cls(
             command_path=command_path,
             args_template=args_template,
@@ -1084,13 +1177,19 @@ class CursorCliConfig:
             input_mode=input_mode,
             output_mode=output_mode,
             model_label=model_label,
+            model=model,
             configured=command_path is not None,
         )
 
     @classmethod
-    def cursor_agent_preset(cls, command: str = CURSOR_AGENT_CLI_COMMAND) -> "CursorCliConfig":
+    def cursor_agent_preset(
+        cls,
+        command: str = CURSOR_AGENT_CLI_COMMAND,
+        *,
+        model: str = CURSOR_AGENT_CLI_DEFAULT_MODEL,
+    ) -> "CursorCliConfig":
         """Build the safe read-only Cursor Agent CLI preset config."""
-        return cls.from_env(cursor_agent_cli_preset_env(command))
+        return cls.from_env(cursor_agent_cli_preset_env(command, model=model))
 
     @property
     def is_cursor_agent(self) -> bool:
@@ -1173,7 +1272,7 @@ class CursorCliConfig:
 
     def display_label(self) -> str:
         return (
-            "Cursor Agent CLI (plan mode, proposal-only)"
+            "Cursor Agent CLI (ask mode, NDJSON, proposal-only)"
             if self.is_cursor_agent
             else "Cursor CLI / headless"
         )
@@ -1182,7 +1281,10 @@ class CursorCliConfig:
         """Short human-readable read-only safety mode string for the UI."""
         if not self.is_cursor_agent:
             return None
-        return "Cursor Agent CLI · --print · --mode plan · isolated agent workspace · proposal-only"
+        return (
+            "Cursor Agent CLI · --print · --output-format stream-json · "
+            "--stream-partial-output · --mode ask · isolated agent workspace · proposal-only"
+        )
 
     def to_dict(self) -> dict[str, Any]:
         blocking, warnings = self.safety_issues()
@@ -1194,6 +1296,7 @@ class CursorCliConfig:
             "input_mode": self.input_mode,
             "output_mode": self.output_mode,
             "model_label": self.model_label,
+            "model": self.model,
             "configured": self.configured,
             "command_exists": self.command_exists(),
             "ready": self.ready(),
@@ -1550,6 +1653,7 @@ class CursorCliAgentBackend(AgentBackend):
             token = token.replace(
                 PLACEHOLDER_AGENT_WORKSPACE, str(request.agent_workspace_path or "")
             )
+            token = token.replace(PLACEHOLDER_MODEL, self.config.model)
             # ``{prompt}`` is substituted with a single argv element (shell=False,
             # so it is never shell-interpreted or word-split).
             token = token.replace(PLACEHOLDER_PROMPT, prompt_value)
@@ -1908,6 +2012,44 @@ class CursorCliAgentBackend(AgentBackend):
                     else "Cursor CLI produced no usable response text and stderr indicated a failure."
                 ),
                 **invocation_diagnostics(stdout),
+            )
+            self._last_result = result
+            return result
+
+        if self.config.is_cursor_agent:
+            # PART 2/3: the one-shot Cursor Agent CLI preset is always NDJSON
+            # stream-json now -- parse it and only ever hand the single
+            # authoritative terminal `result` string to the caller. Raw
+            # assistant/tool/thinking events (including any `createPlan`
+            # tool-call/interaction-query workflow) never become the
+            # canonical response and never reach the operation extractor.
+            parse_result = parse_cursor_stream_json(stdout)
+            stream_diag = {"stream_json_diagnostics": parse_result.diagnostics}
+            if parse_result.classification == CLASSIFICATION_TRANSPORT_PARSE_ERROR:
+                status = AGENT_INVOKE_TRANSPORT_PARSE_ERROR
+            elif parse_result.classification == CLASSIFICATION_TERMINAL_ERROR:
+                status = AGENT_INVOKE_TERMINAL_ERROR
+            elif parse_result.classification == CLASSIFICATION_EMPTY_SUCCESS:
+                status = AGENT_INVOKE_EMPTY_SUCCESS
+            elif parse_result.classification == (
+                CLASSIFICATION_TERMINAL_RESULT_WITHOUT_STRUCTURED_PROPOSAL
+            ):
+                status = AGENT_INVOKE_TERMINAL_RESULT_WITHOUT_STRUCTURED_PROPOSAL
+            else:
+                status = AGENT_INVOKE_SUCCESS
+            self._last_status = status
+            result = AgentInvocationResult(
+                status=status,
+                response_text=parse_result.canonical_response if status == AGENT_INVOKE_SUCCESS else None,
+                raw_stdout=stdout,
+                raw_stderr=stderr,
+                exit_code=exit_code,
+                model_label=self.config.model_label,
+                transport_label=self.backend_id,
+                started_at=started,
+                completed_at=_now_iso(),
+                error_message=parse_result.error_message,
+                **invocation_diagnostics(stdout, **stream_diag),
             )
             self._last_result = result
             return result

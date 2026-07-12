@@ -154,6 +154,80 @@ def validate_coherent_batch_limits(
     return {"operation_count": len(items), "total_write_bytes": total_write_bytes}
 
 
+# -- explicit user-stated per-response operation limit (slice
+# ADMISSIBLE_NARROW_FIX_CURSOR_ONESHOT_STREAM_JSON_ASK_AND_OPERATION_LIMIT,
+# PART 4) ---------------------------------------------------------------------
+# The Neon raw goal states "Use no more than four write operations in one
+# response." as implementation-process guidance, not a top-level acceptance
+# criterion. This narrowly recognizes that kind of explicit user-stated
+# per-response limit and folds it into the *existing*
+# ``max_structured_operations_per_response`` high-autonomy run field via
+# ``min(system_maximum, explicit_user_maximum)`` -- no new schema family.
+
+_NUMBER_WORDS: dict[str, int] = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+}
+_NUMBER_TOKEN_PATTERN = r"(\d+|" + "|".join(_NUMBER_WORDS) + r")"
+
+_EXPLICIT_OPERATION_LIMIT_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(pattern.format(n=_NUMBER_TOKEN_PATTERN), re.IGNORECASE)
+    for pattern in (
+        r"no more than {n}\s+write\s+operations?\s+(?:in|per)\s+(?:one|a\s+single|1)\s+response",
+        r"at\s+most\s+{n}\s+writes?\s+per\s+response",
+        r"maximum(?:\s+of)?\s+{n}\s+file\s+operations?\s+per\s+response",
+    )
+)
+
+
+def _parse_number_token(token: str) -> int:
+    lowered = token.strip().lower()
+    if lowered in _NUMBER_WORDS:
+        return _NUMBER_WORDS[lowered]
+    return int(lowered)
+
+
+def derive_explicit_user_operation_limit(text: str) -> int | None:
+    """Narrowly recognize an explicit user-stated per-response operation limit.
+
+    Only matches specific, unambiguous phrasings such as "no more than four
+    write operations in one response", "at most 4 writes per response", or
+    "maximum of 4 file operations per response" (digits or small number words).
+    Returns the smallest such limit found, or ``None`` when no explicit
+    per-response limit is stated -- never a guess from unrelated numbers.
+    """
+
+    if not text:
+        return None
+    best: int | None = None
+    for pattern in _EXPLICIT_OPERATION_LIMIT_PATTERNS:
+        for match in pattern.finditer(text):
+            try:
+                value = _parse_number_token(match.group(1))
+            except ValueError:
+                continue
+            if value > 0 and (best is None or value < best):
+                best = value
+    return best
+
+
+def effective_max_structured_operations_per_response(
+    system_maximum: int, goal_text: str
+) -> tuple[int, int | None]:
+    """Return ``(effective_limit, explicit_user_limit)`` for one high-autonomy run.
+
+    ``effective_limit`` is ``min(system_maximum, explicit_user_limit)`` when the
+    goal text states an explicit per-response operation limit, else
+    ``system_maximum`` unchanged. Never raises; a goal with no recognizable
+    limit leaves the system default untouched.
+    """
+
+    explicit = derive_explicit_user_operation_limit(goal_text)
+    if explicit is None:
+        return system_maximum, None
+    return min(system_maximum, explicit), explicit
+
+
 def _json_after_marker(raw_text: str, marker: str) -> tuple[dict[str, Any] | None, tuple[int, int] | None]:
     match = re.search(re.escape(marker), raw_text, re.IGNORECASE)
     if not match:
@@ -1257,6 +1331,8 @@ __all__ = [
     "DEFAULT_MAX_REPAIR_ROUNDS",
     "DEFAULT_OUTCOME_IN_PROGRESS",
     "derive_acceptance_criteria_from_goal",
+    "derive_explicit_user_operation_limit",
+    "effective_max_structured_operations_per_response",
     "extract_completion_candidate",
     "extract_required_paths_from_goal",
     "failed_mandatory_criteria",

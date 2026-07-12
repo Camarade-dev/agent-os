@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import unittest
@@ -41,6 +42,13 @@ def _no_real_subprocess(*args, **kwargs):
     raise AssertionError("tests must not invoke a real Cursor Agent process")
 
 
+def _ndjson_success(text: str) -> str:
+    """Wrap ``text`` as a minimal one-line NDJSON terminal success event."""
+    return json.dumps(
+        {"type": "result", "subtype": "success", "is_error": False, "result": text}
+    )
+
+
 class TestCursorAgentFilePointerContract(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -78,7 +86,12 @@ class TestCursorAgentFilePointerContract(unittest.TestCase):
                     "instruction": instruction_file.read_text(encoding="utf-8"),
                 }
             )
-            return _FakeCompleted(stdout="complete proposal")
+            return _FakeCompleted(
+                stdout=_ndjson_success(
+                    "complete proposal\nADMISSIBLE_STRUCTURED_OPERATION:\n"
+                    '{"operation": "write_file", "path": "a.txt", "content": "x"}'
+                )
+            )
 
         backend = CursorCliAgentBackend(config=self.config, runner=runner)
         medium = "M" * 1200
@@ -121,7 +134,7 @@ class TestCursorAgentFilePointerContract(unittest.TestCase):
         self.assertEqual(result.prompt_mode, PROMPT_MODE_FILE_POINTER)
 
     def test_diagnostics_persist_on_the_exactly_once_invocation_record(self) -> None:
-        output = "structured stdout response"
+        output = _ndjson_success("structured stdout response")
         instruction = "governed instruction"
         backend = CursorCliAgentBackend(
             config=self.config,
@@ -156,7 +169,7 @@ class TestCursorAgentFilePointerContract(unittest.TestCase):
         response = load_fixture(FIXTURE)
         backend = CursorCliAgentBackend(
             config=self.config,
-            runner=lambda argv, **kwargs: _FakeCompleted(stdout=response),
+            runner=lambda argv, **kwargs: _FakeCompleted(stdout=_ndjson_success(response)),
         )
         controller = ControlSurfaceController(session_dir=self.root / "sessions")
         with mock.patch.object(subprocess, "run", side_effect=_no_real_subprocess):

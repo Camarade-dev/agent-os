@@ -8,6 +8,7 @@ a provider/model call.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import unittest
@@ -15,6 +16,14 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from admissible.diagnostics import callable_backend_probe as cbp
+
+
+def _ndjson_success_line(text: str) -> str:
+    """Wrap ``text`` as a minimal one-line NDJSON terminal success event."""
+    return (
+        json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": text})
+        + "\n"
+    )
 
 
 class _FakeStream:
@@ -298,7 +307,15 @@ class AdapterProbeTests(unittest.TestCase):
     """The adapter path must drive the real production CursorCliAgentBackend."""
 
     def test_adapter_probe_success_uses_production_argv_building(self) -> None:
-        fake = _FakeProcess(exit_code=0, stdout_lines=["ADMISSIBLE_PROBE_MEDIUM_OK\n"])
+        fake = _FakeProcess(
+            exit_code=0,
+            stdout_lines=[
+                _ndjson_success_line(
+                    "ADMISSIBLE_PROBE_MEDIUM_OK\nADMISSIBLE_STRUCTURED_OPERATION:\n"
+                    '{"operation": "write_file", "path": "a.txt", "content": "x"}'
+                )
+            ],
+        )
         with tempfile.TemporaryDirectory() as tmp:
             dummy_command = Path(tmp) / "cursor-agent.cmd"
             dummy_command.write_text("@echo off\n", encoding="utf-8")

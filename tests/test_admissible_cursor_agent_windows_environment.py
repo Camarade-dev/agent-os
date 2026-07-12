@@ -9,6 +9,7 @@ No real Cursor Agent invocation; subprocess is injected/mocked.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import unittest
@@ -26,6 +27,13 @@ from admissible.agent_backend import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _ndjson_success(text: str) -> str:
+    """Wrap ``text`` as a minimal one-line NDJSON terminal success event."""
+    return json.dumps(
+        {"type": "result", "subtype": "success", "is_error": False, "result": text}
+    )
 
 
 class _FakeCompleted:
@@ -169,7 +177,12 @@ class TestCursorAgentInvocationEnvironment(unittest.TestCase):
         def runner(argv, **kwargs):
             captured["env"] = kwargs["env"]
             captured["shell"] = kwargs["shell"]
-            return _FakeCompleted(stdout="ADMISSIBLE PROPOSAL ok")
+            return _FakeCompleted(
+                stdout=_ndjson_success(
+                    "ADMISSIBLE PROPOSAL ok\nADMISSIBLE_STRUCTURED_OPERATION:\n"
+                    '{"operation": "write_file", "path": "a.txt", "content": "x"}'
+                )
+            )
 
         backend = CursorCliAgentBackend(
             config=self.config, env=self.win_env, runner=runner

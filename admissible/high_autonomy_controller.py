@@ -2499,6 +2499,9 @@ def start_high_autonomy_run(
     - neither — defaults to the legacy Cursor GUI file bridge (semi-autonomous).
     """
     from admissible.agent_transport import FileBridgeAgentTransport
+    from admissible.governed_run import (
+        effective_max_structured_operations_per_response as effective_max_structured_operations_per_response_fn,
+    )
     from admissible.mission_contract import (
         contract_acceptance_ledger,
         ledger_coverage_report,
@@ -2547,18 +2550,30 @@ def start_high_autonomy_run(
     snap = transport.status_snapshot()
     transport_kind = _resolve_transport_kind(transport)
     contract = controller._session.mission_contract or {}
+    goal_text = str((controller._session.goal_intake or {}).get("prompt") or "")
     ledger = (
-        make_acceptance_ledger(acceptance_criteria, goal_text=str((controller._session.goal_intake or {}).get("prompt") or ""))
+        make_acceptance_ledger(acceptance_criteria, goal_text=goal_text)
         if acceptance_criteria is not None
         else contract_acceptance_ledger(contract)
     )
     if not ledger:
-        ledger = make_acceptance_ledger(None, goal_text=str((controller._session.goal_intake or {}).get("prompt") or ""))
+        ledger = make_acceptance_ledger(None, goal_text=goal_text)
     for criterion in ledger:
         if not criterion.get("verification_disposition"):
             criterion["verification_disposition"] = (
                 "deterministic_structural" if criterion.get("verification") else "evidence_required"
             )
+    # PART 4: derive an explicit per-response operation limit from narrowly
+    # recognized user language in the raw goal (e.g. "Use no more than four
+    # write operations in one response.") and fold it into the *existing*
+    # max_structured_operations_per_response field via min(system, user) --
+    # never a new top-level acceptance criterion, never a new schema family.
+    (
+        effective_max_structured_operations_per_response,
+        explicit_user_operation_limit,
+    ) = effective_max_structured_operations_per_response_fn(
+        max_structured_operations_per_response, goal_text
+    )
     ha_state = HighAutonomyRunState(
         active=True,
         mode=HA_MODE_RUNNING,
@@ -2574,7 +2589,7 @@ def start_high_autonomy_run(
         last_event="High-autonomy run started.",
         next_action=HA_NEXT_WRITE_INSTRUCTION,
         closure_reserve_turns=closure_reserve_turns,
-        max_structured_operations_per_response=max_structured_operations_per_response,
+        max_structured_operations_per_response=effective_max_structured_operations_per_response,
         max_total_proposed_write_bytes=max_total_proposed_write_bytes,
         turns_remaining=max_turns,
         automatic_empty_success_retries=automatic_empty_success_retries,
@@ -2598,7 +2613,9 @@ def start_high_autonomy_run(
                 "transport_kind": ha_state.transport_kind,
                 "backend_id": ha_state.backend_id,
                 "closure_reserve_turns": closure_reserve_turns,
-                "max_structured_operations_per_response": max_structured_operations_per_response,
+                "max_structured_operations_per_response": effective_max_structured_operations_per_response,
+                "system_max_structured_operations_per_response": max_structured_operations_per_response,
+                "explicit_user_operation_limit": explicit_user_operation_limit,
                 "max_total_proposed_write_bytes": max_total_proposed_write_bytes,
                 "automatic_empty_success_retries": automatic_empty_success_retries,
                 "acceptance_criterion_ids": [

@@ -13,6 +13,7 @@ guards unchanged, no auto-approval.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import unittest
@@ -64,13 +65,20 @@ def _make_fake_cursor_agent(tmp: Path) -> Path:
     return fake
 
 
+def _ndjson_success(text: str) -> str:
+    """Wrap ``text`` as a minimal one-line NDJSON terminal success event."""
+    return json.dumps(
+        {"type": "result", "subtype": "success", "is_error": False, "result": text}
+    )
+
+
 def _counting_runner(responses: list[str], counter: dict) -> "callable":
     queue = list(responses)
 
     def runner(argv, **kwargs):
         counter["n"] = counter.get("n", 0) + 1
         text = queue.pop(0) if queue else ""
-        return _FakeCompleted(stdout=text, returncode=0)
+        return _FakeCompleted(stdout=_ndjson_success(text), returncode=0)
 
     return runner
 
