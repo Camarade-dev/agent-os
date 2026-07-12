@@ -30,7 +30,7 @@ VERIFICATION_DISPOSITIONS = frozenset(
 )
 
 _HEADINGS = {
-    "deliverables": ("mandatory deliverables", "required files", "deliverables", "livrables obligatoires"),
+    "deliverables": ("mandatory deliverables", "required files", "mandatory files", "deliverables", "livrables obligatoires"),
     "requirements": ("requirements", "mandatory behavior", "robustness", "observability", "documentation"),
     "architecture": ("architecture", "scope and architecture are already authorized", "technical choices"),
     "boundaries": ("constraints", "authorized scope", "execution boundaries", "working method"),
@@ -79,6 +79,20 @@ def _is_acceptance_heading(value: str) -> bool:
 _PATH_RE = re.compile(r"(?<![\w.-])(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:html?|css|js|mjs|cjs|ts|tsx|py|json|ya?ml|md|txt|csv|sql)(?![\w.-])", re.I)
 _BULLET_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)(.+?)\s*$")
 _NUMBERED_RE = re.compile(r"^\s*(\d+)[.)]\s+(.+?)\s*$")
+_PLAIN_BULLET_RE = re.compile(r"^\s*[-*+]\s+(.+?)\s*$")
+_MARKDOWN_HEADING_RE = re.compile(r"^#{1,6}\s+\S")
+# Polarity cues that mark a sentence as a negated/rejected statement: paths
+# mentioned inside such a sentence are rejected substitutes or non-goals,
+# never positive mandatory declarations. Deliberately narrower than every
+# possible English negation ("no"/"only" alone are far too broad) -- these
+# are the cue shapes that reject a previously named artifact.
+_NEGATION_CUE_RE = re.compile(
+    r"\b(?:do(?:es)?\s+not|must\s+not|may\s+not|shall\s+not|cannot|can\s+not|never|"
+    r"is\s+not|are\s+not|isn'?t|aren'?t|doesn'?t|don'?t|won'?t|"
+    r"instead\s+of|rather\s+than|forbidden|prohibited|rejected)\b",
+    re.I,
+)
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.;!?])\s+")
 
 
 def _now() -> str:
@@ -116,6 +130,57 @@ def _heading(line: str) -> str | None:
     return None
 
 
+def _is_section_boundary_heading(lines: list[str], index: int) -> bool:
+    """True when a line is structurally a top-level section heading.
+
+    RUN_050: a heading the role vocabulary does not recognize (e.g.
+    "IMPLEMENTATION PROCESS", "VERIFICATION AND REPAIR", "FINAL REPORT",
+    "WORKING METHOD") must still TERMINATE the current section, or every
+    later section's bullets get absorbed into the acceptance criteria.
+    Recognition is structural, never an exact string list: a Markdown
+    ``#`` heading at the margin, or a short standalone ALL-CAPS line
+    separated by blank lines / document edges. An indented line is never
+    a heading -- it is a continuation of the current numbered item.
+    """
+
+    line = lines[index]
+    stripped = line.strip()
+    if not stripped or line != line.lstrip():
+        return False
+    if _MARKDOWN_HEADING_RE.match(stripped):
+        return True
+    prev_blank = index == 0 or not lines[index - 1].strip()
+    next_blank = index == len(lines) - 1 or not lines[index + 1].strip()
+    if not (prev_blank and next_blank):
+        return False
+    if len(stripped) > 60 or stripped.endswith((".", ";", ",", "?", "!")):
+        return False
+    if _BULLET_RE.match(stripped):
+        return False
+    if not any(ch.isalpha() for ch in stripped) or any(ch.islower() for ch in stripped):
+        return False
+    return 1 <= len(stripped.split()) <= 8
+
+
+def _negated_path_mentions(text: str) -> set[str]:
+    """Exact paths that appear only inside negated/rejected sentences.
+
+    Wrapped physical lines are re-joined paragraph-by-paragraph before
+    sentence splitting so a negation cue and the paths it rejects cannot
+    be separated by a mid-sentence line wrap. Callers must still let a
+    positively scoped declaration (a mandatory-files/deliverables bullet)
+    win over a negated mention elsewhere.
+    """
+
+    negated: set[str] = set()
+    for paragraph in re.split(r"\n\s*\n", text):
+        joined = " ".join(part.strip() for part in paragraph.split("\n") if part.strip())
+        for sentence in _SENTENCE_SPLIT_RE.split(joined):
+            if _NEGATION_CUE_RE.search(sentence):
+                negated.update(p.replace("\\", "/") for p in _PATH_RE.findall(sentence))
+    return negated
+
+
 def _entry(identifier: str, text: str, *, source: str, order: int, **extra: Any) -> dict[str, Any]:
     return {"id": identifier, "source_text": text.strip(), "source": source, "order": order, **extra}
 
@@ -150,15 +215,83 @@ class MissionContract:
 def build_mission_contract(raw_goal: str, *, created_at: str | None = None) -> MissionContract:
     if not isinstance(raw_goal, str) or not raw_goal.strip():
         raise ValueError("raw_goal must be a non-empty string")
-    sections: list[tuple[str | None, str]] = []
+    lines = raw_goal.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+    # Pass 1 (RUN_050): assign section roles. A recognized heading selects its
+    # role; an unrecognized *structural* heading (see
+    # _is_section_boundary_heading) terminates the current section so later
+    # sections (e.g. an implementation-process or final-report section) are
+    # never absorbed into acceptance parsing. Blank lines are kept -- pass 2
+    # needs them to tell a wrapped continuation from a new standalone line.
+    labeled: list[tuple[str | None, str]] = []
     role: str | None = None
-    for line in raw_goal.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+    for index, line in enumerate(lines):
         detected = _heading(line)
         if detected:
             role = detected
             continue
-        if line.strip():
-            sections.append((role, line))
+        if _is_section_boundary_heading(lines, index):
+            role = None
+            continue
+        labeled.append((role, line))
+
+    # Pass 2 (RUN_050): group physical lines into logical units. A numbered
+    # acceptance item owns every following line until the next numbered
+    # sibling at the same indent level or the next section heading:
+    # indented lines are nested supporting content (bullets there become the
+    # criterion's subrequirements), and a non-blank margin line directly
+    # under it is an ordinary wrapped continuation. A blank line only
+    # terminates the item when the following content is back at the margin
+    # (clearly-nested indented content continues it). Every other section
+    # keeps the pre-existing one-line-per-unit semantics.
+    units: list[tuple[str | None, dict[str, Any]]] = []
+    active: dict[str, Any] | None = None
+    blank_gap = False
+
+    def _flush() -> None:
+        nonlocal active
+        if active is not None:
+            units.append((active["role"], active))
+            active = None
+
+    for line_role, line in labeled:
+        stripped = line.strip()
+        if not stripped:
+            blank_gap = True
+            continue
+        numbered = _NUMBERED_RE.match(line)
+        indent = len(line) - len(line.lstrip())
+        if active is not None:
+            if line_role != active["role"] or (numbered and indent <= active["indent"]):
+                _flush()
+            elif indent > active["indent"]:
+                nested_bullet = _PLAIN_BULLET_RE.match(line)
+                if nested_bullet:
+                    active["nested_bullets"].append(nested_bullet.group(1).strip())
+                    active["text_parts"].append(nested_bullet.group(1).strip())
+                else:
+                    active["text_parts"].append(stripped)
+                blank_gap = False
+                continue
+            elif not blank_gap and not _BULLET_RE.match(line):
+                active["text_parts"].append(stripped)
+                blank_gap = False
+                continue
+            else:
+                _flush()
+        if line_role == "acceptance" and numbered:
+            active = {
+                "role": line_role,
+                "kind": "numbered",
+                "number": int(numbered.group(1)),
+                "indent": indent,
+                "text_parts": [numbered.group(2).strip()],
+                "nested_bullets": [],
+            }
+        else:
+            units.append((line_role, {"role": line_role, "kind": "line", "line": line, "nested_bullets": []}))
+        blank_gap = False
+    _flush()
 
     paths: list[str] = []
     deliverables: list[dict[str, Any]] = []
@@ -170,21 +303,59 @@ def build_mission_contract(raw_goal: str, *, created_at: str | None = None) -> M
     ambiguities: list[dict[str, Any]] = []
     dep_policy: dict[str, Any] | None = None
     counters = {k: 0 for k in ("deliverable", "requirement", "criterion", "architecture", "boundary", "non_goal", "ambiguity")}
+    # RUN_050 path polarity: a path mentioned only inside a negated/rejected
+    # sentence must never become mandatory. Positive scoped declarations
+    # (deliverables-section bullets) always win over a negated mention
+    # elsewhere in the goal.
+    negated_paths = _negated_path_mentions(raw_goal)
 
-    for section, line in sections:
-        bullet = _BULLET_RE.match(line)
-        text = bullet.group(1).strip() if bullet else line.strip()
+    for section, unit in units:
+        if unit["kind"] == "numbered":
+            bullet = None
+            numbered = None
+            text = " ".join(unit["text_parts"]).strip()
+        else:
+            line = unit["line"]
+            bullet = _BULLET_RE.match(line)
+            numbered = _NUMBERED_RE.match(line)
+            text = bullet.group(1).strip() if bullet else line.strip()
         found_paths = [p.replace("\\", "/") for p in _PATH_RE.findall(text)]
         if section == "deliverables":
+            rejected_here = [] if bullet else [p for p in dict.fromkeys(found_paths) if p in negated_paths]
             for path in found_paths:
+                if path in rejected_here:
+                    continue
                 if path not in paths:
                     paths.append(path)
                     counters["deliverable"] += 1
                     deliverables.append(_entry(f"deliverable_{counters['deliverable']:03d}", path, source="explicit", order=counters["deliverable"], exact_path=path))
-        numbered = _NUMBERED_RE.match(line)
-        if section == "acceptance" and numbered:
+            if rejected_here:
+                counters["non_goal"] += 1
+                non_goals.append(
+                    _entry(
+                        f"non_goal_{counters['non_goal']:03d}",
+                        text,
+                        source="explicit",
+                        order=counters["non_goal"],
+                        kind="rejected_path_substitute",
+                        rejected_paths=rejected_here,
+                    )
+                )
+        if section == "acceptance" and unit["kind"] == "numbered":
             counters["criterion"] += 1
-            criteria.append(_entry(f"explicit_ac_{counters['criterion']:03d}", numbered.group(2), source="explicit", order=counters["criterion"], source_number=int(numbered.group(1)), mandatory=True))
+            entry = _entry(f"explicit_ac_{counters['criterion']:03d}", text, source="explicit", order=counters["criterion"], source_number=unit["number"], mandatory=True)
+            if unit["nested_bullets"]:
+                entry["subrequirements"] = [
+                    {
+                        "id": f"{entry['id']}_sub_{sub_index:03d}",
+                        "source_text": sub_text,
+                        "source": "explicit",
+                        "order": sub_index,
+                        "mandatory": True,
+                    }
+                    for sub_index, sub_text in enumerate(unit["nested_bullets"], start=1)
+                ]
+            criteria.append(entry)
         elif section == "acceptance" and bullet:
             counters["criterion"] += 1
             criteria.append(_entry(f"explicit_ac_{counters['criterion']:03d}", text, source="explicit", order=counters["criterion"], mandatory=True))
@@ -233,11 +404,12 @@ def build_mission_contract(raw_goal: str, *, created_at: str | None = None) -> M
             counters["ambiguity"] += 1
             ambiguities.append(_entry(f"ambiguity_{counters['ambiguity']:03d}", text, source="explicit", order=counters["ambiguity"]))
 
-    # Paths named inside explicit criteria/requirements are also exact contract paths.
+    # Paths named inside explicit criteria/requirements are also exact contract
+    # paths -- unless they only ever appear in negated/rejected sentences.
     for item in criteria + requirements:
         for path in _PATH_RE.findall(item["source_text"]):
             path = path.replace("\\", "/")
-            if path not in paths:
+            if path not in paths and path not in negated_paths:
                 paths.append(path)
     first = next((line.strip() for line in raw_goal.splitlines() if line.strip()), "")
     intent = "software_build" if re.search(r"\b(build|create|implement|develop)\b", first, re.I) else "general_task"
@@ -252,15 +424,17 @@ def build_mission_contract(raw_goal: str, *, created_at: str | None = None) -> M
     if not criteria and not requirements and not inferred and first:
         inferred.append(_entry("inferred_ac_001", first, source="deterministic_inference", order=1, mandatory=True))
     # Retain exact paths even when they occur in compact prose rather than a
-    # dedicated deliverables section.
+    # dedicated deliverables section. Negated mentions (rejected substitutes,
+    # non-goals) never make a path mandatory; a path declared positively
+    # elsewhere is already in ``paths`` and stays.
     for path in _PATH_RE.findall(raw_goal):
         path = path.replace("\\", "/")
-        if path not in paths:
+        if path not in paths and path not in negated_paths:
             paths.append(path)
     completeness = not ambiguities and bool(criteria or requirements or deliverables or inferred)
     diagnostics = {
-        "parser": "structural_heading_first_v1",
-        "recognized_section_roles": sorted({r for r, _ in sections if r}),
+        "parser": "structural_heading_first_v2",
+        "recognized_section_roles": sorted({r for r, _ in units if r}),
         "explicit_numbered_criterion_count": len([c for c in criteria if "source_number" in c]),
         "mandatory_path_count": len(paths),
         "quantity_fragments": re.findall(r"\b(?:at least|at most|exactly|minimum|maximum)\s+\d+\b", raw_goal, re.I),
@@ -300,12 +474,21 @@ def select_verification_for_criterion_text(source_text: str, mandatory_paths: li
     mentioned_paths = [
         p for p in mandatory_paths if p in source_text or PurePosixPath(p).name in source_text
     ]
+    # RUN_050: a dynamic/runtime-shaped criterion (collision, respawn,
+    # restart, live-state, camera ...) must keep its unsupported_verifier
+    # disposition so it is routed to the RUN_042/044 browser-runtime plan
+    # builder -- a GENERIC keyword proxy (controls/score/doc-usage below) must
+    # not claim it as deterministic_structural just because its full text also
+    # mentions a static keyword. Dedicated verifiers stay available:
+    # file_exists (existence is static regardless of phrasing) and the
+    # unambiguous "R key" game_restart_check branch (RUN_049 PART B) below.
+    runtime_shaped = infer_verification_disposition(source_text or "") == "unsupported_verifier"
 
     if mentioned_paths and _EXISTENCE_ASSERTION_RE.search(lower):
         return [{"check_id": "file_exists", "target_paths": mentioned_paths[:1]}]
-    if js_targets and ("arrow" in lower or "wasd" in lower or "movement" in lower):
+    if not runtime_shaped and js_targets and ("arrow" in lower or "wasd" in lower or "movement" in lower):
         return [{"check_id": "game_controls_check", "target_paths": js_targets[:1]}]
-    if js_targets and ("collectible" in lower or "collecting" in lower or "score" in lower):
+    if not runtime_shaped and js_targets and ("collectible" in lower or "collecting" in lower or "score" in lower):
         return [{"check_id": "file_contains", "target_paths": js_targets[:1], "contains": ["score"]}]
     # Deliberately narrower than derive_acceptance_criteria_from_goal's
     # goal-level "restart" OR-branch: a bare "restart" keyword is also how
@@ -319,9 +502,18 @@ def select_verification_for_criterion_text(source_text: str, mandatory_paths: li
     # with that dynamic phrasing.
     if js_targets and (" r key" in lower or "press `r`" in lower):
         return [{"check_id": "game_restart_check", "target_paths": js_targets[:1]}]
-    if doc_targets and ("usage" in lower or "local" in lower or "run" in lower):
+    # RUN_050: the local-usage documentation check applies only to a criterion
+    # that is actually ABOUT the documentation deliverable -- it must name the
+    # doc path itself. Bare substrings like "local"/"run" ("loads locally",
+    # "running") used to attach this unrelated check to gameplay criteria
+    # whenever their continuation text was truncated or merely mentioned
+    # locality; that mis-selection is a false structural proxy, not a verifier.
+    doc_mentioned = [
+        p for p in doc_targets if p in source_text or PurePosixPath(p).name in source_text
+    ]
+    if not runtime_shaped and doc_mentioned and re.search(r"\b(?:usage|local(?:ly)?|open(?:ing|s)?|run(?:ning)?|document\w*)\b", lower):
         contains = ["open"] + (html_targets[:1] if html_targets else ["index.html"])
-        return [{"check_id": "local_usage_check", "target_paths": doc_targets[:1], "contains": contains}]
+        return [{"check_id": "local_usage_check", "target_paths": doc_mentioned[:1], "contains": contains}]
     return []
 
 
@@ -336,9 +528,18 @@ def contract_acceptance_ledger(contract: MissionContract | dict[str, Any]) -> li
     ledger = []
     for item in sources:
         checks = list(item.get("verification") or [])
-        if not checks:
+        # RUN_050: disposition/check selection runs on the criterion's COMPLETE
+        # reconstructed text. A criterion whose own full text requires human
+        # observation must never be handed a keyword-matched static check that
+        # would silently reclassify it as deterministic_structural.
+        # (Runtime-shaped criteria are handled inside
+        # select_verification_for_criterion_text itself: generic keyword
+        # proxies skip them, while dedicated static verifiers such as
+        # game_restart_check still apply -- RUN_049 PART B.)
+        disposition = infer_verification_disposition(item["source_text"])
+        if not checks and disposition != "human_observation_required":
             checks = select_verification_for_criterion_text(item["source_text"], mandatory_paths)
-        ledger.append({"criterion_id": item["id"], "source_text": item["source_text"], "source_type": item.get("source", "explicit_user_requirement"), "mandatory": True, "status": "open", "evidence_refs": [], "verification_notes": [], "verification": checks, "verification_disposition": "deterministic_structural" if checks else infer_verification_disposition(item["source_text"])})
+        ledger.append({"criterion_id": item["id"], "source_text": item["source_text"], "source_type": item.get("source", "explicit_user_requirement"), "mandatory": True, "status": "open", "evidence_refs": [], "verification_notes": [], "verification": checks, "verification_disposition": "deterministic_structural" if checks else disposition})
     return ledger
 
 

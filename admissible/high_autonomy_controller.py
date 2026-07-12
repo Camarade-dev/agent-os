@@ -851,6 +851,18 @@ def build_high_autonomy_summary(
         "runtime_gap_criterion_ids": list(ha_state.runtime_gap_criterion_ids),
         "runtime_coverage_report": ha_state.runtime_coverage_report,
         "human_observation_pending_criterion_ids": list(ha_state.human_observation_pending_criterion_ids),
+        # RUN_050 state priority: pending ids above are a static ledger
+        # projection that exists as soon as a subjective criterion is parsed
+        # -- long before any artifact is written or verified. "Human
+        # observation is awaited NOW" is only true once the run has actually
+        # handed over to the human-observation phase (mode transition happens
+        # only after mandatory writes and applicable static/runtime
+        # verification). The UI must key its "Awaiting human observation"
+        # panel on this flag, never on the bare pending-id list.
+        "human_observation_currently_awaited": bool(
+            ha_state.mode == HA_MODE_AWAITING_HUMAN_OBSERVATION
+            and ha_state.human_observation_pending_criterion_ids
+        ),
         "human_observation_records": list(ha_state.human_observation_records),
         # RUN_045: typed wait/technical-pause/state-invariant visibility.
         "wait_reason": ha_state.wait_reason,
@@ -3883,6 +3895,10 @@ def runtime_verification_status_view(controller: "ControlSurfaceController") -> 
         "runtime_failed_criterion_ids": list(ha_state.runtime_failed_criterion_ids),
         "runtime_gap_criterion_ids": list(ha_state.runtime_gap_criterion_ids),
         "human_observation_pending_criterion_ids": list(ha_state.human_observation_pending_criterion_ids),
+        "human_observation_currently_awaited": bool(
+            ha_state.mode == HA_MODE_AWAITING_HUMAN_OBSERVATION
+            and ha_state.human_observation_pending_criterion_ids
+        ),
         "human_observation_records": list(ha_state.human_observation_records),
         "runtime_coverage_report": ha_state.runtime_coverage_report,
     }

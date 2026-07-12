@@ -1525,7 +1525,11 @@ function renderHighAutonomy(state) {
     : "";
   const pendingObservationIds = ha.human_observation_pending_criterion_ids || [];
   const observedCriteria = new Map((ha.acceptance_criteria || []).map((c) => [c.criterion_id, c]));
-  const humanObservationRow = pendingObservationIds.length
+  // RUN_050: pending ids exist as soon as a subjective criterion is parsed;
+  // the "Awaiting human observation" panel must only appear once the run has
+  // actually reached the human-observation phase (writes + applicable
+  // verification done and observation is the next unresolved action).
+  const humanObservationRow = ha.human_observation_currently_awaited && pendingObservationIds.length
     ? `<div class="ha-human-observation" style="margin:0 0 .65rem;padding:.55rem .65rem;border:1px solid var(--cs-border-strong);border-radius:6px;">
          <p class="ha-blocking-title">Awaiting human observation — ${pendingObservationIds.length} subjective criterion/criteria:</p>
          <ul class="ha-blocking-list">
