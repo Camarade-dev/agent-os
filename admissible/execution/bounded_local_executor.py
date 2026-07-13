@@ -21,6 +21,11 @@ from admissible.admitted_execution import (
     is_local_allow_without_missing_evidence,
 )
 from admissible.run_loop import EvidenceRecord
+from admissible.execution.bounded_write import (
+    BoundedWriteError,
+    BoundedWriteRequest,
+    execute_bounded_write,
+)
 
 ALLOWED_BOUNDED_OPERATIONS = frozenset({"list_files", "read_file", "write_file"})
 
@@ -572,11 +577,18 @@ class BoundedLocalExecutor:
                     )
 
                 elif name == "write_file":
-                    content = str(operation["content"])
-                    prior_sha256 = _sha256_bytes(target.read_bytes()) if target.is_file() else None
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_text(content, encoding="utf-8", newline="")
-                    digest = _sha256_bytes(target.read_bytes())
+                    content = operation["content"]
+                    try:
+                        write_result = execute_bounded_write(
+                            BoundedWriteRequest(
+                                workspace=self.workspace,
+                                relative_path=rel_path,
+                                content=operation["content"],
+                            )
+                        )
+                    except BoundedWriteError as exc:
+                        raise BoundedExecutionError(str(exc), diagnostic=exc.diagnostic) from exc
+                    digest = write_result.sha256
                     summary = f"Wrote file {rel_path} ({len(content)} chars)"
                     evidence_records.append(
                         EvidenceRecord(
@@ -601,10 +613,10 @@ class BoundedLocalExecutor:
                             "operation": name,
                             "path": rel_path,
                             "sha256": digest,
-                            "prior_sha256": prior_sha256,
-                            "bytes": len(content.encode("utf-8")),
+                            "prior_sha256": write_result.prior_sha256,
+                            "bytes": write_result.byte_count,
                             "outcome": "executed_mutation",
-                            "overwrite": prior_sha256 is not None,
+                            "overwrite": write_result.overwritten,
                         }
                     )
 

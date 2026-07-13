@@ -11,9 +11,16 @@ from dataclasses import dataclass, replace
 import secrets
 from typing import Protocol
 
+from admissible.execution.bounded_write import (
+    BoundedWriteError,
+    PhysicalAttestationError,
+    attest_completed_write_against_original_authority,
+    attest_physical_file,
+)
 from admissible.v0_controller.commands import Command, CommandKind, CommandStatus
 from admissible.v0_controller.events import (
     _BoundedExecutionCompleted,
+    _BoundedExecutionInterrupted,
     BoundedExecutionCompleted,
     CommandDispatchStarted,
     Event,
@@ -22,6 +29,7 @@ from admissible.v0_controller.events import (
     NoEvent,
     SessionCreated,
     TechnicalFault,
+    V0ExecutionInterrupted,
     V0ExecutionResultEnvelope,
 )
 from admissible.v0_controller.invariants import InvariantViolation, validate_state
@@ -34,6 +42,7 @@ from admissible.v0_controller.store import (
 )
 from admissible.v0_controller.workspace_guard import (
     FilesystemIdentityPolicy,
+    ValidatedTarget,
     ValidatedWorkspaceTarget,
     WorkspaceGuard,
     WorkspaceGuardError,
@@ -66,7 +75,7 @@ class V0BoundedExecutorAdapter(Protocol):
         command: Command,
         batch: BatchRecord,
         workspace_target: ValidatedWorkspaceTarget,
-    ) -> V0ExecutionResultEnvelope:
+    ) -> V0ExecutionResultEnvelope | V0ExecutionInterrupted:
         ...
 
 
@@ -137,7 +146,38 @@ class V0ControllerEngine:
             state.contract.target_workspace,
             state.contract.workspace_policy,
             identity_policy=self._filesystem_identity_policy,
+            authority=state.workspace_authority,
         )
+
+    @staticmethod
+    def _workspace_authority_reason(error: ValueError) -> OutcomeReason:
+        diagnostic = getattr(error, "diagnostic", "workspace_authority_changed")
+        return OutcomeReason(
+            (
+                ReasonCode.WORKSPACE_CONTAINMENT_CHANGED
+                if diagnostic == "workspace_containment_changed"
+                else ReasonCode.WORKSPACE_AUTHORITY_CHANGED
+            ),
+            f"{diagnostic}: {error}",
+            "Treat this V0 session as technically paused; inspect the workspace binding and start a new session.",
+        )
+
+    @staticmethod
+    def _physical_attestation_reason(error: ValueError) -> OutcomeReason:
+        diagnostic = getattr(error, "diagnostic", "physical_attestation_failed")
+        return OutcomeReason(
+            ReasonCode.PHYSICAL_ATTESTATION_FAILED,
+            f"{diagnostic}: {error}",
+            "Treat this V0 session as technically paused; inspect the physical file and start a new session.",
+        )
+
+    def ensure_workspace_authority(self, state: SessionState) -> None:
+        """Fail closed if the configuration-time workspace binding changed."""
+
+        self._guard(state).revalidate_authority()
+
+    def fail_closed_workspace_authority(self, session_id: str, error: ValueError) -> TickResult:
+        return self.tick(session_id, TechnicalFault(self._workspace_authority_reason(error)))
 
     @staticmethod
     def _expected_execution_capability(state: SessionState, command: Command, batch: BatchRecord) -> ExecutionCapability:
@@ -187,6 +227,186 @@ class V0ControllerEngine:
                         "a bounded execution target aliases already materialized V0 evidence",
                     )
         return target
+
+    @staticmethod
+    def _receipt_id(command_id: str, action_id: str) -> str:
+        return f"v0receipt:{command_id}:{action_id}"
+
+    def _validate_complete_execution_receipts(
+        self,
+        *,
+        state: SessionState,
+        command: Command,
+        batch: BatchRecord,
+        capability: ExecutionCapability,
+        envelope: V0ExecutionResultEnvelope,
+        workspace_target: ValidatedWorkspaceTarget,
+    ) -> None:
+        """Reject any receipt that is not the exact active V0 write fact."""
+
+        receipts = envelope.receipts
+        if not envelope.success:
+            if receipts:
+                raise IllegalTransition("failed execution envelopes cannot claim successful V0 receipts")
+            return
+        admitted = {
+            operation.operation_id: operation
+            for operation in batch.proposed_operations
+            if operation.operation_id in set(batch.admitted_operation_ids)
+        }
+        if not receipts or {receipt.action_id for receipt in receipts} != set(admitted):
+            raise IllegalTransition("successful execution envelope must contain exactly one receipt per admitted action")
+        if len({receipt.receipt_id for receipt in receipts}) != len(receipts):
+            raise IllegalTransition("execution envelope receipt ids must be unique")
+        consumed_ids = {receipt.receipt_id for receipt in state.execution_receipt_history}
+        if consumed_ids.intersection(receipt.receipt_id for receipt in receipts):
+            raise IllegalTransition("execution receipt replay is not permitted")
+        targets = {target.relative_path: target for target in workspace_target.targets}
+        for receipt in receipts:
+            operation = admitted.get(receipt.action_id)
+            target = targets.get(receipt.path)
+            if operation is None or target is None:
+                if state.workspace_authority is not None:
+                    raise PhysicalAttestationError(
+                        "execution receipt names a target that is not physically authorized for the active batch",
+                        diagnostic="physical_attestation_failed",
+                    )
+                raise IllegalTransition("execution receipt action or path is not part of the active admitted batch")
+            if (
+                receipt.schema_version != "admissible_v0_execution_receipt_v1"
+                or receipt.receipt_id != self._receipt_id(command.command_id or "", receipt.action_id)
+                or receipt.session_id != state.session_id
+                or receipt.issued_revision != capability.issued_revision
+                or receipt.execution_command_id != command.command_id
+                or receipt.batch_id != batch.batch_id
+                or receipt.invocation_id != batch.invocation_id
+                or receipt.operation_kind != operation.operation.get("operation")
+                or receipt.operation_kind != "write_file"
+                or receipt.path != operation.path
+                or receipt.success is not True
+            ):
+                if state.workspace_authority is not None:
+                    raise PhysicalAttestationError(
+                        "execution receipt does not exactly correlate to the active V0 lifecycle",
+                        diagnostic="physical_attestation_failed",
+                    )
+                raise IllegalTransition("execution receipt does not exactly correlate to the active V0 lifecycle")
+            if (
+                receipt.resolved_target != target.resolved_target
+                or receipt.physical_identity_key != target.physical_identity_key
+            ):
+                raise PhysicalAttestationError(
+                    "execution receipt physical target does not match the current authorized target",
+                    diagnostic="physical_attestation_failed",
+                )
+            if state.workspace_authority is not None:
+                content = operation.operation.get("content")
+                if not isinstance(content, str):
+                    raise PhysicalAttestationError(
+                        "admitted write command has no confirmed string content",
+                        diagnostic="physical_attestation_failed",
+                    )
+                try:
+                    facts = attest_physical_file(
+                        authority=state.workspace_authority,
+                        relative_path=receipt.path,
+                        expected_resolved_target=target.resolved_target,
+                        expected_physical_identity_key=target.physical_identity_key,
+                        expected_content=content.encode("utf-8"),
+                    )
+                except BoundedWriteError as exc:
+                    if exc.diagnostic in {"workspace_authority_changed", "workspace_containment_changed"}:
+                        raise WorkspaceGuardError(exc.diagnostic, str(exc)) from exc
+                    raise PhysicalAttestationError(str(exc), diagnostic=exc.diagnostic) from exc
+                if facts.sha256 != receipt.sha256 or facts.byte_count != receipt.byte_count:
+                    raise PhysicalAttestationError(
+                        "execution receipt SHA-256 or byte count does not match the final physical file",
+                        diagnostic="physical_attestation_failed",
+                    )
+
+    def _validate_interrupted_receipts(
+        self,
+        *,
+        state: SessionState,
+        command: Command,
+        batch: BatchRecord,
+        capability: ExecutionCapability,
+        interrupted: V0ExecutionInterrupted,
+    ) -> tuple[ValidatedTarget, ...]:
+        """Attest an accomplished completed prefix against the original authority.
+
+        A rebound logical workspace path is never followed here: every receipt
+        is re-attested beneath the immutable canonical workspace captured in the
+        persisted ``WorkspaceAuthorityDescriptor``.
+        """
+
+        admitted = batch.admitted_operation_ids
+        receipts = interrupted.receipts
+        completed_ids = tuple(receipt.action_id for receipt in receipts)
+        if completed_ids != admitted[: len(completed_ids)]:
+            raise IllegalTransition("interrupted execution receipts must be the exact ordered admitted prefix")
+        if interrupted.remaining_action_ids != admitted[len(completed_ids):]:
+            raise IllegalTransition("interrupted execution must report the exact unexecuted remainder")
+        if len({receipt.receipt_id for receipt in receipts}) != len(receipts):
+            raise IllegalTransition("execution envelope receipt ids must be unique")
+        consumed_ids = {receipt.receipt_id for receipt in state.execution_receipt_history}
+        if consumed_ids.intersection(receipt.receipt_id for receipt in receipts):
+            raise IllegalTransition("execution receipt replay is not permitted")
+
+        admitted_by_id = {item.operation_id: item for item in batch.proposed_operations if item.operation_id in set(admitted)}
+        identity_policy = self._filesystem_identity_policy or FilesystemIdentityPolicy.for_host()
+        targets: list[ValidatedTarget] = []
+        for receipt in receipts:
+            operation = admitted_by_id.get(receipt.action_id)
+            if operation is None:
+                raise IllegalTransition("interrupted receipt names an action outside the admitted batch")
+            if (
+                receipt.schema_version != "admissible_v0_execution_receipt_v1"
+                or receipt.receipt_id != self._receipt_id(command.command_id or "", receipt.action_id)
+                or receipt.session_id != state.session_id
+                or receipt.issued_revision != capability.issued_revision
+                or receipt.execution_command_id != command.command_id
+                or receipt.batch_id != batch.batch_id
+                or receipt.invocation_id != batch.invocation_id
+                or receipt.operation_kind != operation.operation.get("operation")
+                or receipt.operation_kind != "write_file"
+                or receipt.path != operation.path
+                or receipt.success is not True
+            ):
+                raise IllegalTransition("interrupted receipt does not exactly correlate to the active V0 lifecycle")
+            content = operation.operation.get("content")
+            if not isinstance(content, str):
+                raise PhysicalAttestationError(
+                    "admitted write command has no confirmed string content",
+                    diagnostic="physical_attestation_failed",
+                )
+            if state.workspace_authority is None:
+                targets.append(self._guard(state).validate(receipt.path))
+                continue
+            facts = attest_completed_write_against_original_authority(
+                authority=state.workspace_authority,
+                relative_path=receipt.path,
+                expected_resolved_target=receipt.resolved_target,
+                expected_physical_identity_key=receipt.physical_identity_key,
+                expected_content=content.encode("utf-8"),
+            )
+            if (
+                facts.sha256 != receipt.sha256
+                or facts.byte_count != receipt.byte_count
+                or identity_policy.key_for_resolved_target(facts.resolved_target) != receipt.physical_identity_key
+            ):
+                raise PhysicalAttestationError(
+                    "interrupted receipt SHA-256, byte count, or identity does not match the physical file",
+                    diagnostic="physical_attestation_failed",
+                )
+            targets.append(
+                ValidatedTarget(
+                    relative_path=receipt.path,
+                    resolved_target=facts.resolved_target,
+                    physical_identity_key=facts.physical_identity_key,
+                )
+            )
+        return tuple(targets)
 
     def _normalize_event(self, state: SessionState, event: Event | None) -> Event:
         if event is not None:
@@ -272,7 +492,10 @@ class V0ControllerEngine:
     def tick(self, session_id: str, event: Event | None = None, *, expected_revision: int | None = None) -> TickResult:
         """Submit normal public facts; raw execution completions are prohibited."""
 
-        if isinstance(event, (BoundedExecutionCompleted, _BoundedExecutionCompleted)):
+        if isinstance(
+            event,
+            (BoundedExecutionCompleted, _BoundedExecutionCompleted, V0ExecutionInterrupted, _BoundedExecutionInterrupted),
+        ):
             raise IllegalTransition("raw execution completion is accepted only through trusted adapter consumption")
         state = self.store.load(session_id)
         if expected_revision is not None and expected_revision != state.revision:
@@ -294,9 +517,76 @@ class V0ControllerEngine:
         admitted_paths = tuple(
             item.path for item in batch.proposed_operations if item.operation_id in set(batch.admitted_operation_ids)
         )
-        workspace_target = self._validated_execution_target(state, admitted_paths)
-        envelope = adapter.execute(command=command, batch=batch, workspace_target=workspace_target)
+        try:
+            workspace_target = self._validated_execution_target(state, admitted_paths)
+            envelope = adapter.execute(command=command, batch=batch, workspace_target=workspace_target)
+        except WorkspaceGuardError as exc:
+            if state.workspace_authority is None:
+                raise
+            return self.fail_closed_workspace_authority(session_id, exc)
+        except BoundedWriteError as exc:
+            if state.workspace_authority is None:
+                raise
+            if exc.diagnostic in {"workspace_authority_changed", "workspace_containment_changed"}:
+                return self.fail_closed_workspace_authority(session_id, exc)
+            return self.tick(session_id, TechnicalFault(self._physical_attestation_reason(exc)))
+        if isinstance(envelope, V0ExecutionInterrupted):
+            return self.consume_trusted_interrupted_result(session_id, envelope)
         return self.consume_trusted_execution_result(session_id, envelope)
+
+    def consume_trusted_interrupted_result(self, session_id: str, interrupted: V0ExecutionInterrupted) -> TickResult:
+        """Durably represent an accomplished completed prefix, then pause.
+
+        The remaining operations are never replayed or continued, and no
+        structural verification follows an interruption.
+        """
+
+        adapter = self._bounded_executor_adapter
+        if adapter is None:
+            raise IllegalTransition("trusted adapter consumption requires a configured adapter")
+        if (
+            interrupted.adapter_identity != adapter.identity
+            or interrupted.adapter_protocol_version != adapter.protocol_version
+        ):
+            raise IllegalTransition("executor result identity does not match the configured trusted adapter")
+        state = self.store.load(session_id)
+        command, batch = self._active_execution(state)
+        expected = self._expected_execution_capability(state, command, batch)
+        if interrupted.capability != expected:
+            raise IllegalTransition("interrupted executor result capability is forged, stale, or bound to another lifecycle")
+        try:
+            targets = self._validate_interrupted_receipts(
+                state=state,
+                command=command,
+                batch=batch,
+                capability=expected,
+                interrupted=interrupted,
+            )
+        except PhysicalAttestationError as exc:
+            return self.tick(session_id, TechnicalFault(self._physical_attestation_reason(exc)))
+        except (BoundedWriteError, WorkspaceGuardError) as exc:
+            if state.workspace_authority is None:
+                raise
+            return self.fail_closed_workspace_authority(session_id, exc)
+        internal = _BoundedExecutionInterrupted(
+            execution_command_id=command.command_id or "",
+            batch_id=batch.batch_id,
+            invocation_id=batch.invocation_id,
+            receipts=interrupted.receipts,
+            validated_targets=targets,
+            remaining_action_ids=interrupted.remaining_action_ids,
+            interruption_code=interrupted.interruption_code,
+            diagnostic=interrupted.diagnostic,
+            occurred_at=interrupted.occurred_at,
+            adapter_identity=interrupted.adapter_identity,
+            adapter_protocol_version=interrupted.adapter_protocol_version,
+            failure_reason=interrupted.failure_reason,
+            failed_action_id=interrupted.failed_action_id,
+        )
+        try:
+            return self._apply_loaded(state, internal)
+        except CommittedButDurabilityUncertain as outcome:
+            return self._enter_durability_pause(session_id, outcome)
 
     def consume_trusted_execution_result(self, session_id: str, envelope: V0ExecutionResultEnvelope) -> TickResult:
         """The only engine method that converts an adapter envelope to reducer input."""
@@ -314,14 +604,38 @@ class V0ControllerEngine:
         expected = self._expected_execution_capability(state, command, batch)
         if envelope.capability != expected:
             raise IllegalTransition("executor envelope capability is forged, stale, or bound to another lifecycle")
-        targets = self._validated_execution_target(state, tuple(receipt.path for receipt in envelope.receipts))
+        admitted_paths = tuple(
+            operation.path
+            for operation in batch.proposed_operations
+            if operation.operation_id in set(batch.admitted_operation_ids)
+        )
+        try:
+            workspace_target = self._validated_execution_target(state, admitted_paths)
+            self._validate_complete_execution_receipts(
+                state=state,
+                command=command,
+                batch=batch,
+                capability=expected,
+                envelope=envelope,
+                workspace_target=workspace_target,
+            )
+            # The envelope is accepted only after a final authority check
+            # immediately before reducer consumption.
+            self._guard(state).revalidate_authority()
+        except WorkspaceGuardError as exc:
+            if state.workspace_authority is None:
+                raise
+            return self.fail_closed_workspace_authority(session_id, exc)
+        except PhysicalAttestationError as exc:
+            return self.tick(session_id, TechnicalFault(self._physical_attestation_reason(exc)))
+        targets = tuple(workspace_target.target_for(receipt.path) for receipt in envelope.receipts)
         internal = _BoundedExecutionCompleted(
             execution_command_id=command.command_id or "",
             batch_id=batch.batch_id,
             invocation_id=batch.invocation_id,
             success=envelope.success,
             receipts=envelope.receipts,
-            validated_targets=targets.targets,
+            validated_targets=targets,
             occurred_at=envelope.occurred_at,
             adapter_identity=envelope.adapter_identity,
             adapter_protocol_version=envelope.adapter_protocol_version,

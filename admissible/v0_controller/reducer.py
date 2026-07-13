@@ -10,6 +10,7 @@ from admissible.v0_controller.events import (
     AgentInvocationFailed,
     AgentResultReceived,
     _BoundedExecutionCompleted,
+    _BoundedExecutionInterrupted,
     CommandDispatchStarted,
     Event,
     ExecutionReceipt,
@@ -121,6 +122,8 @@ def _finalize_current_batch(
     executed_operation_ids: tuple[str, ...] | None = None,
     materialized_evidence: tuple[FileEvidence, ...] | None = None,
     remaining_mandatory_paths: tuple[str, ...] | None = None,
+    remaining_action_ids: tuple[str, ...] = (),
+    interruption_code: str | None = None,
 ) -> SessionState:
     batch = state.current_batch
     if batch is None:
@@ -131,6 +134,8 @@ def _finalize_current_batch(
         executed_operation_ids=batch.executed_operation_ids if executed_operation_ids is None else executed_operation_ids,
         materialized_evidence=batch.materialized_evidence if materialized_evidence is None else materialized_evidence,
         remaining_mandatory_paths=batch.remaining_mandatory_paths if remaining_mandatory_paths is None else remaining_mandatory_paths,
+        remaining_action_ids=remaining_action_ids,
+        interruption_code=interruption_code,
     )
     return replace(state, current_batch=None, batch_history=(*state.batch_history, final))
 
@@ -198,10 +203,10 @@ def _structural_passes(state: SessionState, event: StructuralCheckCompleted) -> 
     evidence_by_path = {item.path: item for item in state.materialized_evidence}
     for path in state.mandatory_paths:
         check = checks.get(path)
-        if check is None or not (check.exists and check.non_empty and check.inside_workspace):
+        if check is None or not (check.passed and check.exists and check.non_empty and check.inside_workspace):
             return False
         evidence = evidence_by_path.get(path)
-        if evidence is not None and check.sha256 != evidence.sha256:
+        if evidence is not None and (check.observed_sha256 or check.sha256) != evidence.sha256:
             return False
     return True
 
@@ -248,7 +253,7 @@ def _receipt_evidence(
         raise IllegalTransition("execution result invocation does not match active batch")
     admitted_by_id = {item.operation_id: item for item in batch.proposed_operations if item.operation_id in set(batch.admitted_operation_ids)}
     receipts = event.receipts
-    if not receipts:
+    if not receipts and event.success:
         raise IllegalTransition("bounded execution completion requires at least one executor receipt")
     action_ids = [receipt.action_id for receipt in receipts]
     paths = [receipt.path for receipt in receipts]
@@ -276,42 +281,114 @@ def _receipt_evidence(
     if not all(receipt.success for receipt in receipts):
         raise IllegalTransition("successful execution cannot contain a failed receipt")
 
+    materialized = _materialize_receipt_evidence(
+        state,
+        receipts,
+        targets_by_path,
+        execution_command_id=event.execution_command_id,
+        batch_id=event.batch_id,
+        invocation_id=event.invocation_id,
+    )
+    if not materialized:
+        raise IllegalTransition("successful execution cannot be empty of materialized V0 work")
+    return tuple(action_ids), materialized
+
+
+def _materialize_receipt_evidence(
+    state: SessionState,
+    receipts: tuple[ExecutionReceipt, ...],
+    targets_by_path: dict[str, object],
+    *,
+    execution_command_id: str,
+    batch_id: str,
+    invocation_id: str,
+) -> tuple[FileEvidence, ...]:
     materialized: list[FileEvidence] = []
     existing_paths = {item.path for item in state.materialized_evidence}
     existing_physical_keys = {item.physical_identity_key for item in state.materialized_evidence}
     for receipt in receipts:
-        if receipt.operation_kind == "write_file":
-            if not receipt.sha256 or receipt.byte_count is None:
-                raise IllegalTransition("successful materialized file receipt requires hash and byte confirmation")
-            if receipt.path not in state.mandatory_paths:
-                raise IllegalTransition("V0 may materialize evidence only for mandatory paths")
-            target = targets_by_path[receipt.path]
-            if receipt.path in existing_paths or target.physical_identity_key in existing_physical_keys:
-                raise IllegalTransition("V0 cannot overwrite an already-materialized mandatory physical target")
-            try:
-                materialized.append(
-                    FileEvidence(
-                        path=receipt.path,
-                        resolved_target=target.resolved_target,
-                        physical_identity_key=target.physical_identity_key,
-                        sha256=receipt.sha256,
-                        byte_count=receipt.byte_count,
-                        action_id=receipt.action_id,
-                        execution_command_id=event.execution_command_id,
-                        batch_id=event.batch_id,
-                        invocation_id=event.invocation_id,
-                    )
-                )
-            except ValueError as exc:
-                raise IllegalTransition("successful materialized file receipt has an invalid SHA-256") from exc
-        elif receipt.sha256 is not None or receipt.byte_count is not None:
+        if receipt.operation_kind != "write_file":
             raise IllegalTransition("non-materializing receipt cannot claim file evidence")
-    if not materialized:
-        raise IllegalTransition("successful execution cannot be empty of materialized V0 work")
-    return tuple(action_ids), tuple(materialized)
+        if receipt.path not in state.mandatory_paths:
+            raise IllegalTransition("V0 may materialize evidence only for mandatory paths")
+        target = targets_by_path[receipt.path]
+        if receipt.path in existing_paths or target.physical_identity_key in existing_physical_keys:
+            raise IllegalTransition("V0 cannot overwrite an already-materialized mandatory physical target")
+        try:
+            materialized.append(
+                FileEvidence(
+                    path=receipt.path,
+                    resolved_target=target.resolved_target,
+                    physical_identity_key=target.physical_identity_key,
+                    sha256=receipt.sha256,
+                    byte_count=receipt.byte_count,
+                    action_id=receipt.action_id,
+                    execution_command_id=execution_command_id,
+                    batch_id=batch_id,
+                    invocation_id=invocation_id,
+                    execution_receipt_id=receipt.receipt_id,
+                )
+            )
+        except ValueError as exc:
+            raise IllegalTransition("materialized file receipt has an invalid SHA-256") from exc
+    return tuple(materialized)
 
 
-def reduce(state: SessionState, event: Event | _BoundedExecutionCompleted) -> ReducerResult:
+def _interrupted_prefix_evidence(
+    state: SessionState,
+    batch: BatchRecord,
+    event: _BoundedExecutionInterrupted,
+) -> tuple[tuple[str, ...], tuple[FileEvidence, ...]]:
+    """Accept only an exact ordered completed prefix of the admitted operations."""
+
+    command = state.pending_command
+    if command is None or command.command_id != event.execution_command_id:
+        raise IllegalTransition("interrupted execution does not name the active execution command")
+    if event.invocation_id != batch.invocation_id:
+        raise IllegalTransition("interrupted execution invocation does not match active batch")
+    if not event.interruption_code or event.failure_reason is None:
+        raise IllegalTransition("interrupted execution requires a bounded code and typed reason")
+
+    admitted = batch.admitted_operation_ids
+    receipts = event.receipts
+    completed_ids = tuple(receipt.action_id for receipt in receipts)
+    if completed_ids != admitted[: len(completed_ids)]:
+        raise IllegalTransition("interrupted execution receipts must be the exact ordered admitted prefix")
+    if event.remaining_action_ids != admitted[len(completed_ids):]:
+        raise IllegalTransition("interrupted execution must report the exact unexecuted remainder")
+    if event.failed_action_id is not None and event.failed_action_id not in set(event.remaining_action_ids):
+        raise IllegalTransition("interrupted execution failed action must be an unexecuted admitted action")
+
+    admitted_by_id = {item.operation_id: item for item in batch.proposed_operations if item.operation_id in set(admitted)}
+    paths = [receipt.path for receipt in receipts]
+    targets_by_path = {target.relative_path: target for target in event.validated_targets}
+    if (
+        len(set(paths)) != len(paths)
+        or len(targets_by_path) != len(event.validated_targets)
+        or set(targets_by_path) != set(paths)
+        or len({target.physical_identity_key for target in event.validated_targets}) != len(event.validated_targets)
+    ):
+        raise IllegalTransition("interrupted execution receipts cannot duplicate an action or path")
+    for receipt in receipts:
+        operation = admitted_by_id[receipt.action_id]
+        if (
+            receipt.operation_kind != operation.operation.get("operation")
+            or receipt.path != operation.path
+            or receipt.success is not True
+        ):
+            raise IllegalTransition("interrupted receipt does not match its admitted operation")
+    evidence = _materialize_receipt_evidence(
+        state,
+        receipts,
+        targets_by_path,
+        execution_command_id=event.execution_command_id,
+        batch_id=event.batch_id,
+        invocation_id=event.invocation_id,
+    )
+    return completed_ids, evidence
+
+
+def reduce(state: SessionState, event: Event | _BoundedExecutionCompleted | _BoundedExecutionInterrupted) -> ReducerResult:
     """Reduce one typed fact without I/O, clocks, ids, dispatch, or projection."""
 
     if state.phase in {Phase.COMPLETED, Phase.FAILED}:
@@ -497,6 +574,42 @@ def reduce(state: SessionState, event: Event | _BoundedExecutionCompleted) -> Re
             ),
         )
 
+    if isinstance(event, _BoundedExecutionInterrupted):
+        batch = state.current_batch
+        if (
+            state.phase != Phase.READY_TO_EXECUTE
+            or batch is None
+            or batch.batch_id != event.batch_id
+            or not _matches_in_flight_command(state, kind=CommandKind.EXECUTE_BOUNDED_OPERATIONS, owner_id=event.batch_id)
+        ):
+            raise IllegalTransition("interrupted execution result does not match admitted batch")
+        completed_ids, evidence = _interrupted_prefix_evidence(state, batch, event)
+        settled = _settle_pending(state)
+        known_receipt_ids = {receipt.receipt_id for receipt in settled.execution_receipt_history}
+        incoming_receipt_ids = [receipt.receipt_id for receipt in event.receipts]
+        if known_receipt_ids.intersection(incoming_receipt_ids) or len(set(incoming_receipt_ids)) != len(incoming_receipt_ids):
+            raise IllegalTransition("execution receipt replay is not permitted")
+        temporary = replace(
+            settled,
+            materialized_evidence=_merge_evidence(settled.materialized_evidence, evidence),
+            execution_receipt_history=(*settled.execution_receipt_history, *event.receipts),
+        )
+        interrupted_state = _finalize_current_batch(
+            temporary,
+            BatchStatus.INTERRUPTED,
+            executed_operation_ids=completed_ids,
+            materialized_evidence=evidence,
+            remaining_mandatory_paths=temporary.remaining_paths(),
+            remaining_action_ids=event.remaining_action_ids,
+            interruption_code=event.interruption_code,
+        )
+        # The accomplished prefix is durable; the batch is never continued.
+        return ReducerResult(
+            _pause(interrupted_state, event.failure_reason),
+            semantic_progress=True,
+            diagnostic_facts=("execution_interrupted_prefix_persisted", f"completed_effects:{len(completed_ids)}"),
+        )
+
     if isinstance(event, _BoundedExecutionCompleted):
         batch = state.current_batch
         if (
@@ -515,7 +628,15 @@ def reduce(state: SessionState, event: Event | _BoundedExecutionCompleted) -> Re
                 semantic_progress=True,
             )
         merged_evidence = _merge_evidence(settled.materialized_evidence, evidence)
-        temporary = replace(settled, materialized_evidence=merged_evidence)
+        known_receipt_ids = {receipt.receipt_id for receipt in settled.execution_receipt_history}
+        incoming_receipt_ids = [receipt.receipt_id for receipt in event.receipts]
+        if known_receipt_ids.intersection(incoming_receipt_ids) or len(set(incoming_receipt_ids)) != len(incoming_receipt_ids):
+            raise IllegalTransition("execution receipt replay is not permitted")
+        temporary = replace(
+            settled,
+            materialized_evidence=merged_evidence,
+            execution_receipt_history=(*settled.execution_receipt_history, *event.receipts),
+        )
         remaining = temporary.remaining_paths()
         completed_state = _finalize_current_batch(
             temporary,

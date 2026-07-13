@@ -116,9 +116,18 @@ class OfflineReceiptAdapter:
         if receipts is None:
             receipts = tuple(
                 ExecutionReceipt(
+                    schema_version="admissible_v0_execution_receipt_v1",
+                    receipt_id=f"v0receipt:{command.command_id}:{operation.operation_id}",
+                    session_id=capability.session_id,
+                    issued_revision=capability.issued_revision,
+                    execution_command_id=capability.command_id,
+                    batch_id=capability.batch_id,
+                    invocation_id=capability.invocation_id,
                     action_id=operation.operation_id,
                     operation_kind=operation.operation["operation"],
                     path=operation.path,
+                    resolved_target=workspace_target.target_for(operation.path).resolved_target,
+                    physical_identity_key=workspace_target.target_for(operation.path).physical_identity_key,
                     sha256=SHA_A,
                     byte_count=10,
                     success=True,
@@ -213,15 +222,28 @@ class Case:
         return self.tick(ActionsAdmitted(batch.batch_id, tuple(item.operation_id for item in batch.proposed_operations)))
 
     def receipt(self, action_id: str, *, sha256: str | None = SHA_A, path: str | None = None, operation_kind: str | None = None) -> ExecutionReceipt:
-        batch = self.state().current_batch
-        assert batch is not None
+        state = self.state()
+        batch = state.current_batch
+        command = state.pending_command
+        assert batch is not None and command is not None
+        capability = ExecutionCapability.from_dict(command.payload["execution_capability"])
         operation = next(item for item in batch.proposed_operations if item.operation_id == action_id)
+        target = WorkspaceGuard(self.workspace, state.contract.workspace_policy).validate(operation.path)
         return ExecutionReceipt(
+            schema_version="admissible_v0_execution_receipt_v1",
+            receipt_id=f"v0receipt:{command.command_id}:{action_id}",
+            session_id=state.session_id,
+            issued_revision=capability.issued_revision,
+            execution_command_id=command.command_id or "",
+            batch_id=batch.batch_id,
+            invocation_id=batch.invocation_id,
             action_id=action_id,
             operation_kind=operation.operation["operation"] if operation_kind is None else operation_kind,
             path=operation.path if path is None else path,
-            sha256=sha256,
-            byte_count=10 if sha256 is not None else None,
+            resolved_target=target.resolved_target,
+            physical_identity_key=target.physical_identity_key,
+            sha256=sha256 or "",
+            byte_count=10,
             success=True,
         )
 

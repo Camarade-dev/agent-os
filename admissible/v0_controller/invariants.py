@@ -90,8 +90,9 @@ def _validate_batch_shape(state: SessionState, batch: BatchRecord, *, current: b
         _fail("batch proposal paths must be unique")
     for proposal in batch.proposed_operations:
         operation = proposal.operation
-        if not isinstance(operation.get("operation"), str) or not operation["operation"]:
-            _fail("proposed operation kind is required")
+        # Proposed operations are immutable untrusted backend facts.  Their
+        # exact (including absent or malformed) kind is retained until the
+        # admission boundary rejects it; normalizing it here would be unsafe.
         if operation.get("path") != proposal.path or not state.contract.permits_path(proposal.path):
             _fail("proposed operation path is not authorized")
     admitted = batch.admitted_operation_ids
@@ -119,6 +120,9 @@ def _validate_batch_shape(state: SessionState, batch: BatchRecord, *, current: b
     if len(set(batch.remaining_mandatory_paths)) != len(batch.remaining_mandatory_paths):
         _fail("batch remaining paths must be unique")
 
+    if batch.status != BatchStatus.INTERRUPTED and (batch.remaining_action_ids or batch.interruption_code is not None):
+        _fail("only an interrupted batch may record an unexecuted remainder or interruption code")
+
     if current:
         if batch.status == BatchStatus.PREPARED:
             if admitted or executed or evidence:
@@ -131,11 +135,22 @@ def _validate_batch_shape(state: SessionState, batch: BatchRecord, *, current: b
         else:
             _fail("only prepared or admitted batches may remain active")
     else:
-        if batch.status not in {BatchStatus.COMPLETED, BatchStatus.FAILED}:
-            _fail("batch history may contain only completed or failed batches")
+        if batch.status not in {BatchStatus.COMPLETED, BatchStatus.INTERRUPTED, BatchStatus.FAILED}:
+            _fail("batch history may contain only completed, interrupted, or failed batches")
         if batch.status == BatchStatus.COMPLETED:
             if set(executed) != set(admitted) or not evidence:
                 _fail("completed batch must record all execution and materialized evidence")
+        elif batch.status == BatchStatus.INTERRUPTED:
+            # An interruption may represent only an exact completed prefix of
+            # the persisted admitted order, and every completed effect exactly once.
+            if executed != admitted[: len(executed)]:
+                _fail("interrupted batch executed operations must be an exact ordered admitted prefix")
+            if batch.remaining_action_ids != admitted[len(executed):]:
+                _fail("interrupted batch must record the exact unexecuted admitted remainder")
+            if not batch.interruption_code:
+                _fail("interrupted batch requires a bounded interruption code")
+            if len(evidence) != len(executed) or {item.action_id for item in evidence} != set(executed):
+                _fail("interrupted batch evidence must represent every completed effect exactly once")
         elif evidence:
             _fail("failed batch cannot claim materialized evidence")
 
@@ -204,18 +219,46 @@ def _validate_command_payload_for_phase(
     _fail("pending command exists in a phase with no command ownership")
 
 
-def _completed_batches(state: SessionState) -> tuple[BatchRecord, ...]:
-    return tuple(batch for batch in state.batch_history if batch.status == BatchStatus.COMPLETED)
+def _evidence_batches(state: SessionState) -> tuple[BatchRecord, ...]:
+    """Batches whose physical effects are durably represented: completed or interrupted."""
+
+    return tuple(
+        batch
+        for batch in state.batch_history
+        if batch.status in {BatchStatus.COMPLETED, BatchStatus.INTERRUPTED}
+    )
 
 
 def _validate_materialized_history(state: SessionState) -> None:
     expected = tuple(
         evidence
-        for batch in _completed_batches(state)
+        for batch in _evidence_batches(state)
         for evidence in batch.materialized_evidence
     )
     if state.materialized_evidence != expected:
         _fail("materialized evidence must exactly equal immutable completed-batch evidence")
+    receipts = state.execution_receipt_history
+    if len({receipt.receipt_id for receipt in receipts}) != len(receipts):
+        _fail("execution receipt history ids must be unique")
+    if len(receipts) != len(expected):
+        _fail("execution receipt history must exactly cover materialized evidence")
+    for evidence, receipt in zip(expected, receipts, strict=True):
+        if (
+            receipt.session_id != state.session_id
+            or receipt.receipt_id != evidence.execution_receipt_id
+            or receipt.path != evidence.path
+            or receipt.resolved_target != evidence.resolved_target
+            or receipt.physical_identity_key != evidence.physical_identity_key
+            or receipt.sha256 != evidence.sha256
+            or receipt.byte_count != evidence.byte_count
+            or receipt.action_id != evidence.action_id
+            or receipt.execution_command_id != evidence.execution_command_id
+            or receipt.batch_id != evidence.batch_id
+            or receipt.invocation_id != evidence.invocation_id
+            or receipt.operation_kind != "write_file"
+            or receipt.success is not True
+        ):
+            _fail("execution receipt history does not exactly correlate materialized evidence")
 
 
 def _validate_nonpause_history(state: SessionState, *, allow_current_batch: bool = False) -> None:
@@ -329,6 +372,7 @@ def validate_state(state: SessionState, *, allow_unassigned_command_id: bool = F
             state.revision != 0
             or state.semantic_state_version != 0
             or state.materialized_evidence
+            or state.execution_receipt_history
             or state.current_invocation is not None
             or state.invocation_history
             or state.current_batch is not None

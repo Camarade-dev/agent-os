@@ -12,6 +12,7 @@ from admissible.v0_controller.state import (
     OutcomeReason,
     ProposedOperation,
     StructuralFileCheck,
+    V0ExecutionReceipt,
 )
 from admissible.v0_controller.workspace_guard import ValidatedTarget
 
@@ -61,37 +62,8 @@ class ActionsAdmitted:
     admitted_operation_ids: tuple[str, ...]
 
 
-@dataclass(frozen=True)
-class ExecutionReceipt:
-    """Immutable bounded-executor confirmation for one admitted operation.
-
-    These facts cross the executor/engine boundary.  The reducer maps a
-    validated successful ``write_file`` receipt to authoritative evidence; an
-    agent proposal alone never does so.
-    """
-
-    action_id: str
-    operation_kind: str
-    path: str
-    sha256: str | None
-    byte_count: int | None
-    success: bool
-    diagnostic: str | None = None
-
-    def __post_init__(self) -> None:
-        text_fields = (
-            self.action_id,
-            self.operation_kind,
-            self.path,
-        )
-        if any(not isinstance(value, str) or not value for value in text_fields):
-            raise ValueError("execution receipt identifiers are required")
-        if self.byte_count is not None and (
-            not isinstance(self.byte_count, int)
-            or isinstance(self.byte_count, bool)
-            or self.byte_count < 0
-        ):
-            raise ValueError("execution receipt byte_count is invalid")
+ExecutionReceipt = V0ExecutionReceipt
+"""Complete immutable receipt consumed only through the trusted V0 adapter."""
 
 
 @dataclass(frozen=True)
@@ -107,7 +79,7 @@ class BoundedExecutionCompleted:
     batch_id: str
     invocation_id: str
     success: bool
-    receipts: tuple[ExecutionReceipt, ...]
+    receipts: tuple[V0ExecutionReceipt, ...]
     occurred_at: str
     failure_reason: OutcomeReason | None = None
 
@@ -157,7 +129,7 @@ class V0ExecutionResultEnvelope:
     """Trusted-adapter return value; correlations are derived by the engine."""
 
     capability: ExecutionCapability
-    receipts: tuple[ExecutionReceipt, ...]
+    receipts: tuple[V0ExecutionReceipt, ...]
     success: bool
     occurred_at: str
     adapter_identity: str
@@ -177,12 +149,76 @@ class _BoundedExecutionCompleted:
     batch_id: str
     invocation_id: str
     success: bool
-    receipts: tuple[ExecutionReceipt, ...]
+    receipts: tuple[V0ExecutionReceipt, ...]
     validated_targets: tuple[ValidatedTarget, ...]
     occurred_at: str
     adapter_identity: str
     adapter_protocol_version: str
     failure_reason: OutcomeReason | None = None
+
+
+INTERRUPTION_DIAGNOSTIC_CAP = 512
+"""Interrupted-execution diagnostics are bounded before they become durable."""
+
+
+def bounded_interruption_diagnostic(diagnostic: str) -> str:
+    return diagnostic[:INTERRUPTION_DIAGNOSTIC_CAP]
+
+
+@dataclass(frozen=True)
+class V0ExecutionInterrupted:
+    """Trusted-adapter result for a batch stopped after an exact completed prefix.
+
+    ``receipts`` are the ordered receipts of the physical writes that really
+    happened.  They are preserved so an interruption cannot erase an
+    accomplished effect.  The batch is never continued from this result.
+    """
+
+    capability: ExecutionCapability
+    receipts: tuple[V0ExecutionReceipt, ...]
+    remaining_action_ids: tuple[str, ...]
+    interruption_code: str
+    diagnostic: str
+    occurred_at: str
+    adapter_identity: str
+    adapter_protocol_version: str
+    failure_reason: OutcomeReason
+    failed_action_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not self.adapter_identity
+            or not self.adapter_protocol_version
+            or not self.occurred_at
+            or not self.interruption_code
+            or len(self.diagnostic) > INTERRUPTION_DIAGNOSTIC_CAP
+        ):
+            raise ValueError("interrupted executor result identity, code, or diagnostic is invalid")
+        if any(receipt.success is not True for receipt in self.receipts):
+            raise ValueError("interrupted executor result may carry only completed receipts")
+
+    @property
+    def completed_action_ids(self) -> tuple[str, ...]:
+        return tuple(receipt.action_id for receipt in self.receipts)
+
+
+@dataclass(frozen=True)
+class _BoundedExecutionInterrupted:
+    """Internal reducer fact built only by trusted interrupted-result consumption."""
+
+    execution_command_id: str
+    batch_id: str
+    invocation_id: str
+    receipts: tuple[V0ExecutionReceipt, ...]
+    validated_targets: tuple[ValidatedTarget, ...]
+    remaining_action_ids: tuple[str, ...]
+    interruption_code: str
+    diagnostic: str
+    occurred_at: str
+    adapter_identity: str
+    adapter_protocol_version: str
+    failure_reason: OutcomeReason
+    failed_action_id: str | None = None
 
 
 @dataclass(frozen=True)

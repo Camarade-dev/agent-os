@@ -15,6 +15,10 @@ import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Iterable
 
+from admissible.execution.bounded_write import (
+    WorkspaceAuthorityDescriptor,
+    revalidate_workspace_authority,
+)
 from admissible.v0_controller.state import WorkspacePolicy
 
 
@@ -66,6 +70,7 @@ class ValidatedWorkspaceTarget:
     resolved_workspace: str
     identity_policy: FilesystemIdentityPolicy
     targets: tuple[ValidatedTarget, ...]
+    authority: WorkspaceAuthorityDescriptor | None = None
 
     def target_for(self, relative_path: str) -> ValidatedTarget:
         matches = [target for target in self.targets if target.relative_path == relative_path]
@@ -118,11 +123,20 @@ class WorkspaceGuard:
     target_workspace: str | Path
     policy: WorkspacePolicy | None = None
     identity_policy: FilesystemIdentityPolicy | None = None
+    authority: WorkspaceAuthorityDescriptor | None = None
 
     def _identity_policy(self) -> FilesystemIdentityPolicy:
         return self.identity_policy or FilesystemIdentityPolicy.for_host()
 
     def resolved_workspace(self) -> Path:
+        if self.authority is not None:
+            try:
+                return revalidate_workspace_authority(self.authority)
+            except ValueError as exc:
+                raise WorkspaceGuardError(
+                    getattr(exc, "diagnostic", "workspace_authority_changed"),
+                    str(exc),
+                ) from exc
         raw = str(self.target_workspace).strip()
         if not raw:
             raise WorkspaceGuardError("workspace_unavailable", "configured target workspace is empty")
@@ -133,6 +147,11 @@ class WorkspaceGuard:
             return root.resolve(strict=True)
         except OSError as exc:
             raise WorkspaceGuardError("workspace_unavailable", f"configured target workspace cannot be resolved: {exc}") from exc
+
+    def revalidate_authority(self) -> Path:
+        """Revalidate the immutable workspace descriptor before an external stage."""
+
+        return self.resolved_workspace()
 
     def validate(self, relative_path: str) -> ValidatedTarget:
         parts = _canonical_relative_path(relative_path)
@@ -188,4 +207,5 @@ class WorkspaceGuard:
             resolved_workspace=str(root),
             identity_policy=self._identity_policy(),
             targets=self.validate_distinct(relative_paths),
+            authority=self.authority,
         )

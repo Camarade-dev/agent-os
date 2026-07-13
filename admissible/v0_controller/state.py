@@ -8,10 +8,11 @@ import json
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Mapping
 
+from admissible.execution.bounded_write import WorkspaceAuthorityDescriptor
 from admissible.v0_controller.commands import Command
 
 
-V0_SCHEMA_VERSION = "admissible_v0_controller_state_v1"
+V0_SCHEMA_VERSION = "admissible_v0_controller_state_v3"
 
 
 class Phase(str, Enum):
@@ -42,6 +43,7 @@ class BatchStatus(str, Enum):
     ADMITTED = "admitted"
     EXECUTING = "executing"
     COMPLETED = "completed"
+    INTERRUPTED = "interrupted"
     FAILED = "failed"
 
 
@@ -66,6 +68,9 @@ class ReasonCode(str, Enum):
     INVALID_EXTERNAL_RESULT = "invalid_external_result"
     INVARIANT_FAILURE = "invariant_failure"
     DURABILITY_UNCERTAIN = "durability_uncertain"
+    WORKSPACE_AUTHORITY_CHANGED = "workspace_authority_changed"
+    WORKSPACE_CONTAINMENT_CHANGED = "workspace_containment_changed"
+    PHYSICAL_ATTESTATION_FAILED = "physical_attestation_failed"
 
 
 def _canonical_json(value: Mapping[str, Any]) -> str:
@@ -185,6 +190,79 @@ class MissionContract:
 
 
 @dataclass(frozen=True)
+class V0ExecutionReceipt:
+    """The complete immutable V0 fact for one confirmed bounded write."""
+
+    schema_version: str
+    receipt_id: str
+    session_id: str
+    issued_revision: int
+    execution_command_id: str
+    batch_id: str
+    invocation_id: str
+    action_id: str
+    operation_kind: str
+    path: str
+    resolved_target: str
+    physical_identity_key: str
+    sha256: str
+    byte_count: int
+    success: bool
+    diagnostic: str | None = None
+
+    def __post_init__(self) -> None:
+        text = (
+            self.schema_version, self.receipt_id, self.session_id, self.execution_command_id,
+            self.batch_id, self.invocation_id, self.action_id, self.operation_kind,
+            self.path, self.resolved_target, self.physical_identity_key, self.sha256,
+        )
+        if (
+            any(not isinstance(value, str) or not value for value in text)
+            or self.schema_version != "admissible_v0_execution_receipt_v1"
+            or self.issued_revision < 0
+            or not _safe_relative_path(self.path)
+            or not _is_sha256(self.sha256, required=True)
+            or not isinstance(self.byte_count, int)
+            or isinstance(self.byte_count, bool)
+            or self.byte_count < 0
+            or self.success is not True
+            or (self.diagnostic is not None and not isinstance(self.diagnostic, str))
+        ):
+            raise ValueError("invalid V0 execution receipt")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "receipt_id": self.receipt_id,
+            "session_id": self.session_id,
+            "issued_revision": self.issued_revision,
+            "execution_command_id": self.execution_command_id,
+            "batch_id": self.batch_id,
+            "invocation_id": self.invocation_id,
+            "action_id": self.action_id,
+            "operation_kind": self.operation_kind,
+            "path": self.path,
+            "resolved_target": self.resolved_target,
+            "physical_identity_key": self.physical_identity_key,
+            "sha256": self.sha256,
+            "byte_count": self.byte_count,
+            "success": self.success,
+            "diagnostic": self.diagnostic,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "V0ExecutionReceipt":
+        expected = {
+            "schema_version", "receipt_id", "session_id", "issued_revision", "execution_command_id",
+            "batch_id", "invocation_id", "action_id", "operation_kind", "path", "resolved_target",
+            "physical_identity_key", "sha256", "byte_count", "success", "diagnostic",
+        }
+        if set(data) != expected:
+            raise ValueError("invalid V0 execution receipt fields")
+        return cls(**dict(data))
+
+
+@dataclass(frozen=True)
 class FileEvidence:
     """Durable receipt-derived evidence with its physical target identity.
 
@@ -202,6 +280,7 @@ class FileEvidence:
     execution_command_id: str
     batch_id: str
     invocation_id: str
+    execution_receipt_id: str
 
     def __post_init__(self) -> None:
         if (
@@ -218,6 +297,7 @@ class FileEvidence:
             or not self.execution_command_id
             or not self.batch_id
             or not self.invocation_id
+            or not self.execution_receipt_id
         ):
             raise ValueError("invalid file evidence")
 
@@ -232,6 +312,7 @@ class FileEvidence:
             "execution_command_id": self.execution_command_id,
             "batch_id": self.batch_id,
             "invocation_id": self.invocation_id,
+            "execution_receipt_id": self.execution_receipt_id,
         }
 
     @classmethod
@@ -246,6 +327,7 @@ class FileEvidence:
             "execution_command_id",
             "batch_id",
             "invocation_id",
+            "execution_receipt_id",
         }:
             raise ValueError("invalid file evidence fields")
         return cls(**dict(data))
@@ -330,6 +412,8 @@ class BatchRecord:
     materialized_evidence: tuple[FileEvidence, ...]
     remaining_mandatory_paths: tuple[str, ...]
     status: BatchStatus
+    remaining_action_ids: tuple[str, ...] = ()
+    interruption_code: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -341,6 +425,8 @@ class BatchRecord:
             "materialized_evidence": [item.to_dict() for item in self.materialized_evidence],
             "remaining_mandatory_paths": list(self.remaining_mandatory_paths),
             "status": self.status.value,
+            "remaining_action_ids": list(self.remaining_action_ids),
+            "interruption_code": self.interruption_code,
         }
 
     @classmethod
@@ -348,12 +434,16 @@ class BatchRecord:
         expected = {
             "batch_id", "invocation_id", "proposed_operations", "admitted_operation_ids",
             "executed_operation_ids", "materialized_evidence", "remaining_mandatory_paths", "status",
+            "remaining_action_ids", "interruption_code",
         }
         if set(data) != expected:
             raise ValueError("invalid batch record")
-        list_fields = ("proposed_operations", "admitted_operation_ids", "executed_operation_ids", "materialized_evidence", "remaining_mandatory_paths")
+        list_fields = ("proposed_operations", "admitted_operation_ids", "executed_operation_ids", "materialized_evidence", "remaining_mandatory_paths", "remaining_action_ids")
         if any(not isinstance(data[name], list) for name in list_fields):
             raise ValueError("invalid batch list field")
+        code = data["interruption_code"]
+        if code is not None and (not isinstance(code, str) or not code):
+            raise ValueError("invalid batch interruption code")
         return cls(
             batch_id=data["batch_id"],
             invocation_id=data["invocation_id"],
@@ -363,6 +453,8 @@ class BatchRecord:
             materialized_evidence=tuple(FileEvidence.from_dict(item) for item in data["materialized_evidence"]),
             remaining_mandatory_paths=tuple(data["remaining_mandatory_paths"]),
             status=BatchStatus(data["status"]),
+            remaining_action_ids=tuple(data["remaining_action_ids"]),
+            interruption_code=code,
         )
 
 
@@ -433,6 +525,12 @@ class StructuralFileCheck:
     non_empty: bool
     inside_workspace: bool
     sha256: str | None
+    structural_command_id: str = ""
+    check_kind: str = "mandatory_file"
+    passed: bool = True
+    failure_code: str | None = None
+    expected_sha256: str | None = None
+    observed_sha256: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -441,14 +539,33 @@ class StructuralFileCheck:
             "non_empty": self.non_empty,
             "inside_workspace": self.inside_workspace,
             "sha256": self.sha256,
+            "structural_command_id": self.structural_command_id,
+            "check_kind": self.check_kind,
+            "passed": self.passed,
+            "failure_code": self.failure_code,
+            "expected_sha256": self.expected_sha256,
+            "observed_sha256": self.observed_sha256,
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "StructuralFileCheck":
-        if set(data) != {"path", "exists", "non_empty", "inside_workspace", "sha256"}:
+        if set(data) != {
+            "path", "exists", "non_empty", "inside_workspace", "sha256", "structural_command_id",
+            "check_kind", "passed", "failure_code", "expected_sha256", "observed_sha256",
+        }:
             raise ValueError("invalid structural file check")
         check = cls(**dict(data))
-        if not _safe_relative_path(check.path) or not _is_sha256(check.sha256):
+        if (
+            not _safe_relative_path(check.path)
+            or not _is_sha256(check.sha256)
+            or not isinstance(check.structural_command_id, str)
+            or not isinstance(check.check_kind, str)
+            or not check.check_kind
+            or not isinstance(check.passed, bool)
+            or (check.failure_code is not None and (not isinstance(check.failure_code, str) or not check.failure_code))
+            or not _is_sha256(check.expected_sha256)
+            or not _is_sha256(check.observed_sha256)
+        ):
             raise ValueError("invalid structural file check path or hash")
         return check
 
@@ -497,7 +614,9 @@ class SessionState:
     phase: Phase
     contract: MissionContract
     mandatory_paths: tuple[str, ...]
+    workspace_authority: WorkspaceAuthorityDescriptor | None = None
     materialized_evidence: tuple[FileEvidence, ...] = ()
+    execution_receipt_history: tuple[V0ExecutionReceipt, ...] = ()
     current_invocation: InvocationRecord | None = None
     invocation_history: tuple[InvocationRecord, ...] = ()
     current_batch: BatchRecord | None = None
@@ -523,7 +642,9 @@ class SessionState:
             "phase": self.phase.value,
             "contract": self.contract.to_dict(),
             "mandatory_paths": list(self.mandatory_paths),
+            "workspace_authority": None if self.workspace_authority is None else self.workspace_authority.to_dict(),
             "materialized_evidence": [item.to_dict() for item in self.materialized_evidence],
+            "execution_receipt_history": [item.to_dict() for item in self.execution_receipt_history],
             "current_invocation": None if self.current_invocation is None else self.current_invocation.to_dict(),
             "invocation_history": [item.to_dict() for item in self.invocation_history],
             "current_batch": None if self.current_batch is None else self.current_batch.to_dict(),
@@ -544,13 +665,14 @@ class SessionState:
     def from_dict(cls, data: Mapping[str, Any]) -> "SessionState":
         expected = {
             "schema_version", "session_id", "revision", "semantic_state_version", "phase", "contract", "mandatory_paths",
-            "materialized_evidence", "current_invocation", "invocation_history", "current_batch", "batch_history",
+            "materialized_evidence", "execution_receipt_history", "current_invocation", "invocation_history", "current_batch", "batch_history",
             "pending_command", "completed_command_ids", "uncertain_command_ids", "wait_token", "structural_verification",
-            "outcome_reason", "counters",
+            "outcome_reason", "counters", "workspace_authority",
         }
-        if set(data) != expected:
+        legacy_expected = expected - {"workspace_authority"}
+        if set(data) != expected and set(data) != legacy_expected:
             raise ValueError("invalid V0 session state fields")
-        list_fields = ("mandatory_paths", "materialized_evidence", "invocation_history", "batch_history", "completed_command_ids", "uncertain_command_ids")
+        list_fields = ("mandatory_paths", "materialized_evidence", "execution_receipt_history", "invocation_history", "batch_history", "completed_command_ids", "uncertain_command_ids")
         if any(not isinstance(data[name], list) for name in list_fields):
             raise ValueError("invalid V0 session list field")
         state = cls(
@@ -561,7 +683,13 @@ class SessionState:
             phase=Phase(data["phase"]),
             contract=MissionContract.from_dict(data["contract"]),
             mandatory_paths=tuple(data["mandatory_paths"]),
+            workspace_authority=(
+                None
+                if data.get("workspace_authority") is None
+                else WorkspaceAuthorityDescriptor.from_dict(data["workspace_authority"])
+            ),
             materialized_evidence=tuple(FileEvidence.from_dict(item) for item in data["materialized_evidence"]),
+            execution_receipt_history=tuple(V0ExecutionReceipt.from_dict(item) for item in data["execution_receipt_history"]),
             current_invocation=None if data["current_invocation"] is None else InvocationRecord.from_dict(data["current_invocation"]),
             invocation_history=tuple(InvocationRecord.from_dict(item) for item in data["invocation_history"]),
             current_batch=None if data["current_batch"] is None else BatchRecord.from_dict(data["current_batch"]),
@@ -585,7 +713,12 @@ class SessionState:
         return state
 
 
-def new_session_state(*, session_id: str, contract: MissionContract) -> SessionState:
+def new_session_state(
+    *,
+    session_id: str,
+    contract: MissionContract,
+    workspace_authority: WorkspaceAuthorityDescriptor | None = None,
+) -> SessionState:
     """Build an in-memory bootstrap state; the engine persists creation atomically."""
 
     if not session_id:
@@ -598,4 +731,5 @@ def new_session_state(*, session_id: str, contract: MissionContract) -> SessionS
         phase=Phase.PLAN,
         contract=contract,
         mandatory_paths=contract.mandatory_paths,
+        workspace_authority=workspace_authority,
     )
