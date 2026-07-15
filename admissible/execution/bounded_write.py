@@ -12,6 +12,7 @@ import hashlib
 import os
 from pathlib import Path
 import re
+from urllib.parse import urlsplit
 
 
 DIAG_FORBIDDEN_OPERATION_CATEGORY = "forbidden_operation_category"
@@ -197,6 +198,30 @@ _NETWORK_SIDE_EFFECT_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     )
 )
 _EXTERNAL_RESOURCE_REFERENCE_PATTERN = re.compile(r"(?:src|href)\s*=\s*[\"']\s*https?://", re.IGNORECASE)
+# Executable / shell network constructs that must be rejected in Markdown even
+# when they target a loopback host.  The loopback exemption below applies only to
+# bare documentation URLs, never to these active-invocation forms.
+_MARKDOWN_EXECUTABLE_NETWORK_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"\bfetch\s*\(",
+        r"\bXMLHttpRequest\b",
+        r"\bWebSocket\s*\(",
+        r"\bEventSource\s*\(",
+        r"\bsendBeacon\s*\(",
+        r"\b(?:curl|wget)\b",
+        r"\bwss?://",
+    )
+)
+# A conservative bare HTTP(S) URL occurrence.  Delimiters that never belong to a
+# URL authority/path (whitespace, Markdown backticks, quotes, brackets, angle
+# brackets, closing parentheses) terminate the match; trailing sentence
+# punctuation is stripped before parsing.
+_HTTP_URL_OCCURRENCE_PATTERN = re.compile(
+    r"https?://(?:\[[0-9A-Fa-f:.]+\])?[^\s)`\"'<>\]}]*",
+    re.IGNORECASE,
+)
+_STRICT_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 _EXECUTABLE_OR_SECRET_CONTENT_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -561,6 +586,50 @@ def _looks_like_forbidden_natural_language(text: str) -> bool:
     return any(pattern.search(text) for pattern in _FORBIDDEN_NATURAL_LANGUAGE_PATTERNS)
 
 
+def _http_url_is_strict_loopback(url: str) -> bool:
+    """Return True only when ``url`` is a provably loopback HTTP(S) URL.
+
+    Strict rules (all required): scheme is exactly http or https; no userinfo
+    (username/password); host is exactly one of localhost, 127.0.0.1, or ::1
+    (case-insensitive); any port is numeric.  Malformed or ambiguous URLs, and
+    any suffix/prefix host trick (e.g. localhost.example.com), return False.
+    """
+
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    if parts.scheme.lower() not in ("http", "https"):
+        return False
+    if parts.username or parts.password:
+        return False
+    try:
+        host = parts.hostname
+        _ = parts.port  # validates a numeric port; raises ValueError otherwise
+    except ValueError:
+        return False
+    if host is None:
+        return False
+    return host.lower() in _STRICT_LOOPBACK_HOSTS
+
+
+def _forbidden_markdown_network_reason(content: str) -> str | None:
+    """Markdown network guard with a strict loopback-documentation exemption.
+
+    Executable/shell network constructs are always forbidden.  A bare HTTP(S)
+    URL is only allowed when every occurrence is a strict loopback URL; any
+    non-loopback (or unparseable) URL is forbidden.
+    """
+
+    if any(pattern.search(content) for pattern in _MARKDOWN_EXECUTABLE_NETWORK_PATTERNS):
+        return "forbidden network call in write content"
+    for raw in _HTTP_URL_OCCURRENCE_PATTERN.findall(content):
+        candidate = raw.rstrip(".,;:!?\"')]}>`")
+        if not _http_url_is_strict_loopback(candidate):
+            return "forbidden network call in write content"
+    return None
+
+
 def forbidden_write_content_reason(path: str, content: str) -> str | None:
     """The established bounded-executor content guard, shared without legacy imports."""
 
@@ -577,7 +646,7 @@ def forbidden_write_content_reason(path: str, content: str) -> str | None:
             return "forbidden external resource reference in write content"
         return "forbidden network call in write content" if network else None
     if extension == ".md":
-        return "forbidden network call in write content" if network else None
+        return _forbidden_markdown_network_reason(content)
     return "forbidden operation string in write content" if _looks_like_forbidden_natural_language(content) else None
 
 
