@@ -32,6 +32,7 @@ Example (dry-run, the default)::
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import sys
 from dataclasses import dataclass
@@ -69,6 +70,14 @@ MAX_AUTOMATIC_RETRIES = 0
 
 CANARY_PAUSE_CODE = "canary_complete_no_execution"
 
+# Filename extensions that name a shell-script wrapper rather than a native
+# executable.  On Windows these are launched through a shell interpreter, so the
+# canary refuses them as the configured executable and asks the operator to name
+# a native executable plus explicit prefix arguments instead.  This is a bounded
+# canary/preflight guard, not a universal claim that a filename extension is an
+# executable-security mechanism.
+WINDOWS_SHELL_WRAPPER_SUFFIXES = (".ps1", ".cmd", ".bat")
+
 
 class CanaryPreflightError(ValueError):
     """A configuration fault found *before* any durable session can exist."""
@@ -90,6 +99,7 @@ class CanaryPreflight:
     store_directory: Path
     session_id: str
     allowed_workspace_roots: tuple[str, ...]
+    executable_prefix_args: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -107,7 +117,44 @@ class CanaryOutcome:
     failure: str = ""
 
 
+def _reject_windows_shell_wrapper(executable: str) -> None:
+    """On Windows, refuse a shell-script wrapper as the configured executable."""
+
+    if os.name != "nt":
+        return
+    suffix = Path(executable).suffix.lower()
+    if suffix in WINDOWS_SHELL_WRAPPER_SUFFIXES:
+        raise CanaryPreflightError(
+            "shell_wrapper_executable",
+            f"the configured executable {executable!r} is a {suffix} shell-script wrapper; "
+            "name a native executable (for example node.exe) and pass the launcher script "
+            "with --executable-prefix-arg instead, so no shell interpreter is invoked",
+        )
+
+
+def _resolve_launcher_file(value: str, *, target_workspace: Path) -> str:
+    """Validate one operator prefix argument declared as a required launcher file."""
+
+    candidate = Path(value)
+    if not candidate.exists():
+        raise CanaryPreflightError(
+            "launcher_file_missing", f"the required launcher file {value!r} does not exist"
+        )
+    if not candidate.is_file():
+        raise CanaryPreflightError(
+            "launcher_file_not_a_file", f"the required launcher file {value!r} is not a regular file"
+        )
+    resolved = candidate.resolve()
+    if resolved == target_workspace or target_workspace in resolved.parents:
+        raise CanaryPreflightError(
+            "launcher_file_in_target_workspace",
+            f"the required launcher file {value!r} resolves inside the target application workspace",
+        )
+    return str(resolved)
+
+
 def _resolve_executable(executable: str) -> str:
+    _reject_windows_shell_wrapper(executable)
     candidate = Path(executable)
     if candidate.is_absolute() or candidate.parent != Path("."):
         if not candidate.is_file():
@@ -157,10 +204,19 @@ def preflight(args: argparse.Namespace) -> CanaryPreflight:
     if store_directory.exists() and not store_directory.is_dir():
         raise CanaryPreflightError("invalid_store_path", "the store path exists and is not a directory")
 
+    # Every operator prefix argument is a required launcher file: it must exist,
+    # be a regular file, resolve canonically, and never live inside the target
+    # workspace.  The resolved paths are what enter the fingerprinted config.
+    prefix_args = tuple(
+        _resolve_launcher_file(value, target_workspace=target)
+        for value in args.executable_prefix_arg
+    )
+
     try:
         config = CursorBackendConfig(
             executable=args.executable,
             agent_workspace=agent,
+            executable_prefix_args=prefix_args,
             model=args.model,
             timeout_seconds=args.timeout_seconds,
             max_operations=MAX_OPERATIONS,
@@ -177,6 +233,7 @@ def preflight(args: argparse.Namespace) -> CanaryPreflight:
         store_directory=store_directory,
         session_id=args.session_id,
         allowed_workspace_roots=tuple(args.allowed_workspace_root),
+        executable_prefix_args=prefix_args,
     )
 
 
@@ -186,7 +243,9 @@ def describe(pre: CanaryPreflight, *, real: bool) -> str:
         "=== Admissible V0 Slice 3: one-call Cursor proposal canary ===",
         f"executable                    : {pre.executable}",
         f"resolved executable           : {pre.resolved_executable}",
-        f"fixed argv                    : {' '.join(config.fixed_arguments())}",
+        f"executable prefix arguments   : {list(config.executable_prefix_args) or '(none)'}",
+        f"fixed cursor arguments        : {' '.join(config.fixed_cursor_arguments())}",
+        f"effective argv template       : {' '.join(config.fixed_arguments())}",
         f"target workspace              : {pre.target_workspace}",
         f"isolated agent workspace      : {pre.agent_workspace}",
         f"durable session store         : {pre.store_directory}",
@@ -314,6 +373,17 @@ def run_one_call_canary(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="v0_cursor_canary", description=__doc__)
     parser.add_argument("--executable", help="Cursor CLI executable, e.g. cursor-agent")
+    parser.add_argument(
+        "--executable-prefix-arg",
+        action="append",
+        default=[],
+        help=(
+            "An explicit operator-trusted launcher argument inserted between the executable "
+            "and the fixed Cursor arguments (repeatable, order preserved). Each value is treated "
+            "as a required launcher file and must exist. Example: the Cursor index.js for a native "
+            "node.exe launch."
+        ),
+    )
     parser.add_argument("--target-workspace", help="The real application workspace (never written by the canary)")
     parser.add_argument("--agent-workspace", help="The isolated proposal workspace handed to Cursor")
     parser.add_argument("--store-directory", help="Directory for the durable V0 canary session state")

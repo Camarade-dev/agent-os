@@ -8,6 +8,7 @@ answered by an exact integer, never by a real process.
 from __future__ import annotations
 
 import ast
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -30,8 +31,10 @@ class CanaryHarness:
         self.workspace.mkdir()
         self.agent_workspace = self.root / "agent_workspace"
         self.store_dir = self.root / "sessions"
-        # A real file so executable resolution succeeds without a real Cursor.
-        self.executable = self.root / "cursor-agent.cmd"
+        # A real native-executable file so resolution succeeds without a real
+        # Cursor.  A ``.exe`` (not a ``.cmd``/``.ps1``/``.bat`` wrapper) is used
+        # so the Windows shell-wrapper preflight guard does not reject it.
+        self.executable = self.root / "cursor-agent.exe"
         self.executable.write_text("", encoding="utf-8")
         self.runner = FakeCursorProcessRunner()
 
@@ -260,6 +263,109 @@ class TestCanaryOneCall(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(harness.runner.started, 1)
         self.assertEqual(harness.state().phase, Phase.TECHNICAL_PAUSE)
+        self.assertEqual(harness.target_snapshot(), [])
+
+
+class TestCanaryExecutablePrefix(unittest.TestCase):
+    """Native launcher prefix: node.exe + index.js compatibility on the canary."""
+
+    def _index_js(self, harness: CanaryHarness) -> Path:
+        launcher = harness.root / "launcher" / "index.js"
+        launcher.parent.mkdir(parents=True, exist_ok=True)
+        launcher.write_text("// fake launcher\n", encoding="utf-8")
+        return launcher
+
+    def test_native_exe_plus_index_js_passes_dry_run_preflight(self) -> None:
+        harness = CanaryHarness(self)
+        index_js = self._index_js(harness)
+        code = harness.main("--executable-prefix-arg", str(index_js))
+        self.assertEqual(code, 0)  # dry run
+        self.assertEqual(harness.runner.started, 0)
+        self.assertFalse(harness.session_exists())
+
+    def test_dry_run_prints_executable_prefix_and_effective_argv(self) -> None:
+        harness = CanaryHarness(self)
+        index_js = self._index_js(harness)
+        pre = canary.preflight(
+            canary.build_parser().parse_args(
+                harness.argv("--executable-prefix-arg", str(index_js))
+            )
+        )
+        text = canary.describe(pre, real=False)
+        self.assertIn("executable prefix arguments", text)
+        self.assertIn(str(index_js.resolve()), text)
+        self.assertIn("effective argv template", text)
+        # The prefix sits between the executable and the fixed Cursor arguments.
+        argv = list(pre.config.fixed_arguments())
+        self.assertEqual(argv[0], str(harness.executable))
+        self.assertEqual(argv[1], str(index_js.resolve()))
+        self.assertEqual(argv[2], "--print")
+
+    def test_a_missing_required_launcher_file_rejects_before_any_session(self) -> None:
+        harness = CanaryHarness(self)
+        missing = harness.root / "launcher" / "does-not-exist.js"
+        code = harness.main(
+            "--executable-prefix-arg", str(missing), "--execute", "--confirm-real-invocation"
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(harness.runner.started, 0)
+        self.assertFalse(harness.session_exists())
+
+    def test_a_directory_as_required_launcher_file_rejects(self) -> None:
+        harness = CanaryHarness(self)
+        directory = harness.root / "launcher-dir"
+        directory.mkdir()
+        code = harness.main(
+            "--executable-prefix-arg", str(directory), "--execute", "--confirm-real-invocation"
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(harness.runner.started, 0)
+        self.assertFalse(harness.session_exists())
+
+    def test_a_launcher_file_inside_the_target_workspace_rejects(self) -> None:
+        harness = CanaryHarness(self)
+        inside = harness.workspace / "index.js"
+        inside.write_text("// inside target\n", encoding="utf-8")
+        code = harness.main(
+            "--executable-prefix-arg", str(inside), "--execute", "--confirm-real-invocation"
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(harness.runner.started, 0)
+        self.assertFalse(harness.session_exists())
+
+    @unittest.skipUnless(os.name == "nt", "shell-wrapper extension guard is Windows-specific")
+    def test_ps1_cmd_bat_executables_reject_on_windows(self) -> None:
+        for suffix in (".ps1", ".cmd", ".bat"):
+            with self.subTest(suffix=suffix):
+                harness = CanaryHarness(self)
+                wrapper = harness.root / f"cursor-agent{suffix}"
+                wrapper.write_text("", encoding="utf-8")
+                code = harness.main(
+                    "--execute",
+                    "--confirm-real-invocation",
+                    **{"--executable": str(wrapper)},
+                )
+                self.assertEqual(code, 2)
+                self.assertEqual(harness.runner.started, 0)
+                self.assertFalse(harness.session_exists())
+
+    def test_prefix_canary_performs_exactly_one_call_and_no_writes(self) -> None:
+        harness = CanaryHarness(self)
+        index_js = self._index_js(harness)
+        before = harness.target_snapshot()
+        code = harness.main(
+            "--executable-prefix-arg", str(index_js), "--execute", "--confirm-real-invocation"
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(harness.runner.started, 1)
+        self.assertEqual(len(harness.runner.instructions), 1)
+        # The real spawned argv carried the resolved prefix between exe and args.
+        argv = list(harness.runner.invocations[0].argv)
+        self.assertEqual(argv[0], str(harness.executable))
+        self.assertEqual(argv[1], str(index_js.resolve()))
+        self.assertEqual(argv[2], "--print")
+        # Zero target writes.
+        self.assertEqual(harness.target_snapshot(), before)
         self.assertEqual(harness.target_snapshot(), [])
 
 

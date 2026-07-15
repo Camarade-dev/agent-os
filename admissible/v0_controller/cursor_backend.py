@@ -210,6 +210,7 @@ class CursorBackendConfig:
 
     executable: str
     agent_workspace: Path
+    executable_prefix_args: tuple[str, ...] = ()
     model: str = "auto"
     mode: str = "ask"
     trust: bool = True
@@ -229,6 +230,12 @@ class CursorBackendConfig:
     def __post_init__(self) -> None:
         if not self.executable:
             raise ValueError("an explicit Cursor executable is required")
+        object.__setattr__(self, "executable_prefix_args", tuple(self.executable_prefix_args))
+        for arg in self.executable_prefix_args:
+            if not isinstance(arg, str) or arg == "":
+                raise ValueError("every executable prefix argument must be a non-empty string")
+            if "\x00" in arg:
+                raise ValueError("executable prefix arguments may not contain null bytes")
         if self.max_operations < 1 or self.max_operations > MAX_PROPOSAL_OPERATIONS:
             raise ValueError(f"max_operations must be between 1 and {MAX_PROPOSAL_OPERATIONS}")
         if min(
@@ -243,7 +250,7 @@ class CursorBackendConfig:
     def argv(self, *, agent_workspace: Path, prompt: str) -> tuple[str, ...]:
         """The fixed argument vector.  Nothing here comes from agent output."""
 
-        argv = [self.executable, "--print", "--output-format", "stream-json"]
+        argv = [self.executable, *self.executable_prefix_args, "--print", "--output-format", "stream-json"]
         if self.stream_partial_output:
             argv.append("--stream-partial-output")
         argv.extend(["--mode", self.mode, "--model", self.model, "--workspace", str(agent_workspace)])
@@ -253,9 +260,20 @@ class CursorBackendConfig:
         return tuple(argv)
 
     def fixed_arguments(self) -> tuple[str, ...]:
-        """The argv shape with the prompt and workspace elided, for the canary."""
+        """The complete argv template with the prompt and workspace elided.
+
+        This is the full effective argv shape (executable, operator prefix
+        arguments, fixed Cursor arguments, prompt placeholder) as it would be
+        spawned -- suitable for a canary dry-run summary.
+        """
 
         return self.argv(agent_workspace=Path("{agent_workspace}"), prompt="{prompt}")
+
+    def fixed_cursor_arguments(self) -> tuple[str, ...]:
+        """Only the fixed Cursor arguments, without the executable or the operator prefix."""
+
+        prefix_len = len(self.executable_prefix_args)
+        return self.fixed_arguments()[1 + prefix_len :]
 
     def build_environment(self, *, base: Mapping[str, str] | None = None) -> dict[str, str]:
         """Bounded inherited environment: an explicit allowlist plus explicit extras."""
@@ -274,6 +292,7 @@ class CursorBackendConfig:
             "protocol_version": BACKEND_PROTOCOL_VERSION,
             "transport": TRANSPORT_IDENTITY,
             "executable": self.executable,
+            "executable_prefix_args": list(self.executable_prefix_args),
             "model": self.model,
             "mode": self.mode,
             "trust": self.trust,
@@ -359,6 +378,22 @@ class CursorCallableProposalBackend:
     _last_agent_workspace: Path | None = None
     _agent_workspace: V0AgentWorkspace | None = None
     _closed_reason: str = ""
+
+    def __post_init__(self) -> None:
+        # The operator prefix is trusted launcher configuration; it must never
+        # smuggle the real application workspace path in as a Cursor argument.
+        candidates = {str(self.target_workspace)}
+        try:
+            candidates.add(str(Path(self.target_workspace).resolve()))
+        except OSError:
+            pass
+        for arg in self.config.executable_prefix_args:
+            for target in candidates:
+                if target and target in arg:
+                    raise ValueError(
+                        "an executable prefix argument may not contain the target application workspace path; "
+                        "the prefix is launcher configuration only."
+                    )
 
     # -- protocol surface ----------------------------------------------------
 

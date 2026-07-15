@@ -1152,6 +1152,169 @@ class TestExactOnceResults(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Native launcher executable prefix (node.exe + index.js)
+# ---------------------------------------------------------------------------
+
+
+class TestExecutablePrefixArgs(unittest.TestCase):
+    """The operator prefix inserted between the executable and fixed arguments."""
+
+    def _argv(self, config: CursorBackendConfig) -> list[str]:
+        return list(config.argv(agent_workspace=Path("/agent/ws"), prompt="PROMPT"))
+
+    def test_empty_prefix_preserves_the_previous_argv_exactly(self) -> None:
+        config = CursorBackendConfig(executable="cursor-agent", agent_workspace=Path("/agent/ws"))
+        argv = self._argv(config)
+        self.assertEqual(
+            argv,
+            [
+                "cursor-agent",
+                "--print",
+                "--output-format",
+                "stream-json",
+                "--stream-partial-output",
+                "--mode",
+                "ask",
+                "--model",
+                "auto",
+                "--workspace",
+                str(Path("/agent/ws")),
+                "--trust",
+                "PROMPT",
+            ],
+        )
+        self.assertEqual(config.executable_prefix_args, ())
+
+    def test_one_prefix_argument_produces_node_index_print(self) -> None:
+        config = CursorBackendConfig(
+            executable="node.exe",
+            agent_workspace=Path("/agent/ws"),
+            executable_prefix_args=("index.js",),
+        )
+        argv = self._argv(config)
+        self.assertEqual(argv[:3], ["node.exe", "index.js", "--print"])
+
+    def test_multiple_prefix_arguments_preserve_exact_order(self) -> None:
+        config = CursorBackendConfig(
+            executable="node.exe",
+            agent_workspace=Path("/agent/ws"),
+            executable_prefix_args=("--enable-x", "index.js", "--flag"),
+        )
+        argv = self._argv(config)
+        self.assertEqual(argv[:5], ["node.exe", "--enable-x", "index.js", "--flag", "--print"])
+
+    def test_prefix_argument_with_spaces_stays_one_argv_element(self) -> None:
+        spaced = r"C:\Program Files\cursor\index.js"
+        config = CursorBackendConfig(
+            executable="node.exe",
+            agent_workspace=Path("/agent/ws"),
+            executable_prefix_args=(spaced,),
+        )
+        argv = self._argv(config)
+        self.assertEqual(argv[1], spaced)  # never split on the space
+        self.assertEqual(argv.count(spaced), 1)
+
+    def test_prefix_is_never_shell_interpolated(self) -> None:
+        # A value that a shell would expand must survive verbatim as one element.
+        hostile = "index.js && rm -rf / ; $(whoami)"
+        config = CursorBackendConfig(
+            executable="node.exe",
+            agent_workspace=Path("/agent/ws"),
+            executable_prefix_args=(hostile,),
+        )
+        argv = self._argv(config)
+        self.assertEqual(argv[1], hostile)
+
+    def test_empty_or_null_prefix_entries_reject(self) -> None:
+        with self.assertRaises(ValueError):
+            CursorBackendConfig(
+                executable="node.exe", agent_workspace=Path("/agent/ws"), executable_prefix_args=("",)
+            )
+        with self.assertRaises(ValueError):
+            CursorBackendConfig(
+                executable="node.exe",
+                agent_workspace=Path("/agent/ws"),
+                executable_prefix_args=("index\x00.js",),
+            )
+
+    def test_a_prefix_containing_the_target_workspace_rejects(self) -> None:
+        harness = CursorBackendHarness(self)
+        config = replace(
+            harness.config,
+            executable="node.exe",
+            executable_prefix_args=(str(harness.workspace / "index.js"),),
+        )
+        with self.assertRaises(ValueError):
+            CursorCallableProposalBackend(
+                config=config,
+                target_workspace=harness.workspace,
+                store=harness.store,
+                runner=harness.runner,
+            )
+
+    def test_prefix_cannot_originate_from_model_output(self) -> None:
+        # The prefix is a frozen config field; a proposal envelope cannot set it.
+        # Even after a full successful invocation, the argv prefix is exactly the
+        # configured one, never anything derived from the returned proposal.
+        harness = CursorBackendHarness(self, executable_prefix_args=("index.js",))
+        harness.invoke_once()
+        argv = list(harness.runner.invocations[0].argv)
+        self.assertEqual(argv[:2], ["cursor-agent", "index.js"])
+        # No proposed path (model output) leaked into the launcher prefix.
+        for element in argv[:2]:
+            self.assertNotIn("cli008", element)
+
+    def test_prefix_change_changes_the_fingerprint(self) -> None:
+        base = CursorBackendConfig(executable="node.exe", agent_workspace=Path("/agent/ws"))
+        with_index = replace(base, executable_prefix_args=("index.js",))
+        other_path = replace(base, executable_prefix_args=("other.js",))
+        reordered = replace(base, executable_prefix_args=("a.js", "b.js"))
+        reordered_2 = replace(base, executable_prefix_args=("b.js", "a.js"))
+        extra = replace(base, executable_prefix_args=("index.js", "extra"))
+        fps = {
+            base.fingerprint(),
+            with_index.fingerprint(),
+            other_path.fingerprint(),
+            reordered.fingerprint(),
+            reordered_2.fingerprint(),
+            extra.fingerprint(),
+        }
+        # All six configurations must have distinct fingerprints.
+        self.assertEqual(len(fps), 6)
+
+    def test_persisted_dispatch_for_prefix_a_rejects_configured_prefix_b(self) -> None:
+        harness = CursorBackendHarness(self, executable_prefix_args=("a.js",))
+        command = harness.dispatch_command()
+        other = CursorCallableProposalBackend(
+            config=replace(harness.config, executable_prefix_args=("b.js",)),
+            target_workspace=harness.workspace,
+            store=harness.store,
+            runner=harness.runner,
+        )
+        request = PersistedCursorDispatchRequest(
+            session_id=harness.integration_config.session_id,
+            command_id=command.command_id or "",
+            invocation_id=command.owner_id,
+            batch_id=expected_batch_id(harness.state(), command.owner_id),
+            expected_revision=harness.state().revision,
+            backend_fingerprint=other.config_fingerprint,
+        )
+        with self.assertRaises(V0ProposalBackendFailure) as failure:
+            other.invoke_persisted(request=request)
+        self.assertEqual(failure.exception.kind, V0BackendFailureKind.BACKEND_FINGERPRINT_MISMATCH)
+        self.assertEqual(harness.runner.started, 0)
+
+    def test_a_forged_result_fingerprint_under_a_prefix_rejects(self) -> None:
+        harness = CursorBackendHarness(self, executable_prefix_args=("index.js",))
+        result = harness.invoke_once()
+        forged = replace(result, config_fingerprint="0" * 64)
+        with self.assertRaises(V0ProposalBackendFailure) as failure:
+            harness.backend.mark_result_consumed(forged)
+        self.assertEqual(failure.exception.kind, V0BackendFailureKind.BACKEND_FINGERPRINT_MISMATCH)
+        self.assertEqual(harness.backend.results_consumed, 0)
+
+
+# ---------------------------------------------------------------------------
 # Fail-closed orchestration
 # ---------------------------------------------------------------------------
 
