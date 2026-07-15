@@ -47,3 +47,7 @@ benchmark/reports/admissible_cursor_admitted_execution_truth_console_trace.json
 # Admissible V0 runtime advisory locks are machine-local control state,
 # never committed evidence. Defense-in-depth: never let one into the archive.
 *.runtime.lock
+
+# Admissible V0 disposition advisory locks are machine-local control state,
+# never committed evidence. Defense-in-depth: never let one into the review dir.
+*.disposition.lock
