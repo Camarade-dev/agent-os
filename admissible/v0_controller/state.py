@@ -137,6 +137,13 @@ class MissionContract:
     max_batches: int = 8
     max_commands: int = 32
     workspace_policy: WorkspacePolicy = field(default_factory=WorkspacePolicy)
+    # The immutable, operator-approved mission specification.  It is the sole
+    # mission-content authority for the governed instruction; it is never derived
+    # from CLI text, UI projection, diagnostics, or mutable process state after
+    # session creation.  Empty by default so pre-mission contracts round-trip.
+    mission_specification: str = ""
+
+    MAX_MISSION_SPECIFICATION_BYTES = 8192
 
     def __post_init__(self) -> None:
         if not self.contract_id or not self.target_workspace:
@@ -147,6 +154,10 @@ class MissionContract:
             raise ValueError("mandatory path escapes or violates workspace policy")
         if min(self.max_invocations, self.max_batches, self.max_commands) <= 0:
             raise ValueError("contract limits must be positive")
+        if "\x00" in self.mission_specification:
+            raise ValueError("mission specification may not contain NUL characters")
+        if len(self.mission_specification.encode("utf-8")) > self.MAX_MISSION_SPECIFICATION_BYTES:
+            raise ValueError("mission specification exceeds the bounded size")
 
     def permits_path(self, path: str) -> bool:
         return self.workspace_policy.permits(path)
@@ -161,11 +172,12 @@ class MissionContract:
             "max_batches": self.max_batches,
             "max_commands": self.max_commands,
             "workspace_policy": self.workspace_policy.to_dict(),
+            "mission_specification": self.mission_specification,
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "MissionContract":
-        expected = {
+        required = {
             "contract_id",
             "target_workspace",
             "mandatory_paths",
@@ -175,7 +187,11 @@ class MissionContract:
             "max_commands",
             "workspace_policy",
         }
-        if set(data) != expected or not isinstance(data["mandatory_paths"], list):
+        # ``mission_specification`` is accepted but optional, so a contract
+        # persisted before the field existed still round-trips deterministically.
+        allowed = required | {"mission_specification"}
+        keys = set(data)
+        if not required.issubset(keys) or not keys.issubset(allowed) or not isinstance(data["mandatory_paths"], list):
             raise ValueError("invalid mission contract")
         return cls(
             contract_id=data["contract_id"],
@@ -186,6 +202,7 @@ class MissionContract:
             max_batches=data["max_batches"],
             max_commands=data["max_commands"],
             workspace_policy=WorkspacePolicy.from_dict(data["workspace_policy"]),
+            mission_specification=data.get("mission_specification", ""),
         )
 
 

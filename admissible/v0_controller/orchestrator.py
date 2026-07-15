@@ -354,7 +354,12 @@ class V0OfflineOrchestrator:
         return [self.run_no_event_tick() for _ in range(ticks)]
 
 
-def cli008_contract(*, target_workspace: Path, contract_id: str = "cli008-offline-two-batch") -> MissionContract:
+def cli008_contract(
+    *,
+    target_workspace: Path,
+    contract_id: str = "cli008-offline-two-batch",
+    mission_specification: str = "",
+) -> MissionContract:
     return MissionContract(
         contract_id=contract_id,
         target_workspace=str(target_workspace),
@@ -363,4 +368,5 @@ def cli008_contract(*, target_workspace: Path, contract_id: str = "cli008-offlin
         max_invocations=8,
         max_batches=8,
         max_commands=32,
+        mission_specification=mission_specification,
     )

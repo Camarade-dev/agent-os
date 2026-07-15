@@ -74,6 +74,7 @@ def build_governed_instruction(
         "session_id": state.session_id,
         "mission": {
             "contract_id": state.contract.contract_id,
+            "specification": state.contract.mission_specification,
             "mandatory_paths": list(state.mandatory_paths),
             "structural_completion_only": state.contract.structural_completion_only,
         },
@@ -123,9 +124,17 @@ def render_governed_prompt(instruction: Mapping[str, Any]) -> str:
         f"Mission contract: {instruction['mission']['contract_id']}",
         f"Invocation: {instruction['invocation_id']}",
         f"Batch: {instruction['batch_id']}",
-        "",
-        "REMAINING MANDATORY PATHS (propose only these):",
     ]
+    specification = str(instruction["mission"].get("specification") or "").strip()
+    if specification:
+        lines.extend(["", "MISSION SPECIFICATION (the exact approved mission for this run):"])
+        lines.extend(f"  {line}" if line.strip() else "" for line in specification.split("\n"))
+    lines.extend(
+        [
+            "",
+            "REMAINING MANDATORY PATHS (propose only these):",
+        ]
+    )
     lines.extend(f"  - {path}" for path in remaining)
     if materialized:
         lines.append("")
