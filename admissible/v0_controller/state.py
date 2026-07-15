@@ -372,12 +372,85 @@ class ProposedOperation:
 
 
 @dataclass(frozen=True)
+class DispatchAuthorityRecord:
+    """Independent engine-issued authority for one real proposal dispatch.
+
+    The command payload carries a capability for the callable backend.  This
+    record lives on the active invocation instead, so a partial raw-store
+    mutation of either location is detectable before a process may start.
+    It is intentionally structural rather than a claim of cryptographic
+    protection against a coherent rewrite of the complete session file.
+    """
+
+    schema_version: str
+    nonce: str
+    session_id: str
+    issued_revision: int
+    command_id: str
+    batch_id: str
+    invocation_id: str
+    wait_token_id: str
+    wait_owner_id: str
+    backend_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if (
+            self.schema_version != "admissible_v0_dispatch_authority_v1"
+            or not self.nonce
+            or not self.session_id
+            or not isinstance(self.issued_revision, int)
+            or isinstance(self.issued_revision, bool)
+            or self.issued_revision < 0
+            or not self.command_id
+            or not self.batch_id
+            or not self.invocation_id
+            or not self.wait_token_id
+            or not self.wait_owner_id
+            or not self.backend_fingerprint
+        ):
+            raise ValueError("invalid dispatch authority record")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "nonce": self.nonce,
+            "session_id": self.session_id,
+            "issued_revision": self.issued_revision,
+            "command_id": self.command_id,
+            "batch_id": self.batch_id,
+            "invocation_id": self.invocation_id,
+            "wait_token_id": self.wait_token_id,
+            "wait_owner_id": self.wait_owner_id,
+            "backend_fingerprint": self.backend_fingerprint,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "DispatchAuthorityRecord":
+        expected = {
+            "schema_version",
+            "nonce",
+            "session_id",
+            "issued_revision",
+            "command_id",
+            "batch_id",
+            "invocation_id",
+            "wait_token_id",
+            "wait_owner_id",
+            "backend_fingerprint",
+        }
+        if set(data) != expected:
+            raise ValueError("invalid dispatch authority fields")
+        return cls(**dict(data))
+
+
+@dataclass(frozen=True)
 class InvocationRecord:
     invocation_id: str
     lifecycle: InvocationLifecycle
     request_at: str
     response_reference: str | None = None
     diagnostics: tuple[str, ...] = ()
+    dispatch_authority: DispatchAuthorityRecord | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -386,19 +459,36 @@ class InvocationRecord:
             "request_at": self.request_at,
             "response_reference": self.response_reference,
             "diagnostics": list(self.diagnostics),
+            "dispatch_authority": (
+                None if self.dispatch_authority is None else self.dispatch_authority.to_dict()
+            ),
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "InvocationRecord":
-        expected = {"invocation_id", "lifecycle", "request_at", "response_reference", "diagnostics"}
-        if set(data) != expected or not isinstance(data["diagnostics"], list):
+        expected = {
+            "invocation_id",
+            "lifecycle",
+            "request_at",
+            "response_reference",
+            "diagnostics",
+            "dispatch_authority",
+        }
+        legacy_expected = expected - {"dispatch_authority"}
+        if set(data) not in (expected, legacy_expected) or not isinstance(data["diagnostics"], list):
             raise ValueError("invalid invocation record")
+        raw_authority = data.get("dispatch_authority")
+        if raw_authority is not None and not isinstance(raw_authority, dict):
+            raise ValueError("invalid invocation dispatch authority")
         return cls(
             invocation_id=data["invocation_id"],
             lifecycle=InvocationLifecycle(data["lifecycle"]),
             request_at=data["request_at"],
             response_reference=data["response_reference"],
             diagnostics=tuple(data["diagnostics"]),
+            dispatch_authority=(
+                None if raw_authority is None else DispatchAuthorityRecord.from_dict(raw_authority)
+            ),
         )
 
 
@@ -465,6 +555,8 @@ class WaitToken:
     command_id: str | None
     expected_event: str
     deadline: str | None = None
+    token_id: str | None = None
+    correlation_nonce: str | None = None
 
     def __post_init__(self) -> None:
         if not self.owner_id or not self.expected_event:
@@ -474,6 +566,10 @@ class WaitToken:
                 raise ValueError("human wait tokens cannot claim a command")
         elif not self.command_id:
             raise ValueError("external-result wait tokens require a command id")
+        if self.token_id is not None and not self.token_id:
+            raise ValueError("wait token id cannot be empty")
+        if self.correlation_nonce is not None and not self.correlation_nonce:
+            raise ValueError("wait correlation nonce cannot be empty")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -482,12 +578,23 @@ class WaitToken:
             "command_id": self.command_id,
             "expected_event": self.expected_event,
             "deadline": self.deadline,
+            "token_id": self.token_id,
+            "correlation_nonce": self.correlation_nonce,
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "WaitToken":
-        expected = {"kind", "owner_id", "command_id", "expected_event", "deadline"}
-        if set(data) != expected:
+        expected = {
+            "kind",
+            "owner_id",
+            "command_id",
+            "expected_event",
+            "deadline",
+            "token_id",
+            "correlation_nonce",
+        }
+        legacy_expected = expected - {"token_id", "correlation_nonce"}
+        if set(data) not in (expected, legacy_expected):
             raise ValueError("invalid wait token")
         return cls(
             kind=WaitKind(data["kind"]),
@@ -495,6 +602,8 @@ class WaitToken:
             command_id=data["command_id"],
             expected_event=data["expected_event"],
             deadline=data["deadline"],
+            token_id=data.get("token_id"),
+            correlation_nonce=data.get("correlation_nonce"),
         )
 
 

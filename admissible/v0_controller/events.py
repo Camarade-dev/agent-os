@@ -85,6 +85,63 @@ class BoundedExecutionCompleted:
 
 
 @dataclass(frozen=True)
+class DispatchCapability:
+    """Engine-issued, persisted, single-use in-process agent-dispatch capability.
+
+    It is the persisted proof that *this* engine created *this* dispatch command
+    for *this* invocation, turn batch, revision lineage, and configured backend.
+    A store-backed dispatch authority re-derives it immediately before a real
+    process starts, so a synthetic in-memory ``Command`` can never start Cursor.
+    """
+
+    nonce: str
+    session_id: str
+    issued_revision: int
+    command_id: str
+    batch_id: str
+    invocation_id: str
+    backend_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if (
+            not self.nonce
+            or not self.session_id
+            or self.issued_revision < 0
+            or not self.command_id
+            or not self.batch_id
+            or not self.invocation_id
+            or not self.backend_fingerprint
+        ):
+            raise ValueError("dispatch capability is incomplete")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "nonce": self.nonce,
+            "session_id": self.session_id,
+            "issued_revision": self.issued_revision,
+            "command_id": self.command_id,
+            "batch_id": self.batch_id,
+            "invocation_id": self.invocation_id,
+            "backend_fingerprint": self.backend_fingerprint,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> "DispatchCapability":
+        expected = {
+            "nonce",
+            "session_id",
+            "issued_revision",
+            "command_id",
+            "batch_id",
+            "invocation_id",
+            "backend_fingerprint",
+        }
+        if set(data) != expected:
+            raise ValueError("dispatch capability fields are invalid")
+        return cls(**data)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True)
 class ExecutionCapability:
     """Engine-issued, persisted, single-use in-process execution capability."""
 

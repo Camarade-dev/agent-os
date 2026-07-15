@@ -15,11 +15,14 @@ import unittest
 from pathlib import Path
 
 from admissible.managed_process import (
+    OBSERVATION_PROVEN_EMPTY,
+    OBSERVATION_UNKNOWN,
     PLATFORM_STRATEGY_POSIX_SESSION,
     PLATFORM_STRATEGY_WINDOWS_JOB,
     TERMINATION_CLEANUP_FAILED,
     ContainmentStrategy,
     ManagedProcess,
+    TreeObservation,
     TreeTerminationOutcome,
     pid_alive,
     run_managed_oneshot,
@@ -261,6 +264,209 @@ class TestManagedOneshot(unittest.TestCase):
         self.assertTrue(result.timed_out)
         self.assertTrue(result.cleanup_proven)
         self.assertFalse(any(world.is_alive(p) for p in (7000, 7001, 7002)))
+
+
+class ExitedRootProc(FakeProc):
+    """A root that exited *on its own* while its owned descendants live on.
+
+    This is the real ``.CMD -> powershell -> node`` shape: the wrapper returns,
+    the node process keeps the model connection open. ``wait()`` returns the
+    root's real exit code immediately -- no timeout, no cancellation.
+    """
+
+    def __init__(self, world: FakeWorld, *, exit_code: int = 0) -> None:
+        super().__init__(world, exits_on_graceful=False)
+        self.exit_code = exit_code
+        self.world.alive[self.world.root] = False  # the root is already gone
+
+    def poll(self):
+        return self.exit_code
+
+    def wait(self, timeout=None):
+        return self.exit_code
+
+
+class CountingContainment(FakeContainment):
+    """Counts termination attempts so a test can assert *exactly* how many."""
+
+    def __init__(self, world: FakeWorld, name: str, *, provable: bool = True) -> None:
+        super().__init__(world, name)
+        self.terminate_calls = 0
+        self.provable = provable
+
+    def ownership_provable(self, proc) -> bool:
+        return self.provable
+
+    def terminate_tree(self, proc, *, grace_seconds, force_seconds):
+        self.terminate_calls += 1
+        return super().terminate_tree(proc, grace_seconds=grace_seconds, force_seconds=force_seconds)
+
+
+class FailingTerminationContainment(CountingContainment):
+    """Termination itself fails: nothing dies, and cleanup must not be claimed."""
+
+    def terminate_tree(self, proc, *, grace_seconds, force_seconds):
+        self.terminate_calls += 1
+        return TreeTerminationOutcome(
+            observed_descendant_ids=list(self.world.descendants),
+            remaining_process_ids=[self.world.root, *self.world.descendants],
+            strategy=self.name,
+        )
+
+
+class IncompleteJobContainment(CountingContainment):
+    """An owned Job Object whose PID enumeration cannot prove membership."""
+
+    def __init__(self, world: FakeWorld, *, final_empty_proven: bool) -> None:
+        super().__init__(world, PLATFORM_STRATEGY_WINDOWS_JOB)
+        self.final_empty_proven = final_empty_proven
+
+    def observe_owned_tree(self, proc) -> TreeObservation:
+        if not any(self.world.is_alive(pid) for pid in [self.world.root, *self.world.descendants]):
+            return TreeObservation(
+                OBSERVATION_PROVEN_EMPTY if self.final_empty_proven else OBSERVATION_UNKNOWN
+            )
+        # The job itself remains our authority, but the root has exited and a
+        # recursive PID observer cannot enumerate its hidden child.
+        return TreeObservation(OBSERVATION_UNKNOWN)
+
+
+class TestLiveDescendantsAfterRootExit(unittest.TestCase):
+    """BLOCKER 2 — a root that exited naturally must not shield live descendants."""
+
+    def _oneshot(self, proc, containment):
+        return run_managed_oneshot(
+            ["cursor-agent.CMD"],
+            cwd=".",
+            env={},
+            timeout_seconds=5.0,
+            spawn=_spawn_of(proc),
+            containment=containment,
+        )
+
+    def test_root_exits_zero_with_a_live_owned_child_terminates_the_child(self) -> None:
+        world = FakeWorld(8000, [8001])
+        proc = ExitedRootProc(world, exit_code=0)
+        containment = CountingContainment(world, PLATFORM_STRATEGY_WINDOWS_JOB)
+        result = self._oneshot(proc, containment)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(containment.terminate_calls, 1)
+        self.assertTrue(result.process_result.graceful_termination_attempted)
+        self.assertTrue(result.process_result.force_termination_attempted)
+        self.assertTrue(result.cleanup_proven)
+        self.assertEqual(result.process_result.remaining_process_ids, [])
+        self.assertFalse(world.is_alive(8001))
+
+    def test_root_exits_nonzero_with_a_live_owned_child_terminates_the_child(self) -> None:
+        # The exact cold-audit reproduction: rc=3, one live descendant, and the
+        # old finish() path reported cleanup_proven=False with 0 terminate calls.
+        world = FakeWorld(8100, [8101])
+        proc = ExitedRootProc(world, exit_code=3)
+        containment = CountingContainment(world, PLATFORM_STRATEGY_WINDOWS_JOB)
+        result = self._oneshot(proc, containment)
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(containment.terminate_calls, 1)
+        self.assertTrue(result.cleanup_proven)
+        self.assertEqual(result.process_result.remaining_process_ids, [])
+        self.assertFalse(world.is_alive(8101))
+
+    def test_a_clean_exit_with_no_live_descendant_terminates_nothing(self) -> None:
+        world = FakeWorld(8200, [8201])
+        world.kill_all()  # everything really is gone
+        proc = ExitedRootProc(world, exit_code=0)
+        containment = CountingContainment(world, PLATFORM_STRATEGY_POSIX_SESSION)
+        result = self._oneshot(proc, containment)
+        self.assertEqual(containment.terminate_calls, 0)
+        self.assertFalse(result.process_result.graceful_termination_attempted)
+        self.assertFalse(result.process_result.force_termination_attempted)
+        self.assertTrue(result.cleanup_proven)
+
+    def test_terminal_output_with_a_surviving_descendant_is_never_clean(self) -> None:
+        # A parser/result-limit failure downstream must still see cleanup_proven
+        # False when an owned descendant survived every termination attempt.
+        world = FakeWorld(8300, [8301], leak={8301})
+        proc = ExitedRootProc(world, exit_code=0)
+        containment = CountingContainment(world, PLATFORM_STRATEGY_WINDOWS_JOB)
+        result = self._oneshot(proc, containment)
+        self.assertEqual(containment.terminate_calls, 1)
+        self.assertFalse(result.cleanup_proven)
+        self.assertIn(8301, result.process_result.remaining_process_ids)
+        self.assertEqual(result.process_result.termination_reason, TERMINATION_CLEANUP_FAILED)
+
+    def test_termination_failure_is_reported_not_swallowed(self) -> None:
+        world = FakeWorld(8400, [8401])
+        proc = ExitedRootProc(world, exit_code=0)
+        containment = FailingTerminationContainment(world, PLATFORM_STRATEGY_WINDOWS_JOB)
+        result = self._oneshot(proc, containment)
+        self.assertEqual(containment.terminate_calls, 1)
+        self.assertFalse(result.cleanup_proven)
+        self.assertIn(8401, result.process_result.remaining_process_ids)
+        self.assertTrue(world.is_alive(8401))
+
+    def test_unprovable_ownership_kills_nothing_and_fails_cleanup(self) -> None:
+        world = FakeWorld(8500, [8501])
+        proc = ExitedRootProc(world, exit_code=0)
+        containment = CountingContainment(world, PLATFORM_STRATEGY_WINDOWS_JOB, provable=False)
+        result = self._oneshot(proc, containment)
+        # No arbitrary kill: ownership could not be proven.
+        self.assertEqual(containment.terminate_calls, 0)
+        self.assertFalse(result.process_result.force_termination_attempted)
+        self.assertFalse(result.cleanup_proven)
+        self.assertIn(8501, result.process_result.remaining_process_ids)
+        self.assertTrue(world.is_alive(8501))
+
+    def test_hidden_job_member_is_cleaned_even_when_pid_enumeration_is_empty(self) -> None:
+        world = FakeWorld(8550, [8551])
+        proc = ExitedRootProc(world, exit_code=0)
+        containment = IncompleteJobContainment(world, final_empty_proven=True)
+        result = self._oneshot(proc, containment)
+        self.assertTrue(world.is_alive(8551) is False)
+        self.assertEqual(containment.terminate_calls, 1)
+        self.assertTrue(result.cleanup_proven)
+        self.assertEqual(result.process_result.cleanup_observation, OBSERVATION_PROVEN_EMPTY)
+
+    def test_unknown_final_job_emptiness_is_not_reported_clean(self) -> None:
+        world = FakeWorld(8560, [8561])
+        proc = ExitedRootProc(world, exit_code=0)
+        containment = IncompleteJobContainment(world, final_empty_proven=False)
+        result = self._oneshot(proc, containment)
+        self.assertEqual(containment.terminate_calls, 1)
+        self.assertFalse(result.process_result.cleanup_complete)
+        self.assertFalse(result.cleanup_proven)
+        self.assertEqual(result.process_result.cleanup_observation, OBSERVATION_UNKNOWN)
+
+    def test_timeout_with_hidden_job_member_attempts_containment_cleanup(self) -> None:
+        world = FakeWorld(8570, [8571])
+        proc = FakeProc(world, exits_on_graceful=False)
+        containment = IncompleteJobContainment(world, final_empty_proven=True)
+        result = run_managed_oneshot(
+            ["cursor-agent.CMD"],
+            cwd=".",
+            env={},
+            timeout_seconds=0.1,
+            spawn=_spawn_of(proc),
+            containment=containment,
+        )
+        self.assertTrue(result.timed_out)
+        self.assertEqual(containment.terminate_calls, 1)
+        self.assertTrue(result.cleanup_proven)
+
+    def test_timeout_with_live_descendants_still_terminates_the_tree(self) -> None:
+        world = FakeWorld(8600, [8601, 8602])
+        proc = FakeProc(world, exits_on_graceful=False)  # never exits -> timeout
+        containment = CountingContainment(world, PLATFORM_STRATEGY_WINDOWS_JOB)
+        result = run_managed_oneshot(
+            ["cursor-agent.CMD"],
+            cwd=".",
+            env={},
+            timeout_seconds=0.1,
+            spawn=_spawn_of(proc),
+            containment=containment,
+        )
+        self.assertTrue(result.timed_out)
+        self.assertEqual(containment.terminate_calls, 1)
+        self.assertTrue(result.cleanup_proven)
+        self.assertFalse(any(world.is_alive(p) for p in (8600, 8601, 8602)))
 
 
 class TestOneshotAdapterUsesManagedCleanup(unittest.TestCase):

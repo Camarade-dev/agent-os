@@ -23,6 +23,7 @@ from admissible.v0_controller.events import (
     _BoundedExecutionInterrupted,
     BoundedExecutionCompleted,
     CommandDispatchStarted,
+    DispatchCapability,
     Event,
     ExecutionCapability,
     InvocationRequested,
@@ -34,7 +35,14 @@ from admissible.v0_controller.events import (
 )
 from admissible.v0_controller.invariants import InvariantViolation, validate_state
 from admissible.v0_controller.reducer import IllegalTransition, ReducerResult, reduce
-from admissible.v0_controller.state import BatchRecord, OutcomeReason, Phase, ReasonCode, SessionState
+from admissible.v0_controller.state import (
+    BatchRecord,
+    DispatchAuthorityRecord,
+    OutcomeReason,
+    Phase,
+    ReasonCode,
+    SessionState,
+)
 from admissible.v0_controller.store import (
     AtomicSessionStore,
     CommittedButDurabilityUncertain,
@@ -88,10 +96,15 @@ class V0ControllerEngine:
         *,
         bounded_executor_adapter: V0BoundedExecutorAdapter | None = None,
         filesystem_identity_policy: FilesystemIdentityPolicy | None = None,
+        dispatch_backend_fingerprint: str | None = None,
     ) -> None:
         self.store = store
         self._bounded_executor_adapter = bounded_executor_adapter
         self._filesystem_identity_policy = filesystem_identity_policy
+        # Set only when a real callable proposal backend is configured.  It binds
+        # each persisted dispatch command to one exact backend configuration, so
+        # a differently configured backend cannot consume that dispatch.
+        self._dispatch_backend_fingerprint = dispatch_backend_fingerprint
 
     @staticmethod
     def _invocation_id(state: SessionState) -> str:
@@ -100,6 +113,53 @@ class V0ControllerEngine:
     @staticmethod
     def _command_id(state: SessionState, command: Command, ordinal: int) -> str:
         return f"v0cmd:{state.session_id}:{state.revision + 1}:{ordinal}:{command.kind.value}:{command.owner_id}"
+
+    @staticmethod
+    def dispatch_batch_id(state: SessionState, invocation_id: str) -> str:
+        """The exact turn-batch identity this dispatch command may propose into."""
+
+        return f"{invocation_id}:batch:{state.counters.batches + 1}"
+
+    @staticmethod
+    def dispatch_wait_token_id(command_id: str) -> str:
+        """Deterministic identity for the wait token bound to one dispatch."""
+
+        return f"v0wait:{command_id}"
+
+    def _dispatch_capability(self, previous: SessionState, next_state: SessionState, command: Command) -> DispatchCapability:
+        if command.command_id is None:
+            raise InvariantViolation("dispatch capability requires a materialized command id")
+        if not self._dispatch_backend_fingerprint:
+            raise InvariantViolation("dispatch capability requires a configured backend fingerprint")
+        return DispatchCapability(
+            nonce=secrets.token_urlsafe(32),
+            session_id=previous.session_id,
+            issued_revision=previous.revision + 1,
+            command_id=command.command_id,
+            batch_id=self.dispatch_batch_id(next_state, command.owner_id),
+            invocation_id=command.owner_id,
+            backend_fingerprint=self._dispatch_backend_fingerprint,
+        )
+
+    @classmethod
+    def _dispatch_authority_record(
+        cls,
+        capability: DispatchCapability,
+    ) -> DispatchAuthorityRecord:
+        """Persist a second, semantically separate engine-issued nonce binding."""
+
+        return DispatchAuthorityRecord(
+            schema_version="admissible_v0_dispatch_authority_v1",
+            nonce=capability.nonce,
+            session_id=capability.session_id,
+            issued_revision=capability.issued_revision,
+            command_id=capability.command_id,
+            batch_id=capability.batch_id,
+            invocation_id=capability.invocation_id,
+            wait_token_id=cls.dispatch_wait_token_id(capability.command_id),
+            wait_owner_id=capability.invocation_id,
+            backend_fingerprint=capability.backend_fingerprint,
+        )
 
     @staticmethod
     def _execution_capability(
@@ -128,6 +188,25 @@ class V0ControllerEngine:
         if next_state.pending_command != command or command.command_id is not None:
             raise InvariantViolation("reducer command intent must be the sole unassigned pending command")
         assigned = command.with_id(self._command_id(previous, command, 1))
+        if assigned.kind == CommandKind.DISPATCH_AGENT and self._dispatch_backend_fingerprint:
+            payload = assigned.payload
+            capability = self._dispatch_capability(previous, next_state, assigned)
+            payload["dispatch_capability"] = capability.to_dict()
+            assigned = assigned.with_payload(payload)
+            invocation = next_state.current_invocation
+            if (
+                invocation is None
+                or invocation.invocation_id != assigned.owner_id
+                or invocation.dispatch_authority is not None
+            ):
+                raise InvariantViolation("dispatch capability requires one prepared active invocation")
+            next_state = replace(
+                next_state,
+                current_invocation=replace(
+                    invocation,
+                    dispatch_authority=self._dispatch_authority_record(capability),
+                ),
+            )
         if assigned.kind == CommandKind.EXECUTE_BOUNDED_OPERATIONS:
             batch = next_state.current_batch
             if batch is None or assigned.owner_id != batch.batch_id:

@@ -6,6 +6,23 @@ durable command intent, and fixture-dispatcher seams.
 """
 
 from admissible.v0_controller.commands import Command, CommandKind, CommandStatus
+from admissible.v0_controller.cursor_backend import (
+    CursorBackendConfig,
+    CursorCallableProposalBackend,
+    ManagedCursorProcessRunner,
+    V0ProcessInvocation,
+    V0ProcessOutcome,
+    V0ProcessRunner,
+)
+from admissible.v0_controller.cursor_dispatch import (
+    CursorDispatchAuthority,
+    PersistedCursorDispatchRequest,
+)
+from admissible.v0_controller.cursor_failures import (
+    V0BackendFailure,
+    V0BackendFailureKind,
+    V0ProposalBackendFailure,
+)
 from admissible.v0_controller.engine import V0BoundedExecutorAdapter, V0ControllerEngine
 from admissible.v0_controller.events import (
     ActionsAdmitted,
@@ -57,6 +74,17 @@ __all__ = [
     "CommandDispatchStarted",
     "CommandKind",
     "CommandStatus",
+    "CursorBackendConfig",
+    "CursorCallableProposalBackend",
+    "CursorDispatchAuthority",
+    "ManagedCursorProcessRunner",
+    "PersistedCursorDispatchRequest",
+    "V0BackendFailure",
+    "V0BackendFailureKind",
+    "V0ProcessInvocation",
+    "V0ProcessOutcome",
+    "V0ProcessRunner",
+    "V0ProposalBackendFailure",
     "ExecutionReceipt",
     "ExecutionCapability",
     "FilesystemIdentityPolicy",

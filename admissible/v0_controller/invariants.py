@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from admissible.v0_controller.commands import Command, CommandKind, CommandStatus
-from admissible.v0_controller.events import ExecutionCapability
+from admissible.v0_controller.events import DispatchCapability, ExecutionCapability
 from admissible.v0_controller.state import (
     BatchRecord,
     BatchStatus,
@@ -165,9 +165,52 @@ def _validate_command_payload_for_phase(
         invocation = state.current_invocation
         if invocation is None:
             _fail("dispatch phase lacks an invocation")
-        payload = _require_payload(command, {"invocation_id", "mandatory_paths"})
+        payload = _payload(command)
+        base_fields = {"invocation_id", "mandatory_paths"}
+        if set(payload) not in (base_fields, base_fields | {"dispatch_capability"}):
+            _fail("dispatch command payload fields are invalid")
         if payload["invocation_id"] != invocation.invocation_id or payload["mandatory_paths"] != list(state.remaining_paths()):
             _fail("dispatch command payload does not match active invocation")
+        if "dispatch_capability" in payload:
+            raw = payload["dispatch_capability"]
+            if not isinstance(raw, dict):
+                _fail("dispatch command capability must be an object")
+            try:
+                capability = DispatchCapability.from_dict(raw)
+            except (TypeError, ValueError) as exc:
+                _fail(f"dispatch command capability is invalid: {exc}")
+            if (
+                capability.session_id != state.session_id
+                or capability.issued_revision != state.revision - (1 if command.status == CommandStatus.IN_FLIGHT else 0)
+                or capability.command_id != command.command_id
+                or capability.invocation_id != invocation.invocation_id
+                or capability.batch_id != f"{invocation.invocation_id}:batch:{state.counters.batches + 1}"
+            ):
+                _fail("dispatch command capability does not bind the active lifecycle")
+            authority = invocation.dispatch_authority
+            if authority is None:
+                _fail("dispatch capability has no independent active invocation authority")
+            if (
+                authority.nonce != capability.nonce
+                or authority.session_id != capability.session_id
+                or authority.issued_revision != capability.issued_revision
+                or authority.command_id != capability.command_id
+                or authority.batch_id != capability.batch_id
+                or authority.invocation_id != capability.invocation_id
+                or authority.wait_owner_id != invocation.invocation_id
+                or authority.backend_fingerprint != capability.backend_fingerprint
+            ):
+                _fail("dispatch capability does not match independent invocation authority")
+            if command.status == CommandStatus.IN_FLIGHT:
+                token = state.wait_token
+                if (
+                    token is None
+                    or token.token_id != authority.wait_token_id
+                    or token.correlation_nonce != authority.nonce
+                ):
+                    _fail("dispatch wait token does not match independent invocation authority")
+        elif invocation.dispatch_authority is not None:
+            _fail("fixture dispatch cannot retain callable-backend authority")
         return
     if state.phase == Phase.ADMITTING:
         batch = state.current_batch

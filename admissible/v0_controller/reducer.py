@@ -448,20 +448,43 @@ def reduce(state: SessionState, event: Event | _BoundedExecutionCompleted | _Bou
             raise IllegalTransition("dispatch start requires the matching persisted prepared command")
         wait_kind, expected_event = _WAIT_FOR_COMMAND[pending.kind]
         in_flight = pending.with_status(CommandStatus.IN_FLIGHT)
-        next_state = replace(
-            state,
-            pending_command=in_flight,
-            wait_token=WaitToken(
+        dispatch_wait: WaitToken | None = None
+        if pending.kind == CommandKind.DISPATCH_AGENT and "dispatch_capability" in pending.payload:
+            invocation = state.current_invocation
+            authority = None if invocation is None else invocation.dispatch_authority
+            if (
+                invocation is None
+                or invocation.lifecycle != InvocationLifecycle.PREPARED
+                or invocation.invocation_id != pending.owner_id
+                or authority is None
+                or authority.command_id != pending.command_id
+                or authority.wait_owner_id != pending.owner_id
+            ):
+                raise IllegalTransition("dispatch command has no engine-issued invocation authority")
+            dispatch_wait = WaitToken(
                 kind=wait_kind,
                 owner_id=pending.owner_id,
                 command_id=pending.command_id,
                 expected_event=expected_event,
+                token_id=authority.wait_token_id,
+                correlation_nonce=authority.nonce,
+            )
+        next_state = replace(
+            state,
+            pending_command=in_flight,
+            wait_token=(
+                dispatch_wait
+                if dispatch_wait is not None
+                else WaitToken(
+                    kind=wait_kind,
+                    owner_id=pending.owner_id,
+                    command_id=pending.command_id,
+                    expected_event=expected_event,
+                )
             ),
         )
         if pending.kind == CommandKind.DISPATCH_AGENT:
             invocation = state.current_invocation
-            if invocation is None or invocation.lifecycle != InvocationLifecycle.PREPARED or invocation.invocation_id != pending.owner_id:
-                raise IllegalTransition("dispatch command has no matching prepared invocation")
             next_state = replace(
                 next_state,
                 phase=Phase.WAITING_FOR_AGENT,

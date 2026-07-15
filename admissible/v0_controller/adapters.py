@@ -68,7 +68,13 @@ class V0ProposalOperation:
 
 @dataclass(frozen=True)
 class V0ProposalResult:
-    """Typed proposal-only backend result; diagnostics are not lifecycle authority."""
+    """Typed proposal-only backend result; diagnostics are not lifecycle authority.
+
+    ``output_truncated`` and the identity fields are explicit metadata: a backend
+    must never let a truncated stream masquerade as a complete one, and the
+    engine must be able to say exactly which backend, model, and transport
+    produced a proposal.  Materialized execution evidence is never carried here.
+    """
 
     invocation_id: str
     result_id: str
@@ -77,6 +83,17 @@ class V0ProposalResult:
     operations: tuple[V0ProposalOperation, ...]
     diagnostics: tuple[str, ...] = ()
     retained_diagnostic_stream: str = ""
+    output_truncated: bool = False
+    backend_identity: str = ""
+    model_identity: str = ""
+    transport_identity: str = ""
+    # The dispatch/config fingerprint the result was produced under.  Result
+    # consumption verifies it, so a result cannot be consumed by a backend whose
+    # configuration is not the one that produced it.
+    config_fingerprint: str = ""
+    # The nonce from the independently persisted dispatch authority.  It is
+    # checked by the real backend before a result may be consumed.
+    dispatch_nonce: str = ""
 
     @property
     def retained_diagnostic_bytes(self) -> int:
@@ -84,13 +101,23 @@ class V0ProposalResult:
 
 
 class V0ProposalBackend(Protocol):
-    """Protocol for a future proposal-only callable backend."""
+    """Protocol for any proposal-only callable backend (fixture or real Cursor)."""
 
     @property
     def invocation_count(self) -> int:
         ...
 
+    @property
+    def results_consumed(self) -> int:
+        ...
+
     def invoke(self, *, command: Command, instruction: Mapping[str, Any]) -> V0ProposalResult:
+        ...
+
+    def mark_result_consumed(self, result: V0ProposalResult | None = None) -> None:
+        ...
+
+    def retain_diagnostic_stream(self, stream: str) -> tuple[str, bool]:
         ...
 
 
@@ -137,7 +164,7 @@ class FixtureProposalBackend:
         self._invocation_count += 1
         return result
 
-    def mark_result_consumed(self) -> None:
+    def mark_result_consumed(self, result: V0ProposalResult | None = None) -> None:
         self._results_consumed += 1
 
     def retain_diagnostic_stream(self, stream: str) -> tuple[str, bool]:
@@ -308,15 +335,28 @@ def admit_proposal_for_batch(
 
 def proposal_backend_to_agent_result(
     *,
-    backend: FixtureProposalBackend,
+    backend: V0ProposalBackend,
     command: Command,
     result: V0ProposalResult,
 ) -> AgentResultReceived:
+    """Convert one typed proposal result into the single reducer-facing fact.
+
+    Consumption is exact-once: a backend that already consumed this result, or
+    that is bound to another lifecycle, rejects here before any state changes.
+    """
+
     retained, truncated = backend.retain_diagnostic_stream(result.retained_diagnostic_stream)
     diagnostics = (*result.diagnostics, f"result_id:{result.result_id}")
-    if truncated:
+    if truncated or result.output_truncated:
         diagnostics = (*diagnostics, "diagnostic_stream_truncated")
-    backend.mark_result_consumed()
+    for label, value in (
+        ("backend_identity", result.backend_identity),
+        ("model_identity", result.model_identity),
+        ("transport_identity", result.transport_identity),
+    ):
+        if value:
+            diagnostics = (*diagnostics, f"{label}:{value}")
+    backend.mark_result_consumed(result)
     return AgentResultReceived(
         invocation_id=result.invocation_id,
         batch_id=result.batch_id,

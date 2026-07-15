@@ -9,12 +9,15 @@ from typing import Any
 
 from admissible.execution.bounded_write import WorkspaceAuthorityDescriptor
 from admissible.v0_controller.adapters import (
-    FixtureProposalBackend,
     V0ProposalBackend,
+    V0ProposalResult,
     admit_proposal_for_batch,
     proposal_backend_to_agent_result,
 )
 from admissible.v0_controller.commands import Command, CommandKind, CommandStatus
+from admissible.v0_controller.cursor_dispatch import PersistedCursorDispatchRequest
+from admissible.v0_controller.cursor_failures import V0BackendFailureKind, V0ProposalBackendFailure
+from admissible.v0_controller.cursor_instruction import build_governed_instruction, expected_batch_id
 from admissible.v0_controller.engine import TickResult, V0BoundedExecutorAdapter, V0ControllerEngine
 from admissible.v0_controller.events import CommandDispatchStarted, Event, NoEvent, TechnicalFault
 from admissible.v0_controller.integration_policy import WorkspaceIntegrationPolicy
@@ -158,7 +161,18 @@ class V0OfflineOrchestrator:
             self.store,
             bounded_executor_adapter=self.config.bounded_executor_adapter,
             filesystem_identity_policy=self.config.filesystem_identity_policy,
+            dispatch_backend_fingerprint=self.backend_fingerprint(),
         )
+
+    def backend_fingerprint(self) -> str | None:
+        """The configured callable backend's identity, when it has one.
+
+        A fixture backend has none: it never starts a process, so no persisted
+        dispatch capability is issued for it.
+        """
+
+        fingerprint = getattr(self.config.proposal_backend, "config_fingerprint", None)
+        return fingerprint if isinstance(fingerprint, str) and fingerprint else None
 
     def load_state(self) -> SessionState:
         return self.store.load(self.config.session_id)
@@ -247,11 +261,13 @@ class V0OfflineOrchestrator:
             return TechnicalFault(engine._workspace_authority_reason(exc))
         if command.kind == CommandKind.DISPATCH_AGENT:
             backend = self.config.proposal_backend
-            if not isinstance(backend, FixtureProposalBackend):
-                raise TypeError("offline orchestrator requires FixtureProposalBackend for proposal dispatch")
-            instruction = command.payload
-            result = backend.invoke(command=command, instruction=instruction)
-            return proposal_backend_to_agent_result(backend=backend, command=command, result=result)
+            try:
+                result = self._invoke_proposal_backend(state, command, backend)
+                return proposal_backend_to_agent_result(backend=backend, command=command, result=result)
+            except V0ProposalBackendFailure as failure:
+                # Fail closed.  Slice 3 never retries and never falls back to the
+                # legacy backend: the operator disposes of the paused session.
+                return TechnicalFault(failure.to_reason())
         if command.kind == CommandKind.ADMIT_PROPOSAL:
             batch = state.current_batch
             if batch is None:
@@ -272,6 +288,40 @@ class V0OfflineOrchestrator:
             except WorkspaceGuardError as exc:
                 return TechnicalFault(engine._workspace_authority_reason(exc))
         raise IllegalTransition(f"unsupported prepared command for offline dispatch: {command.kind.value}")
+
+    def _invoke_proposal_backend(
+        self,
+        state: SessionState,
+        command: Command,
+        backend: V0ProposalBackend,
+    ) -> V0ProposalResult:
+        """Dispatch one persisted agent command to the configured backend.
+
+        A backend with store-backed persisted dispatch authority (the real Cursor
+        backend) receives *identifiers only* and reloads the session itself; the
+        in-memory ``state``/``command`` here are never its authority.  A fixture
+        backend, which starts no process, keeps the pure in-memory seam.
+        """
+
+        persisted = getattr(backend, "invoke_persisted", None)
+        if callable(persisted):
+            fingerprint = self.backend_fingerprint()
+            if not fingerprint:
+                raise V0ProposalBackendFailure(
+                    V0BackendFailureKind.BACKEND_FINGERPRINT_MISMATCH,
+                    "A store-backed callable backend must expose a configuration fingerprint.",
+                )
+            request = PersistedCursorDispatchRequest(
+                session_id=self.config.session_id,
+                command_id=command.command_id or "",
+                invocation_id=command.owner_id,
+                batch_id=expected_batch_id(state, command.owner_id),
+                expected_revision=state.revision,
+                backend_fingerprint=fingerprint,
+            )
+            return persisted(request=request)
+        instruction = build_governed_instruction(state=state, command=command)
+        return backend.invoke(command=command, instruction=instruction)
 
     def projection(self) -> IntegrationRunProjection:
         state = self.load_state()

@@ -67,6 +67,11 @@ TERMINATION_CLEANUP_FAILED = "cleanup_failed"
 TERMINATION_SPAWN_FAILED = "spawn_failed"
 TERMINATION_NOT_STARTED = "not_started"
 
+# -- containment observation states -----------------------------------------
+OBSERVATION_PROVEN_EMPTY = "proven_empty"
+OBSERVATION_PROVEN_LIVE = "proven_live"
+OBSERVATION_UNKNOWN = "unknown"
+
 _DEFAULT_GRACE_SECONDS = 5.0
 _DEFAULT_FORCE_SECONDS = 5.0
 _DEFAULT_MAX_CAPTURE_BYTES = 512 * 1024
@@ -79,6 +84,28 @@ def _now_iso() -> str:
 # ---------------------------------------------------------------------------
 # Durable result value object (PART A.4)
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TreeObservation:
+    """A containment observation with an explicit proof level.
+
+    An empty PID list is evidence of an empty tree only when the containment
+    says the membership query is complete. A missing root can make recursive
+    PID enumeration impossible while descendants in a Job Object or process
+    group remain alive, so ``UNKNOWN`` is deliberately not treated as clean.
+    """
+
+    state: str
+    observed_descendant_ids: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.state not in {
+            OBSERVATION_PROVEN_EMPTY,
+            OBSERVATION_PROVEN_LIVE,
+            OBSERVATION_UNKNOWN,
+        }:
+            raise ValueError("invalid process-tree observation state")
 
 
 @dataclass
@@ -101,6 +128,7 @@ class ManagedProcessResult:
     graceful_termination_attempted: bool = False
     force_termination_attempted: bool = False
     cleanup_complete: bool = True
+    cleanup_observation: str = OBSERVATION_PROVEN_EMPTY
     remaining_process_ids: list[int] = field(default_factory=list)
     stdout_bytes: int = 0
     stderr_bytes: int = 0
@@ -110,7 +138,11 @@ class ManagedProcessResult:
     @property
     def cleanup_proven(self) -> bool:
         """True only when the managed tree is proven gone (circuit-breaker input)."""
-        return self.cleanup_complete and not self.remaining_process_ids
+        return (
+            self.cleanup_complete
+            and self.cleanup_observation == OBSERVATION_PROVEN_EMPTY
+            and not self.remaining_process_ids
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -125,6 +157,7 @@ class ManagedProcessResult:
             "graceful_termination_attempted": self.graceful_termination_attempted,
             "force_termination_attempted": self.force_termination_attempted,
             "cleanup_complete": self.cleanup_complete,
+            "cleanup_observation": self.cleanup_observation,
             "cleanup_proven": self.cleanup_proven,
             "remaining_process_ids": list(self.remaining_process_ids),
             "stdout_bytes": self.stdout_bytes,
@@ -228,6 +261,9 @@ class ContainmentStrategy(ABC):
     def assign(self, proc: Any) -> None:  # pragma: no cover - default no-op
         """Assign ``proc`` (and future descendants) to this containment."""
 
+    def release(self) -> None:  # pragma: no cover - default no-op
+        """Release an owned containment only after emptiness was proven."""
+
     def observed_descendant_ids(self, proc: Any) -> list[int]:
         """Best-effort snapshot of descendant pids (never includes the root)."""
         if psutil is None or proc is None or getattr(proc, "pid", None) is None:
@@ -238,11 +274,41 @@ class ContainmentStrategy(ABC):
         except psutil.Error:
             return []
 
+    def observe_owned_tree(self, proc: Any) -> TreeObservation:
+        """Return explicit containment knowledge, never infer it from ``[]``.
+
+        Simple injected strategies may use the default when their observer is
+        complete. OS strategies with weaker PID enumeration override it with
+        containment-native membership proof.
+        """
+
+        try:
+            descendants = tuple(
+                pid
+                for pid in sorted(set(self.observed_descendant_ids(proc)))
+                if self.is_alive(pid)
+            )
+        except Exception:
+            return TreeObservation(OBSERVATION_UNKNOWN)
+        root_alive = self.is_alive(getattr(proc, "pid", None))
+        if root_alive or descendants:
+            return TreeObservation(OBSERVATION_PROVEN_LIVE, descendants)
+        return TreeObservation(OBSERVATION_PROVEN_EMPTY)
+
     @abstractmethod
     def terminate_tree(
         self, proc: Any, *, grace_seconds: float, force_seconds: float
     ) -> TreeTerminationOutcome:
         """Terminate the whole tree; return observed + still-remaining pids."""
+
+    def ownership_provable(self, proc: Any) -> bool:
+        """True when this strategy can still prove which processes it owns.
+
+        When ownership cannot be proven, ``ManagedProcess`` refuses to terminate
+        anything (killing an unproven pid could kill an unrelated process after
+        pid reuse) and reports the cleanup as *unproven* instead.
+        """
+        return True
 
     def is_alive(self, pid: int | None) -> bool:
         return pid_alive(pid)
@@ -255,6 +321,28 @@ class PsutilTreeContainment(ContainmentStrategy):
     """
 
     name = PLATFORM_STRATEGY_PSUTIL_TREE_KILL
+
+    def ownership_provable(self, proc: Any) -> bool:
+        # Without psutil the descendant set cannot be enumerated or re-verified,
+        # so only the root is ever provably ours.
+        return psutil is not None
+
+    def observe_owned_tree(self, proc: Any) -> TreeObservation:
+        """A vanished root makes psutil descendant enumeration incomplete."""
+
+        if psutil is None or proc is None or getattr(proc, "pid", None) is None:
+            return TreeObservation(OBSERVATION_UNKNOWN)
+        pid = proc.pid
+        try:
+            root = psutil.Process(pid)
+            descendants = tuple(sorted({child.pid for child in root.children(recursive=True)}))
+            if root.is_running() or descendants:
+                return TreeObservation(OBSERVATION_PROVEN_LIVE, descendants)
+            return TreeObservation(OBSERVATION_UNKNOWN, descendants)
+        except psutil.NoSuchProcess:
+            return TreeObservation(OBSERVATION_UNKNOWN)
+        except psutil.Error:
+            return TreeObservation(OBSERVATION_UNKNOWN)
 
     def terminate_tree(
         self, proc: Any, *, grace_seconds: float, force_seconds: float
@@ -304,6 +392,26 @@ class PosixSessionContainment(ContainmentStrategy):
     terminate the whole process group with ``SIGTERM`` then ``SIGKILL``."""
 
     name = PLATFORM_STRATEGY_POSIX_SESSION
+
+    def observe_owned_tree(self, proc: Any) -> TreeObservation:
+        """The dedicated process group remains queryable after its leader exits."""
+
+        pid = getattr(proc, "pid", None)
+        if pid is None:
+            return TreeObservation(OBSERVATION_UNKNOWN)
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return TreeObservation(OBSERVATION_PROVEN_EMPTY)
+        except PermissionError:
+            return TreeObservation(OBSERVATION_UNKNOWN)
+        except OSError:
+            return TreeObservation(OBSERVATION_UNKNOWN)
+        try:
+            descendants = tuple(sorted(set(self.observed_descendant_ids(proc))))
+        except Exception:
+            descendants = ()
+        return TreeObservation(OBSERVATION_PROVEN_LIVE, descendants)
 
     def terminate_tree(
         self, proc: Any, *, grace_seconds: float, force_seconds: float
@@ -372,6 +480,60 @@ class WindowsJobContainment(ContainmentStrategy):
             # Any failure -> deterministic psutil fallback; never leave uncontained.
             self._job_handle = None
             self._assigned = False
+
+    def observe_owned_tree(self, proc: Any) -> TreeObservation:
+        """Ask the owned Job Object, not a vanished root PID, for membership."""
+
+        if self._assigned and self._job_handle is not None:
+            try:
+                members = self._active_job_process_ids()
+            except Exception:
+                # The job is ours, but its membership cannot be proven empty.
+                return TreeObservation(OBSERVATION_UNKNOWN)
+            descendants = tuple(sorted(pid for pid in members if pid != getattr(proc, "pid", None)))
+            if members:
+                return TreeObservation(OBSERVATION_PROVEN_LIVE, descendants)
+            return TreeObservation(OBSERVATION_PROVEN_EMPTY)
+        # The fallback owns only what psutil can prove. Its observer is
+        # intentionally unknown after a vanished root.
+        return self._fallback.observe_owned_tree(proc)
+
+    def _active_job_process_ids(self) -> tuple[int, ...]:  # pragma: no cover - real Windows only
+        """Return the active members of this owned job or raise if unknown."""
+
+        if self._kernel32 is None or self._job_handle is None:
+            raise RuntimeError("owned Windows Job Object is unavailable")
+        import ctypes
+        from ctypes import wintypes
+
+        JobObjectBasicProcessIdList = 3
+        header_size = ctypes.sizeof(wintypes.DWORD) * 2
+        slot_size = ctypes.sizeof(ctypes.c_size_t)
+        slots = 8
+        while slots <= 65536:
+            size = header_size + (slots * slot_size)
+            buffer = ctypes.create_string_buffer(size)
+            returned = wintypes.DWORD()
+            ok = self._kernel32.QueryInformationJobObject(
+                self._job_handle,
+                JobObjectBasicProcessIdList,
+                buffer,
+                size,
+                ctypes.byref(returned),
+            )
+            if not ok:
+                raise ctypes.WinError(ctypes.get_last_error())
+            assigned = wintypes.DWORD.from_buffer(buffer, 0).value
+            listed = wintypes.DWORD.from_buffer(buffer, ctypes.sizeof(wintypes.DWORD)).value
+            if assigned > listed:
+                slots = max(slots * 2, assigned)
+                continue
+            values = ctypes.cast(
+                ctypes.addressof(buffer) + header_size,
+                ctypes.POINTER(ctypes.c_size_t),
+            )
+            return tuple(int(values[index]) for index in range(listed))
+        raise RuntimeError("owned Windows Job Object membership list is too large")
 
     def _assign_job(self, proc: Any) -> None:  # pragma: no cover - real Windows only
         import ctypes
@@ -453,6 +615,14 @@ class WindowsJobContainment(ContainmentStrategy):
             raise ctypes.WinError(err)
         self._job_handle = job
 
+    def release(self) -> None:  # pragma: no cover - real Windows only
+        if self._job_handle is not None:
+            try:
+                self._kernel32.CloseHandle(self._job_handle)
+            except Exception:
+                pass
+        self._job_handle = None
+
     def terminate_tree(
         self, proc: Any, *, grace_seconds: float, force_seconds: float
     ) -> TreeTerminationOutcome:
@@ -473,11 +643,11 @@ class WindowsJobContainment(ContainmentStrategy):
             pass
         self._wait_gone(proc, grace_seconds)
         try:
-            self._kernel32.CloseHandle(self._job_handle)
+            remaining = list(self._active_job_process_ids())
         except Exception:
-            pass
-        self._job_handle = None
-        remaining = [p for p in [pid, *observed] if p is not None and pid_alive(p)]
+            # The owned job still exists but its membership is unknown. Preserve
+            # every known pid and let the manager fail closed after re-observe.
+            remaining = [p for p in [pid, *observed] if p is not None and pid_alive(p)]
         if remaining:
             # Job Object did not prove clean -> escalate to explicit tree-kill.
             fallback = self._fallback.terminate_tree(
@@ -695,6 +865,7 @@ class ManagedProcess:
         self._graceful_attempted = False
         self._force_attempted = False
         self._cleanup_complete = True
+        self._cleanup_observation = OBSERVATION_PROVEN_EMPTY
         self._remaining: list[int] = []
         self._terminated = False
         self._start_clock = 0.0
@@ -777,20 +948,26 @@ class ManagedProcess:
         except subprocess.TimeoutExpired:
             return None
 
-    def finish(self, *, reason: str = TERMINATION_COMPLETED) -> None:
-        """Record a natural (already-exited) completion and stop the pumps."""
+    def finish(self, *, reason: str = TERMINATION_COMPLETED) -> ManagedProcessResult:
+        """Record a natural (already-exited) completion and stop the pumps.
+
+        A root process that exited on its own does *not* prove its tree is gone:
+        the ``.CMD -> powershell -> node`` chain routinely outlives its root. So
+        every completion path -- success, nonzero exit, parser rejection later,
+        malformed output -- still terminates any verified owned descendant that
+        is still alive, and reports ``cleanup_complete=False`` when it cannot.
+        """
         if self._terminated:
-            return
+            return self.result()
         self._exit_code = self.poll()
         self._exited_at = _now_iso()
         self._termination_reason = reason
         self._join_pumps()
-        # A clean exit still deserves verification that nothing was left behind.
-        self._remaining = [
-            p for p in [self.pid, *self._observed_descendants] if p and self._is_alive(p)
-        ]
-        self._cleanup_complete = not self._remaining
+        self._cleanup_owned_tree()
+        if self._remaining:
+            self._termination_reason = TERMINATION_CLEANUP_FAILED
         self._terminated = True
+        return self.result()
 
     def terminate(self, *, reason: str = TERMINATION_CANCELLED) -> ManagedProcessResult:
         """Graceful-then-force terminate the whole tree and verify cleanup."""
@@ -800,39 +977,126 @@ class ManagedProcess:
         if self._terminated:
             return self.result()
 
-        # 1) graceful: close stdin (EOF/shutdown signal for a stdio server).
-        self._graceful_attempted = True
-        self.close_stdin()
-        self.wait(timeout=self.grace_seconds)
-        # Verify the *whole* owned set, not just the root: a graceful root exit
-        # does not guarantee ``powershell.exe``/``node.exe`` descendants died.
-        remaining_after_graceful = [
-            p for p in [self.pid, *self._observed_descendants] if p and self._is_alive(p)
-        ]
-        if remaining_after_graceful:
-            # 2) force: kill the whole owned tree deterministically.
-            self._force_attempted = True
-            outcome = self._containment.terminate_tree(
-                self._proc,
-                grace_seconds=self.grace_seconds,
-                force_seconds=self.force_seconds,
-            )
-            if outcome.observed_descendant_ids:
-                merged = set(self._observed_descendants) | set(outcome.observed_descendant_ids)
-                self._observed_descendants = sorted(merged)
-            self._remaining = list(outcome.remaining_process_ids)
-        else:
-            self._remaining = []
-
+        self._cleanup_owned_tree(force_graceful_attempt=True)
         self._exit_code = self.poll()
         self._exited_at = _now_iso()
-        self._cleanup_complete = not self._remaining
         self._termination_reason = (
             TERMINATION_CLEANUP_FAILED if self._remaining else reason
         )
         self._join_pumps()
         self._terminated = True
         return self.result()
+
+    def _owned_pids(self) -> list[int]:
+        """The pids whose ownership by this managed tree is proven."""
+        return [p for p in [self.pid, *self._observed_descendants] if p]
+
+    def _live_owned_pids(self) -> list[int]:
+        return [p for p in self._owned_pids() if self._is_alive(p)]
+
+    def _observe_owned_tree(self) -> TreeObservation:
+        """Observe the containment and retain only proven descendant ids."""
+
+        try:
+            observation = self._containment.observe_owned_tree(self._proc)
+        except Exception:
+            observation = TreeObservation(OBSERVATION_UNKNOWN)
+        if observation.observed_descendant_ids:
+            self._observed_descendants = sorted(
+                set(self._observed_descendants) | set(observation.observed_descendant_ids)
+            )
+        return observation
+
+    def _record_cleanup_observation(self, observation: TreeObservation) -> None:
+        """Record completion only from positive containment-empty proof."""
+
+        self._cleanup_observation = observation.state
+        known_live = set(self._live_owned_pids())
+        known_live.update(
+            pid for pid in observation.observed_descendant_ids if self._is_alive(pid)
+        )
+        self._remaining = sorted(known_live)
+        self._cleanup_complete = observation.state == OBSERVATION_PROVEN_EMPTY
+        if self._cleanup_complete:
+            try:
+                self._containment.release()
+            except Exception:
+                # The tree was already proven empty. A handle-close failure must
+                # not turn that proof into an arbitrary-PID cleanup attempt.
+                pass
+
+    def _cleanup_owned_tree(self, *, force_graceful_attempt: bool = False) -> None:
+        """Graceful -> wait -> force -> wait -> independently verify.
+
+        Only pids proven to belong to this managed tree are ever terminated. If
+        ownership cannot be proven, nothing is killed and the surviving pids are
+        reported as remaining, so the caller fails closed instead of the layer
+        killing an arbitrary process.
+        """
+        if self._proc is None:
+            self._remaining = []
+            self._cleanup_complete = True
+            self._cleanup_observation = OBSERVATION_PROVEN_EMPTY
+            return
+
+        observation = self._observe_owned_tree()
+        if observation.state == OBSERVATION_PROVEN_EMPTY:
+            self._record_cleanup_observation(observation)
+            return
+
+        try:
+            provable = self._containment.ownership_provable(self._proc)
+        except Exception:
+            provable = False
+        if not provable:
+            # Known children are retained for diagnostics; unknown membership is
+            # still a failed cleanup even if no arbitrary PID may be killed.
+            self._record_cleanup_observation(
+                TreeObservation(OBSERVATION_UNKNOWN, observation.observed_descendant_ids)
+            )
+            return
+
+        # Both PROVEN_LIVE and UNKNOWN are unsafe. UNKNOWN is safe to clean only
+        # through the containment handle we created and own, never by guessing
+        # arbitrary descendant PIDs.
+        self._graceful_attempted = True
+        self.close_stdin()
+        self.wait(timeout=self.grace_seconds)
+
+        observation = self._observe_owned_tree()
+        if observation.state == OBSERVATION_PROVEN_EMPTY:
+            self._record_cleanup_observation(observation)
+            return
+
+        # Force the *owned containment* even when membership was unknown. A
+        # Job Object/process group remains the authority after the wrapper exits.
+        self._force_attempted = True
+        try:
+            outcome = self._containment.terminate_tree(
+                self._proc,
+                grace_seconds=self.grace_seconds,
+                force_seconds=self.force_seconds,
+            )
+        except Exception:
+            outcome = TreeTerminationOutcome(strategy=self.platform_strategy)
+        if outcome.observed_descendant_ids:
+            self._observed_descendants = sorted(
+                set(self._observed_descendants) | set(outcome.observed_descendant_ids)
+            )
+        # Independently query containment after any strategy report. An empty
+        # termination outcome is not enough to establish that a job/group is
+        # empty.
+        observation = self._observe_owned_tree()
+        self._record_cleanup_observation(observation)
+        if outcome.remaining_process_ids:
+            self._remaining = sorted(
+                set(self._remaining)
+                | {pid for pid in outcome.remaining_process_ids if self._is_alive(pid)}
+            )
+            if self._remaining:
+                self._cleanup_complete = False
+                if self._cleanup_observation == OBSERVATION_PROVEN_EMPTY:
+                    self._cleanup_observation = OBSERVATION_UNKNOWN
 
     def _is_alive(self, pid: int | None) -> bool:
         try:
@@ -866,6 +1130,7 @@ class ManagedProcess:
             graceful_termination_attempted=self._graceful_attempted,
             force_termination_attempted=self._force_attempted,
             cleanup_complete=self._cleanup_complete,
+            cleanup_observation=self._cleanup_observation,
             remaining_process_ids=list(self._remaining),
             stdout_bytes=self._stdout_pump.byte_count if self._stdout_pump else 0,
             stderr_bytes=self._stderr_pump.byte_count if self._stderr_pump else 0,
@@ -967,8 +1232,12 @@ __all__ = [
     "TERMINATION_CLEANUP_FAILED",
     "TERMINATION_SPAWN_FAILED",
     "TERMINATION_NOT_STARTED",
+    "OBSERVATION_PROVEN_EMPTY",
+    "OBSERVATION_PROVEN_LIVE",
+    "OBSERVATION_UNKNOWN",
     "READ_TIMEOUT",
     "ManagedProcessResult",
+    "TreeObservation",
     "TreeTerminationOutcome",
     "ContainmentStrategy",
     "PsutilTreeContainment",
