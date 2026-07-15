@@ -1,0 +1,128 @@
+{
+  "archive_id": "neon-serpents-live-002",
+  "classification": "real-live-run-evidence",
+  "note": "Authentic Slice-4 two-turn governed Cursor run. Recovered from Windows temp; bytes unmodified. NOT a test fixture.",
+  "source_run_directory": "C:/Users/stris/AppData/Local/Temp/admissible-v0-neon-live-002-20260715-180833",
+  "canonical_facts": {
+    "cursor_invocations": 2,
+    "consumed_results": 2,
+    "admitted_operations": 8,
+    "physical_writes": 8,
+    "durable_receipts": 8,
+    "file_evidence": 8,
+    "remaining_mandatory_paths": 0,
+    "structural_verification_passed": true,
+    "structural_file_checks": 8,
+    "final_phase": "awaiting_human",
+    "revision": 16
+  },
+  "entry_point": "target/index.html",
+  "target_evidence_hashes": {
+    "index.html": {
+      "sha256": "ec44c1029bc0451a432c51dae956e3ae2ab9a5c8f792bbf8713381a31c3178c0",
+      "bytes": 1255
+    },
+    "style.css": {
+      "sha256": "a658742594ee7aff32ff4f40a0c5bc112d6158dfe98ecac8318194529b4a3651",
+      "bytes": 2251
+    },
+    "src/entities.js": {
+      "sha256": "a7d1dbf5d82e45acb6c4b50db50f3f4dff5cc5ec8bad0be9793f345e2e7fbaa1",
+      "bytes": 4443
+    },
+    "src/render.js": {
+      "sha256": "d3fc3856c687f0319f6c5dc86a3c376d9bfc875242d852fb972445c959ef8d7e",
+      "bytes": 5297
+    },
+    "src/main.js": {
+      "sha256": "634f74030528a064bfc484b7a815bc3b68acc571d10a2160b23f3ff0e59c9804",
+      "bytes": 3295
+    },
+    "src/game.js": {
+      "sha256": "cdeedd7aa77791ffb194736a0200d5f31b27b78e15131418cfdc1a2fc0d125b4",
+      "bytes": 4577
+    },
+    "src/bots.js": {
+      "sha256": "d1588ccd454e781fba4be6108abddffb0d34bd331800a6fa4af8f0ef47acab06",
+      "bytes": 2856
+    },
+    "LOCAL_DEV.md": {
+      "sha256": "d14e2d68acdd8dda4017db3d4c8278cbd3b69cceb8738dacd614a7ca01586078",
+      "bytes": 1801
+    }
+  },
+  "archived_files": {
+    "agent/INSTRUCTION.md": {
+      "sha256": "c3544c6c799b61e0bb76da6f575f0729f834bb754f3d3fdd1a38b979dd34c0ed",
+      "bytes": 3282
+    },
+    "agent/_proposal_batch1.json": {
+      "sha256": "2f73349cfc4630255319c6c8dfc1b46a8996ace9d14d8e07563b165915918ec2",
+      "bytes": 12
+    },
+    "agent/context/index.html": {
+      "sha256": "ec44c1029bc0451a432c51dae956e3ae2ab9a5c8f792bbf8713381a31c3178c0",
+      "bytes": 1255
+    },
+    "agent/context/src/entities.js": {
+      "sha256": "a7d1dbf5d82e45acb6c4b50db50f3f4dff5cc5ec8bad0be9793f345e2e7fbaa1",
+      "bytes": 4443
+    },
+    "agent/context/src/render.js": {
+      "sha256": "d3fc3856c687f0319f6c5dc86a3c376d9bfc875242d852fb972445c959ef8d7e",
+      "bytes": 5297
+    },
+    "agent/context/style.css": {
+      "sha256": "a658742594ee7aff32ff4f40a0c5bc112d6158dfe98ecac8318194529b4a3651",
+      "bytes": 2251
+    },
+    "agent/context_manifest.json": {
+      "sha256": "6c76985d876e96f3f60af66ec83226ceec790fb947afcf92eeb0dea82e706398",
+      "bytes": 1895
+    },
+    "agent/instruction.json": {
+      "sha256": "8a389216f79c9d013832811f88eb623789689fb3641eba75a705f2c506d4aa6b",
+      "bytes": 16559
+    },
+    "neon_serpents_mission.txt": {
+      "sha256": "f8cb66f69cf8293942d34df82bf8bc7cdfd35efa69c12a1dba4b83a7a3c8b162",
+      "bytes": 684
+    },
+    "session.v0.json": {
+      "sha256": "31f37c6fa37640ed50044c6c31f92d5c6a8efbc63497cdcdf45dd65331301a1c",
+      "bytes": 61475
+    },
+    "target/LOCAL_DEV.md": {
+      "sha256": "d14e2d68acdd8dda4017db3d4c8278cbd3b69cceb8738dacd614a7ca01586078",
+      "bytes": 1801
+    },
+    "target/index.html": {
+      "sha256": "ec44c1029bc0451a432c51dae956e3ae2ab9a5c8f792bbf8713381a31c3178c0",
+      "bytes": 1255
+    },
+    "target/src/bots.js": {
+      "sha256": "d1588ccd454e781fba4be6108abddffb0d34bd331800a6fa4af8f0ef47acab06",
+      "bytes": 2856
+    },
+    "target/src/entities.js": {
+      "sha256": "a7d1dbf5d82e45acb6c4b50db50f3f4dff5cc5ec8bad0be9793f345e2e7fbaa1",
+      "bytes": 4443
+    },
+    "target/src/game.js": {
+      "sha256": "cdeedd7aa77791ffb194736a0200d5f31b27b78e15131418cfdc1a2fc0d125b4",
+      "bytes": 4577
+    },
+    "target/src/main.js": {
+      "sha256": "634f74030528a064bfc484b7a815bc3b68acc571d10a2160b23f3ff0e59c9804",
+      "bytes": 3295
+    },
+    "target/src/render.js": {
+      "sha256": "d3fc3856c687f0319f6c5dc86a3c376d9bfc875242d852fb972445c959ef8d7e",
+      "bytes": 5297
+    },
+    "target/style.css": {
+      "sha256": "a658742594ee7aff32ff4f40a0c5bc112d6158dfe98ecac8318194529b4a3651",
+      "bytes": 2251
+    }
+  }
+}

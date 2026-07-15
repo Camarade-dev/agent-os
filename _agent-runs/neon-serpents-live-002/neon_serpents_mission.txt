@@ -1,0 +1,22 @@
+Neon Serpents
+
+Build a self-contained plain HTML, CSS, and JavaScript browser game called "Neon Serpents".
+
+Requirements:
+- No external dependencies.
+- No CDN or external network references.
+- Use local assets only.
+- A loopback localhost URL may appear only as inert local-development documentation.
+- Document the keyboard controls.
+- The game must open deterministically through index.html.
+- Provide complete final contents for every proposed file.
+- Create exactly these eight mandatory paths:
+  - index.html
+  - style.css
+  - src/main.js
+  - src/game.js
+  - src/entities.js
+  - src/bots.js
+  - src/render.js
+  - LOCAL_DEV.md
+- Do not make runtime or browser-verification claims.

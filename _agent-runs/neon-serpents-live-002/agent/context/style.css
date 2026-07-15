@@ -1,0 +1,128 @@
+:root {
+  --bg-deep: #0a0a12;
+  --bg-panel: #12121f;
+  --neon-cyan: #00f5ff;
+  --neon-magenta: #ff00aa;
+  --neon-lime: #39ff14;
+  --neon-orange: #ff6b00;
+  --text-dim: #8899aa;
+  --text-bright: #e8f4ff;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg-deep);
+  color: var(--text-bright);
+  font-family: "Segoe UI", system-ui, sans-serif;
+  min-height: 100vh;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 1rem;
+}
+
+#app {
+  max-width: 960px;
+  width: 100%;
+}
+
+header {
+  text-align: center;
+  margin-bottom: 1rem;
+}
+
+header h1 {
+  font-size: 2rem;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--neon-cyan);
+  text-shadow: 0 0 10px var(--neon-cyan), 0 0 30px rgba(0, 245, 255, 0.4);
+}
+
+#hud {
+  display: flex;
+  justify-content: center;
+  gap: 2rem;
+  margin-top: 0.5rem;
+  font-size: 1rem;
+}
+
+#score {
+  color: var(--neon-lime);
+  font-weight: bold;
+}
+
+#status {
+  color: var(--neon-magenta);
+}
+
+main {
+  display: flex;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: flex-start;
+}
+
+#game-canvas {
+  display: block;
+  background: var(--bg-panel);
+  border: 2px solid var(--neon-cyan);
+  box-shadow: 0 0 15px rgba(0, 245, 255, 0.3), inset 0 0 40px rgba(0, 0, 0, 0.5);
+  border-radius: 4px;
+  outline: none;
+  cursor: crosshair;
+}
+
+#game-canvas:focus {
+  box-shadow: 0 0 20px rgba(0, 245, 255, 0.6), inset 0 0 40px rgba(0, 0, 0, 0.5);
+}
+
+#controls-panel {
+  background: var(--bg-panel);
+  border: 1px solid rgba(0, 245, 255, 0.25);
+  border-radius: 4px;
+  padding: 1rem 1.25rem;
+  min-width: 220px;
+}
+
+#controls-panel h2 {
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--neon-magenta);
+  margin-bottom: 0.75rem;
+}
+
+#controls-panel ul {
+  list-style: none;
+  font-size: 0.9rem;
+  line-height: 1.8;
+  color: var(--text-dim);
+}
+
+kbd {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 3px;
+  padding: 0.1em 0.4em;
+  font-family: monospace;
+  font-size: 0.85em;
+  color: var(--text-bright);
+}
+
+footer {
+  text-align: center;
+  margin-top: 1rem;
+}
+
+#message {
+  color: var(--neon-orange);
+  font-size: 0.95rem;
+  min-height: 1.4em;
+}

@@ -1,0 +1,42 @@
+{
+  "files": [
+    {
+      "action_id": "op-1",
+      "batch_id": "v0inv:neon-serpents-live-002:1:1:batch:1",
+      "byte_count": 1255,
+      "execution_receipt_id": "v0receipt:v0cmd:neon-serpents-live-002:5:1:execute_bounded_operations:v0inv:neon-serpents-live-002:1:1:batch:1:op-1",
+      "invocation_id": "v0inv:neon-serpents-live-002:1:1",
+      "path": "index.html",
+      "sha256": "ec44c1029bc0451a432c51dae956e3ae2ab9a5c8f792bbf8713381a31c3178c0"
+    },
+    {
+      "action_id": "op-3",
+      "batch_id": "v0inv:neon-serpents-live-002:1:1:batch:1",
+      "byte_count": 4443,
+      "execution_receipt_id": "v0receipt:v0cmd:neon-serpents-live-002:5:1:execute_bounded_operations:v0inv:neon-serpents-live-002:1:1:batch:1:op-3",
+      "invocation_id": "v0inv:neon-serpents-live-002:1:1",
+      "path": "src/entities.js",
+      "sha256": "a7d1dbf5d82e45acb6c4b50db50f3f4dff5cc5ec8bad0be9793f345e2e7fbaa1"
+    },
+    {
+      "action_id": "op-4",
+      "batch_id": "v0inv:neon-serpents-live-002:1:1:batch:1",
+      "byte_count": 5297,
+      "execution_receipt_id": "v0receipt:v0cmd:neon-serpents-live-002:5:1:execute_bounded_operations:v0inv:neon-serpents-live-002:1:1:batch:1:op-4",
+      "invocation_id": "v0inv:neon-serpents-live-002:1:1",
+      "path": "src/render.js",
+      "sha256": "d3fc3856c687f0319f6c5dc86a3c376d9bfc875242d852fb972445c959ef8d7e"
+    },
+    {
+      "action_id": "op-2",
+      "batch_id": "v0inv:neon-serpents-live-002:1:1:batch:1",
+      "byte_count": 2251,
+      "execution_receipt_id": "v0receipt:v0cmd:neon-serpents-live-002:5:1:execute_bounded_operations:v0inv:neon-serpents-live-002:1:1:batch:1:op-2",
+      "invocation_id": "v0inv:neon-serpents-live-002:1:1",
+      "path": "style.css",
+      "sha256": "a658742594ee7aff32ff4f40a0c5bc112d6158dfe98ecac8318194529b4a3651"
+    }
+  ],
+  "schema_version": "admissible_v0_persisted_context_v1",
+  "skipped_paths": []
+}

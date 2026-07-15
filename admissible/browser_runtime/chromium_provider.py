@@ -440,6 +440,40 @@ class ChromiumCdpRuntimeProvider(BaseBrowserRuntimeProvider):
     def _pump_events(self, session: RuntimeSession) -> None:
         time.sleep(0.01)
 
+    # --- bounded read-only document capture (Slice 5A) ------------------
+    MAX_DOCUMENT_HTML_BYTES = 512 * 1024
+
+    def capture_document(self, session: RuntimeSession) -> dict[str, Any]:
+        """Return a bounded serialized-document snapshot for runtime evidence.
+
+        This is a single read-only evaluation of the fixed expressions below;
+        it never accepts a caller expression, mutates the document, or writes
+        anything. The serialized outer HTML is length-bounded so evidence can
+        never grow without limit. Returned on a best-effort basis: any failure
+        yields ``captured=False`` with the reason, never an exception.
+        """
+
+        try:
+            html = self._evaluate(session, "document.documentElement.outerHTML") or ""
+            if not isinstance(html, str):
+                html = str(html)
+            truncated = len(html.encode("utf-8")) > self.MAX_DOCUMENT_HTML_BYTES
+            if truncated:
+                html = html.encode("utf-8")[: self.MAX_DOCUMENT_HTML_BYTES].decode("utf-8", "ignore")
+            ready_state = self._evaluate(session, "document.readyState")
+            title = self._evaluate(session, "document.title")
+            url = self._evaluate(session, "document.location.href")
+            return {
+                "captured": True,
+                "outer_html": html,
+                "outer_html_truncated": bool(truncated),
+                "ready_state": ready_state,
+                "title": title,
+                "final_url": _redact_query(url) if isinstance(url, str) else None,
+            }
+        except Exception as exc:  # noqa: BLE001 - evidence capture must never crash the session
+            return {"captured": False, "reason": f"{type(exc).__name__}: {exc}"}
+
     def close_session(self, session: RuntimeSession) -> dict[str, Any]:
         return self._teardown(session)
 

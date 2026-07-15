@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Neon Serpents</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>Neon Serpents</h1>
+      <div id="hud">
+        <span id="score-label">Score: <span id="score">0</span></span>
+        <span id="status"></span>
+      </div>
+    </header>
+    <main>
+      <canvas id="game-canvas" width="640" height="480" tabindex="0" aria-label="Neon Serpents game board"></canvas>
+      <aside id="controls-panel">
+        <h2>Controls</h2>
+        <ul>
+          <li><kbd>W</kbd> / <kbd>&uarr;</kbd> &mdash; Move up</li>
+          <li><kbd>S</kbd> / <kbd>&darr;</kbd> &mdash; Move down</li>
+          <li><kbd>A</kbd> / <kbd>&larr;</kbd> &mdash; Move left</li>
+          <li><kbd>D</kbd> / <kbd>&rarr;</kbd> &mdash; Move right</li>
+          <li><kbd>Space</kbd> / <kbd>Enter</kbd> &mdash; Start / Restart</li>
+          <li><kbd>P</kbd> &mdash; Pause / Resume</li>
+        </ul>
+      </aside>
+    </main>
+    <footer>
+      <p id="message">Press Space or Enter to start.</p>
+    </footer>
+  </div>
+  <script type="module" src="src/main.js"></script>
+</body>
+</html>

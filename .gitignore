@@ -43,3 +43,7 @@ benchmark/reports/admissible_cursor_real_capture_truth_console.html
 benchmark/reports/admissible_cursor_real_capture_truth_console_trace.json
 benchmark/reports/admissible_cursor_admitted_execution_truth_console.html
 benchmark/reports/admissible_cursor_admitted_execution_truth_console_trace.json
+
+# Admissible V0 runtime advisory locks are machine-local control state,
+# never committed evidence. Defense-in-depth: never let one into the archive.
+*.runtime.lock
