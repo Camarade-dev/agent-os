@@ -48,6 +48,37 @@ The prompt is one final argv item and begins with a fixed harness-controlled
 header. Mission text is embedded in that item and cannot become an option-like
 first argument.
 
+## Attestation classes
+
+Two explicit attestation classes exist and are bound into the attestation,
+request, and owner authorization payload:
+
+- `PACKAGE_BIN_PROVENANCE` — the mode described above; preferred whenever its
+  manifest/bin requirements are satisfied.
+- `LOCAL_WRAPPER_CHAIN` — a weaker, explicitly owner-accepted class for the
+  locally observed `cursor-agent.cmd → cursor-agent.ps1 → versions/<latest>
+  node.exe index.js` chain, whose runtime package intentionally declares no
+  `bin.cursor-agent`. It attests the winning OS command resolution
+  (which/where/Get-Command/PATH/PATHEXT agreement), strict-parsed wrapper
+  bytes and semantics, deterministic version selection, and exact
+  runtime/entry/manifest identity — and explicitly does **not** attest
+  Anysphere publisher identity, Cursor desktop ownership, package-manager
+  ownership, payload signatures, CLI capability behavior (no version/help
+  probe runs in this mode), or production trustworthiness. Its readiness
+  reason is `LOCAL_CURSOR_WRAPPER_CHAIN_ATTESTED_FOR_EXPERIMENT`. A failed
+  package-bin attestation never downgrades to this class; it requires
+  `--attestation-class wrapper-chain` plus an owner digest over a payload
+  naming the class and every non-claim. See
+  `admissible-cursor-wrapper-chain-attestation.md` for the forensic decision.
+
+In wrapper-chain mode the configuration accepts only the bare canonical
+`cursor-agent` command; every launcher file is derived from host discovery,
+so caller-supplied wrapper roots, fake manifests, or injected attestations
+cannot become production-ready. Immediately before spawn the full discovery,
+wrapper parsing, version inventory/selection, and every file identity are
+recomputed and must match the authorized attestation exactly; a newly added
+later version invalidates the authorization.
+
 ## Request, result, and durable sidecars
 
 The immutable request is restricted to execution attempt `0`. It binds the

@@ -24,11 +24,17 @@ from admissible.delegated_gate.checkpoint import capture_checkpoint
 from admissible.delegated_gate.events import CheckpointRecorded, GateExecutionStarted
 from admissible.delegated_gate.models import CommandEvidence, EvidenceKind, EvidenceStatus, GateClause, GateContract, GatePlan, Mission, VerificationCommand
 from admissible.delegated_gate.native_executor import (
+    ATTESTATION_CLASS_PACKAGE_BIN,
+    ATTESTATION_CLASS_WRAPPER_CHAIN,
     AtomicNativeExecutionStore,
+    BackendAttestation,
     CAPTURE_EXPECTED_SUCCESS_STATUS,
+    CURSOR_DISCOVERY_COMMAND,
     CursorNativeBackendConfig,
     NATIVE_PROMPT_HEADER,
     NativeBackendAttestation,
+    PACKAGE_BIN_NON_CLAIMS,
+    WRAPPER_CHAIN_NON_CLAIMS,
     NativeCanaryTerminalRecord,
     NativeCaptureTerminalStatus,
     NativeCheckpointCaptureAttempt,
@@ -69,7 +75,7 @@ DEFAULT_TIMEOUT_SECONDS = 900
 DEFAULT_STDOUT_BYTE_LIMIT = 512 * 1024
 DEFAULT_STDERR_BYTE_LIMIT = 128 * 1024
 OWNER_AUTHORIZATION_DIGEST_ENV = "ADMISSIBLE_NATIVE_CANARY_OWNER_AUTHORIZATION_SHA256"
-AUTHORIZATION_SCHEMA_VERSION = "admissible_native_canary_authorization_v1"
+AUTHORIZATION_SCHEMA_VERSION = "admissible_native_canary_authorization_v2"
 BEHAVIORAL_EVIDENCE_SCHEMA_VERSION = "admissible_native_canary_behavioral_evidence_v1"
 EXPECTED_MATERIAL_PATHS = frozenset({"README.md", "src/game-state.js", "src/score.js", "test/game-state.test.js"})
 
@@ -410,7 +416,7 @@ def _checkpoint_success_reason(checkpoint: Any, gate_contract: GateContract) -> 
 
 class NativeCanaryCoordinator:
     """One READY_FOR_GATE -> CHECKPOINT_CAPTURED canary path, with no retry."""
-    def __init__(self, *, session_store: AtomicDelegatedSessionStore, execution_store: AtomicNativeExecutionStore, executor: NativeDelegatedExecutor, backend_attestation: NativeBackendAttestation, source_repository: str | Path, work_workspace: str | Path, canary_parent: str | Path, evidence_directory: str | Path, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS, stdout_byte_limit: int = DEFAULT_STDOUT_BYTE_LIMIT, stderr_byte_limit: int = DEFAULT_STDERR_BYTE_LIMIT) -> None:
+    def __init__(self, *, session_store: AtomicDelegatedSessionStore, execution_store: AtomicNativeExecutionStore, executor: NativeDelegatedExecutor, backend_attestation: BackendAttestation, source_repository: str | Path, work_workspace: str | Path, canary_parent: str | Path, evidence_directory: str | Path, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS, stdout_byte_limit: int = DEFAULT_STDOUT_BYTE_LIMIT, stderr_byte_limit: int = DEFAULT_STDERR_BYTE_LIMIT) -> None:
         self.session_store=session_store; self.execution_store=execution_store; self.executor=executor; self.backend_attestation=backend_attestation.validated()
         self.source_repository,_=_safe_directory(source_repository,"source repository"); self.work_workspace,_=_safe_directory(work_workspace,"work workspace"); self.canary_parent,_=_safe_directory(canary_parent,"canary parent"); self.evidence_directory,_=_safe_directory(evidence_directory,"evidence directory")
         self.timeout_seconds=timeout_seconds; self.stdout_byte_limit=stdout_byte_limit; self.stderr_byte_limit=stderr_byte_limit
@@ -528,7 +534,9 @@ class NativeCanaryAuthorizationPayload:
     mission_fingerprint: str
     gate_plan_fingerprint: str
     gate_contract_fingerprint: str
+    backend_attestation_class: str
     backend_attestation_fingerprint: str
+    attestation_non_claims: tuple[str, ...]
     executable: str
     launcher_prefix: tuple[str, ...]
     selected_model: str
@@ -542,12 +550,20 @@ class NativeCanaryAuthorizationPayload:
     evidence_root: str
     payload_fingerprint: str
     def _body(self) -> dict[str, Any]:
-        data=dict(self.__dict__); data["launcher_prefix"]=list(self.launcher_prefix); data["budgets"]=list(self.budgets); data.pop("payload_fingerprint"); return data
+        data=dict(self.__dict__); data["launcher_prefix"]=list(self.launcher_prefix); data["budgets"]=list(self.budgets); data["attestation_non_claims"]=list(self.attestation_non_claims); data.pop("payload_fingerprint"); return data
     def validated(self) -> "NativeCanaryAuthorizationPayload":
         if self.schema_version!=AUTHORIZATION_SCHEMA_VERSION: raise ValueError("unsupported authorization payload")
         _safe_directory(self.source_repository,"authorization source repository"); require_sha256(self.mission_fingerprint,"authorization mission fingerprint"); require_sha256(self.gate_plan_fingerprint,"authorization gate plan fingerprint"); require_sha256(self.gate_contract_fingerprint,"authorization gate contract fingerprint"); require_sha256(self.backend_attestation_fingerprint,"authorization backend fingerprint"); require_sha256(self.payload_fingerprint,"authorization payload fingerprint")
         require_identifier(self.run_id,"authorization run ID"); require_identifier(self.session_id,"authorization session ID"); require_nonempty_text(self.source_head,"authorization source HEAD",max_bytes=128); require_nonempty_text(self.selected_model,"authorization model",max_bytes=256); require_nonempty_text(self.fixture_version,"fixture version",max_bytes=128); require_nonempty_text(self.required_commit_message,"commit message",max_bytes=1024)
         if not self.clean_worktree_required: raise ValueError("authorization must require a clean worktree")
+        if self.backend_attestation_class == ATTESTATION_CLASS_PACKAGE_BIN:
+            if tuple(self.attestation_non_claims) != PACKAGE_BIN_NON_CLAIMS: raise ValueError("authorization non-claims differ from the package-bin attestation class")
+        elif self.backend_attestation_class == ATTESTATION_CLASS_WRAPPER_CHAIN:
+            # The owner explicitly authorizes the weaker class with every
+            # non-claim spelled out; a mismatch is not authorizable.
+            if tuple(self.attestation_non_claims) != WRAPPER_CHAIN_NON_CLAIMS: raise ValueError("authorization non-claims differ from the wrapper-chain attestation class")
+        else:
+            raise ValueError("authorization attestation class is unsupported")
         for value in self.launcher_prefix: require_nonempty_text(value,"authorization launcher path",max_bytes=4096)
         for value in self.budgets: require_strict_int(value,"authorization budget",minimum=0,maximum=1)
         require_strict_int(self.timeout_seconds,"authorization timeout",minimum=1,maximum=3600); require_strict_int(self.stdout_byte_limit,"authorization stdout limit",minimum=1,maximum=16*1024*1024); require_strict_int(self.stderr_byte_limit,"authorization stderr limit",minimum=1,maximum=16*1024*1024)
@@ -556,9 +572,9 @@ class NativeCanaryAuthorizationPayload:
     def to_dict(self) -> dict[str, Any]: data=self._body(); data["payload_fingerprint"]=self.payload_fingerprint; return data
 
 
-def build_authorization_payload(*, source_repository: Path, source_head: str, run_id: str, session_id: str, attestation: NativeBackendAttestation, run_root: str | Path, timeout_seconds: int) -> NativeCanaryAuthorizationPayload:
+def build_authorization_payload(*, source_repository: Path, source_head: str, run_id: str, session_id: str, attestation: BackendAttestation, run_root: str | Path, timeout_seconds: int) -> NativeCanaryAuthorizationPayload:
     state=create_canary_session(session_id=session_id); root=Path(os.path.abspath(os.fspath(run_root))); evidence=root / "evidence"; attestation=attestation.validated()
-    provisional=NativeCanaryAuthorizationPayload(AUTHORIZATION_SCHEMA_VERSION,str(source_repository),source_head.lower(),True,run_id,session_id,state.mission.mission_fingerprint,state.gate_plan.plan_fingerprint,state.current_gate.contract_fingerprint,attestation.attestation_fingerprint,attestation.executable.canonical_path,tuple(item.canonical_path for item in attestation.launcher_prefix),attestation.selected_model,timeout_seconds,DEFAULT_STDOUT_BYTE_LIMIT,DEFAULT_STDERR_BYTE_LIMIT,(1,1,0,0,0),CANARY_FIXTURE_VERSION,REQUIRED_COMMIT_MESSAGE,str(root),str(evidence),"0"*64)
+    provisional=NativeCanaryAuthorizationPayload(AUTHORIZATION_SCHEMA_VERSION,str(source_repository),source_head.lower(),True,run_id,session_id,state.mission.mission_fingerprint,state.gate_plan.plan_fingerprint,state.current_gate.contract_fingerprint,attestation.attestation_class,attestation.attestation_fingerprint,tuple(attestation.non_claims),attestation.executable.canonical_path,tuple(item.canonical_path for item in attestation.launcher_prefix),attestation.selected_model,timeout_seconds,DEFAULT_STDOUT_BYTE_LIMIT,DEFAULT_STDERR_BYTE_LIMIT,(1,1,0,0,0),CANARY_FIXTURE_VERSION,REQUIRED_COMMIT_MESSAGE,str(root),str(evidence),"0"*64)
     return NativeCanaryAuthorizationPayload(**{**provisional.__dict__,"payload_fingerprint":fingerprint(provisional._body())}).validated()
 
 
@@ -593,6 +609,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser=argparse.ArgumentParser(prog="python -m admissible.delegated_gate.native_canary",description="Future-only one-shot locally-attested native Cursor canary")
     parser.add_argument("--source-repository",required=True); parser.add_argument("--required-source-head",required=True); parser.add_argument("--run-root",required=True); parser.add_argument("--run-id",required=True); parser.add_argument("--session-id",required=True)
     parser.add_argument("--executable",required=True); parser.add_argument("--executable-prefix-arg",action="append",default=[]); parser.add_argument("--model",default="auto"); parser.add_argument("--timeout-seconds",type=int,default=DEFAULT_TIMEOUT_SECONDS)
+    parser.add_argument("--attestation-class",choices=["package-bin","wrapper-chain"],default="package-bin",help="Explicit attestation class. wrapper-chain is the weaker LOCAL_WRAPPER_CHAIN class: it derives every launcher file from canonical host cursor-agent discovery, establishes no publisher provenance, and requires owner authorization naming that exact class.")
     parser.add_argument("--owner-authorization",help="Explicit owner phrase; never persisted"); parser.add_argument("--preflight-only",action="store_true",help="Print local attestation and authorization payload without creating a run")
     return parser
 
@@ -604,7 +621,10 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc: print(json.dumps({**blocked,"detail":str(exc)},sort_keys=True)); return 2
     ready,detail=_git_source_preflight(source,args.required_source_head)
     if not ready: print(json.dumps({**blocked,"detail":detail},sort_keys=True)); return 2
-    config=CursorNativeBackendConfig(executable=args.executable,launcher_prefix=tuple(args.executable_prefix_arg),model=args.model); decision:NativePreflightDecision=preflight_native_cursor(config=config)
+    attestation_class=ATTESTATION_CLASS_WRAPPER_CHAIN if args.attestation_class=="wrapper-chain" else ATTESTATION_CLASS_PACKAGE_BIN
+    try: config=CursorNativeBackendConfig(executable=args.executable,launcher_prefix=tuple(args.executable_prefix_arg),model=args.model,attestation_class=attestation_class)
+    except ValueError as exc: print(json.dumps({**blocked,"detail":str(exc)},sort_keys=True)); return 2
+    decision:NativePreflightDecision=preflight_native_cursor(config=config)
     if not decision.ready or decision.attestation is None: print(json.dumps({**blocked,"detail":decision.detail,"reason_code":decision.reason_code},sort_keys=True)); return 2
     payload=build_authorization_payload(source_repository=source,source_head=args.required_source_head,run_id=args.run_id,session_id=args.session_id,attestation=decision.attestation,run_root=args.run_root,timeout_seconds=args.timeout_seconds)
     if args.preflight_only: print(json.dumps({"status":NativePreflightStatus.PREFLIGHT_READY.value,"authorization_payload":payload.to_dict(),"attestation":decision.attestation.to_dict()},sort_keys=True)); return 0

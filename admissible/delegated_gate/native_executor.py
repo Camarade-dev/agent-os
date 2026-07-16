@@ -47,13 +47,44 @@ REQUEST_SCHEMA_VERSION = "admissible_native_execution_request_v2"
 RESULT_SCHEMA_VERSION = "admissible_native_execution_result_v2"
 ARTIFACT_SCHEMA_VERSION = "admissible_native_execution_artifact_v2"
 ATTESTATION_SCHEMA_VERSION = "admissible_native_backend_attestation_v1"
+WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION = "admissible_cursor_wrapper_chain_attestation_v1"
+ATTESTATION_CLASS_PACKAGE_BIN = "PACKAGE_BIN_PROVENANCE"
+ATTESTATION_CLASS_WRAPPER_CHAIN = "LOCAL_WRAPPER_CHAIN"
 CAPTURE_ATTEMPT_SCHEMA_VERSION = "admissible_native_capture_attempt_v1"
 CAPTURE_EXPECTED_SUCCESS_STATUS = "CHECKPOINT_CAPTURED"
 TERMINAL_SCHEMA_VERSION = "admissible_native_canary_terminal_v1"
 BACKEND_IDENTITY = "cursor-agent-native-oneshot"
 BACKEND_PROTOCOL_VERSION = "cursor-agent-print-force-v2"
 CURSOR_DISCOVERY_MECHANISM = "shutil.which:cursor-agent"
+WRAPPER_CHAIN_DISCOVERY_MECHANISM = "which+where+powershell-get-command:cursor-agent"
 CURSOR_DISCOVERY_COMMAND = "cursor-agent"
+WRAPPER_CHAIN_READY_REASON = "LOCAL_CURSOR_WRAPPER_CHAIN_ATTESTED_FOR_EXPERIMENT"
+WRAPPER_CHAIN_BLOCKED_REASON = "LOCAL_WRAPPER_CHAIN_ATTESTATION_BLOCKED"
+PACKAGE_BIN_NON_CLAIMS: tuple[str, ...] = (
+    "publisher identity is not cryptographically established",
+    "javascript payload integrity is locally hashed, not signed",
+)
+WRAPPER_CHAIN_NON_CLAIMS: tuple[str, ...] = (
+    "anysphere publisher identity is not established",
+    "ownership by the signed cursor desktop installation is not established",
+    "package-manager or installer ownership is not established",
+    "the javascript payload carries no verified signature",
+    "native cli argument and capability behavior is experimentally unproven",
+    "production trustworthiness is not established",
+    "suitable only for an explicitly owner-authorized local experiment",
+)
+WRAPPER_CHAIN_CLAIMS: dict[str, bool] = {
+    "command_routing_chain_established": True,
+    "local_file_identity_established": True,
+    "deterministic_version_selection_established": True,
+    "wrapper_stability_between_attestation_and_spawn_required": True,
+    "publisher_provenance_established": False,
+    "cursor_desktop_ownership_established": False,
+    "package_manager_ownership_established": False,
+    "javascript_payload_signature_present": False,
+    "cli_capability_behavior_proven": False,
+    "production_trustworthiness_established": False,
+}
 EXPECTED_CURSOR_PACKAGE_NAME = "@anysphere/agent-cli-runtime"
 PROCESS_TREE_CLEANUP_POLICY = "managed-process-tree-hard-timeout-and-proven-empty"
 NATIVE_PROMPT_HEADER = "You are the Admissible native coding agent."
@@ -318,10 +349,20 @@ class CursorNativeBackendConfig:
     launcher_prefix: tuple[str, ...] = ()
     model: str = "auto"
     environment_allowlist: tuple[str, ...] = DEFAULT_ENVIRONMENT_ALLOWLIST
+    attestation_class: str = ATTESTATION_CLASS_PACKAGE_BIN
 
     def __post_init__(self) -> None:
         if not isinstance(self.executable, str) or not self.executable or "\x00" in self.executable:
             raise ValueError("a native Cursor executable is required")
+        if self.attestation_class not in {ATTESTATION_CLASS_PACKAGE_BIN, ATTESTATION_CLASS_WRAPPER_CHAIN}:
+            raise ValueError("unsupported native attestation class")
+        if self.attestation_class == ATTESTATION_CLASS_WRAPPER_CHAIN and (
+            self.executable != CURSOR_DISCOVERY_COMMAND or self.launcher_prefix
+        ):
+            # Wrapper-chain mode derives every launcher file from canonical
+            # host command discovery; a caller-supplied root or prefix is not
+            # an acceptable substitute for the winning OS resolution.
+            raise ValueError("wrapper-chain attestation accepts only the bare canonical cursor-agent command")
         _validate_argv((self.executable, *self.launcher_prefix), "Cursor launcher")
         require_nonempty_text(self.model, "Cursor model", max_bytes=256)
         if not isinstance(self.environment_allowlist, tuple) or not self.environment_allowlist:
@@ -475,6 +516,605 @@ class CursorInstallationProvenance:
         return cls(**values).validated()
 
 
+_VERSION_DIR_PATTERN = re.compile(r"^\d{4}\.\d{1,2}\.\d{1,2}(-\d{2}-\d{2}-\d{2})?-[a-f0-9]+$")
+_CMD_BANNED_CHARACTERS = re.compile(r"[&|<>^!]")
+_CMD_INVOCATION_PATTERN = re.compile(
+    r'%SystemRoot%\\System32\\WindowsPowerShell\\v1\.0\\powershell\.exe'
+    r' -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%\\(?P<target>[A-Za-z0-9][A-Za-z0-9._-]*\.ps1)" %\*'
+)
+# The exact locally observed Anysphere launcher grammar, normalized by
+# removing comment-only and blank lines.  The recognizer accepts nothing else:
+# any added executable behavior changes at least one non-comment line.
+_POWERSHELL_WRAPPER_TEMPLATE_LINES: tuple[str, ...] = (
+    "if (-not $env:CURSOR_INVOKED_AS) {",
+    "    $env:CURSOR_INVOKED_AS = Split-Path -leaf $MyInvocation.MyCommand.Name",
+    "}",
+    "$scriptPath = Split-Path -parent $MyInvocation.MyCommand.Definition",
+    "function Parse-VersionString {",
+    "    param (",
+    "        [string]$versionString",
+    "    )",
+    "    $datePart = $versionString.Split('-')[0]",
+    "    $parts = $datePart.Split('.')",
+    "    if ($parts.Length -ne 3) {",
+    '        throw "Invalid version format. Expected format: YYYY.MM.DD-commit"',
+    "    }",
+    "    $year = $parts[0]",
+    "    $month = $parts[1].PadLeft(2, '0')",
+    "    $day = $parts[2].PadLeft(2, '0')",
+    "    return [int]($year + $month + $day)",
+    "}",
+    "if (-not $env:NODE_COMPILE_CACHE) {",
+    '    $env:NODE_COMPILE_CACHE = "$env:LOCALAPPDATA\\cursor-compile-cache"',
+    "}",
+    'if (Test-Path "$scriptPath\\node.exe") {',
+    '    & "$scriptPath\\node.exe" "$scriptPath\\index.js" $args',
+    "    exit $LASTEXITCODE",
+    "}",
+    '$versionDir = Get-ChildItem -Path "$scriptPath\\versions" -Directory |',
+    "    Where-Object {",
+    "        $name = $_.Name",
+    "        $name -match '^\\d{4}\\.\\d{1,2}\\.\\d{1,2}(-\\d{2}-\\d{2}-\\d{2})?-[a-f0-9]+$'",
+    "    } |",
+    "    Sort-Object { Parse-VersionString $_.Name } -Descending |",
+    "    Select-Object -First 1",
+    "if (-not $versionDir) {",
+    '    Write-Error "No version directories found in $scriptPath"',
+    "    exit 1",
+    "}",
+    "$versionName = $versionDir.Name",
+    '$nodePath = "$scriptPath\\versions\\$versionName\\node.exe"',
+    '& "$nodePath" "$scriptPath\\versions\\$versionName\\index.js" $args',
+    "exit $LASTEXITCODE",
+)
+
+
+def _parse_cmd_wrapper(data: bytes, *, wrapper_name: str) -> dict[str, Any]:
+    """Strict recognizer for the exact observed cursor-agent.cmd semantics.
+
+    This is deliberately not a batch interpreter.  Anything beyond the audited
+    ``powershell.exe -NoProfile ... adjacent .ps1 %*`` forwarding shape fails.
+    """
+
+    if not isinstance(data, bytes) or len(data) > 8192:
+        raise ValueError("cmd wrapper bytes are missing or oversized")
+    try:
+        text = data.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ValueError("cmd wrapper must be plain ASCII") from exc
+    if _CMD_BANNED_CHARACTERS.search(text):
+        raise ValueError("cmd wrapper contains shell operators, chaining, or redirection")
+    lines = [line.rstrip() for line in text.replace("\r\n", "\n").split("\n")]
+    body = [line for line in lines if line.strip() and not line.strip().upper().startswith("REM ")]
+    if len(body) != 6:
+        raise ValueError("cmd wrapper command structure differs from the audited grammar")
+    if body[0].lower() != "@echo off" or body[1].lower() != "setlocal enabledelayedexpansion":
+        raise ValueError("cmd wrapper prologue differs from the audited grammar")
+    if body[2] != 'set "CURSOR_INVOKED_AS=%~nx0"' or body[3] != 'set "SCRIPT_DIR=%~dp0"':
+        raise ValueError("cmd wrapper variable derivation differs from the audited grammar")
+    if body[4] != 'if "%SCRIPT_DIR:~-1%"=="\\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"':
+        raise ValueError("cmd wrapper directory normalization differs from the audited grammar")
+    invocation = _CMD_INVOCATION_PATTERN.fullmatch(body[5])
+    if invocation is None:
+        raise ValueError("cmd wrapper does not perform the single audited adjacent PowerShell invocation")
+    target = invocation.group("target")
+    expected = f"{Path(wrapper_name).stem}.ps1"
+    if target != expected:
+        raise ValueError("cmd wrapper targets a PowerShell script other than its adjacent same-name wrapper")
+    return {
+        "wrapper_kind": "cmd",
+        "interpreter": "%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        "no_profile": True,
+        "execution_policy": "Bypass",
+        "adjacent_powershell_target": target,
+        "argument_forwarding": "%*",
+        "changes_cwd": False,
+        "extra_commands": 0,
+        "shell_operators": 0,
+    }
+
+
+def _parse_powershell_wrapper(data: bytes) -> dict[str, Any]:
+    """Bounded recognizer for the observed version-selecting launcher script.
+
+    It accepts exactly the audited statement sequence and fails closed on any
+    unrecognized executable behavior; it does not interpret PowerShell.
+    """
+
+    if not isinstance(data, bytes) or len(data) > 64 * 1024:
+        raise ValueError("PowerShell wrapper bytes are missing or oversized")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("PowerShell wrapper must be UTF-8 text") from exc
+    if "<#" in text or '@"' in text or "@'" in text:
+        raise ValueError("PowerShell wrapper contains block comments or here-strings outside the audited grammar")
+    normalized: list[str] = []
+    for raw in text.replace("\r\n", "\n").split("\n"):
+        line = raw.rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if line.endswith("`"):
+            raise ValueError("PowerShell wrapper uses line continuation outside the audited grammar")
+        normalized.append(line)
+    if tuple(normalized) != _POWERSHELL_WRAPPER_TEMPLATE_LINES:
+        raise ValueError("PowerShell wrapper contains executable behavior outside the audited launcher grammar")
+    grammar_line = next(line for line in normalized if "-match" in line)
+    grammar = grammar_line.strip()[len("$name -match '"):-1]
+    if grammar != _VERSION_DIR_PATTERN.pattern:
+        raise ValueError("PowerShell wrapper version grammar differs from the audited pattern")
+    return {
+        "wrapper_kind": "powershell",
+        "derives_own_directory": True,
+        "adjacent_node_shortcut": True,
+        "version_enumeration_root": "versions",
+        "version_name_grammar": grammar,
+        "ordering": "date-integer-descending",
+        "selection": "latest-single",
+        "executes": "selected-version node.exe index.js",
+        "argument_forwarding": "$args",
+        "network_actions": 0,
+        "installer_actions": 0,
+        "leaves_wrapper_root": False,
+    }
+
+
+def _wrapper_version_key(name: str) -> int:
+    year, month, day = name.split("-")[0].split(".")
+    return int(year + month.zfill(2) + day.zfill(2))
+
+
+def _select_wrapper_version(wrapper_root: Path) -> tuple[tuple[str, ...], str]:
+    """Recompute the wrapper's deterministic latest-version selection."""
+
+    versions_dir, _ = _safe_directory(wrapper_root / "versions", "Cursor versions directory")
+    names: list[str] = []
+    for child in sorted(versions_dir.iterdir(), key=lambda item: item.name):
+        if not _VERSION_DIR_PATTERN.match(child.name):
+            continue
+        metadata = os.lstat(child)
+        if _is_redirecting_path(child, metadata):
+            raise ValueError("Cursor version directory contains a redirecting link or reparse point")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError("Cursor version candidate is not a plain directory")
+        names.append(child.name)
+    if not names:
+        raise ValueError("no Cursor version directory matches the audited wrapper grammar")
+    best = max(_wrapper_version_key(name) for name in names)
+    winners = [name for name in names if _wrapper_version_key(name) == best]
+    if len(winners) != 1:
+        raise ValueError("Cursor version selection is ambiguous for the audited wrapper ordering")
+    return tuple(names), winners[0]
+
+
+class WrapperChainDiscovery(Protocol):
+    """Host command-resolution surface for wrapper-chain attestation.
+
+    Tests may substitute a fake adapter through explicit attestor arguments;
+    the production CLI never exposes that seam and always uses the host.
+    """
+
+    def which_cursor_agent(self) -> str | None: ...
+    def where_cursor_agent(self) -> tuple[str, ...]: ...
+    def powershell_cursor_agent(self) -> tuple[str, ...] | None: ...
+    def path_value(self) -> str: ...
+    def pathext_value(self) -> str: ...
+    def node_signature_context(self, node_path: Path) -> str: ...
+
+
+class HostWrapperChainDiscovery:
+    """Real OS resolution for cursor-agent; never executes the bundle."""
+
+    @staticmethod
+    def _bounded_lines(argv: list[str]) -> tuple[str, ...] | None:
+        try:
+            completed = subprocess.run(argv, shell=False, check=False, capture_output=True, timeout=20, stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace")
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if completed.returncode != 0:
+            return ()
+        return tuple(line.strip() for line in completed.stdout[:_PROBE_LIMIT].splitlines() if line.strip())
+
+    def which_cursor_agent(self) -> str | None:
+        return shutil.which(CURSOR_DISCOVERY_COMMAND)
+
+    def where_cursor_agent(self) -> tuple[str, ...]:
+        lines = self._bounded_lines(["where.exe", CURSOR_DISCOVERY_COMMAND])
+        if lines is None:
+            raise ValueError("where.exe command resolution is unavailable")
+        return lines
+
+    def powershell_cursor_agent(self) -> tuple[str, ...] | None:
+        lines = self._bounded_lines([
+            "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+            f"(Get-Command {CURSOR_DISCOVERY_COMMAND} -All -CommandType Application,ExternalScript -ErrorAction SilentlyContinue | ForEach-Object {{ $_.Path }})",
+        ])
+        return lines
+
+    def path_value(self) -> str:
+        return os.environ.get("PATH", "")
+
+    def pathext_value(self) -> str:
+        return os.environ.get("PATHEXT", "")
+
+    def node_signature_context(self, node_path: Path) -> str:
+        text = os.fspath(node_path)
+        if "'" in text or "\x00" in text:
+            return "signature-context-unavailable"
+        lines = self._bounded_lines([
+            "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+            f"$s = Get-AuthenticodeSignature -LiteralPath '{text}'; Write-Output ($s.Status.ToString() + '|' + [string]$s.SignerCertificate.Subject)",
+        ])
+        if not lines:
+            return "signature-context-unavailable"
+        return "|".join(lines)[:512]
+
+
+def _normalized_path(value: str) -> str:
+    return os.path.normcase(os.path.abspath(value))
+
+
+@dataclass(frozen=True)
+class CursorWrapperChainResolution:
+    """Canonical winning OS command resolution for cursor-agent."""
+
+    discovery_mechanism: str
+    command: str
+    which_path: str
+    where_paths: tuple[str, ...]
+    powershell_paths: tuple[str, ...]
+    powershell_available: bool
+    winning_cmd: NativeBackendFileAttestation
+    candidates: tuple[NativeBackendFileAttestation, ...]
+    wrapper_root: str
+    wrapper_root_identity: NativeFilesystemIdentity
+    authoritative_path_entry: str
+    path_sha256: str
+    pathext: tuple[str, ...]
+
+    def _body(self) -> dict[str, Any]:
+        return {
+            "discovery_mechanism": self.discovery_mechanism, "command": self.command,
+            "which_path": self.which_path, "where_paths": list(self.where_paths),
+            "powershell_paths": list(self.powershell_paths), "powershell_available": self.powershell_available,
+            "winning_cmd": self.winning_cmd.to_dict(), "candidates": [item.to_dict() for item in self.candidates],
+            "wrapper_root": self.wrapper_root, "wrapper_root_identity": self.wrapper_root_identity.to_dict(),
+            "authoritative_path_entry": self.authoritative_path_entry, "path_sha256": self.path_sha256,
+            "pathext": list(self.pathext),
+        }
+
+    def validated(self) -> "CursorWrapperChainResolution":
+        if self.discovery_mechanism != WRAPPER_CHAIN_DISCOVERY_MECHANISM or self.command != CURSOR_DISCOVERY_COMMAND:
+            raise ValueError("unsupported wrapper-chain discovery mechanism")
+        self.winning_cmd.validated()
+        winner = Path(self.winning_cmd.canonical_path)
+        if winner.stem.lower() != CURSOR_DISCOVERY_COMMAND or winner.suffix.lower() != ".cmd":
+            raise ValueError("winning cursor-agent command is not the canonical cmd wrapper")
+        require_nonempty_text(self.which_path, "which resolution", max_bytes=4096)
+        if not self.where_paths:
+            raise ValueError("where.exe produced no cursor-agent candidate")
+        if _normalized_path(self.which_path) != _normalized_path(str(winner)) or _normalized_path(self.where_paths[0]) != _normalized_path(str(winner)):
+            raise ValueError("which/where cursor-agent resolutions are contradictory")
+        require_bool(self.powershell_available, "powershell resolution availability")
+        if self.powershell_available and not self.powershell_paths:
+            raise ValueError("PowerShell resolution is available but produced no cursor-agent candidate")
+        if not self.powershell_available and self.powershell_paths:
+            raise ValueError("PowerShell resolution availability contradicts its candidates")
+        wrapper_root, identity = _safe_directory(self.wrapper_root, "Cursor wrapper root")
+        if str(wrapper_root) != self.wrapper_root or not _same_directory_identity(identity, self.wrapper_root_identity):
+            raise ValueError("Cursor wrapper root path or identity changed")
+        if winner.parent != wrapper_root:
+            raise ValueError("winning cursor-agent command is outside the attested wrapper root")
+        for value in (*self.where_paths, *self.powershell_paths):
+            candidate = Path(os.path.abspath(value))
+            if _normalized_path(str(candidate.parent)) != _normalized_path(str(wrapper_root)):
+                raise ValueError("a discovered cursor-agent candidate resolves outside the winning wrapper root")
+            if candidate.stem.lower() != CURSOR_DISCOVERY_COMMAND:
+                raise ValueError("a discovered cursor-agent candidate has an unexpected name")
+        if not self.candidates:
+            raise ValueError("wrapper-chain resolution must bind every discovered candidate")
+        seen: set[str] = set()
+        for item in self.candidates:
+            item.validated()
+            path = Path(item.canonical_path)
+            if path.parent != wrapper_root:
+                raise ValueError("an attested candidate escapes the wrapper root")
+            seen.add(_normalized_path(item.canonical_path))
+        for value in (self.which_path, *self.where_paths, *self.powershell_paths):
+            if _normalized_path(value) not in seen:
+                raise ValueError("a discovered candidate lacks a bound file attestation")
+        if _normalized_path(self.authoritative_path_entry) != _normalized_path(str(wrapper_root)):
+            raise ValueError("authoritative PATH entry differs from the wrapper root")
+        require_sha256(self.path_sha256, "PATH fingerprint")
+        if not isinstance(self.pathext, tuple) or not self.pathext or ".CMD" not in {item.upper() for item in self.pathext}:
+            raise ValueError("PATHEXT semantics do not cover the winning cmd wrapper")
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        return self._body()
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "CursorWrapperChainResolution":
+        require_exact_keys(data, set(cls.__dataclass_fields__), "wrapper-chain command resolution")
+        values = dict(data)
+        values["winning_cmd"] = NativeBackendFileAttestation.from_dict(data["winning_cmd"])
+        values["candidates"] = tuple(NativeBackendFileAttestation.from_dict(item) for item in data["candidates"])
+        values["wrapper_root_identity"] = NativeFilesystemIdentity.from_dict(data["wrapper_root_identity"])
+        for key in ("where_paths", "powershell_paths", "pathext"):
+            values[key] = require_string_list(data[key], key)
+        return cls(**values).validated()
+
+
+def _validated_semantics(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or not value:
+        raise ValueError(f"{label} parsed semantics are missing")
+    for key, item in value.items():
+        if not isinstance(key, str) or not isinstance(item, (str, bool, int)):
+            raise ValueError(f"{label} parsed semantics contain an unsupported value")
+    return dict(value)
+
+
+@dataclass(frozen=True)
+class WrapperChainBackendAttestation:
+    """LOCAL_WRAPPER_CHAIN attestation: routing and byte identity only.
+
+    This class deliberately does not claim publisher identity, desktop-app
+    ownership, package-manager ownership, payload signatures, or production
+    trust.  It exists solely so one explicitly owner-authorized local
+    experiment can bind the exact mechanically observed launch chain.
+    """
+
+    schema_version: str
+    attestation_class: str
+    backend_identity: str
+    backend_protocol_version: str
+    command_resolution: CursorWrapperChainResolution
+    cmd_wrapper: NativeBackendFileAttestation
+    cmd_semantics: Mapping[str, Any]
+    powershell_wrapper: NativeBackendFileAttestation
+    powershell_semantics: Mapping[str, Any]
+    version_inventory: tuple[str, ...]
+    selected_version: str
+    selected_version_root: str
+    selected_version_root_identity: NativeFilesystemIdentity
+    executable: NativeBackendFileAttestation
+    launcher_prefix: tuple[NativeBackendFileAttestation, ...]
+    package_manifest: NativeBackendFileAttestation
+    package_name: str
+    manifest_declares_cursor_agent_bin: bool
+    version_wrapper_copies: tuple[NativeBackendFileAttestation, ...]
+    node_signature_context: str
+    claims: Mapping[str, bool]
+    non_claims: tuple[str, ...]
+    static_argv_template: tuple[str, ...]
+    selected_model: str
+    environment_allowlist: tuple[str, ...]
+    attestation_fingerprint: str
+
+    def _body(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version, "attestation_class": self.attestation_class,
+            "backend_identity": self.backend_identity, "backend_protocol_version": self.backend_protocol_version,
+            "command_resolution": self.command_resolution.to_dict(),
+            "cmd_wrapper": self.cmd_wrapper.to_dict(), "cmd_semantics": dict(self.cmd_semantics),
+            "powershell_wrapper": self.powershell_wrapper.to_dict(), "powershell_semantics": dict(self.powershell_semantics),
+            "version_inventory": list(self.version_inventory), "selected_version": self.selected_version,
+            "selected_version_root": self.selected_version_root,
+            "selected_version_root_identity": self.selected_version_root_identity.to_dict(),
+            "executable": self.executable.to_dict(),
+            "launcher_prefix": [item.to_dict() for item in self.launcher_prefix],
+            "package_manifest": self.package_manifest.to_dict(), "package_name": self.package_name,
+            "manifest_declares_cursor_agent_bin": self.manifest_declares_cursor_agent_bin,
+            "version_wrapper_copies": [item.to_dict() for item in self.version_wrapper_copies],
+            "node_signature_context": self.node_signature_context,
+            "claims": dict(self.claims), "non_claims": list(self.non_claims),
+            "static_argv_template": list(self.static_argv_template),
+            "selected_model": self.selected_model, "environment_allowlist": list(self.environment_allowlist),
+        }
+
+    def validated(self) -> "WrapperChainBackendAttestation":
+        if (
+            self.schema_version != WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION
+            or self.attestation_class != ATTESTATION_CLASS_WRAPPER_CHAIN
+            or self.backend_identity != BACKEND_IDENTITY
+            or self.backend_protocol_version != BACKEND_PROTOCOL_VERSION
+        ):
+            raise ValueError("unsupported wrapper-chain backend attestation")
+        self.command_resolution.validated()
+        wrapper_root = Path(self.command_resolution.wrapper_root)
+        self.cmd_wrapper.validated(); self.powershell_wrapper.validated()
+        if Path(self.cmd_wrapper.canonical_path) != Path(self.command_resolution.winning_cmd.canonical_path):
+            raise ValueError("attested cmd wrapper differs from the winning command resolution")
+        cmd_path = Path(self.cmd_wrapper.canonical_path)
+        cmd_semantics = _parse_cmd_wrapper(cmd_path.read_bytes(), wrapper_name=cmd_path.name)
+        if _validated_semantics(self.cmd_semantics, "cmd wrapper") != cmd_semantics:
+            raise ValueError("cmd wrapper parsed semantics changed")
+        expected_ps = wrapper_root / cmd_semantics["adjacent_powershell_target"]
+        if Path(self.powershell_wrapper.canonical_path) != expected_ps:
+            raise ValueError("attested PowerShell wrapper is not the cmd wrapper's adjacent target")
+        ps_semantics = _parse_powershell_wrapper(expected_ps.read_bytes())
+        if _validated_semantics(self.powershell_semantics, "PowerShell wrapper") != ps_semantics:
+            raise ValueError("PowerShell wrapper parsed semantics changed")
+        if (wrapper_root / "node.exe").exists():
+            raise ValueError("wrapper root contains an adjacent node.exe shortcut outside the attested version chain")
+        inventory, selected = _select_wrapper_version(wrapper_root)
+        if inventory != self.version_inventory or selected != self.selected_version:
+            raise ValueError("Cursor version inventory or selection changed after attestation")
+        selected_root, selected_identity = _safe_directory(wrapper_root / "versions" / selected, "selected Cursor version root")
+        if str(selected_root) != self.selected_version_root or not _same_directory_identity(selected_identity, self.selected_version_root_identity):
+            raise ValueError("selected Cursor version root path or identity changed")
+        self.executable.validated(); self.package_manifest.validated()
+        if Path(self.executable.canonical_path) != selected_root / "node.exe":
+            raise ValueError("attested runtime is not the selected version's node.exe")
+        if len(self.launcher_prefix) != 1 or Path(self.launcher_prefix[0].validated().canonical_path) != selected_root / "index.js":
+            raise ValueError("attested entry is not the selected version's index.js")
+        if Path(self.package_manifest.canonical_path) != selected_root / "package.json":
+            raise ValueError("attested manifest is not the selected version's package.json")
+        for item in (self.executable, self.launcher_prefix[0], self.package_manifest):
+            if not _inside(Path(item.canonical_path), selected_root):
+                raise ValueError("an authoritative launcher file escapes the selected version root")
+        if not _inside(selected_root, wrapper_root):
+            raise ValueError("selected version root escapes the canonical wrapper root")
+        try:
+            manifest = json.loads(Path(self.package_manifest.canonical_path).read_text(encoding="utf-8"))
+        except (OSError, TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"selected version manifest is unreadable: {exc}") from exc
+        if not isinstance(manifest, Mapping) or manifest.get("name") != self.package_name:
+            raise ValueError("selected version manifest identity differs from the attestation")
+        if self.package_name != EXPECTED_CURSOR_PACKAGE_NAME:
+            raise ValueError("selected version package is not the observed local Agent CLI runtime package")
+        declared_bin = manifest.get("bin")
+        declares = isinstance(declared_bin, Mapping) and CURSOR_DISCOVERY_COMMAND in declared_bin or isinstance(declared_bin, str)
+        require_bool(self.manifest_declares_cursor_agent_bin, "manifest bin declaration record")
+        if self.manifest_declares_cursor_agent_bin != bool(declares):
+            raise ValueError("manifest bin declaration record is untruthful")
+        for item in self.version_wrapper_copies:
+            item.validated()
+            copy_path = Path(item.canonical_path)
+            if copy_path.parent != selected_root:
+                raise ValueError("a version wrapper copy escapes the selected version root")
+            source = wrapper_root / copy_path.name
+            if not source.is_file() or _sha256_file(source) != item.sha256:
+                raise ValueError("selected-version wrapper copy differs from the winning top-level wrapper")
+        require_nonempty_text(self.node_signature_context, "node signature context", max_bytes=1024)
+        if dict(self.claims) != WRAPPER_CHAIN_CLAIMS:
+            raise ValueError("wrapper-chain claim set differs from the audited non-overclaiming claims")
+        if tuple(self.non_claims) != WRAPPER_CHAIN_NON_CLAIMS:
+            raise ValueError("wrapper-chain explicit non-claims differ from the audited set")
+        _validate_argv(self.static_argv_template, "wrapper-chain static argv template")
+        if self.static_argv_template[-1] != "{prompt}":
+            raise ValueError("wrapper-chain attestation prompt placeholder must be final")
+        if self.static_argv_template[0] != self.executable.canonical_path or self.static_argv_template[1] != self.launcher_prefix[0].canonical_path:
+            raise ValueError("wrapper-chain argv template differs from the attested runtime and entry")
+        require_nonempty_text(self.selected_model, "attested selected model", max_bytes=256)
+        if not isinstance(self.environment_allowlist, tuple) or not self.environment_allowlist:
+            raise ValueError("attested environment allowlist is invalid")
+        require_sha256(self.attestation_fingerprint, "wrapper-chain attestation fingerprint")
+        if fingerprint(self._body()) != self.attestation_fingerprint:
+            raise ValueError("wrapper-chain attestation fingerprint mismatch")
+        return self
+
+    def argv(self, *, prompt: str) -> tuple[str, ...]:
+        require_nonempty_text(prompt, "native agent prompt")
+        if not prompt.startswith(NATIVE_PROMPT_HEADER):
+            raise NativeEvidenceInvalid("native prompt lacks the harness-controlled header")
+        return (*self.static_argv_template[:-1], prompt)
+
+    def to_dict(self) -> dict[str, Any]:
+        result = self._body(); result["attestation_fingerprint"] = self.attestation_fingerprint; return result
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "WrapperChainBackendAttestation":
+        require_exact_keys(data, set(cls.__dataclass_fields__), "wrapper-chain backend attestation")
+        values = dict(data)
+        values["command_resolution"] = CursorWrapperChainResolution.from_dict(data["command_resolution"])
+        for key in ("cmd_wrapper", "powershell_wrapper", "executable", "package_manifest"):
+            values[key] = NativeBackendFileAttestation.from_dict(data[key])
+        values["launcher_prefix"] = tuple(NativeBackendFileAttestation.from_dict(item) for item in data["launcher_prefix"])
+        values["version_wrapper_copies"] = tuple(NativeBackendFileAttestation.from_dict(item) for item in data["version_wrapper_copies"])
+        values["selected_version_root_identity"] = NativeFilesystemIdentity.from_dict(data["selected_version_root_identity"])
+        values["cmd_semantics"] = _validated_semantics(data["cmd_semantics"], "cmd wrapper")
+        values["powershell_semantics"] = _validated_semantics(data["powershell_semantics"], "PowerShell wrapper")
+        values["claims"] = dict(data["claims"]) if isinstance(data["claims"], Mapping) else data["claims"]
+        for key in ("version_inventory", "static_argv_template", "environment_allowlist", "non_claims"):
+            values[key] = require_string_list(data[key], key)
+        return cls(**values).validated()
+
+
+def _attest_wrapper_chain_cursor(config: CursorNativeBackendConfig, *, discovery: WrapperChainDiscovery | None = None) -> WrapperChainBackendAttestation:
+    """Attest the exact winning local cursor-agent wrapper chain without executing it."""
+
+    if config.attestation_class != ATTESTATION_CLASS_WRAPPER_CHAIN:
+        raise ValueError("wrapper-chain attestation requires the explicitly configured LOCAL_WRAPPER_CHAIN class")
+    discovery = discovery or HostWrapperChainDiscovery()
+    which_path = discovery.which_cursor_agent()
+    if which_path is None:
+        raise ValueError("canonical local cursor-agent discovery found no command")
+    winner_path, _ = _safe_file(which_path, "winning cursor-agent command")
+    where_paths = discovery.where_cursor_agent()
+    if not where_paths:
+        raise ValueError("where.exe found no cursor-agent command")
+    powershell_paths = discovery.powershell_cursor_agent()
+    powershell_available = powershell_paths is not None
+    powershell_paths = powershell_paths or ()
+    if _normalized_path(where_paths[0]) != _normalized_path(str(winner_path)):
+        raise ValueError("shutil.which and where.exe disagree on the winning cursor-agent command")
+    wrapper_root, wrapper_root_identity = _safe_directory(winner_path.parent, "Cursor wrapper root")
+    candidate_paths: dict[str, Path] = {}
+    for value in (str(winner_path), *where_paths, *powershell_paths):
+        candidate, _ = _safe_file(value, "discovered cursor-agent candidate")
+        if candidate.parent != wrapper_root:
+            raise ValueError("a discovered cursor-agent candidate resolves outside the winning wrapper root")
+        if candidate.stem.lower() != CURSOR_DISCOVERY_COMMAND:
+            raise ValueError("a discovered cursor-agent candidate has an unexpected name")
+        candidate_paths[_normalized_path(str(candidate))] = candidate
+    candidates = tuple(
+        NativeBackendFileAttestation.observe(candidate_paths[key], "discovered cursor-agent candidate")
+        for key in sorted(candidate_paths)
+    )
+    path_value = discovery.path_value()
+    entries = [entry for entry in path_value.split(os.pathsep) if entry]
+    if not any(_normalized_path(entry) == _normalized_path(str(wrapper_root)) for entry in entries):
+        raise ValueError("the winning wrapper root is not an authoritative PATH entry")
+    pathext = tuple(item.strip().upper() for item in discovery.pathext_value().split(os.pathsep) if item.strip())
+    if ".CMD" not in pathext:
+        raise ValueError("PATHEXT does not resolve the winning cmd wrapper")
+    resolution = CursorWrapperChainResolution(
+        discovery_mechanism=WRAPPER_CHAIN_DISCOVERY_MECHANISM, command=CURSOR_DISCOVERY_COMMAND,
+        which_path=str(winner_path), where_paths=tuple(where_paths), powershell_paths=tuple(powershell_paths),
+        powershell_available=powershell_available,
+        winning_cmd=NativeBackendFileAttestation.observe(winner_path, "winning cursor-agent cmd wrapper"),
+        candidates=candidates, wrapper_root=str(wrapper_root), wrapper_root_identity=wrapper_root_identity,
+        authoritative_path_entry=str(wrapper_root),
+        path_sha256=hashlib.sha256(path_value.encode("utf-8", "surrogatepass")).hexdigest(), pathext=pathext,
+    ).validated()
+    cmd_semantics = _parse_cmd_wrapper(winner_path.read_bytes(), wrapper_name=winner_path.name)
+    ps_path, _ = _safe_file(wrapper_root / cmd_semantics["adjacent_powershell_target"], "adjacent PowerShell wrapper")
+    ps_semantics = _parse_powershell_wrapper(ps_path.read_bytes())
+    if (wrapper_root / "node.exe").exists():
+        raise ValueError("wrapper root contains an adjacent node.exe shortcut outside the attested version chain")
+    inventory, selected = _select_wrapper_version(wrapper_root)
+    selected_root, selected_identity = _safe_directory(wrapper_root / "versions" / selected, "selected Cursor version root")
+    node = NativeBackendFileAttestation.observe(selected_root / "node.exe", "selected version node.exe")
+    entry = NativeBackendFileAttestation.observe(selected_root / "index.js", "selected version index.js")
+    manifest_file = NativeBackendFileAttestation.observe(selected_root / "package.json", "selected version manifest")
+    try:
+        manifest = json.loads((selected_root / "package.json").read_text(encoding="utf-8"))
+    except (OSError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"selected version manifest is unreadable: {exc}") from exc
+    if not isinstance(manifest, Mapping) or manifest.get("name") != EXPECTED_CURSOR_PACKAGE_NAME:
+        raise ValueError("selected version package is not the observed local Agent CLI runtime package")
+    declared_bin = manifest.get("bin")
+    declares = bool(isinstance(declared_bin, Mapping) and CURSOR_DISCOVERY_COMMAND in declared_bin or isinstance(declared_bin, str))
+    copies: list[NativeBackendFileAttestation] = []
+    for name in (winner_path.name, ps_path.name):
+        copy_path = selected_root / name
+        if copy_path.exists():
+            copy = NativeBackendFileAttestation.observe(copy_path, "selected version wrapper copy")
+            if copy.sha256 != _sha256_file(wrapper_root / name):
+                raise ValueError("selected-version wrapper copy differs from the winning top-level wrapper")
+            copies.append(copy)
+    template = (node.canonical_path, entry.canonical_path, "--print", "--output-format", "stream-json", "--force", "--trust", "--model", config.model, "{prompt}")
+    provisional = WrapperChainBackendAttestation(
+        schema_version=WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION, attestation_class=ATTESTATION_CLASS_WRAPPER_CHAIN,
+        backend_identity=BACKEND_IDENTITY, backend_protocol_version=BACKEND_PROTOCOL_VERSION,
+        command_resolution=resolution,
+        cmd_wrapper=resolution.winning_cmd, cmd_semantics=cmd_semantics,
+        powershell_wrapper=NativeBackendFileAttestation.observe(ps_path, "adjacent PowerShell wrapper"),
+        powershell_semantics=ps_semantics,
+        version_inventory=inventory, selected_version=selected,
+        selected_version_root=str(selected_root), selected_version_root_identity=selected_identity,
+        executable=node, launcher_prefix=(entry,), package_manifest=manifest_file,
+        package_name=EXPECTED_CURSOR_PACKAGE_NAME, manifest_declares_cursor_agent_bin=declares,
+        version_wrapper_copies=tuple(copies),
+        node_signature_context=discovery.node_signature_context(Path(node.canonical_path)),
+        claims=dict(WRAPPER_CHAIN_CLAIMS), non_claims=WRAPPER_CHAIN_NON_CLAIMS,
+        static_argv_template=template, selected_model=config.model,
+        environment_allowlist=config.environment_allowlist, attestation_fingerprint="0" * 64,
+    )
+    return WrapperChainBackendAttestation(**{**provisional.__dict__, "attestation_fingerprint": fingerprint(provisional._body())}).validated()
+
+
 def _bounded_probe(argv: tuple[str, ...], environment: Mapping[str, str]) -> tuple[int | None, bytes, bytes]:
     try:
         completed = subprocess.run(
@@ -560,6 +1200,14 @@ class NativeBackendAttestation:
             raise ValueError("native backend attestation fingerprint mismatch")
         return self
 
+    @property
+    def attestation_class(self) -> str:
+        return ATTESTATION_CLASS_PACKAGE_BIN
+
+    @property
+    def non_claims(self) -> tuple[str, ...]:
+        return PACKAGE_BIN_NON_CLAIMS
+
     def argv(self, *, prompt: str) -> tuple[str, ...]:
         require_nonempty_text(prompt, "native agent prompt")
         if not prompt.startswith(NATIVE_PROMPT_HEADER):
@@ -587,7 +1235,7 @@ class NativePreflightDecision:
     status: NativePreflightStatus
     reason_code: str
     detail: str
-    attestation: NativeBackendAttestation | None
+    attestation: "BackendAttestation | None"
 
     @property
     def ready(self) -> bool:
@@ -687,6 +1335,8 @@ def _cursor_provenance(config: CursorNativeBackendConfig) -> tuple[NativeBackend
 
 
 def _attest_native_cursor(config: CursorNativeBackendConfig) -> NativeBackendAttestation:
+    if config.attestation_class != ATTESTATION_CLASS_PACKAGE_BIN:
+        raise ValueError("package-bin attestation requires the PACKAGE_BIN_PROVENANCE class")
     executable, prefix, provenance = _cursor_provenance(config)
     launcher = (executable.canonical_path, *(item.canonical_path for item in prefix))
     version_argv = (*launcher, "--version")
@@ -719,15 +1369,53 @@ def _attest_native_cursor(config: CursorNativeBackendConfig) -> NativeBackendAtt
     return NativeBackendAttestation(**{**provisional.__dict__, "attestation_fingerprint": fingerprint(provisional._body())}).validated()
 
 
-def preflight_native_cursor(*, config: CursorNativeBackendConfig, work_workspace: str | Path | None = None) -> NativePreflightDecision:
-    """Run only local ``--version``/``--help`` probes; never send a prompt."""
+BackendAttestation = NativeBackendAttestation | WrapperChainBackendAttestation
 
+
+def attestation_from_dict(data: Mapping[str, Any]) -> BackendAttestation:
+    """Class-preserving deserialization; the class can never be reinterpreted."""
+
+    if not isinstance(data, Mapping):
+        raise ValueError("backend attestation payload must be a mapping")
+    if data.get("schema_version") == WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION:
+        return WrapperChainBackendAttestation.from_dict(data)
+    return NativeBackendAttestation.from_dict(data)
+
+
+def _attest_local_backend(config: CursorNativeBackendConfig) -> BackendAttestation:
+    """Attest exactly the explicitly configured class; failures never downgrade.
+
+    A blocked PACKAGE_BIN_PROVENANCE attestation raises; it is never silently
+    reinterpreted as the weaker LOCAL_WRAPPER_CHAIN class, which requires its
+    own explicit configuration and owner authorization.
+    """
+
+    if config.attestation_class == ATTESTATION_CLASS_WRAPPER_CHAIN:
+        return _attest_wrapper_chain_cursor(config)
+    return _attest_native_cursor(config)
+
+
+def preflight_native_cursor(*, config: CursorNativeBackendConfig, work_workspace: str | Path | None = None) -> NativePreflightDecision:
+    """Package-bin mode runs local ``--version``/``--help`` probes only.
+
+    Wrapper-chain mode performs static discovery/parse attestation and never
+    executes the launcher bundle at all; capability behavior stays unproven.
+    """
+
+    wrapper_chain = config.attestation_class == ATTESTATION_CLASS_WRAPPER_CHAIN
     try:
         if work_workspace is not None:
             _safe_directory(work_workspace, "preflight work workspace")
-        return NativePreflightDecision(NativePreflightStatus.PREFLIGHT_READY, "LOCAL_CURSOR_CAPABILITIES_ATTESTED", "Local Cursor version/help probes advertised the required bounded experiment flags.", _attest_native_cursor(config))
+        attestation = _attest_local_backend(config)
+        if wrapper_chain:
+            return NativePreflightDecision(
+                NativePreflightStatus.PREFLIGHT_READY, WRAPPER_CHAIN_READY_REASON,
+                "Exact local cursor-agent command routing, wrapper bytes, deterministic version selection, and runtime/entry identity attested. Publisher provenance, Cursor desktop ownership, payload signature, and CLI capability behavior are explicitly NOT established; suitable only for an owner-authorized local experiment.",
+                attestation,
+            )
+        return NativePreflightDecision(NativePreflightStatus.PREFLIGHT_READY, "LOCAL_CURSOR_CAPABILITIES_ATTESTED", "Local Cursor version/help probes advertised the required bounded experiment flags.", attestation)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        return NativePreflightDecision(NativePreflightStatus.PREFLIGHT_BLOCKED, "LOCAL_CAPABILITY_ATTESTATION_BLOCKED", str(exc), None)
+        return NativePreflightDecision(NativePreflightStatus.PREFLIGHT_BLOCKED, WRAPPER_CHAIN_BLOCKED_REASON if wrapper_chain else "LOCAL_CAPABILITY_ATTESTATION_BLOCKED", str(exc), None)
 
 
 @dataclass(frozen=True)
@@ -747,7 +1435,7 @@ class NativeExecutionRequest:
     executable: str
     launcher_prefix: tuple[str, ...]
     backend_identity: str
-    backend_attestation: NativeBackendAttestation
+    backend_attestation: BackendAttestation
     backend_attestation_fingerprint: str
     timeout_seconds: int
     stdout_byte_limit: int
@@ -757,7 +1445,7 @@ class NativeExecutionRequest:
     request_fingerprint: str
 
     @classmethod
-    def create(cls, *, session_id: str, gate_id: str, execution_attempt_index: int, mission_fingerprint: str, gate_contract_fingerprint: str, work_workspace: str | Path, evidence_store_root: str | Path, artifact_directory: str | Path, attestation: NativeBackendAttestation, prompt: str, timeout_seconds: int, stdout_byte_limit: int, stderr_byte_limit: int) -> "NativeExecutionRequest":
+    def create(cls, *, session_id: str, gate_id: str, execution_attempt_index: int, mission_fingerprint: str, gate_contract_fingerprint: str, work_workspace: str | Path, evidence_store_root: str | Path, artifact_directory: str | Path, attestation: BackendAttestation, prompt: str, timeout_seconds: int, stdout_byte_limit: int, stderr_byte_limit: int) -> "NativeExecutionRequest":
         workspace, identity = _safe_directory(work_workspace, "work_workspace")
         evidence_root, evidence_identity = _safe_directory(evidence_store_root, "execution evidence root")
         artifacts, artifacts_identity = _safe_artifact_directory(evidence_root, artifact_directory)
@@ -823,7 +1511,7 @@ class NativeExecutionRequest:
             raise ValueError("native execution request fingerprint mismatch")
         return self
 
-    def validated_for_execution(self, *, current_attestation: NativeBackendAttestation) -> "NativeExecutionRequest":
+    def validated_for_execution(self, *, current_attestation: BackendAttestation) -> "NativeExecutionRequest":
         """Make an inert parsed request executable only after fresh local proof."""
 
         self.validated()
@@ -843,7 +1531,7 @@ class NativeExecutionRequest:
         values["evidence_store_identity"] = NativeFilesystemIdentity.from_dict(data["evidence_store_identity"])
         values["artifact_directory_identity"] = NativeFilesystemIdentity.from_dict(data["artifact_directory_identity"])
         values["launcher_prefix"] = require_string_list(data["launcher_prefix"], "launcher_prefix")
-        values["backend_attestation"] = NativeBackendAttestation.from_dict(data["backend_attestation"])
+        values["backend_attestation"] = attestation_from_dict(data["backend_attestation"])
         return cls(**values).validated()
 
 
@@ -1195,11 +1883,11 @@ def _consume_issued_native_result(handle: object) -> None:
 
 class NativeDelegatedExecutor:
     """Capture one attested native process and independently observed effects."""
-    def __init__(self, *, config: CursorNativeBackendConfig, process_runner: NativeProcessRunner | None = None, clock: Callable[[], str] = _utc_now, local_attestor: Callable[[CursorNativeBackendConfig], NativeBackendAttestation] | None = None) -> None:
+    def __init__(self, *, config: CursorNativeBackendConfig, process_runner: NativeProcessRunner | None = None, clock: Callable[[], str] = _utc_now, local_attestor: Callable[[CursorNativeBackendConfig], BackendAttestation] | None = None) -> None:
         self.config = config; self.process_runner = process_runner or ManagedNativeProcessRunner(); self.clock = clock
-        self._local_attestor = local_attestor or _attest_native_cursor
+        self._local_attestor = local_attestor or _attest_local_backend
 
-    def attest_local_backend(self) -> NativeBackendAttestation:
+    def attest_local_backend(self) -> BackendAttestation:
         """Explicit authority-bearing local re-attestation; never implicit parse work."""
 
         try:
@@ -1531,6 +2219,6 @@ class AtomicNativeExecutionStore:
 
 
 __all__ = [
-    "ARTIFACT_SCHEMA_VERSION", "ATTESTATION_SCHEMA_VERSION", "BACKEND_IDENTITY", "BACKEND_PROTOCOL_VERSION", "CAPTURE_ATTEMPT_SCHEMA_VERSION", "CAPTURE_EXPECTED_SUCCESS_STATUS", "CURSOR_DISCOVERY_COMMAND", "CURSOR_DISCOVERY_MECHANISM", "DEFAULT_ENVIRONMENT_ALLOWLIST", "EXPECTED_CURSOR_PACKAGE_NAME", "NATIVE_PROMPT_HEADER", "REQUEST_SCHEMA_VERSION", "RESULT_SCHEMA_VERSION", "TERMINAL_SCHEMA_VERSION",
-    "AtomicNativeExecutionStore", "CursorInstallationProvenance", "CursorNativeBackendConfig", "ManagedNativeProcessRunner", "NativeArtifactReference", "NativeBackendAttestation", "NativeBackendFileAttestation", "NativeCanaryTerminalRecord", "NativeCaptureTerminalStatus", "NativeCheckpointCaptureAttempt", "NativeCommittedButDurabilityUncertain", "NativeDelegatedExecutor", "NativeEvidenceInvalid", "NativeEvidenceNotFound", "NativeExecutionRequest", "NativeExecutionResult", "NativeExecutionStatus", "NativeExecutionStoreError", "NativeFilesystemIdentity", "NativePreflightDecision", "NativePreflightStatus", "NativeProcessInvocation", "NativeProcessOutcome", "NativeProcessRunner", "NativeProcessStartError", "NativeRequestAlreadyExists", "NativeResultAlreadyExists", "preflight_native_cursor",
+    "ARTIFACT_SCHEMA_VERSION", "ATTESTATION_CLASS_PACKAGE_BIN", "ATTESTATION_CLASS_WRAPPER_CHAIN", "ATTESTATION_SCHEMA_VERSION", "BACKEND_IDENTITY", "BACKEND_PROTOCOL_VERSION", "CAPTURE_ATTEMPT_SCHEMA_VERSION", "CAPTURE_EXPECTED_SUCCESS_STATUS", "CURSOR_DISCOVERY_COMMAND", "CURSOR_DISCOVERY_MECHANISM", "DEFAULT_ENVIRONMENT_ALLOWLIST", "EXPECTED_CURSOR_PACKAGE_NAME", "NATIVE_PROMPT_HEADER", "PACKAGE_BIN_NON_CLAIMS", "REQUEST_SCHEMA_VERSION", "RESULT_SCHEMA_VERSION", "TERMINAL_SCHEMA_VERSION", "WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION", "WRAPPER_CHAIN_BLOCKED_REASON", "WRAPPER_CHAIN_CLAIMS", "WRAPPER_CHAIN_DISCOVERY_MECHANISM", "WRAPPER_CHAIN_NON_CLAIMS", "WRAPPER_CHAIN_READY_REASON",
+    "AtomicNativeExecutionStore", "BackendAttestation", "CursorInstallationProvenance", "CursorNativeBackendConfig", "CursorWrapperChainResolution", "HostWrapperChainDiscovery", "WrapperChainBackendAttestation", "WrapperChainDiscovery", "attestation_from_dict", "ManagedNativeProcessRunner", "NativeArtifactReference", "NativeBackendAttestation", "NativeBackendFileAttestation", "NativeCanaryTerminalRecord", "NativeCaptureTerminalStatus", "NativeCheckpointCaptureAttempt", "NativeCommittedButDurabilityUncertain", "NativeDelegatedExecutor", "NativeEvidenceInvalid", "NativeEvidenceNotFound", "NativeExecutionRequest", "NativeExecutionResult", "NativeExecutionStatus", "NativeExecutionStoreError", "NativeFilesystemIdentity", "NativePreflightDecision", "NativePreflightStatus", "NativeProcessInvocation", "NativeProcessOutcome", "NativeProcessRunner", "NativeProcessStartError", "NativeRequestAlreadyExists", "NativeResultAlreadyExists", "preflight_native_cursor",
 ]
