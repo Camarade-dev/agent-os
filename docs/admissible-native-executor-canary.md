@@ -178,21 +178,77 @@ state must be exactly `CHECKPOINT_CAPTURED` with no audit or repair history.
 ## Future live authorization
 
 The future-only entry point is `python -m admissible.delegated_gate.native_canary`.
-Its order is source clean/HEAD validation, local backend attestation,
-authorization-payload construction, phrase validation, fresh-run validation,
-then—and only then—run-root/fixture creation and the single native launch. The
-fresh run root is named exactly for the run ID, so an authorization payload
-cannot be silently reused for another root.
+For a live authorization, it first performs read-only local backend preflight
+and obtains the concrete attestation; constructs and structurally validates the
+canonical v3 payload; independently rebinds its signed source path and
+filesystem identity to the trusted active source repository; and freshly
+validates that active repository's Git root, exact required HEAD, and clean
+worktree. It then revalidates complete payload/source authority, recomputes the
+canonical payload bytes and phrase-bound owner digest, and compares the
+expected digest in constant time. Only after that successful authorization does
+it validate the fresh proposed run root and create the run root, fixture
+workspace, and evidence structure. The fresh run root is named exactly for the
+run ID, so an authorization payload cannot be silently reused for another root.
 
 `--preflight-only` prints the canonical non-secret authorization payload and
 attestation without creating a workspace or invoking a provider. The owner
 digest is SHA-256 over `owner_phrase_utf8 + NUL + canonical_payload_bytes` and
-is never persisted or printed. The payload binds exact source HEAD, clean-state
-requirement, fresh run ID/session, mission/gate fingerprints, backend/executable
-identity, model, budgets, fixture version, commit message, and canonical
-run/evidence paths. A different HEAD, backend, model, timeout, mission, root,
-or run ID requires a new authorization digest; a partial or completed run ID is
-not fresh.
+is never persisted or printed.
+
+The current canonical schema is `admissible_native_canary_authorization_v3`.
+The prior `_v2` schema is superseded: it is retained only as inert historical
+data and can no longer authorize a new live wrapper-chain canary. The v3
+payload binds exact source HEAD, clean-state requirement, fresh run
+ID/session, mission/gate fingerprints, backend/executable identity, model,
+budgets, fixture version, commit message, and the complete set of canonical
+paths: `run_root`, the deterministic committed children `workspace_root`
+(`<run_root>/work`) and `evidence_root` (`<run_root>/evidence`), and
+`native_sidecar_root` (`<evidence_root>/native-execution`). Validation proves
+each child is the exact committed deterministic descendant, that no path is
+independently redirected or substituted, and that the run root stays outside
+the Agent OS source repository with workspace and evidence disjoint.
+
+For every future live authorization, v3 supersedes v2 completely: every v2
+payload fingerprint, canonical-byte hash, and phrase-bound digest input is
+invalid for live use. After this repair is committed, the exact preview must
+be regenerated from the new clean HEAD, an empty worktree, and a fresh local
+wrapper-chain re-attestation. No pre-commit preview fingerprint may be
+authorized; the final owner decision must reference only that post-commit v3
+payload. The serialized source path is not trusted by itself: final
+authorization independently rebinds it, including filesystem identity, to the
+trusted active Agent OS repository whose HEAD and cleanliness are checked.
+
+v3 also binds `backend_readiness_reason` under an exact class/reason pairing —
+`LOCAL_WRAPPER_CHAIN` ↔ `LOCAL_CURSOR_WRAPPER_CHAIN_ATTESTED_FOR_EXPERIMENT`,
+`PACKAGE_BIN_PROVENANCE` ↔ `LOCAL_CURSOR_CAPABILITIES_ATTESTED` — so a payload
+carrying a missing, mismatched, or unknown reason cannot be authorized even
+when self-refingerprinted.
+
+Alongside the wrapper-attestation non-claims, v3 binds a separate
+exact-ordered `canary_non_claims` tuple describing the *execution* boundary of
+the experiment (not the Cursor wrapper identity). It states that the
+authorization establishes no OS sandboxing, no credential isolation, no global
+filesystem containment, no continuous filesystem monitoring, no detection of a
+mutation perfectly restored between before/after observations, no safety
+against a hostile local process or interpreter, and no production suitability;
+that observed containment is limited to the roots and before/after
+measurements implemented by the committed harness; that the owner phrase is
+supplied to the current CLI as a process argument and is therefore not
+protected against a hostile local process observing process arguments; and
+that this authorizes exactly one owner-authorized local experiment. Any
+omission, addition, reordering, or reworded claim fails validation.
+
+A different HEAD, backend, model, timeout, mission, root, run ID, readiness
+reason, wrapper bytes/version, or any canary non-claim requires a new
+authorization digest; a partial or completed run ID is not fresh.
+
+The owner phrase must be a random, one-time value — never a password reused
+elsewhere. It authorizes only the exact run-bound payload and becomes useless
+once the run ID is consumed or any payload field changes. The recommended
+computation reads it with PowerShell `Read-Host -AsSecureString` into a
+process-local variable, never writes it to disk, and clears it immediately;
+even so, the current CLI receives the phrase as a process argument, and that
+residual exposure is recorded truthfully in `canary_non_claims`.
 
 Hard budgets remain provider/native attempts `1/1`, repair/auditor/retry
 `0/0/0`. No independent model auditor exists, and no live canary has run.

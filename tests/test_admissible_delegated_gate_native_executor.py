@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import os
@@ -51,6 +51,7 @@ from admissible.delegated_gate.native_executor import (
     NativeExecutionResult,
     NativeExecutionStatus,
     NativeFilesystemIdentity,
+    NativePreflightDecision,
     NativePreflightStatus,
     NativeProcessInvocation,
     NativeProcessOutcome,
@@ -595,14 +596,14 @@ def test_authorization_payload_binds_backend_head_model_timeout_and_run_id(tmp_p
     h=_harness(tmp_path); payload=build_authorization_payload(source_repository=h.source,source_head=_command(["git","rev-parse","HEAD"],cwd=h.source).stdout.strip(),run_id="run-one",session_id=h.session_id,attestation=h.attestation,run_root=tmp_path/"future-run",timeout_seconds=30)
     phrase="owner phrase"; digest=hashlib.sha256(phrase.encode()+b"\0"+__import__("admissible.delegated_gate.canonical",fromlist=["canonical_bytes"]).canonical_bytes(payload.to_dict())).hexdigest(); monkeypatch.setenv("ADMISSIBLE_NATIVE_CANARY_OWNER_AUTHORIZATION_SHA256",digest)
     from admissible.delegated_gate.native_canary import _authorized
-    assert _authorized(phrase,payload) and not _authorized("wrong",payload)
+    assert _authorized(phrase,payload,active_source_repository=h.source) and not _authorized("wrong",payload,active_source_repository=h.source)
     changed=payload.to_dict(); changed["run_id"]="run-two"; changed["payload_fingerprint"]=fingerprint({key:value for key,value in changed.items() if key!="payload_fingerprint"})
     from admissible.delegated_gate.native_canary import NativeCanaryAuthorizationPayload
-    assert not _authorized(phrase,NativeCanaryAuthorizationPayload(**{**changed,"launcher_prefix":tuple(changed["launcher_prefix"]),"budgets":tuple(changed["budgets"])}).validated())
+    assert not _authorized(phrase,NativeCanaryAuthorizationPayload.from_dict(changed),active_source_repository=h.source)
     for field,value in (("source_head","f"*40),("backend_attestation_fingerprint","0"*64),("selected_model","other-model"),("timeout_seconds",31)):
         changed=payload.to_dict(); changed[field]=value; changed["payload_fingerprint"]=fingerprint({key:value for key,value in changed.items() if key!="payload_fingerprint"})
-        altered=NativeCanaryAuthorizationPayload(**{**changed,"launcher_prefix":tuple(changed["launcher_prefix"]),"budgets":tuple(changed["budgets"])}).validated()
-        assert not _authorized(phrase,altered)
+        altered=NativeCanaryAuthorizationPayload.from_dict(changed)
+        assert not _authorized(phrase,altered,active_source_repository=h.source)
 
 
 def test_preflight_only_is_effect_free_and_existing_run_id_is_rejected(tmp_path: Path,monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
@@ -901,7 +902,7 @@ def test_authorization_payload_rejects_mismatched_class_and_non_claims(tmp_path:
         changed = payload.to_dict(); changed[field] = value
         changed["payload_fingerprint"] = fingerprint({key: item for key, item in changed.items() if key != "payload_fingerprint"})
         with pytest.raises(ValueError):
-            NativeCanaryAuthorizationPayload(**{**changed, "launcher_prefix": tuple(changed["launcher_prefix"]), "budgets": tuple(changed["budgets"]), "attestation_non_claims": tuple(changed["attestation_non_claims"])}).validated()
+            NativeCanaryAuthorizationPayload.from_dict(changed)
 
 
 def test_real_host_wrapper_chain_preflight_is_static_and_truthfully_non_overclaiming():
@@ -922,3 +923,321 @@ def test_real_host_wrapper_chain_preflight_is_static_and_truthfully_non_overclai
 def test_prompt_header_and_no_agent_os_import():
     package=Path(__file__).resolve().parents[1]/"admissible"/"delegated_gate"; source=(package/"native_executor.py").read_text(encoding="utf-8")+(package/"native_canary.py").read_text(encoding="utf-8")
     assert "agent_os" not in source and build_native_agent_prompt(mission=create_canary_session(session_id="s").mission,gate_contract=create_canary_session(session_id="s").current_gate,work_workspace=Path.cwd()).startswith("You are the Admissible native coding agent.")
+
+
+# --- Act 2A.3A: complete v3 authorization payload ---------------------------
+
+from admissible.delegated_gate.canonical import canonical_bytes as _canonical_bytes
+from admissible.delegated_gate.native_canary import (
+    AUTHORIZATION_SCHEMA_VERSION,
+    AUTHORIZATION_SCHEMA_VERSION_LEGACY_V2,
+    CANARY_NON_CLAIMS,
+    CLASS_READINESS_REASONS,
+    EVIDENCE_DIRECTORY_NAME,
+    NATIVE_SIDECAR_DIRECTORY_NAME,
+    PACKAGE_BIN_READY_REASON,
+    WORKSPACE_DIRECTORY_NAME,
+    _authorized,
+)
+
+_V3_RUN_ID = "native-cursor-canary-001"
+
+
+def _v3_payload(tmp_path: Path, *, run_id: str = _V3_RUN_ID, run_root: Path | None = None):
+    _root, _discovery, attestation = _wrapper_attestation(tmp_path)
+    source = tmp_path / "source-repo"; source.mkdir()
+    run_root = run_root if run_root is not None else tmp_path / run_id
+    payload = build_authorization_payload(
+        source_repository=source, source_head="e" * 40, run_id=run_id, session_id=run_id,
+        attestation=attestation, run_root=run_root, timeout_seconds=900,
+    )
+    return source, run_root, attestation, payload
+
+
+def _refingerprint(data: dict) -> dict:
+    data = dict(data)
+    data["payload_fingerprint"] = fingerprint({k: v for k, v in data.items() if k != "payload_fingerprint"})
+    return data
+
+
+def _rebuild(data: dict) -> NativeCanaryAuthorizationPayload:
+    return NativeCanaryAuthorizationPayload.from_dict(data)
+
+
+def _owner_digest(phrase: str, payload: NativeCanaryAuthorizationPayload) -> str:
+    return hashlib.sha256(phrase.encode("utf-8") + b"\0" + _canonical_bytes(payload.to_dict())).hexdigest()
+
+
+def test_v3_round_trip_and_deterministic_fingerprint(tmp_path: Path):
+    _s, run_root, _a, payload = _v3_payload(tmp_path)
+    assert payload.schema_version == AUTHORIZATION_SCHEMA_VERSION == "admissible_native_canary_authorization_v3"
+    twin_base = tmp_path / "twin"; twin_base.mkdir()
+    _s2, _rr2, _a2, again = _v3_payload(twin_base)
+    twin_root = tmp_path / "twin" / _V3_RUN_ID
+    assert again.run_root == str(twin_root)
+    reloaded = _rebuild(payload.to_dict()).validated()
+    assert reloaded == payload and reloaded.payload_fingerprint == payload.payload_fingerprint
+    assert not run_root.exists()
+
+
+def test_v3_exact_proposed_run_validates_and_binds_roots(tmp_path: Path):
+    _s, run_root, _a, payload = _v3_payload(tmp_path)
+    assert payload.run_id == payload.session_id == _V3_RUN_ID
+    assert payload.workspace_root == str(run_root / WORKSPACE_DIRECTORY_NAME)
+    assert payload.evidence_root == str(run_root / EVIDENCE_DIRECTORY_NAME)
+    assert payload.native_sidecar_root == str(run_root / EVIDENCE_DIRECTORY_NAME / NATIVE_SIDECAR_DIRECTORY_NAME)
+    assert payload.backend_readiness_reason == WRAPPER_CHAIN_READY_REASON
+    assert payload.backend_attestation_class == ATTESTATION_CLASS_WRAPPER_CHAIN
+    assert tuple(payload.canary_non_claims) == CANARY_NON_CLAIMS
+    payload.validated()
+
+
+def test_v2_schema_cannot_authorize_new_live_path(tmp_path: Path):
+    _s, _rr, _a, payload = _v3_payload(tmp_path)
+    downgraded = _refingerprint({**payload.to_dict(), "schema_version": AUTHORIZATION_SCHEMA_VERSION_LEGACY_V2})
+    with pytest.raises(ValueError):
+        _rebuild(downgraded).validated()
+
+
+@pytest.mark.parametrize("reason", ["", PACKAGE_BIN_READY_REASON, "SOME_UNKNOWN_REASON"])
+def test_missing_or_mismatched_readiness_reason_rejected(tmp_path: Path, reason: str):
+    _s, _rr, _a, payload = _v3_payload(tmp_path)
+    altered = _refingerprint({**payload.to_dict(), "backend_readiness_reason": reason})
+    with pytest.raises(ValueError):
+        _rebuild(altered).validated()
+
+
+@pytest.mark.parametrize("field", ["workspace_root", "native_sidecar_root", "evidence_root"])
+def test_changed_bound_root_rejected_even_when_refingerprinted(tmp_path: Path, field: str):
+    _s, run_root, _a, payload = _v3_payload(tmp_path)
+    altered = _refingerprint({**payload.to_dict(), field: str(run_root / "elsewhere")})
+    with pytest.raises(ValueError):
+        _rebuild(altered).validated()
+
+
+def test_run_root_inside_source_repository_rejected(tmp_path: Path):
+    _root, _discovery, attestation = _wrapper_attestation(tmp_path)
+    source = tmp_path / "source-repo"; source.mkdir()
+    with pytest.raises(ValueError):
+        build_authorization_payload(
+            source_repository=source, source_head="e" * 40, run_id=_V3_RUN_ID, session_id=_V3_RUN_ID,
+            attestation=attestation, run_root=source / _V3_RUN_ID, timeout_seconds=900,
+        )
+
+
+@pytest.mark.parametrize("index", range(len(CANARY_NON_CLAIMS)))
+def test_each_canary_non_claim_mutation_rejected(tmp_path: Path, index: int):
+    _s, _rr, _a, payload = _v3_payload(tmp_path)
+    mutated = list(CANARY_NON_CLAIMS)
+    mutated[index] = mutated[index] + " (tampered)"
+    altered = _refingerprint({**payload.to_dict(), "canary_non_claims": mutated})
+    with pytest.raises(ValueError):
+        _rebuild(altered).validated()
+
+
+def test_reordered_and_resized_canary_non_claims_rejected(tmp_path: Path):
+    _s, _rr, _a, payload = _v3_payload(tmp_path)
+    reordered = list(CANARY_NON_CLAIMS)
+    reordered[0], reordered[1] = reordered[1], reordered[0]
+    with pytest.raises(ValueError):
+        _rebuild(_refingerprint({**payload.to_dict(), "canary_non_claims": reordered})).validated()
+    dropped = list(CANARY_NON_CLAIMS)[:-1]
+    with pytest.raises(ValueError):
+        _rebuild(_refingerprint({**payload.to_dict(), "canary_non_claims": dropped})).validated()
+    added = list(CANARY_NON_CLAIMS) + ["os sandboxing is guaranteed"]
+    with pytest.raises(ValueError):
+        _rebuild(_refingerprint({**payload.to_dict(), "canary_non_claims": added})).validated()
+
+
+def test_payload_fingerprint_and_owner_digest_change_when_new_fields_change(tmp_path: Path):
+    _s, _rr, _a, payload = _v3_payload(tmp_path)
+    phrase = "one-time-random-owner-phrase"
+    baseline_digest = _owner_digest(phrase, payload)
+    alt_base = tmp_path / "alt"; alt_base.mkdir()
+    _s2, _rr2, _a2, other = _v3_payload(alt_base)
+    assert other.payload_fingerprint != payload.payload_fingerprint
+    assert _owner_digest(phrase, other) != baseline_digest
+    mutated = _refingerprint({**payload.to_dict(), "canary_non_claims": [c + "!" for c in CANARY_NON_CLAIMS]})
+    assert mutated["payload_fingerprint"] != payload.payload_fingerprint
+
+
+def test_owner_authorization_binds_full_v3_payload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _s, _rr, _a, payload = _v3_payload(tmp_path)
+    phrase = "one-time-random-owner-phrase"
+    monkeypatch.setenv("ADMISSIBLE_NATIVE_CANARY_OWNER_AUTHORIZATION_SHA256", _owner_digest(phrase, payload))
+    assert _authorized(phrase, payload, active_source_repository=_s) and not _authorized("wrong", payload, active_source_repository=_s)
+    for field, value in (
+        ("workspace_root", str(_rr / "other")),
+        ("native_sidecar_root", str(_rr / EVIDENCE_DIRECTORY_NAME / "other")),
+    ):
+        with pytest.raises(ValueError):
+            _rebuild(_refingerprint({**payload.to_dict(), field: value}))
+
+
+def test_preflight_only_payload_exposes_every_new_field(tmp_path: Path):
+    _s, _rr, _a, payload = _v3_payload(tmp_path)
+    emitted = payload.to_dict()
+    for key in (
+        "backend_attestation_class", "backend_readiness_reason", "attestation_non_claims",
+        "canary_non_claims", "run_root", "workspace_root", "evidence_root", "native_sidecar_root",
+    ):
+        assert key in emitted, key
+    assert emitted["canary_non_claims"] == list(CANARY_NON_CLAIMS)
+
+
+# --- Act 2A.3A authorization authority repair --------------------------------
+
+def _source_identity_dict(path: Path) -> dict[str, int]:
+    return NativeFilesystemIdentity.from_stat(os.lstat(path)).validated().to_dict()
+
+
+def _refingerprinted_source(payload: NativeCanaryAuthorizationPayload, source: Path) -> dict:
+    return _refingerprint({
+        **payload.to_dict(),
+        "source_repository": str(source),
+        "source_repository_identity": _source_identity_dict(source),
+    })
+
+
+def test_v3_source_path_is_structural_then_rebound_to_active_authority(tmp_path: Path):
+    source, _rr, _a, payload = _v3_payload(tmp_path, run_root=tmp_path.parent / "outside-run")
+    assert payload.validated_for_authorization(active_source_repository=source) is payload
+
+    alternate = _refingerprint({**payload.to_dict(), "source_repository": str(source) + "\\."})
+    with pytest.raises(ValueError, match="canonical"):
+        NativeCanaryAuthorizationPayload.from_dict(alternate)
+    alternate_separator = _refingerprint({**payload.to_dict(), "source_repository": str(source).replace("\\", "/")})
+    with pytest.raises(ValueError, match="canonical"):
+        NativeCanaryAuthorizationPayload.from_dict(alternate_separator)
+
+    other = tmp_path / "other-canonical-directory"; other.mkdir()
+    substituted = NativeCanaryAuthorizationPayload.from_dict(_refingerprinted_source(payload, other))
+    with pytest.raises(ValueError, match="active source"):
+        substituted.validated_for_authorization(active_source_repository=source)
+
+    parent = source.parent
+    parent_payload = NativeCanaryAuthorizationPayload.from_dict(_refingerprinted_source(payload, parent))
+    with pytest.raises(ValueError, match="active source"):
+        parent_payload.validated_for_authorization(active_source_repository=source)
+
+
+def test_v3_source_another_git_repository_and_same_commit_clone_fail_authority(tmp_path: Path):
+    left_parent = tmp_path / "left-parent"; left_parent.mkdir()
+    right_parent = tmp_path / "right-parent"; right_parent.mkdir()
+    source = build_canary_repository(left_parent, repository_name="source").repository
+    same_commit_clone = build_canary_repository(right_parent, repository_name="clone").repository
+    assert _command(["git", "rev-parse", "HEAD"], cwd=source).stdout == _command(["git", "rev-parse", "HEAD"], cwd=same_commit_clone).stdout
+    _root, _discovery, attestation = _wrapper_attestation(tmp_path)
+    payload = build_authorization_payload(
+        source_repository=source, source_head="e" * 40, run_id=_V3_RUN_ID, session_id=_V3_RUN_ID,
+        attestation=attestation, run_root=tmp_path.parent / "outside-git-run", timeout_seconds=900,
+    )
+    clone_payload = NativeCanaryAuthorizationPayload.from_dict(_refingerprinted_source(payload, same_commit_clone))
+    with pytest.raises(ValueError, match="active source"):
+        clone_payload.validated_for_authorization(active_source_repository=source)
+
+
+def test_v3_source_symlink_or_junction_alias_is_rejected_structurally(tmp_path: Path):
+    source, _rr, _a, payload = _v3_payload(tmp_path, run_root=tmp_path.parent / "outside-link-run")
+    alias = tmp_path / "source-alias"
+    try:
+        os.symlink(source, alias, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        if os.name != "nt":
+            pytest.skip("directory symlink creation unavailable")
+        completed = subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", str(alias), str(source)], shell=False, capture_output=True)
+        if completed.returncode != 0:
+            pytest.skip("junction creation unavailable")
+    raw = _refingerprint({**payload.to_dict(), "source_repository": str(alias)})
+    with pytest.raises(ValueError, match="redirecting"):
+        NativeCanaryAuthorizationPayload.from_dict(raw)
+
+
+def test_v3_source_identity_replacement_fails_before_authority(tmp_path: Path):
+    source, _rr, _a, payload = _v3_payload(tmp_path)
+    displaced = tmp_path / "displaced-source"
+    source.rename(displaced); source.mkdir()
+    with pytest.raises(ValueError, match="identity changed"):
+        NativeCanaryAuthorizationPayload.from_dict(payload.to_dict())
+
+
+@pytest.mark.parametrize("missing", tuple(NativeCanaryAuthorizationPayload.__dataclass_fields__))
+def test_v3_from_dict_rejects_every_missing_key(tmp_path: Path, missing: str):
+    _s, _rr, _a, payload = _v3_payload(tmp_path)
+    raw = payload.to_dict(); raw.pop(missing)
+    with pytest.raises(ValueError, match="keys"):
+        NativeCanaryAuthorizationPayload.from_dict(raw)
+
+
+def test_v3_from_dict_rejects_unknown_and_malformed_json_arrays(tmp_path: Path):
+    _s, _rr, _a, payload = _v3_payload(tmp_path)
+    unknown = payload.to_dict(); unknown["unexpected"] = "authority expansion"
+    with pytest.raises(ValueError, match="keys"):
+        NativeCanaryAuthorizationPayload.from_dict(unknown)
+    for key, value in (
+        ("budgets", "11000"),
+        ("budgets", [1, 1, 0, 0]),
+        ("budgets", [1, True, 0, 0, 0]),
+        ("launcher_prefix", "not-an-array"),
+        ("launcher_prefix", [payload.launcher_prefix[0], payload.launcher_prefix[0]]),
+        ("attestation_non_claims", "not-an-array"),
+        ("canary_non_claims", [CANARY_NON_CLAIMS[0], CANARY_NON_CLAIMS[0]]),
+    ):
+        raw = _refingerprint({**payload.to_dict(), key: value})
+        with pytest.raises(ValueError):
+            NativeCanaryAuthorizationPayload.from_dict(raw)
+
+
+def test_authorization_revalidates_before_digest_comparison(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import admissible.delegated_gate.native_canary as native_canary_module
+
+    source, _rr, _a, payload = _v3_payload(tmp_path)
+    phrase = "synthetic-unit-test-phrase"
+    monkeypatch.setenv("ADMISSIBLE_NATIVE_CANARY_OWNER_AUTHORIZATION_SHA256", _owner_digest(phrase, payload))
+    compared: list[tuple[str, str]] = []
+    monkeypatch.setattr(native_canary_module.hmac, "compare_digest", lambda left, right: compared.append((left, right)) or left == right)
+
+    malformed = replace(payload, budgets=(1,))
+    assert not _authorized(phrase, malformed, active_source_repository=source)
+    wrong_claims = replace(payload, canary_non_claims=("canary is a sandbox",))
+    assert not _authorized(phrase, wrong_claims, active_source_repository=source)
+    other = tmp_path / "other"; other.mkdir()
+    substituted = NativeCanaryAuthorizationPayload.from_dict(_refingerprinted_source(payload, other))
+    assert not _authorized(phrase, substituted, active_source_repository=source)
+    assert compared == []
+
+    assert _authorized(phrase, payload, active_source_repository=source)
+    assert len(compared) == 1
+    assert not _authorized(phrase, malformed, active_source_repository=source)
+    assert len(compared) == 1
+
+
+def test_cli_missing_or_incorrect_synthetic_authorization_has_zero_run_effect(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
+    h = _harness(tmp_path)
+    head = _command(["git", "rev-parse", "HEAD"], cwd=h.source).stdout.strip()
+    run_root = tmp_path / "cli-future-run"
+    decision = NativePreflightDecision(NativePreflightStatus.PREFLIGHT_READY, "LOCAL_CURSOR_CAPABILITIES_ATTESTED", "synthetic test preflight", h.attestation)
+    monkeypatch.setattr("admissible.delegated_gate.native_canary.preflight_native_cursor", lambda *, config: decision)
+    args = ["--source-repository", str(h.source), "--required-source-head", head, "--run-root", str(run_root), "--run-id", "cli-future-run", "--session-id", h.session_id, "--executable", h.config.executable, "--executable-prefix-arg", h.config.launcher_prefix[0], "--timeout-seconds", "30"]
+    assert main(args) == 2
+    assert not run_root.exists() and h.runner.invocations == []
+    monkeypatch.setenv("ADMISSIBLE_NATIVE_CANARY_OWNER_AUTHORIZATION_SHA256", "0" * 64)
+    assert main([*args, "--owner-authorization", "synthetic-unit-test-phrase"]) == 2
+    assert not run_root.exists() and h.runner.invocations == []
+    assert all(json.loads(line)["status"] == NativeCanaryStatus.PREFLIGHT_BLOCKED.value for line in capsys.readouterr().out.splitlines())
+
+
+def test_cli_preflight_only_rebinds_source_and_exposes_complete_payload_without_run_effect(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
+    h = _harness(tmp_path)
+    head = _command(["git", "rev-parse", "HEAD"], cwd=h.source).stdout.strip()
+    run_root = tmp_path / "preflight-future-run"
+    decision = NativePreflightDecision(NativePreflightStatus.PREFLIGHT_READY, "LOCAL_CURSOR_CAPABILITIES_ATTESTED", "synthetic test preflight", h.attestation)
+    monkeypatch.setattr("admissible.delegated_gate.native_canary.preflight_native_cursor", lambda *, config: decision)
+    args = ["--source-repository", str(h.source), "--required-source-head", head, "--run-root", str(run_root), "--run-id", "preflight-future-run", "--session-id", h.session_id, "--executable", h.config.executable, "--executable-prefix-arg", h.config.launcher_prefix[0], "--timeout-seconds", "30", "--preflight-only"]
+    assert main(args) == 0
+    emitted = json.loads(capsys.readouterr().out)
+    payload = emitted["authorization_payload"]
+    for key in NativeCanaryAuthorizationPayload.__dataclass_fields__:
+        assert key in payload
+    assert payload["source_repository"] == str(h.source)
+    assert not run_root.exists() and h.runner.invocations == []

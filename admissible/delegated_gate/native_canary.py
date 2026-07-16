@@ -10,6 +10,7 @@ import argparse
 from dataclasses import dataclass
 from enum import Enum
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -35,6 +36,8 @@ from admissible.delegated_gate.native_executor import (
     NativeBackendAttestation,
     PACKAGE_BIN_NON_CLAIMS,
     WRAPPER_CHAIN_NON_CLAIMS,
+    WRAPPER_CHAIN_READY_REASON,
+    _lexical_absolute,
     NativeCanaryTerminalRecord,
     NativeCaptureTerminalStatus,
     NativeCheckpointCaptureAttempt,
@@ -75,7 +78,39 @@ DEFAULT_TIMEOUT_SECONDS = 900
 DEFAULT_STDOUT_BYTE_LIMIT = 512 * 1024
 DEFAULT_STDERR_BYTE_LIMIT = 128 * 1024
 OWNER_AUTHORIZATION_DIGEST_ENV = "ADMISSIBLE_NATIVE_CANARY_OWNER_AUTHORIZATION_SHA256"
-AUTHORIZATION_SCHEMA_VERSION = "admissible_native_canary_authorization_v2"
+AUTHORIZATION_SCHEMA_VERSION = "admissible_native_canary_authorization_v3"
+# v2 is superseded and intentionally not authorizable for a new live canary; it
+# may only be parsed as inert historical data by callers that opt in explicitly.
+AUTHORIZATION_SCHEMA_VERSION_LEGACY_V2 = "admissible_native_canary_authorization_v2"
+# The readiness reason is the exact preflight decision reason; each attestation
+# class pairs with exactly one reason and any other pairing is unauthorizable.
+PACKAGE_BIN_READY_REASON = "LOCAL_CURSOR_CAPABILITIES_ATTESTED"
+CLASS_READINESS_REASONS: dict[str, str] = {
+    ATTESTATION_CLASS_WRAPPER_CHAIN: WRAPPER_CHAIN_READY_REASON,
+    ATTESTATION_CLASS_PACKAGE_BIN: PACKAGE_BIN_READY_REASON,
+}
+# Deterministic run-root children the committed CLI always creates.  They are
+# bound into the payload so an authorized digest cannot be reused against a
+# substituted or independently redirected workspace or sidecar location.
+WORKSPACE_DIRECTORY_NAME = "work"
+EVIDENCE_DIRECTORY_NAME = "evidence"
+NATIVE_SIDECAR_DIRECTORY_NAME = "native-execution"
+# Canary-execution-boundary non-claims.  These concern the run boundary of the
+# native experiment, NOT the Cursor wrapper identity (kept separate on purpose).
+# Exact membership AND ordering are authoritative; any change fails validation
+# even when the outer payload fingerprint is recomputed.
+CANARY_NON_CLAIMS: tuple[str, ...] = (
+    "os-level sandboxing of the native agent is not established",
+    "credential isolation from the native agent is not established",
+    "global filesystem containment is not established",
+    "continuous filesystem monitoring is not performed",
+    "a mutation that is perfectly restored between before/after observations is not detected",
+    "safety against a hostile local process or interpreter is not established",
+    "production suitability is not established",
+    "the owner phrase is supplied to the current cli as a process argument and is therefore not protected against a hostile local process observing process arguments",
+    "observed containment is limited to the roots and before/after measurements implemented by the committed canary harness",
+    "this authorization establishes exactly one explicitly owner-authorized local experiment",
+)
 BEHAVIORAL_EVIDENCE_SCHEMA_VERSION = "admissible_native_canary_behavioral_evidence_v1"
 EXPECTED_MATERIAL_PATHS = frozenset({"README.md", "src/game-state.js", "src/score.js", "test/game-state.test.js"})
 
@@ -527,6 +562,7 @@ def _git_source_preflight(source: Path, required_head: str) -> tuple[bool, str]:
 class NativeCanaryAuthorizationPayload:
     schema_version: str
     source_repository: str
+    source_repository_identity: NativeFilesystemIdentity
     source_head: str
     clean_worktree_required: bool
     run_id: str
@@ -535,8 +571,10 @@ class NativeCanaryAuthorizationPayload:
     gate_plan_fingerprint: str
     gate_contract_fingerprint: str
     backend_attestation_class: str
+    backend_readiness_reason: str
     backend_attestation_fingerprint: str
     attestation_non_claims: tuple[str, ...]
+    canary_non_claims: tuple[str, ...]
     executable: str
     launcher_prefix: tuple[str, ...]
     selected_model: str
@@ -547,15 +585,43 @@ class NativeCanaryAuthorizationPayload:
     fixture_version: str
     required_commit_message: str
     run_root: str
+    workspace_root: str
     evidence_root: str
+    native_sidecar_root: str
     payload_fingerprint: str
+
     def _body(self) -> dict[str, Any]:
-        data=dict(self.__dict__); data["launcher_prefix"]=list(self.launcher_prefix); data["budgets"]=list(self.budgets); data["attestation_non_claims"]=list(self.attestation_non_claims); data.pop("payload_fingerprint"); return data
+        data = dict(self.__dict__)
+        data["source_repository_identity"] = self.source_repository_identity.to_dict()
+        data["launcher_prefix"] = list(self.launcher_prefix)
+        data["budgets"] = list(self.budgets)
+        data["attestation_non_claims"] = list(self.attestation_non_claims)
+        data["canary_non_claims"] = list(self.canary_non_claims)
+        data.pop("payload_fingerprint")
+        return data
+
     def validated(self) -> "NativeCanaryAuthorizationPayload":
-        if self.schema_version!=AUTHORIZATION_SCHEMA_VERSION: raise ValueError("unsupported authorization payload")
-        _safe_directory(self.source_repository,"authorization source repository"); require_sha256(self.mission_fingerprint,"authorization mission fingerprint"); require_sha256(self.gate_plan_fingerprint,"authorization gate plan fingerprint"); require_sha256(self.gate_contract_fingerprint,"authorization gate contract fingerprint"); require_sha256(self.backend_attestation_fingerprint,"authorization backend fingerprint"); require_sha256(self.payload_fingerprint,"authorization payload fingerprint")
-        require_identifier(self.run_id,"authorization run ID"); require_identifier(self.session_id,"authorization session ID"); require_nonempty_text(self.source_head,"authorization source HEAD",max_bytes=128); require_nonempty_text(self.selected_model,"authorization model",max_bytes=256); require_nonempty_text(self.fixture_version,"fixture version",max_bytes=128); require_nonempty_text(self.required_commit_message,"commit message",max_bytes=1024)
-        if not self.clean_worktree_required: raise ValueError("authorization must require a clean worktree")
+        if self.schema_version != AUTHORIZATION_SCHEMA_VERSION:
+            raise ValueError("unsupported authorization payload")
+        require_nonempty_text(self.source_repository, "authorization source repository", max_bytes=4096)
+        source, source_identity = _safe_directory(self.source_repository, "authorization source repository")
+        if str(source) != self.source_repository:
+            raise ValueError("authorization source repository must be a canonical absolute path")
+        if not isinstance(self.source_repository_identity, NativeFilesystemIdentity):
+            raise ValueError("authorization source repository identity is invalid")
+        self.source_repository_identity.validated()
+        if not _same_directory_identity(source_identity, self.source_repository_identity):
+            raise ValueError("authorization source repository identity changed")
+        require_sha256(self.mission_fingerprint,"authorization mission fingerprint"); require_sha256(self.gate_plan_fingerprint,"authorization gate plan fingerprint"); require_sha256(self.gate_contract_fingerprint,"authorization gate contract fingerprint"); require_sha256(self.backend_attestation_fingerprint,"authorization backend fingerprint"); require_sha256(self.payload_fingerprint,"authorization payload fingerprint")
+        require_identifier(self.run_id,"authorization run ID"); require_identifier(self.session_id,"authorization session ID"); require_nonempty_text(self.source_head,"authorization source HEAD",max_bytes=128); require_nonempty_text(self.selected_model,"authorization model",max_bytes=256); require_nonempty_text(self.fixture_version,"fixture version",max_bytes=128); require_nonempty_text(self.required_commit_message,"commit message",max_bytes=1024); require_nonempty_text(self.executable,"authorization executable",max_bytes=4096)
+        if not isinstance(self.clean_worktree_required, bool) or not self.clean_worktree_required:
+            raise ValueError("authorization must require a clean worktree")
+        if not isinstance(self.launcher_prefix, tuple) or not self.launcher_prefix or len(set(self.launcher_prefix)) != len(self.launcher_prefix):
+            raise ValueError("authorization launcher prefix is invalid")
+        if not isinstance(self.budgets, tuple) or len(self.budgets) != 5:
+            raise ValueError("authorization budgets are invalid")
+        if not isinstance(self.attestation_non_claims, tuple) or not isinstance(self.canary_non_claims, tuple):
+            raise ValueError("authorization non-claims must be immutable tuples")
         if self.backend_attestation_class == ATTESTATION_CLASS_PACKAGE_BIN:
             if tuple(self.attestation_non_claims) != PACKAGE_BIN_NON_CLAIMS: raise ValueError("authorization non-claims differ from the package-bin attestation class")
         elif self.backend_attestation_class == ATTESTATION_CLASS_WRAPPER_CHAIN:
@@ -564,25 +630,94 @@ class NativeCanaryAuthorizationPayload:
             if tuple(self.attestation_non_claims) != WRAPPER_CHAIN_NON_CLAIMS: raise ValueError("authorization non-claims differ from the wrapper-chain attestation class")
         else:
             raise ValueError("authorization attestation class is unsupported")
+        # Exact class/reason pairing: the readiness reason is the concrete
+        # preflight decision reason and cannot be swapped, dropped, or unknown.
+        require_nonempty_text(self.backend_readiness_reason,"authorization readiness reason",max_bytes=256)
+        if self.backend_readiness_reason != CLASS_READINESS_REASONS[self.backend_attestation_class]:
+            raise ValueError("authorization readiness reason does not pair with the attestation class")
+        # Canary-execution-boundary non-claims: exact membership and ordering.
+        if tuple(self.canary_non_claims) != CANARY_NON_CLAIMS:
+            raise ValueError("authorization canary non-claims differ from the exact committed canary boundary set")
+        # Roots: absolute, canonical, deterministic committed children, and
+        # disjoint/outside the source repository where required.
+        for value, label in ((self.run_root, "authorization run root"), (self.workspace_root, "authorization workspace root"), (self.evidence_root, "authorization evidence root"), (self.native_sidecar_root, "authorization native sidecar root")):
+            require_nonempty_text(value, label, max_bytes=4096)
+        run_root=_lexical_absolute(self.run_root,"authorization run root"); evidence_root=_lexical_absolute(self.evidence_root,"authorization evidence root"); workspace_root=_lexical_absolute(self.workspace_root,"authorization workspace root"); sidecar_root=_lexical_absolute(self.native_sidecar_root,"authorization native sidecar root")
+        if (str(run_root),str(evidence_root),str(workspace_root),str(sidecar_root)) != (self.run_root,self.evidence_root,self.workspace_root,self.native_sidecar_root):
+            raise ValueError("authorization roots must be canonical absolute paths")
+        if evidence_root != run_root / EVIDENCE_DIRECTORY_NAME: raise ValueError("evidence root must be the committed deterministic child of the run root")
+        if workspace_root != run_root / WORKSPACE_DIRECTORY_NAME: raise ValueError("workspace root must be the committed deterministic child of the run root")
+        if sidecar_root != evidence_root / NATIVE_SIDECAR_DIRECTORY_NAME: raise ValueError("native sidecar root must be the committed deterministic child of the evidence root")
+        if _inside(run_root,source) or _inside(source,run_root): raise ValueError("run root must be outside the source repository")
+        if workspace_root == evidence_root or _inside(workspace_root,evidence_root) or _inside(evidence_root,workspace_root): raise ValueError("workspace and evidence roots must be disjoint")
         for value in self.launcher_prefix: require_nonempty_text(value,"authorization launcher path",max_bytes=4096)
         for value in self.budgets: require_strict_int(value,"authorization budget",minimum=0,maximum=1)
         require_strict_int(self.timeout_seconds,"authorization timeout",minimum=1,maximum=3600); require_strict_int(self.stdout_byte_limit,"authorization stdout limit",minimum=1,maximum=16*1024*1024); require_strict_int(self.stderr_byte_limit,"authorization stderr limit",minimum=1,maximum=16*1024*1024)
         if fingerprint(self._body())!=self.payload_fingerprint: raise ValueError("authorization payload fingerprint mismatch")
         return self
-    def to_dict(self) -> dict[str, Any]: data=self._body(); data["payload_fingerprint"]=self.payload_fingerprint; return data
+
+    def validated_for_authorization(self, *, active_source_repository: str | Path) -> "NativeCanaryAuthorizationPayload":
+        """Bind an already-structural payload to the trusted active source root.
+
+        This deliberately does not run Git or launch a backend.  The caller that
+        grants live authority checks HEAD and cleanliness against this same active
+        root immediately before phrase-bound authorization.
+        """
+
+        self.validated()
+        active, active_identity = _safe_directory(active_source_repository, "active authorization source repository")
+        signed, signed_identity = _safe_directory(self.source_repository, "authorization source repository")
+        if (
+            str(active) != self.source_repository
+            or active != signed
+            or not _same_directory_identity(active_identity, signed_identity)
+            or not _same_directory_identity(active_identity, self.source_repository_identity)
+        ):
+            raise ValueError("authorization source repository differs from the active source repository")
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        data=self._body(); data["payload_fingerprint"]=self.payload_fingerprint; return data
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "NativeCanaryAuthorizationPayload":
+        """Parse persisted review data without granting executable authority."""
+
+        require_exact_keys(data, set(cls.__dataclass_fields__), "native canary authorization payload")
+        values = dict(data)
+        values["source_repository_identity"] = NativeFilesystemIdentity.from_dict(data["source_repository_identity"])
+        for key in ("launcher_prefix", "attestation_non_claims", "canary_non_claims"):
+            raw = data[key]
+            if not isinstance(raw, list) or any(not isinstance(item, str) for item in raw) or len(set(raw)) != len(raw):
+                raise ValueError(f"authorization {key} must be a duplicate-free JSON string array")
+            values[key] = tuple(raw)
+        raw_budgets = data["budgets"]
+        if not isinstance(raw_budgets, list) or len(raw_budgets) != 5:
+            raise ValueError("authorization budgets must be a five-item JSON array")
+        values["budgets"] = tuple(raw_budgets)
+        return cls(**values).validated()
 
 
-def build_authorization_payload(*, source_repository: Path, source_head: str, run_id: str, session_id: str, attestation: BackendAttestation, run_root: str | Path, timeout_seconds: int) -> NativeCanaryAuthorizationPayload:
-    state=create_canary_session(session_id=session_id); root=Path(os.path.abspath(os.fspath(run_root))); evidence=root / "evidence"; attestation=attestation.validated()
-    provisional=NativeCanaryAuthorizationPayload(AUTHORIZATION_SCHEMA_VERSION,str(source_repository),source_head.lower(),True,run_id,session_id,state.mission.mission_fingerprint,state.gate_plan.plan_fingerprint,state.current_gate.contract_fingerprint,attestation.attestation_class,attestation.attestation_fingerprint,tuple(attestation.non_claims),attestation.executable.canonical_path,tuple(item.canonical_path for item in attestation.launcher_prefix),attestation.selected_model,timeout_seconds,DEFAULT_STDOUT_BYTE_LIMIT,DEFAULT_STDERR_BYTE_LIMIT,(1,1,0,0,0),CANARY_FIXTURE_VERSION,REQUIRED_COMMIT_MESSAGE,str(root),str(evidence),"0"*64)
+def build_authorization_payload(*, source_repository: Path, source_head: str, run_id: str, session_id: str, attestation: BackendAttestation, run_root: str | Path, timeout_seconds: int, backend_readiness_reason: str | None = None) -> NativeCanaryAuthorizationPayload:
+    state=create_canary_session(session_id=session_id); source, source_identity=_safe_directory(source_repository,"authorization source repository"); root=Path(os.path.abspath(os.fspath(run_root))); evidence=root / EVIDENCE_DIRECTORY_NAME; workspace=root / WORKSPACE_DIRECTORY_NAME; sidecar=evidence / NATIVE_SIDECAR_DIRECTORY_NAME; attestation=attestation.validated()
+    # The readiness reason is the concrete preflight decision reason; when the
+    # caller does not thread one through it defaults to the exact class pairing.
+    readiness_reason=backend_readiness_reason if backend_readiness_reason is not None else CLASS_READINESS_REASONS.get(attestation.attestation_class,"")
+    provisional=NativeCanaryAuthorizationPayload(AUTHORIZATION_SCHEMA_VERSION,str(source),source_identity,source_head.lower(),True,run_id,session_id,state.mission.mission_fingerprint,state.gate_plan.plan_fingerprint,state.current_gate.contract_fingerprint,attestation.attestation_class,readiness_reason,attestation.attestation_fingerprint,tuple(attestation.non_claims),CANARY_NON_CLAIMS,attestation.executable.canonical_path,tuple(item.canonical_path for item in attestation.launcher_prefix),attestation.selected_model,timeout_seconds,DEFAULT_STDOUT_BYTE_LIMIT,DEFAULT_STDERR_BYTE_LIMIT,(1,1,0,0,0),CANARY_FIXTURE_VERSION,REQUIRED_COMMIT_MESSAGE,str(root),str(workspace),str(evidence),str(sidecar),"0"*64)
     return NativeCanaryAuthorizationPayload(**{**provisional.__dict__,"payload_fingerprint":fingerprint(provisional._body())}).validated()
 
 
-def _authorized(phrase: str, payload: NativeCanaryAuthorizationPayload) -> bool:
+def _authorized(phrase: str, payload: NativeCanaryAuthorizationPayload, *, active_source_repository: str | Path) -> bool:
+    try:
+        if not isinstance(phrase, str):
+            return False
+        payload.validated_for_authorization(active_source_repository=active_source_repository)
+    except (TypeError, ValueError):
+        return False
     expected=os.environ.get(OWNER_AUTHORIZATION_DIGEST_ENV,"")
     if len(expected)!=64 or any(char not in "0123456789abcdefABCDEF" for char in expected): return False
     observed=hashlib.sha256(phrase.encode("utf-8")+b"\0"+canonical_bytes(payload.to_dict())).hexdigest()
-    return observed==expected.lower()
+    return hmac.compare_digest(observed,expected.lower())
 
 
 def _write_run_metadata_once(path: Path, payload: Mapping[str, Any]) -> None:
@@ -619,24 +754,28 @@ def main(argv: list[str] | None = None) -> int:
     if not 1<=args.timeout_seconds<=3600: print(json.dumps({**blocked,"detail":"timeout must be from 1 through 3600 seconds"},sort_keys=True)); return 2
     try: source,_=_safe_directory(args.source_repository,"source repository")
     except ValueError as exc: print(json.dumps({**blocked,"detail":str(exc)},sort_keys=True)); return 2
-    ready,detail=_git_source_preflight(source,args.required_source_head)
-    if not ready: print(json.dumps({**blocked,"detail":detail},sort_keys=True)); return 2
     attestation_class=ATTESTATION_CLASS_WRAPPER_CHAIN if args.attestation_class=="wrapper-chain" else ATTESTATION_CLASS_PACKAGE_BIN
     try: config=CursorNativeBackendConfig(executable=args.executable,launcher_prefix=tuple(args.executable_prefix_arg),model=args.model,attestation_class=attestation_class)
     except ValueError as exc: print(json.dumps({**blocked,"detail":str(exc)},sort_keys=True)); return 2
     decision:NativePreflightDecision=preflight_native_cursor(config=config)
     if not decision.ready or decision.attestation is None: print(json.dumps({**blocked,"detail":decision.detail,"reason_code":decision.reason_code},sort_keys=True)); return 2
-    payload=build_authorization_payload(source_repository=source,source_head=args.required_source_head,run_id=args.run_id,session_id=args.session_id,attestation=decision.attestation,run_root=args.run_root,timeout_seconds=args.timeout_seconds)
+    try:
+        payload=build_authorization_payload(source_repository=source,source_head=args.required_source_head,run_id=args.run_id,session_id=args.session_id,attestation=decision.attestation,run_root=args.run_root,timeout_seconds=args.timeout_seconds,backend_readiness_reason=decision.reason_code)
+        payload.validated_for_authorization(active_source_repository=source)
+    except ValueError as exc:
+        print(json.dumps({**blocked,"detail":str(exc)},sort_keys=True)); return 2
+    ready,detail=_git_source_preflight(source,args.required_source_head)
+    if not ready: print(json.dumps({**blocked,"detail":detail},sort_keys=True)); return 2
     if args.preflight_only: print(json.dumps({"status":NativePreflightStatus.PREFLIGHT_READY.value,"authorization_payload":payload.to_dict(),"attestation":decision.attestation.to_dict()},sort_keys=True)); return 0
-    if not args.owner_authorization or not _authorized(args.owner_authorization,payload): print(json.dumps({**blocked,"detail":"owner authorization did not match the exact canonical payload"},sort_keys=True)); return 2
+    if not args.owner_authorization or not _authorized(args.owner_authorization,payload,active_source_repository=source): print(json.dumps({**blocked,"detail":"owner authorization did not match the exact canonical payload"},sort_keys=True)); return 2
     run_root=Path(os.path.abspath(args.run_root))
     if run_root.name != args.run_id: print(json.dumps({**blocked,"detail":"run root basename must equal the fresh run ID"},sort_keys=True)); return 2
     if run_root.exists() or _inside(run_root,source) or _inside(source,run_root): print(json.dumps({**blocked,"detail":"run root must be fresh and non-overlapping with source"},sort_keys=True)); return 2
     try: _safe_directory(run_root.parent,"run root parent")
     except ValueError as exc: print(json.dumps({**blocked,"detail":str(exc)},sort_keys=True)); return 2
-    run_root.mkdir(); _safe_directory(run_root,"run root"); fixture=build_canary_repository(run_root); evidence=(run_root/"evidence"); evidence.mkdir(); _safe_directory(evidence,"evidence directory")
+    run_root.mkdir(); _safe_directory(run_root,"run root"); fixture=build_canary_repository(run_root,repository_name=WORKSPACE_DIRECTORY_NAME); evidence=(run_root/EVIDENCE_DIRECTORY_NAME); evidence.mkdir(); _safe_directory(evidence,"evidence directory")
     _write_run_metadata_once(evidence/"canary-preflight.json",{"classification":CANARY_CLASSIFICATION,"authorization_payload":payload.to_dict(),"attestation":decision.attestation.to_dict(),"local_capability_status":decision.status.value})
-    session_store=AtomicDelegatedSessionStore(evidence/"delegated-state"); execution_store=AtomicNativeExecutionStore(evidence/"native-execution"); session_store.create(create_canary_session(session_id=args.session_id))
+    session_store=AtomicDelegatedSessionStore(evidence/"delegated-state"); execution_store=AtomicNativeExecutionStore(evidence/NATIVE_SIDECAR_DIRECTORY_NAME); session_store.create(create_canary_session(session_id=args.session_id))
     coordinator=NativeCanaryCoordinator(session_store=session_store,execution_store=execution_store,executor=NativeDelegatedExecutor(config=config),backend_attestation=decision.attestation,source_repository=source,work_workspace=fixture.repository,canary_parent=run_root,evidence_directory=evidence,timeout_seconds=args.timeout_seconds)
     outcome=coordinator.run(session_id=args.session_id); _write_run_metadata_once(evidence/"final-status.json",outcome.to_dict()); print(json.dumps(outcome.to_dict(),sort_keys=True)); return 0 if outcome.canary_success else 1
 
@@ -644,4 +783,4 @@ def main(argv: list[str] | None = None) -> int:
 if __name__ == "__main__": sys.exit(main())
 
 
-__all__=["AUTHORIZATION_SCHEMA_VERSION","BEHAVIORAL_EVIDENCE_SCHEMA_VERSION","CANARY_CLASSIFICATION","CANARY_FIXTURE_VERSION","CANARY_GATE_ID","CANARY_MISSION","CANARY_MISSION_ID","DEFAULT_STDERR_BYTE_LIMIT","DEFAULT_STDOUT_BYTE_LIMIT","DEFAULT_TIMEOUT_SECONDS","EXPECTED_MATERIAL_PATHS","FixtureRepository","MAX_AUDITOR_INVOCATIONS","MAX_NATIVE_PHASE_ATTEMPTS","MAX_PROVIDER_INVOCATIONS","MAX_REPAIR_ROUNDS","MAX_RETRIES","NativeCanaryAuthorizationPayload","NativeCanaryCoordinator","NativeCanaryOutcome","NativeCanaryStatus","OWNER_AUTHORIZATION_DIGEST_ENV","REQUIRED_COMMIT_MESSAGE","BehavioralVerifierEvidence","build_authorization_payload","build_canary_repository","build_native_agent_prompt","build_parser","create_canary_session","load_behavioral_verifier","main","npm_test_argv","run_behavioral_verifier"]
+__all__=["AUTHORIZATION_SCHEMA_VERSION","AUTHORIZATION_SCHEMA_VERSION_LEGACY_V2","CANARY_NON_CLAIMS","CLASS_READINESS_REASONS","EVIDENCE_DIRECTORY_NAME","NATIVE_SIDECAR_DIRECTORY_NAME","PACKAGE_BIN_READY_REASON","WORKSPACE_DIRECTORY_NAME","BEHAVIORAL_EVIDENCE_SCHEMA_VERSION","CANARY_CLASSIFICATION","CANARY_FIXTURE_VERSION","CANARY_GATE_ID","CANARY_MISSION","CANARY_MISSION_ID","DEFAULT_STDERR_BYTE_LIMIT","DEFAULT_STDOUT_BYTE_LIMIT","DEFAULT_TIMEOUT_SECONDS","EXPECTED_MATERIAL_PATHS","FixtureRepository","MAX_AUDITOR_INVOCATIONS","MAX_NATIVE_PHASE_ATTEMPTS","MAX_PROVIDER_INVOCATIONS","MAX_REPAIR_ROUNDS","MAX_RETRIES","NativeCanaryAuthorizationPayload","NativeCanaryCoordinator","NativeCanaryOutcome","NativeCanaryStatus","OWNER_AUTHORIZATION_DIGEST_ENV","REQUIRED_COMMIT_MESSAGE","BehavioralVerifierEvidence","build_authorization_payload","build_canary_repository","build_native_agent_prompt","build_parser","create_canary_session","load_behavioral_verifier","main","npm_test_argv","run_behavioral_verifier"]
