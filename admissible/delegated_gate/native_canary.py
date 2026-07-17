@@ -62,6 +62,7 @@ from admissible.delegated_gate.native_executor import (
     NativeProcessObservationPublicationError,
     NativeProcessStartError,
     NativeResultIneligible,
+    _result_from_observation,
     _inside,
     _safe_create_directory,
     _safe_directory,
@@ -176,6 +177,9 @@ class NativeCanaryOutcome:
     accepted_native_results_published: int
     canary_success: bool
     detail: str
+    behavioral_evidence_fingerprint: str | None = None
+    capture_attempt_fingerprint: str | None = None
+    workspace_final_git_head: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -188,6 +192,9 @@ class NativeCanaryOutcome:
             "process_observations_published": self.process_observations_published,
             "accepted_native_results_published": self.accepted_native_results_published,
             "canary_success": self.canary_success, "detail": self.detail,
+            "behavioral_evidence_fingerprint": self.behavioral_evidence_fingerprint,
+            "capture_attempt_fingerprint": self.capture_attempt_fingerprint,
+            "workspace_final_git_head": self.workspace_final_git_head,
             "authorized_budgets": {"provider_invocations": 1, "native_phase_attempts": 1, "repair_rounds": 0, "auditor_invocations": 0, "retries": 0},
             "budgets": {"provider_invocations": 1, "native_phase_attempts": 1, "repair_rounds": 0, "auditor_invocations": 0, "retries": 0},
         }
@@ -435,7 +442,7 @@ def run_behavioral_verifier(*, request: NativeExecutionRequest, execution_store:
     return execution_store.create_behavioral_evidence(request=request,evidence=evidence,loader=BehavioralVerifierEvidence.from_dict)
 
 
-def load_behavioral_verifier(*, request: NativeExecutionRequest, execution_store: AtomicNativeExecutionStore) -> BehavioralVerifierEvidence:
+def load_behavioral_verifier(*, request: NativeExecutionRequest | NativeExecutionRequestBinding, execution_store: AtomicNativeExecutionStore) -> BehavioralVerifierEvidence:
     try: evidence=execution_store.load_behavioral_evidence(request.session_id,request.gate_id,request.execution_attempt_index,loader=BehavioralVerifierEvidence.from_dict)
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc: raise NativeEvidenceInvalid(f"behavioral verifier evidence is invalid: {exc}") from exc
     if evidence.request_fingerprint!=request.request_fingerprint: raise NativeEvidenceInvalid("behavioral verifier evidence differs from the durable request")
@@ -486,24 +493,43 @@ class NativeCanaryCoordinator:
         self.session_store=session_store; self.execution_store=execution_store; self.executor=executor; self.backend_attestation=backend_attestation.validated()
         self.source_repository,_=_safe_directory(source_repository,"source repository"); self.work_workspace,_=_safe_directory(work_workspace,"work workspace"); self.canary_parent,_=_safe_directory(canary_parent,"canary parent"); self.evidence_directory,_=_safe_directory(evidence_directory,"evidence directory")
         self.timeout_seconds=timeout_seconds; self.stdout_byte_limit=stdout_byte_limit; self.stderr_byte_limit=stderr_byte_limit
-    def _outcome(self, *, status: NativeCanaryStatus, state: DelegatedSessionState, request: NativeExecutionRequest | NativeExecutionRequestBinding | None = None, result: NativeExecutionResult | None = None, result_fingerprint: str | None = None, detail: str) -> NativeCanaryOutcome:
+    def _outcome(self, *, status: NativeCanaryStatus, state: DelegatedSessionState, request: NativeExecutionRequest | NativeExecutionRequestBinding | None = None, result: NativeExecutionResult | None = None, result_fingerprint: str | None = None, detail: str, behavioral_evidence_fingerprint: str | None = None, capture_attempt_fingerprint: str | None = None, workspace_final_git_head: str | None = None) -> NativeCanaryOutcome:
         checkpoint=state.checkpoint_history[-1] if state.checkpoint_history else None
         counts=NativeLifecycleCounts()
         if request is not None:
             counts=self.execution_store.lifecycle_counts(request.session_id,request.gate_id,request.execution_attempt_index)
-        return NativeCanaryOutcome(status,state.session_id,state.phase.value,request.request_fingerprint if request else None,result.result_fingerprint if result else result_fingerprint,checkpoint.checkpoint_fingerprint if checkpoint else None,counts.provider_invocations_started,counts.native_attempts_reserved,counts.native_processes_started,counts.native_processes_completed,counts.process_observations_published,counts.accepted_native_results_published,status is NativeCanaryStatus.CHECKPOINT_CAPTURED_CANARY_SUCCESS,detail)
+        return NativeCanaryOutcome(status,state.session_id,state.phase.value,request.request_fingerprint if request else None,result.result_fingerprint if result else result_fingerprint,checkpoint.checkpoint_fingerprint if checkpoint else None,counts.provider_invocations_started,counts.native_attempts_reserved,counts.native_processes_started,counts.native_processes_completed,counts.process_observations_published,counts.accepted_native_results_published,status is NativeCanaryStatus.CHECKPOINT_CAPTURED_CANARY_SUCCESS,detail,behavioral_evidence_fingerprint,capture_attempt_fingerprint,workspace_final_git_head)
     def _terminal_outcome(self, state: DelegatedSessionState, request: NativeExecutionRequest | NativeExecutionRequestBinding, terminal: NativeCanaryTerminalRecord) -> NativeCanaryOutcome:
         category_mapping={"process_spawn_failure":NativeCanaryStatus.PROCESS_SPAWN_FAILED,"process_timeout":NativeCanaryStatus.TIMED_OUT,"process_exit_failure":NativeCanaryStatus.PROCESS_FAILED,"process_cleanup_failure":NativeCanaryStatus.CLEANUP_UNCERTAIN,"process_observation_publication":NativeCanaryStatus.PROCESS_OBSERVATION_PUBLICATION_FAILED}
         mapping={NativeCaptureTerminalStatus.PRECAPTURE_FAILED:NativeCanaryStatus.PRECAPTURE_ELIGIBILITY_FAILED,NativeCaptureTerminalStatus.CAPTURE_FAILED:NativeCanaryStatus.CHECKPOINT_CAPTURE_FAILED,NativeCaptureTerminalStatus.DURABILITY_UNCERTAIN:NativeCanaryStatus.DURABILITY_UNCERTAIN}
         status=category_mapping.get(terminal.failure_category,mapping[terminal.status])
         return self._outcome(status=status,state=state,request=request,result_fingerprint=terminal.result_fingerprint,detail=terminal.diagnostic)
-    def _load_authoritative_request(self, *, session_id: str, gate_id: str) -> NativeExecutionRequest:
-        current=self.executor.attest_local_backend()
-        return self.execution_store.load_request_verified_against_local_backend(session_id,gate_id,0,current_attestation=current)
-    def _reconstruct_success(self, state: DelegatedSessionState, request: NativeExecutionRequest, result: NativeExecutionResult) -> NativeCanaryOutcome:
-        request.validated_for_execution(current_attestation=self.executor.attest_local_backend())
+    def _reconstruct_success(self, state: DelegatedSessionState, request: NativeExecutionRequest | NativeExecutionRequestBinding, result: NativeExecutionResult) -> NativeCanaryOutcome:
+        """Evidence-only interpretation of an already-completed success.
+
+        This historical path validates persisted canonical records and the
+        run-local workspace only.  It never consults, attests, or compares the
+        live Cursor backend; it can veto but never grant execution authority,
+        and no runner, provider, verifier, or checkpoint command is reachable
+        from it.
+        """
         if self.execution_store.has_terminal(state.session_id,request.gate_id,0): return self._terminal_outcome(state,request,self.execution_store.load_terminal(state.session_id,request.gate_id,0))
+        if (
+            request.session_id!=state.session_id or request.execution_attempt_index!=0
+            or request.mission_fingerprint!=state.mission.mission_fingerprint
+            or request.gate_contract_fingerprint!=state.current_gate.contract_fingerprint
+        ): raise NativeEvidenceInvalid("persisted request does not bind the delegated session authority")
+        reservation=self.execution_store.load_attempt_reserved(state.session_id,request.gate_id,0)
+        started=self.execution_store.load_process_started(state.session_id,request.gate_id,0)
+        observation=self.execution_store.load_process_observation(state.session_id,request.gate_id,0)
+        eligibility=self.execution_store.load_execution_eligibility(state.session_id,request.gate_id,0)
+        if not eligibility.eligible or eligibility.ineligibility_reasons: raise NativeEvidenceInvalid("accepted success requires persisted successful eligibility")
+        counts=self.execution_store.lifecycle_counts(state.session_id,request.gate_id,0)
+        if (counts.native_attempts_reserved,counts.native_processes_started,counts.native_processes_completed,counts.process_observations_published,counts.accepted_native_results_published)!=(1,1,1,1,1): raise NativeEvidenceInvalid("one-shot lifecycle counts are contradictory")
         attempt=self.execution_store.load_capture_attempt(state.session_id,request.gate_id,0)
+        if not (reservation.reserved_at<=started.process_started_at<=observation.process["ended_at"]<=eligibility.evaluated_at<=attempt.started_at): raise NativeEvidenceInvalid("lifecycle timestamps are out of order")
+        expected=_result_from_observation(observation,backend_attestation_fingerprint=request.backend_attestation_fingerprint)
+        if NativeExecutionResult(**{**expected.__dict__,"result_fingerprint":result.result_fingerprint})!=result: raise NativeEvidenceInvalid("accepted result contradicts the persisted process observation")
         behavioral=load_behavioral_verifier(request=request,execution_store=self.execution_store)
         if (
             attempt.session_id!=state.session_id or attempt.gate_id!=state.current_gate.gate_id or attempt.execution_attempt_index!=0
@@ -519,6 +545,7 @@ class NativeCanaryCoordinator:
         if state.phase is not Phase.CHECKPOINT_CAPTURED or len(state.checkpoint_history)!=1 or state.audit_history or state.repair_authority is not None or state.human_boundary_reason is not None or state.human_disposition is not None or state.current_gate.gate_id!=CANARY_GATE_ID: raise NativeEvidenceInvalid("reconstructed delegated state exceeds Act-2A stop boundary")
         checkpoint=state.checkpoint_history[-1]
         if checkpoint.session_id!=state.session_id or checkpoint.gate_id!=request.gate_id or checkpoint.execution_attempt_index!=0: raise NativeEvidenceInvalid("checkpoint differs from the active request")
+        if checkpoint.git_head!=result.final_git_head or checkpoint.git_worktree_status!=result.final_git_porcelain_status: raise NativeEvidenceInvalid("checkpoint Git facts contradict the accepted result")
         checkpoint_root,_=_safe_directory(self.evidence_directory / "checkpoint-artifacts","checkpoint artifact root")
         for reference in checkpoint.artifact_references:
             path=checkpoint_root / reference.relative_path; safe,_=_safe_file(path,"checkpoint artifact")
@@ -527,7 +554,7 @@ class NativeCanaryCoordinator:
             if len(data)!=reference.byte_count or hashlib.sha256(data).hexdigest()!=reference.sha256: raise NativeEvidenceInvalid("checkpoint artifact hash mismatch")
         if _pre_capture_reason(result, behavioral) is not None: raise NativeEvidenceInvalid("reconstructed success no longer satisfies eligibility")
         if _checkpoint_success_reason(checkpoint,state.current_gate) is not None: raise NativeEvidenceInvalid("reconstructed checkpoint command evidence does not satisfy Act-2A success")
-        return self._outcome(status=NativeCanaryStatus.CHECKPOINT_CAPTURED_CANARY_SUCCESS,state=state,request=request,result=result,detail="All native, behavioral, capture, checkpoint, and state evidence reloaded from disk.")
+        return self._outcome(status=NativeCanaryStatus.CHECKPOINT_CAPTURED_CANARY_SUCCESS,state=state,request=request,result=result,detail="All native, behavioral, capture, checkpoint, and state evidence reloaded from disk.",behavioral_evidence_fingerprint=behavioral.evidence_fingerprint,capture_attempt_fingerprint=attempt.attempt_fingerprint,workspace_final_git_head=result.final_git_head)
     def _publish_failure_terminal(self, *, state: DelegatedSessionState, request: NativeExecutionRequest | NativeExecutionRequestBinding, result: NativeExecutionResult | None, status: NativeCaptureTerminalStatus, failure_category: str, diagnostic: str, capture_attempt: NativeCheckpointCaptureAttempt | None = None) -> NativeCanaryOutcome:
         try:
             terminal=self.execution_store.create_terminal(request=request,result=result,status=status,failure_category=failure_category,diagnostic=diagnostic[:1024],capture_attempt=capture_attempt)
@@ -537,7 +564,12 @@ class NativeCanaryCoordinator:
     def run(self, *, session_id: str) -> NativeCanaryOutcome:
         state=self.session_store.load(session_id); gate=state.current_gate; attempt=0
         if state.phase is Phase.CHECKPOINT_CAPTURED:
-            return self._reconstruct_success(state,self._load_authoritative_request(session_id=session_id,gate_id=gate.gate_id),self.execution_store.load_result(session_id,gate.gate_id,attempt))
+            # Historical-evidence path: recognize a persisted terminal first,
+            # then reconstruct the completed success from persisted canonical
+            # evidence alone.  The live Cursor backend is never consulted.
+            binding=self.execution_store.load_request_structural(session_id,gate.gate_id,attempt)
+            if self.execution_store.has_terminal(session_id,gate.gate_id,attempt): return self._terminal_outcome(state,binding,self.execution_store.load_terminal(session_id,gate.gate_id,attempt))
+            return self._reconstruct_success(state,binding,self.execution_store.load_result(session_id,gate.gate_id,attempt))
         if state.phase is Phase.READY_FOR_GATE:
             started=reduce(state,GateExecutionStarted(gate.gate_id)); self.session_store.replace(started,expected_revision=state.revision); state=self.session_store.load(session_id)
         if state.phase is not Phase.GATE_EXECUTING: raise RuntimeError(f"coordinator refuses delegated phase {state.phase.value}")

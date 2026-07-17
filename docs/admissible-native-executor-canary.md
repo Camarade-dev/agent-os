@@ -334,14 +334,31 @@ only when every exact active-contract verification command is present and
 A failed verification checkpoint leaves durable state at `GATE_EXECUTING`,
 writes one terminal record, and consumes the one capture attempt.
 
-Success is emitted only after reloading request, freshly matching backend
-attestation, result, native artifacts, behavioral evidence, capture-attempt
+Live backend attestation grants prospective execution authority only: it is
+required before a new process may be created and is never a way to interpret
+history. A completed `CHECKPOINT_CAPTURED` success reconstructs exclusively
+from persisted run evidence — the canonical structural request snapshot,
+reservation, process start, process observation, successful eligibility,
+accepted result, native artifacts, behavioral evidence, capture-attempt
 record, delegated state, checkpoint, and every checkpoint artifact hash/size
-from disk. Reconstruction binds the unique capture attempt to the exact run,
+from disk, plus read-only Git facts from the run-local workspace. Current
+backend availability or equality with the historical attestation is not
+required to interpret that success: evidence-only reconstruction never calls
+the local attestor, wrapper-chain or command-resolution discovery, a runner or
+provider, the behavioral verifier, or a checkpoint command, and it cannot
+spawn, authorize, retry, verify, capture, or create attempt one.
+Reconstruction binds the unique capture attempt to the exact run,
 request/result/behavioral fingerprints, plan, active gate contract, required
 command identities, expected `CHECKPOINT_CAPTURED` outcome, state revision,
-and persisted checkpoint. The reconstructed
-state must be exactly `CHECKPOINT_CAPTURED` with no audit or repair history.
+and persisted checkpoint, cross-checks the accepted result against the
+persisted process observation and the checkpoint's Git facts, and requires
+one-shot lifecycle counts with ordered timestamps. The reconstructed state
+must be exactly `CHECKPOINT_CAPTURED` with no audit or repair history.
+Missing, malformed, non-canonical, fingerprint-invalid, out-of-order,
+contradictory, or terminal-accompanied evidence remains fail-closed without
+executing anything. Canary-004 remains immutable and unaccepted until a
+separate explicit owner decision; none of this adds any sandboxing,
+hostile-process-resistance, or production-suitability claim.
 
 ## Future live authorization
 
@@ -463,3 +480,10 @@ a new run ID, a new empty root, a new clean-HEAD preview, a new payload, a new
 owner decision, and a new one-time phrase. Neither
 `native-cursor-canary-001` nor `native-cursor-canary-002` can ever satisfy any
 of those conditions or become executable authority.
+
+Historical completed-success reconstruction inspects run-local Git facts only
+through the production native-executor Git helper. That helper explicitly
+passes `GIT_OPTIONAL_LOCKS=0` to each Git child, so reconstruction does not
+refresh or rewrite the historical Git index. This guarantee is production
+code, not test-environment configuration; it does not claim that every Git
+executable or filesystem is safe against hostile local mutation.

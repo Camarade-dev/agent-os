@@ -2719,7 +2719,12 @@ def _material_snapshot(root: Path) -> tuple[str, tuple[str, ...]]:
 
 
 def _git(repository: Path, *arguments: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(["git", *arguments], cwd=repository, shell=False, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+    # Git may opportunistically refresh the index during otherwise observational
+    # commands.  The native evidence boundary must not depend on its caller's
+    # environment for read-only repository observations.
+    environment = dict(os.environ)
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    result = subprocess.run(["git", *arguments], cwd=repository, env=environment, shell=False, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
     if len(result.stdout.encode("utf-8")) > 2 * 1024 * 1024 or len(result.stderr.encode("utf-8")) > 2 * 1024 * 1024: raise NativeEvidenceInvalid("Git observation exceeded its output bound")
     return result
 
@@ -3509,7 +3514,9 @@ class AtomicNativeExecutionStore:
         return self.load_behavioral_evidence(request.session_id, request.gate_id, request.execution_attempt_index, loader=loader)
     def load_behavioral_evidence(self, session_id: str, gate_id: str, attempt: int, *, loader: Callable[[Mapping[str, Any]], Any]) -> Any:
         evidence = self._load("behavioral", session_id, gate_id, attempt, loader)
-        request = self.load_request(session_id, gate_id, attempt)
+        # Binding uses the inert structural request snapshot: loading persisted
+        # behavioral evidence is never an occasion to consult the live backend.
+        request = self.load_request_structural(session_id, gate_id, attempt)
         self._validate_behavioral_binding(request, evidence)
         for reference in (evidence.script, evidence.stdout, evidence.stderr): self._verify_artifact(reference)
         return evidence

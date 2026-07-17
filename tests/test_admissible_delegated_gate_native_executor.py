@@ -2862,3 +2862,224 @@ def test_act_2a_3g_corrected_payload_cannot_match_invalidated_act_2a_3f_vector(t
     assert payload.gate_contract_fingerprint == _ACT_2A_GATE_CONTRACT_FINGERPRINT
     assert payload.payload_fingerprint != "a6f4340ce0e3acfcdb63f1455de8d753de412a8fffa3f2531bf08e57d9b3e28e"
     assert hashlib.sha256(canonical_payload).hexdigest() != "f0c83a2634f853bea66afe8c2b8f161e9374c3d717180499b8c652c935c9f311"
+
+
+# --- Act 2A.4B: evidence-only reconstruction of a completed success ----------
+
+
+class _LiveCapabilityTrap(AssertionError):
+    """Raised when a booby-trapped live capability is invoked."""
+
+
+def _trap_capability(label: str) -> Callable[..., object]:
+    def _fire(*_args: object, **_kwargs: object) -> object:
+        raise _LiveCapabilityTrap(f"{label} invoked during evidence-only reconstruction")
+    return _fire
+
+
+class _TrapProcessRunner:
+    def run(self, invocation: NativeProcessInvocation) -> NativeProcessOutcome:
+        raise _LiveCapabilityTrap("native process runner invoked during evidence-only reconstruction")
+
+
+class _InertStubAttestation:
+    """Constructor stand-in proving reconstruction never uses a live attestation."""
+
+    def validated(self) -> "_InertStubAttestation":
+        return self
+
+
+def _force_rmtree(root: Path) -> None:
+    def _grant(func, path, _exc):
+        os.chmod(path, stat.S_IWRITE); func(path)
+    shutil.rmtree(root, onerror=_grant)
+
+
+def _tree_hashes(root: Path) -> dict[str, str]:
+    return {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+def _rewrite_record(path: Path, mutate: Callable[[dict], None], *, self_fingerprint: str | None) -> None:
+    from admissible.delegated_gate.canonical import canonical_bytes
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    mutate(raw)
+    if self_fingerprint is not None:
+        raw[self_fingerprint] = fingerprint({key: value for key, value in raw.items() if key != self_fingerprint})
+    path.write_bytes(canonical_bytes(raw) + b"\n")
+
+
+def _evidence_only_coordinator(h: Harness, monkeypatch: pytest.MonkeyPatch, *, source: Path | None = None) -> NativeCanaryCoordinator:
+    """A restarted coordinator in which every live capability is a trap."""
+
+    monkeypatch.setattr("admissible.delegated_gate.native_canary.run_behavioral_verifier", _trap_capability("behavioral verifier"))
+    monkeypatch.setattr("admissible.delegated_gate.native_canary.capture_checkpoint", _trap_capability("checkpoint capture"))
+    executor = NativeDelegatedExecutor(config=h.config, process_runner=_TrapProcessRunner(), local_attestor=_trap_capability("local backend attestor"))
+    return NativeCanaryCoordinator(
+        session_store=AtomicDelegatedSessionStore(h.session_store.directory),
+        execution_store=AtomicNativeExecutionStore(h.store.directory),
+        executor=executor, backend_attestation=_InertStubAttestation(),
+        source_repository=source if source is not None else h.source, work_workspace=h.work,
+        canary_parent=h.root, evidence_directory=h.evidence,
+        timeout_seconds=30, stdout_byte_limit=4096, stderr_byte_limit=2048,
+    )
+
+
+def _repository_internals(repository: Path) -> dict[str, tuple[bytes, int, int]]:
+    """Exact bytes, size, and nanosecond mtime for the disposable repository."""
+
+    return {
+        path.relative_to(repository).as_posix(): (path.read_bytes(), path.stat().st_size, path.stat().st_mtime_ns)
+        for path in sorted(repository.rglob("*")) if path.is_file()
+    }
+
+
+def test_git_forces_optional_locks_off_only_for_its_child(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    repository = tmp_path / "repository"; repository.mkdir()
+    observed: dict[str, object] = {}
+
+    def capture(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        observed["command"] = args[0]
+        observed.update(kwargs)
+        return subprocess.CompletedProcess(args[0], 0, "ok\n", "")
+
+    monkeypatch.setenv("GIT_OPTIONAL_LOCKS", "1")
+    monkeypatch.setenv("NATIVE_GIT_INHERITED_TEST", "preserved")
+    monkeypatch.setattr(native_executor.subprocess, "run", capture)
+    assert native_executor._git(repository, "status", "--porcelain", timeout=17).stdout == "ok\n"
+    assert observed["env"]["GIT_OPTIONAL_LOCKS"] == "0"
+    assert observed["env"]["NATIVE_GIT_INHERITED_TEST"] == "preserved"
+    assert os.environ["GIT_OPTIONAL_LOCKS"] == "1"
+    assert observed["command"] == ["git", "status", "--porcelain"]
+    assert observed["cwd"] == repository and observed["timeout"] == 17
+    assert observed["shell"] is False and observed["capture_output"] is True
+
+
+def test_git_observation_does_not_refresh_disposable_index(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("GIT_OPTIONAL_LOCKS", raising=False)
+    repository = tmp_path / "repository"; repository.mkdir()
+    _command(["git", "init", "--quiet"], cwd=repository)
+    tracked = repository / "tracked.txt"; tracked.write_text("unchanged\n", encoding="utf-8")
+    _commit(repository, "initial")
+    # Change only the worktree stat information, the condition under which Git
+    # may refresh a clean index entry.  Production observation must not do so.
+    old = tracked.stat(); os.utime(tracked, ns=(old.st_atime_ns, old.st_mtime_ns + 2_000_000_000))
+    before = _repository_internals(repository)
+    result = native_executor._git(repository, "status", "--porcelain=v1", "--untracked-files=all")
+    assert result.returncode == 0 and result.stdout == ""
+    assert _repository_internals(repository) == before
+
+
+def test_checkpoint_captured_success_reconstruction_is_evidence_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    h = _harness(tmp_path); assert h.coordinator.run(session_id=h.session_id).canary_success
+    before = _tree_hashes(h.evidence)
+    outcome = _evidence_only_coordinator(h, monkeypatch).run(session_id=h.session_id)
+    result = h.store.load_result(h.session_id, CANARY_GATE_ID, 0)
+    behavioral = load_behavioral_verifier(request=h.store.load_request_structural(h.session_id, CANARY_GATE_ID, 0), execution_store=h.store)
+    attempt = h.store.load_capture_attempt(h.session_id, CANARY_GATE_ID, 0)
+    state = h.session_store.load(h.session_id)
+    assert outcome.status is NativeCanaryStatus.CHECKPOINT_CAPTURED_CANARY_SUCCESS and outcome.canary_success
+    assert (outcome.native_attempts_reserved, outcome.native_processes_started, outcome.native_processes_completed, outcome.process_observations_published, outcome.accepted_native_results_published, outcome.provider_invocations) == (1, 1, 1, 1, 1, 1)
+    assert outcome.request_fingerprint == result.request_fingerprint and outcome.result_fingerprint == result.result_fingerprint
+    assert outcome.behavioral_evidence_fingerprint == behavioral.evidence_fingerprint
+    assert outcome.capture_attempt_fingerprint == attempt.attempt_fingerprint
+    assert outcome.checkpoint_fingerprint == state.checkpoint_history[-1].checkpoint_fingerprint
+    assert outcome.workspace_final_git_head == result.final_git_head and outcome.phase == Phase.CHECKPOINT_CAPTURED.value
+    assert len(h.runner.invocations) == 1
+    assert _tree_hashes(h.evidence) == before
+    assert not tuple(h.store.directory.glob("*.attempt-1.*")) and not h.store.has_terminal(h.session_id, CANARY_GATE_ID, 0)
+
+
+def test_completed_success_survives_changed_or_absent_backend_and_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    h = _harness(tmp_path); assert h.coordinator.run(session_id=h.session_id).canary_success
+    (h.source / "advance.txt").write_text("post-canary source work\n", encoding="utf-8")
+    _commit(h.source, "chore: advance source HEAD")
+    restarted = _evidence_only_coordinator(h, monkeypatch)
+    _force_rmtree(tmp_path / "injected-test-installation")
+    _force_rmtree(h.source)
+    outcome = restarted.run(session_id=h.session_id)
+    assert outcome.status is NativeCanaryStatus.CHECKPOINT_CAPTURED_CANARY_SUCCESS and outcome.canary_success
+    assert len(h.runner.invocations) == 1
+    assert not h.store.has_terminal(h.session_id, CANARY_GATE_ID, 0)
+
+
+def _delete_record(kind: str) -> Callable[[Harness], None]:
+    def _mutate(h: Harness) -> None:
+        h.store._path(kind, h.session_id, CANARY_GATE_ID, 0).unlink()
+    return _mutate
+
+
+def _tamper_record(kind: str, mutate: Callable[[dict], None], *, self_fingerprint: str | None) -> Callable[[Harness], None]:
+    def _apply(h: Harness) -> None:
+        _rewrite_record(h.store._path(kind, h.session_id, CANARY_GATE_ID, 0), mutate, self_fingerprint=self_fingerprint)
+    return _apply
+
+
+def _tamper_state(mutate: Callable[[dict], None]) -> Callable[[Harness], None]:
+    def _apply(h: Harness) -> None:
+        _rewrite_record(h.session_store.directory / f"{h.session_id}.delegated-gate.json", mutate, self_fingerprint="state_fingerprint")
+    return _apply
+
+
+def _eligibility_recorded_false(raw: dict) -> None:
+    raw["process_status_eligible"] = False
+    raw["eligible"] = False
+    raw["ineligibility_reasons"] = ["native_process_or_cleanup_ineligible"]
+
+
+def _advance_workspace_head(h: Harness) -> None:
+    (h.work / "advance.js").write_text("// post-success mutation\n", encoding="utf-8")
+    _commit(h.work, "chore: post-success mutation")
+
+
+def _dirty_workspace(h: Harness) -> None:
+    (h.work / "untracked.txt").write_text("dirty\n", encoding="utf-8")
+
+
+_EVIDENCE_TAMPER_CASES = [
+    ("missing-request", _delete_record("request")),
+    ("malformed-request", lambda h: h.store._path("request", h.session_id, CANARY_GATE_ID, 0).write_bytes(b"{not canonical json\n")),
+    ("request-fingerprint-mismatch", _tamper_record("request", lambda raw: raw.__setitem__("request_fingerprint", "0" * 64), self_fingerprint=None)),
+    ("missing-reservation", _delete_record("attempt-reserved")),
+    ("missing-process-start", _delete_record("process-started")),
+    ("missing-observation", _delete_record("process-observation")),
+    ("eligibility-recorded-false", _tamper_record("execution-eligibility", _eligibility_recorded_false, self_fingerprint="eligibility_fingerprint")),
+    ("eligibility-fingerprint-mismatch", _tamper_record("execution-eligibility", lambda raw: raw.__setitem__("eligibility_fingerprint", "1" * 64), self_fingerprint=None)),
+    ("missing-result", _delete_record("result")),
+    ("result-fingerprint-mismatch", _tamper_record("result", lambda raw: raw.__setitem__("result_fingerprint", "2" * 64), self_fingerprint=None)),
+    ("missing-behavioral", _delete_record("behavioral")),
+    ("behavioral-fingerprint-mismatch", _tamper_record("behavioral", lambda raw: raw.__setitem__("evidence_fingerprint", "3" * 64), self_fingerprint=None)),
+    ("missing-capture-attempt", _delete_record("capture-attempt")),
+    ("capture-result-binding-mismatch", _tamper_record("capture-attempt", lambda raw: raw.__setitem__("result_fingerprint", "4" * 64), self_fingerprint="attempt_fingerprint")),
+    ("state-missing-checkpoint", _tamper_state(lambda raw: raw.__setitem__("checkpoint_history", []))),
+    ("state-checkpoint-fingerprint-mismatch", _tamper_state(lambda raw: raw["checkpoint_history"][0].__setitem__("checkpoint_fingerprint", "5" * 64))),
+    ("state-revision-incorrect", _tamper_state(lambda raw: raw.__setitem__("revision", 7))),
+    ("workspace-head-advanced", _advance_workspace_head),
+    ("workspace-dirty", _dirty_workspace),
+]
+
+
+@pytest.mark.parametrize(("case", "mutate"), _EVIDENCE_TAMPER_CASES, ids=[case for case, _ in _EVIDENCE_TAMPER_CASES])
+def test_evidence_only_reconstruction_fails_closed_on_tampered_or_missing_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str, mutate: Callable[[Harness], None]):
+    from admissible.delegated_gate.store import DelegatedGateStoreError
+    h = _harness(tmp_path); assert h.coordinator.run(session_id=h.session_id).canary_success
+    mutate(h)
+    restarted = _evidence_only_coordinator(h, monkeypatch)
+    with pytest.raises((NativeExecutionStoreError, DelegatedGateStoreError)):
+        restarted.run(session_id=h.session_id)
+    assert len(h.runner.invocations) == 1
+    assert not tuple(h.store.directory.glob("*.attempt-1.*"))
+    assert not h.store.has_terminal(h.session_id, CANARY_GATE_ID, 0)
+
+
+def test_contradictory_terminal_over_completed_success_is_recognized_never_success(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    h = _harness(tmp_path); assert h.coordinator.run(session_id=h.session_id).canary_success
+    h.store.create_terminal(
+        request=h.store.load_request_structural(h.session_id, CANARY_GATE_ID, 0),
+        result=h.store.load_result(h.session_id, CANARY_GATE_ID, 0),
+        status=NativeCaptureTerminalStatus.CAPTURE_FAILED,
+        failure_category="checkpoint_capture", diagnostic="synthetic contradictory terminal for fail-closed testing",
+    )
+    outcome = _evidence_only_coordinator(h, monkeypatch).run(session_id=h.session_id)
+    assert outcome.status is NativeCanaryStatus.CHECKPOINT_CAPTURE_FAILED and not outcome.canary_success
+    assert len(h.runner.invocations) == 1
+    assert not tuple(h.store.directory.glob("*.attempt-1.*"))
