@@ -5,10 +5,16 @@
 Act 2A remains a one-shot canary harness. The terminal run
 `native-cursor-canary-001` consumed its one authorization and entered
 `GATE_EXECUTING`, but durable request publication stopped before native/provider
-eligibility. It has no native result or checkpoint, provider/native execution
-remained zero, and the run is immutable, terminal, non-resumable evidence. It
-must never be repaired, retried, or reused. No live Cursor, Codex, Claude, or
-other provider invocation has occurred. The harness is not an OS sandbox, credential
+eligibility. It has no native result or checkpoint and provider/native
+execution remained zero. The terminal run `native-cursor-canary-002` launched
+exactly one authorized native Cursor process. Cursor updated its live wrapper
+catalog during that process, post-run request loading rejected the changed
+catalog before process truth could be persisted, and the created commit also
+carried a forbidden `Co-authored-by` trailer. Its historical final-status
+`provider_invocations: 0` is inaccurate; the immutable on-disk artifact is not
+rewritten retroactively. Both runs are immutable, terminal, non-resumable
+forensic evidence and must never be repaired, retried, resumed, or reused. The
+harness is not an OS sandbox, credential
 isolation system, global filesystem monitor, command-level monitor, push
 broker, or production containment boundary.
 
@@ -51,7 +57,11 @@ runtime authority.
 
 The prompt is one final argv item and begins with a fixed harness-controlled
 header. Mission text is embedded in that item and cannot become an option-like
-first argument.
+first argument. It explicitly forbids `--trailer`, message bodies,
+`Co-authored-by`, sign-offs, and attribution, requires
+`git log -1 --format=%B`, and requires amendment of the same single commit when
+the complete message is not exact. Prompt wording is not compliance evidence;
+the production `%B` verifier remains authoritative.
 
 ## Attestation classes
 
@@ -102,16 +112,46 @@ Windows-wide behavior under another PATH/PATHEXT, protect against a hostile
 process changing that environment, establish OS sandboxing, or add production
 trust.
 
-## Request, result, and durable sidecars
+## Request, lifecycle truth, eligibility, and durable sidecars
 
 The immutable request is restricted to execution attempt `0`. It binds the
 session, gate, mission and contract fingerprints, canonical workspace and
 identity, canonical evidence and bounded artifact roots with identities,
 complete backend attestation, timeout/output limits, cleanup policy, prompt
 hash, and request fingerprint. No PATH-dependent executable or shell fragment
-is authoritative. Parsing a persisted request is inert: execution and final
-reconstruction require a fresh local re-attestation that exactly matches the
-persisted backend record.
+is authoritative. The strict pre-spawn path parses the durable request and
+freshly re-attests the complete live backend. It requires exact pinned files,
+wrappers, catalog, selected version, and attestation equality before process
+creation. A separate post-spawn structural loader validates canonical request
+bytes, request and backend-snapshot fingerprints, and
+session/gate/mission/attempt bindings without consulting the mutable live
+catalog. That inert loader can bind already-observed evidence only; it has no
+argv builder, runner entry point, or eligibility authority.
+
+Four CREATE_ONLY lifecycle records separate truth from acceptance:
+
+- `ATTEMPT_RESERVED` is published after strict pre-spawn validation and before
+  process creation. It consumes attempt zero and binds request, mission, gate,
+  executable/launcher prefix, pre-spawn attestation fingerprint, a non-secret
+  argv fingerprint, workspace, timestamp, model, and authorized budgets. It
+  does not claim that a process started.
+- `PROCESS_STARTED` is constructible only from the managed runner's private
+  post-spawn proof and is published after operating-system process creation.
+  It binds the reservation, request, start time, executable/launcher, and PID
+  when safely available.
+- `PROCESS_OBSERVATION` is published after termination and managed cleanup but
+  before post-run backend eligibility. It records completion, exit/timeout and
+  cleanup facts, bounded stdout/stderr artifact hashes and sizes, workspace,
+  source, and sibling observations. It is non-authorizing forensic evidence.
+- `EXECUTION_ELIGIBILITY` is published only after process observation. It
+  records pinned executable/launcher validation, wrapper/catalog and
+  selected-version drift, complete commit-message compliance, cleanliness,
+  remotes, commit count, material paths, boundary checks, and exact reasons.
+
+Only successful eligibility permits accepted native-result publication.
+Behavioral verification and checkpoint capture are downstream of that
+accepted boundary. Stdout, stderr, workspace mutations, reservation, start,
+and observation records can never authorize success by themselves.
 
 `NativeDelegatedExecutor.execute()` returns a private, transient,
 exact-object-issued result handle. The write-once sidecar accepts only that
@@ -123,7 +163,8 @@ commit count, complete message, changed paths, remotes, status, and material
 tree are independently recomputed from the assigned workspace rather than
 accepted as self-fingerprinted success claims.
 
-Request, result, behavioral-verifier, capture-attempt, terminal, and native
+Request, reservation, process-start, process-observation, eligibility,
+accepted-result, behavioral-verifier, capture-attempt, terminal, and native
 artifact records use one shared platform durability adapter. Immutable records
 use `CREATE_ONLY`; an existing destination is a typed conflict and is never
 overwritten. Delegated-state replacement alone uses `REPLACE_EXISTING`, and
@@ -196,7 +237,11 @@ identity are validated before request publication, before process invocation,
 and before each artifact creation; an escaped artifact root cannot cause a
 native process to start.
 
-This remains before/after measured observation, not continuous containment. A
+The harness-owned evidence child is excluded from unrelated-sibling content
+comparison because CREATE_ONLY lifecycle publication intentionally changes it;
+its physical root, non-redirection, record fingerprints, and artifact hashes
+remain independently bound. This remains before/after measured observation,
+not continuous containment. A
 mutation perfectly restored between observations is not detected. The harness
 does not claim detection outside its measured source repository and canary
 parent.
@@ -208,12 +253,12 @@ no dependencies or lifecycle hooks, and a Node-built-in `npm test` script. The
 mission requires source, test, and README changes.
 
 Act 2A.3G makes the immutable mission itself end with `Stop after the local
-commit.` The separately retained prompt-level completion bullet, `stop
-immediately after the local commit.`, is additional defense in depth; it is not
-a substitute for the immutable mission boundary. The old Act 2A.3F payload,
+commit.` Act 2A.3R strengthens the prompt with the exact complete-message check
+and stop-after-verification rule; it is not a substitute for the immutable
+mission boundary or production verifier. The old Act 2A.3F payload,
 payload fingerprint, canonical payload hash, mission fingerprint, gate-plan
-fingerprint, and every prospective digest input are invalid. No owner digest
-was generated and no live canary has run. Only after this repair is committed
+fingerprint, and every prospective digest input are invalid. No Act 2A.3R
+owner digest was generated and no new live canary was run. Only after this repair is committed
 and the worktree is clean is a new preview mandatory.
 
 The repository's own `npm test` remains a fixed checkpoint command, but it is
@@ -226,20 +271,44 @@ evidence.
 
 ## Pre-capture and capture contract
 
-Before `capture_checkpoint`, the harness requires: one successful process; no
-timeout, cleanup uncertainty, source mutation, sibling mutation, or remote;
-changed HEAD; exactly one new commit; exact complete commit message
-`feat: add deterministic high-score persistence`; clean worktree; every
-required source/test/README path changed; and a passing immutable behavioral
-verifier. A zero exit, mutable test pass, or provider claim alone cannot reach
-a checkpoint.
+After `PROCESS_OBSERVATION` and before any behavioral verifier, execution
+eligibility requires: one successful process; no timeout, cleanup uncertainty,
+backend drift, source mutation, sibling mutation, or remote; changed HEAD;
+exactly one new commit; exact complete commit message
+`feat: add deterministic high-score persistence`; clean worktree; and every
+required source/test/README path changed. The complete message is the
+`git log -1 --format=%B` output after removing terminal newline characters
+only, so every body and trailer remains a mismatch. Only then may the immutable
+behavioral verifier run, followed by checkpoint capture. A zero exit, mutable
+test pass, process observation, or provider claim alone cannot reach a
+checkpoint.
+
+Post-run comparison distinguishes pinned executable or launcher content drift,
+pinned-file identity-only drift, wrapper content drift, wrapper metadata-only
+drift, version-inventory/catalog drift, selected-version drift, and no drift.
+Every drift class that was previously conservative-blocking remains
+ineligible, but reservation, start, completion, cleanup, artifact references,
+and actual invocation consumption remain durable. Future reuse requires a new
+preview and attestation.
 
 Each pre-capture failure creates a write-once terminal record and leaves the
 delegated state at `GATE_EXECUTING`. Before actual capture, a durable
 capture-attempt record is published. Capture failure receives a terminal
 record; a persisted attempt without a completed checkpoint is ambiguous and is
 never replayed. There is no repair, retry, audit, gate pass, advancement, push,
-or second provider invocation.
+or second provider invocation. Restart recognizes a persisted terminal before
+optional live catalog validation. Request-only, reservation-only,
+started-without-observation, observation-without-eligibility, and
+eligible-without-result states are fail-closed, never spawn again, never create
+attempt one, and never reconstruct success from mutable live state.
+
+Operator output reports authorized budgets separately from actual
+`native_attempts_reserved`, `native_processes_started`,
+`native_processes_completed`, `process_observations_published`,
+`accepted_native_results_published`, and provider invocations started. For the
+native Cursor backend, one successfully started Cursor process is one actual
+provider invocation even when timeout, cleanup failure, backend drift, commit
+mismatch, precapture failure, or capture failure prevents acceptance.
 
 Act 1 may legitimately capture failed command evidence as an observation. Act
 2A constructs that successor transiently, but persists `CHECKPOINT_CAPTURED`
@@ -317,7 +386,7 @@ Every earlier wrapper-v1 attestation and every prior v3 preview, payload
 fingerprint, canonical hash, or digest input is invalid. Pre-commit Act 2A.3E
 vectors are labeled `PRE_COMMIT_PROVISIONAL_NOT_AUTHORIZABLE`. A fresh
 post-commit clean-HEAD real-CLI preview is mandatory before owner review. No
-owner digest exists and no live canary has run.
+No Act 2A.3R owner digest exists and no post-repair live canary has run.
 
 For every future live authorization, v3 supersedes v2 completely: every v2
 payload fingerprint, canonical-byte hash, and phrase-bound digest input is
@@ -374,5 +443,6 @@ residual exposure is recorded truthfully in `canary_non_claims`.
 Hard budgets remain provider/native attempts `1/1`, repair/auditor/retry
 `0/0/0`. No independent model auditor exists. Any future live canary requires
 a new run ID, a new empty root, a new clean-HEAD preview, a new payload, a new
-owner decision, and a new one-time phrase. `native-cursor-canary-001` can never
-satisfy any of those conditions and is not executable authority.
+owner decision, and a new one-time phrase. Neither
+`native-cursor-canary-001` nor `native-cursor-canary-002` can ever satisfy any
+of those conditions or become executable authority.

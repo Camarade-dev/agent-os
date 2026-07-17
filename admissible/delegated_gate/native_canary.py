@@ -52,10 +52,16 @@ from admissible.delegated_gate.native_executor import (
     NativeExecutionRequest,
     NativeExecutionResult,
     NativeExecutionStatus,
+    NativeExecutionStoreError,
+    NativeExecutionRequestBinding,
+    NativeLifecycleCounts,
     NativeArtifactReference,
     NativeFilesystemIdentity,
     NativePreflightDecision,
     NativePreflightStatus,
+    NativeProcessObservationPublicationError,
+    NativeProcessStartError,
+    NativeResultIneligible,
     _inside,
     _safe_create_directory,
     _safe_directory,
@@ -127,6 +133,12 @@ run the complete npm test suite, update the README, and create one local Git com
 class NativeCanaryStatus(str, Enum):
     PREFLIGHT_BLOCKED = "PREFLIGHT_BLOCKED"
     EXECUTION_RESULT_MISSING_NO_RETRY = "EXECUTION_RESULT_MISSING_NO_RETRY"
+    ATTEMPT_RESERVED_LAUNCH_OUTCOME_UNKNOWN = "ATTEMPT_RESERVED_LAUNCH_OUTCOME_UNKNOWN"
+    PROCESS_OBSERVATION_MISSING = "PROCESS_OBSERVATION_MISSING"
+    EXECUTION_ELIGIBILITY_MISSING = "EXECUTION_ELIGIBILITY_MISSING"
+    ACCEPTED_RESULT_MISSING = "ACCEPTED_RESULT_MISSING"
+    PROCESS_SPAWN_FAILED = "PROCESS_SPAWN_FAILED"
+    PROCESS_OBSERVATION_PUBLICATION_FAILED = "PROCESS_OBSERVATION_PUBLICATION_FAILED"
     PROCESS_FAILED = "PROCESS_FAILED"
     TIMED_OUT = "TIMED_OUT"
     CLEANUP_UNCERTAIN = "CLEANUP_UNCERTAIN"
@@ -157,6 +169,11 @@ class NativeCanaryOutcome:
     result_fingerprint: str | None
     checkpoint_fingerprint: str | None
     provider_invocations: int
+    native_attempts_reserved: int
+    native_processes_started: int
+    native_processes_completed: int
+    process_observations_published: int
+    accepted_native_results_published: int
     canary_success: bool
     detail: str
 
@@ -165,7 +182,13 @@ class NativeCanaryOutcome:
             "status": self.status.value, "session_id": self.session_id, "phase": self.phase,
             "request_fingerprint": self.request_fingerprint, "result_fingerprint": self.result_fingerprint,
             "checkpoint_fingerprint": self.checkpoint_fingerprint, "provider_invocations": self.provider_invocations,
+            "native_attempts_reserved": self.native_attempts_reserved,
+            "native_processes_started": self.native_processes_started,
+            "native_processes_completed": self.native_processes_completed,
+            "process_observations_published": self.process_observations_published,
+            "accepted_native_results_published": self.accepted_native_results_published,
             "canary_success": self.canary_success, "detail": self.detail,
+            "authorized_budgets": {"provider_invocations": 1, "native_phase_attempts": 1, "repair_rounds": 0, "auditor_invocations": 0, "retries": 0},
             "budgets": {"provider_invocations": 1, "native_phase_attempts": 1, "repair_rounds": 0, "auditor_invocations": 0, "retries": 0},
         }
 
@@ -316,9 +339,13 @@ run shell commands, diagnose failures, use npm, run tests, and use Git locally a
 Required completion conditions:
 - run the complete `npm test` suite;
 - create exactly one intended local feature commit with complete message `{required_commit_message}`;
+- use no `--trailer` when creating or amending the commit;
+- add no commit-message body, `Co-authored-by`, sign-off, attribution, or other trailer;
+- before stopping, run `git log -1 --format=%B` and verify that its complete output, after removing terminal newline characters only, is exactly `{required_commit_message}`;
+- if the complete message is not exact, amend that same commit during this native invocation, do not create a second commit, and run the exact `%B` verification again;
 - do not add or modify a Git remote;
 - do not push;
-- stop immediately after the local commit.
+- stop immediately only after the exact full-message verification passes.
 
 Do not merely describe changes. Perform the work inside the assigned workspace.
 """
@@ -459,18 +486,23 @@ class NativeCanaryCoordinator:
         self.session_store=session_store; self.execution_store=execution_store; self.executor=executor; self.backend_attestation=backend_attestation.validated()
         self.source_repository,_=_safe_directory(source_repository,"source repository"); self.work_workspace,_=_safe_directory(work_workspace,"work workspace"); self.canary_parent,_=_safe_directory(canary_parent,"canary parent"); self.evidence_directory,_=_safe_directory(evidence_directory,"evidence directory")
         self.timeout_seconds=timeout_seconds; self.stdout_byte_limit=stdout_byte_limit; self.stderr_byte_limit=stderr_byte_limit
-    def _outcome(self, *, status: NativeCanaryStatus, state: DelegatedSessionState, request: NativeExecutionRequest | None = None, result: NativeExecutionResult | None = None, provider_invocations: int = 0, detail: str) -> NativeCanaryOutcome:
+    def _outcome(self, *, status: NativeCanaryStatus, state: DelegatedSessionState, request: NativeExecutionRequest | NativeExecutionRequestBinding | None = None, result: NativeExecutionResult | None = None, result_fingerprint: str | None = None, detail: str) -> NativeCanaryOutcome:
         checkpoint=state.checkpoint_history[-1] if state.checkpoint_history else None
-        return NativeCanaryOutcome(status,state.session_id,state.phase.value,request.request_fingerprint if request else None,result.result_fingerprint if result else None,checkpoint.checkpoint_fingerprint if checkpoint else None,provider_invocations,status is NativeCanaryStatus.CHECKPOINT_CAPTURED_CANARY_SUCCESS,detail)
-    def _terminal_outcome(self, state: DelegatedSessionState, request: NativeExecutionRequest, result: NativeExecutionResult | None, terminal: NativeCanaryTerminalRecord) -> NativeCanaryOutcome:
+        counts=NativeLifecycleCounts()
+        if request is not None:
+            counts=self.execution_store.lifecycle_counts(request.session_id,request.gate_id,request.execution_attempt_index)
+        return NativeCanaryOutcome(status,state.session_id,state.phase.value,request.request_fingerprint if request else None,result.result_fingerprint if result else result_fingerprint,checkpoint.checkpoint_fingerprint if checkpoint else None,counts.provider_invocations_started,counts.native_attempts_reserved,counts.native_processes_started,counts.native_processes_completed,counts.process_observations_published,counts.accepted_native_results_published,status is NativeCanaryStatus.CHECKPOINT_CAPTURED_CANARY_SUCCESS,detail)
+    def _terminal_outcome(self, state: DelegatedSessionState, request: NativeExecutionRequest | NativeExecutionRequestBinding, terminal: NativeCanaryTerminalRecord) -> NativeCanaryOutcome:
+        category_mapping={"process_spawn_failure":NativeCanaryStatus.PROCESS_SPAWN_FAILED,"process_timeout":NativeCanaryStatus.TIMED_OUT,"process_exit_failure":NativeCanaryStatus.PROCESS_FAILED,"process_cleanup_failure":NativeCanaryStatus.CLEANUP_UNCERTAIN,"process_observation_publication":NativeCanaryStatus.PROCESS_OBSERVATION_PUBLICATION_FAILED}
         mapping={NativeCaptureTerminalStatus.PRECAPTURE_FAILED:NativeCanaryStatus.PRECAPTURE_ELIGIBILITY_FAILED,NativeCaptureTerminalStatus.CAPTURE_FAILED:NativeCanaryStatus.CHECKPOINT_CAPTURE_FAILED,NativeCaptureTerminalStatus.DURABILITY_UNCERTAIN:NativeCanaryStatus.DURABILITY_UNCERTAIN}
-        return self._outcome(status=mapping[terminal.status],state=state,request=request,result=result,detail=terminal.diagnostic)
+        status=category_mapping.get(terminal.failure_category,mapping[terminal.status])
+        return self._outcome(status=status,state=state,request=request,result_fingerprint=terminal.result_fingerprint,detail=terminal.diagnostic)
     def _load_authoritative_request(self, *, session_id: str, gate_id: str) -> NativeExecutionRequest:
         current=self.executor.attest_local_backend()
         return self.execution_store.load_request_verified_against_local_backend(session_id,gate_id,0,current_attestation=current)
     def _reconstruct_success(self, state: DelegatedSessionState, request: NativeExecutionRequest, result: NativeExecutionResult) -> NativeCanaryOutcome:
         request.validated_for_execution(current_attestation=self.executor.attest_local_backend())
-        if self.execution_store.has_terminal(state.session_id,request.gate_id,0): return self._terminal_outcome(state,request,result,self.execution_store.load_terminal(state.session_id,request.gate_id,0))
+        if self.execution_store.has_terminal(state.session_id,request.gate_id,0): return self._terminal_outcome(state,request,self.execution_store.load_terminal(state.session_id,request.gate_id,0))
         attempt=self.execution_store.load_capture_attempt(state.session_id,request.gate_id,0)
         behavioral=load_behavioral_verifier(request=request,execution_store=self.execution_store)
         if (
@@ -496,6 +528,12 @@ class NativeCanaryCoordinator:
         if _pre_capture_reason(result, behavioral) is not None: raise NativeEvidenceInvalid("reconstructed success no longer satisfies eligibility")
         if _checkpoint_success_reason(checkpoint,state.current_gate) is not None: raise NativeEvidenceInvalid("reconstructed checkpoint command evidence does not satisfy Act-2A success")
         return self._outcome(status=NativeCanaryStatus.CHECKPOINT_CAPTURED_CANARY_SUCCESS,state=state,request=request,result=result,detail="All native, behavioral, capture, checkpoint, and state evidence reloaded from disk.")
+    def _publish_failure_terminal(self, *, state: DelegatedSessionState, request: NativeExecutionRequest | NativeExecutionRequestBinding, result: NativeExecutionResult | None, status: NativeCaptureTerminalStatus, failure_category: str, diagnostic: str, capture_attempt: NativeCheckpointCaptureAttempt | None = None) -> NativeCanaryOutcome:
+        try:
+            terminal=self.execution_store.create_terminal(request=request,result=result,status=status,failure_category=failure_category,diagnostic=diagnostic[:1024],capture_attempt=capture_attempt)
+        except (NativeCommittedButDurabilityUncertain,NativeEvidenceInvalid,NativeExecutionStoreError,OSError,ValueError) as exc:
+            return self._outcome(status=NativeCanaryStatus.DURABILITY_UNCERTAIN,state=state,request=request,result=result,detail=f"terminal publication failed: {type(exc).__name__}: {exc}")
+        return self._terminal_outcome(state,request,terminal)
     def run(self, *, session_id: str) -> NativeCanaryOutcome:
         state=self.session_store.load(session_id); gate=state.current_gate; attempt=0
         if state.phase is Phase.CHECKPOINT_CAPTURED:
@@ -506,13 +544,24 @@ class NativeCanaryCoordinator:
         prompt=build_native_agent_prompt(mission=state.mission,gate_contract=gate,work_workspace=self.work_workspace)
         request_exists=self.execution_store.has_request(session_id,gate.gate_id,attempt)
         if request_exists:
-            request=self._load_authoritative_request(session_id=session_id,gate_id=gate.gate_id)
-            result=self.execution_store.load_result(session_id,gate.gate_id,attempt) if self.execution_store.has_result(session_id,gate.gate_id,attempt) else None
-            if self.execution_store.has_terminal(session_id,gate.gate_id,attempt): return self._terminal_outcome(state,request,result,self.execution_store.load_terminal(session_id,gate.gate_id,attempt))
+            # Terminal recognition is first and uses only structural request
+            # binding.  Mutable backend catalog state is never consulted.
+            terminal=self.execution_store.load_terminal(session_id,gate.gate_id,attempt) if self.execution_store.has_terminal(session_id,gate.gate_id,attempt) else None
+            request=self.execution_store.load_request_structural(session_id,gate.gate_id,attempt)
+            if terminal is not None: return self._terminal_outcome(state,request,terminal)
+            counts=self.execution_store.lifecycle_counts(session_id,gate.gate_id,attempt)
+            result=self.execution_store.load_result(session_id,gate.gate_id,attempt) if counts.accepted_native_results_published else None
             if self.execution_store.has_capture_attempt(session_id,gate.gate_id,attempt): return self._outcome(status=NativeCanaryStatus.CAPTURE_ATTEMPT_AMBIGUOUS,state=state,request=request,result=result,detail="A durable capture-attempt record exists without CHECKPOINT_CAPTURED; capture is never replayed.")
-            if result is None: return self._outcome(status=NativeCanaryStatus.EXECUTION_RESULT_MISSING_NO_RETRY,state=state,request=request,detail="A durable request exists without a result; native execution is never reinvoked.")
+            if not counts.native_attempts_reserved: return self._outcome(status=NativeCanaryStatus.EXECUTION_RESULT_MISSING_NO_RETRY,state=state,request=request,detail="A durable request exists without attempt reservation; the one-shot request is never reinvoked.")
+            if not counts.native_processes_started: return self._outcome(status=NativeCanaryStatus.ATTEMPT_RESERVED_LAUNCH_OUTCOME_UNKNOWN,state=state,request=request,detail="ATTEMPT_RESERVED exists without PROCESS_STARTED; launch outcome is unknown and no second process is permitted.")
+            if not counts.process_observations_published: return self._outcome(status=NativeCanaryStatus.PROCESS_OBSERVATION_MISSING,state=state,request=request,detail="PROCESS_STARTED exists without PROCESS_OBSERVATION; execution observation is ambiguous and no rerun is permitted.")
+            if not self.execution_store.has_execution_eligibility(session_id,gate.gate_id,attempt): return self._outcome(status=NativeCanaryStatus.EXECUTION_ELIGIBILITY_MISSING,state=state,request=request,detail="Observed execution has no eligibility record; mutable live state is not used to recompute it.")
+            eligibility=self.execution_store.load_execution_eligibility(session_id,gate.gate_id,attempt)
+            if not eligibility.eligible: return self._outcome(status=NativeCanaryStatus.DURABILITY_UNCERTAIN,state=state,request=request,detail="Persisted ineligibility exists without its required terminal; execution remains rejected and is never rerun.")
+            if not counts.accepted_native_results_published: return self._outcome(status=NativeCanaryStatus.ACCEPTED_RESULT_MISSING,state=state,request=request,detail="Successful eligibility exists without an accepted result publication; execution is never rerun.")
+            result=self.execution_store.load_result(session_id,gate.gate_id,attempt)
             if self.execution_store.has_behavioral_evidence(session_id,gate.gate_id,attempt): return self._outcome(status=NativeCanaryStatus.DURABILITY_UNCERTAIN,state=state,request=request,result=result,detail="A visible behavioral record without a capture boundary is fail-closed and never reused.")
-            return self._outcome(status=NativeCanaryStatus.CAPTURE_ATTEMPT_AMBIGUOUS,state=state,request=request,result=result,detail="A durable result without terminal or capture record is an ambiguous no-retry boundary.")
+            return self._outcome(status=NativeCanaryStatus.CAPTURE_ATTEMPT_AMBIGUOUS,state=state,request=request,result=result,detail="An accepted result without terminal or capture record is an ambiguous no-retry boundary.")
         try: current=self.executor.attest_local_backend()
         except NativeEvidenceInvalid as exc: return self._outcome(status=NativeCanaryStatus.PREFLIGHT_BLOCKED,state=state,detail=str(exc))
         if current!=self.backend_attestation: return self._outcome(status=NativeCanaryStatus.PREFLIGHT_BLOCKED,state=state,detail="coordinator backend attestation differs from fresh local installation evidence")
@@ -520,34 +569,46 @@ class NativeCanaryCoordinator:
         try: self.execution_store.create_request(request)
         except NativeCommittedButDurabilityUncertain as exc: return self._outcome(status=NativeCanaryStatus.DURABILITY_UNCERTAIN,state=state,request=request,detail=str(exc))
         try:
-            issued=self.executor.execute(request=request,prompt=prompt,source_repository=self.source_repository,canary_parent=self.canary_parent,allowed_parent_children=frozenset({self.work_workspace.name}),evidence_store_root=self.execution_store.directory,artifact_directory=self.execution_store.artifact_directory)
+            issued=self.executor.execute(request=request,prompt=prompt,source_repository=self.source_repository,canary_parent=self.canary_parent,allowed_parent_children=frozenset({self.work_workspace.name}),evidence_store_root=self.execution_store.directory,artifact_directory=self.execution_store.artifact_directory,required_commit_message=REQUIRED_COMMIT_MESSAGE,required_material_paths=EXPECTED_MATERIAL_PATHS,execution_store=self.execution_store)
             result=self.execution_store.write_result(issued)
-        except NativeCommittedButDurabilityUncertain as exc: return self._outcome(status=NativeCanaryStatus.DURABILITY_UNCERTAIN,state=state,request=request,detail=str(exc),provider_invocations=1)
+        except NativeResultIneligible as exc:
+            observation=self.execution_store.load_process_observation(session_id,gate.gate_id,0)
+            process=observation.process
+            category="process_timeout" if process["timed_out"] else "process_cleanup_failure" if not process["cleanup_confirmed"] else "process_exit_failure" if process["exit_code"]!=0 else "result_ineligible"
+            return self._publish_failure_terminal(state=state,request=request,result=None,status=NativeCaptureTerminalStatus.PRECAPTURE_FAILED,failure_category=category,diagnostic=f"result ineligible: {'; '.join(exc.eligibility.ineligibility_reasons)}")
+        except NativeProcessStartError as exc:
+            return self._publish_failure_terminal(state=state,request=request,result=None,status=NativeCaptureTerminalStatus.PRECAPTURE_FAILED,failure_category="process_spawn_failure",diagnostic=f"process spawn failure: {exc}")
+        except NativeProcessObservationPublicationError as exc:
+            return self._publish_failure_terminal(state=state,request=request,result=None,status=NativeCaptureTerminalStatus.PRECAPTURE_FAILED,failure_category="process_observation_publication",diagnostic=str(exc))
+        except NativeCommittedButDurabilityUncertain as exc:
+            return self._publish_failure_terminal(state=state,request=request,result=None,status=NativeCaptureTerminalStatus.DURABILITY_UNCERTAIN,failure_category="lifecycle_durability_uncertain",diagnostic=str(exc))
         except NativeEvidenceInvalid as exc:
-            terminal=self.execution_store.create_terminal(request=request,result=None,status=NativeCaptureTerminalStatus.PRECAPTURE_FAILED,failure_category="executor_observation_failed",diagnostic=str(exc)); return self._terminal_outcome(state,request,None,terminal)
+            if self.execution_store.has_attempt_reserved(session_id,gate.gate_id,0): return self._publish_failure_terminal(state=state,request=request,result=None,status=NativeCaptureTerminalStatus.PRECAPTURE_FAILED,failure_category="executor_observation_failed",diagnostic=str(exc))
+            return self._outcome(status=NativeCanaryStatus.PREFLIGHT_BLOCKED,state=state,request=request,detail=str(exc))
+        except NativeExecutionStoreError as exc:
+            if self.execution_store.has_attempt_reserved(session_id,gate.gate_id,0): return self._publish_failure_terminal(state=state,request=request,result=None,status=NativeCaptureTerminalStatus.PRECAPTURE_FAILED,failure_category="lifecycle_publication_failure",diagnostic=f"{type(exc).__name__}: {exc}")
+            return self._outcome(status=NativeCanaryStatus.PREFLIGHT_BLOCKED,state=state,request=request,detail=str(exc))
         try:
             behavioral=run_behavioral_verifier(request=request,execution_store=self.execution_store)
         except NativeCommittedButDurabilityUncertain as exc:
-            return self._outcome(status=NativeCanaryStatus.DURABILITY_UNCERTAIN,state=state,request=request,result=result,provider_invocations=1,detail=str(exc))
+            return self._publish_failure_terminal(state=state,request=request,result=result,status=NativeCaptureTerminalStatus.DURABILITY_UNCERTAIN,failure_category="behavioral_durability_uncertain",diagnostic=str(exc))
         except Exception as exc:
-            terminal=self.execution_store.create_terminal(request=request,result=result,status=NativeCaptureTerminalStatus.PRECAPTURE_FAILED,failure_category="behavioral_verifier_observation",diagnostic=f"{type(exc).__name__}: {exc}")
-            return self._terminal_outcome(state,request,result,terminal)
+            return self._publish_failure_terminal(state=state,request=request,result=result,status=NativeCaptureTerminalStatus.PRECAPTURE_FAILED,failure_category="behavioral_verifier_observation",diagnostic=f"{type(exc).__name__}: {exc}")
         reason=_pre_capture_reason(result,behavioral)
         if reason is not None:
-            terminal=self.execution_store.create_terminal(request=request,result=result,status=NativeCaptureTerminalStatus.PRECAPTURE_FAILED,failure_category="pre_capture_eligibility",diagnostic=reason); return self._terminal_outcome(state,request,result,terminal)
+            return self._publish_failure_terminal(state=state,request=request,result=result,status=NativeCaptureTerminalStatus.PRECAPTURE_FAILED,failure_category="pre_capture_eligibility",diagnostic=reason)
         try: capture_attempt=self.execution_store.create_capture_attempt(request=request,result=result,gate_plan_fingerprint=state.gate_plan.plan_fingerprint,checkpoint_contract_fingerprint=gate.contract_fingerprint,behavioral_evidence_fingerprint=behavioral.evidence_fingerprint,required_command_ids=tuple(command.command_id for command in gate.checkpoint_verification_commands),state_revision=state.revision)
-        except NativeCommittedButDurabilityUncertain as exc: return self._outcome(status=NativeCanaryStatus.DURABILITY_UNCERTAIN,state=state,request=request,result=result,provider_invocations=1,detail=str(exc))
+        except NativeCommittedButDurabilityUncertain as exc: return self._publish_failure_terminal(state=state,request=request,result=result,status=NativeCaptureTerminalStatus.DURABILITY_UNCERTAIN,failure_category="capture_attempt_durability_uncertain",diagnostic=str(exc))
         try:
             captured=capture_checkpoint(repository=self.work_workspace,artifact_directory=self.evidence_directory / "checkpoint-artifacts",session_id=session_id,gate_contract=gate,execution_attempt_index=0)
         except Exception as exc:
-            terminal=self.execution_store.create_terminal(request=request,result=result,status=NativeCaptureTerminalStatus.CAPTURE_FAILED,failure_category="checkpoint_capture",diagnostic=str(exc),capture_attempt=capture_attempt); return self._terminal_outcome(state,request,result,terminal)
+            return self._publish_failure_terminal(state=state,request=request,result=result,status=NativeCaptureTerminalStatus.CAPTURE_FAILED,failure_category="checkpoint_capture",diagnostic=str(exc),capture_attempt=capture_attempt)
         # Once capture returns, a state-persistence interruption is deliberately
         # left as the durable started-attempt ambiguity; capture is not replayed.
         checkpoint_state=reduce(state,CheckpointRecorded(captured))
         checkpoint_reason=_checkpoint_success_reason(checkpoint_state.checkpoint_history[-1],gate)
         if checkpoint_reason is not None:
-            terminal=self.execution_store.create_terminal(request=request,result=result,status=NativeCaptureTerminalStatus.CAPTURE_FAILED,failure_category="checkpoint_verification",diagnostic=checkpoint_reason,capture_attempt=capture_attempt)
-            return self._terminal_outcome(state,request,result,terminal)
+            return self._publish_failure_terminal(state=state,request=request,result=result,status=NativeCaptureTerminalStatus.CAPTURE_FAILED,failure_category="checkpoint_verification",diagnostic=checkpoint_reason,capture_attempt=capture_attempt)
         self.session_store.replace(checkpoint_state,expected_revision=state.revision)
         final=self.session_store.load(session_id); return self._reconstruct_success(final,request,result)
 
@@ -767,7 +828,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args=build_parser().parse_args(argv); blocked={"status":NativeCanaryStatus.PREFLIGHT_BLOCKED.value,"provider_invocations":0,"canary_success":False}
+    args=build_parser().parse_args(argv); blocked={"status":NativeCanaryStatus.PREFLIGHT_BLOCKED.value,"provider_invocations":0,"native_attempts_reserved":0,"native_processes_started":0,"native_processes_completed":0,"process_observations_published":0,"accepted_native_results_published":0,"authorized_budgets":{"provider_invocations":1,"native_phase_attempts":1,"repair_rounds":0,"auditor_invocations":0,"retries":0},"canary_success":False}
     if not 1<=args.timeout_seconds<=3600: print(json.dumps({**blocked,"detail":"timeout must be from 1 through 3600 seconds"},sort_keys=True)); return 2
     try: source,_=_safe_directory(args.source_repository,"source repository")
     except ValueError as exc: print(json.dumps({**blocked,"detail":str(exc)},sort_keys=True)); return 2

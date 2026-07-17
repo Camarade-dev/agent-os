@@ -45,9 +45,11 @@ from admissible.delegated_gate.durability import (
 )
 from admissible.delegated_gate.store import _FileLock
 from admissible.managed_process import (
+    ManagedProcess,
     ManagedProcessError,
     OBSERVATION_PROVEN_EMPTY,
-    run_managed_oneshot,
+    TERMINATION_COMPLETED,
+    TERMINATION_HARD_TIMEOUT,
 )
 
 
@@ -64,6 +66,11 @@ ATTESTATION_CLASS_WRAPPER_CHAIN = "LOCAL_WRAPPER_CHAIN"
 CAPTURE_ATTEMPT_SCHEMA_VERSION = "admissible_native_capture_attempt_v1"
 CAPTURE_EXPECTED_SUCCESS_STATUS = "CHECKPOINT_CAPTURED"
 TERMINAL_SCHEMA_VERSION = "admissible_native_canary_terminal_v1"
+TERMINAL_SCHEMA_VERSION_V2 = "admissible_native_canary_terminal_v2"
+ATTEMPT_RESERVED_SCHEMA_VERSION = "admissible_native_attempt_reserved_v1"
+PROCESS_STARTED_SCHEMA_VERSION = "admissible_native_process_started_v1"
+PROCESS_OBSERVATION_SCHEMA_VERSION = "admissible_native_process_observation_v1"
+EXECUTION_ELIGIBILITY_SCHEMA_VERSION = "admissible_native_execution_eligibility_v1"
 BACKEND_IDENTITY = "cursor-agent-native-oneshot"
 BACKEND_PROTOCOL_VERSION = "cursor-agent-print-force-v2"
 CURSOR_DISCOVERY_MECHANISM = "shutil.which:cursor-agent"
@@ -142,6 +149,18 @@ class NativeExecutionStoreError(RuntimeError):
 
 class NativeProcessStartError(RuntimeError):
     pass
+
+
+class NativeResultIneligible(RuntimeError):
+    """The process was observed, but the durable eligibility record rejected it."""
+
+    def __init__(self, eligibility: "NativeExecutionEligibility") -> None:
+        self.eligibility = eligibility
+        super().__init__("; ".join(eligibility.ineligibility_reasons))
+
+
+class NativeProcessObservationPublicationError(NativeExecutionStoreError):
+    """A started process completed, but its observation could not be published."""
 
 
 class NativeRequestAlreadyExists(NativeExecutionStoreError):
@@ -2096,6 +2115,319 @@ class NativeExecutionRequest:
 
 
 @dataclass(frozen=True)
+class NativeExecutionRequestBinding:
+    """Inert structural binding for post-spawn evidence publication.
+
+    This type deliberately carries no ``argv`` builder and no execution
+    validation method.  It validates the canonical durable request bytes and
+    their immutable fingerprints without consulting the mutable live backend.
+    """
+
+    session_id: str
+    gate_id: str
+    execution_attempt_index: int
+    request_fingerprint: str
+    mission_fingerprint: str
+    gate_contract_fingerprint: str
+    backend_attestation_fingerprint: str
+    executable: str
+    launcher_prefix: tuple[str, ...]
+    work_workspace: str
+    evidence_store_root: str
+    artifact_directory: str
+    prompt_fingerprint: str
+    timeout_seconds: int
+    stdout_byte_limit: int
+    stderr_byte_limit: int
+    selected_model: str
+
+
+def _structural_request_binding(data: Mapping[str, Any]) -> NativeExecutionRequestBinding:
+    """Validate an inert request snapshot without re-reading backend files."""
+
+    require_exact_keys(data, set(NativeExecutionRequest.__dataclass_fields__), "native execution request")
+    if data.get("schema_version") != REQUEST_SCHEMA_VERSION:
+        raise ValueError("unsupported native execution request schema")
+    body = dict(data); claimed = body.pop("request_fingerprint", None)
+    require_sha256(claimed, "request fingerprint")
+    if fingerprint(body) != claimed:
+        raise ValueError("native execution request fingerprint mismatch")
+    require_identifier(data["session_id"], "request session_id")
+    require_identifier(data["gate_id"], "request gate_id")
+    require_strict_int(data["execution_attempt_index"], "execution_attempt_index", minimum=0, maximum=0)
+    require_sha256(data["mission_fingerprint"], "mission_fingerprint")
+    require_sha256(data["gate_contract_fingerprint"], "gate_contract_fingerprint")
+    require_sha256(data["backend_attestation_fingerprint"], "backend attestation fingerprint")
+    require_sha256(data["prompt_fingerprint"], "prompt fingerprint")
+    require_nonempty_text(data["executable"], "request executable", max_bytes=4096)
+    launcher = require_string_list(data["launcher_prefix"], "request launcher prefix")
+    if not launcher:
+        raise ValueError("request launcher prefix is empty")
+    for value, label in (
+        (data["work_workspace"], "request workspace"),
+        (data["evidence_store_root"], "request evidence root"),
+        (data["artifact_directory"], "request artifact directory"),
+    ):
+        require_nonempty_text(value, label, max_bytes=4096)
+    for key, maximum in (("timeout_seconds", 3600), ("stdout_byte_limit", 16 * 1024 * 1024), ("stderr_byte_limit", 16 * 1024 * 1024)):
+        require_strict_int(data[key], key, minimum=1, maximum=maximum)
+    attestation = data.get("backend_attestation")
+    if not isinstance(attestation, Mapping):
+        raise ValueError("request backend attestation is not an object")
+    attestation_body = dict(attestation)
+    attestation_fingerprint = attestation_body.pop("attestation_fingerprint", None)
+    require_sha256(attestation_fingerprint, "embedded backend attestation fingerprint")
+    if fingerprint(attestation_body) != attestation_fingerprint:
+        raise ValueError("embedded backend attestation fingerprint mismatch")
+    if attestation_fingerprint != data["backend_attestation_fingerprint"]:
+        raise ValueError("request backend attestation binding differs")
+    if data.get("backend_identity") != BACKEND_IDENTITY:
+        raise ValueError("request backend identity differs")
+    if data.get("process_tree_cleanup_policy") != PROCESS_TREE_CLEANUP_POLICY:
+        raise ValueError("unsupported cleanup policy")
+    selected_model = attestation.get("selected_model")
+    require_nonempty_text(selected_model, "attested selected model", max_bytes=256)
+    # Validate persisted filesystem snapshots as data only.  No path is opened.
+    for key in ("work_workspace_identity", "evidence_store_identity", "artifact_directory_identity"):
+        if not isinstance(data[key], Mapping):
+            raise ValueError(f"{key} is not an object")
+        NativeFilesystemIdentity.from_dict(data[key])
+    return NativeExecutionRequestBinding(
+        data["session_id"], data["gate_id"], data["execution_attempt_index"], claimed,
+        data["mission_fingerprint"], data["gate_contract_fingerprint"],
+        data["backend_attestation_fingerprint"], data["executable"], launcher,
+        data["work_workspace"], data["evidence_store_root"], data["artifact_directory"],
+        data["prompt_fingerprint"], data["timeout_seconds"], data["stdout_byte_limit"],
+        data["stderr_byte_limit"], selected_model,
+    )
+
+
+@dataclass(frozen=True)
+class NativeAttemptReserved:
+    schema_version: str
+    session_id: str
+    gate_id: str
+    execution_attempt_index: int
+    request_fingerprint: str
+    mission_fingerprint: str
+    gate_contract_fingerprint: str
+    backend_attestation_fingerprint: str
+    executable: str
+    launcher_prefix: tuple[str, ...]
+    argv_fingerprint: str
+    cwd: str
+    reserved_at: str
+    authorized_model: str
+    provider_invocation_budget: int
+    native_attempt_budget: int
+    timeout_seconds: int
+    stdout_byte_limit: int
+    stderr_byte_limit: int
+    reservation_fingerprint: str
+
+    def _body(self) -> dict[str, Any]:
+        data = dict(self.__dict__); data["launcher_prefix"] = list(self.launcher_prefix); data.pop("reservation_fingerprint"); return data
+
+    def validated(self) -> "NativeAttemptReserved":
+        if self.schema_version != ATTEMPT_RESERVED_SCHEMA_VERSION: raise ValueError("unsupported attempt-reserved schema")
+        require_identifier(self.session_id, "reservation session ID"); require_identifier(self.gate_id, "reservation gate ID")
+        require_strict_int(self.execution_attempt_index, "reservation attempt", minimum=0, maximum=0)
+        for label, value in (("request fingerprint", self.request_fingerprint), ("mission fingerprint", self.mission_fingerprint), ("gate fingerprint", self.gate_contract_fingerprint), ("backend fingerprint", self.backend_attestation_fingerprint), ("argv fingerprint", self.argv_fingerprint), ("reservation fingerprint", self.reservation_fingerprint)): require_sha256(value, label)
+        require_nonempty_text(self.executable, "reserved executable", max_bytes=4096); _validate_argv((self.executable, *self.launcher_prefix), "reserved launcher")
+        require_nonempty_text(self.cwd, "reserved cwd", max_bytes=4096); _validate_timestamp(self.reserved_at, "reserved_at")
+        require_nonempty_text(self.authorized_model, "authorized model", max_bytes=256)
+        require_strict_int(self.provider_invocation_budget, "provider invocation budget", minimum=1, maximum=1)
+        require_strict_int(self.native_attempt_budget, "native attempt budget", minimum=1, maximum=1)
+        require_strict_int(self.timeout_seconds, "reserved timeout", minimum=1, maximum=3600)
+        require_strict_int(self.stdout_byte_limit, "reserved stdout limit", minimum=1, maximum=16 * 1024 * 1024)
+        require_strict_int(self.stderr_byte_limit, "reserved stderr limit", minimum=1, maximum=16 * 1024 * 1024)
+        if fingerprint(self._body()) != self.reservation_fingerprint: raise ValueError("attempt-reserved fingerprint mismatch")
+        return self
+
+    def to_dict(self) -> dict[str, Any]: data=self._body(); data["reservation_fingerprint"]=self.reservation_fingerprint; return data
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "NativeAttemptReserved":
+        require_exact_keys(data,set(cls.__dataclass_fields__),"attempt reservation"); values=dict(data); values["launcher_prefix"]=require_string_list(data["launcher_prefix"],"reserved launcher prefix"); return cls(**values).validated()
+
+
+@dataclass(frozen=True)
+class NativeProcessStarted:
+    schema_version: str
+    session_id: str
+    gate_id: str
+    execution_attempt_index: int
+    request_fingerprint: str
+    reservation_fingerprint: str
+    process_started_at: str
+    process_id: int | None
+    executable: str
+    launcher_prefix: tuple[str, ...]
+    process_started_fingerprint: str
+
+    def _body(self) -> dict[str, Any]:
+        data=dict(self.__dict__); data["launcher_prefix"]=list(self.launcher_prefix); data.pop("process_started_fingerprint"); return data
+    def validated(self) -> "NativeProcessStarted":
+        if self.schema_version != PROCESS_STARTED_SCHEMA_VERSION: raise ValueError("unsupported process-started schema")
+        require_identifier(self.session_id,"process-start session ID"); require_identifier(self.gate_id,"process-start gate ID"); require_strict_int(self.execution_attempt_index,"process-start attempt",minimum=0,maximum=0)
+        require_sha256(self.request_fingerprint,"process-start request fingerprint"); require_sha256(self.reservation_fingerprint,"process-start reservation fingerprint"); require_sha256(self.process_started_fingerprint,"process-start fingerprint")
+        _validate_timestamp(self.process_started_at,"process_started_at")
+        if self.process_id is not None: require_strict_int(self.process_id,"process ID",minimum=1,maximum=2**63-1)
+        require_nonempty_text(self.executable,"started executable",max_bytes=4096); _validate_argv((self.executable,*self.launcher_prefix),"started launcher")
+        if fingerprint(self._body()) != self.process_started_fingerprint: raise ValueError("process-started fingerprint mismatch")
+        return self
+    def to_dict(self) -> dict[str, Any]: data=self._body(); data["process_started_fingerprint"]=self.process_started_fingerprint; return data
+    @classmethod
+    def from_dict(cls,data: Mapping[str,Any])->"NativeProcessStarted":
+        require_exact_keys(data,set(cls.__dataclass_fields__),"process started"); values=dict(data); values["launcher_prefix"]=require_string_list(data["launcher_prefix"],"started launcher prefix"); return cls(**values).validated()
+
+
+def _validate_string_mapping(value: Any, label: str, keys: set[str]) -> dict[str, Any]:
+    if not isinstance(value, Mapping): raise ValueError(f"{label} is not an object")
+    require_exact_keys(value, keys, label)
+    return dict(value)
+
+
+@dataclass(frozen=True)
+class NativeProcessObservation:
+    schema_version: str
+    session_id: str
+    gate_id: str
+    execution_attempt_index: int
+    request_fingerprint: str
+    reservation_fingerprint: str
+    process_started_fingerprint: str
+    process_completion_observed: bool
+    process: Mapping[str, Any]
+    stdout_artifact: NativeArtifactReference
+    stderr_artifact: NativeArtifactReference
+    initial_workspace: Mapping[str, Any]
+    final_workspace: Mapping[str, Any]
+    source_observation: Mapping[str, Any]
+    parent_observation: Mapping[str, Any]
+    observation_fingerprint: str
+
+    def _body(self) -> dict[str, Any]:
+        data=dict(self.__dict__); data["process"]=dict(self.process); data["initial_workspace"]=dict(self.initial_workspace); data["final_workspace"]=dict(self.final_workspace); data["source_observation"]=dict(self.source_observation); data["parent_observation"]=dict(self.parent_observation); data["stdout_artifact"]=self.stdout_artifact.to_dict(); data["stderr_artifact"]=self.stderr_artifact.to_dict(); data.pop("observation_fingerprint"); return data
+    def validated(self) -> "NativeProcessObservation":
+        if self.schema_version != PROCESS_OBSERVATION_SCHEMA_VERSION: raise ValueError("unsupported process-observation schema")
+        require_identifier(self.session_id,"observation session ID"); require_identifier(self.gate_id,"observation gate ID"); require_strict_int(self.execution_attempt_index,"observation attempt",minimum=0,maximum=0)
+        for label,value in (("request",self.request_fingerprint),("reservation",self.reservation_fingerprint),("process start",self.process_started_fingerprint),("observation",self.observation_fingerprint)): require_sha256(value,f"{label} fingerprint")
+        require_bool(self.process_completion_observed,"process completion observed")
+        if not self.process_completion_observed: raise ValueError("published process observation must establish completion")
+        process=_validate_string_mapping(self.process,"process observation",{"started_at","ended_at","process_id","executable","launcher_prefix","argv_fingerprint","cwd","exit_code","timed_out","termination_reason","cleanup_confirmed","cleanup_observation","orphan_process_ids","output_truncation_occurred"})
+        _validate_timestamp(process["started_at"],"observation started_at"); _validate_timestamp(process["ended_at"],"observation ended_at")
+        if datetime.fromisoformat(process["ended_at"].replace("Z","+00:00")) < datetime.fromisoformat(process["started_at"].replace("Z","+00:00")): raise ValueError("observation ended_at precedes started_at")
+        if process["process_id"] is not None: require_strict_int(process["process_id"],"observed process ID",minimum=1,maximum=2**63-1)
+        require_nonempty_text(process["executable"],"observed executable",max_bytes=4096); require_string_list(process["launcher_prefix"],"observed launcher prefix"); require_sha256(process["argv_fingerprint"],"observed argv fingerprint"); require_nonempty_text(process["cwd"],"observed cwd",max_bytes=4096)
+        if process["exit_code"] is not None and (isinstance(process["exit_code"],bool) or not isinstance(process["exit_code"],int)): raise ValueError("observed exit code is invalid")
+        require_bool(process["timed_out"],"observed timeout"); require_nonempty_text(process["termination_reason"],"observed termination reason",max_bytes=256); require_bool(process["cleanup_confirmed"],"observed cleanup confirmation"); require_nonempty_text(process["cleanup_observation"],"observed cleanup state",max_bytes=256); require_bool(process["output_truncation_occurred"],"observed truncation")
+        pids=process["orphan_process_ids"]
+        if not isinstance(pids,list) or any(isinstance(pid,bool) or not isinstance(pid,int) or pid<=0 for pid in pids): raise ValueError("observed orphan process IDs are invalid")
+        expected_cleanup=process["cleanup_observation"]==OBSERVATION_PROVEN_EMPTY and not pids
+        if process["cleanup_confirmed"]!=expected_cleanup: raise ValueError("observed cleanup confirmation contradicts raw cleanup evidence")
+        self.stdout_artifact.validated(); self.stderr_artifact.validated()
+        if (self.stdout_artifact.purpose,self.stderr_artifact.purpose)!=("stdout","stderr"): raise ValueError("observation artifact roles differ")
+        if process["output_truncation_occurred"]!=(self.stdout_artifact.truncated or self.stderr_artifact.truncated): raise ValueError("observed truncation summary contradicts artifacts")
+        workspace_keys={"material_tree_hash","git_head","git_status","git_remotes","commit_message","files"}
+        for label,value in (("initial workspace",self.initial_workspace),("final workspace",self.final_workspace)):
+            workspace=_validate_string_mapping(value,label,workspace_keys); require_optional_git_oid(workspace["git_head"],f"{label} Git HEAD")
+            if not isinstance(workspace["git_status"],str) or "\x00" in workspace["git_status"]: raise ValueError(f"{label} Git status is invalid")
+            if workspace["commit_message"] is not None and (not isinstance(workspace["commit_message"],str) or "\x00" in workspace["commit_message"]): raise ValueError(f"{label} commit message is invalid")
+            for key in ("git_remotes","files"):
+                if not isinstance(workspace[key],list) or any(not isinstance(item,str) or "\x00" in item for item in workspace[key]): raise ValueError(f"{label} {key} is invalid")
+        source=_validate_string_mapping(self.source_observation,"source observation",{"tree_hash_before","tree_hash_after","git_head_before","git_head_after","git_status_before","git_status_after","mutated"})
+        for key in ("git_head_before","git_head_after"): require_optional_git_oid(source[key],f"source {key}")
+        for key in ("git_status_before","git_status_after"):
+            if not isinstance(source[key],str) or "\x00" in source[key]: raise ValueError(f"source {key} is invalid")
+        require_bool(source["mutated"],"source mutated")
+        expected_source_mutated=source["tree_hash_before"]!=source["tree_hash_after"] or source["git_head_before"]!=source["git_head_after"] or source["git_status_before"]!=source["git_status_after"]
+        if source["mutated"]!=expected_source_mutated: raise ValueError("source mutation summary contradicts observations")
+        parent=_validate_string_mapping(self.parent_observation,"parent observation",{"inventory_before","inventory_after","unexpected_sibling_mutations"})
+        for key in ("inventory_before","inventory_after","unexpected_sibling_mutations"):
+            if not isinstance(parent[key],list) or any(not isinstance(item,str) or "\x00" in item for item in parent[key]): raise ValueError(f"parent {key} is invalid")
+        expected_siblings=sorted(set(parent["inventory_before"]).symmetric_difference(parent["inventory_after"]))
+        if parent["unexpected_sibling_mutations"]!=expected_siblings: raise ValueError("parent mutation summary contradicts inventories")
+        for value in (self.initial_workspace["material_tree_hash"],self.final_workspace["material_tree_hash"],self.source_observation["tree_hash_before"],self.source_observation["tree_hash_after"]): require_sha256(value,"observation tree hash")
+        if fingerprint(self._body()) != self.observation_fingerprint: raise ValueError("process-observation fingerprint mismatch")
+        return self
+    def to_dict(self)->dict[str,Any]: data=self._body(); data["observation_fingerprint"]=self.observation_fingerprint; return data
+    @classmethod
+    def from_dict(cls,data: Mapping[str,Any])->"NativeProcessObservation":
+        require_exact_keys(data,set(cls.__dataclass_fields__),"process observation"); values=dict(data); values["stdout_artifact"]=NativeArtifactReference.from_dict(data["stdout_artifact"]); values["stderr_artifact"]=NativeArtifactReference.from_dict(data["stderr_artifact"]); return cls(**values).validated()
+
+
+@dataclass(frozen=True)
+class NativeExecutionEligibility:
+    schema_version: str
+    session_id: str
+    gate_id: str
+    execution_attempt_index: int
+    request_fingerprint: str
+    observation_fingerprint: str
+    evaluated_at: str
+    pinned_executable_validation: str
+    pinned_launcher_validation: tuple[str, ...]
+    wrapper_chain_drift: tuple[str, ...]
+    catalog_validation: str
+    selected_version_validation: str
+    backend_drift_diagnostics: tuple[str, ...]
+    process_status_eligible: bool
+    commit_message_compliant: bool
+    workspace_clean: bool
+    remotes_absent: bool
+    exactly_one_commit: bool
+    material_paths_compliant: bool
+    source_and_root_integrity: bool
+    eligible: bool
+    ineligibility_reasons: tuple[str, ...]
+    eligibility_fingerprint: str
+
+    def _body(self)->dict[str,Any]:
+        data=dict(self.__dict__)
+        for key in ("pinned_launcher_validation","wrapper_chain_drift","backend_drift_diagnostics","ineligibility_reasons"): data[key]=list(data[key])
+        data.pop("eligibility_fingerprint"); return data
+    def validated(self)->"NativeExecutionEligibility":
+        if self.schema_version != EXECUTION_ELIGIBILITY_SCHEMA_VERSION: raise ValueError("unsupported execution-eligibility schema")
+        require_identifier(self.session_id,"eligibility session ID"); require_identifier(self.gate_id,"eligibility gate ID"); require_strict_int(self.execution_attempt_index,"eligibility attempt",minimum=0,maximum=0); require_sha256(self.request_fingerprint,"eligibility request fingerprint"); require_sha256(self.observation_fingerprint,"eligibility observation fingerprint"); require_sha256(self.eligibility_fingerprint,"eligibility fingerprint"); _validate_timestamp(self.evaluated_at,"eligibility evaluated_at")
+        allowed={"NO_DRIFT","CONTENT_DRIFT","IDENTITY_ONLY_DRIFT","METADATA_ONLY_DRIFT","MISSING","UNREADABLE","NOT_APPLICABLE","VERSION_INVENTORY_DRIFT","SELECTED_VERSION_DRIFT"}
+        for value in (self.pinned_executable_validation,*self.pinned_launcher_validation,self.catalog_validation,self.selected_version_validation,*self.wrapper_chain_drift):
+            if value not in allowed: raise ValueError("eligibility drift classification is invalid")
+        for name in ("process_status_eligible","commit_message_compliant","workspace_clean","remotes_absent","exactly_one_commit","material_paths_compliant","source_and_root_integrity","eligible"): require_bool(getattr(self,name),name)
+        if not isinstance(self.backend_drift_diagnostics,tuple) or not isinstance(self.ineligibility_reasons,tuple) or any(not isinstance(item,str) or not item for item in (*self.backend_drift_diagnostics,*self.ineligibility_reasons)): raise ValueError("eligibility diagnostics are invalid")
+        drift_clean=all(value in {"NO_DRIFT","NOT_APPLICABLE"} for value in (self.pinned_executable_validation,*self.pinned_launcher_validation,*self.wrapper_chain_drift,self.catalog_validation,self.selected_version_validation))
+        expected_reasons=[]
+        if not drift_clean: expected_reasons.append("post_run_backend_drift")
+        if not self.process_status_eligible: expected_reasons.append("native_process_or_cleanup_ineligible")
+        if not self.commit_message_compliant: expected_reasons.append("complete_commit_message_mismatch")
+        if not self.workspace_clean: expected_reasons.append("final_worktree_not_clean")
+        if not self.remotes_absent: expected_reasons.append("git_remote_present")
+        if not self.exactly_one_commit: expected_reasons.append("exactly_one_new_commit_required")
+        if not self.material_paths_compliant: expected_reasons.append("required_material_paths_missing")
+        if not self.source_and_root_integrity: expected_reasons.append("source_or_parent_boundary_changed")
+        if self.ineligibility_reasons!=tuple(expected_reasons): raise ValueError("eligibility reasons contradict recorded checks")
+        expected = not self.ineligibility_reasons
+        if self.eligible != expected: raise ValueError("eligibility decision contradicts its reasons")
+        if fingerprint(self._body()) != self.eligibility_fingerprint: raise ValueError("execution-eligibility fingerprint mismatch")
+        return self
+    def to_dict(self)->dict[str,Any]: data=self._body(); data["eligibility_fingerprint"]=self.eligibility_fingerprint; return data
+    @classmethod
+    def from_dict(cls,data: Mapping[str,Any])->"NativeExecutionEligibility":
+        require_exact_keys(data,set(cls.__dataclass_fields__),"execution eligibility"); values=dict(data)
+        for key in ("pinned_launcher_validation","wrapper_chain_drift","backend_drift_diagnostics","ineligibility_reasons"): values[key]=require_string_list(data[key],key)
+        return cls(**values).validated()
+
+
+@dataclass(frozen=True)
+class NativeLifecycleCounts:
+    native_attempts_reserved: int = 0
+    native_processes_started: int = 0
+    native_processes_completed: int = 0
+    process_observations_published: int = 0
+    accepted_native_results_published: int = 0
+    provider_invocations_started: int = 0
+
+
+@dataclass(frozen=True)
 class NativeArtifactReference:
     schema_version: str
     artifact_id: str
@@ -2252,12 +2584,32 @@ class NativeExecutionResult:
 
 
 @dataclass(frozen=True)
+class _NativeProcessCreationProof:
+    process_id: int | None
+    _authority: object
+
+    @classmethod
+    def _after_successful_spawn(cls, process_id: int | None) -> "_NativeProcessCreationProof":
+        if process_id is not None: require_strict_int(process_id,"spawned process ID",minimum=1,maximum=2**63-1)
+        return cls(process_id,_PROCESS_CREATION_AUTHORITY)
+
+    def validated(self) -> "_NativeProcessCreationProof":
+        if self._authority is not _PROCESS_CREATION_AUTHORITY: raise NativeEvidenceInvalid("process-start proof lacks runner authority")
+        if self.process_id is not None: require_strict_int(self.process_id,"spawned process ID",minimum=1,maximum=2**63-1)
+        return self
+
+
+_PROCESS_CREATION_AUTHORITY = object()
+
+
+@dataclass(frozen=True)
 class NativeProcessInvocation:
     argv: tuple[str, ...]
     cwd: str
     env: Mapping[str, str]
     timeout_seconds: int
     max_capture_bytes: int
+    process_started: Callable[[_NativeProcessCreationProof], None]
 
 
 @dataclass(frozen=True)
@@ -2273,6 +2625,7 @@ class NativeProcessOutcome:
     observed_stdout_bytes: int = 0
     observed_stderr_bytes: int = 0
     output_truncated: bool = False
+    process_id: int | None = None
 
 
 class NativeProcessRunner(Protocol):
@@ -2282,12 +2635,33 @@ class NativeProcessRunner(Protocol):
 class ManagedNativeProcessRunner:
     """Real no-shell managed-process runner. It never retries."""
     def run(self, invocation: NativeProcessInvocation) -> NativeProcessOutcome:
+        process = ManagedProcess(
+            list(invocation.argv), cwd=invocation.cwd, env=dict(invocation.env),
+            want_stdin=False, max_capture_bytes=invocation.max_capture_bytes,
+        )
         try:
-            outcome = run_managed_oneshot(list(invocation.argv), cwd=invocation.cwd, env=dict(invocation.env), timeout_seconds=invocation.timeout_seconds, max_capture_bytes=invocation.max_capture_bytes)
+            process.start()
         except ManagedProcessError as exc:
             raise NativeProcessStartError(f"native process could not start: {exc}") from exc
-        process = outcome.process_result
-        return NativeProcessOutcome(outcome.returncode, outcome.stdout, outcome.stderr, outcome.timed_out, process.cleanup_proven, process.cleanup_observation, process.termination_reason, tuple(process.remaining_process_ids), process.stdout_bytes, process.stderr_bytes, process.output_truncated)
+        try:
+            # The callback is unreachable until ManagedProcess.start() has
+            # returned with an OS process.  Its CREATE_ONLY publication is the
+            # only constructor path for durable PROCESS_STARTED evidence.
+            invocation.process_started(_NativeProcessCreationProof._after_successful_spawn(process.pid))
+        except BaseException:
+            process.terminate(reason="process_start_evidence_publication_failed")
+            raise
+        exit_code = process.wait(timeout=invocation.timeout_seconds)
+        timed_out = exit_code is None and process.poll() is None
+        observed = process.terminate(reason=TERMINATION_HARD_TIMEOUT) if timed_out else process.finish(reason=TERMINATION_COMPLETED)
+        return NativeProcessOutcome(
+            observed.exit_code if observed.exit_code is not None else exit_code,
+            process.captured_stdout(), process.captured_stderr(), timed_out,
+            observed.cleanup_proven, observed.cleanup_observation,
+            observed.termination_reason, tuple(observed.remaining_process_ids),
+            observed.stdout_bytes, observed.stderr_bytes,
+            observed.output_truncated, process.pid,
+        )
 
 
 @dataclass(frozen=True)
@@ -2407,6 +2781,133 @@ def _write_artifact(*, store_root: Path, artifact_directory: Path, artifact_id: 
     return NativeArtifactReference(ARTIFACT_SCHEMA_VERSION, artifact_id, purpose, destination.relative_to(store_root).as_posix(), hashlib.sha256(data).hexdigest(), len(data), truncated).validated()
 
 
+def _repository_observation_dict(item: _RepositoryObservation) -> dict[str, Any]:
+    return {
+        "material_tree_hash": item.material_tree_hash,
+        "git_head": item.git_head,
+        "git_status": item.git_status,
+        "git_remotes": list(item.git_remotes),
+        "commit_message": item.commit_message,
+        "files": list(item.files),
+    }
+
+
+def _attested_file_drift(item: NativeBackendFileAttestation) -> str:
+    """Compare one live file to its snapshot without treating drift as parse failure."""
+
+    try:
+        path, identity = _safe_file(item.canonical_path, "post-run attested backend file")
+        if str(path) != item.canonical_path:
+            return "IDENTITY_ONLY_DRIFT"
+        data_hash = _sha256_file(path)
+    except FileNotFoundError:
+        return "MISSING"
+    except (OSError, ValueError):
+        return "UNREADABLE"
+    if data_hash != item.sha256 or identity.size != item.byte_count:
+        return "CONTENT_DRIFT"
+    if identity == item.filesystem_identity:
+        return "NO_DRIFT"
+    old = item.filesystem_identity
+    physical_equal = (identity.device, identity.inode, identity.mode, identity.size, identity.file_attributes) == (old.device, old.inode, old.mode, old.size, old.file_attributes)
+    return "METADATA_ONLY_DRIFT" if physical_equal else "IDENTITY_ONLY_DRIFT"
+
+
+def _attested_directory_drift(path_value: str, snapshot: NativeFilesystemIdentity) -> str:
+    try:
+        path, identity=_safe_directory(path_value,"post-run attested backend directory")
+        if str(path)!=path_value: return "IDENTITY_ONLY_DRIFT"
+    except FileNotFoundError: return "MISSING"
+    except (OSError,ValueError): return "UNREADABLE"
+    if identity==snapshot: return "NO_DRIFT"
+    physical_equal=(identity.device,identity.inode,identity.mode,identity.file_attributes)==(snapshot.device,snapshot.inode,snapshot.mode,snapshot.file_attributes)
+    return "METADATA_ONLY_DRIFT" if physical_equal else "IDENTITY_ONLY_DRIFT"
+
+
+@dataclass(frozen=True)
+class _BackendDrift:
+    executable: str
+    launchers: tuple[str, ...]
+    wrappers: tuple[str, ...]
+    catalog: str
+    selected_version: str
+    diagnostics: tuple[str, ...]
+
+    @property
+    def clean(self) -> bool:
+        return all(value in {"NO_DRIFT", "NOT_APPLICABLE"} for value in (self.executable, *self.launchers, *self.wrappers, self.catalog, self.selected_version))
+
+
+def _observe_backend_drift(attestation: BackendAttestation) -> _BackendDrift:
+    executable = _attested_file_drift(attestation.executable)
+    launchers = tuple(_attested_file_drift(item) for item in attestation.launcher_prefix)
+    wrappers: tuple[str, ...] = ()
+    catalog = "NOT_APPLICABLE"
+    selected = "NOT_APPLICABLE"
+    diagnostics: list[str] = [f"pinned_executable:{executable}"]
+    diagnostics.extend(f"pinned_launcher_{index}:{value}" for index, value in enumerate(launchers))
+    if isinstance(attestation, WrapperChainBackendAttestation):
+        wrappers = (
+            _attested_file_drift(attestation.cmd_wrapper),
+            _attested_file_drift(attestation.powershell_wrapper),
+            _attested_file_drift(attestation.package_manifest),
+            *tuple(_attested_file_drift(item) for item in attestation.version_wrapper_copies),
+        )
+        diagnostics.extend((f"cmd_wrapper:{wrappers[0]}", f"powershell_wrapper:{wrappers[1]}",f"selected_package_manifest:{wrappers[2]}"))
+        diagnostics.extend(f"selected_wrapper_copy_{index}:{value}" for index,value in enumerate(wrappers[3:]))
+        try:
+            inventory, selected_version = _select_wrapper_version(Path(attestation.command_resolution.wrapper_root))
+            catalog = "NO_DRIFT" if inventory == attestation.version_inventory else "VERSION_INVENTORY_DRIFT"
+            selected = _attested_directory_drift(attestation.selected_version_root,attestation.selected_version_root_identity) if selected_version == attestation.selected_version else "SELECTED_VERSION_DRIFT"
+        except (OSError, ValueError):
+            catalog = "UNREADABLE"
+            selected = "UNREADABLE"
+        diagnostics.extend((f"version_inventory:{catalog}", f"selected_version:{selected}"))
+    else:
+        # Package-bin authority includes the discovered shim, manifest and
+        # mapped launcher.  Any change remains conservatively ineligible.
+        package_items = (
+            attestation.provenance.discovered_shim,
+            attestation.provenance.package_manifest,
+            attestation.provenance.launcher,
+        )
+        wrappers = (
+            *tuple(_attested_file_drift(item) for item in package_items),
+            _attested_directory_drift(attestation.provenance.installation_root,attestation.provenance.installation_root_identity),
+            _attested_directory_drift(attestation.provenance.package_root,attestation.provenance.package_root_identity),
+        )
+        diagnostics.extend(f"package_chain_{index}:{value}" for index, value in enumerate(wrappers))
+    return _BackendDrift(executable, launchers, wrappers, catalog, selected, tuple(diagnostics))
+
+
+def _result_from_observation(observation: NativeProcessObservation, *, backend_attestation_fingerprint: str) -> NativeExecutionResult:
+    process=dict(observation.process); initial=dict(observation.initial_workspace); final=dict(observation.final_workspace); source=dict(observation.source_observation); parent=dict(observation.parent_observation)
+    cleanup_confirmed=process["cleanup_confirmed"]
+    status=NativeExecutionStatus.CLEANUP_UNCERTAIN if not cleanup_confirmed else NativeExecutionStatus.TIMED_OUT if process["timed_out"] else NativeExecutionStatus.PROCESS_SUCCEEDED if process["exit_code"]==0 else NativeExecutionStatus.PROCESS_FAILED
+    # Accepted results retain only the non-secret executable/launcher prefix.
+    # The complete argv is represented by the reservation/observation
+    # fingerprint and is never serialized.
+    argv=(process["executable"],*tuple(process["launcher_prefix"]))
+    provisional=NativeExecutionResult(
+        RESULT_SCHEMA_VERSION, observation.request_fingerprint,
+        f"native:{observation.session_id}:{observation.gate_id}:{observation.execution_attempt_index}",
+        status, BACKEND_IDENTITY, backend_attestation_fingerprint,
+        process["started_at"], process["ended_at"], process["executable"], argv,
+        process["cwd"], process["exit_code"], process["timed_out"], process["termination_reason"],
+        cleanup_confirmed, process["cleanup_observation"], tuple(process["orphan_process_ids"]),
+        observation.stdout_artifact, observation.stderr_artifact, process["output_truncation_occurred"],
+        initial["material_tree_hash"], final["material_tree_hash"], initial["git_head"], final["git_head"],
+        final["git_status"], tuple(final["git_remotes"]), final["commit_message"],
+        _commits_added(Path(process["cwd"]), initial["git_head"], final["git_head"]),
+        _changed_files(Path(process["cwd"]), initial["git_head"], final["git_head"]),
+        source["tree_hash_before"], source["tree_hash_after"], source["git_head_before"], source["git_head_after"],
+        source["git_status_before"], source["git_status_after"], source["mutated"],
+        tuple(parent["inventory_before"]), tuple(parent["inventory_after"]), tuple(parent["unexpected_sibling_mutations"]),
+        initial["material_tree_hash"] != final["material_tree_hash"] or initial["git_head"] != final["git_head"], "0"*64,
+    )
+    return provisional
+
+
 class _IssuedNativeResult:
     __slots__ = ("__weakref__",)
     def __copy__(self): raise TypeError("native result issuance is transient and non-copyable")
@@ -2457,7 +2958,15 @@ class NativeDelegatedExecutor:
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             raise NativeEvidenceInvalid("local backend installation/capability attestation is unavailable") from exc
 
-    def execute(self, *, request: NativeExecutionRequest, prompt: str, source_repository: str | Path, canary_parent: str | Path, allowed_parent_children: frozenset[str], evidence_store_root: str | Path, artifact_directory: str | Path) -> _IssuedNativeResult:
+    def execute(
+        self, *, request: NativeExecutionRequest, prompt: str,
+        source_repository: str | Path, canary_parent: str | Path,
+        allowed_parent_children: frozenset[str], evidence_store_root: str | Path,
+        artifact_directory: str | Path,
+        required_commit_message: str,
+        required_material_paths: frozenset[str],
+        execution_store: "AtomicNativeExecutionStore | None" = None,
+    ) -> _IssuedNativeResult:
         current = self.attest_local_backend()
         try:
             request.validated_for_execution(current_attestation=current)
@@ -2480,23 +2989,49 @@ class NativeDelegatedExecutor:
         if workspace.parent != parent: raise NativeEvidenceInvalid("work workspace must be a direct child of canary parent")
         if _inside(evidence_root, parent) is False and _inside(parent, evidence_root) is False: raise NativeEvidenceInvalid("execution evidence root must be measured under canary parent")
         if not allowed_parent_children == frozenset({workspace.name}): raise NativeEvidenceInvalid("only the exact work workspace may be excluded from sibling observations")
-        initial = _repository_observation(workspace); source_before = _repository_observation(source); parent_before = _parent_inventory(parent, allowed_children=allowed_parent_children)
+        store = execution_store or AtomicNativeExecutionStore(evidence_root)
+        if store.directory != evidence_root or store.artifact_directory != artifacts:
+            raise NativeEvidenceInvalid("executor lifecycle store differs from the durable request roots")
+        if not store.has_request(request.session_id, request.gate_id, request.execution_attempt_index):
+            raise NativeEvidenceInvalid("durable native request must exist before attempt reservation")
+        persisted = store.load_request_verified_against_local_backend(
+            request.session_id, request.gate_id, request.execution_attempt_index,
+            current_attestation=current,
+        )
+        if persisted != request:
+            raise NativeEvidenceInvalid("in-memory request differs from the strict durable pre-spawn request")
+        evidence_child=evidence_root.relative_to(parent).parts[0]
+        measured_parent_exclusions=allowed_parent_children | frozenset({evidence_child})
+        initial = _repository_observation(workspace); source_before = _repository_observation(source); parent_before = _parent_inventory(parent, allowed_children=measured_parent_exclusions)
         argv = request.backend_attestation.argv(prompt=prompt)
-        invocation = NativeProcessInvocation(argv, str(workspace), self.config.build_environment(), request.timeout_seconds, max(request.stdout_byte_limit, request.stderr_byte_limit))
-        started_at = self.clock()
-        try:
-            outcome = self.process_runner.run(invocation)
-        except NativeProcessStartError as exc:
-            outcome = NativeProcessOutcome(None, "", f"{type(exc).__name__}: {exc}\n", False, False, "unknown", "spawn_failed", observed_stderr_bytes=len(str(exc).encode("utf-8")))
+        argv_fingerprint = hashlib.sha256(canonical_bytes(list(argv))).hexdigest()
+        reservation = store.create_attempt_reserved(
+            request=request, argv_fingerprint=argv_fingerprint,
+            reserved_at=self.clock(), authorized_model=current.selected_model,
+        )
+        started_record: NativeProcessStarted | None = None
+        def process_started(proof: _NativeProcessCreationProof) -> None:
+            nonlocal started_record
+            started_record = store.create_process_started(
+                binding=store.load_request_structural(request.session_id, request.gate_id, 0),
+                reservation=reservation, proof=proof, started_at=self.clock(),
+            )
+        invocation = NativeProcessInvocation(
+            argv, str(workspace), self.config.build_environment(), request.timeout_seconds,
+            max(request.stdout_byte_limit, request.stderr_byte_limit), process_started,
+        )
+        outcome = self.process_runner.run(invocation)
+        if started_record is None:
+            raise NativeProcessStartError("native runner returned without durable process-start evidence")
         ended_at = self.clock()
         # Revalidate every root before using the post-process observations.
         post_source, post_source_identity = _safe_directory(source, "source repository post-exit"); post_workspace, post_identity = _safe_directory(workspace, "work workspace post-exit"); post_parent, post_parent_identity = _safe_directory(parent, "canary parent post-exit"); post_evidence, post_evidence_identity = _safe_directory(evidence_root, "execution evidence root post-exit"); post_artifacts, post_artifacts_identity = _safe_artifact_directory(post_evidence, artifacts)
         if post_workspace != workspace or not _same_mutable_directory_entry(post_identity, workspace_identity): raise NativeEvidenceInvalid("work workspace identity changed during execution")
         if post_source != source or not _same_directory_identity(post_source_identity, source_identity): raise NativeEvidenceInvalid("source repository identity changed during execution")
         if post_parent != parent or not _same_directory_identity(post_parent_identity, parent_identity): raise NativeEvidenceInvalid("canary parent identity changed during execution")
-        if post_evidence != evidence_root or not _same_directory_identity(post_evidence_identity, evidence_identity): raise NativeEvidenceInvalid("execution evidence root identity changed during execution")
-        if post_artifacts != artifacts or not _same_directory_identity(post_artifacts_identity, artifacts_identity): raise NativeEvidenceInvalid("native artifact directory identity changed during execution")
-        final = _repository_observation(workspace); source_after = _repository_observation(source); parent_after = _parent_inventory(parent, allowed_children=allowed_parent_children)
+        if post_evidence != evidence_root or not _same_mutable_directory_entry(post_evidence_identity, evidence_identity): raise NativeEvidenceInvalid("execution evidence root identity changed during execution")
+        if post_artifacts != artifacts or not _same_mutable_directory_entry(post_artifacts_identity, artifacts_identity): raise NativeEvidenceInvalid("native artifact directory identity changed during execution")
+        final = _repository_observation(workspace); source_after = _repository_observation(source); parent_after = _parent_inventory(parent, allowed_children=measured_parent_exclusions)
         stdout_data, stdout_truncated = _bounded(outcome.stdout, request.stdout_byte_limit, outcome.observed_stdout_bytes, outcome.output_truncated)
         stderr_data, stderr_truncated = _bounded(outcome.stderr, request.stderr_byte_limit, outcome.observed_stderr_bytes, outcome.output_truncated)
         prefix = f"{request.session_id}.{request.gate_id}.attempt-{request.execution_attempt_index}"
@@ -2504,15 +3039,62 @@ class NativeDelegatedExecutor:
         stderr_ref = _write_artifact(store_root=evidence_root, artifact_directory=artifacts, artifact_id=f"{prefix}.native.stderr", purpose="stderr", data=stderr_data, truncated=stderr_truncated)
         cleanup_confirmed = outcome.cleanup_confirmed and outcome.cleanup_observation == OBSERVATION_PROVEN_EMPTY and not outcome.orphan_process_ids
         status = NativeExecutionStatus.CLEANUP_UNCERTAIN if not cleanup_confirmed else NativeExecutionStatus.TIMED_OUT if outcome.timed_out else NativeExecutionStatus.PROCESS_SUCCEEDED if outcome.returncode == 0 else NativeExecutionStatus.PROCESS_FAILED
-        provisional = NativeExecutionResult(
-            RESULT_SCHEMA_VERSION, request.request_fingerprint, f"native:{request.session_id}:{request.gate_id}:{request.execution_attempt_index}", status, BACKEND_IDENTITY, request.backend_attestation_fingerprint,
-            started_at, ended_at, request.executable, argv, str(workspace), outcome.returncode, outcome.timed_out, outcome.termination_reason, cleanup_confirmed, outcome.cleanup_observation, outcome.orphan_process_ids,
-            stdout_ref, stderr_ref, stdout_truncated or stderr_truncated, initial.material_tree_hash, final.material_tree_hash, initial.git_head, final.git_head, final.git_status, final.git_remotes, final.commit_message,
-            _commits_added(workspace, initial.git_head, final.git_head), _changed_files(workspace, initial.git_head, final.git_head), source_before.material_tree_hash, source_after.material_tree_hash, source_before.git_head, source_after.git_head, source_before.git_status, source_after.git_status,
-            False, parent_before, parent_after, (), False, "0" * 64,
+        source_mutated = source_before.material_tree_hash != source_after.material_tree_hash or source_before.git_head != source_after.git_head or source_before.git_status != source_after.git_status
+        sibling_mutations = tuple(sorted(set(parent_before).symmetric_difference(parent_after)))
+        process_data = {
+            "started_at": started_record.process_started_at, "ended_at": ended_at,
+            "process_id": started_record.process_id, "executable": request.executable,
+            "launcher_prefix": list(request.launcher_prefix), "argv_fingerprint": argv_fingerprint,
+            "cwd": str(workspace), "exit_code": outcome.returncode, "timed_out": outcome.timed_out,
+            "termination_reason": outcome.termination_reason, "cleanup_confirmed": cleanup_confirmed,
+            "cleanup_observation": outcome.cleanup_observation, "orphan_process_ids": list(outcome.orphan_process_ids),
+            "output_truncation_occurred": stdout_truncated or stderr_truncated,
+        }
+        provisional_observation = NativeProcessObservation(
+            PROCESS_OBSERVATION_SCHEMA_VERSION, request.session_id, request.gate_id, 0,
+            request.request_fingerprint, reservation.reservation_fingerprint,
+            started_record.process_started_fingerprint, True, process_data, stdout_ref, stderr_ref,
+            _repository_observation_dict(initial), _repository_observation_dict(final),
+            {"tree_hash_before":source_before.material_tree_hash,"tree_hash_after":source_after.material_tree_hash,"git_head_before":source_before.git_head,"git_head_after":source_after.git_head,"git_status_before":source_before.git_status,"git_status_after":source_after.git_status,"mutated":source_mutated},
+            {"inventory_before":list(parent_before),"inventory_after":list(parent_after),"unexpected_sibling_mutations":list(sibling_mutations)},
+            "0"*64,
         )
-        derived = NativeExecutionResult(**{**provisional.__dict__, "source_repository_mutated": (source_before.material_tree_hash != source_after.material_tree_hash or source_before.git_head != source_after.git_head or source_before.git_status != source_after.git_status), "unexpected_sibling_mutations": tuple(sorted(set(parent_before).symmetric_difference(parent_after))), "workspace_material_changed": initial.material_tree_hash != final.material_tree_hash or initial.git_head != final.git_head})
-        result = NativeExecutionResult(**{**derived.__dict__, "result_fingerprint": fingerprint(derived._body())}).validated()
+        observation = NativeProcessObservation(**{**provisional_observation.__dict__,"observation_fingerprint":fingerprint(provisional_observation._body())}).validated()
+        try:
+            observation = store.create_process_observation(observation)
+        except (NativeExecutionStoreError, NativeEvidenceInvalid) as exc:
+            raise NativeProcessObservationPublicationError(f"process observation publication failed: {exc}") from exc
+
+        drift = _observe_backend_drift(request.backend_attestation)
+        process_ok = status is NativeExecutionStatus.PROCESS_SUCCEEDED and not outcome.timed_out and cleanup_confirmed and not outcome.orphan_process_ids
+        commit_ok = final.commit_message == required_commit_message
+        workspace_clean = final.git_status == ""
+        remotes_absent = not final.git_remotes
+        one_commit = _commits_added(workspace, initial.git_head, final.git_head) == 1
+        material_ok = required_material_paths.issubset(set(_changed_files(workspace, initial.git_head, final.git_head)))
+        boundary_ok = not source_mutated and not sibling_mutations
+        reasons: list[str] = []
+        if not drift.clean: reasons.append("post_run_backend_drift")
+        if not process_ok: reasons.append("native_process_or_cleanup_ineligible")
+        if not commit_ok: reasons.append("complete_commit_message_mismatch")
+        if not workspace_clean: reasons.append("final_worktree_not_clean")
+        if not remotes_absent: reasons.append("git_remote_present")
+        if not one_commit: reasons.append("exactly_one_new_commit_required")
+        if not material_ok: reasons.append("required_material_paths_missing")
+        if not boundary_ok: reasons.append("source_or_parent_boundary_changed")
+        provisional_eligibility = NativeExecutionEligibility(
+            EXECUTION_ELIGIBILITY_SCHEMA_VERSION, request.session_id, request.gate_id, 0,
+            request.request_fingerprint, observation.observation_fingerprint, self.clock(),
+            drift.executable, drift.launchers, drift.wrappers, drift.catalog, drift.selected_version,
+            drift.diagnostics, process_ok, commit_ok, workspace_clean, remotes_absent, one_commit,
+            material_ok, boundary_ok, not reasons, tuple(reasons), "0"*64,
+        )
+        eligibility = NativeExecutionEligibility(**{**provisional_eligibility.__dict__,"eligibility_fingerprint":fingerprint(provisional_eligibility._body())}).validated()
+        eligibility = store.create_execution_eligibility(eligibility)
+        if not eligibility.eligible:
+            raise NativeResultIneligible(eligibility)
+        provisional = _result_from_observation(observation, backend_attestation_fingerprint=request.backend_attestation_fingerprint)
+        result = NativeExecutionResult(**{**provisional.__dict__, "result_fingerprint": fingerprint(provisional._body())}).validated()
         return _issue_native_result(result)
 
 
@@ -2570,16 +3152,26 @@ class NativeCanaryTerminalRecord:
     created_at: str
     failure_category: str
     diagnostic: str
+    attempt_reserved_fingerprint: str | None
+    process_started_fingerprint: str | None
+    process_observation_fingerprint: str | None
+    execution_eligibility_fingerprint: str | None
     terminal_fingerprint: str
 
     def _body(self) -> dict[str, Any]:
-        data = dict(self.__dict__); data["status"] = self.status.value; data.pop("terminal_fingerprint"); return data
+        data = dict(self.__dict__); data["status"] = self.status.value; data.pop("terminal_fingerprint")
+        if self.schema_version == TERMINAL_SCHEMA_VERSION:
+            for key in ("attempt_reserved_fingerprint","process_started_fingerprint","process_observation_fingerprint","execution_eligibility_fingerprint"): data.pop(key)
+        return data
     def validated(self) -> "NativeCanaryTerminalRecord":
-        if self.schema_version != TERMINAL_SCHEMA_VERSION: raise ValueError("unsupported terminal schema")
+        if self.schema_version not in {TERMINAL_SCHEMA_VERSION,TERMINAL_SCHEMA_VERSION_V2}: raise ValueError("unsupported terminal schema")
         require_identifier(self.session_id, "terminal session ID"); require_identifier(self.gate_id, "terminal gate ID"); require_strict_int(self.execution_attempt_index, "terminal attempt", minimum=0, maximum=0)
         require_sha256(self.request_fingerprint, "terminal request fingerprint")
         if self.result_fingerprint is not None: require_sha256(self.result_fingerprint, "terminal result fingerprint")
         if self.capture_attempt_fingerprint is not None: require_sha256(self.capture_attempt_fingerprint, "terminal capture attempt fingerprint")
+        for label,value in (("attempt reserved",self.attempt_reserved_fingerprint),("process started",self.process_started_fingerprint),("process observation",self.process_observation_fingerprint),("execution eligibility",self.execution_eligibility_fingerprint)):
+            if value is not None: require_sha256(value,f"terminal {label} fingerprint")
+        if self.schema_version == TERMINAL_SCHEMA_VERSION and any(value is not None for value in (self.attempt_reserved_fingerprint,self.process_started_fingerprint,self.process_observation_fingerprint,self.execution_eligibility_fingerprint)): raise ValueError("legacy terminal cannot invent lifecycle evidence")
         if not isinstance(self.status, NativeCaptureTerminalStatus): raise ValueError("terminal status is invalid")
         _validate_timestamp(self.created_at, "terminal created_at"); require_nonempty_text(self.failure_category, "terminal failure category", max_bytes=128); require_nonempty_text(self.diagnostic, "terminal diagnostic", max_bytes=1024); require_sha256(self.terminal_fingerprint, "terminal fingerprint")
         if fingerprint(self._body()) != self.terminal_fingerprint: raise ValueError("terminal fingerprint mismatch")
@@ -2587,7 +3179,13 @@ class NativeCanaryTerminalRecord:
     def to_dict(self) -> dict[str, Any]: data = self._body(); data["terminal_fingerprint"] = self.terminal_fingerprint; return data
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "NativeCanaryTerminalRecord":
-        require_exact_keys(data, set(cls.__dataclass_fields__), "canary terminal"); values=dict(data); values["status"]=NativeCaptureTerminalStatus(data["status"]); return cls(**values).validated()
+        if data.get("schema_version")==TERMINAL_SCHEMA_VERSION:
+            legacy=set(cls.__dataclass_fields__)-{"attempt_reserved_fingerprint","process_started_fingerprint","process_observation_fingerprint","execution_eligibility_fingerprint"}
+            require_exact_keys(data,legacy,"legacy canary terminal"); values=dict(data)
+            values.update({"attempt_reserved_fingerprint":None,"process_started_fingerprint":None,"process_observation_fingerprint":None,"execution_eligibility_fingerprint":None})
+        else:
+            require_exact_keys(data,set(cls.__dataclass_fields__),"canary terminal"); values=dict(data)
+        values["status"]=NativeCaptureTerminalStatus(data["status"]); return cls(**values).validated()
 
 
 def _publish_native_bytes(
@@ -2653,10 +3251,23 @@ class AtomicNativeExecutionStore:
         self._assert_root_identity(); self._assert_artifact_root_identity()
         _publish_native_bytes(self.durability_adapter, path, data, operation=operation)
     def has_request(self, session_id: str, gate_id: str, attempt: int) -> bool: return self._path("request", session_id, gate_id, attempt).is_file()
+    def has_attempt_reserved(self, session_id: str, gate_id: str, attempt: int) -> bool: return self._path("attempt-reserved", session_id, gate_id, attempt).is_file()
+    def has_process_started(self, session_id: str, gate_id: str, attempt: int) -> bool: return self._path("process-started", session_id, gate_id, attempt).is_file()
+    def has_process_observation(self, session_id: str, gate_id: str, attempt: int) -> bool: return self._path("process-observation", session_id, gate_id, attempt).is_file()
+    def has_execution_eligibility(self, session_id: str, gate_id: str, attempt: int) -> bool: return self._path("execution-eligibility", session_id, gate_id, attempt).is_file()
     def has_result(self, session_id: str, gate_id: str, attempt: int) -> bool: return self._path("result", session_id, gate_id, attempt).is_file()
     def has_capture_attempt(self, session_id: str, gate_id: str, attempt: int) -> bool: return self._path("capture-attempt", session_id, gate_id, attempt).is_file()
     def has_terminal(self, session_id: str, gate_id: str, attempt: int) -> bool: return self._path("terminal", session_id, gate_id, attempt).is_file()
     def has_behavioral_evidence(self, session_id: str, gate_id: str, attempt: int) -> bool: return self._path("behavioral", session_id, gate_id, attempt).is_file()
+    def lifecycle_counts(self, session_id: str, gate_id: str, attempt: int) -> NativeLifecycleCounts:
+        reserved=int(self.has_attempt_reserved(session_id,gate_id,attempt))
+        started=int(self.has_process_started(session_id,gate_id,attempt))
+        observed=int(self.has_process_observation(session_id,gate_id,attempt))
+        completed=0
+        if observed:
+            completed=int(self.load_process_observation(session_id,gate_id,attempt).process_completion_observed)
+        accepted=int(self.has_result(session_id,gate_id,attempt))
+        return NativeLifecycleCounts(reserved,started,completed,observed,accepted,started)
     def assert_unique_capture_attempt(self, session_id: str, gate_id: str, attempt: int) -> None:
         expected = self._path("capture-attempt", session_id, gate_id, attempt)
         matches = tuple(self.directory.glob(f"{session_id}.{gate_id}.attempt-*.native-capture-attempt.json"))
@@ -2672,15 +3283,77 @@ class AtomicNativeExecutionStore:
     def _load(self, kind: str, session_id: str, gate_id: str, attempt: int, loader: Callable[[Mapping[str, Any]], Any]) -> Any:
         self._assert_root_identity(); path=self._path(kind, session_id, gate_id, attempt)
         if not path.is_file(): raise NativeEvidenceNotFound(f"native {kind} not found")
-        try: item=loader(json.loads(path.read_text(encoding="utf-8")))
+        try:
+            raw=path.read_bytes(); parsed=json.loads(raw.decode("utf-8"))
+            if not isinstance(parsed,Mapping) or raw != canonical_bytes(parsed)+b"\n": raise ValueError("record bytes are not canonical")
+            item=loader(parsed)
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc: raise NativeEvidenceInvalid(f"native {kind} is invalid: {exc}") from exc
         if hasattr(item, "session_id") and (item.session_id, item.gate_id, item.execution_attempt_index) != (session_id, gate_id, attempt):
             raise NativeEvidenceInvalid(f"native {kind} identity differs from filename")
         return item
     def load_request(self, session_id: str, gate_id: str, attempt: int) -> NativeExecutionRequest: return self._load("request", session_id, gate_id, attempt, NativeExecutionRequest.from_dict)
+    def load_request_structural(self, session_id: str, gate_id: str, attempt: int) -> NativeExecutionRequestBinding:
+        return self._load("request",session_id,gate_id,attempt,_structural_request_binding)
     def load_request_verified_against_local_backend(self, session_id: str, gate_id: str, attempt: int, *, current_attestation: NativeBackendAttestation) -> NativeExecutionRequest:
         request = self.load_request(session_id, gate_id, attempt)
         return request.validated_for_execution(current_attestation=current_attestation)
+    def create_attempt_reserved(self, *, request: NativeExecutionRequest, argv_fingerprint: str, reserved_at: str, authorized_model: str) -> NativeAttemptReserved:
+        request.validated(); binding=self.load_request_structural(request.session_id,request.gate_id,request.execution_attempt_index)
+        if binding.request_fingerprint != request.request_fingerprint: raise NativeEvidenceInvalid("reservation request binding differs")
+        if any((self.has_attempt_reserved(binding.session_id,binding.gate_id,0),self.has_process_started(binding.session_id,binding.gate_id,0),self.has_process_observation(binding.session_id,binding.gate_id,0),self.has_execution_eligibility(binding.session_id,binding.gate_id,0),self.has_result(binding.session_id,binding.gate_id,0))): raise NativeResultAlreadyExists("native attempt slot is already consumed")
+        provisional=NativeAttemptReserved(ATTEMPT_RESERVED_SCHEMA_VERSION,binding.session_id,binding.gate_id,0,binding.request_fingerprint,binding.mission_fingerprint,binding.gate_contract_fingerprint,binding.backend_attestation_fingerprint,binding.executable,binding.launcher_prefix,argv_fingerprint,binding.work_workspace,reserved_at,authorized_model,1,1,binding.timeout_seconds,binding.stdout_byte_limit,binding.stderr_byte_limit,"0"*64)
+        item=NativeAttemptReserved(**{**provisional.__dict__,"reservation_fingerprint":fingerprint(provisional._body())}).validated(); path=self._path("attempt-reserved",item.session_id,item.gate_id,0)
+        with self._lock(item.session_id,item.gate_id,0):
+            if path.exists(): raise NativeResultAlreadyExists("attempt reservation is write-once")
+            try: self._atomic_create(path,item.to_dict(),operation="native attempt reservation")
+            except FileExistsError as exc: raise NativeResultAlreadyExists("attempt reservation is write-once") from exc
+        return self.load_attempt_reserved(item.session_id,item.gate_id,0)
+    def load_attempt_reserved(self,session_id: str,gate_id: str,attempt: int)->NativeAttemptReserved:
+        item=self._load("attempt-reserved",session_id,gate_id,attempt,NativeAttemptReserved.from_dict); binding=self.load_request_structural(session_id,gate_id,attempt)
+        if item.request_fingerprint!=binding.request_fingerprint: raise NativeEvidenceInvalid("attempt reservation differs from request")
+        return item
+    def create_process_started(self, *, binding: NativeExecutionRequestBinding, reservation: NativeAttemptReserved, proof: _NativeProcessCreationProof, started_at: str) -> NativeProcessStarted:
+        # This method is intentionally called only by the runner's post-spawn
+        # callback.  No coordinator/preflight API exposes a pre-spawn path.
+        if reservation.request_fingerprint!=binding.request_fingerprint: raise NativeEvidenceInvalid("process start differs from reservation request")
+        process_id=proof.validated().process_id
+        if self.has_process_started(binding.session_id,binding.gate_id,0): raise NativeResultAlreadyExists("process-started record is write-once")
+        provisional=NativeProcessStarted(PROCESS_STARTED_SCHEMA_VERSION,binding.session_id,binding.gate_id,0,binding.request_fingerprint,reservation.reservation_fingerprint,started_at,process_id,binding.executable,binding.launcher_prefix,"0"*64)
+        item=NativeProcessStarted(**{**provisional.__dict__,"process_started_fingerprint":fingerprint(provisional._body())}).validated(); path=self._path("process-started",item.session_id,item.gate_id,0)
+        with self._lock(item.session_id,item.gate_id,0):
+            if path.exists(): raise NativeResultAlreadyExists("process-started record is write-once")
+            self._atomic_create(path,item.to_dict(),operation="native process started")
+        return self.load_process_started(item.session_id,item.gate_id,0)
+    def load_process_started(self,session_id: str,gate_id: str,attempt: int)->NativeProcessStarted:
+        item=self._load("process-started",session_id,gate_id,attempt,NativeProcessStarted.from_dict); reservation=self.load_attempt_reserved(session_id,gate_id,attempt)
+        if item.reservation_fingerprint!=reservation.reservation_fingerprint: raise NativeEvidenceInvalid("process start differs from reservation")
+        return item
+    def create_process_observation(self,item: NativeProcessObservation)->NativeProcessObservation:
+        item.validated(); binding=self.load_request_structural(item.session_id,item.gate_id,item.execution_attempt_index); started=self.load_process_started(item.session_id,item.gate_id,item.execution_attempt_index)
+        if item.request_fingerprint!=binding.request_fingerprint or item.process_started_fingerprint!=started.process_started_fingerprint: raise NativeEvidenceInvalid("process observation lifecycle binding differs")
+        self._verify_artifact(item.stdout_artifact); self._verify_artifact(item.stderr_artifact); path=self._path("process-observation",item.session_id,item.gate_id,0)
+        with self._lock(item.session_id,item.gate_id,0):
+            if path.exists(): raise NativeResultAlreadyExists("process observation is write-once")
+            self._atomic_create(path,item.to_dict(),operation="native process observation")
+        return self.load_process_observation(item.session_id,item.gate_id,0)
+    def load_process_observation(self,session_id: str,gate_id: str,attempt: int)->NativeProcessObservation:
+        item=self._load("process-observation",session_id,gate_id,attempt,NativeProcessObservation.from_dict); started=self.load_process_started(session_id,gate_id,attempt)
+        if item.process_started_fingerprint!=started.process_started_fingerprint: raise NativeEvidenceInvalid("process observation differs from process start")
+        reservation=self.load_attempt_reserved(session_id,gate_id,attempt)
+        if (item.process["started_at"],item.process["process_id"],item.process["executable"],tuple(item.process["launcher_prefix"]),item.process["argv_fingerprint"])!=(started.process_started_at,started.process_id,started.executable,started.launcher_prefix,reservation.argv_fingerprint): raise NativeEvidenceInvalid("process observation contradicts reservation/process-start evidence")
+        self._verify_artifact(item.stdout_artifact); self._verify_artifact(item.stderr_artifact); return item
+    def create_execution_eligibility(self,item: NativeExecutionEligibility)->NativeExecutionEligibility:
+        item.validated(); observation=self.load_process_observation(item.session_id,item.gate_id,item.execution_attempt_index)
+        if item.observation_fingerprint!=observation.observation_fingerprint: raise NativeEvidenceInvalid("eligibility differs from process observation")
+        path=self._path("execution-eligibility",item.session_id,item.gate_id,0)
+        with self._lock(item.session_id,item.gate_id,0):
+            if path.exists(): raise NativeResultAlreadyExists("execution eligibility is write-once")
+            self._atomic_create(path,item.to_dict(),operation="native execution eligibility")
+        return self.load_execution_eligibility(item.session_id,item.gate_id,0)
+    def load_execution_eligibility(self,session_id: str,gate_id: str,attempt: int)->NativeExecutionEligibility:
+        item=self._load("execution-eligibility",session_id,gate_id,attempt,NativeExecutionEligibility.from_dict); observation=self.load_process_observation(session_id,gate_id,attempt)
+        if item.observation_fingerprint!=observation.observation_fingerprint: raise NativeEvidenceInvalid("eligibility differs from observation")
+        return item
     def _verify_artifact(self, reference: NativeArtifactReference) -> None:
         reference.validated(); candidate = self.directory / reference.relative_path
         try: path, _ = _safe_file(candidate, "native artifact")
@@ -2736,10 +3409,13 @@ class AtomicNativeExecutionStore:
         self._validate_behavioral_binding(request, evidence)
         for reference in (evidence.script, evidence.stdout, evidence.stderr): self._verify_artifact(reference)
         return evidence
-    def _request_for_result(self, result: NativeExecutionResult) -> NativeExecutionRequest:
+    def _request_for_result(self, result: NativeExecutionResult) -> NativeExecutionRequestBinding:
         matches=[]
         for path in self.directory.glob("*.native-request.json"):
-            try: request=NativeExecutionRequest.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            try:
+                raw=path.read_bytes(); data=json.loads(raw.decode("utf-8"))
+                if raw!=canonical_bytes(data)+b"\n": raise ValueError("record bytes are not canonical")
+                request=_structural_request_binding(data)
             except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc: raise NativeEvidenceInvalid(f"native request catalog is invalid: {exc}") from exc
             if request.request_fingerprint==result.request_fingerprint: matches.append(request)
         if len(matches)!=1: raise NativeEvidenceInvalid("result must bind exactly one request")
@@ -2747,13 +3423,15 @@ class AtomicNativeExecutionStore:
         if result.invocation_id != f"native:{request.session_id}:{request.gate_id}:{request.execution_attempt_index}": raise NativeEvidenceInvalid("result invocation differs from request")
         return request
     @staticmethod
-    def _validate_result_binding(request: NativeExecutionRequest, result: NativeExecutionResult) -> None:
+    def _validate_result_binding(request: NativeExecutionRequestBinding, result: NativeExecutionResult) -> None:
         if result.backend_attestation_fingerprint != request.backend_attestation_fingerprint or result.executable != request.executable or result.cwd != request.work_workspace: raise NativeEvidenceInvalid("result backend/executable/cwd differs from request")
         launcher=(request.executable,*request.launcher_prefix)
-        if result.argv[:len(launcher)] != launcher or hashlib.sha256(result.argv[-1].encode("utf-8")).hexdigest()!=request.prompt_fingerprint: raise NativeEvidenceInvalid("result argv differs from request")
+        if result.argv != launcher: raise NativeEvidenceInvalid("result executable/launcher prefix differs from request")
         if result.stdout_artifact.byte_count>request.stdout_byte_limit or result.stderr_artifact.byte_count>request.stderr_byte_limit: raise NativeEvidenceInvalid("result artifact exceeds request limit")
     def write_result(self, issued_result: object) -> NativeExecutionResult:
         record=_issued_native_result_for(issued_result); result=record.result.validated(); request=self._request_for_result(result); self._validate_result_binding(request,result); self._verify_artifact(result.stdout_artifact); self._verify_artifact(result.stderr_artifact)
+        eligibility=self.load_execution_eligibility(request.session_id,request.gate_id,request.execution_attempt_index)
+        if not eligibility.eligible: raise NativeEvidenceInvalid("accepted result requires successful execution eligibility")
         path=self._path("result",request.session_id,request.gate_id,request.execution_attempt_index)
         with self._lock(request.session_id,request.gate_id,request.execution_attempt_index):
             if path.exists(): raise NativeResultAlreadyExists("native execution result is write-once")
@@ -2763,8 +3441,10 @@ class AtomicNativeExecutionStore:
         if reloaded!=result: raise NativeEvidenceInvalid("reloaded result differs")
         _consume_issued_native_result(issued_result); return reloaded
     def load_result(self, session_id: str, gate_id: str, attempt: int) -> NativeExecutionResult:
-        result=self._load("result",session_id,gate_id,attempt,NativeExecutionResult.from_dict); request=self.load_request(session_id,gate_id,attempt)
+        result=self._load("result",session_id,gate_id,attempt,NativeExecutionResult.from_dict); request=self.load_request_structural(session_id,gate_id,attempt)
         if result.request_fingerprint!=request.request_fingerprint: raise NativeEvidenceInvalid("result request binding mismatch")
+        eligibility=self.load_execution_eligibility(session_id,gate_id,attempt)
+        if not eligibility.eligible: raise NativeEvidenceInvalid("accepted result has ineligible execution evidence")
         self._validate_result_binding(request,result); self._verify_artifact(result.stdout_artifact); self._verify_artifact(result.stderr_artifact); return result
     def create_capture_attempt(self, *, request: NativeExecutionRequest, result: NativeExecutionResult, gate_plan_fingerprint: str, checkpoint_contract_fingerprint: str, behavioral_evidence_fingerprint: str, required_command_ids: tuple[str, ...], state_revision: int, clock: Callable[[], str] = _utc_now) -> NativeCheckpointCaptureAttempt:
         if self.has_capture_attempt(request.session_id,request.gate_id,request.execution_attempt_index): raise NativeResultAlreadyExists("capture attempt is write-once")
@@ -2775,8 +3455,14 @@ class AtomicNativeExecutionStore:
     def load_capture_attempt(self, session_id: str, gate_id: str, attempt: int) -> NativeCheckpointCaptureAttempt:
         self.assert_unique_capture_attempt(session_id, gate_id, attempt)
         return self._load("capture-attempt",session_id,gate_id,attempt,NativeCheckpointCaptureAttempt.from_dict)
-    def create_terminal(self, *, request: NativeExecutionRequest, result: NativeExecutionResult | None, status: NativeCaptureTerminalStatus, failure_category: str, diagnostic: str, capture_attempt: NativeCheckpointCaptureAttempt | None = None, clock: Callable[[], str] = _utc_now) -> NativeCanaryTerminalRecord:
-        provisional=NativeCanaryTerminalRecord(TERMINAL_SCHEMA_VERSION,request.session_id,request.gate_id,0,request.request_fingerprint,result.result_fingerprint if result else None,status,capture_attempt.attempt_fingerprint if capture_attempt else None,clock(),failure_category,diagnostic,"0"*64)
+    def create_terminal(self, *, request: NativeExecutionRequest | NativeExecutionRequestBinding, result: NativeExecutionResult | None, status: NativeCaptureTerminalStatus, failure_category: str, diagnostic: str, capture_attempt: NativeCheckpointCaptureAttempt | None = None, clock: Callable[[], str] = _utc_now) -> NativeCanaryTerminalRecord:
+        binding=self.load_request_structural(request.session_id,request.gate_id,0)
+        if request.request_fingerprint!=binding.request_fingerprint: raise NativeEvidenceInvalid("terminal request binding differs")
+        reserved=self.load_attempt_reserved(binding.session_id,binding.gate_id,0) if self.has_attempt_reserved(binding.session_id,binding.gate_id,0) else None
+        started=self.load_process_started(binding.session_id,binding.gate_id,0) if self.has_process_started(binding.session_id,binding.gate_id,0) else None
+        observation=self.load_process_observation(binding.session_id,binding.gate_id,0) if self.has_process_observation(binding.session_id,binding.gate_id,0) else None
+        eligibility=self.load_execution_eligibility(binding.session_id,binding.gate_id,0) if self.has_execution_eligibility(binding.session_id,binding.gate_id,0) else None
+        provisional=NativeCanaryTerminalRecord(TERMINAL_SCHEMA_VERSION_V2,binding.session_id,binding.gate_id,0,binding.request_fingerprint,result.result_fingerprint if result else None,status,capture_attempt.attempt_fingerprint if capture_attempt else None,clock(),failure_category,diagnostic,reserved.reservation_fingerprint if reserved else None,started.process_started_fingerprint if started else None,observation.observation_fingerprint if observation else None,eligibility.eligibility_fingerprint if eligibility else None,"0"*64)
         item=NativeCanaryTerminalRecord(**{**provisional.__dict__,"terminal_fingerprint":fingerprint(provisional._body())}).validated(); path=self._path("terminal",item.session_id,item.gate_id,0)
         with self._lock(item.session_id,item.gate_id,0):
             if path.exists(): raise NativeResultAlreadyExists("canary terminal record is write-once")
@@ -2786,6 +3472,6 @@ class AtomicNativeExecutionStore:
 
 
 __all__ = [
-    "ARTIFACT_SCHEMA_VERSION", "ATTESTATION_CLASS_PACKAGE_BIN", "ATTESTATION_CLASS_WRAPPER_CHAIN", "ATTESTATION_SCHEMA_VERSION", "BACKEND_IDENTITY", "BACKEND_PROTOCOL_VERSION", "CAPTURE_ATTEMPT_SCHEMA_VERSION", "CAPTURE_EXPECTED_SUCCESS_STATUS", "CURSOR_DISCOVERY_COMMAND", "CURSOR_DISCOVERY_MECHANISM", "DEFAULT_ENVIRONMENT_ALLOWLIST", "EXPECTED_CURSOR_PACKAGE_NAME", "NATIVE_PROMPT_HEADER", "PACKAGE_BIN_NON_CLAIMS", "REQUEST_SCHEMA_VERSION", "RESULT_SCHEMA_VERSION", "TERMINAL_SCHEMA_VERSION", "WINDOWS_COMMAND_RESOLUTION_SCHEMA_VERSION", "WINDOWS_WHERE_DIAGNOSTIC_SCHEMA_VERSION", "WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION", "WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION_LEGACY_V1", "WRAPPER_CHAIN_BLOCKED_REASON", "WRAPPER_CHAIN_CLAIMS", "WRAPPER_CHAIN_DISCOVERY_MECHANISM", "WRAPPER_CHAIN_NON_CLAIMS", "WRAPPER_CHAIN_READY_REASON",
-    "AtomicNativeExecutionStore", "BackendAttestation", "CursorInstallationProvenance", "CursorNativeBackendConfig", "CursorWrapperChainResolution", "DeterministicWindowsCommandResolution", "HostWrapperChainDiscovery", "PowerShellCommandCandidate", "PowerShellCommandObservation", "WhereCommandObservation", "WindowsPathCandidate", "WindowsWhereDiagnostic", "WindowsWhereDiagnosticStatus", "WrapperChainBackendAttestation", "WrapperChainDiscovery", "attestation_from_dict", "ManagedNativeProcessRunner", "NativeArtifactReference", "NativeBackendAttestation", "NativeBackendFileAttestation", "NativeCanaryTerminalRecord", "NativeCaptureTerminalStatus", "NativeCheckpointCaptureAttempt", "NativeCommittedButDurabilityUncertain", "NativeDelegatedExecutor", "NativeEvidenceInvalid", "NativeEvidenceNotFound", "NativeExecutionRequest", "NativeExecutionResult", "NativeExecutionStatus", "NativeExecutionStoreError", "NativeFilesystemIdentity", "NativePreflightDecision", "NativePreflightStatus", "NativeProcessInvocation", "NativeProcessOutcome", "NativeProcessRunner", "NativeProcessStartError", "NativeRequestAlreadyExists", "NativeResultAlreadyExists", "preflight_native_cursor",
+    "ARTIFACT_SCHEMA_VERSION", "ATTESTATION_CLASS_PACKAGE_BIN", "ATTESTATION_CLASS_WRAPPER_CHAIN", "ATTESTATION_SCHEMA_VERSION", "ATTEMPT_RESERVED_SCHEMA_VERSION", "BACKEND_IDENTITY", "BACKEND_PROTOCOL_VERSION", "CAPTURE_ATTEMPT_SCHEMA_VERSION", "CAPTURE_EXPECTED_SUCCESS_STATUS", "CURSOR_DISCOVERY_COMMAND", "CURSOR_DISCOVERY_MECHANISM", "DEFAULT_ENVIRONMENT_ALLOWLIST", "EXECUTION_ELIGIBILITY_SCHEMA_VERSION", "EXPECTED_CURSOR_PACKAGE_NAME", "NATIVE_PROMPT_HEADER", "PACKAGE_BIN_NON_CLAIMS", "PROCESS_OBSERVATION_SCHEMA_VERSION", "PROCESS_STARTED_SCHEMA_VERSION", "REQUEST_SCHEMA_VERSION", "RESULT_SCHEMA_VERSION", "TERMINAL_SCHEMA_VERSION", "TERMINAL_SCHEMA_VERSION_V2", "WINDOWS_COMMAND_RESOLUTION_SCHEMA_VERSION", "WINDOWS_WHERE_DIAGNOSTIC_SCHEMA_VERSION", "WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION", "WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION_LEGACY_V1", "WRAPPER_CHAIN_BLOCKED_REASON", "WRAPPER_CHAIN_CLAIMS", "WRAPPER_CHAIN_DISCOVERY_MECHANISM", "WRAPPER_CHAIN_NON_CLAIMS", "WRAPPER_CHAIN_READY_REASON",
+    "AtomicNativeExecutionStore", "BackendAttestation", "CursorInstallationProvenance", "CursorNativeBackendConfig", "CursorWrapperChainResolution", "DeterministicWindowsCommandResolution", "HostWrapperChainDiscovery", "PowerShellCommandCandidate", "PowerShellCommandObservation", "WhereCommandObservation", "WindowsPathCandidate", "WindowsWhereDiagnostic", "WindowsWhereDiagnosticStatus", "WrapperChainBackendAttestation", "WrapperChainDiscovery", "attestation_from_dict", "ManagedNativeProcessRunner", "NativeArtifactReference", "NativeAttemptReserved", "NativeBackendAttestation", "NativeBackendFileAttestation", "NativeCanaryTerminalRecord", "NativeCaptureTerminalStatus", "NativeCheckpointCaptureAttempt", "NativeCommittedButDurabilityUncertain", "NativeDelegatedExecutor", "NativeEvidenceInvalid", "NativeEvidenceNotFound", "NativeExecutionEligibility", "NativeExecutionRequest", "NativeExecutionRequestBinding", "NativeExecutionResult", "NativeExecutionStatus", "NativeExecutionStoreError", "NativeFilesystemIdentity", "NativeLifecycleCounts", "NativePreflightDecision", "NativePreflightStatus", "NativeProcessInvocation", "NativeProcessObservation", "NativeProcessObservationPublicationError", "NativeProcessOutcome", "NativeProcessRunner", "NativeProcessStarted", "NativeProcessStartError", "NativeRequestAlreadyExists", "NativeResultAlreadyExists", "NativeResultIneligible", "preflight_native_cursor",
 ]

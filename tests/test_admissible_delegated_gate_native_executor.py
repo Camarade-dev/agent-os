@@ -23,9 +23,11 @@ from admissible.delegated_gate.durability import (
     PlatformDurabilityAdapter,
     PublicationMetadataDurability,
     PublicationVisibleButMetadataUncertain,
+    DurabilityAdapterError,
 )
 from admissible.delegated_gate.native_canary import (
     CANARY_MISSION,
+    CANARY_GATE_ID,
     EXPECTED_MATERIAL_PATHS,
     MAX_AUDITOR_INVOCATIONS,
     MAX_NATIVE_PHASE_ATTEMPTS,
@@ -56,19 +58,27 @@ from admissible.delegated_gate.native_executor import (
     EXPECTED_CURSOR_PACKAGE_NAME,
     NativeBackendAttestation,
     NativeBackendFileAttestation,
+    NativeAttemptReserved,
     NativeCanaryTerminalRecord,
     NativeCaptureTerminalStatus,
     NativeCommittedButDurabilityUncertain,
     NativeDelegatedExecutor,
     NativeEvidenceInvalid,
     NativeExecutionRequest,
+    NativeExecutionEligibility,
     NativeExecutionResult,
     NativeExecutionStatus,
+    NativeExecutionStoreError,
     NativeFilesystemIdentity,
     NativePreflightDecision,
     NativePreflightStatus,
     NativeProcessInvocation,
+    NativeProcessObservation,
     NativeProcessOutcome,
+    NativeProcessStartError,
+    NativeProcessStarted,
+    NativeResultIneligible,
+    _NativeProcessCreationProof,
     NativeRequestAlreadyExists,
     NativeResultAlreadyExists,
     OBSERVATION_PROVEN_EMPTY,
@@ -86,6 +96,14 @@ def _commit(repository: Path, message: str) -> None:
     env = dict(os.environ)
     env.update({"GIT_AUTHOR_NAME": "Deterministic Fake Executor", "GIT_AUTHOR_EMAIL": "fake@invalid.example", "GIT_COMMITTER_NAME": "Deterministic Fake Executor", "GIT_COMMITTER_EMAIL": "fake@invalid.example", "GIT_AUTHOR_DATE": "2026-01-02T00:00:00Z", "GIT_COMMITTER_DATE": "2026-01-02T00:00:00Z"})
     _command(["git", "add", "--all"], cwd=repository); _command(["git", "commit", "--quiet", "-m", message], cwd=repository, env=env)
+
+
+def _amend_message(repository: Path, *paragraphs: str) -> None:
+    env=dict(os.environ)
+    env.update({"GIT_AUTHOR_NAME":"Deterministic Fake Executor","GIT_AUTHOR_EMAIL":"fake@invalid.example","GIT_COMMITTER_NAME":"Deterministic Fake Executor","GIT_COMMITTER_EMAIL":"fake@invalid.example","GIT_AUTHOR_DATE":"2026-01-02T00:00:00Z","GIT_COMMITTER_DATE":"2026-01-02T00:00:00Z"})
+    argv=["git","commit","--quiet","--amend"]
+    for paragraph in paragraphs: argv.extend(("-m",paragraph))
+    _command(argv,cwd=repository,env=env)
 
 
 def _materialize_success(repository: Path) -> None:
@@ -141,16 +159,23 @@ class FakeNativeProcessRunner:
     cleanup_confirmed: bool = True
     orphan_process_ids: tuple[int, ...] = ()
     stdout: str = "provider prose is non-authoritative\n"
+    spawn_error: bool = False
+    after_start: Callable[[], None] | None = None
     invocations: list[NativeProcessInvocation] = field(default_factory=list)
     def run(self, invocation: NativeProcessInvocation) -> NativeProcessOutcome:
         self.invocations.append(invocation)
+        if self.spawn_error:
+            raise NativeProcessStartError("injected spawn failure")
+        invocation.process_started(_NativeProcessCreationProof._after_successful_spawn(4242))
+        if self.after_start: self.after_start()
         if self.mutation: self.mutation(Path(invocation.cwd))
-        return NativeProcessOutcome(self.returncode, self.stdout, "", self.timed_out, self.cleanup_confirmed, OBSERVATION_PROVEN_EMPTY if self.cleanup_confirmed else "unknown", "hard_timeout" if self.timed_out else "completed", self.orphan_process_ids, len(self.stdout.encode()), 0, False)
+        return NativeProcessOutcome(self.returncode, self.stdout, "", self.timed_out, self.cleanup_confirmed, OBSERVATION_PROVEN_EMPTY if self.cleanup_confirmed else "unknown", "hard_timeout" if self.timed_out else "completed", self.orphan_process_ids, len(self.stdout.encode()), 0, False, 4242)
 
 
 class Clock:
-    def __init__(self) -> None: self.values=iter(("2026-07-16T10:00:00.000000Z","2026-07-16T10:00:01.000000Z","2026-07-16T10:00:02.000000Z"))
-    def __call__(self) -> str: return next(self.values)
+    def __init__(self) -> None: self.index=0
+    def __call__(self) -> str:
+        value=f"2026-07-16T10:00:{self.index:02d}.000000Z"; self.index+=1; return value
 
 
 @dataclass
@@ -355,7 +380,7 @@ def test_inert_request_parse_needs_fresh_local_attestation_before_execution(tmp_
     with pytest.raises(NativeEvidenceInvalid,match="freshly attested"):
         parsed.validated_for_execution(current_attestation=h.attestation)
     with pytest.raises(NativeEvidenceInvalid):
-        h.executor.execute(request=parsed,prompt=prompt,source_repository=h.source,canary_parent=h.root,allowed_parent_children=frozenset({h.work.name}),evidence_store_root=h.store.directory,artifact_directory=h.store.artifact_directory)
+        h.executor.execute(request=parsed,prompt=prompt,source_repository=h.source,canary_parent=h.root,allowed_parent_children=frozenset({h.work.name}),evidence_store_root=h.store.directory,artifact_directory=h.store.artifact_directory,required_commit_message=REQUIRED_COMMIT_MESSAGE,required_material_paths=EXPECTED_MATERIAL_PATHS,execution_store=h.store)
     assert h.runner.invocations==[]
 
 
@@ -373,7 +398,7 @@ def test_substituted_manifest_or_launcher_identity_cannot_reload_as_authority(tm
 def test_changed_launcher_before_spawn_blocks_without_fake_process(tmp_path: Path):
     h=_harness(tmp_path); request,prompt=_request(h); Path(h.attestation.launcher_prefix[0].canonical_path).write_text("print('changed')\n",encoding="utf-8")
     with pytest.raises(NativeEvidenceInvalid):
-        h.executor.execute(request=request,prompt=prompt,source_repository=h.source,canary_parent=h.root,allowed_parent_children=frozenset({h.work.name}),evidence_store_root=h.store.directory,artifact_directory=h.store.artifact_directory)
+        h.executor.execute(request=request,prompt=prompt,source_repository=h.source,canary_parent=h.root,allowed_parent_children=frozenset({h.work.name}),evidence_store_root=h.store.directory,artifact_directory=h.store.artifact_directory,required_commit_message=REQUIRED_COMMIT_MESSAGE,required_material_paths=EXPECTED_MATERIAL_PATHS,execution_store=h.store)
     assert h.runner.invocations==[]
 
 
@@ -381,14 +406,14 @@ def test_changed_help_capability_evidence_blocks_before_spawn(tmp_path: Path):
     h=_harness(tmp_path); request,prompt=_request(h)
     (tmp_path/"injected-test-installation"/"capabilities.txt").write_text("--print --output-format stream-json --trust --model",encoding="utf-8")
     with pytest.raises(NativeEvidenceInvalid):
-        h.executor.execute(request=request,prompt=prompt,source_repository=h.source,canary_parent=h.root,allowed_parent_children=frozenset({h.work.name}),evidence_store_root=h.store.directory,artifact_directory=h.store.artifact_directory)
+        h.executor.execute(request=request,prompt=prompt,source_repository=h.source,canary_parent=h.root,allowed_parent_children=frozenset({h.work.name}),evidence_store_root=h.store.directory,artifact_directory=h.store.artifact_directory,required_commit_message=REQUIRED_COMMIT_MESSAGE,required_material_paths=EXPECTED_MATERIAL_PATHS,execution_store=h.store)
     assert h.runner.invocations==[]
 
 
 def test_changed_copied_executable_after_request_blocks_when_platform_can_launch_copy(tmp_path: Path):
     h=_harness(tmp_path); request,prompt=_request(h); executable=Path(h.config.executable); executable.write_bytes(executable.read_bytes()+b"x")
     with pytest.raises(NativeEvidenceInvalid):
-        h.executor.execute(request=request,prompt=prompt,source_repository=h.source,canary_parent=h.root,allowed_parent_children=frozenset({h.work.name}),evidence_store_root=h.store.directory,artifact_directory=h.store.artifact_directory)
+        h.executor.execute(request=request,prompt=prompt,source_repository=h.source,canary_parent=h.root,allowed_parent_children=frozenset({h.work.name}),evidence_store_root=h.store.directory,artifact_directory=h.store.artifact_directory,required_commit_message=REQUIRED_COMMIT_MESSAGE,required_material_paths=EXPECTED_MATERIAL_PATHS,execution_store=h.store)
     assert h.runner.invocations==[]
 
 
@@ -396,7 +421,7 @@ def test_plain_deserialized_and_lookalike_results_cannot_be_written(tmp_path: Pa
     h=_harness(tmp_path); request,prompt=_request(h); h.store.create_request(request)
     with pytest.raises(NativeEvidenceInvalid,match="executor-issued"):
         h.store.write_result(object())
-    issued=h.executor.execute(request=request,prompt=prompt,source_repository=h.source,canary_parent=h.root,allowed_parent_children=frozenset({h.work.name}),evidence_store_root=h.store.directory,artifact_directory=h.store.artifact_directory)
+    issued=h.executor.execute(request=request,prompt=prompt,source_repository=h.source,canary_parent=h.root,allowed_parent_children=frozenset({h.work.name}),evidence_store_root=h.store.directory,artifact_directory=h.store.artifact_directory,required_commit_message=REQUIRED_COMMIT_MESSAGE,required_material_paths=EXPECTED_MATERIAL_PATHS,execution_store=h.store)
     result=h.store.write_result(issued); assert result.status is NativeExecutionStatus.PROCESS_SUCCEEDED
     with pytest.raises(NativeEvidenceInvalid): h.store.write_result(issued)
     with pytest.raises(Exception): h.store.create_request(request)
@@ -417,14 +442,14 @@ def test_recomputed_contradictory_result_is_rejected(tmp_path: Path):
 ])
 def test_self_fingerprinted_git_success_claims_are_recomputed(tmp_path: Path, field: str, value: object, message: str):
     h=_harness(tmp_path); request,prompt=_request(h); h.store.create_request(request)
-    result=h.store.write_result(h.executor.execute(request=request,prompt=prompt,source_repository=h.source,canary_parent=h.root,allowed_parent_children=frozenset({h.work.name}),evidence_store_root=h.store.directory,artifact_directory=h.store.artifact_directory))
+    result=h.store.write_result(h.executor.execute(request=request,prompt=prompt,source_repository=h.source,canary_parent=h.root,allowed_parent_children=frozenset({h.work.name}),evidence_store_root=h.store.directory,artifact_directory=h.store.artifact_directory,required_commit_message=REQUIRED_COMMIT_MESSAGE,required_material_paths=EXPECTED_MATERIAL_PATHS,execution_store=h.store))
     raw=result.to_dict(); raw[field]=value; raw["result_fingerprint"]=fingerprint({key:item for key,item in raw.items() if key!="result_fingerprint"})
     with pytest.raises(ValueError,match=message): NativeExecutionResult.from_dict(raw)
 
 
 def test_workspace_git_change_after_result_publication_fails_reloaded_authority(tmp_path: Path):
     h=_harness(tmp_path); request,prompt=_request(h); h.store.create_request(request)
-    h.store.write_result(h.executor.execute(request=request,prompt=prompt,source_repository=h.source,canary_parent=h.root,allowed_parent_children=frozenset({h.work.name}),evidence_store_root=h.store.directory,artifact_directory=h.store.artifact_directory))
+    h.store.write_result(h.executor.execute(request=request,prompt=prompt,source_repository=h.source,canary_parent=h.root,allowed_parent_children=frozenset({h.work.name}),evidence_store_root=h.store.directory,artifact_directory=h.store.artifact_directory,required_commit_message=REQUIRED_COMMIT_MESSAGE,required_material_paths=EXPECTED_MATERIAL_PATHS,execution_store=h.store))
     (h.work/"README.md").write_text("changed after result\n",encoding="utf-8")
     with pytest.raises(NativeEvidenceInvalid,match="invalid"):
         h.store.load_result(h.session_id,"native-canary-gate",0)
@@ -445,7 +470,7 @@ def test_symlinked_workspace_and_source_workspace_are_refused(tmp_path: Path):
     state=h.session_store.load(h.session_id)
     with pytest.raises(ValueError): NativeExecutionRequest.create(session_id=state.session_id,gate_id=state.current_gate.gate_id,execution_attempt_index=0,mission_fingerprint=state.mission.mission_fingerprint,gate_contract_fingerprint=state.current_gate.contract_fingerprint,work_workspace=link,evidence_store_root=h.store.directory,artifact_directory=h.store.artifact_directory,attestation=h.attestation,prompt=build_native_agent_prompt(mission=state.mission,gate_contract=state.current_gate,work_workspace=h.work),timeout_seconds=30,stdout_byte_limit=10,stderr_byte_limit=10)
     request,prompt=_request(h)
-    with pytest.raises(NativeEvidenceInvalid): h.executor.execute(request=request,prompt=prompt,source_repository=h.work,canary_parent=h.root,allowed_parent_children=frozenset({h.work.name}),evidence_store_root=h.store.directory,artifact_directory=h.store.artifact_directory)
+    with pytest.raises(NativeEvidenceInvalid): h.executor.execute(request=request,prompt=prompt,source_repository=h.work,canary_parent=h.root,allowed_parent_children=frozenset({h.work.name}),evidence_store_root=h.store.directory,artifact_directory=h.store.artifact_directory,required_commit_message=REQUIRED_COMMIT_MESSAGE,required_material_paths=EXPECTED_MATERIAL_PATHS,execution_store=h.store)
 
 
 def test_real_windows_junction_workspace_and_evidence_root_are_refused(tmp_path: Path):
@@ -466,7 +491,7 @@ def test_redirecting_artifact_destination_blocks_before_fake_process(tmp_path: P
     except (OSError,NotImplementedError): pytest.skip("symlinks unavailable")
     request,prompt=_request(h)
     with pytest.raises(ValueError):
-        h.executor.execute(request=request,prompt=prompt,source_repository=h.source,canary_parent=h.root,allowed_parent_children=frozenset({h.work.name}),evidence_store_root=h.store.directory,artifact_directory=destination)
+        h.executor.execute(request=request,prompt=prompt,source_repository=h.source,canary_parent=h.root,allowed_parent_children=frozenset({h.work.name}),evidence_store_root=h.store.directory,artifact_directory=destination,required_commit_message=REQUIRED_COMMIT_MESSAGE,required_material_paths=EXPECTED_MATERIAL_PATHS,execution_store=h.store)
     assert h.runner.invocations==[]
 
 
@@ -488,7 +513,7 @@ def test_evidence_root_replacement_blocks_before_fake_process(tmp_path: Path):
     h=_harness(tmp_path); request,prompt=_request(h); h.store.create_request(request)
     original=h.store.directory; displaced=original.parent/"displaced-native-evidence"; original.rename(displaced); original.mkdir(); (original/"artifacts").mkdir()
     with pytest.raises(NativeEvidenceInvalid):
-        h.executor.execute(request=request,prompt=prompt,source_repository=h.source,canary_parent=h.root,allowed_parent_children=frozenset({h.work.name}),evidence_store_root=original,artifact_directory=original/"artifacts")
+        h.executor.execute(request=request,prompt=prompt,source_repository=h.source,canary_parent=h.root,allowed_parent_children=frozenset({h.work.name}),evidence_store_root=original,artifact_directory=original/"artifacts",required_commit_message=REQUIRED_COMMIT_MESSAGE,required_material_paths=EXPECTED_MATERIAL_PATHS,execution_store=h.store)
     assert h.runner.invocations==[]
 
 
@@ -516,11 +541,11 @@ def test_directory_durability_uncertainty_blocks_before_provider(tmp_path: Path)
 
 def test_behavioral_record_directory_durability_uncertainty_is_visible_and_never_captures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     calls={"publish":0,"capture":0}
-    class SixthPublicationUncertain(PlatformDurabilityAdapter):
+    class BehavioralPublicationUncertain(PlatformDurabilityAdapter):
         def publish(self, final_path, data, *, mode, replacement_authority=None):
             result=super().publish(final_path,data,mode=mode,replacement_authority=replacement_authority)
             calls["publish"]+=1
-            if calls["publish"] == 6:
+            if Path(final_path).name.endswith(".native-behavioral.json"):
                 raise PublicationVisibleButMetadataUncertain(
                     "injected behavioral metadata durability uncertainty",
                     path=Path(final_path),
@@ -529,7 +554,7 @@ def test_behavioral_record_directory_durability_uncertainty_is_visible_and_never
                     metadata_status=PublicationMetadataDurability.PUBLICATION_METADATA_UNCERTAIN,
                 )
             return result
-    h=_harness(tmp_path,durability_adapter=SixthPublicationUncertain())
+    h=_harness(tmp_path,durability_adapter=BehavioralPublicationUncertain())
     def capture(**kwargs: object) -> object:
         calls["capture"]+=1
         raise AssertionError("checkpoint must not be reached after behavioral durability uncertainty")
@@ -548,6 +573,8 @@ def test_process_failure_boundaries_create_terminal_without_checkpoint(tmp_path:
 def test_zero_exit_without_commit_never_captures_checkpoint(tmp_path: Path):
     h=_harness(tmp_path,runner=FakeNativeProcessRunner(mutation=None)); outcome=h.coordinator.run(session_id=h.session_id)
     assert outcome.status is NativeCanaryStatus.PRECAPTURE_ELIGIBILITY_FAILED; assert h.session_store.load(h.session_id).checkpoint_history==()
+    assert h.store.has_process_observation(h.session_id,CANARY_GATE_ID,0) and not h.store.has_result(h.session_id,CANARY_GATE_ID,0)
+    assert outcome.provider_invocations==1 and outcome.accepted_native_results_published==0
 
 
 def test_wrong_message_extra_commit_dirty_tree_remote_and_missing_path_all_block_before_checkpoint(tmp_path: Path):
@@ -563,6 +590,30 @@ def test_wrong_message_extra_commit_dirty_tree_remote_and_missing_path_all_block
     assert all(item.status is NativeCanaryStatus.PRECAPTURE_ELIGIBILITY_FAILED for item in cases)
 
 
+def test_exact_complete_commit_message_is_accepted(tmp_path: Path):
+    h=_harness(tmp_path); outcome=h.coordinator.run(session_id=h.session_id)
+    eligibility=h.store.load_execution_eligibility(h.session_id,CANARY_GATE_ID,0)
+    assert outcome.canary_success and eligibility.commit_message_compliant and eligibility.eligible
+    assert h.store.load_result(h.session_id,CANARY_GATE_ID,0).final_commit_message==REQUIRED_COMMIT_MESSAGE
+
+
+@pytest.mark.parametrize("extra",[
+    "Co-authored-by: Cursor <cursoragent@cursor.com>",
+    "body text is forbidden",
+    "Signed-off-by: Cursor <cursoragent@cursor.com>",
+])
+def test_complete_commit_message_rejects_trailer_body_and_signoff_before_behavioral(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra: str):
+    def mutation(repository: Path) -> None:
+        _materialize_success(repository); _amend_message(repository,REQUIRED_COMMIT_MESSAGE,extra)
+    h=_harness(tmp_path,runner=FakeNativeProcessRunner(mutation=mutation)); calls={"behavioral":0}
+    monkeypatch.setattr("admissible.delegated_gate.native_canary.run_behavioral_verifier",lambda **_: calls.__setitem__("behavioral",calls["behavioral"]+1))
+    outcome=h.coordinator.run(session_id=h.session_id)
+    eligibility=h.store.load_execution_eligibility(h.session_id,CANARY_GATE_ID,0)
+    assert outcome.status is NativeCanaryStatus.PRECAPTURE_ELIGIBILITY_FAILED
+    assert not eligibility.commit_message_compliant and "complete_commit_message_mismatch" in eligibility.ineligibility_reasons
+    assert calls["behavioral"]==0 and outcome.provider_invocations==1 and outcome.accepted_native_results_published==0
+
+
 def test_mutable_tests_cannot_self_certify_and_behavioral_evidence_is_fingerprinted(tmp_path: Path):
     h=_harness(tmp_path,runner=FakeNativeProcessRunner(mutation=_mutate_without_feature)); outcome=h.coordinator.run(session_id=h.session_id)
     assert outcome.status is NativeCanaryStatus.PRECAPTURE_ELIGIBILITY_FAILED; request=h.store.load_request(h.session_id,"native-canary-gate",0); evidence=load_behavioral_verifier(request=request,execution_store=h.store); assert evidence.exit_code != 0
@@ -571,7 +622,7 @@ def test_mutable_tests_cannot_self_certify_and_behavioral_evidence_is_fingerprin
 
 def test_genuine_implementation_passes_behavioral_verifier_and_reconstructs_disk_evidence(tmp_path: Path):
     h=_harness(tmp_path); first=h.coordinator.run(session_id=h.session_id); assert first.status is NativeCanaryStatus.CHECKPOINT_CAPTURED_CANARY_SUCCESS
-    second=h.coordinator.run(session_id=h.session_id); assert second.status is NativeCanaryStatus.CHECKPOINT_CAPTURED_CANARY_SUCCESS and second.provider_invocations==0 and len(h.runner.invocations)==1
+    second=h.coordinator.run(session_id=h.session_id); assert second.status is NativeCanaryStatus.CHECKPOINT_CAPTURED_CANARY_SUCCESS and second.provider_invocations==1 and len(h.runner.invocations)==1
     request=h.store.load_request(h.session_id,"native-canary-gate",0); assert run_behavioral_verifier(request=request,execution_store=h.store).exit_code==0
 
 
@@ -580,6 +631,7 @@ def test_capture_failure_is_terminal_and_repeated_call_never_retries(tmp_path: P
     monkeypatch.setattr("admissible.delegated_gate.native_canary.capture_checkpoint",lambda **_: (_ for _ in ()).throw(RuntimeError("capture boom")))
     first=h.coordinator.run(session_id=h.session_id); second=h.coordinator.run(session_id=h.session_id)
     assert first.status is NativeCanaryStatus.CHECKPOINT_CAPTURE_FAILED and second.status is NativeCanaryStatus.CHECKPOINT_CAPTURE_FAILED and len(h.runner.invocations)==1
+    assert first.provider_invocations==second.provider_invocations==1 and first.accepted_native_results_published==1
 
 
 def _materialize_success_with_failing_checkpoint_command(repository: Path) -> None:
@@ -606,7 +658,7 @@ def test_failed_checkpoint_command_is_terminal_and_never_persists_success(tmp_pa
 
 def test_started_capture_record_is_ambiguous_and_never_replayed(tmp_path: Path):
     h=_harness(tmp_path); state=h.session_store.load(h.session_id); started=__import__("admissible.delegated_gate.reducer",fromlist=["reduce"]).reduce(state,__import__("admissible.delegated_gate.events",fromlist=["GateExecutionStarted"]).GateExecutionStarted(state.current_gate.gate_id)); h.session_store.replace(started,expected_revision=state.revision)
-    request,prompt=_request(h); h.store.create_request(request); issued=h.executor.execute(request=request,prompt=prompt,source_repository=h.source,canary_parent=h.root,allowed_parent_children=frozenset({h.work.name}),evidence_store_root=h.store.directory,artifact_directory=h.store.artifact_directory); result=h.store.write_result(issued); behavioral=run_behavioral_verifier(request=request,execution_store=h.store)
+    request,prompt=_request(h); h.store.create_request(request); issued=h.executor.execute(request=request,prompt=prompt,source_repository=h.source,canary_parent=h.root,allowed_parent_children=frozenset({h.work.name}),evidence_store_root=h.store.directory,artifact_directory=h.store.artifact_directory,required_commit_message=REQUIRED_COMMIT_MESSAGE,required_material_paths=EXPECTED_MATERIAL_PATHS,execution_store=h.store); result=h.store.write_result(issued); behavioral=run_behavioral_verifier(request=request,execution_store=h.store)
     h.store.create_capture_attempt(request=request,result=result,gate_plan_fingerprint=state.gate_plan.plan_fingerprint,checkpoint_contract_fingerprint=state.current_gate.contract_fingerprint,behavioral_evidence_fingerprint=behavioral.evidence_fingerprint,required_command_ids=tuple(command.command_id for command in state.current_gate.checkpoint_verification_commands),state_revision=state.revision)
     outcome=h.coordinator.run(session_id=h.session_id); assert outcome.status is NativeCanaryStatus.CAPTURE_ATTEMPT_AMBIGUOUS and len(h.runner.invocations)==1
 
@@ -634,6 +686,150 @@ def test_restart_with_visible_request_and_no_result_is_inert_no_retry(tmp_path: 
     assert not restarted_store.has_capture_attempt(h.session_id,"native-canary-gate",0)
     assert h.runner.invocations==[]
     assert not tuple(restarted_store.directory.glob("*.attempt-1.*"))
+
+
+def test_attempt_lifecycle_order_and_truthful_actual_counts(tmp_path: Path):
+    h=_harness(tmp_path)
+    class OrderingRunner(FakeNativeProcessRunner):
+        def run(self, invocation: NativeProcessInvocation) -> NativeProcessOutcome:
+            assert h.store.has_attempt_reserved(h.session_id,CANARY_GATE_ID,0)
+            assert not h.store.has_process_started(h.session_id,CANARY_GATE_ID,0)
+            return super().run(invocation)
+    ordered=OrderingRunner(); h.runner=ordered; h.executor.process_runner=ordered
+    outcome=h.coordinator.run(session_id=h.session_id)
+    reserved=h.store.load_attempt_reserved(h.session_id,CANARY_GATE_ID,0)
+    started=h.store.load_process_started(h.session_id,CANARY_GATE_ID,0)
+    observation=h.store.load_process_observation(h.session_id,CANARY_GATE_ID,0)
+    eligibility=h.store.load_execution_eligibility(h.session_id,CANARY_GATE_ID,0)
+    assert reserved.reserved_at < started.process_started_at < observation.process["ended_at"] < eligibility.evaluated_at
+    assert (outcome.native_attempts_reserved,outcome.native_processes_started,outcome.native_processes_completed,outcome.process_observations_published,outcome.accepted_native_results_published,outcome.provider_invocations)==(1,1,1,1,1,1)
+    assert observation.process_completion_observed and eligibility.eligible
+    result=h.store.load_result(h.session_id,CANARY_GATE_ID,0); request=h.store.load_request(h.session_id,CANARY_GATE_ID,0)
+    assert result.argv==(request.executable,*request.launcher_prefix)
+    assert all("Immutable mission:" not in item for item in result.argv)
+    lifecycle_bytes=b"".join(h.store._path(kind,h.session_id,CANARY_GATE_ID,0).read_bytes() for kind in ("attempt-reserved","process-started","process-observation","execution-eligibility"))
+    assert b"Immutable mission:" not in lifecycle_bytes and b"OWNER_AUTHORIZATION" not in lifecycle_bytes and b"authorization_digest" not in lifecycle_bytes and b"environment" not in lifecycle_bytes
+    with pytest.raises(NativeResultAlreadyExists): h.store.create_attempt_reserved(request=h.store.load_request(h.session_id,CANARY_GATE_ID,0),argv_fingerprint=reserved.argv_fingerprint,reserved_at=reserved.reserved_at,authorized_model=reserved.authorized_model)
+    with pytest.raises(NativeResultAlreadyExists): h.store.create_process_started(binding=h.store.load_request_structural(h.session_id,CANARY_GATE_ID,0),reservation=reserved,proof=_NativeProcessCreationProof._after_successful_spawn(4242),started_at=started.process_started_at)
+    with pytest.raises(NativeResultAlreadyExists): h.store.create_process_observation(observation)
+    with pytest.raises(NativeResultAlreadyExists): h.store.create_execution_eligibility(eligibility)
+
+
+def test_spawn_failure_reserves_without_claiming_start_or_provider_consumption(tmp_path: Path):
+    h=_harness(tmp_path,runner=FakeNativeProcessRunner(spawn_error=True))
+    outcome=h.coordinator.run(session_id=h.session_id)
+    assert outcome.status is NativeCanaryStatus.PROCESS_SPAWN_FAILED
+    assert (outcome.native_attempts_reserved,outcome.native_processes_started,outcome.native_processes_completed,outcome.process_observations_published,outcome.accepted_native_results_published,outcome.provider_invocations)==(1,0,0,0,0,0)
+    assert h.store.has_terminal(h.session_id,CANARY_GATE_ID,0)
+    terminal=h.store.load_terminal(h.session_id,CANARY_GATE_ID,0)
+    assert terminal.attempt_reserved_fingerprint and terminal.process_started_fingerprint is None and terminal.process_observation_fingerprint is None
+    assert not h.store.has_process_started(h.session_id,CANARY_GATE_ID,0)
+
+
+def test_process_started_record_rejects_non_runner_creation_proof(tmp_path: Path):
+    h=_harness(tmp_path); request,prompt=_request(h); h.store.create_request(request)
+    argv=request.backend_attestation.argv(prompt=prompt)
+    reserved=h.store.create_attempt_reserved(request=request,argv_fingerprint=hashlib.sha256(__import__("admissible.delegated_gate.canonical",fromlist=["canonical_bytes"]).canonical_bytes(list(argv))).hexdigest(),reserved_at=Clock()(),authorized_model=h.attestation.selected_model)
+    with pytest.raises(NativeEvidenceInvalid,match="runner authority"):
+        h.store.create_process_started(binding=h.store.load_request_structural(h.session_id,CANARY_GATE_ID,0),reservation=reserved,proof=_NativeProcessCreationProof(4242,object()),started_at="2026-07-16T10:00:01.000000Z")
+    assert not h.store.has_process_started(h.session_id,CANARY_GATE_ID,0)
+
+
+@pytest.mark.parametrize(("runner","expected"),[
+    (FakeNativeProcessRunner(mutation=None,timed_out=True,returncode=None),NativeCanaryStatus.TIMED_OUT),
+    (FakeNativeProcessRunner(mutation=None,cleanup_confirmed=False),NativeCanaryStatus.CLEANUP_UNCERTAIN),
+])
+def test_started_timeout_and_cleanup_failure_report_provider_actual_one(tmp_path: Path, runner: FakeNativeProcessRunner, expected: NativeCanaryStatus):
+    h=_harness(tmp_path,runner=runner); outcome=h.coordinator.run(session_id=h.session_id)
+    assert outcome.status is expected
+    assert (outcome.native_attempts_reserved,outcome.native_processes_started,outcome.native_processes_completed,outcome.process_observations_published,outcome.accepted_native_results_published,outcome.provider_invocations)==(1,1,1,1,0,1)
+
+
+def test_process_observation_publication_failure_is_terminal_and_never_reruns(tmp_path: Path):
+    class RejectObservation(PlatformDurabilityAdapter):
+        def publish(self,final_path,data,*,mode,replacement_authority=None):
+            if Path(final_path).name.endswith(".native-process-observation.json"):
+                raise DurabilityAdapterError("injected observation failure",path=Path(final_path))
+            return super().publish(final_path,data,mode=mode,replacement_authority=replacement_authority)
+    h=_harness(tmp_path,durability_adapter=RejectObservation())
+    first=h.coordinator.run(session_id=h.session_id); second=h.coordinator.run(session_id=h.session_id)
+    assert first.status is NativeCanaryStatus.PROCESS_OBSERVATION_PUBLICATION_FAILED
+    assert second.status is NativeCanaryStatus.PROCESS_OBSERVATION_PUBLICATION_FAILED
+    assert (first.native_attempts_reserved,first.native_processes_started,first.native_processes_completed,first.process_observations_published,first.provider_invocations)==(1,1,0,0,1)
+    terminal=h.store.load_terminal(h.session_id,CANARY_GATE_ID,0)
+    assert terminal.attempt_reserved_fingerprint and terminal.process_started_fingerprint and terminal.process_observation_fingerprint is None
+    assert len(h.runner.invocations)==1 and not h.store.has_result(h.session_id,CANARY_GATE_ID,0)
+
+
+def test_accepted_result_publication_is_distinct_from_started_invocation(tmp_path: Path):
+    class RejectAcceptedResult(PlatformDurabilityAdapter):
+        def publish(self,final_path,data,*,mode,replacement_authority=None):
+            if Path(final_path).name.endswith(".native-result.json"):
+                raise DurabilityAdapterError("injected accepted-result failure",path=Path(final_path))
+            return super().publish(final_path,data,mode=mode,replacement_authority=replacement_authority)
+    h=_harness(tmp_path,durability_adapter=RejectAcceptedResult())
+    first=h.coordinator.run(session_id=h.session_id); second=h.coordinator.run(session_id=h.session_id)
+    assert first.status is NativeCanaryStatus.PRECAPTURE_ELIGIBILITY_FAILED and second.status is first.status
+    assert (first.native_attempts_reserved,first.native_processes_started,first.native_processes_completed,first.process_observations_published,first.accepted_native_results_published,first.provider_invocations)==(1,1,1,1,0,1)
+    assert h.store.load_execution_eligibility(h.session_id,CANARY_GATE_ID,0).eligible
+    assert len(h.runner.invocations)==1 and not h.store.has_result(h.session_id,CANARY_GATE_ID,0)
+
+
+def _put_gate_executing(h: Harness) -> None:
+    state=h.session_store.load(h.session_id)
+    started=__import__("admissible.delegated_gate.reducer",fromlist=["reduce"]).reduce(state,__import__("admissible.delegated_gate.events",fromlist=["GateExecutionStarted"]).GateExecutionStarted(state.current_gate.gate_id))
+    h.session_store.replace(started,expected_revision=state.revision)
+
+
+def test_restart_reserved_only_never_creates_a_second_process(tmp_path: Path):
+    h=_harness(tmp_path); _put_gate_executing(h); request,prompt=_request(h); h.store.create_request(request)
+    argv=request.backend_attestation.argv(prompt=prompt)
+    h.store.create_attempt_reserved(request=request,argv_fingerprint=hashlib.sha256(__import__("admissible.delegated_gate.canonical",fromlist=["canonical_bytes"]).canonical_bytes(list(argv))).hexdigest(),reserved_at=Clock()(),authorized_model=h.attestation.selected_model)
+    outcome=h.coordinator.run(session_id=h.session_id)
+    assert outcome.status is NativeCanaryStatus.ATTEMPT_RESERVED_LAUNCH_OUTCOME_UNKNOWN
+    assert outcome.native_attempts_reserved==1 and outcome.native_processes_started==0 and h.runner.invocations==[]
+    assert not tuple(h.store.directory.glob("*.attempt-1.*"))
+
+
+def test_restart_process_started_without_observation_never_reruns(tmp_path: Path):
+    h=_harness(tmp_path); _put_gate_executing(h); request,prompt=_request(h); h.store.create_request(request)
+    argv=request.backend_attestation.argv(prompt=prompt); clock=Clock()
+    reserved=h.store.create_attempt_reserved(request=request,argv_fingerprint=hashlib.sha256(__import__("admissible.delegated_gate.canonical",fromlist=["canonical_bytes"]).canonical_bytes(list(argv))).hexdigest(),reserved_at=clock(),authorized_model=h.attestation.selected_model)
+    h.store.create_process_started(binding=h.store.load_request_structural(h.session_id,CANARY_GATE_ID,0),reservation=reserved,proof=_NativeProcessCreationProof._after_successful_spawn(4242),started_at=clock())
+    outcome=h.coordinator.run(session_id=h.session_id)
+    assert outcome.status is NativeCanaryStatus.PROCESS_OBSERVATION_MISSING
+    assert outcome.provider_invocations==1 and h.runner.invocations==[]
+    assert not tuple(h.store.directory.glob("*.attempt-1.*"))
+
+
+def test_restart_observation_without_eligibility_never_recomputes_or_reruns(tmp_path: Path):
+    class RejectEligibility(PlatformDurabilityAdapter):
+        def publish(self,final_path,data,*,mode,replacement_authority=None):
+            if Path(final_path).name.endswith(".native-execution-eligibility.json"):
+                raise DurabilityAdapterError("injected eligibility failure",path=Path(final_path))
+            return super().publish(final_path,data,mode=mode,replacement_authority=replacement_authority)
+    h=_harness(tmp_path,durability_adapter=RejectEligibility()); _put_gate_executing(h); request,prompt=_request(h); h.store.create_request(request)
+    with pytest.raises(NativeExecutionStoreError):
+        h.executor.execute(request=request,prompt=prompt,source_repository=h.source,canary_parent=h.root,allowed_parent_children=frozenset({h.work.name}),evidence_store_root=h.store.directory,artifact_directory=h.store.artifact_directory,required_commit_message=REQUIRED_COMMIT_MESSAGE,required_material_paths=EXPECTED_MATERIAL_PATHS,execution_store=h.store)
+    assert h.store.has_process_observation(h.session_id,CANARY_GATE_ID,0) and not h.store.has_execution_eligibility(h.session_id,CANARY_GATE_ID,0)
+    h.executor._local_attestor=lambda _: (_ for _ in ()).throw(AssertionError("restart must not re-attest"))
+    before=len(h.runner.invocations); outcome=h.coordinator.run(session_id=h.session_id)
+    assert outcome.status is NativeCanaryStatus.EXECUTION_ELIGIBILITY_MISSING and len(h.runner.invocations)==before==1
+    assert not tuple(h.store.directory.glob("*.attempt-1.*"))
+
+
+def test_canary_002_synthetic_copy_parses_as_legacy_terminal_without_invented_lifecycle(tmp_path: Path):
+    source=Path(__file__).resolve().parents[2]/"native-cursor-canary-002"
+    if not source.is_dir(): pytest.skip("immutable canary-002 forensic run is unavailable")
+    synthetic=tmp_path/"synthetic-canary-002"; shutil.copytree(source,synthetic)
+    store=AtomicNativeExecutionStore(synthetic/"evidence"/"native-execution")
+    binding=store.load_request_structural("native-cursor-canary-002",CANARY_GATE_ID,0)
+    terminal=store.load_terminal("native-cursor-canary-002",CANARY_GATE_ID,0)
+    counts=store.lifecycle_counts("native-cursor-canary-002",CANARY_GATE_ID,0)
+    assert binding.request_fingerprint==terminal.request_fingerprint
+    assert terminal.schema_version=="admissible_native_canary_terminal_v1"
+    assert terminal.attempt_reserved_fingerprint is None and terminal.process_started_fingerprint is None and terminal.process_observation_fingerprint is None and terminal.execution_eligibility_fingerprint is None
+    assert counts==type(counts)() and not tuple(store.directory.glob("*.attempt-1.*"))
 
 
 def test_checkpoint_artifact_tamper_blocks_final_reconstruction(tmp_path: Path):
@@ -993,6 +1189,62 @@ def test_wrapper_chain_attestation_round_trips_through_request_execution_and_rec
     assert argv[0] == h.attestation.executable.canonical_path and argv[1] == h.attestation.launcher_prefix[0].canonical_path
 
 
+@pytest.mark.parametrize("drift_kind",["wrapper_metadata","wrapper_content","catalog","pinned_content","pinned_launcher_content","pinned_identity"])
+def test_post_spawn_backend_drift_preserves_observation_but_blocks_downstream(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drift_kind: str):
+    h,_=_wrapper_chain_harness(tmp_path)
+    root=Path(h.attestation.command_resolution.wrapper_root); executable=Path(h.attestation.executable.canonical_path)
+    def mutate() -> None:
+        if drift_kind=="wrapper_metadata":
+            target=root/"cursor-agent.cmd"; metadata=os.stat(target); os.utime(target,ns=(metadata.st_atime_ns,metadata.st_mtime_ns+10_000_000))
+        elif drift_kind=="wrapper_content":
+            target=root/"cursor-agent.cmd"; target.write_bytes(target.read_bytes()+b"REM drift\r\n")
+        elif drift_kind=="catalog":
+            (root/"versions"/"2026.08.01-cafecafe").mkdir()
+        elif drift_kind=="pinned_content":
+            executable.write_bytes(executable.read_bytes()+b"x")
+        elif drift_kind=="pinned_launcher_content":
+            launcher=Path(h.attestation.launcher_prefix[0].canonical_path); launcher.write_bytes(launcher.read_bytes()+b"// drift\n")
+        else:
+            replacement=executable.with_name("node.replacement"); replacement.write_bytes(executable.read_bytes()); os.replace(replacement,executable)
+    h.runner.after_start=mutate
+    calls={"behavioral":0,"capture":0}
+    def forbidden_behavioral(**kwargs: object) -> object: calls["behavioral"]+=1; raise AssertionError("behavioral verifier must be unreachable")
+    def forbidden_capture(**kwargs: object) -> object: calls["capture"]+=1; raise AssertionError("checkpoint must be unreachable")
+    monkeypatch.setattr("admissible.delegated_gate.native_canary.run_behavioral_verifier",forbidden_behavioral)
+    monkeypatch.setattr("admissible.delegated_gate.native_canary.capture_checkpoint",forbidden_capture)
+    first=h.coordinator.run(session_id=h.session_id)
+    assert first.status is NativeCanaryStatus.PRECAPTURE_ELIGIBILITY_FAILED
+    observation=h.store.load_process_observation(h.session_id,CANARY_GATE_ID,0)
+    eligibility=h.store.load_execution_eligibility(h.session_id,CANARY_GATE_ID,0)
+    assert observation.process_completion_observed and not eligibility.eligible
+    assert "post_run_backend_drift" in eligibility.ineligibility_reasons
+    assert (first.native_attempts_reserved,first.native_processes_started,first.native_processes_completed,first.process_observations_published,first.accepted_native_results_published,first.provider_invocations)==(1,1,1,1,0,1)
+    assert not h.store.has_result(h.session_id,CANARY_GATE_ID,0) and not h.store.has_behavioral_evidence(h.session_id,CANARY_GATE_ID,0) and calls=={"behavioral":0,"capture":0}
+    if drift_kind=="wrapper_metadata":
+        assert eligibility.wrapper_chain_drift[0]=="METADATA_ONLY_DRIFT"
+        assert eligibility.pinned_executable_validation=="NO_DRIFT" and eligibility.pinned_launcher_validation==("NO_DRIFT",)
+    elif drift_kind=="wrapper_content": assert eligibility.wrapper_chain_drift[0]=="CONTENT_DRIFT"
+    elif drift_kind=="catalog": assert eligibility.catalog_validation=="VERSION_INVENTORY_DRIFT" and eligibility.selected_version_validation=="SELECTED_VERSION_DRIFT"
+    elif drift_kind=="pinned_content": assert eligibility.pinned_executable_validation=="CONTENT_DRIFT"
+    elif drift_kind=="pinned_launcher_content": assert eligibility.pinned_launcher_validation==("CONTENT_DRIFT",)
+    else: assert eligibility.pinned_executable_validation=="IDENTITY_ONLY_DRIFT"
+    # Terminal reconstruction is structural and precedes any now-broken live
+    # catalog re-attestation.
+    h.executor._local_attestor=lambda _: (_ for _ in ()).throw(ValueError("live catalog unavailable"))
+    second=h.coordinator.run(session_id=h.session_id)
+    assert second.status is NativeCanaryStatus.PRECAPTURE_ELIGIBILITY_FAILED and len(h.runner.invocations)==1
+
+
+def test_post_spawn_structural_request_reload_is_inert_while_strict_reload_rejects_drift(tmp_path: Path):
+    h,_=_wrapper_chain_harness(tmp_path); root=Path(h.attestation.command_resolution.wrapper_root)
+    h.runner.after_start=lambda: (root/"versions"/"2026.08.01-cafecafe").mkdir()
+    assert h.coordinator.run(session_id=h.session_id).status is NativeCanaryStatus.PRECAPTURE_ELIGIBILITY_FAILED
+    binding=h.store.load_request_structural(h.session_id,CANARY_GATE_ID,0)
+    assert binding.request_fingerprint and not hasattr(binding,"validated_for_execution") and len(h.runner.invocations)==1
+    with pytest.raises((NativeEvidenceInvalid,ValueError)):
+        h.store.load_request_verified_against_local_backend(h.session_id,CANARY_GATE_ID,0,current_attestation=h.attestation)
+
+
 def test_new_later_version_after_authorization_blocks_spawn_and_invalidates_payload(tmp_path: Path):
     h, discovery = _wrapper_chain_harness(tmp_path)
     state = h.session_store.load(h.session_id)
@@ -1007,7 +1259,7 @@ def test_new_later_version_after_authorization_blocks_spawn_and_invalidates_payl
     (later / "index.js").write_text("// newer entry\n", encoding="utf-8")
     (later / "package.json").write_text(json.dumps({"name": EXPECTED_CURSOR_PACKAGE_NAME}), encoding="utf-8")
     with pytest.raises(NativeEvidenceInvalid):
-        h.executor.execute(request=request, prompt=prompt, source_repository=h.source, canary_parent=h.root, allowed_parent_children=frozenset({h.work.name}), evidence_store_root=h.store.directory, artifact_directory=h.store.artifact_directory)
+        h.executor.execute(request=request, prompt=prompt, source_repository=h.source, canary_parent=h.root, allowed_parent_children=frozenset({h.work.name}), evidence_store_root=h.store.directory, artifact_directory=h.store.artifact_directory, required_commit_message=REQUIRED_COMMIT_MESSAGE, required_material_paths=EXPECTED_MATERIAL_PATHS, execution_store=h.store)
     assert h.runner.invocations == []
     fresh = _attest_wrapper_chain_cursor(_WRAPPER_CONFIG, discovery=discovery)
     new_payload = build_authorization_payload(source_repository=h.source, source_head=_command(["git", "rev-parse", "HEAD"], cwd=h.source).stdout.strip(), run_id="run-one", session_id=h.session_id, attestation=fresh, run_root=tmp_path / "future-run", timeout_seconds=30)
@@ -2140,7 +2392,8 @@ def test_path_or_pathext_change_between_request_and_pre_spawn_blocks_with_zero_r
         h.executor.execute(
             request=request, prompt=prompt, source_repository=h.source, canary_parent=h.root,
             allowed_parent_children=frozenset({h.work.name}), evidence_store_root=h.store.directory,
-            artifact_directory=h.store.artifact_directory,
+            artifact_directory=h.store.artifact_directory, required_commit_message=REQUIRED_COMMIT_MESSAGE,
+            required_material_paths=EXPECTED_MATERIAL_PATHS, execution_store=h.store,
         )
     assert h.runner.invocations == []
 
@@ -2359,7 +2612,11 @@ def test_act_2a_3g_immutable_mission_plan_and_prompt_bind_stop_clause(tmp_path: 
     assert state.current_gate.contract_fingerprint == _ACT_2A_GATE_CONTRACT_FINGERPRINT
     assert f"Immutable mission:\n{_ACT_2A_3G_MISSION}\n\nCurrent gate objective:" in prompt
     assert prompt.count("Stop after the local commit.") == 1
-    assert "- stop immediately after the local commit." in prompt
+    assert "- use no `--trailer`" in prompt
+    assert "`Co-authored-by`, sign-off, attribution, or other trailer" in prompt
+    assert "git log -1 --format=%B" in prompt
+    assert "amend that same commit" in prompt and "do not create a second commit" in prompt
+    assert "- stop immediately only after the exact full-message verification passes." in prompt
     assert request_prompt == build_native_agent_prompt(
         mission=h.session_store.load(h.session_id).mission,
         gate_contract=h.session_store.load(h.session_id).current_gate,
