@@ -71,6 +71,8 @@ ATTEMPT_RESERVED_SCHEMA_VERSION = "admissible_native_attempt_reserved_v1"
 PROCESS_STARTED_SCHEMA_VERSION = "admissible_native_process_started_v1"
 PROCESS_OBSERVATION_SCHEMA_VERSION = "admissible_native_process_observation_v1"
 EXECUTION_ELIGIBILITY_SCHEMA_VERSION = "admissible_native_execution_eligibility_v1"
+SELECTED_VERSION_MTIME_DIAGNOSTIC = "selected_version:METADATA_ONLY_DRIFT"
+FUTURE_ATTESTATION_REFRESH_DIAGNOSTIC = "selected_version:METADATA_ONLY_DRIFT:FUTURE_ATTESTATION_REFRESH_REQUIRED"
 BACKEND_IDENTITY = "cursor-agent-native-oneshot"
 BACKEND_PROTOCOL_VERSION = "cursor-agent-print-force-v2"
 CURSOR_DISCOVERY_MECHANISM = "shutil.which:cursor-agent"
@@ -2395,8 +2397,25 @@ class NativeExecutionEligibility:
         for name in ("process_status_eligible","commit_message_compliant","workspace_clean","remotes_absent","exactly_one_commit","material_paths_compliant","source_and_root_integrity","eligible"): require_bool(getattr(self,name),name)
         if not isinstance(self.backend_drift_diagnostics,tuple) or not isinstance(self.ineligibility_reasons,tuple) or any(not isinstance(item,str) or not item for item in (*self.backend_drift_diagnostics,*self.ineligibility_reasons)): raise ValueError("eligibility diagnostics are invalid")
         drift_clean=all(value in {"NO_DRIFT","NOT_APPLICABLE"} for value in (self.pinned_executable_validation,*self.pinned_launcher_validation,*self.wrapper_chain_drift,self.catalog_validation,self.selected_version_validation))
+        isolated_selected_version_mtime_diagnostic = _is_isolated_selected_version_mtime_drift(
+            executable=self.pinned_executable_validation,
+            launchers=self.pinned_launcher_validation,
+            wrappers=self.wrapper_chain_drift,
+            catalog=self.catalog_validation,
+            selected_version=self.selected_version_validation,
+        )
+        has_refresh_marker = FUTURE_ATTESTATION_REFRESH_DIAGNOSTIC in self.backend_drift_diagnostics
+        if has_refresh_marker and (
+            not isolated_selected_version_mtime_diagnostic
+            or SELECTED_VERSION_MTIME_DIAGNOSTIC not in self.backend_drift_diagnostics
+            or self.backend_drift_diagnostics.count(FUTURE_ATTESTATION_REFRESH_DIAGNOSTIC) != 1
+        ):
+            raise ValueError("execution-eligibility refresh marker is not an isolated selected-version mtime diagnostic")
+        post_run_backend_drift_blocking = not drift_clean and not (
+            isolated_selected_version_mtime_diagnostic and has_refresh_marker
+        )
         expected_reasons=[]
-        if not drift_clean: expected_reasons.append("post_run_backend_drift")
+        if post_run_backend_drift_blocking: expected_reasons.append("post_run_backend_drift")
         if not self.process_status_eligible: expected_reasons.append("native_process_or_cleanup_ineligible")
         if not self.commit_message_compliant: expected_reasons.append("complete_commit_message_mismatch")
         if not self.workspace_clean: expected_reasons.append("final_worktree_not_clean")
@@ -2820,8 +2839,28 @@ def _attested_directory_drift(path_value: str, snapshot: NativeFilesystemIdentit
     except FileNotFoundError: return "MISSING"
     except (OSError,ValueError): return "UNREADABLE"
     if identity==snapshot: return "NO_DRIFT"
-    physical_equal=(identity.device,identity.inode,identity.mode,identity.file_attributes)==(snapshot.device,snapshot.inode,snapshot.mode,snapshot.file_attributes)
+    physical_equal=(identity.device,identity.inode,identity.mode,identity.size,identity.file_attributes)==(snapshot.device,snapshot.inode,snapshot.mode,snapshot.size,snapshot.file_attributes)
     return "METADATA_ONLY_DRIFT" if physical_equal else "IDENTITY_ONLY_DRIFT"
+
+
+def _is_isolated_selected_version_mtime_drift(
+    *, executable: str, launchers: tuple[str, ...], wrappers: tuple[str, ...],
+    catalog: str, selected_version: str,
+) -> bool:
+    """The sole post-observation diagnostic-only backend condition.
+
+    This is deliberately narrower than raw drift classification.  It is only
+    true for the wrapper-chain selected-version directory after selection and
+    inventory remain stable and every pinned file/launcher/wrapper comparison
+    still reports ``NO_DRIFT``.
+    """
+
+    return (
+        selected_version == "METADATA_ONLY_DRIFT"
+        and catalog == "NO_DRIFT"
+        and executable == "NO_DRIFT"
+        and all(value == "NO_DRIFT" for value in (*launchers, *wrappers))
+    )
 
 
 @dataclass(frozen=True)
@@ -2829,19 +2868,61 @@ class _BackendDrift:
     executable: str
     launchers: tuple[str, ...]
     wrappers: tuple[str, ...]
+    command_resolution: str
     catalog: str
     selected_version: str
     diagnostics: tuple[str, ...]
 
     @property
     def clean(self) -> bool:
-        return all(value in {"NO_DRIFT", "NOT_APPLICABLE"} for value in (self.executable, *self.launchers, *self.wrappers, self.catalog, self.selected_version))
+        return all(value in {"NO_DRIFT", "NOT_APPLICABLE"} for value in (self.executable, *self.launchers, *self.wrappers, self.command_resolution, self.catalog, self.selected_version))
+
+    @property
+    def isolated_selected_version_mtime_drift(self) -> bool:
+        return _is_isolated_selected_version_mtime_drift(
+            executable=self.executable,
+            launchers=self.launchers,
+            wrappers=(*self.wrappers, self.command_resolution),
+            catalog=self.catalog,
+            selected_version=self.selected_version,
+        )
+
+    @property
+    def diagnostic_only_diagnostics(self) -> tuple[str, ...]:
+        if not self.isolated_selected_version_mtime_drift:
+            return ()
+        return (FUTURE_ATTESTATION_REFRESH_DIAGNOSTIC,)
+
+    @property
+    def persisted_diagnostics(self) -> tuple[str, ...]:
+        """Raw drift diagnostics plus the narrowly scoped policy marker."""
+
+        return (*self.diagnostics, *self.diagnostic_only_diagnostics)
+
+    @property
+    def blocking_diagnostics(self) -> tuple[str, ...]:
+        """Raw diagnostics that continue to make post-run eligibility fail."""
+
+        if self.clean or self.isolated_selected_version_mtime_drift:
+            return ()
+        return tuple(
+            diagnostic for diagnostic in self.diagnostics
+            if diagnostic.rsplit(":", 1)[-1] not in {"NO_DRIFT", "NOT_APPLICABLE"}
+        )
+
+    @property
+    def post_run_eligible(self) -> bool:
+        return not self.blocking_diagnostics
 
 
-def _observe_backend_drift(attestation: BackendAttestation) -> _BackendDrift:
+def _observe_backend_drift(
+    attestation: BackendAttestation,
+    *, post_run_wrapper_chain_attestation: WrapperChainBackendAttestation | None = None,
+) -> _BackendDrift:
     executable = _attested_file_drift(attestation.executable)
     launchers = tuple(_attested_file_drift(item) for item in attestation.launcher_prefix)
     wrappers: tuple[str, ...] = ()
+    command_resolution = "NOT_APPLICABLE"
     catalog = "NOT_APPLICABLE"
     selected = "NOT_APPLICABLE"
     diagnostics: list[str] = [f"pinned_executable:{executable}"]
@@ -2855,6 +2936,15 @@ def _observe_backend_drift(attestation: BackendAttestation) -> _BackendDrift:
         )
         diagnostics.extend((f"cmd_wrapper:{wrappers[0]}", f"powershell_wrapper:{wrappers[1]}",f"selected_package_manifest:{wrappers[2]}"))
         diagnostics.extend(f"selected_wrapper_copy_{index}:{value}" for index,value in enumerate(wrappers[3:]))
+        if post_run_wrapper_chain_attestation is None:
+            command_resolution = "UNREADABLE"
+        else:
+            command_resolution = (
+                "NO_DRIFT"
+                if post_run_wrapper_chain_attestation.command_resolution == attestation.command_resolution
+                else "IDENTITY_ONLY_DRIFT"
+            )
+        diagnostics.append(f"command_resolution:{command_resolution}")
         try:
             inventory, selected_version = _select_wrapper_version(Path(attestation.command_resolution.wrapper_root))
             catalog = "NO_DRIFT" if inventory == attestation.version_inventory else "VERSION_INVENTORY_DRIFT"
@@ -2877,7 +2967,7 @@ def _observe_backend_drift(attestation: BackendAttestation) -> _BackendDrift:
             _attested_directory_drift(attestation.provenance.package_root,attestation.provenance.package_root_identity),
         )
         diagnostics.extend(f"package_chain_{index}:{value}" for index, value in enumerate(wrappers))
-    return _BackendDrift(executable, launchers, wrappers, catalog, selected, tuple(diagnostics))
+    return _BackendDrift(executable, launchers, wrappers, command_resolution, catalog, selected, tuple(diagnostics))
 
 
 def _result_from_observation(observation: NativeProcessObservation, *, backend_attestation_fingerprint: str) -> NativeExecutionResult:
@@ -3065,7 +3155,21 @@ class NativeDelegatedExecutor:
         except (NativeExecutionStoreError, NativeEvidenceInvalid) as exc:
             raise NativeProcessObservationPublicationError(f"process observation publication failed: {exc}") from exc
 
-        drift = _observe_backend_drift(request.backend_attestation)
+        post_run_wrapper_chain_attestation: WrapperChainBackendAttestation | None = None
+        if isinstance(request.backend_attestation, WrapperChainBackendAttestation):
+            try:
+                refreshed = self.attest_local_backend()
+                if isinstance(refreshed, WrapperChainBackendAttestation):
+                    post_run_wrapper_chain_attestation = refreshed
+            except NativeEvidenceInvalid:
+                # The raw file/directory comparisons below remain durable.  A
+                # failed post-run resolution refresh is conservatively surfaced
+                # as an unreadable command-resolution comparison.
+                pass
+        drift = _observe_backend_drift(
+            request.backend_attestation,
+            post_run_wrapper_chain_attestation=post_run_wrapper_chain_attestation,
+        )
         process_ok = status is NativeExecutionStatus.PROCESS_SUCCEEDED and not outcome.timed_out and cleanup_confirmed and not outcome.orphan_process_ids
         commit_ok = final.commit_message == required_commit_message
         workspace_clean = final.git_status == ""
@@ -3074,7 +3178,7 @@ class NativeDelegatedExecutor:
         material_ok = required_material_paths.issubset(set(_changed_files(workspace, initial.git_head, final.git_head)))
         boundary_ok = not source_mutated and not sibling_mutations
         reasons: list[str] = []
-        if not drift.clean: reasons.append("post_run_backend_drift")
+        if not drift.post_run_eligible: reasons.append("post_run_backend_drift")
         if not process_ok: reasons.append("native_process_or_cleanup_ineligible")
         if not commit_ok: reasons.append("complete_commit_message_mismatch")
         if not workspace_clean: reasons.append("final_worktree_not_clean")
@@ -3085,8 +3189,8 @@ class NativeDelegatedExecutor:
         provisional_eligibility = NativeExecutionEligibility(
             EXECUTION_ELIGIBILITY_SCHEMA_VERSION, request.session_id, request.gate_id, 0,
             request.request_fingerprint, observation.observation_fingerprint, self.clock(),
-            drift.executable, drift.launchers, drift.wrappers, drift.catalog, drift.selected_version,
-            drift.diagnostics, process_ok, commit_ok, workspace_clean, remotes_absent, one_commit,
+            drift.executable, drift.launchers, (*drift.wrappers, drift.command_resolution), drift.catalog, drift.selected_version,
+            drift.persisted_diagnostics, process_ok, commit_ok, workspace_clean, remotes_absent, one_commit,
             material_ok, boundary_ok, not reasons, tuple(reasons), "0"*64,
         )
         eligibility = NativeExecutionEligibility(**{**provisional_eligibility.__dict__,"eligibility_fingerprint":fingerprint(provisional_eligibility._body())}).validated()

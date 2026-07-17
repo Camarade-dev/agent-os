@@ -12,7 +12,10 @@ catalog during that process, post-run request loading rejected the changed
 catalog before process truth could be persisted, and the created commit also
 carried a forbidden `Co-authored-by` trailer. Its historical final-status
 `provider_invocations: 0` is inaccurate; the immutable on-disk artifact is not
-rewritten retroactively. Both runs are immutable, terminal, non-resumable
+rewritten retroactively. The terminal run `native-cursor-canary-003` retained
+its durable process observation but failed eligibility with
+`selected_version:METADATA_ONLY_DRIFT`; it is not retroactively accepted by
+the post-run policy below. All three runs are immutable, terminal, non-resumable
 forensic evidence and must never be repaired, retried, resumed, or reused. The
 harness is not an OS sandbox, credential
 isolation system, global filesystem monitor, command-level monitor, push
@@ -273,7 +276,7 @@ evidence.
 
 After `PROCESS_OBSERVATION` and before any behavioral verifier, execution
 eligibility requires: one successful process; no timeout, cleanup uncertainty,
-backend drift, source mutation, sibling mutation, or remote; changed HEAD;
+blocking backend drift, source mutation, sibling mutation, or remote; changed HEAD;
 exactly one new commit; exact complete commit message
 `feat: add deterministic high-score persistence`; clean worktree; and every
 required source/test/README path changed. The complete message is the
@@ -283,13 +286,27 @@ behavioral verifier run, followed by checkpoint capture. A zero exit, mutable
 test pass, process observation, or provider claim alone cannot reach a
 checkpoint.
 
-Post-run comparison distinguishes pinned executable or launcher content drift,
-pinned-file identity-only drift, wrapper content drift, wrapper metadata-only
-drift, version-inventory/catalog drift, selected-version drift, and no drift.
-Every drift class that was previously conservative-blocking remains
-ineligible, but reservation, start, completion, cleanup, artifact references,
-and actual invocation consumption remain durable. Future reuse requires a new
-preview and attestation.
+Post-run comparison preserves the raw `NO_DRIFT`, `CONTENT_DRIFT`,
+`IDENTITY_ONLY_DRIFT`, `METADATA_ONLY_DRIFT`, `MISSING`, `UNREADABLE`,
+`VERSION_INVENTORY_DRIFT`, and `SELECTED_VERSION_DRIFT` classifications. The
+sole diagnostic-only exception is an already-observed wrapper-chain process
+whose selected-version directory alone reports `METADATA_ONLY_DRIFT`: Cursor
+may create a `.running` child there, which changes that directory's mtime while
+its canonical size, device/file ID, mode, attributes, selection, inventory,
+and all pinned command material remain unchanged. The raw
+`selected_version:METADATA_ONLY_DRIFT` diagnostic remains persisted alongside
+`selected_version:METADATA_ONLY_DRIFT:FUTURE_ATTESTATION_REFRESH_REQUIRED`.
+
+That marker does not make any pre-spawn authority reusable. Before every future
+process, the exact live re-attestation still requires the selected-version
+directory mtime to match the fresh preview/request; a stale payload therefore
+still blocks before process creation. Post-run, content, identity, mode,
+attribute or reparse changes, missing/unreadable material, version inventory
+or selected-version changes, command-resolution changes, and all wrapper or
+file metadata drift remain blocking. The directory-mtime diagnostic also never
+masks a simultaneous blocking drift. Every future run still requires a fresh
+preview and attestation. This is a measured post-run policy only; it does not
+claim continuous monitoring or hostile-process safety.
 
 Each pre-capture failure creates a write-once terminal record and leaves the
 delegated state at `GATE_EXECUTING`. Before actual capture, a durable

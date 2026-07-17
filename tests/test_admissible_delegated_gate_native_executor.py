@@ -16,6 +16,7 @@ from typing import Callable
 
 import pytest
 
+import admissible.delegated_gate.native_executor as native_executor
 from admissible.delegated_gate.canonical import fingerprint
 from admissible.delegated_gate.durability import (
     CapabilityStep,
@@ -832,6 +833,30 @@ def test_canary_002_synthetic_copy_parses_as_legacy_terminal_without_invented_li
     assert counts==type(counts)() and not tuple(store.directory.glob("*.attempt-1.*"))
 
 
+def test_canary_003_synthetic_copy_remains_terminal_with_its_original_blocking_eligibility(tmp_path: Path):
+    source = Path(__file__).resolve().parents[2] / "native-cursor-canary-003"
+    if not source.is_dir(): pytest.skip("immutable canary-003 forensic run is unavailable")
+    synthetic = tmp_path / "synthetic-canary-003"; shutil.copytree(source, synthetic)
+    store = AtomicNativeExecutionStore(synthetic / "evidence" / "native-execution")
+    eligibility_path = store._path("execution-eligibility", "native-cursor-canary-003", CANARY_GATE_ID, 0)
+    raw = json.loads(eligibility_path.read_text(encoding="utf-8"))
+    eligibility = store.load_execution_eligibility("native-cursor-canary-003", CANARY_GATE_ID, 0)
+    terminal = store.load_terminal("native-cursor-canary-003", CANARY_GATE_ID, 0)
+    counts = store.lifecycle_counts("native-cursor-canary-003", CANARY_GATE_ID, 0)
+    assert set(raw) == set(NativeExecutionEligibility.__dataclass_fields__)
+    assert eligibility.schema_version == "admissible_native_execution_eligibility_v1"
+    assert not eligibility.eligible and "post_run_backend_drift" in eligibility.ineligibility_reasons
+    assert eligibility.selected_version_validation == "METADATA_ONLY_DRIFT"
+    assert "selected_version:METADATA_ONLY_DRIFT" in eligibility.backend_drift_diagnostics
+    assert "selected_version:METADATA_ONLY_DRIFT:FUTURE_ATTESTATION_REFRESH_REQUIRED" not in eligibility.backend_drift_diagnostics
+    assert terminal.status is NativeCaptureTerminalStatus.PRECAPTURE_FAILED
+    assert counts.provider_invocations_started == 1
+    assert not store.has_result("native-cursor-canary-003", CANARY_GATE_ID, 0)
+    assert not store.has_behavioral_evidence("native-cursor-canary-003", CANARY_GATE_ID, 0)
+    assert not store.has_capture_attempt("native-cursor-canary-003", CANARY_GATE_ID, 0)
+    assert not tuple(store.directory.glob("*.attempt-1.*"))
+
+
 def test_checkpoint_artifact_tamper_blocks_final_reconstruction(tmp_path: Path):
     h=_harness(tmp_path); assert h.coordinator.run(session_id=h.session_id).canary_success; state=h.session_store.load(h.session_id); ref=state.checkpoint_history[-1].artifact_references[0]; path=h.evidence/"checkpoint-artifacts"/ref.relative_path; path.write_bytes(path.read_bytes()+b"tamper")
     with pytest.raises(NativeEvidenceInvalid,match="checkpoint artifact hash"):
@@ -1233,6 +1258,202 @@ def test_post_spawn_backend_drift_preserves_observation_but_blocks_downstream(tm
     h.executor._local_attestor=lambda _: (_ for _ in ()).throw(ValueError("live catalog unavailable"))
     second=h.coordinator.run(session_id=h.session_id)
     assert second.status is NativeCanaryStatus.PRECAPTURE_ELIGIBILITY_FAILED and len(h.runner.invocations)==1
+
+
+def _bump_directory_mtime(path: Path) -> None:
+    metadata = os.stat(path)
+    os.utime(path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 10_000_000))
+
+
+def test_selected_version_directory_mtime_only_is_persisted_diagnostic_and_reaches_behavioral_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    h, _ = _wrapper_chain_harness(tmp_path)
+    selected = Path(h.attestation.selected_version_root)
+    h.runner.after_start = lambda: _bump_directory_mtime(selected)
+    reached = {"behavioral": 0, "capture": 0}
+
+    def stop_at_behavioral(**kwargs: object) -> object:
+        assert h.store.has_result(h.session_id, CANARY_GATE_ID, 0)
+        reached["behavioral"] += 1
+        raise RuntimeError("synthetic behavioral boundary reached")
+
+    def capture_must_not_run(**kwargs: object) -> object:
+        reached["capture"] += 1
+        raise AssertionError("checkpoint must not run after synthetic behavioral stop")
+
+    monkeypatch.setattr("admissible.delegated_gate.native_canary.run_behavioral_verifier", stop_at_behavioral)
+    monkeypatch.setattr("admissible.delegated_gate.native_canary.capture_checkpoint", capture_must_not_run)
+    outcome = h.coordinator.run(session_id=h.session_id)
+    eligibility = h.store.load_execution_eligibility(h.session_id, CANARY_GATE_ID, 0)
+    assert outcome.status is NativeCanaryStatus.PRECAPTURE_ELIGIBILITY_FAILED
+    assert eligibility.eligible and "post_run_backend_drift" not in eligibility.ineligibility_reasons
+    assert eligibility.selected_version_validation == "METADATA_ONLY_DRIFT"
+    assert "selected_version:METADATA_ONLY_DRIFT" in eligibility.backend_drift_diagnostics
+    assert "selected_version:METADATA_ONLY_DRIFT:FUTURE_ATTESTATION_REFRESH_REQUIRED" in eligibility.backend_drift_diagnostics
+    assert h.store.has_process_observation(h.session_id, CANARY_GATE_ID, 0)
+    assert h.store.has_result(h.session_id, CANARY_GATE_ID, 0)
+    assert not h.store.has_behavioral_evidence(h.session_id, CANARY_GATE_ID, 0)
+    assert reached == {"behavioral": 1, "capture": 0}
+
+
+def test_selected_version_directory_mtime_change_before_spawn_still_blocks_exact_reattestation(tmp_path: Path):
+    h, _ = _wrapper_chain_harness(tmp_path)
+    request, prompt = _request(h)
+    h.store.create_request(request)
+    _bump_directory_mtime(Path(h.attestation.selected_version_root))
+    with pytest.raises(NativeEvidenceInvalid):
+        h.executor.execute(
+            request=request, prompt=prompt, source_repository=h.source, canary_parent=h.root,
+            allowed_parent_children=frozenset({h.work.name}), evidence_store_root=h.store.directory,
+            artifact_directory=h.store.artifact_directory, required_commit_message=REQUIRED_COMMIT_MESSAGE,
+            required_material_paths=EXPECTED_MATERIAL_PATHS, execution_store=h.store,
+        )
+    assert h.runner.invocations == []
+
+
+def test_post_run_command_resolution_change_remains_blocking(tmp_path: Path):
+    h, discovery = _wrapper_chain_harness(tmp_path)
+    earlier = tmp_path / "post-run-earlier-path"; earlier.mkdir()
+    h.runner.after_start = lambda: setattr(discovery, "path", _path_value(earlier, discovery.root, "C:\\Windows"))
+    request, prompt = _request(h)
+    h.store.create_request(request)
+    with pytest.raises(NativeResultIneligible):
+        h.executor.execute(
+            request=request, prompt=prompt, source_repository=h.source, canary_parent=h.root,
+            allowed_parent_children=frozenset({h.work.name}), evidence_store_root=h.store.directory,
+            artifact_directory=h.store.artifact_directory, required_commit_message=REQUIRED_COMMIT_MESSAGE,
+            required_material_paths=EXPECTED_MATERIAL_PATHS, execution_store=h.store,
+        )
+    eligibility = h.store.load_execution_eligibility(h.session_id, CANARY_GATE_ID, 0)
+    assert "IDENTITY_ONLY_DRIFT" in eligibility.wrapper_chain_drift
+    assert "command_resolution:IDENTITY_ONLY_DRIFT" in eligibility.backend_drift_diagnostics
+    assert not eligibility.eligible and "post_run_backend_drift" in eligibility.ineligibility_reasons
+
+
+def _materialize_two_commits(repository: Path) -> None:
+    _materialize_success(repository)
+    path = repository / "src" / "score.js"
+    path.write_text(path.read_text(encoding="utf-8") + "\n// second commit\n", encoding="utf-8")
+    _commit(repository, "chore: second commit")
+
+
+def _materialize_wrong_message(repository: Path) -> None:
+    _materialize_success(repository)
+    _amend_message(repository, REQUIRED_COMMIT_MESSAGE, "forbidden body")
+
+
+def _materialize_dirty_worktree(repository: Path) -> None:
+    _materialize_success(repository)
+    (repository / "untracked-after-commit.txt").write_text("dirty\n", encoding="utf-8")
+
+
+def _materialize_missing_material_path(repository: Path) -> None:
+    _materialize_success(repository)
+    _command(["git", "checkout", "HEAD~1", "--", "README.md"], cwd=repository)
+    _command(["git", "add", "README.md"], cwd=repository)
+    _amend_message(repository, REQUIRED_COMMIT_MESSAGE)
+
+
+def _add_work_remote(h: Harness) -> None:
+    _command(["git", "remote", "add", "origin", "https://invalid.example/canary.git"], cwd=h.work)
+
+
+def _mutate_source_during_process(h: Harness) -> None:
+    original = h.runner.after_start
+    assert original is not None
+
+    def mutate() -> None:
+        original()
+        path = h.source / "README.md"
+        path.write_text(path.read_text(encoding="utf-8") + "\nsource drift\n", encoding="utf-8")
+
+    h.runner.after_start = mutate
+
+
+@pytest.mark.parametrize(("case", "configure", "reason"), [
+    ("process exit", lambda h: setattr(h.runner, "returncode", 7), "native_process_or_cleanup_ineligible"),
+    ("timeout", lambda h: (setattr(h.runner, "returncode", None), setattr(h.runner, "timed_out", True)), "native_process_or_cleanup_ineligible"),
+    ("cleanup", lambda h: setattr(h.runner, "cleanup_confirmed", False), "native_process_or_cleanup_ineligible"),
+    ("exact commit count", lambda h: setattr(h.runner, "mutation", _materialize_two_commits), "exactly_one_new_commit_required"),
+    ("complete commit message", lambda h: setattr(h.runner, "mutation", _materialize_wrong_message), "complete_commit_message_mismatch"),
+    ("workspace cleanliness", lambda h: setattr(h.runner, "mutation", _materialize_dirty_worktree), "final_worktree_not_clean"),
+    ("remote absence", _add_work_remote, "git_remote_present"),
+    ("material paths", lambda h: setattr(h.runner, "mutation", _materialize_missing_material_path), "required_material_paths_missing"),
+    ("source integrity", _mutate_source_during_process, "source_or_parent_boundary_changed"),
+])
+def test_selected_version_mtime_diagnostic_does_not_relax_any_other_precapture_check(tmp_path: Path, case: str, configure: Callable[[Harness], object], reason: str):
+    h, _ = _wrapper_chain_harness(tmp_path)
+    selected = Path(h.attestation.selected_version_root)
+    h.runner.after_start = lambda: _bump_directory_mtime(selected)
+    configure(h)
+    request, prompt = _request(h)
+    h.store.create_request(request)
+    with pytest.raises(NativeResultIneligible):
+        h.executor.execute(
+            request=request, prompt=prompt, source_repository=h.source, canary_parent=h.root,
+            allowed_parent_children=frozenset({h.work.name}), evidence_store_root=h.store.directory,
+            artifact_directory=h.store.artifact_directory, required_commit_message=REQUIRED_COMMIT_MESSAGE,
+            required_material_paths=EXPECTED_MATERIAL_PATHS, execution_store=h.store,
+        )
+    eligibility = h.store.load_execution_eligibility(h.session_id, CANARY_GATE_ID, 0)
+    assert eligibility.selected_version_validation == "METADATA_ONLY_DRIFT", case
+    assert "selected_version:METADATA_ONLY_DRIFT:FUTURE_ATTESTATION_REFRESH_REQUIRED" in eligibility.backend_drift_diagnostics, case
+    assert "post_run_backend_drift" not in eligibility.ineligibility_reasons, case
+    assert reason in eligibility.ineligibility_reasons, case
+    assert not h.store.has_result(h.session_id, CANARY_GATE_ID, 0)
+
+
+def _synthetic_wrapper_chain_drift(*, executable: str = "NO_DRIFT", launcher: str = "NO_DRIFT", wrapper: str = "NO_DRIFT", package_manifest: str = "NO_DRIFT", command_resolution: str = "NO_DRIFT", catalog: str = "NO_DRIFT", selected_version: str = "NO_DRIFT") -> object:
+    wrappers = (wrapper, "NO_DRIFT", package_manifest, "NO_DRIFT", "NO_DRIFT")
+    diagnostics = (
+        f"pinned_executable:{executable}", f"pinned_launcher_0:{launcher}",
+        f"cmd_wrapper:{wrappers[0]}", f"powershell_wrapper:{wrappers[1]}",
+        f"selected_package_manifest:{wrappers[2]}", f"selected_wrapper_copy_0:{wrappers[3]}",
+        f"selected_wrapper_copy_1:{wrappers[4]}", f"command_resolution:{command_resolution}",
+        f"version_inventory:{catalog}", f"selected_version:{selected_version}",
+    )
+    return native_executor._BackendDrift(
+        executable, (launcher,), wrappers, command_resolution, catalog, selected_version, diagnostics,
+    )
+
+
+@pytest.mark.parametrize(("case", "drift"), [
+    ("selected-version identical-byte identity replacement", _synthetic_wrapper_chain_drift(selected_version="IDENTITY_ONLY_DRIFT")),
+    ("selected-version mode change", _synthetic_wrapper_chain_drift(selected_version="IDENTITY_ONLY_DRIFT")),
+    ("selected-version Windows attribute change", _synthetic_wrapper_chain_drift(selected_version="IDENTITY_ONLY_DRIFT")),
+    ("selected-version reparse change", _synthetic_wrapper_chain_drift(selected_version="IDENTITY_ONLY_DRIFT")),
+    ("selected-version missing", _synthetic_wrapper_chain_drift(selected_version="MISSING")),
+    ("selected-version unreadable", _synthetic_wrapper_chain_drift(selected_version="UNREADABLE")),
+    ("selected-version value change", _synthetic_wrapper_chain_drift(selected_version="SELECTED_VERSION_DRIFT")),
+    ("version inventory change", _synthetic_wrapper_chain_drift(catalog="VERSION_INVENTORY_DRIFT")),
+    ("command-resolution change", _synthetic_wrapper_chain_drift(command_resolution="IDENTITY_ONLY_DRIFT")),
+    ("node content drift", _synthetic_wrapper_chain_drift(executable="CONTENT_DRIFT")),
+    ("index content drift", _synthetic_wrapper_chain_drift(launcher="CONTENT_DRIFT")),
+    ("node identical-byte identity replacement", _synthetic_wrapper_chain_drift(executable="IDENTITY_ONLY_DRIFT")),
+    ("wrapper content drift", _synthetic_wrapper_chain_drift(wrapper="CONTENT_DRIFT")),
+    ("wrapper metadata-only drift", _synthetic_wrapper_chain_drift(wrapper="METADATA_ONLY_DRIFT")),
+    ("package manifest drift", _synthetic_wrapper_chain_drift(package_manifest="CONTENT_DRIFT")),
+    ("selected mtime plus wrapper content", _synthetic_wrapper_chain_drift(wrapper="CONTENT_DRIFT", selected_version="METADATA_ONLY_DRIFT")),
+    ("selected mtime plus inventory", _synthetic_wrapper_chain_drift(catalog="VERSION_INVENTORY_DRIFT", selected_version="METADATA_ONLY_DRIFT")),
+    ("selected mtime plus pinned identity", _synthetic_wrapper_chain_drift(executable="IDENTITY_ONLY_DRIFT", selected_version="METADATA_ONLY_DRIFT")),
+])
+def test_non_authorized_post_run_backend_drift_categories_remain_ineligible(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str, drift: object):
+    h, _ = _wrapper_chain_harness(tmp_path)
+    request, prompt = _request(h)
+    h.store.create_request(request)
+    monkeypatch.setattr(native_executor, "_observe_backend_drift", lambda *args, **kwargs: drift)
+    with pytest.raises(NativeResultIneligible):
+        h.executor.execute(
+            request=request, prompt=prompt, source_repository=h.source, canary_parent=h.root,
+            allowed_parent_children=frozenset({h.work.name}), evidence_store_root=h.store.directory,
+            artifact_directory=h.store.artifact_directory, required_commit_message=REQUIRED_COMMIT_MESSAGE,
+            required_material_paths=EXPECTED_MATERIAL_PATHS, execution_store=h.store,
+        )
+    eligibility = h.store.load_execution_eligibility(h.session_id, CANARY_GATE_ID, 0)
+    assert not eligibility.eligible, case
+    assert "post_run_backend_drift" in eligibility.ineligibility_reasons, case
+    assert "selected_version:METADATA_ONLY_DRIFT:FUTURE_ATTESTATION_REFRESH_REQUIRED" not in eligibility.backend_drift_diagnostics, case
+    assert h.store.has_process_observation(h.session_id, CANARY_GATE_ID, 0)
+    assert not h.store.has_result(h.session_id, CANARY_GATE_ID, 0)
 
 
 def test_post_spawn_structural_request_reload_is_inert_while_strict_reload_rejects_drift(tmp_path: Path):
