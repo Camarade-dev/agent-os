@@ -53,6 +53,12 @@ accepted:
   every authoritative file: wrappers, `node.exe`, `index.js`, `package.json`,
   and any selected-version wrapper copies (which must be byte-identical to the
   top-level wrappers);
+- normalized local directory identity for the wrapper root and selected
+  version root. Windows directory `st_size` is unstable and is never copied
+  into signed authority: directory `size` is canonical `0`, while
+  device/inode or Windows file identity, mode/type, file attributes, mtime, and
+  non-reparse status remain bound. Regular-file size remains exact and
+  authoritative;
 - containment of every launcher file inside the canonical wrapper/version
   roots;
 - stability between attestation/authorization and spawn: immediately before
@@ -63,6 +69,12 @@ accepted:
 
 Windows Authenticode evidence for the bundled `node.exe` is recorded as
 context only (the OpenJS signature is not authority for `index.js`).
+
+Directory identity remains a local, non-cryptographic observation. It is not
+complete filesystem containment or publisher provenance. The complete
+matching version inventory, deterministic selected version, exact child-root
+relationships, and every authoritative launcher file's byte count, identity,
+and SHA-256 provide the separate material evidence.
 
 ## Explicit non-claims
 
@@ -93,6 +105,15 @@ invocation. Production wrapper-chain discovery is host-anchored: arbitrary
 caller-supplied wrapper roots, fake manifests, injected attestations, or
 environment bypasses cannot reach production readiness; the test discovery
 seam is explicit constructor injection unreachable from the production CLI.
+
+Act 2A.3C retains
+`admissible_cursor_wrapper_chain_attestation_v1` because the serialized shape
+did not change and no live canary was authorized or run. Loading now rejects
+every nonzero authoritative directory size instead of repairing it. Every
+wrapper-chain preview, fingerprint, and canonical-byte hash created before the
+normalization repair is invalid, including a preview whose raw directory size
+happened to be zero. A fresh post-repair, post-commit static attestation and
+clean-HEAD real-CLI payload preview are mandatory before any owner decision.
 
 ## Status
 

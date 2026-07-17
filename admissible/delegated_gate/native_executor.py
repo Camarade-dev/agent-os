@@ -222,24 +222,50 @@ class NativeFilesystemIdentity:
     mtime_ns: int
     file_attributes: int
 
+    @property
+    def entry_kind(self) -> str:
+        """Return the authority-bearing entry kind encoded by ``mode``."""
+
+        if stat.S_ISREG(self.mode):
+            return "REGULAR_FILE"
+        if stat.S_ISDIR(self.mode):
+            return "DIRECTORY"
+        raise ValueError("filesystem identity entry kind is unsupported")
+
     @classmethod
     def from_stat(cls, metadata: os.stat_result) -> "NativeFilesystemIdentity":
+        mode = int(metadata.st_mode)
+        if stat.S_ISREG(mode):
+            size = int(metadata.st_size)
+        elif stat.S_ISDIR(mode):
+            # Windows directory st_size is not a stable observation.  Directory
+            # authority always carries the explicit canonical value zero.
+            size = 0
+        else:
+            raise ValueError("filesystem identity entry kind is unsupported")
         return cls(
             device=int(metadata.st_dev),
             inode=int(metadata.st_ino),
-            mode=int(metadata.st_mode),
-            size=int(metadata.st_size),
+            mode=mode,
+            size=size,
             mtime_ns=int(getattr(metadata, "st_mtime_ns", int(metadata.st_mtime * 1_000_000_000))),
             file_attributes=int(getattr(metadata, "st_file_attributes", 0)),
-        )
+        ).validated()
 
     def validated(self) -> "NativeFilesystemIdentity":
         for label, value in self.__dict__.items():
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"filesystem identity {label} must be a non-negative integer")
+        kind = self.entry_kind
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+        if self.file_attributes & reparse_flag:
+            raise ValueError("filesystem identity cannot authorize a reparse point")
+        if kind == "DIRECTORY" and self.size != 0:
+            raise ValueError("filesystem identity directory size must be canonical zero")
         return self
 
     def to_dict(self) -> dict[str, int]:
+        self.validated()
         return dict(self.__dict__)
 
     @classmethod
@@ -249,7 +275,20 @@ class NativeFilesystemIdentity:
 
 
 def _same_directory_identity(left: NativeFilesystemIdentity, right: NativeFilesystemIdentity) -> bool:
-    """Directory mtimes/sizes change when children are added; identity must not."""
+    """Compare complete immutable directory authority, including mtime."""
+
+    left.validated(); right.validated()
+    if left.entry_kind != "DIRECTORY" or right.entry_kind != "DIRECTORY":
+        raise ValueError("directory identity comparison requires directories")
+    return left == right
+
+
+def _same_mutable_directory_entry(left: NativeFilesystemIdentity, right: NativeFilesystemIdentity) -> bool:
+    """Compare the physical entry for roots whose children intentionally change."""
+
+    left.validated(); right.validated()
+    if left.entry_kind != "DIRECTORY" or right.entry_kind != "DIRECTORY":
+        raise ValueError("mutable directory comparison requires directories")
     return (
         left.device,
         left.inode,
@@ -1484,14 +1523,14 @@ class NativeExecutionRequest:
         require_strict_int(self.execution_attempt_index, "execution_attempt_index", minimum=0, maximum=0)
         require_sha256(self.mission_fingerprint, "mission_fingerprint"); require_sha256(self.gate_contract_fingerprint, "gate_contract_fingerprint")
         workspace, identity = _safe_directory(self.work_workspace, "work_workspace")
-        if str(workspace) != self.work_workspace or not _same_directory_identity(identity, self.work_workspace_identity):
+        if str(workspace) != self.work_workspace or not _same_mutable_directory_entry(identity, self.work_workspace_identity):
             raise ValueError("work workspace path or identity changed")
         self.work_workspace_identity.validated()
         evidence_root, evidence_identity = _safe_directory(self.evidence_store_root, "execution evidence root")
-        if str(evidence_root) != self.evidence_store_root or not _same_directory_identity(evidence_identity, self.evidence_store_identity):
+        if str(evidence_root) != self.evidence_store_root or not _same_mutable_directory_entry(evidence_identity, self.evidence_store_identity):
             raise ValueError("execution evidence root path or identity changed")
         artifacts, artifacts_identity = _safe_artifact_directory(evidence_root, self.artifact_directory)
-        if str(artifacts) != self.artifact_directory or not _same_directory_identity(artifacts_identity, self.artifact_directory_identity):
+        if str(artifacts) != self.artifact_directory or not _same_mutable_directory_entry(artifacts_identity, self.artifact_directory_identity):
             raise ValueError("native artifact directory path or identity changed")
         _require_disjoint_roots(("work workspace", workspace), ("execution evidence root", evidence_root))
         _require_disjoint_roots(("work workspace", workspace), ("native artifact directory", artifacts))
@@ -1818,7 +1857,7 @@ def _parent_inventory(parent: Path, *, allowed_children: frozenset[str]) -> tupl
         if child.name in allowed_children: continue
         metadata = os.lstat(child)
         if _is_redirecting_path(child, metadata):
-            inventory.append(f"{child.name}:redirecting:{NativeFilesystemIdentity.from_stat(metadata).inode}")
+            inventory.append(f"{child.name}:redirecting:{int(metadata.st_ino)}")
         elif stat.S_ISDIR(metadata.st_mode):
             tree_hash, files = _material_snapshot(child); identity = NativeFilesystemIdentity.from_stat(metadata)
             inventory.append(f"{child.name}:directory:{identity.device}:{identity.inode}:{tree_hash}:{len(files)}")
@@ -1903,14 +1942,14 @@ class NativeDelegatedExecutor:
             raise NativeEvidenceInvalid(str(exc)) from exc
         if hashlib.sha256(prompt.encode("utf-8")).hexdigest() != request.prompt_fingerprint: raise NativeEvidenceInvalid("prompt differs from durable request")
         workspace, workspace_identity = _safe_directory(request.work_workspace, "work workspace")
-        if not _same_directory_identity(workspace_identity, request.work_workspace_identity): raise NativeEvidenceInvalid("work workspace identity changed after request issuance")
+        if not _same_mutable_directory_entry(workspace_identity, request.work_workspace_identity): raise NativeEvidenceInvalid("work workspace identity changed after request issuance")
         source, source_identity = _safe_directory(source_repository, "source repository"); parent, parent_identity = _safe_directory(canary_parent, "canary parent")
         evidence_root, evidence_identity = _safe_directory(evidence_store_root, "execution evidence root"); artifacts, artifacts_identity = _safe_artifact_directory(evidence_root, artifact_directory)
         if (
             str(evidence_root) != request.evidence_store_root
-            or not _same_directory_identity(evidence_identity, request.evidence_store_identity)
+            or not _same_mutable_directory_entry(evidence_identity, request.evidence_store_identity)
             or str(artifacts) != request.artifact_directory
-            or not _same_directory_identity(artifacts_identity, request.artifact_directory_identity)
+            or not _same_mutable_directory_entry(artifacts_identity, request.artifact_directory_identity)
         ):
             raise NativeEvidenceInvalid("execution evidence/artifact authority differs from the durable request")
         _require_disjoint_roots(("source repository", source), ("work workspace", workspace), ("execution evidence root", evidence_root))
@@ -1929,7 +1968,7 @@ class NativeDelegatedExecutor:
         ended_at = self.clock()
         # Revalidate every root before using the post-process observations.
         post_source, post_source_identity = _safe_directory(source, "source repository post-exit"); post_workspace, post_identity = _safe_directory(workspace, "work workspace post-exit"); post_parent, post_parent_identity = _safe_directory(parent, "canary parent post-exit"); post_evidence, post_evidence_identity = _safe_directory(evidence_root, "execution evidence root post-exit"); post_artifacts, post_artifacts_identity = _safe_artifact_directory(post_evidence, artifacts)
-        if post_workspace != workspace or not _same_directory_identity(post_identity, workspace_identity): raise NativeEvidenceInvalid("work workspace identity changed during execution")
+        if post_workspace != workspace or not _same_mutable_directory_entry(post_identity, workspace_identity): raise NativeEvidenceInvalid("work workspace identity changed during execution")
         if post_source != source or not _same_directory_identity(post_source_identity, source_identity): raise NativeEvidenceInvalid("source repository identity changed during execution")
         if post_parent != parent or not _same_directory_identity(post_parent_identity, parent_identity): raise NativeEvidenceInvalid("canary parent identity changed during execution")
         if post_evidence != evidence_root or not _same_directory_identity(post_evidence_identity, evidence_identity): raise NativeEvidenceInvalid("execution evidence root identity changed during execution")
@@ -2050,10 +2089,10 @@ class AtomicNativeExecutionStore:
         finally: os.close(fd)
     def _assert_root_identity(self) -> None:
         root, identity = _safe_directory(self.directory, "native execution store")
-        if root != self.directory or not _same_directory_identity(identity, self.directory_identity): raise NativeEvidenceInvalid("native execution store root identity changed")
+        if root != self.directory or not _same_mutable_directory_entry(identity, self.directory_identity): raise NativeEvidenceInvalid("native execution store root identity changed")
     def _assert_artifact_root_identity(self) -> None:
         root, identity = _safe_directory(self.artifact_directory, "native artifact directory")
-        if root != self.artifact_directory or not _same_directory_identity(identity, self.artifact_directory_identity): raise NativeEvidenceInvalid("native artifact directory identity changed")
+        if root != self.artifact_directory or not _same_mutable_directory_entry(identity, self.artifact_directory_identity): raise NativeEvidenceInvalid("native artifact directory identity changed")
     def _atomic_create(self, path: Path, payload: Mapping[str, Any], *, operation: str) -> None:
         self._assert_root_identity(); temporary: str | None = None; published = False
         try:

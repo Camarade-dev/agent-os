@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import re
@@ -29,6 +30,7 @@ from admissible.delegated_gate.native_canary import (
     load_behavioral_verifier,
     main,
     run_behavioral_verifier,
+    _git_source_preflight,
 )
 from admissible.delegated_gate.native_executor import (
     ATTESTATION_SCHEMA_VERSION,
@@ -633,6 +635,9 @@ from admissible.delegated_gate.native_executor import (
     _parse_cmd_wrapper,
     _parse_powershell_wrapper,
     _POWERSHELL_WRAPPER_TEMPLATE_LINES,
+    _safe_directory,
+    _same_directory_identity,
+    _same_mutable_directory_entry,
 )
 
 _OBSERVED_CMD_WRAPPER = (
@@ -1241,3 +1246,507 @@ def test_cli_preflight_only_rebinds_source_and_exposes_complete_payload_without_
         assert key in payload
     assert payload["source_repository"] == str(h.source)
     assert not run_root.exists() and h.runner.invocations == []
+
+
+# --- Act 2A.3C: deterministic directory identity normalization -------------
+
+class _StatOverride:
+    def __init__(self, metadata: os.stat_result, **overrides: int) -> None:
+        self._metadata = metadata
+        self._overrides = overrides
+
+    def __getattr__(self, name: str) -> object:
+        if name in self._overrides:
+            return self._overrides[name]
+        return getattr(self._metadata, name)
+
+
+def _override_lstat(monkeypatch: pytest.MonkeyPatch, rules: dict[Path, object]) -> None:
+    original = os.lstat
+    normalized = {os.path.normcase(os.path.abspath(os.fspath(path))): rule for path, rule in rules.items()}
+    calls = {key: 0 for key in normalized}
+
+    def observed(path: str | bytes | Path, *args: object, **kwargs: object) -> os.stat_result:
+        metadata = original(path, *args, **kwargs)
+        key = os.path.normcase(os.path.abspath(os.fsdecode(path)))
+        rule = normalized.get(key)
+        if rule is None:
+            return metadata
+        index = calls[key]
+        calls[key] += 1
+        overrides = rule(index, metadata) if callable(rule) else rule
+        return _StatOverride(metadata, **overrides)  # type: ignore[return-value, arg-type]
+
+    monkeypatch.setattr(os, "lstat", observed)
+
+
+def _alternating_directory_size(index: int, _metadata: os.stat_result) -> dict[str, int]:
+    values = (0, 4096, 8192, 40960, 12345)
+    return {"st_size": values[index % len(values)]}
+
+
+def test_directory_identity_normalizes_alternating_raw_sizes_and_rejects_noncanonical_json(tmp_path: Path):
+    directory = tmp_path / "directory"; directory.mkdir()
+    metadata = os.lstat(directory)
+    identities = tuple(
+        NativeFilesystemIdentity.from_stat(_StatOverride(metadata, st_size=size))
+        for size in (0, 4096, 8192, 40960, 12345)
+    )
+    assert all(item.entry_kind == "DIRECTORY" and item.size == 0 for item in identities)
+    assert len({json.dumps(item.to_dict(), sort_keys=True) for item in identities}) == 1
+    assert len({fingerprint(item.to_dict()) for item in identities}) == 1
+    noncanonical = identities[0].to_dict(); noncanonical["size"] = 40960
+    with pytest.raises(ValueError, match="canonical zero"):
+        NativeFilesystemIdentity.from_dict(noncanonical)
+
+
+def test_directory_identity_binds_metadata_and_rejects_entry_kind_substitution(tmp_path: Path):
+    directory = tmp_path / "directory"; directory.mkdir()
+    regular_file = tmp_path / "regular.txt"; regular_file.write_text("regular", encoding="utf-8")
+    identity = _test_identity(directory)
+    changed_directory_mode = identity.mode ^ stat.S_IWUSR
+    if not stat.S_ISDIR(changed_directory_mode):
+        changed_directory_mode = identity.mode ^ stat.S_IRUSR
+    variants = (
+        replace(identity, device=identity.device + 1),
+        replace(identity, inode=identity.inode + 1),
+        replace(identity, mode=changed_directory_mode),
+        replace(identity, file_attributes=identity.file_attributes ^ 0x2),
+        replace(identity, mtime_ns=identity.mtime_ns + 1),
+    )
+    assert all(not _same_directory_identity(identity, variant) for variant in variants)
+    file_identity = _test_identity(regular_file)
+    with pytest.raises(ValueError, match="requires directories"):
+        _same_directory_identity(identity, file_identity)
+    with pytest.raises(ValueError, match="requires directories"):
+        _same_directory_identity(file_identity, identity)
+    unsupported = replace(identity, mode=stat.S_IFIFO)
+    with pytest.raises(ValueError, match="unsupported"):
+        unsupported.validated()
+
+
+@pytest.mark.parametrize(
+    ("metadata_field", "identity_field"),
+    (
+        ("st_dev", "device"),
+        ("st_ino", "inode"),
+        ("st_mode", "mode"),
+        ("st_file_attributes", "file_attributes"),
+        ("st_mtime_ns", "mtime_ns"),
+    ),
+)
+def test_regular_file_metadata_mutation_blocks_fresh_file_attestation_and_outer_refingerprint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, metadata_field: str, identity_field: str,
+):
+    config, attestor = _injected_test_cursor(tmp_path)
+    outer_attestation = attestor(config)
+    authority = outer_attestation.executable
+    path = Path(authority.canonical_path)
+    original_metadata = os.lstat(path)
+    original_identity = authority.filesystem_identity
+
+    assert authority.validated() is authority
+    assert outer_attestation.validated() is outer_attestation
+    assert stat.S_ISREG(original_metadata.st_mode)
+    assert original_identity == NativeFilesystemIdentity.from_stat(original_metadata)
+    assert authority.byte_count == original_identity.size == int(original_metadata.st_size)
+    assert authority.sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def altered(_index: int, metadata: os.stat_result) -> dict[str, int]:
+        value = int(getattr(metadata, metadata_field, 0))
+        if metadata_field == "st_mode":
+            changed_mode = value ^ stat.S_IWUSR
+            assert stat.S_ISREG(changed_mode)
+            return {metadata_field: changed_mode}
+        if metadata_field == "st_file_attributes":
+            return {metadata_field: value ^ 0x2}
+        return {metadata_field: value + 1}
+
+    _override_lstat(monkeypatch, {path: altered})
+    fresh_identity = NativeFilesystemIdentity.from_stat(os.lstat(path))
+
+    assert authority.canonical_path == str(path)
+    assert fresh_identity.entry_kind == "REGULAR_FILE"
+    assert fresh_identity.size == authority.byte_count == int(original_metadata.st_size)
+    assert authority.sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+    changed_fields = tuple(
+        field for field in ("device", "inode", "mode", "file_attributes", "mtime_ns", "size")
+        if getattr(fresh_identity, field) != getattr(original_identity, field)
+    )
+    assert changed_fields == (identity_field,)
+
+    with pytest.raises(ValueError, match="identity changed"):
+        authority.validated()
+    provisional = replace(outer_attestation, attestation_fingerprint="0" * 64)
+    refingerprinted = replace(
+        provisional, attestation_fingerprint=fingerprint(provisional._body()),
+    )
+    with pytest.raises(ValueError, match="identity changed"):
+        refingerprinted.validated()
+
+
+def test_regular_file_identity_retains_exact_size_hash_and_substitution_authority(tmp_path: Path):
+    path = tmp_path / "authority.bin"; path.write_bytes(b"aa")
+    original = NativeBackendFileAttestation.observe(path, "regular authority")
+    path.write_bytes(b"bb")
+    same_size_changed_content = NativeBackendFileAttestation.observe(path, "changed regular authority")
+    assert same_size_changed_content.filesystem_identity.size == original.filesystem_identity.size == 2
+    assert same_size_changed_content.sha256 != original.sha256
+    with pytest.raises(ValueError):
+        original.validated()
+    path.write_bytes(b"longer")
+    changed_size = NativeBackendFileAttestation.observe(path, "resized regular authority")
+    assert changed_size.filesystem_identity.size != original.filesystem_identity.size
+    displaced = tmp_path / "displaced.bin"; path.rename(displaced); path.write_bytes(b"longer")
+    with pytest.raises(ValueError):
+        changed_size.validated()
+
+
+def test_same_path_regular_file_replaced_by_directory_fails_fresh_file_authority(tmp_path: Path):
+    path = tmp_path / "same-path-entry"
+    path.write_bytes(b"regular authority")
+    authority = NativeBackendFileAttestation.observe(path, "same-path regular file")
+    assert authority.filesystem_identity.entry_kind == "REGULAR_FILE"
+
+    path.unlink()
+    path.mkdir()
+    assert stat.S_ISDIR(os.lstat(path).st_mode)
+    with pytest.raises(ValueError, match="regular file"):
+        authority.validated()
+
+
+def test_same_path_directory_replaced_by_regular_file_fails_fresh_request_authority(tmp_path: Path):
+    h = _harness(tmp_path)
+    request, _prompt = _request(h)
+    assert request.work_workspace_identity.entry_kind == "DIRECTORY"
+
+    displaced = h.work.with_name("displaced-workspace")
+    h.work.rename(displaced)
+    h.work.write_bytes(b"regular replacement at the authoritative directory path")
+    assert stat.S_ISREG(os.lstat(h.work).st_mode)
+    with pytest.raises(ValueError, match="directory"):
+        request.validated()
+
+
+@pytest.mark.parametrize("target_kind", ("regular-file", "directory"))
+def test_direct_symlink_entry_never_becomes_authority(tmp_path: Path, target_kind: str):
+    target = tmp_path / f"{target_kind}-target"
+    link = tmp_path / f"{target_kind}-link"
+    if target_kind == "regular-file":
+        target.write_bytes(b"target")
+        target_is_directory = False
+    else:
+        target.mkdir()
+        target_is_directory = True
+    try:
+        os.symlink(target, link, target_is_directory=target_is_directory)
+    except (OSError, NotImplementedError):
+        pytest.skip(f"{target_kind} symlink creation unavailable")
+
+    if target_kind == "regular-file":
+        with pytest.raises(ValueError, match="redirecting"):
+            NativeBackendFileAttestation.observe(link, "redirecting regular file")
+    else:
+        with pytest.raises(ValueError, match="redirecting"):
+            _safe_directory(link, "redirecting directory")
+
+
+def test_redirecting_entry_replacing_prior_plain_file_fails_fresh_authority(tmp_path: Path):
+    path = tmp_path / "authoritative-file"
+    target = tmp_path / "replacement-target"
+    path.write_bytes(b"original")
+    target.write_bytes(b"replacement")
+    authority = NativeBackendFileAttestation.observe(path, "plain regular authority")
+    path.unlink()
+    try:
+        os.symlink(target, path, target_is_directory=False)
+    except (OSError, NotImplementedError):
+        pytest.skip("regular-file symlink creation unavailable")
+    with pytest.raises(ValueError, match="redirecting"):
+        authority.validated()
+
+
+def test_windows_junction_replacing_prior_plain_directory_fails_fresh_authority(tmp_path: Path):
+    if os.name != "nt":
+        pytest.skip("Windows junction regression")
+    path = tmp_path / "authoritative-directory"
+    target = tmp_path / "junction-target"
+    path.mkdir(); target.mkdir()
+    _plain, authority = _safe_directory(path, "plain directory authority")
+    path.rmdir()
+    completed = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(path), str(target)],
+        shell=False, capture_output=True,
+    )
+    if completed.returncode != 0:
+        pytest.skip("Windows junction creation unavailable")
+    with pytest.raises(ValueError, match="redirecting"):
+        _safe_directory(path, "junction replacement")
+    assert authority.entry_kind == "DIRECTORY"
+
+
+def test_regular_file_zero_and_40960_sizes_are_exact_and_noninterchangeable(tmp_path: Path):
+    empty = tmp_path / "empty.bin"; empty.write_bytes(b"")
+    large = tmp_path / "large.bin"; large.write_bytes(b"x" * 40960)
+    empty_authority = NativeBackendFileAttestation.observe(empty, "empty regular file")
+    large_authority = NativeBackendFileAttestation.observe(large, "40960-byte regular file")
+
+    assert empty_authority.filesystem_identity.entry_kind == "REGULAR_FILE"
+    assert large_authority.filesystem_identity.entry_kind == "REGULAR_FILE"
+    assert empty_authority.byte_count == empty_authority.filesystem_identity.size == 0
+    assert large_authority.byte_count == large_authority.filesystem_identity.size == 40960
+    same_other_fields = replace(empty_authority.filesystem_identity, size=40960)
+    assert same_other_fields != empty_authority.filesystem_identity
+    assert same_other_fields.entry_kind == "REGULAR_FILE"
+    assert same_other_fields.to_dict()["size"] == 40960
+    assert NativeFilesystemIdentity.from_stat(os.lstat(empty)).size == 0
+    assert NativeFilesystemIdentity.from_stat(os.lstat(large)).size == 40960
+
+
+@pytest.mark.parametrize("false_direction", ("smaller", "larger"))
+@pytest.mark.parametrize("sha_mode", ("matching-content", "altered"))
+def test_self_refingerprinted_wrapper_file_false_size_fails_fresh_authority(
+    tmp_path: Path, false_direction: str, sha_mode: str,
+):
+    _root, _discovery, attestation = _wrapper_attestation(tmp_path)
+    raw = attestation.to_dict()
+    executable = raw["executable"]
+    actual_size = executable["filesystem_identity"]["size"]
+    false_size = actual_size - 1 if false_direction == "smaller" else actual_size + 1
+    executable["filesystem_identity"]["size"] = false_size
+    executable["byte_count"] = false_size
+    if sha_mode == "altered":
+        executable["sha256"] = "0" * 64
+    raw["attestation_fingerprint"] = fingerprint({
+        key: value for key, value in raw.items() if key != "attestation_fingerprint"
+    })
+    with pytest.raises(ValueError, match="identity changed"):
+        attestation_from_dict(raw)
+
+
+def test_mutable_root_lifecycle_allows_expected_children_and_forced_mtime_changes(tmp_path: Path):
+    h = _harness(tmp_path)
+    request, _prompt = _request(h)
+    _evidence_parent, evidence_parent_identity = _safe_directory(h.evidence, "test evidence parent")
+    recorded = (
+        (h.work, request.work_workspace_identity),
+        (h.store.directory, request.evidence_store_identity),
+        (h.store.artifact_directory, request.artifact_directory_identity),
+        (h.evidence, evidence_parent_identity),
+    )
+
+    (h.work / "expected-work-child").mkdir()
+    (h.work / "expected-work-child" / "draft.txt").write_text("expected", encoding="utf-8")
+    (h.store.directory / "expected-sidecar-child.json").write_text("{}\n", encoding="utf-8")
+    (h.store.artifact_directory / "expected-artifact.bin").write_bytes(b"expected")
+    (h.evidence / "expected-evidence-child").mkdir()
+    for path, identity in recorded:
+        forced_mtime = identity.mtime_ns + 2_000_000_000
+        os.utime(path, ns=(forced_mtime, forced_mtime))
+        _fresh_path, fresh_identity = _safe_directory(path, f"fresh mutable {path.name}")
+        assert fresh_identity.mtime_ns != identity.mtime_ns
+        assert _same_mutable_directory_entry(identity, fresh_identity)
+        assert fresh_identity.size == 0
+
+    assert request.validated() is request
+    h.store._assert_root_identity()
+    h.store._assert_artifact_root_identity()
+
+
+@pytest.mark.parametrize("role", ("workspace", "evidence-root", "artifact-root"))
+def test_mutable_authority_rejects_same_path_physical_root_replacement(tmp_path: Path, role: str):
+    h = _harness(tmp_path)
+    request, _prompt = _request(h)
+    path = {
+        "workspace": h.work,
+        "evidence-root": h.store.directory,
+        "artifact-root": h.store.artifact_directory,
+    }[role]
+    displaced = path.with_name(f"displaced-{path.name}")
+    path.rename(displaced)
+    path.mkdir()
+    if role == "evidence-root":
+        (path / "artifacts").mkdir()
+    with pytest.raises(ValueError, match="identity changed"):
+        request.validated()
+
+
+def test_mutable_workspace_sibling_substitution_fails_even_when_request_is_refingerprinted(tmp_path: Path):
+    h = _harness(tmp_path)
+    request, _prompt = _request(h)
+    sibling = tmp_path / "workspace-sibling"; sibling.mkdir()
+    substituted = replace(request, work_workspace=str(sibling), request_fingerprint="0" * 64)
+    substituted = replace(substituted, request_fingerprint=fingerprint(substituted._body()))
+    with pytest.raises(ValueError, match="identity changed"):
+        substituted.validated()
+
+
+def test_canary_parent_same_path_replacement_fails_exact_production_comparison(tmp_path: Path):
+    parent = tmp_path / "canary-parent"; parent.mkdir()
+    _path, authority = _safe_directory(parent, "canary parent authority")
+    displaced = tmp_path / "displaced-canary-parent"
+    parent.rename(displaced); parent.mkdir()
+    _fresh_path, fresh = _safe_directory(parent, "replacement canary parent")
+    assert not _same_directory_identity(authority, fresh)
+
+
+def test_mutable_workspace_junction_replacement_fails_before_comparison(tmp_path: Path):
+    if os.name != "nt":
+        pytest.skip("Windows junction regression")
+    h = _harness(tmp_path)
+    request, _prompt = _request(h)
+    displaced = h.work.with_name("junction-workspace-target")
+    h.work.rename(displaced)
+    completed = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(h.work), str(displaced)],
+        shell=False, capture_output=True,
+    )
+    if completed.returncode != 0:
+        pytest.skip("Windows junction creation unavailable")
+    with pytest.raises(ValueError, match="redirecting"):
+        request.validated()
+
+
+@pytest.mark.parametrize("role", ("source", "wrapper", "selected-version", "mutable-execution-root"))
+def test_raw_directory_size_matrix_is_independent_for_every_authority_role(tmp_path: Path, role: str):
+    wrapper_root = _wrapper_chain_installation(tmp_path)
+    paths = {
+        "source": tmp_path / "source",
+        "wrapper": wrapper_root,
+        "selected-version": wrapper_root / "versions" / "2026.07.09-a3815c0",
+        "mutable-execution-root": tmp_path / "mutable-execution-root",
+    }
+    paths["source"].mkdir(); paths["mutable-execution-root"].mkdir()
+    metadata = os.lstat(paths[role])
+    identities = tuple(
+        NativeFilesystemIdentity.from_stat(_StatOverride(metadata, st_size=size))
+        for size in (0, 4096, 8192, 40960, 12345)
+    )
+    assert all(identity.entry_kind == "DIRECTORY" and identity.size == 0 for identity in identities)
+    assert len(set(identities)) == 1
+    assert _same_mutable_directory_entry(identities[0], identities[-1])
+
+
+def test_v3_source_directory_raw_size_is_normalized_but_git_checks_remain_independent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    source_parent = tmp_path / "source-parent"; source_parent.mkdir()
+    source = build_canary_repository(source_parent, repository_name="source").repository
+    head = _command(["git", "rev-parse", "HEAD"], cwd=source).stdout.strip()
+    _wrapper_root, _discovery, attestation = _wrapper_attestation(tmp_path)
+    _override_lstat(monkeypatch, {source: _alternating_directory_size})
+    payloads = tuple(
+        build_authorization_payload(
+            source_repository=source, source_head=head, run_id=_V3_RUN_ID, session_id=_V3_RUN_ID,
+            attestation=attestation, run_root=tmp_path / _V3_RUN_ID, timeout_seconds=900,
+        )
+        for _ in range(4)
+    )
+    assert len({item.payload_fingerprint for item in payloads}) == 1
+    assert all(item.source_repository_identity.size == 0 for item in payloads)
+    noncanonical = payloads[0].to_dict(); noncanonical["source_repository_identity"]["size"] = 40960
+    with pytest.raises(ValueError, match="canonical zero"):
+        NativeCanaryAuthorizationPayload.from_dict(noncanonical)
+    assert _git_source_preflight(source, "f" * 40)[0] is False
+    assert _git_source_preflight(source, head)[0] is True
+    (source / "dirty.txt").write_text("dirty", encoding="utf-8")
+    assert _git_source_preflight(source, head)[0] is False
+
+
+def test_wrapper_chain_directory_raw_sizes_do_not_change_attestation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    wrapper_root = _wrapper_chain_installation(tmp_path)
+    discovery = FakeWrapperChainDiscovery(wrapper_root)
+    selected_root = wrapper_root / "versions" / "2026.07.09-a3815c0"
+    _override_lstat(monkeypatch, {
+        wrapper_root: _alternating_directory_size,
+        selected_root: _alternating_directory_size,
+    })
+    attestations = tuple(_attest_wrapper_chain_cursor(_WRAPPER_CONFIG, discovery=discovery) for _ in range(6))
+    assert len({item.attestation_fingerprint for item in attestations}) == 1
+    assert all(item.command_resolution.wrapper_root_identity.size == 0 for item in attestations)
+    assert all(item.selected_version_root_identity.size == 0 for item in attestations)
+    for identity_path in (
+        ("command_resolution", "wrapper_root_identity"),
+        ("selected_version_root_identity",),
+    ):
+        raw = attestations[0].to_dict()
+        target = raw
+        for key in identity_path:
+            target = target[key]
+        target["size"] = 40960
+        with pytest.raises(ValueError, match="canonical zero"):
+            attestation_from_dict(raw)
+
+
+@pytest.mark.parametrize("target", ("wrapper", "selected"))
+@pytest.mark.parametrize("field", ("st_dev", "st_ino", "st_mode", "st_file_attributes", "st_mtime_ns"))
+def test_wrapper_chain_immutable_directory_metadata_changes_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str, field: str,
+):
+    wrapper_root, _discovery, attestation = _wrapper_attestation(tmp_path)
+    selected_root = wrapper_root / "versions" / attestation.selected_version
+    changed_path = wrapper_root if target == "wrapper" else selected_root
+
+    def changed(_index: int, metadata: os.stat_result) -> dict[str, int]:
+        value = int(getattr(metadata, field, 0))
+        if field == "st_mode":
+            changed_mode = value ^ stat.S_IWUSR
+            assert stat.S_ISDIR(changed_mode)
+            return {field: changed_mode}
+        if field == "st_file_attributes":
+            return {field: value ^ 0x2}
+        return {field: value + 1}
+
+    _override_lstat(monkeypatch, {changed_path: changed})
+    with pytest.raises(ValueError, match="identity changed"):
+        attestation.validated()
+
+
+def test_payload_and_attestation_are_byte_reproducible_under_all_alternating_directory_sizes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    wrapper_root = _wrapper_chain_installation(tmp_path)
+    selected_root = wrapper_root / "versions" / "2026.07.09-a3815c0"
+    discovery = FakeWrapperChainDiscovery(wrapper_root)
+    source = tmp_path / "source-repository"; source.mkdir()
+    mutable_root = tmp_path / "mutable-execution-root"; mutable_root.mkdir()
+    run_root = tmp_path / _V3_RUN_ID
+    _override_lstat(monkeypatch, {
+        wrapper_root: _alternating_directory_size,
+        selected_root: _alternating_directory_size,
+        source: _alternating_directory_size,
+        mutable_root: _alternating_directory_size,
+    })
+    source_identities: set[str] = set()
+    wrapper_identities: set[str] = set()
+    selected_identities: set[str] = set()
+    mutable_identities: set[str] = set()
+    command_resolution_fingerprints: set[str] = set()
+    backend_fingerprints: set[str] = set()
+    payload_fingerprints: set[str] = set()
+    canonical_payloads: set[bytes] = set()
+    canonical_hashes: set[str] = set()
+    vector_label = "PRE_COMMIT_PROVISIONAL_NOT_AUTHORIZABLE"
+    for _ in range(20):
+        attestation = _attest_wrapper_chain_cursor(_WRAPPER_CONFIG, discovery=discovery)
+        payload = build_authorization_payload(
+            source_repository=source, source_head="e" * 40, run_id=_V3_RUN_ID, session_id=_V3_RUN_ID,
+            attestation=attestation, run_root=run_root, timeout_seconds=900,
+        )
+        _mutable_path, mutable_identity = _safe_directory(mutable_root, "mutable execution root")
+        serialized = _canonical_bytes(payload.to_dict())
+        reloaded = NativeCanaryAuthorizationPayload.from_dict(json.loads(serialized))
+        assert reloaded == payload
+        source_identities.add(json.dumps(payload.source_repository_identity.to_dict(), sort_keys=True))
+        wrapper_identities.add(json.dumps(attestation.command_resolution.wrapper_root_identity.to_dict(), sort_keys=True))
+        selected_identities.add(json.dumps(attestation.selected_version_root_identity.to_dict(), sort_keys=True))
+        mutable_identities.add(json.dumps(mutable_identity.to_dict(), sort_keys=True))
+        command_resolution_fingerprints.add(fingerprint(attestation.command_resolution.to_dict()))
+        backend_fingerprints.add(attestation.attestation_fingerprint)
+        payload_fingerprints.add(payload.payload_fingerprint)
+        canonical_payloads.add(serialized)
+        canonical_hashes.add(hashlib.sha256(serialized).hexdigest())
+        assert attestation.command_resolution.wrapper_root_identity.size == 0
+        assert attestation.selected_version_root_identity.size == 0
+        assert payload.source_repository_identity.size == 0
+        assert mutable_identity.size == 0
+    assert vector_label == "PRE_COMMIT_PROVISIONAL_NOT_AUTHORIZABLE"
+    assert len(source_identities) == len(wrapper_identities) == len(selected_identities) == len(mutable_identities) == 1
+    assert len(command_resolution_fingerprints) == len(backend_fingerprints) == len(payload_fingerprints) == 1
+    assert len(canonical_payloads) == len(canonical_hashes) == 1

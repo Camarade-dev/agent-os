@@ -117,6 +117,32 @@ points, malformed roots, and overlapping source/work/evidence locations are
 refused. Sibling inventories recursively hash contents and include filesystem
 identity, so same-name replacement changes are visible.
 
+The filesystem mode is also the explicit entry-kind authority: only regular
+files and directories are accepted. Sockets, devices, other special files,
+symlinks, junctions, and redirecting reparse points cannot become
+authority-bearing entries. Regular files retain their exact observed byte size
+and, where content identity is required, SHA-256. Windows directory `st_size`
+is not stable authority, so every serialized directory identity uses the
+canonical size value `0`, derived only after the mode proves the entry is a
+directory. A persisted directory identity carrying any other size is rejected;
+it is never silently normalized during JSON loading. Device, inode/Windows file
+identity, directory mode/type, file attributes, and mtime remain bound for
+immutable directory authority. Intentionally mutable workspace and evidence
+roots deliberately exclude raw directory size and directory mtime/allocation
+metadata, which may change during expected child creation, while continuing to
+bind device, inode/Windows file identity, directory mode/type, file
+attributes, and non-reparse status. Therefore legitimate child creation does
+not invalidate a mutable root, but replacing the physical directory at the
+same canonical path still fails; replacement with a symlink, junction, reparse
+path, sibling directory, or substituted parent also fails.
+
+This normalized directory record is local, non-cryptographic identity. It does
+not prove publisher provenance, complete directory contents, continuous
+containment, or protection from a hostile local process. Material authority is
+provided separately by the relevant complete version inventory and selected
+version, exact launcher-file identities and hashes, deterministic child-root
+relationships, material snapshots, and source Git HEAD/cleanliness checks.
+
 The invocation-artifact directory is a pre-created bounded child of the exact
 evidence store. Its containment, existing components, reparse status, and
 identity are validated before request publication, before process invocation,
@@ -217,6 +243,16 @@ authorized; the final owner decision must reference only that post-commit v3
 payload. The serialized source path is not trusted by itself: final
 authorization independently rebinds it, including filesystem identity, to the
 trusted active Agent OS repository whose HEAD and cleanliness are checked.
+
+Act 2A.3C keeps the v3 field shape: the existing `size` field is exact bytes for
+a regular file and canonical `0` for a directory. Pre-repair v3 records with a
+nonzero directory size now fail structural validation. No v3 live run was
+authorized or executed before this repair, and every pre-repair v3 preview,
+payload fingerprint, canonical-byte hash, and digest input is invalid even if
+its observed directory size happened to be zero. A fresh real-CLI preview from
+the new clean committed HEAD and a fresh local attestation is mandatory before
+any later owner decision. The implementation-time reproducibility vectors are
+`PRE_COMMIT_PROVISIONAL_NOT_AUTHORIZABLE`, not live authorization material.
 
 v3 also binds `backend_readiness_reason` under an exact class/reason pairing —
 `LOCAL_WRAPPER_CHAIN` ↔ `LOCAL_CURSOR_WRAPPER_CHAIN_ATTESTED_FOR_EXPERIMENT`,
