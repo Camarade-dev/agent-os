@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
-import errno
 import json
 import os
 from pathlib import Path
-import tempfile
 import time
 
+from admissible.delegated_gate.durability import (
+    DurabilityAdapterError,
+    PlatformDurabilityAdapter,
+    PostPublicationReloadFailure,
+    PublicationConflict,
+    PublicationMode,
+    PublicationVisibleButMetadataUncertain,
+    ReplacementAuthority,
+)
 from admissible.delegated_gate.invariants import validate_state
 from admissible.delegated_gate.state import DelegatedSessionState, Phase
 
@@ -121,12 +128,19 @@ class _FileLock:
 class AtomicDelegatedSessionStore:
     """One validated JSON authority file per session with locked CAS replacement."""
 
-    def __init__(self, directory: str | Path, *, lock_timeout: float = 5.0) -> None:
+    def __init__(
+        self,
+        directory: str | Path,
+        *,
+        lock_timeout: float = 5.0,
+        durability_adapter: PlatformDurabilityAdapter | None = None,
+    ) -> None:
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         if lock_timeout <= 0:
             raise ValueError("lock_timeout must be positive")
         self.lock_timeout = lock_timeout
+        self.durability_adapter = durability_adapter or PlatformDurabilityAdapter()
 
     def _path(self, session_id: str) -> Path:
         if (
@@ -159,71 +173,49 @@ class AtomicDelegatedSessionStore:
             raise PersistedStateInvalid("persisted session ID differs from its filename")
         return state
 
-    @staticmethod
-    def _directory_fsync_unsupported(exc: OSError) -> bool:
-        unsupported = {errno.EINVAL, errno.ENOTSUP}
-        if hasattr(errno, "EOPNOTSUPP"):
-            unsupported.add(errno.EOPNOTSUPP)
-        if os.name == "nt":
-            unsupported.update({errno.EACCES, errno.EPERM})
-        return exc.errno in unsupported
-
-    def _fsync_directory(self) -> None:
+    def _durable_publish(
+        self,
+        path: Path,
+        state: DelegatedSessionState,
+        *,
+        mode: PublicationMode,
+    ) -> None:
         try:
-            directory_fd = os.open(str(self.directory), os.O_RDONLY)
-        except OSError as exc:
-            if self._directory_fsync_unsupported(exc):
-                return
-            raise DurabilityError(f"cannot open delegated store directory for fsync: {exc}") from exc
-        try:
-            os.fsync(directory_fd)
-        except OSError as exc:
-            if not self._directory_fsync_unsupported(exc):
-                raise DurabilityError(f"delegated store directory fsync failed: {exc}") from exc
-        finally:
-            os.close(directory_fd)
-
-    def _atomic_replace(self, path: Path, state: DelegatedSessionState) -> None:
-        temp_name: str | None = None
-        try:
-            fd, temp_name = tempfile.mkstemp(
-                prefix=f".{path.name}.", suffix=".tmp", dir=self.directory
+            self.durability_adapter.publish(
+                path,
+                self._serialized(state),
+                mode=mode,
+                replacement_authority=(
+                    ReplacementAuthority.CAS_LOCK_HELD_AFTER_VALIDATION
+                    if mode is PublicationMode.REPLACE_EXISTING
+                    else None
+                ),
             )
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(self._serialized(state))
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp_name, path)
-            temp_name = None
+        except PublicationConflict as exc:
+            raise SessionAlreadyExists(state.session_id) from exc
+        except PublicationVisibleButMetadataUncertain as exc:
             try:
-                self._fsync_directory()
-            except DurabilityError as exc:
-                try:
-                    visible = self._read_validated(path, state.session_id)
-                    visibility_confirmed = visible.canonical_bytes() == state.canonical_bytes()
-                except DelegatedGateStoreError:
-                    visibility_confirmed = False
-                raise CommittedButDurabilityUncertain(
-                    session_id=state.session_id,
-                    committed_revision=state.revision,
-                    visibility_confirmed=visibility_confirmed,
-                    original_error=exc,
-                ) from exc
-            # Persistence is authoritative only after a fresh disk reconstruction
-            # passes every invariant and is byte-equivalent to the intended state.
-            reconstructed = self._read_validated(path, state.session_id)
-            if reconstructed.canonical_bytes() != state.canonical_bytes():
-                raise PersistedStateInvalid("post-replace reconstruction differs from intended state")
-        except DelegatedGateStoreError:
-            raise
-        except OSError as exc:
-            raise DurabilityError(f"delegated session atomic replacement failed: {exc}") from exc
-        finally:
-            if temp_name is not None and os.path.exists(temp_name):
-                try:
-                    os.unlink(temp_name)
-                except OSError:
-                    pass
+                visible = self._read_validated(path, state.session_id)
+                visibility_confirmed = visible.canonical_bytes() == state.canonical_bytes()
+            except DelegatedGateStoreError:
+                visibility_confirmed = False
+            raise CommittedButDurabilityUncertain(
+                session_id=state.session_id,
+                committed_revision=state.revision,
+                visibility_confirmed=visibility_confirmed,
+                original_error=exc,
+            ) from exc
+        except PostPublicationReloadFailure as exc:
+            raise PersistedStateInvalid(
+                f"{exc.reason_code}: delegated state publication cannot be reloaded exactly"
+            ) from exc
+        except DurabilityAdapterError as exc:
+            raise DurabilityError(f"{exc.reason_code}: {exc}") from exc
+        # Persistence is authoritative only after the production state parser
+        # reconstructs every invariant and the canonical object is exact.
+        reconstructed = self._read_validated(path, state.session_id)
+        if reconstructed.canonical_bytes() != state.canonical_bytes():
+            raise PersistedStateInvalid("post-publication reconstruction differs from intended state")
 
     def create(self, state: DelegatedSessionState) -> None:
         if state.revision != 0:
@@ -236,7 +228,7 @@ class AtomicDelegatedSessionStore:
                 raise PersistedStateInvalid(str(exc)) from exc
             if path.exists():
                 raise SessionAlreadyExists(state.session_id)
-            self._atomic_replace(path, state)
+            self._durable_publish(path, state, mode=PublicationMode.CREATE_ONLY)
 
     def load(self, session_id: str) -> DelegatedSessionState:
         return self._read_validated(self._path(session_id), session_id)
@@ -297,4 +289,4 @@ class AtomicDelegatedSessionStore:
                     f"expected revision {expected_revision}, found {current.revision}"
                 )
             self._validate_successor(current, state)
-            self._atomic_replace(path, state)
+            self._durable_publish(path, state, mode=PublicationMode.REPLACE_EXISTING)

@@ -17,6 +17,13 @@ from typing import Callable
 import pytest
 
 from admissible.delegated_gate.canonical import fingerprint
+from admissible.delegated_gate.durability import (
+    CapabilityStep,
+    DurabilityCapabilityResult,
+    PlatformDurabilityAdapter,
+    PublicationMetadataDurability,
+    PublicationVisibleButMetadataUncertain,
+)
 from admissible.delegated_gate.native_canary import (
     CANARY_MISSION,
     EXPECTED_MATERIAL_PATHS,
@@ -62,6 +69,7 @@ from admissible.delegated_gate.native_executor import (
     NativePreflightStatus,
     NativeProcessInvocation,
     NativeProcessOutcome,
+    NativeRequestAlreadyExists,
     NativeResultAlreadyExists,
     OBSERVATION_PROVEN_EMPTY,
     preflight_native_cursor,
@@ -251,12 +259,17 @@ def _injected_test_cursor(tmp_path: Path) -> tuple[CursorNativeBackendConfig, Ca
     return config, lambda configured: _test_attestation(configured, installation)
 
 
-def _harness(tmp_path: Path, *, runner: FakeNativeProcessRunner | None = None, directory_sync: Callable[[Path], None] | None = None) -> Harness:
+def _harness(
+    tmp_path: Path,
+    *,
+    runner: FakeNativeProcessRunner | None = None,
+    durability_adapter: PlatformDurabilityAdapter | None = None,
+) -> Harness:
     source_parent=tmp_path/"source-parent"; source_parent.mkdir(); source=build_canary_repository(source_parent,repository_name="source").repository
     root=tmp_path/"run"; root.mkdir(); work=build_canary_repository(root).repository; evidence=root/"evidence"; evidence.mkdir()
     config, attestor = _injected_test_cursor(tmp_path)
     attestation = attestor(config)
-    fake=runner or FakeNativeProcessRunner(); store=AtomicNativeExecutionStore(evidence/"native-execution",directory_sync=directory_sync or (lambda _: None)); session_store=AtomicDelegatedSessionStore(evidence/"delegated-state")
+    fake=runner or FakeNativeProcessRunner(); store=AtomicNativeExecutionStore(evidence/"native-execution",durability_adapter=durability_adapter); session_store=AtomicDelegatedSessionStore(evidence/"delegated-state")
     session_id="native-canary-session"; session_store.create(create_canary_session(session_id=session_id)); executor=NativeDelegatedExecutor(config=config,process_runner=fake,clock=Clock(),local_attestor=attestor)
     coordinator=NativeCanaryCoordinator(session_store=session_store,execution_store=store,executor=executor,backend_attestation=attestation,source_repository=source,work_workspace=work,canary_parent=root,evidence_directory=evidence,timeout_seconds=30,stdout_byte_limit=4096,stderr_byte_limit=2048)
     return Harness(root,source,work,evidence,config,attestation,fake,store,session_store,executor,coordinator,session_id)
@@ -319,6 +332,16 @@ def test_request_round_trip_is_attestation_bound_and_attempt_one_is_rejected(tmp
     h=_harness(tmp_path); request,_=_request(h); assert NativeExecutionRequest.from_dict(json.loads(json.dumps(request.to_dict())))==request
     raw=request.to_dict(); raw["execution_attempt_index"]=1; raw["request_fingerprint"]=fingerprint({key:value for key,value in raw.items() if key!="request_fingerprint"})
     with pytest.raises(ValueError): NativeExecutionRequest.from_dict(raw)
+
+
+def test_production_native_request_is_durable_reloaded_and_never_overwritten(tmp_path: Path):
+    h=_harness(tmp_path); request,_=_request(h)
+    h.store.create_request(request)
+    path=h.store._path("request",request.session_id,request.gate_id,0)
+    original=path.read_bytes()
+    assert h.store.load_request(request.session_id,request.gate_id,0)==request
+    with pytest.raises(NativeRequestAlreadyExists): h.store.create_request(request)
+    assert path.read_bytes()==original
 
 
 def test_inert_request_parse_needs_fresh_local_attestation_before_execution(tmp_path: Path):
@@ -434,7 +457,7 @@ def test_real_windows_junction_workspace_and_evidence_root_are_refused(tmp_path:
     with pytest.raises(ValueError): NativeExecutionRequest.create(session_id=state.session_id,gate_id=state.current_gate.gate_id,execution_attempt_index=0,mission_fingerprint=state.mission.mission_fingerprint,gate_contract_fingerprint=state.current_gate.contract_fingerprint,work_workspace=junction,evidence_store_root=h.store.directory,artifact_directory=h.store.artifact_directory,attestation=h.attestation,prompt=prompt,timeout_seconds=30,stdout_byte_limit=10,stderr_byte_limit=10)
     evidence_link=tmp_path/"evidence-junction"; completed=subprocess.run(["cmd.exe","/d","/c","mklink","/J",str(evidence_link),str(h.evidence)],shell=False,capture_output=True)
     if completed.returncode == 0:
-        with pytest.raises(ValueError): AtomicNativeExecutionStore(evidence_link/"store",directory_sync=lambda _:None)
+        with pytest.raises(ValueError): AtomicNativeExecutionStore(evidence_link/"store")
 
 
 def test_redirecting_artifact_destination_blocks_before_fake_process(tmp_path: Path):
@@ -477,17 +500,36 @@ def test_nested_existing_sibling_mutation_is_detected(tmp_path: Path):
 
 
 def test_directory_durability_uncertainty_blocks_before_provider(tmp_path: Path):
-    def fail(_: Path) -> None: raise OSError("directory flush unsupported")
-    h=_harness(tmp_path,directory_sync=fail); outcome=h.coordinator.run(session_id=h.session_id)
+    class UncertainAfterPublication(PlatformDurabilityAdapter):
+        def publish(self, final_path, data, *, mode, replacement_authority=None):
+            result=super().publish(final_path,data,mode=mode,replacement_authority=replacement_authority)
+            raise PublicationVisibleButMetadataUncertain(
+                "injected metadata durability uncertainty",
+                path=Path(final_path),
+                file_content_durable=True,
+                publication_visible=True,
+                metadata_status=PublicationMetadataDurability.PUBLICATION_METADATA_UNCERTAIN,
+            )
+    h=_harness(tmp_path,durability_adapter=UncertainAfterPublication()); outcome=h.coordinator.run(session_id=h.session_id)
     assert outcome.status is NativeCanaryStatus.DURABILITY_UNCERTAIN and h.runner.invocations==[]
 
 
 def test_behavioral_record_directory_durability_uncertainty_is_visible_and_never_captures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    calls={"sync":0,"capture":0}
-    def sync(_: Path) -> None:
-        calls["sync"]+=1
-        if calls["sync"] == 6: raise OSError("behavioral record directory fsync failed")
-    h=_harness(tmp_path,directory_sync=sync)
+    calls={"publish":0,"capture":0}
+    class SixthPublicationUncertain(PlatformDurabilityAdapter):
+        def publish(self, final_path, data, *, mode, replacement_authority=None):
+            result=super().publish(final_path,data,mode=mode,replacement_authority=replacement_authority)
+            calls["publish"]+=1
+            if calls["publish"] == 6:
+                raise PublicationVisibleButMetadataUncertain(
+                    "injected behavioral metadata durability uncertainty",
+                    path=Path(final_path),
+                    file_content_durable=True,
+                    publication_visible=True,
+                    metadata_status=PublicationMetadataDurability.PUBLICATION_METADATA_UNCERTAIN,
+                )
+            return result
+    h=_harness(tmp_path,durability_adapter=SixthPublicationUncertain())
     def capture(**kwargs: object) -> object:
         calls["capture"]+=1
         raise AssertionError("checkpoint must not be reached after behavioral durability uncertainty")
@@ -567,6 +609,31 @@ def test_started_capture_record_is_ambiguous_and_never_replayed(tmp_path: Path):
     request,prompt=_request(h); h.store.create_request(request); issued=h.executor.execute(request=request,prompt=prompt,source_repository=h.source,canary_parent=h.root,allowed_parent_children=frozenset({h.work.name}),evidence_store_root=h.store.directory,artifact_directory=h.store.artifact_directory); result=h.store.write_result(issued); behavioral=run_behavioral_verifier(request=request,execution_store=h.store)
     h.store.create_capture_attempt(request=request,result=result,gate_plan_fingerprint=state.gate_plan.plan_fingerprint,checkpoint_contract_fingerprint=state.current_gate.contract_fingerprint,behavioral_evidence_fingerprint=behavioral.evidence_fingerprint,required_command_ids=tuple(command.command_id for command in state.current_gate.checkpoint_verification_commands),state_revision=state.revision)
     outcome=h.coordinator.run(session_id=h.session_id); assert outcome.status is NativeCanaryStatus.CAPTURE_ATTEMPT_AMBIGUOUS and len(h.runner.invocations)==1
+
+
+def test_restart_with_visible_request_and_no_result_is_inert_no_retry(tmp_path: Path):
+    h=_harness(tmp_path); state=h.session_store.load(h.session_id)
+    started=__import__("admissible.delegated_gate.reducer",fromlist=["reduce"]).reduce(
+        state,
+        __import__("admissible.delegated_gate.events",fromlist=["GateExecutionStarted"]).GateExecutionStarted(state.current_gate.gate_id),
+    )
+    h.session_store.replace(started,expected_revision=state.revision)
+    request,_=_request(h); h.store.create_request(request)
+    restarted_store=AtomicNativeExecutionStore(h.store.directory)
+    restarted_sessions=AtomicDelegatedSessionStore(h.session_store.directory)
+    restarted=NativeCanaryCoordinator(
+        session_store=restarted_sessions,execution_store=restarted_store,executor=h.executor,
+        backend_attestation=h.attestation,source_repository=h.source,work_workspace=h.work,
+        canary_parent=h.root,evidence_directory=h.evidence,timeout_seconds=30,
+        stdout_byte_limit=4096,stderr_byte_limit=2048,
+    )
+    outcome=restarted.run(session_id=h.session_id)
+    assert outcome.status is NativeCanaryStatus.EXECUTION_RESULT_MISSING_NO_RETRY
+    assert restarted_sessions.load(h.session_id).phase is Phase.GATE_EXECUTING
+    assert not restarted_store.has_result(h.session_id,"native-canary-gate",0)
+    assert not restarted_store.has_capture_attempt(h.session_id,"native-canary-gate",0)
+    assert h.runner.invocations==[]
+    assert not tuple(restarted_store.directory.glob("*.attempt-1.*"))
 
 
 def test_checkpoint_artifact_tamper_blocks_final_reconstruction(tmp_path: Path):
@@ -906,7 +973,7 @@ def _wrapper_chain_harness(tmp_path: Path) -> tuple[Harness, FakeWrapperChainDis
     discovery = FakeWrapperChainDiscovery(install_root)
     attestor = lambda config: _attest_wrapper_chain_cursor(config, discovery=discovery)
     attestation = attestor(_WRAPPER_CONFIG)
-    fake = FakeNativeProcessRunner(); store = AtomicNativeExecutionStore(evidence / "native-execution", directory_sync=lambda _: None); session_store = AtomicDelegatedSessionStore(evidence / "delegated-state")
+    fake = FakeNativeProcessRunner(); store = AtomicNativeExecutionStore(evidence / "native-execution"); session_store = AtomicDelegatedSessionStore(evidence / "delegated-state")
     session_id = "wrapper-chain-session"; session_store.create(create_canary_session(session_id=session_id))
     executor = NativeDelegatedExecutor(config=_WRAPPER_CONFIG, process_runner=fake, clock=Clock(), local_attestor=attestor)
     coordinator = NativeCanaryCoordinator(session_store=session_store, execution_store=store, executor=executor, backend_attestation=attestation, source_repository=source, work_workspace=work, canary_parent=root, evidence_directory=evidence, timeout_seconds=30, stdout_byte_limit=4096, stderr_byte_limit=2048)
@@ -1297,7 +1364,102 @@ def test_cli_preflight_only_rebinds_source_and_exposes_complete_payload_without_
     for key in NativeCanaryAuthorizationPayload.__dataclass_fields__:
         assert key in payload
     assert payload["source_repository"] == str(h.source)
+    assert emitted["durability_capability"]["ready"] is True
+    assert "durability_capability" not in payload
     assert not run_root.exists() and h.runner.invocations == []
+
+
+def _ready_durability_capability() -> DurabilityCapabilityResult:
+    return DurabilityCapabilityResult(
+        platform="nt",
+        profile_id="admissible_platform_durability_windows_movefileex_write_through_v1",
+        filesystem_identity={"device": 1, "drive": "C:"},
+        create_only_result=CapabilityStep.CONFLICT_PRESERVED,
+        replace_result=CapabilityStep.SUCCEEDED,
+        cleanup_result=CapabilityStep.SUCCEEDED,
+        reason_code="PLATFORM_DURABILITY_CAPABILITY_READY",
+        detail="synthetic production-path capability result",
+    )
+
+
+def test_capability_probe_precedes_payload_and_owner_digest_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    import admissible.delegated_gate.native_canary as native_canary_module
+
+    h=_harness(tmp_path); head=_command(["git","rev-parse","HEAD"],cwd=h.source).stdout.strip()
+    run_root=tmp_path/"ordered-future-run"
+    decision=NativePreflightDecision(NativePreflightStatus.PREFLIGHT_READY,PACKAGE_BIN_READY_REASON,"synthetic test preflight",h.attestation)
+    events: list[str]=[]
+    monkeypatch.setattr(native_canary_module,"preflight_native_cursor",lambda *,config: decision)
+    def probe(**kwargs):
+        events.append("capability")
+        assert not run_root.exists()
+        return _ready_durability_capability()
+    original_build=native_canary_module.build_authorization_payload
+    def build(**kwargs):
+        events.append("payload")
+        return original_build(**kwargs)
+    def authorized(*args,**kwargs):
+        events.append("owner")
+        return False
+    monkeypatch.setattr(native_canary_module,"probe_platform_durability",probe)
+    monkeypatch.setattr(native_canary_module,"build_authorization_payload",build)
+    monkeypatch.setattr(native_canary_module,"_authorized",authorized)
+    args=["--source-repository",str(h.source),"--required-source-head",head,"--run-root",str(run_root),"--run-id","ordered-future-run","--session-id",h.session_id,"--executable",h.config.executable,"--executable-prefix-arg",h.config.launcher_prefix[0],"--timeout-seconds","30","--owner-authorization","synthetic"]
+    assert main(args)==2
+    assert events==["capability","payload","owner"]
+    assert not run_root.exists() and h.runner.invocations==[]
+    assert json.loads(capsys.readouterr().out)["status"]==NativeCanaryStatus.PREFLIGHT_BLOCKED.value
+
+
+def test_unsupported_capability_blocks_before_payload_authorization_and_run_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    import admissible.delegated_gate.native_canary as native_canary_module
+
+    h=_harness(tmp_path); head=_command(["git","rev-parse","HEAD"],cwd=h.source).stdout.strip()
+    run_root=tmp_path/"blocked-future-run"
+    decision=NativePreflightDecision(NativePreflightStatus.PREFLIGHT_READY,PACKAGE_BIN_READY_REASON,"synthetic test preflight",h.attestation)
+    blocked_capability=replace(
+        _ready_durability_capability(),
+        create_only_result=CapabilityStep.FAILED,
+        replace_result=CapabilityStep.NOT_RUN,
+        reason_code="PUBLICATION_API_UNAVAILABLE",
+        detail="write-through publication unavailable",
+    )
+    monkeypatch.setattr(native_canary_module,"preflight_native_cursor",lambda *,config: decision)
+    monkeypatch.setattr(native_canary_module,"probe_platform_durability",lambda **kwargs: blocked_capability)
+    monkeypatch.setattr(native_canary_module,"build_authorization_payload",lambda **kwargs: (_ for _ in ()).throw(AssertionError("payload construction must be downstream")))
+    monkeypatch.setattr(native_canary_module,"_authorized",lambda *args,**kwargs: (_ for _ in ()).throw(AssertionError("owner digest must not be inspected")))
+    args=["--source-repository",str(h.source),"--required-source-head",head,"--run-root",str(run_root),"--run-id","blocked-future-run","--session-id",h.session_id,"--executable",h.config.executable,"--executable-prefix-arg",h.config.launcher_prefix[0],"--timeout-seconds","30","--owner-authorization","synthetic"]
+    assert main(args)==2
+    emitted=json.loads(capsys.readouterr().out)
+    assert emitted["reason_code"]=="PUBLICATION_API_UNAVAILABLE"
+    assert emitted["durability_capability"]["cleanup_result"]==CapabilityStep.SUCCEEDED.value
+    assert not run_root.exists() and h.runner.invocations==[]
+
+
+def test_cli_rejects_existing_terminal_shaped_run_before_probe_or_authorization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    import admissible.delegated_gate.native_canary as native_canary_module
+
+    h=_harness(tmp_path); head=_command(["git","rev-parse","HEAD"],cwd=h.source).stdout.strip()
+    run_root=tmp_path/"synthetic-terminal-run"; evidence=run_root/"evidence"; evidence.mkdir(parents=True)
+    terminal=evidence/"final-status.json"; terminal.write_bytes(b'{"status":"DURABILITY_UNCERTAIN"}\n')
+    before=terminal.read_bytes()
+    decision=NativePreflightDecision(NativePreflightStatus.PREFLIGHT_READY,PACKAGE_BIN_READY_REASON,"synthetic test preflight",h.attestation)
+    monkeypatch.setattr(native_canary_module,"preflight_native_cursor",lambda *,config: decision)
+    monkeypatch.setattr(native_canary_module,"probe_platform_durability",lambda **kwargs: (_ for _ in ()).throw(AssertionError("existing root must block before probe")))
+    monkeypatch.setattr(native_canary_module,"build_authorization_payload",lambda **kwargs: (_ for _ in ()).throw(AssertionError("existing root must block before payload")))
+    monkeypatch.setattr(native_canary_module,"_authorized",lambda *args,**kwargs: (_ for _ in ()).throw(AssertionError("existing root must block before owner validation")))
+    args=["--source-repository",str(h.source),"--required-source-head",head,"--run-root",str(run_root),"--run-id","synthetic-terminal-run","--session-id",h.session_id,"--executable",h.config.executable,"--executable-prefix-arg",h.config.launcher_prefix[0],"--timeout-seconds","30","--owner-authorization","synthetic"]
+    assert main(args)==2
+    emitted=json.loads(capsys.readouterr().out)
+    assert emitted["status"]==NativeCanaryStatus.PREFLIGHT_BLOCKED.value
+    assert "fresh" in emitted["detail"]
+    assert terminal.read_bytes()==before and h.runner.invocations==[]
 
 
 # --- Act 2A.3C: deterministic directory identity normalization -------------

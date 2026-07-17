@@ -20,6 +20,11 @@ import weakref
 import pytest
 
 import admissible.delegated_gate as delegated_gate_package
+from admissible.delegated_gate.durability import (
+    PlatformDurabilityAdapter,
+    PublicationMetadataDurability,
+    PublicationVisibleButMetadataUncertain,
+)
 
 from admissible.delegated_gate import (
     ArtifactReference,
@@ -1376,15 +1381,26 @@ def test_restart_reconstruction_preserves_every_authoritative_value(tmp_path: Pa
 
 
 def test_post_replace_durability_uncertainty_is_typed_and_visible(tmp_path: Path, monkeypatch):
-    from admissible.delegated_gate.store import DurabilityError
+    class UncertainAfterPublication(PlatformDurabilityAdapter):
+        def publish(self, final_path, data, *, mode, replacement_authority=None):
+            super().publish(
+                final_path,
+                data,
+                mode=mode,
+                replacement_authority=replacement_authority,
+            )
+            raise PublicationVisibleButMetadataUncertain(
+                "injected directory durability failure",
+                path=Path(final_path),
+                file_content_durable=True,
+                publication_visible=True,
+                metadata_status=PublicationMetadataDurability.PUBLICATION_METADATA_UNCERTAIN,
+            )
 
-    store = AtomicDelegatedSessionStore(tmp_path / "sessions")
+    store = AtomicDelegatedSessionStore(
+        tmp_path / "sessions", durability_adapter=UncertainAfterPublication()
+    )
     initial = state_with_plan(session_id="uncertain-session")
-
-    def fail_directory_fsync():
-        raise DurabilityError("injected directory durability failure")
-
-    monkeypatch.setattr(store, "_fsync_directory", fail_directory_fsync)
     with pytest.raises(CommittedButDurabilityUncertain) as raised:
         store.create(initial)
     assert raised.value.committed_revision == 0

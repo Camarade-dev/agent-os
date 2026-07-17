@@ -196,16 +196,29 @@ checkpoint admission.
 ## Persistence and restart
 
 `AtomicDelegatedSessionStore` is a sibling store, not a widening of V0
-`AtomicSessionStore`. It locks one session authority file, validates the entire
-state, enforces compare-and-swap revision advancement, fsyncs a temporary file,
-atomically replaces the authority file, attempts directory durability, and then
-reconstructs and revalidates the state from disk. A stale revision, malformed
-JSON, fingerprint mismatch, unknown field, or invariant violation fails closed.
-Post-replace directory-durability failure is reported as a typed committed-but-
-uncertain outcome with a visibility check, rather than as a retry-safe
-pre-commit failure. Replacement also rejects mission/plan changes, history
-rewrites, non-adjacent phases, and any successor of `COMPLETED`. No state held
-only in memory grants authority after restart.
+`AtomicSessionStore`. It and the native-execution store use one shared platform
+durability adapter. Revision-zero creation is `CREATE_ONLY`; replacement is
+`REPLACE_EXISTING` and is callable only while the session lock is held after
+the expected-revision/CAS and successor checks succeed. An existing create-only
+destination is never overwritten.
+
+Every publication writes complete canonical bytes to a same-directory
+temporary file, flushes Python buffers, and durably flushes the file handle.
+POSIX then atomically publishes and requires parent-directory open plus fsync.
+Native Windows instead uses the wide Win32 `MoveFileExW` write-through metadata
+publication primitive and never calls or suppresses an unsupported POSIX
+directory open/fsync. Both paths require final visibility, absence of the
+temporary name, exact byte reload, and full production state reconstruction
+before success. File durability, visibility, durable metadata, unsupported
+metadata, and uncertain metadata are separately typed; visibility alone is not
+authority.
+
+A stale revision, malformed JSON, fingerprint mismatch, unknown field, or
+invariant violation fails closed. Post-publication metadata uncertainty is
+reported as a typed committed-but-uncertain outcome with a visibility check,
+rather than as a retry-safe pre-commit failure. Replacement also rejects
+mission/plan changes, history rewrites, non-adjacent phases, and any successor
+of `COMPLETED`. No state held only in memory grants authority after restart.
 
 ## Build Week limits
 

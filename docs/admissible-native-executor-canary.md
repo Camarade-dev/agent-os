@@ -2,8 +2,13 @@
 
 ## Status and boundary
 
-Act 2A is an unrun, one-shot canary harness. No live Cursor, Codex, Claude, or
-other provider invocation has occurred. It is not an OS sandbox, credential
+Act 2A remains a one-shot canary harness. The terminal run
+`native-cursor-canary-001` consumed its one authorization and entered
+`GATE_EXECUTING`, but durable request publication stopped before native/provider
+eligibility. It has no native result or checkpoint, provider/native execution
+remained zero, and the run is immutable, terminal, non-resumable evidence. It
+must never be repaired, retried, or reused. No live Cursor, Codex, Claude, or
+other provider invocation has occurred. The harness is not an OS sandbox, credential
 isolation system, global filesystem monitor, command-level monitor, push
 broker, or production containment boundary.
 
@@ -118,13 +123,37 @@ commit count, complete message, changed paths, remotes, status, and material
 tree are independently recomputed from the assigned workspace rather than
 accepted as self-fingerprinted success claims.
 
-Request, result, behavioral-verifier, capture-attempt, and terminal records use lock-protected
-write-once publication, file fsync, directory durability attempt, and reload
-validation. A committed-but-directory-durability-uncertain write is a blocking
-boundary, never full durability. Results verify stdout/stderr artifacts before
-and after publication. Behavioral script/stdout/stderr artifacts and their
-strict evidence record use this same durable write-once boundary; no checkpoint
-may follow behavioral durability uncertainty.
+Request, result, behavioral-verifier, capture-attempt, terminal, and native
+artifact records use one shared platform durability adapter. Immutable records
+use `CREATE_ONLY`; an existing destination is a typed conflict and is never
+overwritten. Delegated-state replacement alone uses `REPLACE_EXISTING`, and
+only after its lock is held and its expected-revision/CAS precondition has been
+validated. No caller treats final-path visibility as durability.
+
+On POSIX, the adapter creates a same-directory temporary file, writes all
+canonical bytes, flushes Python buffers, fsyncs the file, atomically publishes,
+then opens and fsyncs the parent directory. Directory-open and directory-fsync
+errors remain fail-closed; neither is suppressed as success.
+
+On native Windows, the same complete canonical write and Python flush are
+followed by file-handle `os.fsync`. Publication then calls the bound wide Win32
+`MoveFileExW` API with `MOVEFILE_WRITE_THROUGH`; replacement additionally and
+exclusively uses `MOVEFILE_REPLACE_EXISTING`. The temporary source is in the
+destination directory and must be on the same volume. Windows never calls the
+unsupported POSIX directory-open/fsync path and never suppresses `EACCES` or
+`EPERM`. Success requires the temporary name to be absent, the final name to be
+visible, exact byte reload, and production canonical parser/fingerprint
+validation before eligibility. API unavailability, pre-visibility failure,
+visible-but-metadata-uncertain failure, reload failure, fingerprint mismatch,
+and cleanup failure remain distinct typed failures.
+
+The Windows guarantee is limited to canonical file contents durably flushed
+through the file handle, metadata publication through the documented
+write-through move primitive on the actively tested volume/API, and final
+canonical reload/fingerprint verification before eligibility. It does not
+claim protection against hostile local processes, faulty hardware, remote
+filesystems, or guarantees beyond that active volume and API. POSIX continues
+to require both file fsync and parent-directory fsync.
 
 ## Measured path boundary
 
@@ -231,21 +260,33 @@ state must be exactly `CHECKPOINT_CAPTURED` with no audit or repair history.
 ## Future live authorization
 
 The future-only entry point is `python -m admissible.delegated_gate.native_canary`.
-For a live authorization, it first performs read-only local backend preflight
-and obtains the concrete attestation; constructs and structurally validates the
-canonical v3 payload; independently rebinds its signed source path and
-filesystem identity to the trusted active source repository; and freshly
-validates that active repository's Git root, exact required HEAD, and clean
-worktree. It then revalidates complete payload/source authority, recomputes the
-canonical payload bytes and phrase-bound owner digest, and compares the
-expected digest in constant time. Only after that successful authorization does
-it validate the fresh proposed run root and create the run root, fixture
-workspace, and evidence structure. The fresh run root is named exactly for the
-run ID, so an authorization payload cannot be silently reused for another root.
+For a live authorization, it first completes source/backend/gate preflight and
+freshly validates the active repository's exact Git root, required HEAD, and
+clean worktree. Before canonical payload construction or any owner digest
+validation, it exercises the exact shared production adapter in one fresh,
+non-redirecting disposable directory outside both source and the proposed run
+root, preferably under the proposed root's parent. The probe proves
+create-only publication plus conflict preservation, authorized replacement,
+exact final bytes, temporary-name removal, filesystem/volume identity where
+available, and complete cleanup. Platform support is capability-tested on the
+active volume/API; it is not inferred merely from `os.name`.
 
-`--preflight-only` prints the canonical non-secret authorization payload,
-attestation, and separate non-authoritative `where_diagnostic` without creating
-a workspace or invoking a provider. The owner
+Only after that probe succeeds does the CLI construct and validate the
+unchanged canonical v3 payload, rebind its source identity, validate the owner
+digest, consume authorization, recheck fresh-root conditions, and create the
+run root, fixture, delegated state, and native request. Unsupported, uncertain,
+failed, or incompletely cleaned durability capability is `PREFLIGHT_BLOCKED`
+before owner authorization and creates no run root. Native/provider eligibility
+remains strictly downstream of delegated-state and native-request durable
+publication plus production reload validation.
+
+`--preflight-only` executes the same production durability probe and prints its
+typed non-secret `durability_capability` as a separate diagnostic alongside the
+canonical authorization payload, attestation, and non-authoritative
+`where_diagnostic`. The capability diagnostic is outside canonical payload and
+owner-digest bytes; authorization schema v3 is unchanged. The disposable probe
+is removed before return and no workspace, canary run root, or provider is
+created. The owner
 digest is SHA-256 over `owner_phrase_utf8 + NUL + canonical_payload_bytes` and
 is never persisted or printed.
 
@@ -331,4 +372,7 @@ even so, the current CLI receives the phrase as a process argument, and that
 residual exposure is recorded truthfully in `canary_non_claims`.
 
 Hard budgets remain provider/native attempts `1/1`, repair/auditor/retry
-`0/0/0`. No independent model auditor exists, and no live canary has run.
+`0/0/0`. No independent model auditor exists. Any future live canary requires
+a new run ID, a new empty root, a new clean-HEAD preview, a new payload, a new
+owner decision, and a new one-time phrase. `native-cursor-canary-001` can never
+satisfy any of those conditions and is not executable authority.

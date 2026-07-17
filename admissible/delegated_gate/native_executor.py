@@ -19,7 +19,6 @@ import re
 import shutil
 import stat
 import subprocess
-import tempfile
 from typing import Any, Callable, Mapping, Protocol
 import weakref
 
@@ -35,6 +34,14 @@ from admissible.delegated_gate.canonical import (
     require_sha256,
     require_strict_int,
     require_string_list,
+)
+from admissible.delegated_gate.durability import (
+    DurabilityAdapterError,
+    PlatformDurabilityAdapter,
+    PostPublicationReloadFailure,
+    PublicationConflict,
+    PublicationMode,
+    PublicationVisibleButMetadataUncertain,
 )
 from admissible.delegated_gate.store import _FileLock
 from admissible.managed_process import (
@@ -2391,9 +2398,11 @@ def _write_artifact(*, store_root: Path, artifact_directory: Path, artifact_id: 
     _safe_artifact_directory(store_root, artifact_directory)
     destination = artifact_directory / f"{artifact_id}.txt"
     try:
-        with destination.open("xb") as handle:
-            handle.write(data); handle.flush(); os.fsync(handle.fileno())
-    except FileExistsError as exc: raise NativeExecutionStoreError("native output artifact is write-once") from exc
+        _publish_native_bytes(
+            PlatformDurabilityAdapter(), destination, data, operation=f"{purpose} artifact"
+        )
+    except FileExistsError as exc:
+        raise NativeExecutionStoreError("native output artifact is write-once") from exc
     _safe_file(destination, "native output artifact")
     return NativeArtifactReference(ARTIFACT_SCHEMA_VERSION, artifact_id, purpose, destination.relative_to(store_root).as_posix(), hashlib.sha256(data).hexdigest(), len(data), truncated).validated()
 
@@ -2581,26 +2590,51 @@ class NativeCanaryTerminalRecord:
         require_exact_keys(data, set(cls.__dataclass_fields__), "canary terminal"); values=dict(data); values["status"]=NativeCaptureTerminalStatus(data["status"]); return cls(**values).validated()
 
 
+def _publish_native_bytes(
+    adapter: PlatformDurabilityAdapter,
+    path: Path,
+    data: bytes,
+    *,
+    operation: str,
+) -> None:
+    try:
+        adapter.publish(path, data, mode=PublicationMode.CREATE_ONLY)
+    except PublicationConflict as exc:
+        raise FileExistsError(path) from exc
+    except PublicationVisibleButMetadataUncertain as exc:
+        raise NativeCommittedButDurabilityUncertain(
+            operation=operation, path=path, original_error=exc
+        ) from exc
+    except PostPublicationReloadFailure as exc:
+        raise NativeEvidenceInvalid(
+            f"{exc.reason_code}: {operation} reload failed: {exc}"
+        ) from exc
+    except DurabilityAdapterError as exc:
+        raise NativeExecutionStoreError(
+            f"{exc.reason_code}: {operation} publication failed: {exc}"
+        ) from exc
+
+
 class AtomicNativeExecutionStore:
     """Locked write-once request/result/capture sidecar with explicit durability."""
-    def __init__(self, directory: str | Path, *, lock_timeout: float = 5.0, directory_sync: Callable[[Path], None] | None = None) -> None:
+    def __init__(
+        self,
+        directory: str | Path,
+        *,
+        lock_timeout: float = 5.0,
+        durability_adapter: PlatformDurabilityAdapter | None = None,
+    ) -> None:
         self.directory, self.directory_identity = _safe_create_directory(directory, "native execution store")
         self.artifact_directory, self.artifact_directory_identity = _safe_create_directory(self.directory / "artifacts", "native artifact directory")
         if lock_timeout <= 0: raise ValueError("lock timeout must be positive")
-        self.lock_timeout = lock_timeout; self._directory_sync = directory_sync or self._default_directory_sync
+        self.lock_timeout = lock_timeout
+        self.durability_adapter = durability_adapter or PlatformDurabilityAdapter()
 
     @staticmethod
     def _key(session_id: str, gate_id: str, attempt: int) -> str:
         require_identifier(session_id, "store session ID"); require_identifier(gate_id, "store gate ID"); require_strict_int(attempt, "store attempt", minimum=0, maximum=0); return f"{session_id}.{gate_id}.attempt-{attempt}"
     def _path(self, kind: str, session_id: str, gate_id: str, attempt: int) -> Path: return self.directory / f"{self._key(session_id, gate_id, attempt)}.native-{kind}.json"
     def _lock(self, session_id: str, gate_id: str, attempt: int) -> _FileLock: return _FileLock(self.directory / f".{self._key(session_id, gate_id, attempt)}.native-evidence.lock", timeout=self.lock_timeout)
-    @staticmethod
-    def _default_directory_sync(directory: Path) -> None:
-        try:
-            fd = os.open(str(directory), os.O_RDONLY)
-        except OSError as exc: raise OSError(f"directory fsync cannot be opened: {exc}") from exc
-        try: os.fsync(fd)
-        finally: os.close(fd)
     def _assert_root_identity(self) -> None:
         root, identity = _safe_directory(self.directory, "native execution store")
         if root != self.directory or not _same_mutable_directory_entry(identity, self.directory_identity): raise NativeEvidenceInvalid("native execution store root identity changed")
@@ -2608,36 +2642,16 @@ class AtomicNativeExecutionStore:
         root, identity = _safe_directory(self.artifact_directory, "native artifact directory")
         if root != self.artifact_directory or not _same_mutable_directory_entry(identity, self.artifact_directory_identity): raise NativeEvidenceInvalid("native artifact directory identity changed")
     def _atomic_create(self, path: Path, payload: Mapping[str, Any], *, operation: str) -> None:
-        self._assert_root_identity(); temporary: str | None = None; published = False
-        try:
-            fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=self.directory)
-            with os.fdopen(fd, "wb") as handle: handle.write(canonical_bytes(payload)+b"\n"); handle.flush(); os.fsync(handle.fileno())
-            # A hard link creates the final name only when it does not already
-            # exist.  Unlike os.replace this cannot overwrite visible evidence
-            # if an external actor races the lock-protected writer.
-            os.link(temporary, path); published = True
-            os.unlink(temporary); temporary = None
-            self._directory_sync(self.directory)
-        except FileExistsError: raise
-        except OSError as exc:
-            if published: raise NativeCommittedButDurabilityUncertain(operation=operation, path=path, original_error=exc) from exc
-            raise NativeExecutionStoreError(f"{operation} publication failed: {exc}") from exc
-        finally:
-            if temporary is not None and os.path.exists(temporary): os.unlink(temporary)
+        self._assert_root_identity()
+        _publish_native_bytes(
+            self.durability_adapter,
+            path,
+            canonical_bytes(payload) + b"\n",
+            operation=operation,
+        )
     def _atomic_create_bytes(self, path: Path, data: bytes, *, operation: str) -> None:
-        self._assert_root_identity(); self._assert_artifact_root_identity(); temporary: str | None = None; published = False
-        try:
-            fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-            with os.fdopen(fd, "wb") as handle: handle.write(data); handle.flush(); os.fsync(handle.fileno())
-            os.link(temporary, path); published = True
-            os.unlink(temporary); temporary = None
-            self._directory_sync(path.parent)
-        except FileExistsError: raise
-        except OSError as exc:
-            if published: raise NativeCommittedButDurabilityUncertain(operation=operation, path=path, original_error=exc) from exc
-            raise NativeExecutionStoreError(f"{operation} publication failed: {exc}") from exc
-        finally:
-            if temporary is not None and os.path.exists(temporary): os.unlink(temporary)
+        self._assert_root_identity(); self._assert_artifact_root_identity()
+        _publish_native_bytes(self.durability_adapter, path, data, operation=operation)
     def has_request(self, session_id: str, gate_id: str, attempt: int) -> bool: return self._path("request", session_id, gate_id, attempt).is_file()
     def has_result(self, session_id: str, gate_id: str, attempt: int) -> bool: return self._path("result", session_id, gate_id, attempt).is_file()
     def has_capture_attempt(self, session_id: str, gate_id: str, attempt: int) -> bool: return self._path("capture-attempt", session_id, gate_id, attempt).is_file()

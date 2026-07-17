@@ -22,6 +22,10 @@ from typing import Any, Mapping
 
 from admissible.delegated_gate.canonical import canonical_bytes, fingerprint, require_exact_keys, require_identifier, require_nonempty_text, require_sha256, require_strict_int
 from admissible.delegated_gate.checkpoint import capture_checkpoint
+from admissible.delegated_gate.durability import (
+    DurabilityCapabilityResult,
+    probe_platform_durability,
+)
 from admissible.delegated_gate.events import CheckpointRecorded, GateExecutionStarted
 from admissible.delegated_gate.models import CommandEvidence, EvidenceKind, EvidenceStatus, GateClause, GateContract, GatePlan, Mission, VerificationCommand
 from admissible.delegated_gate.native_executor import (
@@ -740,6 +744,19 @@ def _write_run_metadata_once(path: Path, payload: Mapping[str, Any]) -> None:
         raise NativeEvidenceInvalid("canary metadata is write-once") from exc
 
 
+def _validate_future_run_root(
+    *, run_root_value: str | Path, run_id: str, source: Path
+) -> Path:
+    run_root = _lexical_absolute(run_root_value, "future run root")
+    require_identifier(run_id, "future run ID")
+    if run_root.name != run_id:
+        raise ValueError("run root basename must equal the fresh run ID")
+    if run_root.exists() or _inside(run_root, source) or _inside(source, run_root):
+        raise ValueError("run root must be fresh and non-overlapping with source")
+    _safe_directory(run_root.parent, "run root parent")
+    return run_root
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser=argparse.ArgumentParser(prog="python -m admissible.delegated_gate.native_canary",description="Future-only one-shot locally-attested native Cursor canary")
     parser.add_argument("--source-repository",required=True); parser.add_argument("--required-source-head",required=True); parser.add_argument("--run-root",required=True); parser.add_argument("--run-id",required=True); parser.add_argument("--session-id",required=True)
@@ -757,25 +774,54 @@ def main(argv: list[str] | None = None) -> int:
     attestation_class=ATTESTATION_CLASS_WRAPPER_CHAIN if args.attestation_class=="wrapper-chain" else ATTESTATION_CLASS_PACKAGE_BIN
     try: config=CursorNativeBackendConfig(executable=args.executable,launcher_prefix=tuple(args.executable_prefix_arg),model=args.model,attestation_class=attestation_class)
     except ValueError as exc: print(json.dumps({**blocked,"detail":str(exc)},sort_keys=True)); return 2
+    try:
+        # Gate construction/validation is part of source/backend/gate preflight
+        # and has no filesystem or authorization side effect.
+        create_canary_session(session_id=args.session_id)
+    except ValueError as exc:
+        print(json.dumps({**blocked,"detail":str(exc)},sort_keys=True)); return 2
     decision:NativePreflightDecision=preflight_native_cursor(config=config)
     where_diagnostic=decision.where_diagnostic.to_dict() if decision.where_diagnostic is not None else None
     if not decision.ready or decision.attestation is None: print(json.dumps({**blocked,"detail":decision.detail,"reason_code":decision.reason_code,"where_diagnostic":where_diagnostic},sort_keys=True)); return 2
+    ready,detail=_git_source_preflight(source,args.required_source_head)
+    if not ready: print(json.dumps({**blocked,"detail":detail,"where_diagnostic":where_diagnostic},sort_keys=True)); return 2
+    try:
+        future_run_root=_validate_future_run_root(
+            run_root_value=args.run_root, run_id=args.run_id, source=source
+        )
+    except ValueError as exc:
+        print(json.dumps({**blocked,"detail":str(exc),"where_diagnostic":where_diagnostic},sort_keys=True)); return 2
+    capability: DurabilityCapabilityResult = probe_platform_durability(
+        parent=future_run_root.parent,
+        source_root=source,
+        future_run_root=future_run_root,
+    )
+    capability_diagnostic=capability.to_dict()
+    if not capability.ready:
+        print(json.dumps({
+            **blocked,
+            "detail":capability.detail,
+            "reason_code":capability.reason_code,
+            "where_diagnostic":where_diagnostic,
+            "durability_capability":capability_diagnostic,
+        },sort_keys=True)); return 2
     try:
         payload=build_authorization_payload(source_repository=source,source_head=args.required_source_head,run_id=args.run_id,session_id=args.session_id,attestation=decision.attestation,run_root=args.run_root,timeout_seconds=args.timeout_seconds,backend_readiness_reason=decision.reason_code)
         payload.validated_for_authorization(active_source_repository=source)
     except ValueError as exc:
-        print(json.dumps({**blocked,"detail":str(exc),"where_diagnostic":where_diagnostic},sort_keys=True)); return 2
-    ready,detail=_git_source_preflight(source,args.required_source_head)
-    if not ready: print(json.dumps({**blocked,"detail":detail,"where_diagnostic":where_diagnostic},sort_keys=True)); return 2
-    if args.preflight_only: print(json.dumps({"status":NativePreflightStatus.PREFLIGHT_READY.value,"authorization_payload":payload.to_dict(),"attestation":decision.attestation.to_dict(),"where_diagnostic":where_diagnostic},sort_keys=True)); return 0
-    if not args.owner_authorization or not _authorized(args.owner_authorization,payload,active_source_repository=source): print(json.dumps({**blocked,"detail":"owner authorization did not match the exact canonical payload"},sort_keys=True)); return 2
-    run_root=Path(os.path.abspath(args.run_root))
-    if run_root.name != args.run_id: print(json.dumps({**blocked,"detail":"run root basename must equal the fresh run ID"},sort_keys=True)); return 2
-    if run_root.exists() or _inside(run_root,source) or _inside(source,run_root): print(json.dumps({**blocked,"detail":"run root must be fresh and non-overlapping with source"},sort_keys=True)); return 2
-    try: _safe_directory(run_root.parent,"run root parent")
-    except ValueError as exc: print(json.dumps({**blocked,"detail":str(exc)},sort_keys=True)); return 2
+        print(json.dumps({**blocked,"detail":str(exc),"where_diagnostic":where_diagnostic,"durability_capability":capability_diagnostic},sort_keys=True)); return 2
+    if args.preflight_only: print(json.dumps({"status":NativePreflightStatus.PREFLIGHT_READY.value,"authorization_payload":payload.to_dict(),"attestation":decision.attestation.to_dict(),"where_diagnostic":where_diagnostic,"durability_capability":capability_diagnostic},sort_keys=True)); return 0
+    if not args.owner_authorization or not _authorized(args.owner_authorization,payload,active_source_repository=source): print(json.dumps({**blocked,"detail":"owner authorization did not match the exact canonical payload","durability_capability":capability_diagnostic},sort_keys=True)); return 2
+    try:
+        # Recheck freshness after authorization; the successful probe itself
+        # never creates or reserves the future run root.
+        run_root=_validate_future_run_root(
+            run_root_value=args.run_root, run_id=args.run_id, source=source
+        )
+    except ValueError as exc:
+        print(json.dumps({**blocked,"detail":str(exc)},sort_keys=True)); return 2
     run_root.mkdir(); _safe_directory(run_root,"run root"); fixture=build_canary_repository(run_root,repository_name=WORKSPACE_DIRECTORY_NAME); evidence=(run_root/EVIDENCE_DIRECTORY_NAME); evidence.mkdir(); _safe_directory(evidence,"evidence directory")
-    _write_run_metadata_once(evidence/"canary-preflight.json",{"classification":CANARY_CLASSIFICATION,"authorization_payload":payload.to_dict(),"attestation":decision.attestation.to_dict(),"local_capability_status":decision.status.value})
+    _write_run_metadata_once(evidence/"canary-preflight.json",{"classification":CANARY_CLASSIFICATION,"authorization_payload":payload.to_dict(),"attestation":decision.attestation.to_dict(),"local_capability_status":decision.status.value,"durability_capability":capability_diagnostic})
     session_store=AtomicDelegatedSessionStore(evidence/"delegated-state"); execution_store=AtomicNativeExecutionStore(evidence/NATIVE_SIDECAR_DIRECTORY_NAME); session_store.create(create_canary_session(session_id=args.session_id))
     coordinator=NativeCanaryCoordinator(session_store=session_store,execution_store=execution_store,executor=NativeDelegatedExecutor(config=config),backend_attestation=decision.attestation,source_repository=source,work_workspace=fixture.repository,canary_parent=run_root,evidence_directory=evidence,timeout_seconds=args.timeout_seconds)
     outcome=coordinator.run(session_id=args.session_id); _write_run_metadata_once(evidence/"final-status.json",outcome.to_dict()); print(json.dumps(outcome.to_dict(),sort_keys=True)); return 0 if outcome.canary_success else 1
@@ -784,4 +830,4 @@ def main(argv: list[str] | None = None) -> int:
 if __name__ == "__main__": sys.exit(main())
 
 
-__all__=["AUTHORIZATION_SCHEMA_VERSION","AUTHORIZATION_SCHEMA_VERSION_LEGACY_V2","CANARY_NON_CLAIMS","CLASS_READINESS_REASONS","EVIDENCE_DIRECTORY_NAME","NATIVE_SIDECAR_DIRECTORY_NAME","PACKAGE_BIN_READY_REASON","WORKSPACE_DIRECTORY_NAME","BEHAVIORAL_EVIDENCE_SCHEMA_VERSION","CANARY_CLASSIFICATION","CANARY_FIXTURE_VERSION","CANARY_GATE_ID","CANARY_MISSION","CANARY_MISSION_ID","DEFAULT_STDERR_BYTE_LIMIT","DEFAULT_STDOUT_BYTE_LIMIT","DEFAULT_TIMEOUT_SECONDS","EXPECTED_MATERIAL_PATHS","FixtureRepository","MAX_AUDITOR_INVOCATIONS","MAX_NATIVE_PHASE_ATTEMPTS","MAX_PROVIDER_INVOCATIONS","MAX_REPAIR_ROUNDS","MAX_RETRIES","NativeCanaryAuthorizationPayload","NativeCanaryCoordinator","NativeCanaryOutcome","NativeCanaryStatus","OWNER_AUTHORIZATION_DIGEST_ENV","REQUIRED_COMMIT_MESSAGE","BehavioralVerifierEvidence","build_authorization_payload","build_canary_repository","build_native_agent_prompt","build_parser","create_canary_session","load_behavioral_verifier","main","npm_test_argv","run_behavioral_verifier"]
+__all__=["AUTHORIZATION_SCHEMA_VERSION","AUTHORIZATION_SCHEMA_VERSION_LEGACY_V2","CANARY_NON_CLAIMS","CLASS_READINESS_REASONS","EVIDENCE_DIRECTORY_NAME","NATIVE_SIDECAR_DIRECTORY_NAME","PACKAGE_BIN_READY_REASON","WORKSPACE_DIRECTORY_NAME","BEHAVIORAL_EVIDENCE_SCHEMA_VERSION","CANARY_CLASSIFICATION","CANARY_FIXTURE_VERSION","CANARY_GATE_ID","CANARY_MISSION","CANARY_MISSION_ID","DEFAULT_STDERR_BYTE_LIMIT","DEFAULT_STDOUT_BYTE_LIMIT","DEFAULT_TIMEOUT_SECONDS","EXPECTED_MATERIAL_PATHS","FixtureRepository","MAX_AUDITOR_INVOCATIONS","MAX_NATIVE_PHASE_ATTEMPTS","MAX_PROVIDER_INVOCATIONS","MAX_REPAIR_ROUNDS","MAX_RETRIES","NativeCanaryAuthorizationPayload","NativeCanaryCoordinator","NativeCanaryOutcome","NativeCanaryStatus","OWNER_AUTHORIZATION_DIGEST_ENV","REQUIRED_COMMIT_MESSAGE","BehavioralVerifierEvidence","build_authorization_payload","build_canary_repository","build_native_agent_prompt","build_parser","create_canary_session","load_behavioral_verifier","main","npm_test_argv","run_behavioral_verifier","_validate_future_run_root"]
