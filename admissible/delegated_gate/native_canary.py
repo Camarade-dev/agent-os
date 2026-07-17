@@ -117,7 +117,7 @@ EXPECTED_MATERIAL_PATHS = frozenset({"README.md", "src/game-state.js", "src/scor
 CANARY_MISSION = """Add deterministic high-score persistence to this small game-state package.
 Implement the feature across the existing source modules, add tests using the existing Node test runner,
 run the complete npm test suite, update the README, and create one local Git commit with the exact message
-`feat: add deterministic high-score persistence`. Do not add a remote and do not push."""
+`feat: add deterministic high-score persistence`. Do not add a remote and do not push. Stop after the local commit."""
 
 
 class NativeCanaryStatus(str, Enum):

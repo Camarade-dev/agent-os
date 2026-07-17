@@ -178,6 +178,15 @@ The fixture is a clean, deterministic one-commit Git repository with no remote,
 no dependencies or lifecycle hooks, and a Node-built-in `npm test` script. The
 mission requires source, test, and README changes.
 
+Act 2A.3G makes the immutable mission itself end with `Stop after the local
+commit.` The separately retained prompt-level completion bullet, `stop
+immediately after the local commit.`, is additional defense in depth; it is not
+a substitute for the immutable mission boundary. The old Act 2A.3F payload,
+payload fingerprint, canonical payload hash, mission fingerprint, gate-plan
+fingerprint, and every prospective digest input are invalid. No owner digest
+was generated and no live canary has run. Only after this repair is committed
+and the worktree is clean is a new preview mandatory.
+
 The repository's own `npm test` remains a fixed checkpoint command, but it is
 not sufficient success authority. The harness writes an immutable Node-built-in
 behavioral verifier outside the mutable repository tests. It imports the public

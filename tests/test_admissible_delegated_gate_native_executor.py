@@ -20,6 +20,11 @@ from admissible.delegated_gate.canonical import fingerprint
 from admissible.delegated_gate.native_canary import (
     CANARY_MISSION,
     EXPECTED_MATERIAL_PATHS,
+    MAX_AUDITOR_INVOCATIONS,
+    MAX_NATIVE_PHASE_ATTEMPTS,
+    MAX_PROVIDER_INVOCATIONS,
+    MAX_REPAIR_ROUNDS,
+    MAX_RETRIES,
     NativeCanaryCoordinator,
     NativeCanaryStatus,
     REQUIRED_COMMIT_MESSAGE,
@@ -2159,3 +2164,61 @@ def test_prior_wrapper_v1_payload_non_claim_shape_is_invalid_even_when_refingerp
     prior["payload_fingerprint"] = fingerprint({key: value for key, value in prior.items() if key != "payload_fingerprint"})
     with pytest.raises(ValueError, match="non-claims"):
         NativeCanaryAuthorizationPayload.from_dict(prior)
+
+
+# --- Act 2A.3G: immutable mission stop-after-commit binding ----------------
+
+_ACT_2A_3G_MISSION = """Add deterministic high-score persistence to this small game-state package.
+Implement the feature across the existing source modules, add tests using the existing Node test runner,
+run the complete npm test suite, update the README, and create one local Git commit with the exact message
+`feat: add deterministic high-score persistence`. Do not add a remote and do not push. Stop after the local commit."""
+_ACT_2A_3G_MISSION_FINGERPRINT = "1a296853942d359647a12fe7875bac32898690a1fafd16c8d02993c471ae687e"
+_ACT_2A_3G_GATE_PLAN_FINGERPRINT = "fdde35a25b3f88d87474b7ba6dabd0c3cbb1134bac9269b7ae3dafd810d0ddbf"
+_ACT_2A_GATE_CONTRACT_FINGERPRINT = "603d7a09d4a3ce48f5ad21b2d754b6c7a946f6fcc88d9337d3f516c8f2312379"
+
+
+def test_act_2a_3g_immutable_mission_plan_and_prompt_bind_stop_clause(tmp_path: Path):
+    h = _harness(tmp_path)
+    state = create_canary_session(session_id="act-2a-3g-mission-binding")
+    prompt = build_native_agent_prompt(
+        mission=state.mission, gate_contract=state.current_gate, work_workspace=h.work,
+    )
+    request, request_prompt = _request(h)
+
+    assert CANARY_MISSION == _ACT_2A_3G_MISSION
+    assert CANARY_MISSION.endswith("Stop after the local commit.")
+    assert len(CANARY_MISSION.encode("utf-8")) == 402 != 373
+    assert state.mission.specification == _ACT_2A_3G_MISSION
+    assert state.mission.mission_fingerprint == _ACT_2A_3G_MISSION_FINGERPRINT
+    assert state.mission.mission_fingerprint != "f663f7e63d51c503ce9712544c0026874ce05931452e63b3c04431a4aa457726"
+    assert state.gate_plan.immutable_mission_fingerprint == _ACT_2A_3G_MISSION_FINGERPRINT
+    assert state.gate_plan.plan_fingerprint == _ACT_2A_3G_GATE_PLAN_FINGERPRINT
+    assert state.gate_plan.plan_fingerprint != "d433560c437fe2f7744c46dfc44913feb39fd7dab566e8957779d3fdc6db9600"
+    assert state.current_gate.contract_fingerprint == _ACT_2A_GATE_CONTRACT_FINGERPRINT
+    assert f"Immutable mission:\n{_ACT_2A_3G_MISSION}\n\nCurrent gate objective:" in prompt
+    assert prompt.count("Stop after the local commit.") == 1
+    assert "- stop immediately after the local commit." in prompt
+    assert request_prompt == build_native_agent_prompt(
+        mission=h.session_store.load(h.session_id).mission,
+        gate_contract=h.session_store.load(h.session_id).current_gate,
+        work_workspace=h.work,
+    )
+    assert request.prompt_fingerprint == hashlib.sha256(request_prompt.encode("utf-8")).hexdigest()
+    assert (MAX_PROVIDER_INVOCATIONS, MAX_NATIVE_PHASE_ATTEMPTS, MAX_REPAIR_ROUNDS, MAX_AUDITOR_INVOCATIONS, MAX_RETRIES) == (1, 1, 0, 0, 0)
+
+
+def test_act_2a_3g_corrected_payload_cannot_match_invalidated_act_2a_3f_vector(tmp_path: Path):
+    h = _harness(tmp_path)
+    payload = build_authorization_payload(
+        source_repository=h.source,
+        source_head=_command(["git", "rev-parse", "HEAD"], cwd=h.source).stdout.strip(),
+        run_id="act-2a-3g-preview", session_id="act-2a-3g-preview",
+        attestation=h.attestation, run_root=tmp_path / "future-run", timeout_seconds=30,
+    )
+    canonical_payload = _canonical_bytes(payload.to_dict())
+
+    assert payload.mission_fingerprint == _ACT_2A_3G_MISSION_FINGERPRINT
+    assert payload.gate_plan_fingerprint == _ACT_2A_3G_GATE_PLAN_FINGERPRINT
+    assert payload.gate_contract_fingerprint == _ACT_2A_GATE_CONTRACT_FINGERPRINT
+    assert payload.payload_fingerprint != "a6f4340ce0e3acfcdb63f1455de8d753de412a8fffa3f2531bf08e57d9b3e28e"
+    assert hashlib.sha256(canonical_payload).hexdigest() != "f0c83a2634f853bea66afe8c2b8f161e9374c3d717180499b8c652c935c9f311"
