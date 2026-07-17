@@ -1,4 +1,4 @@
-# Cursor wrapper-chain attestation (Act 2A.2 forensic decision)
+# Cursor wrapper-chain attestation (Act 2A.3E deterministic authority)
 
 ## Forensic result
 
@@ -32,9 +32,23 @@ accepted:
 
 ## What LOCAL_WRAPPER_CHAIN attests
 
-- the exact winning OS command resolution for `cursor-agent`
-  (`shutil.which`, `where.exe`, PowerShell `Get-Command` when available,
-  PATH/PATHEXT semantics), blocking on contradictory or ambiguous resolution;
+- deterministic cmd-compatible resolution of the fixed bare command
+  `cursor-agent` under the exact ordered Windows `PATH` and `PATHEXT` strings.
+  The v2 record binds both complete ordered strings and their SHA-256 values,
+  the winning PATH/PATHEXT indices, the authoritative PATH entry, and every
+  material candidate at the winning precedence position. Resolution is
+  case-insensitive, rejects caller-supplied command paths, and accepts only a
+  canonical non-redirecting regular-file winner with exact identity and hash;
+- exact canonical and physical-identity agreement between that deterministic
+  winner and `shutil.which("cursor-agent")` observed against the same captured
+  environment. One missing result, differing paths or identities, or any
+  PATH/PATHEXT change at pre-spawn re-attestation blocks;
+- the complete PowerShell `Get-Command cursor-agent -All` inventory, normalized
+  independently of inventory enumeration order. It must contain the same
+  physical `.cmd` winner and the adjacent `.ps1`, must record `.ps1` as the
+  PowerShell-preferred command, and rejects aliases, functions, application
+  aliases, pathless commands, redirecting entries, contradictory cmd winners,
+  and every out-of-root candidate;
 - the exact winning `cursor-agent.cmd` bytes, accepted only by a strict
   non-general parser: `powershell.exe -NoProfile -ExecutionPolicy Bypass`
   invoking the adjacent same-name `.ps1` with unmodified `%*` forwarding, no
@@ -70,6 +84,27 @@ accepted:
 Windows Authenticode evidence for the bundled `node.exe` is recorded as
 context only (the OpenJS signature is not authority for `index.js`).
 
+## Non-authoritative where.exe diagnostic
+
+`where.exe` is retained only as review context because its availability and
+empty-result behavior are not reliable in this execution environment. The
+separate diagnostic records its exact executable path/identity when available,
+argv, exit code, stdout/stderr byte lengths and SHA-256 values, and parsed
+candidates. Its explicit statuses are `MATCHING_RESULT`,
+`CONTRADICTORY_RESULT`, `EMPTY_RESULT`, `EXECUTION_ERROR`, and `UNAVAILABLE`.
+
+A successful matching result permits readiness. A successful contradictory
+result blocks. Empty output (including exit 1), nonzero/error observations, or
+an unavailable executable do not participate in authority and do not prevent
+the deterministic resolver, `shutil.which`, PowerShell inventory, and wrapper
+identities from deciding readiness.
+
+The diagnostic is emitted separately by `--preflight-only`. It is excluded
+from command-resolution authority, the backend-attestation fingerprint, the
+authorization-payload fingerprint, canonical owner-digest bytes, persisted
+requests, and pre-spawn equality. Variation in diagnostic bytes alone therefore
+cannot change any signed authority.
+
 Directory identity remains a local, non-cryptographic observation. It is not
 complete filesystem containment or publisher provenance. The complete
 matching version inventory, deterministic selected version, exact child-root
@@ -87,7 +122,9 @@ rejects any record that overclaims. It does **not** attest:
 - cryptographic integrity or signature of the JavaScript payload;
 - native CLI argument/capability behavior (no `--version`/`--help` probe is
   run in this mode; behavior stays experimentally unproven);
-- production trustworthiness.
+- production trustworthiness;
+- Windows-wide command behavior under a different PATH/PATHEXT environment;
+- protection against a hostile local process changing the environment.
 
 The readiness reason is `LOCAL_CURSOR_WRAPPER_CHAIN_ATTESTED_FOR_EXPERIMENT`,
 never `CURSOR_INSTALLATION_PROVEN`. The truthful record that the manifest
@@ -101,19 +138,29 @@ execution request, the persisted sidecar, final reconstruction, and the
 run-bound owner authorization payload. The payload names the attestation
 class and the full non-claim list; the owner digest therefore authorizes that
 exact weaker mode, its unproven CLI behavior, and exactly one bounded provider
-invocation. Production wrapper-chain discovery is host-anchored: arbitrary
-caller-supplied wrapper roots, fake manifests, injected attestations, or
-environment bypasses cannot reach production readiness; the test discovery
-seam is explicit constructor injection unreachable from the production CLI.
+invocation. Production wrapper-chain discovery is host-anchored. The private
+deterministic test discovery fixture is unreachable from production `main()`.
+Production accepts no caller PATH/PATHEXT, wrapper root, command candidate,
+resolver JSON, fake attestation, test-mode environment variable, or
+deserialization bypass. Parsed requests remain inert until fresh host
+re-attestation matches them exactly.
 
-Act 2A.3C retains
-`admissible_cursor_wrapper_chain_attestation_v1` because the serialized shape
-did not change and no live canary was authorized or run. Loading now rejects
-every nonzero authoritative directory size instead of repairing it. Every
-wrapper-chain preview, fingerprint, and canonical-byte hash created before the
-normalization repair is invalid, including a preview whose raw directory size
-happened to be zero. A fresh post-repair, post-commit static attestation and
-clean-HEAD real-CLI payload preview are mandatory before any owner decision.
+Act 2A.3E introduces
+`admissible_cursor_wrapper_chain_attestation_v2` because command-resolution
+authority changed materially. The former
+`admissible_cursor_wrapper_chain_attestation_v1` is inert historical data:
+loading rejects it before it can authorize a new request, restart, owner
+payload, or live canary, even if it is refingerprinted.
+
+The outer authorization schema remains
+`admissible_native_canary_authorization_v3`: its field shape did not change,
+production constructs it only from a freshly validated v2 attestation, and it
+binds the new backend fingerprint and expanded exact non-claim list. The live
+CLI does not ingest a caller-provided payload. No v1 owner digest or live run
+exists. Every earlier wrapper-v1 attestation, v3 preview, payload fingerprint,
+canonical-byte hash, and digest input is invalid. Implementation-time vectors
+are `PRE_COMMIT_PROVISIONAL_NOT_AUTHORIZABLE`; a fresh post-commit clean-HEAD
+real-CLI preview is mandatory before any owner decision.
 
 ## Status
 

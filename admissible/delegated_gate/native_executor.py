@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from enum import Enum
 import hashlib
 import json
+import ntpath
 import os
 from pathlib import Path
 import re
@@ -47,7 +48,10 @@ REQUEST_SCHEMA_VERSION = "admissible_native_execution_request_v2"
 RESULT_SCHEMA_VERSION = "admissible_native_execution_result_v2"
 ARTIFACT_SCHEMA_VERSION = "admissible_native_execution_artifact_v2"
 ATTESTATION_SCHEMA_VERSION = "admissible_native_backend_attestation_v1"
-WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION = "admissible_cursor_wrapper_chain_attestation_v1"
+WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION_LEGACY_V1 = "admissible_cursor_wrapper_chain_attestation_v1"
+WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION = "admissible_cursor_wrapper_chain_attestation_v2"
+WINDOWS_COMMAND_RESOLUTION_SCHEMA_VERSION = "admissible_windows_command_resolution_authority_v1"
+WINDOWS_WHERE_DIAGNOSTIC_SCHEMA_VERSION = "admissible_windows_where_diagnostic_v1"
 ATTESTATION_CLASS_PACKAGE_BIN = "PACKAGE_BIN_PROVENANCE"
 ATTESTATION_CLASS_WRAPPER_CHAIN = "LOCAL_WRAPPER_CHAIN"
 CAPTURE_ATTEMPT_SCHEMA_VERSION = "admissible_native_capture_attempt_v1"
@@ -56,7 +60,7 @@ TERMINAL_SCHEMA_VERSION = "admissible_native_canary_terminal_v1"
 BACKEND_IDENTITY = "cursor-agent-native-oneshot"
 BACKEND_PROTOCOL_VERSION = "cursor-agent-print-force-v2"
 CURSOR_DISCOVERY_MECHANISM = "shutil.which:cursor-agent"
-WRAPPER_CHAIN_DISCOVERY_MECHANISM = "which+where+powershell-get-command:cursor-agent"
+WRAPPER_CHAIN_DISCOVERY_MECHANISM = "deterministic-windows-path-pathext+shutil.which+powershell-get-command:cursor-agent"
 CURSOR_DISCOVERY_COMMAND = "cursor-agent"
 WRAPPER_CHAIN_READY_REASON = "LOCAL_CURSOR_WRAPPER_CHAIN_ATTESTED_FOR_EXPERIMENT"
 WRAPPER_CHAIN_BLOCKED_REASON = "LOCAL_WRAPPER_CHAIN_ATTESTATION_BLOCKED"
@@ -72,8 +76,13 @@ WRAPPER_CHAIN_NON_CLAIMS: tuple[str, ...] = (
     "native cli argument and capability behavior is experimentally unproven",
     "production trustworthiness is not established",
     "suitable only for an explicitly owner-authorized local experiment",
+    "windows-wide command behavior outside the exact bound environment is not established",
+    "protection against a hostile process modifying the environment is not established",
 )
 WRAPPER_CHAIN_CLAIMS: dict[str, bool] = {
+    "deterministic_windows_path_pathext_resolution_established": True,
+    "shutil_which_agreement_established": True,
+    "powershell_inventory_agreement_established": True,
     "command_routing_chain_established": True,
     "local_file_identity_established": True,
     "deterministic_version_selection_established": True,
@@ -84,6 +93,8 @@ WRAPPER_CHAIN_CLAIMS: dict[str, bool] = {
     "javascript_payload_signature_present": False,
     "cli_capability_behavior_proven": False,
     "production_trustworthiness_established": False,
+    "windows_wide_command_behavior_established": False,
+    "hostile_environment_protection_established": False,
 }
 EXPECTED_CURSOR_PACKAGE_NAME = "@anysphere/agent-cli-runtime"
 PROCESS_TREE_CLEANUP_POLICY = "managed-process-tree-hard-timeout-and-proven-empty"
@@ -96,6 +107,8 @@ DEFAULT_ENVIRONMENT_ALLOWLIST: tuple[str, ...] = (
 WINDOWS_SHELL_WRAPPER_SUFFIXES = (".bat", ".cmd", ".ps1")
 _FLAG_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])(--[A-Za-z0-9][A-Za-z0-9-]*)")
 _PROBE_LIMIT = 128 * 1024
+_WINDOWS_PATH_SEPARATOR = ";"
+_PATHEXT_COMPONENT = re.compile(r"\.[A-Za-z0-9]+\Z")
 
 
 class NativePreflightStatus(str, Enum):
@@ -726,49 +739,119 @@ def _select_wrapper_version(wrapper_root: Path) -> tuple[tuple[str, ...], str]:
     return tuple(names), winners[0]
 
 
+@dataclass(frozen=True)
+class PowerShellCommandObservation:
+    candidates: tuple[tuple[str, str, str], ...]
+    preferred: tuple[str, str, str] | None
+
+
+@dataclass(frozen=True)
+class WhereCommandObservation:
+    executable: str | None
+    argv: tuple[str, ...]
+    exit_code: int | None
+    stdout: bytes
+    stderr: bytes
+    execution_error: bool = False
+
+
 class WrapperChainDiscovery(Protocol):
     """Host command-resolution surface for wrapper-chain attestation.
 
-    Tests may substitute a fake adapter through explicit attestor arguments;
-    the production CLI never exposes that seam and always uses the host.
+    Tests may substitute a deterministic fake adapter only through the private
+    attestor.  The production CLI exposes no discovery or environment seam.
     """
 
-    def which_cursor_agent(self) -> str | None: ...
-    def where_cursor_agent(self) -> tuple[str, ...]: ...
-    def powershell_cursor_agent(self) -> tuple[str, ...] | None: ...
+    def which_cursor_agent(self, *, path_value: str, pathext_value: str) -> str | None: ...
+    def powershell_cursor_agent(self) -> PowerShellCommandObservation | None: ...
+    def where_cursor_agent(self) -> WhereCommandObservation: ...
     def path_value(self) -> str: ...
     def pathext_value(self) -> str: ...
     def node_signature_context(self, node_path: Path) -> str: ...
 
 
 class HostWrapperChainDiscovery:
-    """Real OS resolution for cursor-agent; never executes the bundle."""
+    """Real host discovery for cursor-agent; never executes the wrapper bundle."""
 
     @staticmethod
-    def _bounded_lines(argv: list[str]) -> tuple[str, ...] | None:
+    def _bounded_bytes(argv: list[str]) -> tuple[int, bytes, bytes] | None:
         try:
-            completed = subprocess.run(argv, shell=False, check=False, capture_output=True, timeout=20, stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace")
+            completed = subprocess.run(
+                argv, shell=False, check=False, capture_output=True, timeout=20,
+                stdin=subprocess.DEVNULL,
+            )
         except (OSError, subprocess.TimeoutExpired):
             return None
-        if completed.returncode != 0:
-            return ()
-        return tuple(line.strip() for line in completed.stdout[:_PROBE_LIMIT].splitlines() if line.strip())
+        if len(completed.stdout) > _PROBE_LIMIT or len(completed.stderr) > _PROBE_LIMIT:
+            return None
+        return completed.returncode, completed.stdout, completed.stderr
 
-    def which_cursor_agent(self) -> str | None:
-        return shutil.which(CURSOR_DISCOVERY_COMMAND)
+    @classmethod
+    def _bounded_lines(cls, argv: list[str]) -> tuple[str, ...] | None:
+        observed = cls._bounded_bytes(argv)
+        if observed is None or observed[0] != 0:
+            return None
+        return tuple(
+            line.strip()
+            for line in observed[1].decode("utf-8", errors="replace").splitlines()
+            if line.strip()
+        )
 
-    def where_cursor_agent(self) -> tuple[str, ...]:
-        lines = self._bounded_lines(["where.exe", CURSOR_DISCOVERY_COMMAND])
-        if lines is None:
-            raise ValueError("where.exe command resolution is unavailable")
-        return lines
+    def which_cursor_agent(self, *, path_value: str, pathext_value: str) -> str | None:
+        if os.environ.get("PATH", "") != path_value or os.environ.get("PATHEXT", "") != pathext_value:
+            raise ValueError("PATH or PATHEXT changed before shutil.which observation")
+        located = shutil.which(CURSOR_DISCOVERY_COMMAND, path=path_value)
+        if os.environ.get("PATH", "") != path_value or os.environ.get("PATHEXT", "") != pathext_value:
+            raise ValueError("PATH or PATHEXT changed during shutil.which observation")
+        return located
 
-    def powershell_cursor_agent(self) -> tuple[str, ...] | None:
-        lines = self._bounded_lines([
-            "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-            f"(Get-Command {CURSOR_DISCOVERY_COMMAND} -All -CommandType Application,ExternalScript -ErrorAction SilentlyContinue | ForEach-Object {{ $_.Path }})",
+    def powershell_cursor_agent(self) -> PowerShellCommandObservation | None:
+        command = (
+            "$items = @(Get-Command cursor-agent -All -ErrorAction SilentlyContinue); "
+            "foreach ($item in $items) { "
+            "$path = if ($null -ne $item.Path) { [string]$item.Path } else { '' }; "
+            "[Console]::Out.WriteLine(([string]$item.CommandType) + \"`t\" + "
+            "([string]$item.Name) + \"`t\" + $path) }"
+        )
+        observed = self._bounded_bytes([
+            "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command,
         ])
-        return lines
+        if observed is None or observed[0] != 0:
+            return None
+        rows: list[tuple[str, str, str]] = []
+        for line in observed[1].decode("utf-8", errors="replace").splitlines():
+            parts = line.rstrip("\r\n").split("\t")
+            if len(parts) != 3:
+                raise ValueError("PowerShell command inventory emitted an unsupported record")
+            rows.append((parts[0], parts[1], parts[2]))
+        candidates = tuple(rows)
+        return PowerShellCommandObservation(candidates, candidates[0] if candidates else None)
+
+    def where_cursor_agent(self) -> WhereCommandObservation:
+        located = shutil.which("where.exe")
+        if located is None:
+            return WhereCommandObservation(None, ("where.exe", CURSOR_DISCOVERY_COMMAND), None, b"", b"")
+        try:
+            where_file = _canonical_backend_file(located, "where.exe diagnostic executable")
+        except (OSError, ValueError) as exc:
+            return WhereCommandObservation(
+                None, (located, CURSOR_DISCOVERY_COMMAND), None, b"", str(exc).encode("utf-8"), True,
+            )
+        argv = (where_file.canonical_path, CURSOR_DISCOVERY_COMMAND)
+        try:
+            completed = subprocess.run(
+                list(argv), shell=False, check=False, capture_output=True, timeout=20,
+                stdin=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return WhereCommandObservation(
+                where_file.canonical_path, argv, None,
+                bytes(getattr(exc, "stdout", None) or b""),
+                bytes(getattr(exc, "stderr", None) or str(exc).encode("utf-8")), True,
+            )
+        return WhereCommandObservation(
+            where_file.canonical_path, argv, completed.returncode, completed.stdout, completed.stderr,
+        )
 
     def path_value(self) -> str:
         return os.environ.get("PATH", "")
@@ -790,83 +873,368 @@ class HostWrapperChainDiscovery:
 
 
 def _normalized_path(value: str) -> str:
-    return os.path.normcase(os.path.abspath(value))
+    return ntpath.normcase(ntpath.abspath(value)).casefold()
+
+
+def _canonical_backend_file(value: str | Path, label: str) -> NativeBackendFileAttestation:
+    path, _identity = _safe_file(value, label)
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"{label} cannot be canonically resolved: {exc}") from exc
+    canonical, _canonical_identity = _safe_file(resolved, label)
+    return NativeBackendFileAttestation.observe(canonical, label)
+
+
+def _same_file_authority(left: NativeBackendFileAttestation, right: NativeBackendFileAttestation) -> bool:
+    left.validated(); right.validated()
+    return (
+        _normalized_path(left.canonical_path) == _normalized_path(right.canonical_path)
+        and left.filesystem_identity == right.filesystem_identity
+        and left.byte_count == right.byte_count
+        and left.sha256 == right.sha256
+    )
+
+
+@dataclass(frozen=True)
+class WindowsPathCandidate:
+    path_entry_index: int
+    pathext_index: int
+    path_entry: str
+    extension: str
+    file: NativeBackendFileAttestation
+
+    def validated(self) -> "WindowsPathCandidate":
+        require_strict_int(self.path_entry_index, "PATH candidate entry index", minimum=0, maximum=65535)
+        require_strict_int(self.pathext_index, "PATH candidate PATHEXT index", minimum=0, maximum=1023)
+        require_nonempty_text(self.path_entry, "PATH candidate entry", max_bytes=32768)
+        require_nonempty_text(self.extension, "PATH candidate extension", max_bytes=256)
+        self.file.validated()
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validated()
+        return {
+            "path_entry_index": self.path_entry_index, "pathext_index": self.pathext_index,
+            "path_entry": self.path_entry, "extension": self.extension, "file": self.file.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "WindowsPathCandidate":
+        require_exact_keys(data, set(cls.__dataclass_fields__), "Windows PATH candidate")
+        return cls(
+            data["path_entry_index"], data["pathext_index"], data["path_entry"], data["extension"],
+            NativeBackendFileAttestation.from_dict(data["file"]),
+        ).validated()
+
+
+@dataclass(frozen=True)
+class DeterministicWindowsCommandResolution:
+    schema_version: str
+    command: str
+    path_entries: tuple[str, ...]
+    path_sha256: str
+    pathext: tuple[str, ...]
+    pathext_sha256: str
+    authoritative_path_entry: str
+    authoritative_path_index: int
+    winning_extension: str
+    winning_pathext_index: int
+    material_candidates: tuple[WindowsPathCandidate, ...]
+    winner: NativeBackendFileAttestation
+
+    def validated(self) -> "DeterministicWindowsCommandResolution":
+        if self.schema_version != WINDOWS_COMMAND_RESOLUTION_SCHEMA_VERSION or self.command != CURSOR_DISCOVERY_COMMAND:
+            raise ValueError("unsupported deterministic Windows command resolution")
+        if not isinstance(self.path_entries, tuple) or not self.path_entries:
+            raise ValueError("deterministic PATH must be a non-empty immutable sequence")
+        if len(self.path_entries) > 4096 or sum(len(item.encode("utf-8")) for item in self.path_entries) > 1024 * 1024:
+            raise ValueError("deterministic PATH exceeds its authority bound")
+        if any(not isinstance(item, str) or "\x00" in item for item in self.path_entries):
+            raise ValueError("deterministic PATH contains an invalid component")
+        if any(item and (not ntpath.isabs(item) or '"' in item) for item in self.path_entries):
+            raise ValueError("deterministic PATH contains a relative or malformed component")
+        require_sha256(self.path_sha256, "deterministic PATH fingerprint")
+        if hashlib.sha256(_WINDOWS_PATH_SEPARATOR.join(self.path_entries).encode("utf-8", "surrogatepass")).hexdigest() != self.path_sha256:
+            raise ValueError("deterministic PATH fingerprint mismatch")
+        if not isinstance(self.pathext, tuple) or not self.pathext:
+            raise ValueError("deterministic PATHEXT must be a non-empty immutable sequence")
+        if len(self.pathext) > 128 or sum(len(item.encode("utf-8")) for item in self.pathext) > 32768:
+            raise ValueError("deterministic PATHEXT exceeds its authority bound")
+        if any(not isinstance(item, str) or not _PATHEXT_COMPONENT.fullmatch(item) for item in self.pathext):
+            raise ValueError("deterministic PATHEXT contains a malformed component")
+        if len({item.casefold() for item in self.pathext}) != len(self.pathext):
+            raise ValueError("deterministic PATHEXT contains a duplicate component")
+        require_sha256(self.pathext_sha256, "deterministic PATHEXT fingerprint")
+        if hashlib.sha256(_WINDOWS_PATH_SEPARATOR.join(self.pathext).encode("utf-8", "surrogatepass")).hexdigest() != self.pathext_sha256:
+            raise ValueError("deterministic PATHEXT fingerprint mismatch")
+        require_strict_int(self.authoritative_path_index, "authoritative PATH index", minimum=0, maximum=len(self.path_entries) - 1)
+        require_strict_int(self.winning_pathext_index, "winning PATHEXT index", minimum=0, maximum=len(self.pathext) - 1)
+        if self.authoritative_path_entry != self.path_entries[self.authoritative_path_index]:
+            raise ValueError("authoritative PATH entry/index binding differs")
+        if self.winning_extension != self.pathext[self.winning_pathext_index]:
+            raise ValueError("winning PATHEXT entry/index binding differs")
+        if not isinstance(self.material_candidates, tuple) or not self.material_candidates:
+            raise ValueError("deterministic resolution lacks its material winner candidate")
+        self.winner.validated()
+        for item in self.material_candidates:
+            item.validated()
+            if (
+                item.path_entry_index != self.authoritative_path_index
+                or item.pathext_index != self.winning_pathext_index
+                or item.path_entry != self.authoritative_path_entry
+                or item.extension != self.winning_extension
+                or not _same_file_authority(item.file, self.winner)
+            ):
+                raise ValueError("material PATH candidate differs from the deterministic winner")
+        winner_path = Path(self.winner.canonical_path)
+        if winner_path.stem.casefold() != self.command.casefold() or winner_path.suffix.casefold() != self.winning_extension.casefold():
+            raise ValueError("deterministic winner name or extension differs")
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validated()
+        return {
+            "schema_version": self.schema_version, "command": self.command,
+            "path_entries": list(self.path_entries), "path_sha256": self.path_sha256,
+            "pathext": list(self.pathext), "pathext_sha256": self.pathext_sha256,
+            "authoritative_path_entry": self.authoritative_path_entry,
+            "authoritative_path_index": self.authoritative_path_index,
+            "winning_extension": self.winning_extension,
+            "winning_pathext_index": self.winning_pathext_index,
+            "material_candidates": [item.to_dict() for item in self.material_candidates],
+            "winner": self.winner.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "DeterministicWindowsCommandResolution":
+        require_exact_keys(data, set(cls.__dataclass_fields__), "deterministic Windows command resolution")
+        return cls(
+            schema_version=data["schema_version"], command=data["command"],
+            path_entries=require_string_list(data["path_entries"], "path_entries"),
+            path_sha256=data["path_sha256"], pathext=require_string_list(data["pathext"], "pathext"),
+            pathext_sha256=data["pathext_sha256"], authoritative_path_entry=data["authoritative_path_entry"],
+            authoritative_path_index=data["authoritative_path_index"], winning_extension=data["winning_extension"],
+            winning_pathext_index=data["winning_pathext_index"],
+            material_candidates=tuple(WindowsPathCandidate.from_dict(item) for item in data["material_candidates"]),
+            winner=NativeBackendFileAttestation.from_dict(data["winner"]),
+        ).validated()
+
+
+def _deterministic_windows_resolve(
+    *, command: str, path_value: str, pathext_value: str,
+) -> DeterministicWindowsCommandResolution:
+    if command != CURSOR_DISCOVERY_COMMAND or ntpath.isabs(command) or ntpath.dirname(command) or "/" in command or "\\" in command:
+        raise ValueError("deterministic resolver accepts only the fixed bare cursor-agent command")
+    if not isinstance(path_value, str) or "\x00" in path_value:
+        raise ValueError("PATH is malformed")
+    if len(path_value.encode("utf-8", "surrogatepass")) > 1024 * 1024:
+        raise ValueError("PATH exceeds the deterministic resolver bound")
+    path_entries = tuple(path_value.split(_WINDOWS_PATH_SEPARATOR))
+    if not path_entries:
+        raise ValueError("PATH is empty")
+    for entry in path_entries:
+        if entry and (not ntpath.isabs(entry) or '"' in entry):
+            raise ValueError("PATH contains a relative or malformed component")
+    if not isinstance(pathext_value, str) or "\x00" in pathext_value:
+        raise ValueError("PATHEXT is malformed")
+    if len(pathext_value.encode("utf-8", "surrogatepass")) > 32768:
+        raise ValueError("PATHEXT exceeds the deterministic resolver bound")
+    pathext = tuple(pathext_value.split(_WINDOWS_PATH_SEPARATOR))
+    if not pathext or any(not item or not _PATHEXT_COMPONENT.fullmatch(item) for item in pathext):
+        raise ValueError("PATHEXT contains an empty or malformed component")
+    if len({item.casefold() for item in pathext}) != len(pathext):
+        raise ValueError("PATHEXT contains duplicate case-insensitive components")
+    path_hash = hashlib.sha256(path_value.encode("utf-8", "surrogatepass")).hexdigest()
+    pathext_hash = hashlib.sha256(pathext_value.encode("utf-8", "surrogatepass")).hexdigest()
+    for path_index, entry in enumerate(path_entries):
+        entry_path = Path.cwd() if not entry else Path(os.path.abspath(entry))
+        if not entry_path.exists():
+            continue
+        try:
+            directory, _identity = _safe_directory(entry_path, f"authoritative PATH entry {path_index}")
+        except ValueError as exc:
+            try:
+                unsafe_children = tuple(entry_path.iterdir()) if entry_path.is_dir() else ()
+            except OSError as observation_error:
+                raise ValueError(
+                    f"unsafe PATH entry {path_index} cannot be shown irrelevant to command resolution"
+                ) from observation_error
+            expected_names = {(command + extension).casefold() for extension in pathext}
+            if any(child.name.casefold() in expected_names for child in unsafe_children):
+                raise ValueError(
+                    f"redirecting or malformed PATH entry {path_index} would affect the cursor-agent winner"
+                ) from exc
+            continue
+        try:
+            children = tuple(directory.iterdir())
+        except OSError as exc:
+            raise ValueError(f"authoritative PATH entry {path_index} cannot be enumerated: {exc}") from exc
+        for extension_index, extension in enumerate(pathext):
+            expected_name = (command + extension).casefold()
+            matches = tuple(child for child in children if child.name.casefold() == expected_name)
+            if not matches:
+                continue
+            if not entry:
+                raise ValueError("an empty PATH component would affect the cursor-agent winner")
+            observed = tuple(
+                _canonical_backend_file(child, "deterministic PATH command candidate")
+                for child in sorted(matches, key=lambda item: (item.name.casefold(), item.name))
+            )
+            first = observed[0]
+            if any(not _same_file_authority(first, item) for item in observed[1:]):
+                raise ValueError("multiple case variants at one PATH/PATHEXT precedence position have conflicting identities")
+            material = tuple(
+                WindowsPathCandidate(path_index, extension_index, entry, extension, item).validated()
+                for item in observed
+            )
+            return DeterministicWindowsCommandResolution(
+                WINDOWS_COMMAND_RESOLUTION_SCHEMA_VERSION, command, path_entries, path_hash,
+                pathext, pathext_hash, entry, path_index, extension, extension_index,
+                material, first,
+            ).validated()
+    raise ValueError("deterministic Windows PATH/PATHEXT resolution found no cursor-agent command")
+
+
+@dataclass(frozen=True)
+class PowerShellCommandCandidate:
+    command_type: str
+    name: str
+    file: NativeBackendFileAttestation
+
+    def validated(self) -> "PowerShellCommandCandidate":
+        require_nonempty_text(self.command_type, "PowerShell command type", max_bytes=128)
+        require_nonempty_text(self.name, "PowerShell command name", max_bytes=1024)
+        self.file.validated()
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validated()
+        return {"command_type": self.command_type, "name": self.name, "file": self.file.to_dict()}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "PowerShellCommandCandidate":
+        require_exact_keys(data, set(cls.__dataclass_fields__), "PowerShell command candidate")
+        return cls(
+            data["command_type"], data["name"], NativeBackendFileAttestation.from_dict(data["file"]),
+        ).validated()
+
+
+def _powershell_candidate_key(item: PowerShellCommandCandidate) -> tuple[str, str, str]:
+    return (_normalized_path(item.file.canonical_path), item.command_type.casefold(), item.name.casefold())
 
 
 @dataclass(frozen=True)
 class CursorWrapperChainResolution:
-    """Canonical winning OS command resolution for cursor-agent."""
+    """v2 command authority: deterministic PATH/PATHEXT plus independent agreement."""
 
     discovery_mechanism: str
     command: str
-    which_path: str
-    where_paths: tuple[str, ...]
-    powershell_paths: tuple[str, ...]
-    powershell_available: bool
-    winning_cmd: NativeBackendFileAttestation
-    candidates: tuple[NativeBackendFileAttestation, ...]
+    deterministic: DeterministicWindowsCommandResolution
+    shutil_which_winner: NativeBackendFileAttestation
+    powershell_inventory: tuple[PowerShellCommandCandidate, ...]
+    powershell_preferred: PowerShellCommandCandidate
+    powershell_prefers_powershell_wrapper: bool
     wrapper_root: str
     wrapper_root_identity: NativeFilesystemIdentity
-    authoritative_path_entry: str
-    path_sha256: str
-    pathext: tuple[str, ...]
+
+    @property
+    def winning_cmd(self) -> NativeBackendFileAttestation:
+        return self.deterministic.winner
+
+    @property
+    def which_path(self) -> str:
+        return self.shutil_which_winner.canonical_path
+
+    @property
+    def powershell_paths(self) -> tuple[str, ...]:
+        return tuple(item.file.canonical_path for item in self.powershell_inventory)
+
+    @property
+    def candidates(self) -> tuple[NativeBackendFileAttestation, ...]:
+        return (self.deterministic.winner, self.shutil_which_winner, *(item.file for item in self.powershell_inventory))
+
+    @property
+    def authoritative_path_entry(self) -> str:
+        return self.deterministic.authoritative_path_entry
+
+    @property
+    def authoritative_path_index(self) -> int:
+        return self.deterministic.authoritative_path_index
+
+    @property
+    def path_sha256(self) -> str:
+        return self.deterministic.path_sha256
+
+    @property
+    def pathext(self) -> tuple[str, ...]:
+        return self.deterministic.pathext
+
+    @property
+    def pathext_sha256(self) -> str:
+        return self.deterministic.pathext_sha256
 
     def _body(self) -> dict[str, Any]:
         return {
             "discovery_mechanism": self.discovery_mechanism, "command": self.command,
-            "which_path": self.which_path, "where_paths": list(self.where_paths),
-            "powershell_paths": list(self.powershell_paths), "powershell_available": self.powershell_available,
-            "winning_cmd": self.winning_cmd.to_dict(), "candidates": [item.to_dict() for item in self.candidates],
+            "deterministic": self.deterministic.to_dict(),
+            "shutil_which_winner": self.shutil_which_winner.to_dict(),
+            "powershell_inventory": [item.to_dict() for item in self.powershell_inventory],
+            "powershell_preferred": self.powershell_preferred.to_dict(),
+            "powershell_prefers_powershell_wrapper": self.powershell_prefers_powershell_wrapper,
             "wrapper_root": self.wrapper_root, "wrapper_root_identity": self.wrapper_root_identity.to_dict(),
-            "authoritative_path_entry": self.authoritative_path_entry, "path_sha256": self.path_sha256,
-            "pathext": list(self.pathext),
         }
 
     def validated(self) -> "CursorWrapperChainResolution":
         if self.discovery_mechanism != WRAPPER_CHAIN_DISCOVERY_MECHANISM or self.command != CURSOR_DISCOVERY_COMMAND:
             raise ValueError("unsupported wrapper-chain discovery mechanism")
-        self.winning_cmd.validated()
-        winner = Path(self.winning_cmd.canonical_path)
-        if winner.stem.lower() != CURSOR_DISCOVERY_COMMAND or winner.suffix.lower() != ".cmd":
+        self.deterministic.validated(); self.shutil_which_winner.validated()
+        winner = self.deterministic.winner
+        if not _same_file_authority(winner, self.shutil_which_winner):
+            raise ValueError("deterministic resolver and shutil.which disagree")
+        winner_path = Path(winner.canonical_path)
+        if winner_path.stem.casefold() != CURSOR_DISCOVERY_COMMAND or winner_path.suffix.casefold() != ".cmd":
             raise ValueError("winning cursor-agent command is not the canonical cmd wrapper")
-        require_nonempty_text(self.which_path, "which resolution", max_bytes=4096)
-        if not self.where_paths:
-            raise ValueError("where.exe produced no cursor-agent candidate")
-        if _normalized_path(self.which_path) != _normalized_path(str(winner)) or _normalized_path(self.where_paths[0]) != _normalized_path(str(winner)):
-            raise ValueError("which/where cursor-agent resolutions are contradictory")
-        require_bool(self.powershell_available, "powershell resolution availability")
-        if self.powershell_available and not self.powershell_paths:
-            raise ValueError("PowerShell resolution is available but produced no cursor-agent candidate")
-        if not self.powershell_available and self.powershell_paths:
-            raise ValueError("PowerShell resolution availability contradicts its candidates")
         wrapper_root, identity = _safe_directory(self.wrapper_root, "Cursor wrapper root")
         if str(wrapper_root) != self.wrapper_root or not _same_directory_identity(identity, self.wrapper_root_identity):
             raise ValueError("Cursor wrapper root path or identity changed")
-        if winner.parent != wrapper_root:
+        if winner_path.parent != wrapper_root:
             raise ValueError("winning cursor-agent command is outside the attested wrapper root")
-        for value in (*self.where_paths, *self.powershell_paths):
-            candidate = Path(os.path.abspath(value))
-            if _normalized_path(str(candidate.parent)) != _normalized_path(str(wrapper_root)):
-                raise ValueError("a discovered cursor-agent candidate resolves outside the winning wrapper root")
-            if candidate.stem.lower() != CURSOR_DISCOVERY_COMMAND:
-                raise ValueError("a discovered cursor-agent candidate has an unexpected name")
-        if not self.candidates:
-            raise ValueError("wrapper-chain resolution must bind every discovered candidate")
-        seen: set[str] = set()
-        for item in self.candidates:
+        if not isinstance(self.powershell_inventory, tuple) or not self.powershell_inventory:
+            raise ValueError("PowerShell command inventory is unavailable or empty")
+        if tuple(sorted(self.powershell_inventory, key=_powershell_candidate_key)) != self.powershell_inventory:
+            raise ValueError("PowerShell command inventory is not canonically ordered")
+        cmd_candidates: list[PowerShellCommandCandidate] = []
+        ps_candidates: list[PowerShellCommandCandidate] = []
+        expected_ps_path = wrapper_root / "cursor-agent.ps1"
+        for item in self.powershell_inventory:
             item.validated()
-            path = Path(item.canonical_path)
-            if path.parent != wrapper_root:
-                raise ValueError("an attested candidate escapes the wrapper root")
-            seen.add(_normalized_path(item.canonical_path))
-        for value in (self.which_path, *self.where_paths, *self.powershell_paths):
-            if _normalized_path(value) not in seen:
-                raise ValueError("a discovered candidate lacks a bound file attestation")
-        if _normalized_path(self.authoritative_path_entry) != _normalized_path(str(wrapper_root)):
-            raise ValueError("authoritative PATH entry differs from the wrapper root")
-        require_sha256(self.path_sha256, "PATH fingerprint")
-        if not isinstance(self.pathext, tuple) or not self.pathext or ".CMD" not in {item.upper() for item in self.pathext}:
-            raise ValueError("PATHEXT semantics do not cover the winning cmd wrapper")
+            candidate_path = Path(item.file.canonical_path)
+            if candidate_path.parent != wrapper_root:
+                raise ValueError("PowerShell inventory contains an out-of-root candidate")
+            if candidate_path.stem.casefold() != CURSOR_DISCOVERY_COMMAND:
+                raise ValueError("PowerShell inventory contains an unexpected command name")
+            suffix = candidate_path.suffix.casefold()
+            if suffix == ".cmd" and item.command_type == "Application":
+                if not _same_file_authority(item.file, winner):
+                    raise ValueError("PowerShell inventory contains a contradictory cmd-compatible winner")
+                cmd_candidates.append(item)
+            elif suffix == ".ps1" and item.command_type == "ExternalScript":
+                if candidate_path != expected_ps_path:
+                    raise ValueError("PowerShell inventory contains a non-adjacent PowerShell wrapper")
+                ps_candidates.append(item)
+            else:
+                raise ValueError("PowerShell inventory contains an alias, function, application alias, or unsupported command")
+        if not cmd_candidates or not ps_candidates:
+            raise ValueError("PowerShell inventory must contain the adjacent .ps1 and deterministic .cmd wrappers")
+        self.powershell_preferred.validated()
+        if self.powershell_preferred not in self.powershell_inventory:
+            raise ValueError("PowerShell preferred command is absent from its complete inventory")
+        require_bool(self.powershell_prefers_powershell_wrapper, "PowerShell wrapper preference")
+        preferred_path = Path(self.powershell_preferred.file.canonical_path)
+        expected_preference = preferred_path == expected_ps_path and self.powershell_preferred.command_type == "ExternalScript"
+        if self.powershell_prefers_powershell_wrapper != expected_preference or not expected_preference:
+            raise ValueError("PowerShell does not prefer the expected adjacent .ps1 wrapper")
         return self
 
     def to_dict(self) -> dict[str, Any]:
@@ -875,13 +1243,129 @@ class CursorWrapperChainResolution:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "CursorWrapperChainResolution":
         require_exact_keys(data, set(cls.__dataclass_fields__), "wrapper-chain command resolution")
-        values = dict(data)
-        values["winning_cmd"] = NativeBackendFileAttestation.from_dict(data["winning_cmd"])
-        values["candidates"] = tuple(NativeBackendFileAttestation.from_dict(item) for item in data["candidates"])
-        values["wrapper_root_identity"] = NativeFilesystemIdentity.from_dict(data["wrapper_root_identity"])
-        for key in ("where_paths", "powershell_paths", "pathext"):
-            values[key] = require_string_list(data[key], key)
-        return cls(**values).validated()
+        return cls(
+            discovery_mechanism=data["discovery_mechanism"], command=data["command"],
+            deterministic=DeterministicWindowsCommandResolution.from_dict(data["deterministic"]),
+            shutil_which_winner=NativeBackendFileAttestation.from_dict(data["shutil_which_winner"]),
+            powershell_inventory=tuple(PowerShellCommandCandidate.from_dict(item) for item in data["powershell_inventory"]),
+            powershell_preferred=PowerShellCommandCandidate.from_dict(data["powershell_preferred"]),
+            powershell_prefers_powershell_wrapper=data["powershell_prefers_powershell_wrapper"],
+            wrapper_root=data["wrapper_root"],
+            wrapper_root_identity=NativeFilesystemIdentity.from_dict(data["wrapper_root_identity"]),
+        ).validated()
+
+
+class WindowsWhereDiagnosticStatus(str, Enum):
+    MATCHING_RESULT = "MATCHING_RESULT"
+    CONTRADICTORY_RESULT = "CONTRADICTORY_RESULT"
+    EMPTY_RESULT = "EMPTY_RESULT"
+    EXECUTION_ERROR = "EXECUTION_ERROR"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
+@dataclass(frozen=True)
+class WindowsWhereDiagnostic:
+    schema_version: str
+    status: WindowsWhereDiagnosticStatus
+    where_executable: NativeBackendFileAttestation | None
+    argv: tuple[str, ...]
+    exit_code: int | None
+    stdout_byte_count: int
+    stdout_sha256: str
+    stderr_byte_count: int
+    stderr_sha256: str
+    parsed_candidates: tuple[str, ...]
+
+    def validated(self) -> "WindowsWhereDiagnostic":
+        if self.schema_version != WINDOWS_WHERE_DIAGNOSTIC_SCHEMA_VERSION or not isinstance(self.status, WindowsWhereDiagnosticStatus):
+            raise ValueError("unsupported where.exe diagnostic")
+        if self.where_executable is not None:
+            self.where_executable.validated()
+        _validate_argv(self.argv, "where.exe diagnostic argv")
+        if self.exit_code is not None:
+            require_strict_int(self.exit_code, "where.exe diagnostic exit code", minimum=0, maximum=2**31 - 1)
+        require_strict_int(self.stdout_byte_count, "where.exe stdout byte count", minimum=0, maximum=2**63 - 1)
+        require_strict_int(self.stderr_byte_count, "where.exe stderr byte count", minimum=0, maximum=2**63 - 1)
+        require_sha256(self.stdout_sha256, "where.exe stdout sha256")
+        require_sha256(self.stderr_sha256, "where.exe stderr sha256")
+        if not isinstance(self.parsed_candidates, tuple) or any(not isinstance(item, str) or not item for item in self.parsed_candidates):
+            raise ValueError("where.exe parsed candidates are invalid")
+        if self.status in {WindowsWhereDiagnosticStatus.MATCHING_RESULT, WindowsWhereDiagnosticStatus.CONTRADICTORY_RESULT}:
+            if self.where_executable is None or self.exit_code != 0 or not self.parsed_candidates:
+                raise ValueError("successful where.exe diagnostic lacks executable, exit, or candidate evidence")
+        if self.status is WindowsWhereDiagnosticStatus.UNAVAILABLE and (self.where_executable is not None or self.exit_code is not None):
+            raise ValueError("unavailable where.exe diagnostic carries executable authority")
+        if self.status is WindowsWhereDiagnosticStatus.EMPTY_RESULT and self.parsed_candidates:
+            raise ValueError("empty where.exe diagnostic carries parsed candidates")
+        if self.where_executable is not None and self.argv[0] != self.where_executable.canonical_path:
+            raise ValueError("where.exe diagnostic argv differs from the observed executable")
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validated()
+        return {
+            "schema_version": self.schema_version, "status": self.status.value,
+            "where_executable": self.where_executable.to_dict() if self.where_executable else None,
+            "argv": list(self.argv), "exit_code": self.exit_code,
+            "stdout_byte_count": self.stdout_byte_count, "stdout_sha256": self.stdout_sha256,
+            "stderr_byte_count": self.stderr_byte_count, "stderr_sha256": self.stderr_sha256,
+            "parsed_candidates": list(self.parsed_candidates),
+        }
+
+
+class _WhereDiagnosticContradiction(ValueError):
+    def __init__(self, diagnostic: WindowsWhereDiagnostic) -> None:
+        super().__init__("successful where.exe result contradicts deterministic command authority")
+        self.diagnostic = diagnostic
+
+
+def _where_diagnostic(
+    discovery: WrapperChainDiscovery, winner: NativeBackendFileAttestation,
+) -> WindowsWhereDiagnostic:
+    observed = discovery.where_cursor_agent()
+    executable: NativeBackendFileAttestation | None = None
+    if observed.executable is not None:
+        try:
+            executable = _canonical_backend_file(observed.executable, "where.exe diagnostic executable")
+        except (OSError, ValueError):
+            executable = None
+    candidates = tuple(
+        line.strip()
+        for line in observed.stdout.decode("utf-8", errors="replace").splitlines()
+        if line.strip()
+    )
+    if observed.executable is None and not observed.execution_error:
+        status = WindowsWhereDiagnosticStatus.UNAVAILABLE
+    elif observed.execution_error:
+        status = WindowsWhereDiagnosticStatus.EXECUTION_ERROR
+    elif not candidates:
+        status = (
+            WindowsWhereDiagnosticStatus.EMPTY_RESULT
+            if observed.exit_code in {0, 1} and not observed.stderr
+            else WindowsWhereDiagnosticStatus.EXECUTION_ERROR
+        )
+    elif observed.exit_code != 0:
+        status = WindowsWhereDiagnosticStatus.EXECUTION_ERROR
+    else:
+        matching = True
+        for candidate in candidates:
+            try:
+                attested = _canonical_backend_file(candidate, "where.exe diagnostic candidate")
+            except (OSError, ValueError):
+                matching = False
+                break
+            if not _same_file_authority(attested, winner):
+                matching = False
+                break
+        status = WindowsWhereDiagnosticStatus.MATCHING_RESULT if matching else WindowsWhereDiagnosticStatus.CONTRADICTORY_RESULT
+    diagnostic = WindowsWhereDiagnostic(
+        WINDOWS_WHERE_DIAGNOSTIC_SCHEMA_VERSION, status, executable, observed.argv, observed.exit_code,
+        len(observed.stdout), hashlib.sha256(observed.stdout).hexdigest(),
+        len(observed.stderr), hashlib.sha256(observed.stderr).hexdigest(), candidates,
+    ).validated()
+    if status is WindowsWhereDiagnosticStatus.CONTRADICTORY_RESULT:
+        raise _WhereDiagnosticContradiction(diagnostic)
+    return diagnostic
 
 
 def _validated_semantics(value: Any, label: str) -> dict[str, Any]:
@@ -1060,53 +1544,60 @@ class WrapperChainBackendAttestation:
         return cls(**values).validated()
 
 
-def _attest_wrapper_chain_cursor(config: CursorNativeBackendConfig, *, discovery: WrapperChainDiscovery | None = None) -> WrapperChainBackendAttestation:
-    """Attest the exact winning local cursor-agent wrapper chain without executing it."""
-
+def _attest_wrapper_chain_cursor_observed(
+    config: CursorNativeBackendConfig, *, discovery: WrapperChainDiscovery | None = None,
+) -> tuple[WrapperChainBackendAttestation, WindowsWhereDiagnostic]:
+    """Attest v2 authority and return separate non-authoritative diagnostics."""
     if config.attestation_class != ATTESTATION_CLASS_WRAPPER_CHAIN:
         raise ValueError("wrapper-chain attestation requires the explicitly configured LOCAL_WRAPPER_CHAIN class")
     discovery = discovery or HostWrapperChainDiscovery()
-    which_path = discovery.which_cursor_agent()
-    if which_path is None:
-        raise ValueError("canonical local cursor-agent discovery found no command")
-    winner_path, _ = _safe_file(which_path, "winning cursor-agent command")
-    where_paths = discovery.where_cursor_agent()
-    if not where_paths:
-        raise ValueError("where.exe found no cursor-agent command")
-    powershell_paths = discovery.powershell_cursor_agent()
-    powershell_available = powershell_paths is not None
-    powershell_paths = powershell_paths or ()
-    if _normalized_path(where_paths[0]) != _normalized_path(str(winner_path)):
-        raise ValueError("shutil.which and where.exe disagree on the winning cursor-agent command")
-    wrapper_root, wrapper_root_identity = _safe_directory(winner_path.parent, "Cursor wrapper root")
-    candidate_paths: dict[str, Path] = {}
-    for value in (str(winner_path), *where_paths, *powershell_paths):
-        candidate, _ = _safe_file(value, "discovered cursor-agent candidate")
-        if candidate.parent != wrapper_root:
-            raise ValueError("a discovered cursor-agent candidate resolves outside the winning wrapper root")
-        if candidate.stem.lower() != CURSOR_DISCOVERY_COMMAND:
-            raise ValueError("a discovered cursor-agent candidate has an unexpected name")
-        candidate_paths[_normalized_path(str(candidate))] = candidate
-    candidates = tuple(
-        NativeBackendFileAttestation.observe(candidate_paths[key], "discovered cursor-agent candidate")
-        for key in sorted(candidate_paths)
-    )
     path_value = discovery.path_value()
-    entries = [entry for entry in path_value.split(os.pathsep) if entry]
-    if not any(_normalized_path(entry) == _normalized_path(str(wrapper_root)) for entry in entries):
-        raise ValueError("the winning wrapper root is not an authoritative PATH entry")
-    pathext = tuple(item.strip().upper() for item in discovery.pathext_value().split(os.pathsep) if item.strip())
-    if ".CMD" not in pathext:
-        raise ValueError("PATHEXT does not resolve the winning cmd wrapper")
+    pathext_value = discovery.pathext_value()
+
+    def require_environment_unchanged(stage: str) -> None:
+        if discovery.path_value() != path_value or discovery.pathext_value() != pathext_value:
+            raise ValueError(f"PATH or PATHEXT changed during wrapper-chain {stage}")
+
+    deterministic = _deterministic_windows_resolve(
+        command=CURSOR_DISCOVERY_COMMAND, path_value=path_value, pathext_value=pathext_value,
+    )
+    which_path = discovery.which_cursor_agent(path_value=path_value, pathext_value=pathext_value)
+    if which_path is None:
+        raise ValueError("shutil.which found no cursor-agent command while deterministic resolution succeeded")
+    which_winner = _canonical_backend_file(which_path, "shutil.which cursor-agent winner")
+    if not _same_file_authority(deterministic.winner, which_winner):
+        raise ValueError("deterministic resolver and shutil.which disagree")
+    winner_path = Path(deterministic.winner.canonical_path)
+    wrapper_root, wrapper_root_identity = _safe_directory(winner_path.parent, "Cursor wrapper root")
+    powershell = discovery.powershell_cursor_agent()
+    require_environment_unchanged("PowerShell inventory")
+    if powershell is None or not powershell.candidates or powershell.preferred is None:
+        raise ValueError("PowerShell command inventory is unavailable or empty")
+
+    def bind_powershell(raw: tuple[str, str, str]) -> PowerShellCommandCandidate:
+        command_type, name, path = raw
+        if command_type not in {"Application", "ExternalScript"} or not path:
+            raise ValueError("PowerShell inventory contains an alias, function, application alias, or pathless command")
+        return PowerShellCommandCandidate(
+            command_type, name, _canonical_backend_file(path, "PowerShell cursor-agent candidate"),
+        ).validated()
+
+    powershell_inventory = tuple(sorted(
+        (bind_powershell(item) for item in powershell.candidates), key=_powershell_candidate_key,
+    ))
+    powershell_preferred = bind_powershell(powershell.preferred)
     resolution = CursorWrapperChainResolution(
         discovery_mechanism=WRAPPER_CHAIN_DISCOVERY_MECHANISM, command=CURSOR_DISCOVERY_COMMAND,
-        which_path=str(winner_path), where_paths=tuple(where_paths), powershell_paths=tuple(powershell_paths),
-        powershell_available=powershell_available,
-        winning_cmd=NativeBackendFileAttestation.observe(winner_path, "winning cursor-agent cmd wrapper"),
-        candidates=candidates, wrapper_root=str(wrapper_root), wrapper_root_identity=wrapper_root_identity,
-        authoritative_path_entry=str(wrapper_root),
-        path_sha256=hashlib.sha256(path_value.encode("utf-8", "surrogatepass")).hexdigest(), pathext=pathext,
+        deterministic=deterministic, shutil_which_winner=which_winner,
+        powershell_inventory=powershell_inventory, powershell_preferred=powershell_preferred,
+        powershell_prefers_powershell_wrapper=(
+            Path(powershell_preferred.file.canonical_path) == wrapper_root / "cursor-agent.ps1"
+            and powershell_preferred.command_type == "ExternalScript"
+        ),
+        wrapper_root=str(wrapper_root), wrapper_root_identity=wrapper_root_identity,
     ).validated()
+    where_diagnostic = _where_diagnostic(discovery, resolution.winning_cmd)
+    require_environment_unchanged("where.exe diagnostic")
     cmd_semantics = _parse_cmd_wrapper(winner_path.read_bytes(), wrapper_name=winner_path.name)
     ps_path, _ = _safe_file(wrapper_root / cmd_semantics["adjacent_powershell_target"], "adjacent PowerShell wrapper")
     ps_semantics = _parse_powershell_wrapper(ps_path.read_bytes())
@@ -1134,6 +1625,8 @@ def _attest_wrapper_chain_cursor(config: CursorNativeBackendConfig, *, discovery
                 raise ValueError("selected-version wrapper copy differs from the winning top-level wrapper")
             copies.append(copy)
     template = (node.canonical_path, entry.canonical_path, "--print", "--output-format", "stream-json", "--force", "--trust", "--model", config.model, "{prompt}")
+    node_signature_context = discovery.node_signature_context(Path(node.canonical_path))
+    require_environment_unchanged("static attestation")
     provisional = WrapperChainBackendAttestation(
         schema_version=WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION, attestation_class=ATTESTATION_CLASS_WRAPPER_CHAIN,
         backend_identity=BACKEND_IDENTITY, backend_protocol_version=BACKEND_PROTOCOL_VERSION,
@@ -1146,12 +1639,23 @@ def _attest_wrapper_chain_cursor(config: CursorNativeBackendConfig, *, discovery
         executable=node, launcher_prefix=(entry,), package_manifest=manifest_file,
         package_name=EXPECTED_CURSOR_PACKAGE_NAME, manifest_declares_cursor_agent_bin=declares,
         version_wrapper_copies=tuple(copies),
-        node_signature_context=discovery.node_signature_context(Path(node.canonical_path)),
+        node_signature_context=node_signature_context,
         claims=dict(WRAPPER_CHAIN_CLAIMS), non_claims=WRAPPER_CHAIN_NON_CLAIMS,
         static_argv_template=template, selected_model=config.model,
         environment_allowlist=config.environment_allowlist, attestation_fingerprint="0" * 64,
     )
-    return WrapperChainBackendAttestation(**{**provisional.__dict__, "attestation_fingerprint": fingerprint(provisional._body())}).validated()
+    attestation = WrapperChainBackendAttestation(
+        **{**provisional.__dict__, "attestation_fingerprint": fingerprint(provisional._body())}
+    ).validated()
+    return attestation, where_diagnostic
+
+
+def _attest_wrapper_chain_cursor(
+    config: CursorNativeBackendConfig, *, discovery: WrapperChainDiscovery | None = None,
+) -> WrapperChainBackendAttestation:
+    """Return only authority; where.exe diagnostics are deliberately excluded."""
+
+    return _attest_wrapper_chain_cursor_observed(config, discovery=discovery)[0]
 
 
 def _bounded_probe(argv: tuple[str, ...], environment: Mapping[str, str]) -> tuple[int | None, bytes, bytes]:
@@ -1275,6 +1779,7 @@ class NativePreflightDecision:
     reason_code: str
     detail: str
     attestation: "BackendAttestation | None"
+    where_diagnostic: WindowsWhereDiagnostic | None = None
 
     @property
     def ready(self) -> bool:
@@ -1416,7 +1921,10 @@ def attestation_from_dict(data: Mapping[str, Any]) -> BackendAttestation:
 
     if not isinstance(data, Mapping):
         raise ValueError("backend attestation payload must be a mapping")
-    if data.get("schema_version") == WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION:
+    schema_version = data.get("schema_version")
+    if schema_version == WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION_LEGACY_V1:
+        raise ValueError("legacy wrapper-chain v1 attestation is inert and cannot authorize new execution")
+    if schema_version == WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION:
         return WrapperChainBackendAttestation.from_dict(data)
     return NativeBackendAttestation.from_dict(data)
 
@@ -1445,14 +1953,20 @@ def preflight_native_cursor(*, config: CursorNativeBackendConfig, work_workspace
     try:
         if work_workspace is not None:
             _safe_directory(work_workspace, "preflight work workspace")
-        attestation = _attest_local_backend(config)
         if wrapper_chain:
+            attestation, where_diagnostic = _attest_wrapper_chain_cursor_observed(config)
             return NativePreflightDecision(
                 NativePreflightStatus.PREFLIGHT_READY, WRAPPER_CHAIN_READY_REASON,
-                "Exact local cursor-agent command routing, wrapper bytes, deterministic version selection, and runtime/entry identity attested. Publisher provenance, Cursor desktop ownership, payload signature, and CLI capability behavior are explicitly NOT established; suitable only for an owner-authorized local experiment.",
-                attestation,
+                "Deterministic Windows PATH/PATHEXT authority, shutil.which agreement, PowerShell inventory, wrapper bytes, deterministic version selection, and runtime/entry identity attested. where.exe is diagnostic only unless a successful result contradicts authority. Publisher provenance, Cursor desktop ownership, payload signature, and CLI capability behavior are explicitly NOT established; suitable only for an owner-authorized local experiment.",
+                attestation, where_diagnostic,
             )
+        attestation = _attest_local_backend(config)
         return NativePreflightDecision(NativePreflightStatus.PREFLIGHT_READY, "LOCAL_CURSOR_CAPABILITIES_ATTESTED", "Local Cursor version/help probes advertised the required bounded experiment flags.", attestation)
+    except _WhereDiagnosticContradiction as exc:
+        return NativePreflightDecision(
+            NativePreflightStatus.PREFLIGHT_BLOCKED, WRAPPER_CHAIN_BLOCKED_REASON,
+            str(exc), None, exc.diagnostic,
+        )
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         return NativePreflightDecision(NativePreflightStatus.PREFLIGHT_BLOCKED, WRAPPER_CHAIN_BLOCKED_REASON if wrapper_chain else "LOCAL_CAPABILITY_ATTESTATION_BLOCKED", str(exc), None)
 
@@ -2258,6 +2772,6 @@ class AtomicNativeExecutionStore:
 
 
 __all__ = [
-    "ARTIFACT_SCHEMA_VERSION", "ATTESTATION_CLASS_PACKAGE_BIN", "ATTESTATION_CLASS_WRAPPER_CHAIN", "ATTESTATION_SCHEMA_VERSION", "BACKEND_IDENTITY", "BACKEND_PROTOCOL_VERSION", "CAPTURE_ATTEMPT_SCHEMA_VERSION", "CAPTURE_EXPECTED_SUCCESS_STATUS", "CURSOR_DISCOVERY_COMMAND", "CURSOR_DISCOVERY_MECHANISM", "DEFAULT_ENVIRONMENT_ALLOWLIST", "EXPECTED_CURSOR_PACKAGE_NAME", "NATIVE_PROMPT_HEADER", "PACKAGE_BIN_NON_CLAIMS", "REQUEST_SCHEMA_VERSION", "RESULT_SCHEMA_VERSION", "TERMINAL_SCHEMA_VERSION", "WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION", "WRAPPER_CHAIN_BLOCKED_REASON", "WRAPPER_CHAIN_CLAIMS", "WRAPPER_CHAIN_DISCOVERY_MECHANISM", "WRAPPER_CHAIN_NON_CLAIMS", "WRAPPER_CHAIN_READY_REASON",
-    "AtomicNativeExecutionStore", "BackendAttestation", "CursorInstallationProvenance", "CursorNativeBackendConfig", "CursorWrapperChainResolution", "HostWrapperChainDiscovery", "WrapperChainBackendAttestation", "WrapperChainDiscovery", "attestation_from_dict", "ManagedNativeProcessRunner", "NativeArtifactReference", "NativeBackendAttestation", "NativeBackendFileAttestation", "NativeCanaryTerminalRecord", "NativeCaptureTerminalStatus", "NativeCheckpointCaptureAttempt", "NativeCommittedButDurabilityUncertain", "NativeDelegatedExecutor", "NativeEvidenceInvalid", "NativeEvidenceNotFound", "NativeExecutionRequest", "NativeExecutionResult", "NativeExecutionStatus", "NativeExecutionStoreError", "NativeFilesystemIdentity", "NativePreflightDecision", "NativePreflightStatus", "NativeProcessInvocation", "NativeProcessOutcome", "NativeProcessRunner", "NativeProcessStartError", "NativeRequestAlreadyExists", "NativeResultAlreadyExists", "preflight_native_cursor",
+    "ARTIFACT_SCHEMA_VERSION", "ATTESTATION_CLASS_PACKAGE_BIN", "ATTESTATION_CLASS_WRAPPER_CHAIN", "ATTESTATION_SCHEMA_VERSION", "BACKEND_IDENTITY", "BACKEND_PROTOCOL_VERSION", "CAPTURE_ATTEMPT_SCHEMA_VERSION", "CAPTURE_EXPECTED_SUCCESS_STATUS", "CURSOR_DISCOVERY_COMMAND", "CURSOR_DISCOVERY_MECHANISM", "DEFAULT_ENVIRONMENT_ALLOWLIST", "EXPECTED_CURSOR_PACKAGE_NAME", "NATIVE_PROMPT_HEADER", "PACKAGE_BIN_NON_CLAIMS", "REQUEST_SCHEMA_VERSION", "RESULT_SCHEMA_VERSION", "TERMINAL_SCHEMA_VERSION", "WINDOWS_COMMAND_RESOLUTION_SCHEMA_VERSION", "WINDOWS_WHERE_DIAGNOSTIC_SCHEMA_VERSION", "WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION", "WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION_LEGACY_V1", "WRAPPER_CHAIN_BLOCKED_REASON", "WRAPPER_CHAIN_CLAIMS", "WRAPPER_CHAIN_DISCOVERY_MECHANISM", "WRAPPER_CHAIN_NON_CLAIMS", "WRAPPER_CHAIN_READY_REASON",
+    "AtomicNativeExecutionStore", "BackendAttestation", "CursorInstallationProvenance", "CursorNativeBackendConfig", "CursorWrapperChainResolution", "DeterministicWindowsCommandResolution", "HostWrapperChainDiscovery", "PowerShellCommandCandidate", "PowerShellCommandObservation", "WhereCommandObservation", "WindowsPathCandidate", "WindowsWhereDiagnostic", "WindowsWhereDiagnosticStatus", "WrapperChainBackendAttestation", "WrapperChainDiscovery", "attestation_from_dict", "ManagedNativeProcessRunner", "NativeArtifactReference", "NativeBackendAttestation", "NativeBackendFileAttestation", "NativeCanaryTerminalRecord", "NativeCaptureTerminalStatus", "NativeCheckpointCaptureAttempt", "NativeCommittedButDurabilityUncertain", "NativeDelegatedExecutor", "NativeEvidenceInvalid", "NativeEvidenceNotFound", "NativeExecutionRequest", "NativeExecutionResult", "NativeExecutionStatus", "NativeExecutionStoreError", "NativeFilesystemIdentity", "NativePreflightDecision", "NativePreflightStatus", "NativeProcessInvocation", "NativeProcessOutcome", "NativeProcessRunner", "NativeProcessStartError", "NativeRequestAlreadyExists", "NativeResultAlreadyExists", "preflight_native_cursor",
 ]

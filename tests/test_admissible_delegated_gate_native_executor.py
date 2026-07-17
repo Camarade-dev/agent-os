@@ -627,15 +627,23 @@ from admissible.delegated_gate.native_executor import (
     WRAPPER_CHAIN_CLAIMS,
     WRAPPER_CHAIN_NON_CLAIMS,
     WRAPPER_CHAIN_READY_REASON,
+    WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION,
+    WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION_LEGACY_V1,
+    PowerShellCommandObservation,
+    WhereCommandObservation,
+    WindowsWhereDiagnosticStatus,
     WrapperChainBackendAttestation,
     attestation_from_dict,
     preflight_native_cursor as _preflight,
     _attest_local_backend,
     _attest_wrapper_chain_cursor,
+    _attest_wrapper_chain_cursor_observed,
+    _deterministic_windows_resolve,
     _parse_cmd_wrapper,
     _parse_powershell_wrapper,
     _POWERSHELL_WRAPPER_TEMPLATE_LINES,
     _safe_directory,
+    _same_file_authority,
     _same_directory_identity,
     _same_mutable_directory_entry,
 )
@@ -675,15 +683,55 @@ class FakeWrapperChainDiscovery:
 
     root: Path
     which: str | None = None
+    which_unavailable: bool = False
     where: tuple[str, ...] | None = None
     powershell: tuple[str, ...] | None = None
+    powershell_records: tuple[tuple[str, str, str], ...] | None = None
+    powershell_preferred: tuple[str, str, str] | None = None
     path: str | None = None
     pathext: str = ".COM;.EXE;.BAT;.CMD"
+    where_exit_code: int = 0
+    where_stdout: bytes | None = None
+    where_stderr: bytes = b""
+    where_unavailable: bool = False
+    where_execution_error: bool = False
 
-    def which_cursor_agent(self) -> str | None: return self.which if self.which is not None else str(self.root / "cursor-agent.cmd")
-    def where_cursor_agent(self) -> tuple[str, ...]: return self.where if self.where is not None else (str(self.root / "cursor-agent.cmd"),)
-    def powershell_cursor_agent(self) -> tuple[str, ...] | None: return self.powershell if self.powershell is not None else (str(self.root / "cursor-agent.ps1"),)
-    def path_value(self) -> str: return self.path if self.path is not None else str(self.root) + os.pathsep + "C:\\Windows"
+    def which_cursor_agent(self, *, path_value: str, pathext_value: str) -> str | None:
+        if self.which_unavailable:
+            return None
+        return self.which if self.which is not None else str(self.root / "cursor-agent.cmd")
+
+    def where_cursor_agent(self) -> WhereCommandObservation:
+        if self.where_unavailable:
+            return WhereCommandObservation(None, ("where.exe", "cursor-agent"), None, b"", b"")
+        executable = str(Path(sys.executable).resolve())
+        paths = self.where if self.where is not None else (str(self.root / "cursor-agent.cmd"),)
+        stdout = self.where_stdout if self.where_stdout is not None else (
+            "".join(f"{item}\r\n" for item in paths).encode("utf-8")
+        )
+        return WhereCommandObservation(
+            executable, (executable, "cursor-agent"),
+            None if self.where_execution_error else self.where_exit_code,
+            stdout, self.where_stderr, self.where_execution_error,
+        )
+
+    def powershell_cursor_agent(self) -> PowerShellCommandObservation | None:
+        if self.powershell_records is not None:
+            rows = self.powershell_records
+        else:
+            paths = self.powershell if self.powershell is not None else (
+                str(self.root / "cursor-agent.ps1"), str(self.root / "cursor-agent.cmd"),
+            )
+            rows = tuple(
+                ("ExternalScript" if Path(item).suffix.casefold() == ".ps1" else "Application", Path(item).name, item)
+                for item in paths
+            )
+        preferred = self.powershell_preferred
+        if preferred is None:
+            preferred = next((item for item in rows if Path(item[2]).suffix.casefold() == ".ps1"), rows[0] if rows else None)
+        return PowerShellCommandObservation(rows, preferred)
+
+    def path_value(self) -> str: return self.path if self.path is not None else str(self.root) + ";" + "C:\\Windows"
     def pathext_value(self) -> str: return self.pathext
     def node_signature_context(self, node_path: Path) -> str: return "NotSigned|test-context"
 
@@ -776,7 +824,6 @@ def test_contradictory_or_out_of_root_command_resolution_blocks(tmp_path: Path):
         FakeWrapperChainDiscovery(root, powershell=(str(elsewhere / "cursor-agent.cmd"),)),
         FakeWrapperChainDiscovery(root, path="C:\\Windows"),
         FakeWrapperChainDiscovery(root, pathext=".COM;.EXE;.BAT"),
-        FakeWrapperChainDiscovery(root, where=()),
         FakeWrapperChainDiscovery(root, which=""),
     ):
         with pytest.raises(ValueError):
@@ -1750,3 +1797,365 @@ def test_payload_and_attestation_are_byte_reproducible_under_all_alternating_dir
     assert len(source_identities) == len(wrapper_identities) == len(selected_identities) == len(mutable_identities) == 1
     assert len(command_resolution_fingerprints) == len(backend_fingerprints) == len(payload_fingerprints) == 1
     assert len(canonical_payloads) == len(canonical_hashes) == 1
+
+
+# --- Act 2A.3E: deterministic Windows command-resolution authority ---------
+
+def _path_value(*entries: Path | str) -> str:
+    return ";".join(os.fspath(item) for item in entries)
+
+
+def test_deterministic_windows_resolver_selects_bare_cmd_in_path_and_pathext_order(tmp_path: Path):
+    earlier = tmp_path / "earlier"; earlier.mkdir()
+    winner_root = tmp_path / "winner"; winner_root.mkdir()
+    winner = winner_root / "cursor-agent.cmd"; winner.write_bytes(_OBSERVED_CMD_WRAPPER.encode("ascii"))
+    resolved = _deterministic_windows_resolve(
+        command="cursor-agent", path_value=_path_value(earlier, winner_root), pathext_value=".COM;.CMD;.EXE",
+    )
+    assert Path(resolved.winner.canonical_path) == winner.resolve()
+    assert resolved.authoritative_path_index == 1
+    assert resolved.winning_pathext_index == 1
+    assert resolved.path_entries == (str(earlier), str(winner_root))
+    assert resolved.pathext == (".COM", ".CMD", ".EXE")
+    assert len(resolved.material_candidates) == 1
+
+
+def test_path_order_changes_winner_and_authority_fingerprint(tmp_path: Path):
+    left = tmp_path / "left"; right = tmp_path / "right"; left.mkdir(); right.mkdir()
+    (left / "cursor-agent.cmd").write_bytes(b"left")
+    (right / "cursor-agent.cmd").write_bytes(b"right")
+    first = _deterministic_windows_resolve(command="cursor-agent", path_value=_path_value(left, right), pathext_value=".CMD")
+    second = _deterministic_windows_resolve(command="cursor-agent", path_value=_path_value(right, left), pathext_value=".CMD")
+    assert first.winner.sha256 != second.winner.sha256
+    assert fingerprint(first.to_dict()) != fingerprint(second.to_dict())
+
+
+def test_pathext_order_changes_winner_and_authority_fingerprint(tmp_path: Path):
+    root = tmp_path / "bin"; root.mkdir()
+    (root / "cursor-agent.com").write_bytes(b"com")
+    (root / "cursor-agent.cmd").write_bytes(b"cmd")
+    com_first = _deterministic_windows_resolve(command="cursor-agent", path_value=str(root), pathext_value=".COM;.CMD")
+    cmd_first = _deterministic_windows_resolve(command="cursor-agent", path_value=str(root), pathext_value=".CMD;.COM")
+    assert Path(com_first.winner.canonical_path).suffix.casefold() == ".com"
+    assert Path(cmd_first.winner.canonical_path).suffix.casefold() == ".cmd"
+    assert fingerprint(com_first.to_dict()) != fingerprint(cmd_first.to_dict())
+
+
+def test_missing_cmd_pathext_and_relative_path_component_fail_closed(tmp_path: Path):
+    root = tmp_path / "bin"; root.mkdir(); (root / "cursor-agent.cmd").write_bytes(b"cmd")
+    with pytest.raises(ValueError, match="found no"):
+        _deterministic_windows_resolve(command="cursor-agent", path_value=str(root), pathext_value=".COM;.EXE")
+    with pytest.raises(ValueError, match="relative"):
+        _deterministic_windows_resolve(command="cursor-agent", path_value=_path_value("relative-bin", root), pathext_value=".CMD")
+
+
+def test_duplicate_path_entries_are_deterministic_and_fully_bound(tmp_path: Path):
+    empty = tmp_path / "empty"; root = tmp_path / "bin"; empty.mkdir(); root.mkdir()
+    (root / "cursor-agent.cmd").write_bytes(b"cmd")
+    duplicate = _deterministic_windows_resolve(
+        command="cursor-agent", path_value=_path_value(empty, empty, root), pathext_value=".CMD",
+    )
+    single = _deterministic_windows_resolve(
+        command="cursor-agent", path_value=_path_value(empty, root), pathext_value=".CMD",
+    )
+    assert duplicate.authoritative_path_index == 2 and single.authoritative_path_index == 1
+    assert _same_file_authority(duplicate.winner, single.winner)
+    assert duplicate.path_sha256 != single.path_sha256
+
+
+def test_empty_path_component_blocks_when_current_directory_can_affect_winner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    later = tmp_path / "later"; later.mkdir()
+    (tmp_path / "cursor-agent.cmd").write_bytes(b"cwd shadow")
+    (later / "cursor-agent.cmd").write_bytes(b"later")
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ValueError, match="empty PATH component"):
+        _deterministic_windows_resolve(
+            command="cursor-agent", path_value=";" + str(later), pathext_value=".CMD",
+        )
+
+
+def test_candidate_directory_and_redirecting_candidate_are_rejected(tmp_path: Path):
+    directory_root = tmp_path / "directory-root"; directory_root.mkdir(); (directory_root / "cursor-agent.cmd").mkdir()
+    with pytest.raises(ValueError, match="regular file"):
+        _deterministic_windows_resolve(command="cursor-agent", path_value=str(directory_root), pathext_value=".CMD")
+
+    link_root = tmp_path / "link-root"; link_root.mkdir()
+    target = tmp_path / "target.cmd"; target.write_bytes(b"target")
+    link = link_root / "cursor-agent.cmd"
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError):
+        pytest.skip("file symlink creation unavailable")
+    with pytest.raises(ValueError, match="redirecting"):
+        _deterministic_windows_resolve(command="cursor-agent", path_value=str(link_root), pathext_value=".CMD")
+
+
+def test_conflicting_case_variants_at_same_precedence_position_are_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    root = tmp_path / "root"; left = tmp_path / "left"; right = tmp_path / "right"
+    root.mkdir(); left.mkdir(); right.mkdir()
+    lower = left / "cursor-agent.cmd"; upper = right / "CURSOR-AGENT.CMD"
+    lower.write_bytes(b"lower"); upper.write_bytes(b"upper")
+    original = Path.iterdir
+
+    def adversarial_iterdir(path: Path):
+        if path == root:
+            return iter((lower, upper))
+        return original(path)
+
+    monkeypatch.setattr(Path, "iterdir", adversarial_iterdir)
+    with pytest.raises(ValueError, match="case variants"):
+        _deterministic_windows_resolve(command="cursor-agent", path_value=str(root), pathext_value=".CMD")
+
+
+@pytest.mark.parametrize("command", ("C:\\Tools\\cursor-agent.cmd", ".\\cursor-agent", "bin/cursor-agent"))
+def test_deterministic_resolver_rejects_caller_supplied_command_paths(tmp_path: Path, command: str):
+    with pytest.raises(ValueError, match="fixed bare"):
+        _deterministic_windows_resolve(command=command, path_value=str(tmp_path), pathext_value=".CMD")
+
+
+def test_earlier_malicious_candidate_shadows_expected_wrapper_and_powershell_blocks(tmp_path: Path):
+    expected_parent = tmp_path / "expected"; expected_parent.mkdir()
+    expected = _wrapper_chain_installation(expected_parent)
+    malicious = tmp_path / "malicious"; malicious.mkdir()
+    malicious_cmd = malicious / "cursor-agent.cmd"; malicious_cmd.write_bytes(_OBSERVED_CMD_WRAPPER.encode("ascii"))
+    records = (
+        ("ExternalScript", "cursor-agent.ps1", str(expected / "cursor-agent.ps1")),
+        ("Application", "cursor-agent.cmd", str(malicious_cmd)),
+        ("Application", "cursor-agent.cmd", str(expected / "cursor-agent.cmd")),
+    )
+    discovery = FakeWrapperChainDiscovery(
+        expected, which=str(malicious_cmd), path=_path_value(malicious, expected),
+        powershell_records=records, powershell_preferred=records[0],
+    )
+    with pytest.raises(ValueError, match="out-of-root"):
+        _attest_wrapper_chain_cursor(_WRAPPER_CONFIG, discovery=discovery)
+
+
+def test_deterministic_and_shutil_which_missing_differing_and_replaced_winners_block(tmp_path: Path):
+    root = _wrapper_chain_installation(tmp_path)
+    with pytest.raises(ValueError, match="shutil.which found no"):
+        _attest_wrapper_chain_cursor(_WRAPPER_CONFIG, discovery=FakeWrapperChainDiscovery(root, which_unavailable=True))
+    elsewhere = tmp_path / "elsewhere"; elsewhere.mkdir()
+    different = elsewhere / "cursor-agent.cmd"; different.write_bytes(_OBSERVED_CMD_WRAPPER.encode("ascii"))
+    with pytest.raises(ValueError, match="disagree"):
+        _attest_wrapper_chain_cursor(_WRAPPER_CONFIG, discovery=FakeWrapperChainDiscovery(root, which=str(different)))
+
+    class ReplacingWhich(FakeWrapperChainDiscovery):
+        def which_cursor_agent(self, *, path_value: str, pathext_value: str) -> str | None:
+            path = self.root / "cursor-agent.cmd"
+            displaced = self.root / "cursor-agent-original.cmd"
+            path.rename(displaced)
+            path.write_bytes(_OBSERVED_CMD_WRAPPER.replace("@echo off", "@echo on").encode("ascii"))
+            return str(path)
+
+    with pytest.raises(ValueError, match="identity changed|disagree"):
+        _attest_wrapper_chain_cursor(_WRAPPER_CONFIG, discovery=ReplacingWhich(root))
+
+
+@pytest.mark.parametrize("changed", ("path", "pathext"))
+def test_path_or_pathext_change_between_request_and_pre_spawn_blocks_with_zero_runner_calls(tmp_path: Path, changed: str):
+    h, discovery = _wrapper_chain_harness(tmp_path)
+    state = h.session_store.load(h.session_id)
+    prompt = build_native_agent_prompt(mission=state.mission, gate_contract=state.current_gate, work_workspace=h.work)
+    request = NativeExecutionRequest.create(
+        session_id=state.session_id, gate_id=state.current_gate.gate_id, execution_attempt_index=0,
+        mission_fingerprint=state.mission.mission_fingerprint,
+        gate_contract_fingerprint=state.current_gate.contract_fingerprint,
+        work_workspace=h.work, evidence_store_root=h.store.directory, artifact_directory=h.store.artifact_directory,
+        attestation=h.attestation, prompt=prompt, timeout_seconds=30, stdout_byte_limit=4096, stderr_byte_limit=2048,
+    )
+    earlier = tmp_path / "new-earlier-path"; earlier.mkdir()
+    if changed == "path":
+        discovery.path = _path_value(earlier, discovery.root, "C:\\Windows")
+    else:
+        discovery.pathext = ".EXE;.COM;.BAT;.CMD"
+    with pytest.raises(NativeEvidenceInvalid):
+        h.executor.execute(
+            request=request, prompt=prompt, source_repository=h.source, canary_parent=h.root,
+            allowed_parent_children=frozenset({h.work.name}), evidence_store_root=h.store.directory,
+            artifact_directory=h.store.artifact_directory,
+        )
+    assert h.runner.invocations == []
+
+
+def test_powershell_inventory_requires_adjacent_wrappers_and_rejects_substitutions(tmp_path: Path):
+    root = _wrapper_chain_installation(tmp_path)
+    with pytest.raises(ValueError, match="adjacent .ps1"):
+        _attest_wrapper_chain_cursor(
+            _WRAPPER_CONFIG, discovery=FakeWrapperChainDiscovery(root, powershell=(str(root / "cursor-agent.cmd"),)),
+        )
+    elsewhere = tmp_path / "elsewhere"; elsewhere.mkdir()
+    outside_ps = elsewhere / "cursor-agent.ps1"; outside_ps.write_bytes(_OBSERVED_PS_WRAPPER.encode("utf-8"))
+    with pytest.raises(ValueError, match="out-of-root"):
+        _attest_wrapper_chain_cursor(
+            _WRAPPER_CONFIG,
+            discovery=FakeWrapperChainDiscovery(
+                root, powershell=(str(outside_ps), str(root / "cursor-agent.cmd")),
+                powershell_preferred=("ExternalScript", outside_ps.name, str(outside_ps)),
+            ),
+        )
+    for record in (
+        ("Alias", "cursor-agent", ""),
+        ("Function", "cursor-agent", ""),
+        ("Application", "cursor-agent.exe", str(Path(sys.executable).resolve())),
+    ):
+        with pytest.raises(ValueError, match="alias|pathless|out-of-root"):
+            _attest_wrapper_chain_cursor(
+                _WRAPPER_CONFIG,
+                discovery=FakeWrapperChainDiscovery(root, powershell_records=(record,), powershell_preferred=record),
+            )
+
+
+def test_powershell_inventory_order_is_canonical_but_material_inventory_change_rebinds(tmp_path: Path):
+    root = _wrapper_chain_installation(tmp_path)
+    ps = ("ExternalScript", "cursor-agent.ps1", str(root / "cursor-agent.ps1"))
+    cmd = ("Application", "cursor-agent.cmd", str(root / "cursor-agent.cmd"))
+    first = _attest_wrapper_chain_cursor(
+        _WRAPPER_CONFIG,
+        discovery=FakeWrapperChainDiscovery(root, powershell_records=(ps, cmd), powershell_preferred=ps),
+    )
+    reordered = _attest_wrapper_chain_cursor(
+        _WRAPPER_CONFIG,
+        discovery=FakeWrapperChainDiscovery(root, powershell_records=(cmd, ps), powershell_preferred=ps),
+    )
+    changed = _attest_wrapper_chain_cursor(
+        _WRAPPER_CONFIG,
+        discovery=FakeWrapperChainDiscovery(root, powershell_records=(ps, cmd, cmd), powershell_preferred=ps),
+    )
+    assert first == reordered
+    assert changed.attestation_fingerprint != first.attestation_fingerprint
+    assert first.command_resolution.powershell_prefers_powershell_wrapper is True
+
+
+def test_where_diagnostic_variation_is_visible_but_excluded_from_authority_and_payload(tmp_path: Path):
+    root = _wrapper_chain_installation(tmp_path)
+    source = tmp_path / "source"; source.mkdir()
+    run_root = tmp_path / "future-run"
+    variants = (
+        FakeWrapperChainDiscovery(root),
+        FakeWrapperChainDiscovery(root, where=(), where_exit_code=1),
+        FakeWrapperChainDiscovery(root, where_unavailable=True),
+        FakeWrapperChainDiscovery(root, where_execution_error=True, where_stderr=b"synthetic execution error"),
+    )
+    observed = tuple(_attest_wrapper_chain_cursor_observed(_WRAPPER_CONFIG, discovery=item) for item in variants)
+    assert tuple(item[1].status for item in observed) == (
+        WindowsWhereDiagnosticStatus.MATCHING_RESULT,
+        WindowsWhereDiagnosticStatus.EMPTY_RESULT,
+        WindowsWhereDiagnosticStatus.UNAVAILABLE,
+        WindowsWhereDiagnosticStatus.EXECUTION_ERROR,
+    )
+    attestations = tuple(item[0] for item in observed)
+    payloads = tuple(
+        build_authorization_payload(
+            source_repository=source, source_head="e" * 40, run_id="future-run", session_id="future-run",
+            attestation=item, run_root=run_root, timeout_seconds=900,
+        )
+        for item in attestations
+    )
+    assert len({item.attestation_fingerprint for item in attestations}) == 1
+    assert len({item.payload_fingerprint for item in payloads}) == 1
+    assert len({_canonical_bytes(item.to_dict()) for item in payloads}) == 1
+    assert "where_diagnostic" not in attestations[0].to_dict()
+    assert "where_paths" not in attestations[0].command_resolution.to_dict()
+
+
+def test_where_matching_stdout_stderr_hash_changes_do_not_change_backend_or_payload(tmp_path: Path):
+    root = _wrapper_chain_installation(tmp_path)
+    path = str(root / "cursor-agent.cmd")
+    source = tmp_path / "source"; source.mkdir()
+    first, first_diag = _attest_wrapper_chain_cursor_observed(
+        _WRAPPER_CONFIG,
+        discovery=FakeWrapperChainDiscovery(root, where_stdout=(path + "\n").encode(), where_stderr=b"first"),
+    )
+    second, second_diag = _attest_wrapper_chain_cursor_observed(
+        _WRAPPER_CONFIG,
+        discovery=FakeWrapperChainDiscovery(root, where_stdout=(path + "\r\n").encode(), where_stderr=b"second"),
+    )
+    assert first_diag.status is second_diag.status is WindowsWhereDiagnosticStatus.MATCHING_RESULT
+    assert first_diag.stdout_sha256 != second_diag.stdout_sha256
+    assert first_diag.stderr_sha256 != second_diag.stderr_sha256
+    assert first == second
+    payload_one = build_authorization_payload(
+        source_repository=source, source_head="e" * 40, run_id="future-run", session_id="future-run",
+        attestation=first, run_root=tmp_path / "future-run", timeout_seconds=900,
+    )
+    payload_two = build_authorization_payload(
+        source_repository=source, source_head="e" * 40, run_id="future-run", session_id="future-run",
+        attestation=second, run_root=tmp_path / "future-run", timeout_seconds=900,
+    )
+    assert payload_one == payload_two
+
+
+def test_successful_contradictory_where_result_blocks(tmp_path: Path):
+    root = _wrapper_chain_installation(tmp_path)
+    elsewhere = tmp_path / "elsewhere"; elsewhere.mkdir()
+    contradictory = elsewhere / "cursor-agent.cmd"; contradictory.write_bytes(_OBSERVED_CMD_WRAPPER.encode("ascii"))
+    with pytest.raises(ValueError, match="where.exe result contradicts"):
+        _attest_wrapper_chain_cursor(
+            _WRAPPER_CONFIG,
+            discovery=FakeWrapperChainDiscovery(root, where=(str(contradictory),), where_exit_code=0),
+        )
+
+
+def test_preflight_only_review_output_exposes_separate_where_diagnostic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
+    source_parent = tmp_path / "source-parent"; source_parent.mkdir()
+    source = build_canary_repository(source_parent, repository_name="source").repository
+    head = _command(["git", "rev-parse", "HEAD"], cwd=source).stdout.strip()
+    root, discovery, attestation = _wrapper_attestation(tmp_path)
+    _same_attestation, diagnostic = _attest_wrapper_chain_cursor_observed(_WRAPPER_CONFIG, discovery=discovery)
+    decision = NativePreflightDecision(
+        NativePreflightStatus.PREFLIGHT_READY, WRAPPER_CHAIN_READY_REASON,
+        "synthetic deterministic review", attestation, diagnostic,
+    )
+    monkeypatch.setattr("admissible.delegated_gate.native_canary.preflight_native_cursor", lambda *, config: decision)
+    run_root = tmp_path / "review-run"
+    args = [
+        "--source-repository", str(source), "--required-source-head", head,
+        "--run-root", str(run_root), "--run-id", "review-run", "--session-id", "review-run",
+        "--executable", "cursor-agent", "--attestation-class", "wrapper-chain",
+        "--model", "auto", "--timeout-seconds", "900", "--preflight-only",
+    ]
+    assert main(args) == 0
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["where_diagnostic"] == diagnostic.to_dict()
+    assert emitted["attestation"] == attestation.to_dict()
+    assert not run_root.exists()
+
+
+def test_wrapper_v1_is_inert_even_when_refingerprinted_and_v2_round_trips(tmp_path: Path):
+    source = tmp_path / "source"; source.mkdir()
+    _root, _discovery, attestation = _wrapper_attestation(tmp_path)
+    assert attestation.schema_version == WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION
+    assert attestation_from_dict(attestation.to_dict()) == attestation
+    legacy = attestation.to_dict()
+    legacy["schema_version"] = WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION_LEGACY_V1
+    legacy["attestation_fingerprint"] = fingerprint({
+        key: value for key, value in legacy.items() if key != "attestation_fingerprint"
+    })
+    with pytest.raises(ValueError, match="legacy wrapper-chain v1.*inert"):
+        attestation_from_dict(legacy)
+    legacy_object = replace(
+        attestation, schema_version=WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION_LEGACY_V1,
+        attestation_fingerprint=legacy["attestation_fingerprint"],
+    )
+    with pytest.raises(ValueError, match="unsupported wrapper-chain"):
+        legacy_object.validated()
+    with pytest.raises(ValueError, match="unsupported wrapper-chain"):
+        build_authorization_payload(
+            source_repository=source, source_head="e" * 40, run_id="future-run", session_id="future-run",
+            attestation=legacy_object, run_root=tmp_path / "future-run", timeout_seconds=900,
+        )
+
+
+def test_prior_wrapper_v1_payload_non_claim_shape_is_invalid_even_when_refingerprinted(tmp_path: Path):
+    source = tmp_path / "source"; source.mkdir()
+    _root, _discovery, attestation = _wrapper_attestation(tmp_path)
+    payload = build_authorization_payload(
+        source_repository=source, source_head="e" * 40, run_id="future-run", session_id="future-run",
+        attestation=attestation, run_root=tmp_path / "future-run", timeout_seconds=900,
+    )
+    prior = payload.to_dict()
+    prior["attestation_non_claims"] = list(WRAPPER_CHAIN_NON_CLAIMS[:-2])
+    prior["payload_fingerprint"] = fingerprint({key: value for key, value in prior.items() if key != "payload_fingerprint"})
+    with pytest.raises(ValueError, match="non-claims"):
+        NativeCanaryAuthorizationPayload.from_dict(prior)

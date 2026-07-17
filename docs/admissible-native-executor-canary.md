@@ -58,9 +58,12 @@ request, and owner authorization payload:
 - `LOCAL_WRAPPER_CHAIN` — a weaker, explicitly owner-accepted class for the
   locally observed `cursor-agent.cmd → cursor-agent.ps1 → versions/<latest>
   node.exe index.js` chain, whose runtime package intentionally declares no
-  `bin.cursor-agent`. It attests the winning OS command resolution
-  (which/where/Get-Command/PATH/PATHEXT agreement), strict-parsed wrapper
-  bytes and semantics, deterministic version selection, and exact
+  `bin.cursor-agent`. Its v2 authority deterministically resolves the fixed
+  bare command from the exact ordered Windows PATH/PATHEXT environment, then
+  requires exact canonical and physical agreement from `shutil.which` and a
+  complete static PowerShell `Get-Command -All` inventory. It binds the
+  strict-parsed wrapper bytes and semantics, deterministic version selection,
+  and exact
   runtime/entry/manifest identity — and explicitly does **not** attest
   Anysphere publisher identity, Cursor desktop ownership, package-manager
   ownership, payload signatures, CLI capability behavior (no version/help
@@ -78,6 +81,21 @@ cannot become production-ready. Immediately before spawn the full discovery,
 wrapper parsing, version inventory/selection, and every file identity are
 recomputed and must match the authorized attestation exactly; a newly added
 later version invalidates the authorization.
+
+`where.exe` is not command authority in wrapper-chain v2. It is a separate
+preflight-review diagnostic with exact executable identity, argv, exit code,
+stdout/stderr lengths and hashes, and parsed candidates. A successful
+contradictory result blocks. A matching result permits readiness; empty output,
+exit 1, nonzero/error output, execution failure, or an unavailable executable
+does not change the authority decided by deterministic PATH/PATHEXT resolution,
+`shutil.which`, PowerShell, and exact wrapper identities. Diagnostic bytes are
+excluded from command-resolution, backend, payload, and owner-digest
+fingerprints.
+
+This authority applies only to the exact bound environment. It does not prove
+Windows-wide behavior under another PATH/PATHEXT, protect against a hostile
+process changing that environment, establish OS sandboxing, or add production
+trust.
 
 ## Request, result, and durable sidecars
 
@@ -216,8 +234,9 @@ it validate the fresh proposed run root and create the run root, fixture
 workspace, and evidence structure. The fresh run root is named exactly for the
 run ID, so an authorization payload cannot be silently reused for another root.
 
-`--preflight-only` prints the canonical non-secret authorization payload and
-attestation without creating a workspace or invoking a provider. The owner
+`--preflight-only` prints the canonical non-secret authorization payload,
+attestation, and separate non-authoritative `where_diagnostic` without creating
+a workspace or invoking a provider. The owner
 digest is SHA-256 over `owner_phrase_utf8 + NUL + canonical_payload_bytes` and
 is never persisted or printed.
 
@@ -233,6 +252,22 @@ paths: `run_root`, the deterministic committed children `workspace_root`
 each child is the exact committed deterministic descendant, that no path is
 independently redirected or substituted, and that the run root stays outside
 the Agent OS source repository with workspace and evidence disjoint.
+
+Act 2A.3E keeps authorization v3 because its field shape is unchanged. The
+wrapper-chain backend schema is now
+`admissible_cursor_wrapper_chain_attestation_v2`; production builds v3 only
+from a fresh validated v2 backend and binds that new backend fingerprint plus
+the expanded exact non-claim set. Wrapper v1 is inert historical data and is
+rejected for new requests, restarts, payload construction, and execution even
+when refingerprinted. Because the live CLI regenerates the payload from host
+attestation and never ingests caller resolver JSON or a caller payload, an old
+v1 record cannot become current authority.
+
+Every earlier wrapper-v1 attestation and every prior v3 preview, payload
+fingerprint, canonical hash, or digest input is invalid. Pre-commit Act 2A.3E
+vectors are labeled `PRE_COMMIT_PROVISIONAL_NOT_AUTHORIZABLE`. A fresh
+post-commit clean-HEAD real-CLI preview is mandatory before owner review. No
+owner digest exists and no live canary has run.
 
 For every future live authorization, v3 supersedes v2 completely: every v2
 payload fingerprint, canonical-byte hash, and phrase-bound digest input is

@@ -758,15 +758,16 @@ def main(argv: list[str] | None = None) -> int:
     try: config=CursorNativeBackendConfig(executable=args.executable,launcher_prefix=tuple(args.executable_prefix_arg),model=args.model,attestation_class=attestation_class)
     except ValueError as exc: print(json.dumps({**blocked,"detail":str(exc)},sort_keys=True)); return 2
     decision:NativePreflightDecision=preflight_native_cursor(config=config)
-    if not decision.ready or decision.attestation is None: print(json.dumps({**blocked,"detail":decision.detail,"reason_code":decision.reason_code},sort_keys=True)); return 2
+    where_diagnostic=decision.where_diagnostic.to_dict() if decision.where_diagnostic is not None else None
+    if not decision.ready or decision.attestation is None: print(json.dumps({**blocked,"detail":decision.detail,"reason_code":decision.reason_code,"where_diagnostic":where_diagnostic},sort_keys=True)); return 2
     try:
         payload=build_authorization_payload(source_repository=source,source_head=args.required_source_head,run_id=args.run_id,session_id=args.session_id,attestation=decision.attestation,run_root=args.run_root,timeout_seconds=args.timeout_seconds,backend_readiness_reason=decision.reason_code)
         payload.validated_for_authorization(active_source_repository=source)
     except ValueError as exc:
-        print(json.dumps({**blocked,"detail":str(exc)},sort_keys=True)); return 2
+        print(json.dumps({**blocked,"detail":str(exc),"where_diagnostic":where_diagnostic},sort_keys=True)); return 2
     ready,detail=_git_source_preflight(source,args.required_source_head)
-    if not ready: print(json.dumps({**blocked,"detail":detail},sort_keys=True)); return 2
-    if args.preflight_only: print(json.dumps({"status":NativePreflightStatus.PREFLIGHT_READY.value,"authorization_payload":payload.to_dict(),"attestation":decision.attestation.to_dict()},sort_keys=True)); return 0
+    if not ready: print(json.dumps({**blocked,"detail":detail,"where_diagnostic":where_diagnostic},sort_keys=True)); return 2
+    if args.preflight_only: print(json.dumps({"status":NativePreflightStatus.PREFLIGHT_READY.value,"authorization_payload":payload.to_dict(),"attestation":decision.attestation.to_dict(),"where_diagnostic":where_diagnostic},sort_keys=True)); return 0
     if not args.owner_authorization or not _authorized(args.owner_authorization,payload,active_source_repository=source): print(json.dumps({**blocked,"detail":"owner authorization did not match the exact canonical payload"},sort_keys=True)); return 2
     run_root=Path(os.path.abspath(args.run_root))
     if run_root.name != args.run_id: print(json.dumps({**blocked,"detail":"run root basename must equal the fresh run ID"},sort_keys=True)); return 2
