@@ -28,12 +28,16 @@ from admissible.delegated_gate.checkpoint import capture_checkpoint
 from admissible.delegated_gate.fixture_registry import (
     INCIDENT_BOARD_FIXTURE_ID,
     INCIDENT_BOARD_FIXTURE_VERSION,
+    WORKFLOW_CONSOLE_FIXTURE_ID,
+    WORKFLOW_CONSOLE_FIXTURE_VERSION,
     build_incident_board_repository,
+    build_workflow_console_repository,
     fixture_material_tree_hash,
 )
 from admissible.delegated_gate.mission_profile import (
     FLAGSHIP_INCIDENT_REPLAY_PROFILE,
     ONE_SHOT_PROFILE_BUDGETS,
+    WORKFLOW_RECOVERY_PROFILE,
     NativeMissionProfile,
     ProfileCheckpointCommand,
     create_native_mission_profile,
@@ -403,7 +407,11 @@ def registered_profiles() -> dict[str, NativeMissionProfile]:
 
     return {
         profile.profile_id: profile
-        for profile in (legacy_canary_profile(), FLAGSHIP_INCIDENT_REPLAY_PROFILE)
+        for profile in (
+            legacy_canary_profile(),
+            FLAGSHIP_INCIDENT_REPLAY_PROFILE,
+            WORKFLOW_RECOVERY_PROFILE,
+        )
     }
 
 
@@ -420,6 +428,7 @@ def fixture_builder_registry() -> dict[tuple[str, int], Any]:
     return {
         (LEGACY_CANARY_FIXTURE_ID, LEGACY_CANARY_FIXTURE_VERSION): build_canary_repository,
         (INCIDENT_BOARD_FIXTURE_ID, INCIDENT_BOARD_FIXTURE_VERSION): build_incident_board_repository,
+        (WORKFLOW_CONSOLE_FIXTURE_ID, WORKFLOW_CONSOLE_FIXTURE_VERSION): build_workflow_console_repository,
     }
 
 
@@ -1488,4 +1497,4 @@ def main(argv: list[str] | None = None) -> int:
 if __name__ == "__main__": sys.exit(main())
 
 
-__all__=["AUTHORIZATION_SCHEMA_VERSION","AUTHORIZATION_SCHEMA_VERSION_LEGACY_V2","AUTHORIZATION_SCHEMA_VERSION_V4","LEGACY_CANARY_PROFILE_ID","LEGACY_CANARY_FIXTURE_ID","LEGACY_CANARY_FIXTURE_VERSION","RUN_PREFLIGHT_METADATA_FILE_NAME","InitializedWorkspaceIdentity","NativeCanaryAuthorizationPayloadV4","build_profile_authorization_payload","fixture_builder_registry","legacy_canary_profile","observe_initialized_workspace_identity","registered_profiles","resolve_fixture_builder","resolve_registered_profile","CANARY_NON_CLAIMS","CLASS_READINESS_REASONS","EVIDENCE_DIRECTORY_NAME","NATIVE_SIDECAR_DIRECTORY_NAME","PACKAGE_BIN_READY_REASON","WORKSPACE_DIRECTORY_NAME","BEHAVIORAL_EVIDENCE_SCHEMA_VERSION","CANARY_CLASSIFICATION","CANARY_FIXTURE_VERSION","CANARY_GATE_ID","CANARY_MISSION","CANARY_MISSION_ID","DEFAULT_STDERR_BYTE_LIMIT","DEFAULT_STDOUT_BYTE_LIMIT","DEFAULT_TIMEOUT_SECONDS","EXPECTED_MATERIAL_PATHS","FixtureRepository","MAX_AUDITOR_INVOCATIONS","MAX_NATIVE_PHASE_ATTEMPTS","MAX_PROVIDER_INVOCATIONS","MAX_REPAIR_ROUNDS","MAX_RETRIES","NativeCanaryAuthorizationPayload","NativeCanaryCoordinator","NativeCanaryOutcome","NativeCanaryStatus","OWNER_AUTHORIZATION_DIGEST_ENV","REQUIRED_COMMIT_MESSAGE","BehavioralVerifierEvidence","EvidenceOnlyCanaryReconstruction","build_authorization_payload","build_canary_repository","build_native_agent_prompt","build_parser","create_canary_session","load_behavioral_verifier","main","npm_test_argv","reconstruct_completed_canary_success","run_behavioral_verifier","_validate_future_run_root"]
+__all__=["AUTHORIZATION_SCHEMA_VERSION","AUTHORIZATION_SCHEMA_VERSION_LEGACY_V2","AUTHORIZATION_SCHEMA_VERSION_V4","LEGACY_CANARY_PROFILE_ID","LEGACY_CANARY_FIXTURE_ID","LEGACY_CANARY_FIXTURE_VERSION","RUN_PREFLIGHT_METADATA_FILE_NAME","InitializedWorkspaceIdentity","NativeCanaryAuthorizationPayloadV4","build_profile_authorization_payload","fixture_builder_registry","legacy_canary_profile","observe_initialized_workspace_identity","registered_profiles","resolve_fixture_builder","resolve_registered_profile","CANARY_NON_CLAIMS","CLASS_READINESS_REASONS","EVIDENCE_DIRECTORY_NAME","NATIVE_SIDECAR_DIRECTORY_NAME","PACKAGE_BIN_READY_REASON","WORKSPACE_DIRECTORY_NAME","BEHAVIORAL_EVIDENCE_SCHEMA_VERSION","CANARY_CLASSIFICATION","CANARY_FIXTURE_VERSION","CANARY_GATE_ID","CANARY_MISSION","CANARY_MISSION_ID","DEFAULT_STDERR_BYTE_LIMIT","DEFAULT_STDOUT_BYTE_LIMIT","DEFAULT_TIMEOUT_SECONDS","EXPECTED_MATERIAL_PATHS","FixtureRepository","MAX_AUDITOR_INVOCATIONS","MAX_NATIVE_PHASE_ATTEMPTS","MAX_PROVIDER_INVOCATIONS","MAX_REPAIR_ROUNDS","MAX_RETRIES","NativeCanaryAuthorizationPayload","NativeCanaryCoordinator","NativeCanaryOutcome","NativeCanaryStatus","OWNER_AUTHORIZATION_DIGEST_ENV","REQUIRED_COMMIT_MESSAGE","BehavioralVerifierEvidence","EvidenceOnlyCanaryReconstruction","build_authorization_payload","build_canary_repository","build_workflow_console_repository","build_native_agent_prompt","build_parser","create_canary_session","load_behavioral_verifier","main","npm_test_argv","reconstruct_completed_canary_success","run_behavioral_verifier","_validate_future_run_root"]
