@@ -487,12 +487,17 @@ def _checkpoint_success_reason(checkpoint: Any, gate_contract: GateContract) -> 
     return None
 
 
-class NativeCanaryCoordinator:
-    """One READY_FOR_GATE -> CHECKPOINT_CAPTURED canary path, with no retry."""
-    def __init__(self, *, session_store: AtomicDelegatedSessionStore, execution_store: AtomicNativeExecutionStore, executor: NativeDelegatedExecutor, backend_attestation: BackendAttestation, source_repository: str | Path, work_workspace: str | Path, canary_parent: str | Path, evidence_directory: str | Path, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS, stdout_byte_limit: int = DEFAULT_STDOUT_BYTE_LIMIT, stderr_byte_limit: int = DEFAULT_STDERR_BYTE_LIMIT) -> None:
-        self.session_store=session_store; self.execution_store=execution_store; self.executor=executor; self.backend_attestation=backend_attestation.validated()
-        self.source_repository,_=_safe_directory(source_repository,"source repository"); self.work_workspace,_=_safe_directory(work_workspace,"work workspace"); self.canary_parent,_=_safe_directory(canary_parent,"canary parent"); self.evidence_directory,_=_safe_directory(evidence_directory,"evidence directory")
-        self.timeout_seconds=timeout_seconds; self.stdout_byte_limit=stdout_byte_limit; self.stderr_byte_limit=stderr_byte_limit
+class EvidenceOnlyCanaryReconstruction:
+    """Read-only interpreter of persisted canary evidence.
+
+    It binds only the durable execution store and the evidence directory.  It
+    holds no executor, backend attestation, source repository, canary parent,
+    or provider handle, so a caller constructing this type alone can veto but
+    never grant native execution, retry, repair, capture, or attempt one.
+    """
+
+    def __init__(self, *, execution_store: AtomicNativeExecutionStore, evidence_directory: str | Path) -> None:
+        self.execution_store=execution_store; self.evidence_directory,_=_safe_directory(evidence_directory,"evidence directory")
     def _outcome(self, *, status: NativeCanaryStatus, state: DelegatedSessionState, request: NativeExecutionRequest | NativeExecutionRequestBinding | None = None, result: NativeExecutionResult | None = None, result_fingerprint: str | None = None, detail: str, behavioral_evidence_fingerprint: str | None = None, capture_attempt_fingerprint: str | None = None, workspace_final_git_head: str | None = None) -> NativeCanaryOutcome:
         checkpoint=state.checkpoint_history[-1] if state.checkpoint_history else None
         counts=NativeLifecycleCounts()
@@ -555,6 +560,15 @@ class NativeCanaryCoordinator:
         if _pre_capture_reason(result, behavioral) is not None: raise NativeEvidenceInvalid("reconstructed success no longer satisfies eligibility")
         if _checkpoint_success_reason(checkpoint,state.current_gate) is not None: raise NativeEvidenceInvalid("reconstructed checkpoint command evidence does not satisfy Act-2A success")
         return self._outcome(status=NativeCanaryStatus.CHECKPOINT_CAPTURED_CANARY_SUCCESS,state=state,request=request,result=result,detail="All native, behavioral, capture, checkpoint, and state evidence reloaded from disk.",behavioral_evidence_fingerprint=behavioral.evidence_fingerprint,capture_attempt_fingerprint=attempt.attempt_fingerprint,workspace_final_git_head=result.final_git_head)
+
+
+class NativeCanaryCoordinator(EvidenceOnlyCanaryReconstruction):
+    """One READY_FOR_GATE -> CHECKPOINT_CAPTURED canary path, with no retry."""
+    def __init__(self, *, session_store: AtomicDelegatedSessionStore, execution_store: AtomicNativeExecutionStore, executor: NativeDelegatedExecutor, backend_attestation: BackendAttestation, source_repository: str | Path, work_workspace: str | Path, canary_parent: str | Path, evidence_directory: str | Path, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS, stdout_byte_limit: int = DEFAULT_STDOUT_BYTE_LIMIT, stderr_byte_limit: int = DEFAULT_STDERR_BYTE_LIMIT) -> None:
+        super().__init__(execution_store=execution_store, evidence_directory=evidence_directory)
+        self.session_store=session_store; self.executor=executor; self.backend_attestation=backend_attestation.validated()
+        self.source_repository,_=_safe_directory(source_repository,"source repository"); self.work_workspace,_=_safe_directory(work_workspace,"work workspace"); self.canary_parent,_=_safe_directory(canary_parent,"canary parent")
+        self.timeout_seconds=timeout_seconds; self.stdout_byte_limit=stdout_byte_limit; self.stderr_byte_limit=stderr_byte_limit
     def _publish_failure_terminal(self, *, state: DelegatedSessionState, request: NativeExecutionRequest | NativeExecutionRequestBinding, result: NativeExecutionResult | None, status: NativeCaptureTerminalStatus, failure_category: str, diagnostic: str, capture_attempt: NativeCheckpointCaptureAttempt | None = None) -> NativeCanaryOutcome:
         try:
             terminal=self.execution_store.create_terminal(request=request,result=result,status=status,failure_category=failure_category,diagnostic=diagnostic[:1024],capture_attempt=capture_attempt)
@@ -643,6 +657,28 @@ class NativeCanaryCoordinator:
             return self._publish_failure_terminal(state=state,request=request,result=result,status=NativeCaptureTerminalStatus.CAPTURE_FAILED,failure_category="checkpoint_verification",diagnostic=checkpoint_reason,capture_attempt=capture_attempt)
         self.session_store.replace(checkpoint_state,expected_revision=state.revision)
         final=self.session_store.load(session_id); return self._reconstruct_success(final,request,result)
+
+
+def reconstruct_completed_canary_success(*, session_store: AtomicDelegatedSessionStore, execution_store: AtomicNativeExecutionStore, evidence_directory: str | Path, session_id: str) -> NativeCanaryOutcome:
+    """Evidence-only outcome for an already ``CHECKPOINT_CAPTURED`` canary run.
+
+    This entry point constructs no executor, backend attestation, runner,
+    provider, behavioral verifier, or checkpoint capability, so it can never
+    spawn, authorize, retry, verify, capture, or create attempt one.  A
+    persisted terminal is recognized first; otherwise the completed success is
+    reconstructed exclusively from persisted canonical records and read-only
+    run-local workspace facts.
+    """
+
+    state=session_store.load(session_id)
+    if state.phase is not Phase.CHECKPOINT_CAPTURED:
+        raise NativeEvidenceInvalid(f"evidence-only reconstruction requires CHECKPOINT_CAPTURED, found {state.phase.value}")
+    gate=state.current_gate
+    reconstruction=EvidenceOnlyCanaryReconstruction(execution_store=execution_store,evidence_directory=evidence_directory)
+    binding=execution_store.load_request_structural(session_id,gate.gate_id,0)
+    if execution_store.has_terminal(session_id,gate.gate_id,0):
+        return reconstruction._terminal_outcome(state,binding,execution_store.load_terminal(session_id,gate.gate_id,0))
+    return reconstruction._reconstruct_success(state,binding,execution_store.load_result(session_id,gate.gate_id,0))
 
 
 def _git_source_preflight(source: Path, required_head: str) -> tuple[bool, str]:
@@ -923,4 +959,4 @@ def main(argv: list[str] | None = None) -> int:
 if __name__ == "__main__": sys.exit(main())
 
 
-__all__=["AUTHORIZATION_SCHEMA_VERSION","AUTHORIZATION_SCHEMA_VERSION_LEGACY_V2","CANARY_NON_CLAIMS","CLASS_READINESS_REASONS","EVIDENCE_DIRECTORY_NAME","NATIVE_SIDECAR_DIRECTORY_NAME","PACKAGE_BIN_READY_REASON","WORKSPACE_DIRECTORY_NAME","BEHAVIORAL_EVIDENCE_SCHEMA_VERSION","CANARY_CLASSIFICATION","CANARY_FIXTURE_VERSION","CANARY_GATE_ID","CANARY_MISSION","CANARY_MISSION_ID","DEFAULT_STDERR_BYTE_LIMIT","DEFAULT_STDOUT_BYTE_LIMIT","DEFAULT_TIMEOUT_SECONDS","EXPECTED_MATERIAL_PATHS","FixtureRepository","MAX_AUDITOR_INVOCATIONS","MAX_NATIVE_PHASE_ATTEMPTS","MAX_PROVIDER_INVOCATIONS","MAX_REPAIR_ROUNDS","MAX_RETRIES","NativeCanaryAuthorizationPayload","NativeCanaryCoordinator","NativeCanaryOutcome","NativeCanaryStatus","OWNER_AUTHORIZATION_DIGEST_ENV","REQUIRED_COMMIT_MESSAGE","BehavioralVerifierEvidence","build_authorization_payload","build_canary_repository","build_native_agent_prompt","build_parser","create_canary_session","load_behavioral_verifier","main","npm_test_argv","run_behavioral_verifier","_validate_future_run_root"]
+__all__=["AUTHORIZATION_SCHEMA_VERSION","AUTHORIZATION_SCHEMA_VERSION_LEGACY_V2","CANARY_NON_CLAIMS","CLASS_READINESS_REASONS","EVIDENCE_DIRECTORY_NAME","NATIVE_SIDECAR_DIRECTORY_NAME","PACKAGE_BIN_READY_REASON","WORKSPACE_DIRECTORY_NAME","BEHAVIORAL_EVIDENCE_SCHEMA_VERSION","CANARY_CLASSIFICATION","CANARY_FIXTURE_VERSION","CANARY_GATE_ID","CANARY_MISSION","CANARY_MISSION_ID","DEFAULT_STDERR_BYTE_LIMIT","DEFAULT_STDOUT_BYTE_LIMIT","DEFAULT_TIMEOUT_SECONDS","EXPECTED_MATERIAL_PATHS","FixtureRepository","MAX_AUDITOR_INVOCATIONS","MAX_NATIVE_PHASE_ATTEMPTS","MAX_PROVIDER_INVOCATIONS","MAX_REPAIR_ROUNDS","MAX_RETRIES","NativeCanaryAuthorizationPayload","NativeCanaryCoordinator","NativeCanaryOutcome","NativeCanaryStatus","OWNER_AUTHORIZATION_DIGEST_ENV","REQUIRED_COMMIT_MESSAGE","BehavioralVerifierEvidence","EvidenceOnlyCanaryReconstruction","build_authorization_payload","build_canary_repository","build_native_agent_prompt","build_parser","create_canary_session","load_behavioral_verifier","main","npm_test_argv","reconstruct_completed_canary_success","run_behavioral_verifier","_validate_future_run_root"]

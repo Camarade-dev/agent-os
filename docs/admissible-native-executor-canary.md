@@ -360,6 +360,106 @@ executing anything. Canary-004 remains immutable and unaccepted until a
 separate explicit owner decision; none of this adds any sandboxing,
 hostile-process-resistance, or production-suitability claim.
 
+## Committed review binding and human checkpoint acceptance
+
+Execution success, the committed review binding, human checkpoint acceptance,
+and archive are four distinct facts. Execution success comes from the
+immutable lifecycle/checkpoint graph alone; the committed review is one
+separate write-once record proving which exact reviewed code HEAD and exact
+review verdict adjudicated which exact persisted evidence; owner acceptance is
+a second write-once record; archive is a fourth, unimplemented decision that
+neither record grants. The absence of both records never invalidates a
+historical execution success, and every historical run remains readable and
+meaningful without them.
+
+Neither record is an execution-state transition. The generic
+`HumanDisposition` protocol stays untouched: it remains legal only at
+`AWAITING_HUMAN` with the `final_review` boundary, and the delegated reducer,
+state schema, and CAS store are unchanged. After both records the delegated
+execution phase remains exactly `CHECKPOINT_CAPTURED`; no reducer event, state
+revision, or `COMPLETED` reinterpretation exists for either.
+
+`admissible.delegated_gate.native_acceptance` provides both protocols. The
+immutable `admissible_native_checkpoint_review_binding_v1` record binds a
+deterministic review-binding ID, reviewer identity, run/session/gate/attempt-
+zero identity, the execution source HEAD, the workspace final HEAD, the
+request/result/behavioral/capture/checkpoint fingerprints, the delegated-state
+revision and fingerprint, the phase `CHECKPOINT_CAPTURED`, the reviewed code
+HEAD, the exact review verdict, a bounded non-secret note, and an
+exact-ordered non-authority tuple stating that a review binding grants no
+invocation, retry, repair, continuation, provider, checkpoint-rerun, human
+acceptance, archive, or production-suitability authority. For a registered
+run, the exact reviewed HEAD, exact verdict, and every evidence identity are
+pinned by a committed review specification inside the module; the canary-004
+specification pins the reviewed code HEAD `48054798…` (Act 2A.4F) and exactly
+the verdict
+`ACT_2A_4F_CANARY_004_COMMITTED_REVIEW_PASS_READY_FOR_OWNER_ACCEPTANCE`.
+Every comparison is byte equality — substring, prefix, suffix, case-folded,
+trimmed, normalized, or regex-family matching is never sufficient — and a
+caller-selected reviewed HEAD or verdict, including a one-character variant,
+fails before publication at creation and at every load.
+
+`record_native_checkpoint_review_binding` reconstructs the completed success
+through the evidence-only path, requires phase `CHECKPOINT_CAPTURED` with
+truthful one-shot counts and no contradictory terminal, derives every
+execution value from persisted truth, requires exact equality with the
+validated review specification, may only run from a clean committed protocol
+checkout, and atomically creates exactly one record at
+`<session>.<gate>.attempt-0.native-checkpoint-review-binding.json` using the
+shared platform durability adapter's `CREATE_ONLY` mode.
+
+The immutable `admissible_native_checkpoint_acceptance_v1` record additionally
+binds actor, `ACCEPTED` decision, the `review_binding_fingerprint` of the
+persisted review binding, the acceptance-protocol code HEAD observed clean and
+committed at write time, and the SHA-256 of the exact fresh owner statement
+(the statement text itself is never persisted). Acceptance is impossible
+without a valid persisted review binding: the duplicated review HEAD and
+verdict fields must equal the loaded review-binding record exactly at creation
+and loading, and a missing, malformed, fingerprint-invalid, or conflicting
+review binding blocks acceptance. Every authority-bearing field participates
+in each record's fingerprint, domain-separated by schema identifier. No owner
+phrase, authorization digest, credential, provider output, or native prompt
+text is stored.
+
+The owner statement follows one exact ASCII one-line canonical grammar parsed
+by a dedicated production parser:
+
+`NATIVE_CHECKPOINT_ACCEPTANCE_V1;run_id=<RUN_ID>;execution_source_head=<40-hex>;workspace_final_head=<40-hex>;evidence_review_code_head=<40-hex>;acceptance_protocol_code_head=<40-hex>;review_binding_fingerprint=<64-hex>;decision=ACCEPTED`
+
+Exact prefix, field order, separators, role labels, lowercase hexadecimal,
+every role exactly once, no extra field, no prose, no whitespace, no CR/LF,
+ASCII only. Every parsed role value must equal its authoritative source —
+statement presence of an expected value somewhere in free text is never
+sufficient. The statement hash is SHA-256 over the raw ASCII bytes of the
+exact statement, computed only after grammar validation, with no trimming or
+normalization; the caller supplies the full statement and can never supply the
+hash directly. The four bound HEADs are semantically distinct roles bound to
+their own authoritative sources; two roles legitimately carrying the same
+object ID is not inherently invalid, but any value contradicting its source —
+including any swap — fails closed.
+
+Both records are write-once: an exactly equivalent existing record (ignoring
+only creation time) returns an explicit idempotent outcome without rewriting;
+any differing, malformed, or fingerprint-invalid existing record fails closed
+and is never replaced. Neither API can reach live backend attestation,
+wrapper or command discovery, the current Cursor installation, prospective
+source preflight for the historical run, owner execution authorization, a
+runner or provider, the behavioral verifier, or npm/checkpoint execution; the
+only current-repository observation is the clean committed protocol-HEAD
+check. The load/classify surfaces expose `ABSENT`, `PRESENT_VALID`, or
+`PRESENT_INVALID` without being required by — or able to alter — evidence-only
+reconstruction.
+
+The only legal eventual order for canary-004 is: the repaired protocol is
+committed; a committed-code review passes; exactly one review-binding write is
+separately authorized and verified read-only; a fresh canonical owner
+statement is formed with the exact committed protocol HEAD and the exact
+persisted review-binding fingerprint; exactly one acceptance is recorded and
+verified read-only. The real canary currently holds neither record and must
+receive neither until those separate authorized operations after commit and
+committed-code review. Archive remains forbidden pending another explicit
+owner decision.
+
 ## Future live authorization
 
 The future-only entry point is `python -m admissible.delegated_gate.native_canary`.
