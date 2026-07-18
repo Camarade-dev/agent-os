@@ -14,14 +14,30 @@ import hmac
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import subprocess
 import sys
 import tempfile
 from typing import Any, Mapping
 
+import functools
+
 from admissible.delegated_gate.canonical import canonical_bytes, fingerprint, require_exact_keys, require_identifier, require_nonempty_text, require_sha256, require_strict_int
 from admissible.delegated_gate.checkpoint import capture_checkpoint
+from admissible.delegated_gate.fixture_registry import (
+    INCIDENT_BOARD_FIXTURE_ID,
+    INCIDENT_BOARD_FIXTURE_VERSION,
+    build_incident_board_repository,
+    fixture_material_tree_hash,
+)
+from admissible.delegated_gate.mission_profile import (
+    FLAGSHIP_INCIDENT_REPLAY_PROFILE,
+    ONE_SHOT_PROFILE_BUDGETS,
+    NativeMissionProfile,
+    ProfileCheckpointCommand,
+    create_native_mission_profile,
+)
 from admissible.delegated_gate.durability import (
     DurabilityCapabilityResult,
     probe_platform_durability,
@@ -90,6 +106,18 @@ DEFAULT_STDOUT_BYTE_LIMIT = 512 * 1024
 DEFAULT_STDERR_BYTE_LIMIT = 128 * 1024
 OWNER_AUTHORIZATION_DIGEST_ENV = "ADMISSIBLE_NATIVE_CANARY_OWNER_AUTHORIZATION_SHA256"
 AUTHORIZATION_SCHEMA_VERSION = "admissible_native_canary_authorization_v3"
+# v4 authorization payloads embed the complete canonical mission profile and
+# the independently observed initialized-workspace identity.  Legacy
+# canary-004 remains exactly on v3 and is never rewritten or reinterpreted.
+AUTHORIZATION_SCHEMA_VERSION_V4 = "admissible_native_canary_authorization_v4"
+# Deterministic evidence-directory metadata file the committed CLI writes
+# before execution.  Evidence-only reconstruction of a v4 run loads the
+# authoritative mission profile from this persisted payload alone.
+RUN_PREFLIGHT_METADATA_FILE_NAME = "canary-preflight.json"
+LEGACY_CANARY_PROFILE_ID = "act-2a-high-score-canary-v1"
+LEGACY_CANARY_FIXTURE_ID = "act-2a-canary-game-state"
+LEGACY_CANARY_FIXTURE_VERSION = 2
+LEGACY_CANARY_FIXTURE_INITIAL_COMMIT_MESSAGE = "chore: initialize native executor canary"
 # v2 is superseded and intentionally not authorizable for a new live canary; it
 # may only be parsed as inert historical data by callers that opt in explicitly.
 AUTHORIZATION_SCHEMA_VERSION_LEGACY_V2 = "admissible_native_canary_authorization_v2"
@@ -312,20 +340,116 @@ def build_canary_repository(temporary_root: str | Path, *, repository_name: str 
 def npm_test_argv() -> tuple[str, ...]: return ("npm.cmd" if os.name == "nt" else "npm", "test")
 
 
-def create_canary_session(*, session_id: str) -> DelegatedSessionState:
-    mission = Mission.create(mission_id=CANARY_MISSION_ID, specification=CANARY_MISSION)
+def _legacy_completion_conditions(required_commit_message: str) -> str:
+    """The exact historical Act-2A prompt completion-conditions block."""
+
+    return f"""Required completion conditions:
+- run the complete `npm test` suite;
+- create exactly one intended local feature commit with complete message `{required_commit_message}`;
+- use no `--trailer` when creating or amending the commit;
+- add no commit-message body, `Co-authored-by`, sign-off, attribution, or other trailer;
+- before stopping, run `git log -1 --format=%B` and verify that its complete output, after removing terminal newline characters only, is exactly `{required_commit_message}`;
+- if the complete message is not exact, amend that same commit during this native invocation, do not create a second commit, and run the exact `%B` verification again;
+- do not add or modify a Git remote;
+- do not push;
+- stop immediately only after the exact full-message verification passes."""
+
+
+@functools.lru_cache(maxsize=1)
+def legacy_canary_profile() -> NativeMissionProfile:
+    """The historical canary-004 mission as one canonical profile.
+
+    Every value reproduces the exact Act-2A module-constant semantics so the
+    legacy execution, prompt, session, and reconstruction behavior remain
+    byte-identical.  It is the fail-closed default whenever no profile is
+    selected and no v4 authorization payload is persisted.
+    """
+
+    return create_native_mission_profile(
+        profile_id=LEGACY_CANARY_PROFILE_ID,
+        fixture_id=LEGACY_CANARY_FIXTURE_ID,
+        fixture_version=LEGACY_CANARY_FIXTURE_VERSION,
+        run_id="native-cursor-canary-004",
+        session_id="native-cursor-canary-004",
+        gate_id=CANARY_GATE_ID,
+        mission_id=CANARY_MISSION_ID,
+        mission_text=CANARY_MISSION,
+        gate_objective="Complete and locally commit deterministic high-score persistence in the assigned canary repository.",
+        gate_clauses=(
+            ("native-canary.material", "The committed material implements deterministic high-score persistence."),
+            ("native-canary.tests", "The complete npm test suite passes independently at checkpoint capture."),
+            ("native-canary.git", "The exact local commit exists, the worktree is clean, and no remote exists."),
+        ),
+        required_evidence_kinds=(EvidenceKind.TARGET_TREE.value, EvidenceKind.GIT_STATE.value, EvidenceKind.VERIFICATION_COMMAND.value),
+        checkpoint_commands=(ProfileCheckpointCommand(command_id="npm-test", argv=npm_test_argv(), timeout_seconds=120, max_capture_bytes=256 * 1024),),
+        required_commit_message=REQUIRED_COMMIT_MESSAGE,
+        required_material_paths=tuple(sorted(EXPECTED_MATERIAL_PATHS)),
+        completion_conditions_text=_legacy_completion_conditions(REQUIRED_COMMIT_MESSAGE),
+        verifier_source=_BEHAVIORAL_SCRIPT,
+        verifier_source_sha256=hashlib.sha256(_BEHAVIORAL_SCRIPT.encode("utf-8")).hexdigest(),
+        verifier_timeout_seconds=60,
+        verifier_output_limit_bytes=128 * 1024,
+        budgets=ONE_SHOT_PROFILE_BUDGETS,
+        timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
+        stdout_byte_limit=DEFAULT_STDOUT_BYTE_LIMIT,
+        stderr_byte_limit=DEFAULT_STDERR_BYTE_LIMIT,
+        model="auto",
+        fixture_initial_commit_message=LEGACY_CANARY_FIXTURE_INITIAL_COMMIT_MESSAGE,
+    )
+
+
+def registered_profiles() -> dict[str, NativeMissionProfile]:
+    """The exact source-controlled profile registry (pre-run selection only)."""
+
+    return {
+        profile.profile_id: profile
+        for profile in (legacy_canary_profile(), FLAGSHIP_INCIDENT_REPLAY_PROFILE)
+    }
+
+
+def resolve_registered_profile(profile_id: str) -> NativeMissionProfile:
+    profiles = registered_profiles()
+    if profile_id not in profiles:
+        raise ValueError(f"unknown mission profile: {profile_id!r}")
+    return profiles[profile_id].validated()
+
+
+def fixture_builder_registry() -> dict[tuple[str, int], Any]:
+    """Trusted executable fixture builders keyed by the exact identity pair."""
+
+    return {
+        (LEGACY_CANARY_FIXTURE_ID, LEGACY_CANARY_FIXTURE_VERSION): build_canary_repository,
+        (INCIDENT_BOARD_FIXTURE_ID, INCIDENT_BOARD_FIXTURE_VERSION): build_incident_board_repository,
+    }
+
+
+def resolve_fixture_builder(fixture_id: str, fixture_version: int) -> Any:
+    """Exact registry hit only: no fallback, no closest version, no default."""
+
+    builders = fixture_builder_registry()
+    key = (fixture_id, fixture_version)
+    if key not in builders:
+        raise ValueError(f"unknown fixture builder: {fixture_id!r} version {fixture_version!r}")
+    return builders[key]
+
+
+def create_canary_session(*, session_id: str, profile: NativeMissionProfile | None = None) -> DelegatedSessionState:
+    profile = (profile if profile is not None else legacy_canary_profile()).validated()
+    mission = Mission.create(mission_id=profile.mission_id, specification=profile.mission_text)
     gate = GateContract.create(
-        gate_id=CANARY_GATE_ID, objective="Complete and locally commit deterministic high-score persistence in the assigned canary repository.",
-        clauses=(GateClause("native-canary.material", "The committed material implements deterministic high-score persistence."), GateClause("native-canary.tests", "The complete npm test suite passes independently at checkpoint capture."), GateClause("native-canary.git", "The exact local commit exists, the worktree is clean, and no remote exists.")),
-        required_evidence_kinds=(EvidenceKind.TARGET_TREE, EvidenceKind.GIT_STATE, EvidenceKind.VERIFICATION_COMMAND),
-        checkpoint_verification_commands=(VerificationCommand(command_id="npm-test", argv=npm_test_argv(), timeout_seconds=120, max_capture_bytes=256 * 1024),), repair_budget=0,
+        gate_id=profile.gate_id, objective=profile.gate_objective,
+        clauses=tuple(GateClause(clause_id, text) for clause_id, text in profile.gate_clauses),
+        required_evidence_kinds=tuple(EvidenceKind(kind) for kind in profile.required_evidence_kinds),
+        checkpoint_verification_commands=tuple(command.to_verification_command() for command in profile.checkpoint_commands), repair_budget=0,
     )
     return new_session_state(session_id=session_id, mission=mission, gate_plan=GatePlan.create(mission=mission, ordered_gate_contracts=(gate,)))
 
 
-def build_native_agent_prompt(*, mission: Mission, gate_contract: GateContract, work_workspace: str | Path, required_commit_message: str = REQUIRED_COMMIT_MESSAGE) -> str:
+def build_native_agent_prompt(*, mission: Mission, gate_contract: GateContract, work_workspace: str | Path, required_commit_message: str = REQUIRED_COMMIT_MESSAGE, completion_conditions: str | None = None) -> str:
     mission.validated(); gate_contract.validated(); workspace, _ = _safe_directory(work_workspace, "assigned work workspace")
     clauses = "\n".join(f"- [{clause.clause_id}] {clause.text}" for clause in gate_contract.clauses)
+    completion_block = completion_conditions if completion_conditions is not None else _legacy_completion_conditions(required_commit_message)
+    require_nonempty_text(completion_block, "completion conditions", max_bytes=16384)
     return f"""{NATIVE_PROMPT_HEADER}
 
 Immutable mission:
@@ -343,16 +467,7 @@ Your exact assigned workspace is:
 You have normal native autonomy only inside that assigned workspace: inspect the repository, edit files,
 run shell commands, diagnose failures, use npm, run tests, and use Git locally as needed.
 
-Required completion conditions:
-- run the complete `npm test` suite;
-- create exactly one intended local feature commit with complete message `{required_commit_message}`;
-- use no `--trailer` when creating or amending the commit;
-- add no commit-message body, `Co-authored-by`, sign-off, attribution, or other trailer;
-- before stopping, run `git log -1 --format=%B` and verify that its complete output, after removing terminal newline characters only, is exactly `{required_commit_message}`;
-- if the complete message is not exact, amend that same commit during this native invocation, do not create a second commit, and run the exact `%B` verification again;
-- do not add or modify a Git remote;
-- do not push;
-- stop immediately only after the exact full-message verification passes.
+{completion_block}
 
 Do not merely describe changes. Perform the work inside the assigned workspace.
 """
@@ -422,12 +537,14 @@ class BehavioralVerifierEvidence:
         require_exact_keys(data, set(cls.__dataclass_fields__), "behavioral verifier evidence"); values=dict(data); values["workspace_identity"]=NativeFilesystemIdentity.from_dict(data["workspace_identity"]); values["argv"]=tuple(data["argv"]); values["script"]=NativeArtifactReference.from_dict(data["script"]); values["stdout"]=NativeArtifactReference.from_dict(data["stdout"]); values["stderr"]=NativeArtifactReference.from_dict(data["stderr"]); return cls(**values).validated()
 
 
-def run_behavioral_verifier(*, request: NativeExecutionRequest, execution_store: AtomicNativeExecutionStore, timeout_seconds: int = 60, output_limit: int = 128 * 1024) -> BehavioralVerifierEvidence:
+def run_behavioral_verifier(*, request: NativeExecutionRequest, execution_store: AtomicNativeExecutionStore, timeout_seconds: int = 60, output_limit: int = 128 * 1024, verifier_source: str | None = None) -> BehavioralVerifierEvidence:
     request.validated(); workspace, identity = _safe_directory(request.work_workspace, "behavioral verifier workspace")
+    source = verifier_source if verifier_source is not None else _BEHAVIORAL_SCRIPT
+    require_nonempty_text(source, "behavioral verifier source", max_bytes=262144)
     if execution_store.has_behavioral_evidence(request.session_id,request.gate_id,request.execution_attempt_index):
-        return load_behavioral_verifier(request=request,execution_store=execution_store)
+        return load_behavioral_verifier(request=request,execution_store=execution_store,verifier_source=source)
     prefix=f"{request.session_id}.{request.gate_id}.attempt-{request.execution_attempt_index}.behavioral"
-    script=execution_store.write_behavioral_artifact(request=request,artifact_id=f"{prefix}.script",purpose="behavioral-script",data=_BEHAVIORAL_SCRIPT.encode("utf-8"))
+    script=execution_store.write_behavioral_artifact(request=request,artifact_id=f"{prefix}.script",purpose="behavioral-script",data=source.encode("utf-8"))
     script_path=execution_store.directory / script.relative_path
     argv=("node.exe" if os.name=="nt" else "node", "--preserve-symlinks", "--preserve-symlinks-main", str(script_path), str(workspace))
     try:
@@ -442,16 +559,18 @@ def run_behavioral_verifier(*, request: NativeExecutionRequest, execution_store:
     return execution_store.create_behavioral_evidence(request=request,evidence=evidence,loader=BehavioralVerifierEvidence.from_dict)
 
 
-def load_behavioral_verifier(*, request: NativeExecutionRequest | NativeExecutionRequestBinding, execution_store: AtomicNativeExecutionStore) -> BehavioralVerifierEvidence:
+def load_behavioral_verifier(*, request: NativeExecutionRequest | NativeExecutionRequestBinding, execution_store: AtomicNativeExecutionStore, verifier_source: str | None = None) -> BehavioralVerifierEvidence:
+    source = verifier_source if verifier_source is not None else _BEHAVIORAL_SCRIPT
     try: evidence=execution_store.load_behavioral_evidence(request.session_id,request.gate_id,request.execution_attempt_index,loader=BehavioralVerifierEvidence.from_dict)
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc: raise NativeEvidenceInvalid(f"behavioral verifier evidence is invalid: {exc}") from exc
     if evidence.request_fingerprint!=request.request_fingerprint: raise NativeEvidenceInvalid("behavioral verifier evidence differs from the durable request")
     script_path=execution_store.directory / evidence.script.relative_path
-    if script_path.read_bytes()!=_BEHAVIORAL_SCRIPT.encode("utf-8"): raise NativeEvidenceInvalid("behavioral verifier script differs from the harness-owned source")
+    if script_path.read_bytes()!=source.encode("utf-8"): raise NativeEvidenceInvalid("behavioral verifier script differs from the harness-owned source")
     return evidence
 
 
-def _pre_capture_reason(result: NativeExecutionResult, behavioral: BehavioralVerifierEvidence) -> str | None:
+def _pre_capture_reason(result: NativeExecutionResult, behavioral: BehavioralVerifierEvidence, profile: NativeMissionProfile | None = None) -> str | None:
+    profile = profile if profile is not None else legacy_canary_profile()
     try: result.validated()
     except (NativeEvidenceInvalid, ValueError) as exc: return f"native result workspace observations no longer validate: {exc}"
     if result.status is not NativeExecutionStatus.PROCESS_SUCCEEDED: return "native process did not succeed"
@@ -460,9 +579,9 @@ def _pre_capture_reason(result: NativeExecutionResult, behavioral: BehavioralVer
     if result.final_git_remotes: return "canary repository has a remote"
     if result.initial_git_head is None or result.final_git_head is None or result.final_git_head == result.initial_git_head: return "final Git HEAD did not change"
     if result.commits_added != 1: return "exactly one new commit is required"
-    if result.final_commit_message != REQUIRED_COMMIT_MESSAGE: return "final complete commit message differs"
+    if result.final_commit_message != profile.required_commit_message: return "final complete commit message differs"
     if result.final_git_porcelain_status != "": return "final worktree is not clean"
-    if not EXPECTED_MATERIAL_PATHS.issubset(set(result.changed_material_files)): return "required material paths did not all change"
+    if not frozenset(profile.required_material_paths).issubset(set(result.changed_material_files)): return "required material paths did not all change"
     if behavioral.timed_out or behavioral.exit_code != 0: return "immutable behavioral verifier did not pass"
     return None
 
@@ -498,6 +617,42 @@ class EvidenceOnlyCanaryReconstruction:
 
     def __init__(self, *, execution_store: AtomicNativeExecutionStore, evidence_directory: str | Path) -> None:
         self.execution_store=execution_store; self.evidence_directory,_=_safe_directory(evidence_directory,"evidence directory")
+        self._profile_cache: NativeMissionProfile | None = None
+        self._persisted_profile_is_v4: bool | None = None
+
+    def _persisted_profile(self) -> NativeMissionProfile:
+        """Resolve the authoritative mission profile for this evidence root.
+
+        A v4 authorization payload is the only post-run profile authority: the
+        complete canonical profile is loaded and validated from the persisted
+        payload bytes alone, never from the current source registry, CLI
+        arguments, environment values, or module-level flagship constants.  A
+        v3 (or absent) payload identifies the historical canary mission.
+        """
+
+        if self._persisted_profile_is_v4 is not None:
+            assert self._profile_cache is not None
+            return self._profile_cache
+        path = self.evidence_directory / RUN_PREFLIGHT_METADATA_FILE_NAME
+        if path.is_file():
+            try:
+                parsed = json.loads(path.read_bytes().decode("utf-8"))
+            except (OSError, ValueError, UnicodeDecodeError) as exc:
+                raise NativeEvidenceInvalid(f"run preflight metadata is unreadable: {exc}") from exc
+            payload = parsed.get("authorization_payload") if isinstance(parsed, Mapping) else None
+            schema = payload.get("schema_version") if isinstance(payload, Mapping) else None
+            if schema == AUTHORIZATION_SCHEMA_VERSION_V4:
+                try:
+                    persisted_payload = NativeCanaryAuthorizationPayloadV4.from_dict(payload)
+                except (ValueError, TypeError) as exc:
+                    raise NativeEvidenceInvalid(f"persisted v4 authorization payload is invalid: {exc}") from exc
+                self._profile_cache = persisted_payload.mission_profile
+                self._persisted_profile_is_v4 = True
+                return self._profile_cache
+        if self._profile_cache is None:
+            self._profile_cache = legacy_canary_profile()
+        self._persisted_profile_is_v4 = False
+        return self._profile_cache
     def _outcome(self, *, status: NativeCanaryStatus, state: DelegatedSessionState, request: NativeExecutionRequest | NativeExecutionRequestBinding | None = None, result: NativeExecutionResult | None = None, result_fingerprint: str | None = None, detail: str, behavioral_evidence_fingerprint: str | None = None, capture_attempt_fingerprint: str | None = None, workspace_final_git_head: str | None = None) -> NativeCanaryOutcome:
         checkpoint=state.checkpoint_history[-1] if state.checkpoint_history else None
         counts=NativeLifecycleCounts()
@@ -519,6 +674,17 @@ class EvidenceOnlyCanaryReconstruction:
         from it.
         """
         if self.execution_store.has_terminal(state.session_id,request.gate_id,0): return self._terminal_outcome(state,request,self.execution_store.load_terminal(state.session_id,request.gate_id,0))
+        profile=self._persisted_profile()
+        if self._persisted_profile_is_v4:
+            if profile.session_id != state.session_id:
+                raise NativeEvidenceInvalid("persisted v4 profile session ID does not bind the durable delegated session")
+            derived = create_canary_session(session_id=state.session_id, profile=profile)
+            if derived.mission.mission_fingerprint != state.mission.mission_fingerprint:
+                raise NativeEvidenceInvalid("persisted v4 profile-derived mission fingerprint does not bind durable delegated state")
+            if derived.gate_plan.plan_fingerprint != state.gate_plan.plan_fingerprint:
+                raise NativeEvidenceInvalid("persisted v4 profile-derived gate-plan fingerprint does not bind durable delegated state")
+            if derived.current_gate.contract_fingerprint != state.current_gate.contract_fingerprint:
+                raise NativeEvidenceInvalid("persisted v4 profile-derived gate-contract fingerprint does not bind durable delegated state")
         if (
             request.session_id!=state.session_id or request.execution_attempt_index!=0
             or request.mission_fingerprint!=state.mission.mission_fingerprint
@@ -535,7 +701,7 @@ class EvidenceOnlyCanaryReconstruction:
         if not (reservation.reserved_at<=started.process_started_at<=observation.process["ended_at"]<=eligibility.evaluated_at<=attempt.started_at): raise NativeEvidenceInvalid("lifecycle timestamps are out of order")
         expected=_result_from_observation(observation,backend_attestation_fingerprint=request.backend_attestation_fingerprint)
         if NativeExecutionResult(**{**expected.__dict__,"result_fingerprint":result.result_fingerprint})!=result: raise NativeEvidenceInvalid("accepted result contradicts the persisted process observation")
-        behavioral=load_behavioral_verifier(request=request,execution_store=self.execution_store)
+        behavioral=load_behavioral_verifier(request=request,execution_store=self.execution_store,verifier_source=profile.verifier_source)
         if (
             attempt.session_id!=state.session_id or attempt.gate_id!=state.current_gate.gate_id or attempt.execution_attempt_index!=0
             or attempt.request_fingerprint!=request.request_fingerprint or attempt.result_fingerprint!=result.result_fingerprint
@@ -547,7 +713,7 @@ class EvidenceOnlyCanaryReconstruction:
             or attempt.expected_terminal_status!=CAPTURE_EXPECTED_SUCCESS_STATUS
             or state.revision!=attempt.state_revision+1
         ): raise NativeEvidenceInvalid("capture attempt does not bind the exact active durable run")
-        if state.phase is not Phase.CHECKPOINT_CAPTURED or len(state.checkpoint_history)!=1 or state.audit_history or state.repair_authority is not None or state.human_boundary_reason is not None or state.human_disposition is not None or state.current_gate.gate_id!=CANARY_GATE_ID: raise NativeEvidenceInvalid("reconstructed delegated state exceeds Act-2A stop boundary")
+        if state.phase is not Phase.CHECKPOINT_CAPTURED or len(state.checkpoint_history)!=1 or state.audit_history or state.repair_authority is not None or state.human_boundary_reason is not None or state.human_disposition is not None or state.current_gate.gate_id!=profile.gate_id: raise NativeEvidenceInvalid("reconstructed delegated state exceeds the one-gate stop boundary")
         checkpoint=state.checkpoint_history[-1]
         if checkpoint.session_id!=state.session_id or checkpoint.gate_id!=request.gate_id or checkpoint.execution_attempt_index!=0: raise NativeEvidenceInvalid("checkpoint differs from the active request")
         if checkpoint.git_head!=result.final_git_head or checkpoint.git_worktree_status!=result.final_git_porcelain_status: raise NativeEvidenceInvalid("checkpoint Git facts contradict the accepted result")
@@ -557,18 +723,23 @@ class EvidenceOnlyCanaryReconstruction:
             if not _inside(safe,checkpoint_root): raise NativeEvidenceInvalid("checkpoint artifact escapes checkpoint evidence root")
             data=safe.read_bytes()
             if len(data)!=reference.byte_count or hashlib.sha256(data).hexdigest()!=reference.sha256: raise NativeEvidenceInvalid("checkpoint artifact hash mismatch")
-        if _pre_capture_reason(result, behavioral) is not None: raise NativeEvidenceInvalid("reconstructed success no longer satisfies eligibility")
+        if _pre_capture_reason(result, behavioral, profile) is not None: raise NativeEvidenceInvalid("reconstructed success no longer satisfies eligibility")
         if _checkpoint_success_reason(checkpoint,state.current_gate) is not None: raise NativeEvidenceInvalid("reconstructed checkpoint command evidence does not satisfy Act-2A success")
         return self._outcome(status=NativeCanaryStatus.CHECKPOINT_CAPTURED_CANARY_SUCCESS,state=state,request=request,result=result,detail="All native, behavioral, capture, checkpoint, and state evidence reloaded from disk.",behavioral_evidence_fingerprint=behavioral.evidence_fingerprint,capture_attempt_fingerprint=attempt.attempt_fingerprint,workspace_final_git_head=result.final_git_head)
 
 
 class NativeCanaryCoordinator(EvidenceOnlyCanaryReconstruction):
     """One READY_FOR_GATE -> CHECKPOINT_CAPTURED canary path, with no retry."""
-    def __init__(self, *, session_store: AtomicDelegatedSessionStore, execution_store: AtomicNativeExecutionStore, executor: NativeDelegatedExecutor, backend_attestation: BackendAttestation, source_repository: str | Path, work_workspace: str | Path, canary_parent: str | Path, evidence_directory: str | Path, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS, stdout_byte_limit: int = DEFAULT_STDOUT_BYTE_LIMIT, stderr_byte_limit: int = DEFAULT_STDERR_BYTE_LIMIT) -> None:
+    def __init__(self, *, session_store: AtomicDelegatedSessionStore, execution_store: AtomicNativeExecutionStore, executor: NativeDelegatedExecutor, backend_attestation: BackendAttestation, source_repository: str | Path, work_workspace: str | Path, canary_parent: str | Path, evidence_directory: str | Path, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS, stdout_byte_limit: int = DEFAULT_STDOUT_BYTE_LIMIT, stderr_byte_limit: int = DEFAULT_STDERR_BYTE_LIMIT, profile: NativeMissionProfile | None = None) -> None:
         super().__init__(execution_store=execution_store, evidence_directory=evidence_directory)
         self.session_store=session_store; self.executor=executor; self.backend_attestation=backend_attestation.validated()
         self.source_repository,_=_safe_directory(source_repository,"source repository"); self.work_workspace,_=_safe_directory(work_workspace,"work workspace"); self.canary_parent,_=_safe_directory(canary_parent,"canary parent")
         self.timeout_seconds=timeout_seconds; self.stdout_byte_limit=stdout_byte_limit; self.stderr_byte_limit=stderr_byte_limit
+        self.profile=(profile if profile is not None else legacy_canary_profile()).validated()
+        # The live coordinator's selected profile is the reconstruction
+        # authority for its own run; the CLI persists the identical profile in
+        # the v4 payload before any execution begins.
+        self._profile_cache=self.profile
     def _publish_failure_terminal(self, *, state: DelegatedSessionState, request: NativeExecutionRequest | NativeExecutionRequestBinding, result: NativeExecutionResult | None, status: NativeCaptureTerminalStatus, failure_category: str, diagnostic: str, capture_attempt: NativeCheckpointCaptureAttempt | None = None) -> NativeCanaryOutcome:
         try:
             terminal=self.execution_store.create_terminal(request=request,result=result,status=status,failure_category=failure_category,diagnostic=diagnostic[:1024],capture_attempt=capture_attempt)
@@ -587,7 +758,7 @@ class NativeCanaryCoordinator(EvidenceOnlyCanaryReconstruction):
         if state.phase is Phase.READY_FOR_GATE:
             started=reduce(state,GateExecutionStarted(gate.gate_id)); self.session_store.replace(started,expected_revision=state.revision); state=self.session_store.load(session_id)
         if state.phase is not Phase.GATE_EXECUTING: raise RuntimeError(f"coordinator refuses delegated phase {state.phase.value}")
-        prompt=build_native_agent_prompt(mission=state.mission,gate_contract=gate,work_workspace=self.work_workspace)
+        prompt=build_native_agent_prompt(mission=state.mission,gate_contract=gate,work_workspace=self.work_workspace,required_commit_message=self.profile.required_commit_message,completion_conditions=self.profile.completion_conditions_text)
         request_exists=self.execution_store.has_request(session_id,gate.gate_id,attempt)
         if request_exists:
             # Terminal recognition is first and uses only structural request
@@ -615,7 +786,7 @@ class NativeCanaryCoordinator(EvidenceOnlyCanaryReconstruction):
         try: self.execution_store.create_request(request)
         except NativeCommittedButDurabilityUncertain as exc: return self._outcome(status=NativeCanaryStatus.DURABILITY_UNCERTAIN,state=state,request=request,detail=str(exc))
         try:
-            issued=self.executor.execute(request=request,prompt=prompt,source_repository=self.source_repository,canary_parent=self.canary_parent,allowed_parent_children=frozenset({self.work_workspace.name}),evidence_store_root=self.execution_store.directory,artifact_directory=self.execution_store.artifact_directory,required_commit_message=REQUIRED_COMMIT_MESSAGE,required_material_paths=EXPECTED_MATERIAL_PATHS,execution_store=self.execution_store)
+            issued=self.executor.execute(request=request,prompt=prompt,source_repository=self.source_repository,canary_parent=self.canary_parent,allowed_parent_children=frozenset({self.work_workspace.name}),evidence_store_root=self.execution_store.directory,artifact_directory=self.execution_store.artifact_directory,required_commit_message=self.profile.required_commit_message,required_material_paths=frozenset(self.profile.required_material_paths),execution_store=self.execution_store)
             result=self.execution_store.write_result(issued)
         except NativeResultIneligible as exc:
             observation=self.execution_store.load_process_observation(session_id,gate.gate_id,0)
@@ -635,12 +806,12 @@ class NativeCanaryCoordinator(EvidenceOnlyCanaryReconstruction):
             if self.execution_store.has_attempt_reserved(session_id,gate.gate_id,0): return self._publish_failure_terminal(state=state,request=request,result=None,status=NativeCaptureTerminalStatus.PRECAPTURE_FAILED,failure_category="lifecycle_publication_failure",diagnostic=f"{type(exc).__name__}: {exc}")
             return self._outcome(status=NativeCanaryStatus.PREFLIGHT_BLOCKED,state=state,request=request,detail=str(exc))
         try:
-            behavioral=run_behavioral_verifier(request=request,execution_store=self.execution_store)
+            behavioral=run_behavioral_verifier(request=request,execution_store=self.execution_store,timeout_seconds=self.profile.verifier_timeout_seconds,output_limit=self.profile.verifier_output_limit_bytes,verifier_source=self.profile.verifier_source)
         except NativeCommittedButDurabilityUncertain as exc:
             return self._publish_failure_terminal(state=state,request=request,result=result,status=NativeCaptureTerminalStatus.DURABILITY_UNCERTAIN,failure_category="behavioral_durability_uncertain",diagnostic=str(exc))
         except Exception as exc:
             return self._publish_failure_terminal(state=state,request=request,result=result,status=NativeCaptureTerminalStatus.PRECAPTURE_FAILED,failure_category="behavioral_verifier_observation",diagnostic=f"{type(exc).__name__}: {exc}")
-        reason=_pre_capture_reason(result,behavioral)
+        reason=_pre_capture_reason(result,behavioral,self.profile)
         if reason is not None:
             return self._publish_failure_terminal(state=state,request=request,result=result,status=NativeCaptureTerminalStatus.PRECAPTURE_FAILED,failure_category="pre_capture_eligibility",diagnostic=reason)
         try: capture_attempt=self.execution_store.create_capture_attempt(request=request,result=result,gate_plan_fingerprint=state.gate_plan.plan_fingerprint,checkpoint_contract_fingerprint=gate.contract_fingerprint,behavioral_evidence_fingerprint=behavioral.evidence_fingerprint,required_command_ids=tuple(command.command_id for command in gate.checkpoint_verification_commands),state_revision=state.revision)
@@ -864,6 +1035,301 @@ def build_authorization_payload(*, source_repository: Path, source_head: str, ru
     return NativeCanaryAuthorizationPayload(**{**provisional.__dict__,"payload_fingerprint":fingerprint(provisional._body())}).validated()
 
 
+@dataclass(frozen=True)
+class InitializedWorkspaceIdentity:
+    """Independently observed identity of one freshly initialized workspace."""
+
+    initial_git_head: str
+    initial_material_tree_hash: str
+    initial_commit_count: int
+    initial_commit_message: str
+
+    def validated(self) -> "InitializedWorkspaceIdentity":
+        if (
+            not isinstance(self.initial_git_head, str) or len(self.initial_git_head) not in {40, 64}
+            or self.initial_git_head != self.initial_git_head.lower()
+            or any(char not in "0123456789abcdef" for char in self.initial_git_head)
+        ):
+            raise ValueError("initialized workspace HEAD must be a lowercase Git object ID")
+        require_sha256(self.initial_material_tree_hash, "initialized workspace material tree hash")
+        require_strict_int(self.initial_commit_count, "initialized workspace commit count", minimum=1, maximum=1)
+        require_nonempty_text(self.initial_commit_message, "initialized workspace commit message", max_bytes=1024)
+        if "\n" in self.initial_commit_message or "\r" in self.initial_commit_message:
+            raise ValueError("initialized workspace commit message must be one exact single line")
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(self.__dict__)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "InitializedWorkspaceIdentity":
+        require_exact_keys(data, set(cls.__dataclass_fields__), "initialized workspace identity")
+        return cls(**data).validated()
+
+
+def _remove_tree_force(root: Path) -> None:
+    """Remove a scratch tree, clearing Windows read-only Git object bits."""
+
+    def _on_error(func: Any, path: Any, _exc_info: Any) -> None:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+
+    shutil.rmtree(root, onerror=_on_error)
+
+
+def _observe_built_fixture(built: Any, profile: NativeMissionProfile) -> InitializedWorkspaceIdentity:
+    """Independently observe one built fixture and bind its exact identity."""
+
+    repository = Path(built.repository)
+    try:
+        head = _run(["git", "rev-parse", "HEAD"], cwd=repository).stdout.strip().lower()
+        count_text = _run(["git", "rev-list", "--count", "HEAD"], cwd=repository).stdout.strip()
+        message = _run(["git", "log", "-1", "--format=%B"], cwd=repository).stdout.rstrip("\r\n")
+        status = _run(["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=repository).stdout
+        remotes = _run(["git", "remote"], cwd=repository).stdout.strip()
+    except RuntimeError as exc:
+        raise NativeEvidenceInvalid(f"initialized workspace observation failed: {exc}") from exc
+    tree = fixture_material_tree_hash(repository)
+    if head != built.initial_head or tree != built.initial_material_tree_hash:
+        raise NativeEvidenceInvalid("fixture builder facts contradict the independent observation")
+    if count_text != "1":
+        raise NativeEvidenceInvalid("initialized workspace must contain exactly one commit")
+    if message != profile.fixture_initial_commit_message:
+        raise NativeEvidenceInvalid("initialized workspace initial commit message is not exact")
+    if status:
+        raise NativeEvidenceInvalid("initialized workspace worktree is not clean")
+    if remotes:
+        raise NativeEvidenceInvalid("initialized workspace has a remote")
+    return InitializedWorkspaceIdentity(head, tree, 1, message).validated()
+
+
+def observe_initialized_workspace_identity(profile: NativeMissionProfile) -> InitializedWorkspaceIdentity:
+    """Observe the deterministic fixture identity via one scratch rehearsal.
+
+    The rehearsal builds the registered fixture in a temporary directory,
+    independently observes its Git and material identity, and removes every
+    scratch file.  It creates no run state and reserves nothing.
+    """
+
+    profile.validated()
+    builder = resolve_fixture_builder(profile.fixture_id, profile.fixture_version)
+    scratch = Path(tempfile.mkdtemp(prefix="admissible-fixture-rehearsal-"))
+    try:
+        built = builder(scratch, repository_name="work")
+        return _observe_built_fixture(built, profile)
+    finally:
+        _remove_tree_force(scratch)
+
+
+def _profile_fixture_version_label(profile: NativeMissionProfile) -> str:
+    return f"{profile.fixture_id}@v{profile.fixture_version}"
+
+
+@dataclass(frozen=True)
+class NativeCanaryAuthorizationPayloadV4:
+    """Profile-bound v4 authorization payload for new native runs.
+
+    It carries every v3 authorization and backend binding plus the complete
+    canonical mission-profile body (with its recomputed non-self-referential
+    fingerprint) and the independently observed initialized-workspace
+    identity.  For a registered profile the profile values are the only
+    authority for identity and budgets; every mirrored payload field must
+    equal its profile counterpart exactly.
+    """
+
+    schema_version: str
+    source_repository: str
+    source_repository_identity: NativeFilesystemIdentity
+    source_head: str
+    clean_worktree_required: bool
+    run_id: str
+    session_id: str
+    mission_fingerprint: str
+    gate_plan_fingerprint: str
+    gate_contract_fingerprint: str
+    backend_attestation_class: str
+    backend_readiness_reason: str
+    backend_attestation_fingerprint: str
+    attestation_non_claims: tuple[str, ...]
+    canary_non_claims: tuple[str, ...]
+    executable: str
+    launcher_prefix: tuple[str, ...]
+    selected_model: str
+    timeout_seconds: int
+    stdout_byte_limit: int
+    stderr_byte_limit: int
+    budgets: tuple[int, int, int, int, int]
+    fixture_version: str
+    required_commit_message: str
+    run_root: str
+    workspace_root: str
+    evidence_root: str
+    native_sidecar_root: str
+    mission_profile: NativeMissionProfile
+    initialized_workspace: InitializedWorkspaceIdentity
+    payload_fingerprint: str
+
+    def _body(self) -> dict[str, Any]:
+        data = dict(self.__dict__)
+        data["source_repository_identity"] = self.source_repository_identity.to_dict()
+        data["launcher_prefix"] = list(self.launcher_prefix)
+        data["budgets"] = list(self.budgets)
+        data["attestation_non_claims"] = list(self.attestation_non_claims)
+        data["canary_non_claims"] = list(self.canary_non_claims)
+        data["mission_profile"] = self.mission_profile.to_dict()
+        data["initialized_workspace"] = self.initialized_workspace.to_dict()
+        data.pop("payload_fingerprint")
+        return data
+
+    def validated(self) -> "NativeCanaryAuthorizationPayloadV4":
+        if self.schema_version != AUTHORIZATION_SCHEMA_VERSION_V4:
+            raise ValueError("unsupported v4 authorization payload")
+        if not isinstance(self.mission_profile, NativeMissionProfile):
+            raise ValueError("v4 authorization payload must embed the complete mission profile")
+        profile = self.mission_profile.validated()
+        if not isinstance(self.initialized_workspace, InitializedWorkspaceIdentity):
+            raise ValueError("v4 authorization payload must bind the initialized workspace identity")
+        self.initialized_workspace.validated()
+        require_nonempty_text(self.source_repository, "authorization source repository", max_bytes=4096)
+        source, source_identity = _safe_directory(self.source_repository, "authorization source repository")
+        if str(source) != self.source_repository:
+            raise ValueError("authorization source repository must be a canonical absolute path")
+        if not isinstance(self.source_repository_identity, NativeFilesystemIdentity):
+            raise ValueError("authorization source repository identity is invalid")
+        self.source_repository_identity.validated()
+        if not _same_directory_identity(source_identity, self.source_repository_identity):
+            raise ValueError("authorization source repository identity changed")
+        require_sha256(self.mission_fingerprint,"authorization mission fingerprint"); require_sha256(self.gate_plan_fingerprint,"authorization gate plan fingerprint"); require_sha256(self.gate_contract_fingerprint,"authorization gate contract fingerprint"); require_sha256(self.backend_attestation_fingerprint,"authorization backend fingerprint"); require_sha256(self.payload_fingerprint,"authorization payload fingerprint")
+        require_identifier(self.run_id,"authorization run ID"); require_identifier(self.session_id,"authorization session ID"); require_nonempty_text(self.source_head,"authorization source HEAD",max_bytes=128); require_nonempty_text(self.selected_model,"authorization model",max_bytes=256); require_nonempty_text(self.fixture_version,"fixture version",max_bytes=128); require_nonempty_text(self.required_commit_message,"commit message",max_bytes=1024); require_nonempty_text(self.executable,"authorization executable",max_bytes=4096)
+        if not isinstance(self.clean_worktree_required, bool) or not self.clean_worktree_required:
+            raise ValueError("authorization must require a clean worktree")
+        if not isinstance(self.launcher_prefix, tuple) or not self.launcher_prefix or len(set(self.launcher_prefix)) != len(self.launcher_prefix):
+            raise ValueError("authorization launcher prefix is invalid")
+        if not isinstance(self.budgets, tuple) or len(self.budgets) != 5:
+            raise ValueError("authorization budgets are invalid")
+        if not isinstance(self.attestation_non_claims, tuple) or not isinstance(self.canary_non_claims, tuple):
+            raise ValueError("authorization non-claims must be immutable tuples")
+        if self.backend_attestation_class == ATTESTATION_CLASS_PACKAGE_BIN:
+            if tuple(self.attestation_non_claims) != PACKAGE_BIN_NON_CLAIMS: raise ValueError("authorization non-claims differ from the package-bin attestation class")
+        elif self.backend_attestation_class == ATTESTATION_CLASS_WRAPPER_CHAIN:
+            if tuple(self.attestation_non_claims) != WRAPPER_CHAIN_NON_CLAIMS: raise ValueError("authorization non-claims differ from the wrapper-chain attestation class")
+        else:
+            raise ValueError("authorization attestation class is unsupported")
+        require_nonempty_text(self.backend_readiness_reason,"authorization readiness reason",max_bytes=256)
+        if self.backend_readiness_reason != CLASS_READINESS_REASONS[self.backend_attestation_class]:
+            raise ValueError("authorization readiness reason does not pair with the attestation class")
+        if tuple(self.canary_non_claims) != CANARY_NON_CLAIMS:
+            raise ValueError("authorization canary non-claims differ from the exact committed canary boundary set")
+        for value, label in ((self.run_root, "authorization run root"), (self.workspace_root, "authorization workspace root"), (self.evidence_root, "authorization evidence root"), (self.native_sidecar_root, "authorization native sidecar root")):
+            require_nonempty_text(value, label, max_bytes=4096)
+        run_root=_lexical_absolute(self.run_root,"authorization run root"); evidence_root=_lexical_absolute(self.evidence_root,"authorization evidence root"); workspace_root=_lexical_absolute(self.workspace_root,"authorization workspace root"); sidecar_root=_lexical_absolute(self.native_sidecar_root,"authorization native sidecar root")
+        if (str(run_root),str(evidence_root),str(workspace_root),str(sidecar_root)) != (self.run_root,self.evidence_root,self.workspace_root,self.native_sidecar_root):
+            raise ValueError("authorization roots must be canonical absolute paths")
+        if evidence_root != run_root / EVIDENCE_DIRECTORY_NAME: raise ValueError("evidence root must be the committed deterministic child of the run root")
+        if workspace_root != run_root / WORKSPACE_DIRECTORY_NAME: raise ValueError("workspace root must be the committed deterministic child of the run root")
+        if sidecar_root != evidence_root / NATIVE_SIDECAR_DIRECTORY_NAME: raise ValueError("native sidecar root must be the committed deterministic child of the evidence root")
+        if _inside(run_root,source) or _inside(source,run_root): raise ValueError("run root must be outside the source repository")
+        if workspace_root == evidence_root or _inside(workspace_root,evidence_root) or _inside(evidence_root,workspace_root): raise ValueError("workspace and evidence roots must be disjoint")
+        for value in self.launcher_prefix: require_nonempty_text(value,"authorization launcher path",max_bytes=4096)
+        for value in self.budgets: require_strict_int(value,"authorization budget",minimum=0,maximum=1)
+        require_strict_int(self.timeout_seconds,"authorization timeout",minimum=1,maximum=3600); require_strict_int(self.stdout_byte_limit,"authorization stdout limit",minimum=1,maximum=16*1024*1024); require_strict_int(self.stderr_byte_limit,"authorization stderr limit",minimum=1,maximum=16*1024*1024)
+        # One authority: every mirrored value must equal the embedded profile.
+        for label, mirrored, authoritative in (
+            ("run ID", self.run_id, profile.run_id),
+            ("session ID", self.session_id, profile.session_id),
+            ("model", self.selected_model, profile.model),
+            ("timeout", self.timeout_seconds, profile.timeout_seconds),
+            ("stdout limit", self.stdout_byte_limit, profile.stdout_byte_limit),
+            ("stderr limit", self.stderr_byte_limit, profile.stderr_byte_limit),
+            ("budgets", self.budgets, profile.budgets),
+            ("commit message", self.required_commit_message, profile.required_commit_message),
+            ("fixture version", self.fixture_version, _profile_fixture_version_label(profile)),
+        ):
+            if mirrored != authoritative:
+                raise ValueError(f"authorization {label} contradicts the embedded mission profile")
+        if Path(self.run_root).name != profile.run_id:
+            raise ValueError("authorization run root basename must equal the profile run ID")
+        if self.initialized_workspace.initial_commit_message != profile.fixture_initial_commit_message:
+            raise ValueError("initialized workspace commit message contradicts the embedded mission profile")
+        # Derived mission/plan/contract fingerprints are recomputed from the
+        # embedded profile, never trusted from the caller.
+        derived = create_canary_session(session_id=profile.session_id, profile=profile)
+        if (
+            derived.mission.mission_fingerprint != self.mission_fingerprint
+            or derived.gate_plan.plan_fingerprint != self.gate_plan_fingerprint
+            or derived.current_gate.contract_fingerprint != self.gate_contract_fingerprint
+        ):
+            raise ValueError("authorization mission/plan/contract fingerprints are not derived from the embedded profile")
+        if fingerprint(self._body())!=self.payload_fingerprint: raise ValueError("authorization payload fingerprint mismatch")
+        return self
+
+    def validated_for_authorization(self, *, active_source_repository: str | Path) -> "NativeCanaryAuthorizationPayloadV4":
+        self.validated()
+        active, active_identity = _safe_directory(active_source_repository, "active authorization source repository")
+        signed, signed_identity = _safe_directory(self.source_repository, "authorization source repository")
+        if (
+            str(active) != self.source_repository
+            or active != signed
+            or not _same_directory_identity(active_identity, signed_identity)
+            or not _same_directory_identity(active_identity, self.source_repository_identity)
+        ):
+            raise ValueError("authorization source repository differs from the active source repository")
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        data=self._body(); data["payload_fingerprint"]=self.payload_fingerprint; return data
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "NativeCanaryAuthorizationPayloadV4":
+        """Parse a persisted v4 payload without granting executable authority."""
+
+        require_exact_keys(data, set(cls.__dataclass_fields__), "native canary authorization payload v4")
+        values = dict(data)
+        values["source_repository_identity"] = NativeFilesystemIdentity.from_dict(data["source_repository_identity"])
+        for key in ("launcher_prefix", "attestation_non_claims", "canary_non_claims"):
+            raw = data[key]
+            if not isinstance(raw, list) or any(not isinstance(item, str) for item in raw) or len(set(raw)) != len(raw):
+                raise ValueError(f"authorization {key} must be a duplicate-free JSON string array")
+            values[key] = tuple(raw)
+        raw_budgets = data["budgets"]
+        if not isinstance(raw_budgets, list) or len(raw_budgets) != 5:
+            raise ValueError("authorization budgets must be a five-item JSON array")
+        values["budgets"] = tuple(raw_budgets)
+        if not isinstance(data["mission_profile"], Mapping):
+            raise ValueError("authorization mission profile must be a complete canonical object")
+        values["mission_profile"] = NativeMissionProfile.from_dict(data["mission_profile"])
+        if not isinstance(data["initialized_workspace"], Mapping):
+            raise ValueError("authorization initialized workspace must be a canonical object")
+        values["initialized_workspace"] = InitializedWorkspaceIdentity.from_dict(data["initialized_workspace"])
+        return cls(**values).validated()
+
+
+def build_profile_authorization_payload(*, source_repository: Path, source_head: str, attestation: BackendAttestation, run_root: str | Path, profile: NativeMissionProfile, initialized_workspace: InitializedWorkspaceIdentity, backend_readiness_reason: str | None = None) -> NativeCanaryAuthorizationPayloadV4:
+    """Build the profile-bound v4 payload; the profile is the one authority."""
+
+    profile = profile.validated()
+    if attestation.selected_model != profile.model:
+        raise ValueError("attested selected model contradicts the mission profile model")
+    state = create_canary_session(session_id=profile.session_id, profile=profile)
+    source, source_identity = _safe_directory(source_repository, "authorization source repository")
+    root = Path(os.path.abspath(os.fspath(run_root))); evidence = root / EVIDENCE_DIRECTORY_NAME; workspace = root / WORKSPACE_DIRECTORY_NAME; sidecar = evidence / NATIVE_SIDECAR_DIRECTORY_NAME
+    attestation = attestation.validated()
+    readiness_reason = backend_readiness_reason if backend_readiness_reason is not None else CLASS_READINESS_REASONS.get(attestation.attestation_class, "")
+    provisional = NativeCanaryAuthorizationPayloadV4(
+        AUTHORIZATION_SCHEMA_VERSION_V4, str(source), source_identity, source_head.lower(), True,
+        profile.run_id, profile.session_id,
+        state.mission.mission_fingerprint, state.gate_plan.plan_fingerprint, state.current_gate.contract_fingerprint,
+        attestation.attestation_class, readiness_reason, attestation.attestation_fingerprint,
+        tuple(attestation.non_claims), CANARY_NON_CLAIMS,
+        attestation.executable.canonical_path, tuple(item.canonical_path for item in attestation.launcher_prefix),
+        profile.model, profile.timeout_seconds, profile.stdout_byte_limit, profile.stderr_byte_limit,
+        profile.budgets, _profile_fixture_version_label(profile), profile.required_commit_message,
+        str(root), str(workspace), str(evidence), str(sidecar),
+        profile, initialized_workspace.validated(), "0" * 64,
+    )
+    return NativeCanaryAuthorizationPayloadV4(**{**provisional.__dict__, "payload_fingerprint": fingerprint(provisional._body())}).validated()
+
+
 def _authorized(phrase: str, payload: NativeCanaryAuthorizationPayload, *, active_source_repository: str | Path) -> bool:
     try:
         if not isinstance(phrase, str):
@@ -913,7 +1379,10 @@ def _validate_future_run_root(
 def build_parser() -> argparse.ArgumentParser:
     parser=argparse.ArgumentParser(prog="python -m admissible.delegated_gate.native_canary",description="Future-only one-shot locally-attested native Cursor canary")
     parser.add_argument("--source-repository",required=True); parser.add_argument("--required-source-head",required=True); parser.add_argument("--run-root",required=True); parser.add_argument("--run-id",required=True); parser.add_argument("--session-id",required=True)
-    parser.add_argument("--executable",required=True); parser.add_argument("--executable-prefix-arg",action="append",default=[]); parser.add_argument("--model",default="auto"); parser.add_argument("--timeout-seconds",type=int,default=DEFAULT_TIMEOUT_SECONDS)
+    parser.add_argument("--executable",required=True); parser.add_argument("--executable-prefix-arg",action="append",default=[]); parser.add_argument("--model",default=None); parser.add_argument("--timeout-seconds",type=int,default=None)
+    parser.add_argument("--stdout-byte-limit",type=int,default=None,help="Native stdout evidence budget in bytes; for a selected profile it may only repeat the profile value")
+    parser.add_argument("--stderr-byte-limit",type=int,default=None,help="Native stderr evidence budget in bytes; for a selected profile it may only repeat the profile value")
+    parser.add_argument("--profile-id",default=None,help="Explicit registered mission-profile selection; omitted selects the historical canary mission with its exact historical defaults. No environment fallback exists.")
     parser.add_argument("--attestation-class",choices=["package-bin","wrapper-chain"],default="package-bin",help="Explicit attestation class. wrapper-chain is the weaker LOCAL_WRAPPER_CHAIN class: it derives every launcher file from canonical host cursor-agent discovery, establishes no publisher provenance, and requires owner authorization naming that exact class.")
     parser.add_argument("--owner-authorization",help="Explicit owner phrase; never persisted"); parser.add_argument("--preflight-only",action="store_true",help="Print local attestation and authorization payload without creating a run")
     return parser
@@ -921,16 +1390,36 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args=build_parser().parse_args(argv); blocked={"status":NativeCanaryStatus.PREFLIGHT_BLOCKED.value,"provider_invocations":0,"native_attempts_reserved":0,"native_processes_started":0,"native_processes_completed":0,"process_observations_published":0,"accepted_native_results_published":0,"authorized_budgets":{"provider_invocations":1,"native_phase_attempts":1,"repair_rounds":0,"auditor_invocations":0,"retries":0},"canary_success":False}
-    if not 1<=args.timeout_seconds<=3600: print(json.dumps({**blocked,"detail":"timeout must be from 1 through 3600 seconds"},sort_keys=True)); return 2
+    # Profile selection and budget-authority resolution run before any local
+    # probe, payload, or filesystem effect.  For a selected profile the profile
+    # values are the one authority; a differing CLI value fails immediately.
+    profile: NativeMissionProfile | None = None
+    if args.profile_id is not None:
+        try: profile=resolve_registered_profile(args.profile_id)
+        except ValueError as exc: print(json.dumps({**blocked,"detail":str(exc)},sort_keys=True)); return 2
+        for label, supplied, authoritative in (("--timeout-seconds",args.timeout_seconds,profile.timeout_seconds),("--stdout-byte-limit",args.stdout_byte_limit,profile.stdout_byte_limit),("--stderr-byte-limit",args.stderr_byte_limit,profile.stderr_byte_limit),("--model",args.model,profile.model)):
+            if supplied is not None and supplied != authoritative:
+                print(json.dumps({**blocked,"detail":f"{label} contradicts the selected profile; the registered profile is the one authority"},sort_keys=True)); return 2
+        if args.run_id != profile.run_id or args.session_id != profile.session_id:
+            print(json.dumps({**blocked,"detail":"run and session IDs are profile authority and must equal the selected profile exactly"},sort_keys=True)); return 2
+        timeout_seconds=profile.timeout_seconds; stdout_byte_limit=profile.stdout_byte_limit; stderr_byte_limit=profile.stderr_byte_limit; model=profile.model
+    else:
+        timeout_seconds=args.timeout_seconds if args.timeout_seconds is not None else DEFAULT_TIMEOUT_SECONDS
+        model=args.model if args.model is not None else "auto"
+        for label, supplied, historical in (("--stdout-byte-limit",args.stdout_byte_limit,DEFAULT_STDOUT_BYTE_LIMIT),("--stderr-byte-limit",args.stderr_byte_limit,DEFAULT_STDERR_BYTE_LIMIT)):
+            if supplied is not None and supplied != historical:
+                print(json.dumps({**blocked,"detail":f"{label} is fixed to the exact historical default for the profile-less historical canary invocation"},sort_keys=True)); return 2
+        stdout_byte_limit=DEFAULT_STDOUT_BYTE_LIMIT; stderr_byte_limit=DEFAULT_STDERR_BYTE_LIMIT
+    if not 1<=timeout_seconds<=3600: print(json.dumps({**blocked,"detail":"timeout must be from 1 through 3600 seconds"},sort_keys=True)); return 2
     try: source,_=_safe_directory(args.source_repository,"source repository")
     except ValueError as exc: print(json.dumps({**blocked,"detail":str(exc)},sort_keys=True)); return 2
     attestation_class=ATTESTATION_CLASS_WRAPPER_CHAIN if args.attestation_class=="wrapper-chain" else ATTESTATION_CLASS_PACKAGE_BIN
-    try: config=CursorNativeBackendConfig(executable=args.executable,launcher_prefix=tuple(args.executable_prefix_arg),model=args.model,attestation_class=attestation_class)
+    try: config=CursorNativeBackendConfig(executable=args.executable,launcher_prefix=tuple(args.executable_prefix_arg),model=model,attestation_class=attestation_class)
     except ValueError as exc: print(json.dumps({**blocked,"detail":str(exc)},sort_keys=True)); return 2
     try:
         # Gate construction/validation is part of source/backend/gate preflight
         # and has no filesystem or authorization side effect.
-        create_canary_session(session_id=args.session_id)
+        create_canary_session(session_id=args.session_id, profile=profile)
     except ValueError as exc:
         print(json.dumps({**blocked,"detail":str(exc)},sort_keys=True)); return 2
     decision:NativePreflightDecision=preflight_native_cursor(config=config)
@@ -959,9 +1448,13 @@ def main(argv: list[str] | None = None) -> int:
             "durability_capability":capability_diagnostic,
         },sort_keys=True)); return 2
     try:
-        payload=build_authorization_payload(source_repository=source,source_head=args.required_source_head,run_id=args.run_id,session_id=args.session_id,attestation=decision.attestation,run_root=args.run_root,timeout_seconds=args.timeout_seconds,backend_readiness_reason=decision.reason_code)
+        if profile is None:
+            payload=build_authorization_payload(source_repository=source,source_head=args.required_source_head,run_id=args.run_id,session_id=args.session_id,attestation=decision.attestation,run_root=args.run_root,timeout_seconds=timeout_seconds,backend_readiness_reason=decision.reason_code)
+        else:
+            rehearsed_identity=observe_initialized_workspace_identity(profile)
+            payload=build_profile_authorization_payload(source_repository=source,source_head=args.required_source_head,attestation=decision.attestation,run_root=args.run_root,profile=profile,initialized_workspace=rehearsed_identity,backend_readiness_reason=decision.reason_code)
         payload.validated_for_authorization(active_source_repository=source)
-    except ValueError as exc:
+    except (ValueError, NativeEvidenceInvalid, RuntimeError) as exc:
         print(json.dumps({**blocked,"detail":str(exc),"where_diagnostic":where_diagnostic,"durability_capability":capability_diagnostic},sort_keys=True)); return 2
     if args.preflight_only: print(json.dumps({"status":NativePreflightStatus.PREFLIGHT_READY.value,"authorization_payload":payload.to_dict(),"attestation":decision.attestation.to_dict(),"where_diagnostic":where_diagnostic,"durability_capability":capability_diagnostic},sort_keys=True)); return 0
     if not args.owner_authorization or not _authorized(args.owner_authorization,payload,active_source_repository=source): print(json.dumps({**blocked,"detail":"owner authorization did not match the exact canonical payload","durability_capability":capability_diagnostic},sort_keys=True)); return 2
@@ -973,14 +1466,26 @@ def main(argv: list[str] | None = None) -> int:
         )
     except ValueError as exc:
         print(json.dumps({**blocked,"detail":str(exc)},sort_keys=True)); return 2
-    run_root.mkdir(); _safe_directory(run_root,"run root"); fixture=build_canary_repository(run_root,repository_name=WORKSPACE_DIRECTORY_NAME); evidence=(run_root/EVIDENCE_DIRECTORY_NAME); evidence.mkdir(); _safe_directory(evidence,"evidence directory")
-    _write_run_metadata_once(evidence/"canary-preflight.json",{"classification":CANARY_CLASSIFICATION,"authorization_payload":payload.to_dict(),"attestation":decision.attestation.to_dict(),"local_capability_status":decision.status.value,"durability_capability":capability_diagnostic})
-    session_store=AtomicDelegatedSessionStore(evidence/"delegated-state"); execution_store=AtomicNativeExecutionStore(evidence/NATIVE_SIDECAR_DIRECTORY_NAME); session_store.create(create_canary_session(session_id=args.session_id))
-    coordinator=NativeCanaryCoordinator(session_store=session_store,execution_store=execution_store,executor=NativeDelegatedExecutor(config=config),backend_attestation=decision.attestation,source_repository=source,work_workspace=fixture.repository,canary_parent=run_root,evidence_directory=evidence,timeout_seconds=args.timeout_seconds)
+    run_root.mkdir(); _safe_directory(run_root,"run root")
+    if profile is None:
+        fixture=build_canary_repository(run_root,repository_name=WORKSPACE_DIRECTORY_NAME)
+    else:
+        try:
+            builder=resolve_fixture_builder(profile.fixture_id,profile.fixture_version)
+            fixture=builder(run_root,repository_name=WORKSPACE_DIRECTORY_NAME)
+            observed_identity=_observe_built_fixture(fixture,profile)
+        except (ValueError, NativeEvidenceInvalid, RuntimeError) as exc:
+            print(json.dumps({**blocked,"detail":f"initialized workspace is not launchable: {exc}"},sort_keys=True)); return 2
+        if observed_identity != payload.initialized_workspace:
+            print(json.dumps({**blocked,"detail":"initialized workspace contradicts the authorized workspace identity"},sort_keys=True)); return 2
+    evidence=(run_root/EVIDENCE_DIRECTORY_NAME); evidence.mkdir(); _safe_directory(evidence,"evidence directory")
+    _write_run_metadata_once(evidence/RUN_PREFLIGHT_METADATA_FILE_NAME,{"classification":CANARY_CLASSIFICATION,"authorization_payload":payload.to_dict(),"attestation":decision.attestation.to_dict(),"local_capability_status":decision.status.value,"durability_capability":capability_diagnostic})
+    session_store=AtomicDelegatedSessionStore(evidence/"delegated-state"); execution_store=AtomicNativeExecutionStore(evidence/NATIVE_SIDECAR_DIRECTORY_NAME); session_store.create(create_canary_session(session_id=args.session_id, profile=profile))
+    coordinator=NativeCanaryCoordinator(session_store=session_store,execution_store=execution_store,executor=NativeDelegatedExecutor(config=config),backend_attestation=decision.attestation,source_repository=source,work_workspace=fixture.repository,canary_parent=run_root,evidence_directory=evidence,timeout_seconds=timeout_seconds,stdout_byte_limit=stdout_byte_limit,stderr_byte_limit=stderr_byte_limit,profile=profile)
     outcome=coordinator.run(session_id=args.session_id); _write_run_metadata_once(evidence/"final-status.json",outcome.to_dict()); print(json.dumps(outcome.to_dict(),sort_keys=True)); return 0 if outcome.canary_success else 1
 
 
 if __name__ == "__main__": sys.exit(main())
 
 
-__all__=["AUTHORIZATION_SCHEMA_VERSION","AUTHORIZATION_SCHEMA_VERSION_LEGACY_V2","CANARY_NON_CLAIMS","CLASS_READINESS_REASONS","EVIDENCE_DIRECTORY_NAME","NATIVE_SIDECAR_DIRECTORY_NAME","PACKAGE_BIN_READY_REASON","WORKSPACE_DIRECTORY_NAME","BEHAVIORAL_EVIDENCE_SCHEMA_VERSION","CANARY_CLASSIFICATION","CANARY_FIXTURE_VERSION","CANARY_GATE_ID","CANARY_MISSION","CANARY_MISSION_ID","DEFAULT_STDERR_BYTE_LIMIT","DEFAULT_STDOUT_BYTE_LIMIT","DEFAULT_TIMEOUT_SECONDS","EXPECTED_MATERIAL_PATHS","FixtureRepository","MAX_AUDITOR_INVOCATIONS","MAX_NATIVE_PHASE_ATTEMPTS","MAX_PROVIDER_INVOCATIONS","MAX_REPAIR_ROUNDS","MAX_RETRIES","NativeCanaryAuthorizationPayload","NativeCanaryCoordinator","NativeCanaryOutcome","NativeCanaryStatus","OWNER_AUTHORIZATION_DIGEST_ENV","REQUIRED_COMMIT_MESSAGE","BehavioralVerifierEvidence","EvidenceOnlyCanaryReconstruction","build_authorization_payload","build_canary_repository","build_native_agent_prompt","build_parser","create_canary_session","load_behavioral_verifier","main","npm_test_argv","reconstruct_completed_canary_success","run_behavioral_verifier","_validate_future_run_root"]
+__all__=["AUTHORIZATION_SCHEMA_VERSION","AUTHORIZATION_SCHEMA_VERSION_LEGACY_V2","AUTHORIZATION_SCHEMA_VERSION_V4","LEGACY_CANARY_PROFILE_ID","LEGACY_CANARY_FIXTURE_ID","LEGACY_CANARY_FIXTURE_VERSION","RUN_PREFLIGHT_METADATA_FILE_NAME","InitializedWorkspaceIdentity","NativeCanaryAuthorizationPayloadV4","build_profile_authorization_payload","fixture_builder_registry","legacy_canary_profile","observe_initialized_workspace_identity","registered_profiles","resolve_fixture_builder","resolve_registered_profile","CANARY_NON_CLAIMS","CLASS_READINESS_REASONS","EVIDENCE_DIRECTORY_NAME","NATIVE_SIDECAR_DIRECTORY_NAME","PACKAGE_BIN_READY_REASON","WORKSPACE_DIRECTORY_NAME","BEHAVIORAL_EVIDENCE_SCHEMA_VERSION","CANARY_CLASSIFICATION","CANARY_FIXTURE_VERSION","CANARY_GATE_ID","CANARY_MISSION","CANARY_MISSION_ID","DEFAULT_STDERR_BYTE_LIMIT","DEFAULT_STDOUT_BYTE_LIMIT","DEFAULT_TIMEOUT_SECONDS","EXPECTED_MATERIAL_PATHS","FixtureRepository","MAX_AUDITOR_INVOCATIONS","MAX_NATIVE_PHASE_ATTEMPTS","MAX_PROVIDER_INVOCATIONS","MAX_REPAIR_ROUNDS","MAX_RETRIES","NativeCanaryAuthorizationPayload","NativeCanaryCoordinator","NativeCanaryOutcome","NativeCanaryStatus","OWNER_AUTHORIZATION_DIGEST_ENV","REQUIRED_COMMIT_MESSAGE","BehavioralVerifierEvidence","EvidenceOnlyCanaryReconstruction","build_authorization_payload","build_canary_repository","build_native_agent_prompt","build_parser","create_canary_session","load_behavioral_verifier","main","npm_test_argv","reconstruct_completed_canary_success","run_behavioral_verifier","_validate_future_run_root"]
