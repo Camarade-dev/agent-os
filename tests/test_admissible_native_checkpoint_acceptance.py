@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
+import subprocess
 import threading
 from typing import Callable
 
@@ -63,11 +65,14 @@ from admissible.delegated_gate.native_acceptance import (
     record_native_checkpoint_review_binding,
     _parse_owner_statement,
 )
+from admissible.delegated_gate import native_canary as native_canary_module
 from admissible.delegated_gate.native_canary import (
     CANARY_CLASSIFICATION,
     CANARY_GATE_ID,
     build_authorization_payload,
     reconstruct_completed_canary_success,
+    _git_source_preflight,
+    _git_source_preflight_run,
 )
 from admissible.delegated_gate.native_executor import (
     NativeCaptureTerminalStatus,
@@ -292,9 +297,11 @@ def _assert_review_blocked(
 def test_valid_review_binding_creation_with_exact_write_accounting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     h, args = _acceptance_context(tmp_path, bind_review=False)
     _install_traps(monkeypatch)
+    monkeypatch.delenv("GIT_OPTIONAL_LOCKS", raising=False)
     source_before = _tree_hashes(h.source)
     run_before = _tree_hashes(h.root)
     work_before = _repository_internals(h.work)
+    protocol_before = _repository_internals(h.protocol_root)
     outcome = record_native_checkpoint_review_binding(**_review_args(h))
     assert outcome.status is NativeCheckpointReviewBindingStatus.REVIEW_BINDING_CREATED
     record = outcome.review_binding
@@ -309,6 +316,8 @@ def test_valid_review_binding_creation_with_exact_write_accounting(tmp_path: Pat
     assert {key: run_after[key] for key in run_before} == run_before
     assert _tree_hashes(h.source) == source_before
     assert _repository_internals(h.work) == work_before
+    assert _repository_internals(h.protocol_root) == protocol_before
+    assert "GIT_OPTIONAL_LOCKS" not in os.environ
     state = h.session_store.load(h.session_id)
     assert state.phase is Phase.CHECKPOINT_CAPTURED and state.human_disposition is None
     raw = _review_path(h).read_bytes()
@@ -325,6 +334,13 @@ def test_valid_review_binding_creation_with_exact_write_accounting(tmp_path: Pat
         session_id=h.session_id, gate_id=CANARY_GATE_ID,
     ) is NativeCheckpointReviewBindingPresence.PRESENT_VALID
     assert len(h.runner.invocations) == 1
+    # Idempotent retry preserves both the record and the protocol repository.
+    path = _review_path(h)
+    record_stat = (path.read_bytes(), path.stat().st_mtime_ns)
+    second = record_native_checkpoint_review_binding(**_review_args(h))
+    assert second.status is NativeCheckpointReviewBindingStatus.REVIEW_BINDING_IDEMPOTENT_EXISTING
+    assert (path.read_bytes(), path.stat().st_mtime_ns) == record_stat
+    assert _repository_internals(h.protocol_root) == protocol_before
 
 
 def test_review_binding_exact_duplicate_idempotent_without_rewrite(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -583,9 +599,11 @@ def test_review_binding_schema_bounds_and_forged_registered_run(tmp_path: Path, 
 def test_valid_acceptance_after_evidence_only_success_with_exact_write_accounting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     h, args = _acceptance_context(tmp_path)
     _install_traps(monkeypatch)
+    monkeypatch.delenv("GIT_OPTIONAL_LOCKS", raising=False)
     source_before = _tree_hashes(h.source)
     run_before = _tree_hashes(h.root)
     work_before = _repository_internals(h.work)
+    protocol_before = _repository_internals(h.protocol_root)
     outcome = record_native_checkpoint_acceptance(**args)
     assert outcome.status is NativeCheckpointAcceptanceStatus.ACCEPTANCE_CREATED
     record = outcome.acceptance
@@ -598,13 +616,16 @@ def test_valid_acceptance_after_evidence_only_success_with_exact_write_accountin
     assert record.evidence_review_verdict == _REVIEW_PASS_VERDICT
     assert record.owner_statement_sha256 == hashlib.sha256(args["owner_statement"].encode("ascii")).hexdigest()
     # Exactly one new file: the acceptance record.  Everything else is
-    # byte-identical, including the workspace Git internals and the source.
+    # byte-identical, including the workspace Git internals, the source, and
+    # the protocol repository (including .git/index bytes and mtime_ns).
     run_after = _tree_hashes(h.root)
     added = set(run_after) - set(run_before)
     assert added == {str(_acceptance_path(h).relative_to(h.root))}
     assert {key: run_after[key] for key in run_before} == run_before
     assert _tree_hashes(h.source) == source_before
     assert _repository_internals(h.work) == work_before
+    assert _repository_internals(h.protocol_root) == protocol_before
+    assert "GIT_OPTIONAL_LOCKS" not in os.environ
     # Delegated state remains untouched at CHECKPOINT_CAPTURED.
     state = h.session_store.load(h.session_id)
     assert state.phase is Phase.CHECKPOINT_CAPTURED
@@ -625,6 +646,13 @@ def test_valid_acceptance_after_evidence_only_success_with_exact_write_accountin
         session_id=h.session_id, gate_id=CANARY_GATE_ID,
     ) is NativeCheckpointAcceptancePresence.PRESENT_VALID
     assert len(h.runner.invocations) == 1
+    path = _acceptance_path(h)
+    record_stat = (path.read_bytes(), path.stat().st_mtime_ns)
+    second = record_native_checkpoint_acceptance(**args)
+    assert second.status is NativeCheckpointAcceptanceStatus.ACCEPTANCE_IDEMPOTENT_EXISTING
+    assert (path.read_bytes(), path.stat().st_mtime_ns) == record_stat
+    assert _repository_internals(h.protocol_root) == protocol_before
+    assert h.session_store.load(h.session_id).phase is Phase.CHECKPOINT_CAPTURED
 
 
 def test_review_binding_then_acceptance_write_order_accounting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -1180,3 +1208,281 @@ def test_owner_statement_adversarial_matrix(tmp_path: Path, monkeypatch: pytest.
     assert outcome.acceptance.owner_statement_sha256 == hashlib.sha256(
         args["owner_statement"].encode("ascii")
     ).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Act 2A.4L: protocol-repository preflight Git read-only child environment
+# ---------------------------------------------------------------------------
+
+
+def _disposable_clean_git_repository(root: Path) -> str:
+    root.mkdir(parents=True, exist_ok=True)
+    _command(["git", "init", "--quiet", "--initial-branch=main"], cwd=root)
+    _command(["git", "config", "core.autocrlf", "false"], cwd=root)
+    _command(["git", "config", "core.filemode", "false"], cwd=root)
+    _command(["git", "config", "commit.gpgsign", "false"], cwd=root)
+    tracked = root / "tracked.txt"
+    tracked.write_text("unchanged\n", encoding="utf-8")
+    _commit(root, "chore: initialize disposable preflight repository")
+    return _command(["git", "rev-parse", "HEAD"], cwd=root).stdout.strip().lower()
+
+
+def _touch_tracked_stat_only(repository: Path) -> None:
+    tracked = repository / "tracked.txt"
+    old = tracked.stat()
+    os.utime(tracked, ns=(old.st_atime_ns, old.st_mtime_ns + 2_000_000_000))
+
+
+def test_git_source_preflight_run_forces_optional_locks_when_parent_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    observed: dict[str, object] = {}
+
+    def capture(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        observed["command"] = args[0]
+        observed.update(kwargs)
+        return subprocess.CompletedProcess(args[0], 0, "ok\n", "")
+
+    monkeypatch.delenv("GIT_OPTIONAL_LOCKS", raising=False)
+    monkeypatch.setenv("NATIVE_PREFLIGHT_INHERITED_TEST", "preserved")
+    monkeypatch.setattr(native_canary_module.subprocess, "run", capture)
+    result = _git_source_preflight_run(repository, "status", "--porcelain=v1", timeout=17)
+    assert result.stdout == "ok\n"
+    assert observed["env"]["GIT_OPTIONAL_LOCKS"] == "0"
+    assert observed["env"]["NATIVE_PREFLIGHT_INHERITED_TEST"] == "preserved"
+    assert "GIT_OPTIONAL_LOCKS" not in os.environ
+    assert observed["command"] == ["git", "status", "--porcelain=v1"]
+    assert observed["cwd"] == repository and observed["timeout"] == 17
+    assert observed["shell"] is False and observed["capture_output"] is True
+    assert observed["text"] is True and observed["encoding"] == "utf-8"
+    assert observed["check"] is False
+
+
+def test_git_source_preflight_run_overrides_parent_optional_locks_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    observed: dict[str, object] = {}
+
+    def capture(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        observed["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(args[0], 0, "ok\n", "")
+
+    monkeypatch.setenv("GIT_OPTIONAL_LOCKS", "1")
+    monkeypatch.setenv("NATIVE_PREFLIGHT_INHERITED_TEST", "still-here")
+    monkeypatch.setattr(native_canary_module.subprocess, "run", capture)
+    _git_source_preflight_run(repository, "rev-parse", "HEAD")
+    assert observed["env"]["GIT_OPTIONAL_LOCKS"] == "0"
+    assert observed["env"]["NATIVE_PREFLIGHT_INHERITED_TEST"] == "still-here"
+    assert os.environ["GIT_OPTIONAL_LOCKS"] == "1"
+
+
+def test_git_source_preflight_run_preserves_unrelated_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    observed: dict[str, object] = {}
+    before = dict(os.environ)
+
+    def capture(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        observed["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(args[0], 0, "ok\n", "")
+
+    monkeypatch.setenv("NATIVE_PREFLIGHT_MARKER", "alpha")
+    monkeypatch.delenv("GIT_OPTIONAL_LOCKS", raising=False)
+    monkeypatch.setattr(native_canary_module.subprocess, "run", capture)
+    _git_source_preflight_run(repository, "status")
+    assert observed["env"]["NATIVE_PREFLIGHT_MARKER"] == "alpha"
+    assert observed["env"]["GIT_OPTIONAL_LOCKS"] == "0"
+    assert dict(os.environ) == {**before, "NATIVE_PREFLIGHT_MARKER": "alpha"}
+    assert "GIT_OPTIONAL_LOCKS" not in os.environ
+
+
+def test_ordinary_git_status_may_refresh_disposable_index(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("GIT_OPTIONAL_LOCKS", raising=False)
+    refreshed = False
+    for attempt in range(5):
+        repository = tmp_path / f"ordinary-{attempt}"
+        _disposable_clean_git_repository(repository)
+        _touch_tracked_stat_only(repository)
+        before = _repository_internals(repository)
+        env = {key: value for key, value in os.environ.items() if key != "GIT_OPTIONAL_LOCKS"}
+        result = subprocess.run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=repository,
+            env=env,
+            shell=False,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+        assert result.returncode == 0 and result.stdout == ""
+        after = _repository_internals(repository)
+        if after != before:
+            refreshed = True
+            assert after[".git/index"] != before[".git/index"]
+            break
+    # Reproduction of ordinary Git index refresh is informative for the act
+    # report; failure to reproduce is not independently blocking.
+    print(f"ORDINARY_GIT_INDEX_REFRESHED={refreshed}")
+
+
+def test_git_source_preflight_does_not_refresh_disposable_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.delenv("GIT_OPTIONAL_LOCKS", raising=False)
+    repository = tmp_path / "production-preflight"
+    head = _disposable_clean_git_repository(repository)
+    _touch_tracked_stat_only(repository)
+    before = _repository_internals(repository)
+    observed_envs: list[dict[str, str]] = []
+    real_run = native_canary_module.subprocess.run
+
+    def instrumented(*args: object, **kwargs: object):
+        env = kwargs.get("env")
+        if env is not None:
+            observed_envs.append(dict(env))
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(native_canary_module.subprocess, "run", instrumented)
+    ready, detail = _git_source_preflight(repository, head)
+    assert ready is True and "clean authorized source HEAD" in detail
+    assert _repository_internals(repository) == before
+    assert observed_envs
+    assert all(env.get("GIT_OPTIONAL_LOCKS") == "0" for env in observed_envs)
+    assert "GIT_OPTIONAL_LOCKS" not in os.environ
+
+
+def test_git_source_preflight_behavior_matrix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("GIT_OPTIONAL_LOCKS", raising=False)
+    clean = tmp_path / "clean"
+    head = _disposable_clean_git_repository(clean)
+    assert _git_source_preflight(clean, head)[0] is True
+    assert _git_source_preflight(clean, "f" * 40)[0] is False
+
+    advanced = tmp_path / "advanced"
+    advanced_head = _disposable_clean_git_repository(advanced)
+    (advanced / "tracked.txt").write_text("advanced\n", encoding="utf-8")
+    _commit(advanced, "chore: advance head")
+    assert _git_source_preflight(advanced, advanced_head)[0] is False
+
+    dirty_tracked = tmp_path / "dirty-tracked"
+    dirty_head = _disposable_clean_git_repository(dirty_tracked)
+    (dirty_tracked / "tracked.txt").write_text("mutated\n", encoding="utf-8")
+    assert _git_source_preflight(dirty_tracked, dirty_head)[0] is False
+
+    untracked = tmp_path / "untracked"
+    untracked_head = _disposable_clean_git_repository(untracked)
+    (untracked / "extra.txt").write_text("untracked\n", encoding="utf-8")
+    assert _git_source_preflight(untracked, untracked_head)[0] is False
+
+    staged = tmp_path / "staged"
+    staged_head = _disposable_clean_git_repository(staged)
+    (staged / "tracked.txt").write_text("staged\n", encoding="utf-8")
+    _command(["git", "add", "--", "tracked.txt"], cwd=staged)
+    assert _git_source_preflight(staged, staged_head)[0] is False
+
+    unborn = tmp_path / "unborn"
+    unborn.mkdir()
+    _command(["git", "init", "--quiet", "--initial-branch=main"], cwd=unborn)
+    assert _git_source_preflight(unborn, "a" * 40)[0] is False
+
+    non_repo = tmp_path / "non-repo"
+    non_repo.mkdir()
+    assert _git_source_preflight(non_repo, "a" * 40)[0] is False
+
+    nested = tmp_path / "nested-root"
+    nested_head = _disposable_clean_git_repository(nested)
+    nested_child = nested / "child"
+    nested_child.mkdir()
+    assert _git_source_preflight(nested_child, nested_head)[0] is False
+
+    missing_git = tmp_path / "missing-git"
+    missing_head = _disposable_clean_git_repository(missing_git)
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+    (tmp_path / "empty-bin").mkdir()
+    try:
+        ready, detail = _git_source_preflight(missing_git, missing_head)
+        assert ready is False and detail
+    except FileNotFoundError:
+        # Existing fail-closed behavior: missing Git surfaces before a ready tuple.
+        pass
+
+
+@pytest.mark.parametrize(
+    ("setup", "path"),
+    [
+        ("dirty", "review"),
+        ("wrong-head", "review"),
+        ("advanced", "review"),
+        ("untracked", "review"),
+        ("unborn", "review"),
+        ("invalid-root", "review"),
+        ("dirty", "acceptance"),
+        ("wrong-head", "acceptance"),
+        ("advanced", "acceptance"),
+        ("untracked", "acceptance"),
+        ("unborn", "acceptance"),
+        ("invalid-root", "acceptance"),
+    ],
+)
+def test_failed_protocol_preflight_write_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, setup: str, path: str
+):
+    bind_review = path == "acceptance"
+    h, args = _acceptance_context(tmp_path, bind_review=bind_review)
+    _install_traps(monkeypatch)
+    monkeypatch.delenv("GIT_OPTIONAL_LOCKS", raising=False)
+    protocol = h.protocol_root
+    if setup == "dirty":
+        (protocol / "protocol.md").write_text("dirty protocol\n", encoding="utf-8")
+    elif setup == "advanced":
+        (protocol / "protocol.md").write_text("advanced protocol\n", encoding="utf-8")
+        _commit(protocol, "feat: later protocol change")
+    elif setup == "untracked":
+        (protocol / "uncommitted.txt").write_text("dirty\n", encoding="utf-8")
+    elif setup == "unborn":
+        unborn = tmp_path / "unborn-protocol"
+        unborn.mkdir()
+        _command(["git", "init", "--quiet", "--initial-branch=main"], cwd=unborn)
+        protocol = unborn
+        h.protocol_root = unborn
+    elif setup == "invalid-root":
+        protocol = tmp_path / "not-a-git-repo"
+        protocol.mkdir()
+        h.protocol_root = protocol
+    protocol_before = _repository_internals(protocol)
+    run_before = _tree_hashes(h.root)
+    if path == "review":
+        rargs = _review_args(h)
+        if setup == "wrong-head":
+            rargs["protocol_code_head"] = "f" * 40
+        if setup in {"unborn", "invalid-root"}:
+            rargs["protocol_repository"] = protocol
+        with pytest.raises(_BLOCKED_ERRORS):
+            record_native_checkpoint_review_binding(**rargs)
+        assert not has_native_checkpoint_review_binding(
+            execution_store=h.store, session_id=h.session_id, gate_id=CANARY_GATE_ID
+        )
+    else:
+        aargs = dict(args)
+        if setup == "wrong-head":
+            aargs["acceptance_protocol_code_head"] = "f" * 40
+            aargs["owner_statement"] = _owner_statement(aargs)
+        if setup in {"unborn", "invalid-root"}:
+            aargs["protocol_repository"] = protocol
+        with pytest.raises(_BLOCKED_ERRORS):
+            record_native_checkpoint_acceptance(**aargs)
+        assert not has_native_checkpoint_acceptance(
+            execution_store=h.store, session_id=h.session_id, gate_id=CANARY_GATE_ID
+        )
+    assert _tree_hashes(h.root) == run_before
+    assert _repository_internals(protocol) == protocol_before
+    assert len(h.runner.invocations) <= 1

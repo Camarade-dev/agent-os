@@ -681,14 +681,38 @@ def reconstruct_completed_canary_success(*, session_store: AtomicDelegatedSessio
     return reconstruction._reconstruct_success(state,binding,execution_store.load_result(session_id,gate.gate_id,0))
 
 
+def _git_source_preflight_run(
+    source: Path, *arguments: str, timeout: int = 60
+) -> subprocess.CompletedProcess[str]:
+    """Run a read-only Git observation for protocol-repository preflight.
+
+    Ordinary Git may refresh ``.git/index`` during otherwise observational
+    commands.  Protocol preflight must force ``GIT_OPTIONAL_LOCKS=0`` in the
+    child only, leave the parent environment untouched, and never depend on the
+    caller's ambient setting.
+    """
+
+    environment = dict(os.environ)
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    return _run(["git", *arguments], cwd=source, env=environment, timeout=timeout)
+
+
 def _git_source_preflight(source: Path, required_head: str) -> tuple[bool, str]:
     try:
-        root=_run(["git","rev-parse","--show-toplevel"],cwd=source).stdout.strip(); head=_run(["git","rev-parse","HEAD"],cwd=source).stdout.strip().lower(); status=_run(["git","status","--porcelain=v1","--untracked-files=all"],cwd=source).stdout
-    except RuntimeError as exc: return False,str(exc)
-    if Path(root).resolve()!=source.resolve(): return False,"source repository is not the exact Git root"
-    if head!=required_head.lower(): return False,"source HEAD does not match the explicitly authorized source HEAD"
-    if status: return False,"source repository is not clean"
-    return True,"clean authorized source HEAD confirmed"
+        root = _git_source_preflight_run(source, "rev-parse", "--show-toplevel").stdout.strip()
+        head = _git_source_preflight_run(source, "rev-parse", "HEAD").stdout.strip().lower()
+        status = _git_source_preflight_run(
+            source, "status", "--porcelain=v1", "--untracked-files=all"
+        ).stdout
+    except RuntimeError as exc:
+        return False, str(exc)
+    if Path(root).resolve() != source.resolve():
+        return False, "source repository is not the exact Git root"
+    if head != required_head.lower():
+        return False, "source HEAD does not match the explicitly authorized source HEAD"
+    if status:
+        return False, "source repository is not clean"
+    return True, "clean authorized source HEAD confirmed"
 
 
 @dataclass(frozen=True)
