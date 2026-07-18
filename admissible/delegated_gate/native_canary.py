@@ -38,6 +38,7 @@ from admissible.delegated_gate.mission_profile import (
     FLAGSHIP_INCIDENT_REPLAY_PROFILE,
     ONE_SHOT_PROFILE_BUDGETS,
     WORKFLOW_RECOVERY_PROFILE,
+    WORKFLOW_RECOVERY_V2_PROFILE,
     NativeMissionProfile,
     ProfileCheckpointCommand,
     create_native_mission_profile,
@@ -411,6 +412,7 @@ def registered_profiles() -> dict[str, NativeMissionProfile]:
             legacy_canary_profile(),
             FLAGSHIP_INCIDENT_REPLAY_PROFILE,
             WORKFLOW_RECOVERY_PROFILE,
+            WORKFLOW_RECOVERY_V2_PROFILE,
         )
     }
 

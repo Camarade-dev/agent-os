@@ -43,6 +43,9 @@ from admissible.delegated_gate.mission_profile import (
     WORKFLOW_RECOVERY_MISSION_TEXT,
     WORKFLOW_RECOVERY_PROFILE,
     WORKFLOW_RECOVERY_REQUIRED_COMMIT_MESSAGE,
+    WORKFLOW_RECOVERY_V2_INTEROPERABILITY_TEXT,
+    WORKFLOW_RECOVERY_V2_MISSION_TEXT,
+    WORKFLOW_RECOVERY_V2_PROFILE,
     WORKFLOW_RECOVERY_VERIFIER_SOURCE,
     NativeMissionProfile,
 )
@@ -75,6 +78,7 @@ from admissible.delegated_gate.store import AtomicDelegatedSessionStore
 
 
 PROFILE = WORKFLOW_RECOVERY_PROFILE
+V2_PROFILE = WORKFLOW_RECOVERY_V2_PROFILE
 MATERIAL_PATHS = (
     "README.md",
     "index.html",
@@ -144,8 +148,8 @@ def _source_head(source: Path) -> str:
     return _command(["git", "rev-parse", "HEAD"], cwd=source).stdout.strip().lower()
 
 
-def _profile_variant(**changes) -> NativeMissionProfile:
-    data = dict(PROFILE.to_dict())
+def _profile_variant_for(profile: NativeMissionProfile, **changes) -> NativeMissionProfile:
+    data = dict(profile.to_dict())
     data.update(changes)
     if "verifier_source" in changes:
         data["verifier_source_sha256"] = hashlib.sha256(
@@ -154,6 +158,10 @@ def _profile_variant(**changes) -> NativeMissionProfile:
     body = {key: value for key, value in data.items() if key != "profile_fingerprint"}
     data["profile_fingerprint"] = fingerprint(body)
     return NativeMissionProfile.from_dict(data)
+
+
+def _profile_variant(**changes) -> NativeMissionProfile:
+    return _profile_variant_for(PROFILE, **changes)
 
 
 @pytest.fixture(scope="module")
@@ -198,10 +206,11 @@ def test_profile_exact_identity_budgets_and_canonical_round_trip():
 
 def test_profile_and_fixture_registries_are_exact_and_preserve_existing_entries():
     assert resolve_registered_profile("workflow-recovery-v1") == PROFILE
+    assert resolve_registered_profile("workflow-recovery-v2") == V2_PROFILE
     assert resolve_registered_profile("incident-replay-v1").profile_id == "incident-replay-v1"
     assert resolve_registered_profile("act-2a-high-score-canary-v1").profile_id == "act-2a-high-score-canary-v1"
     with pytest.raises(ValueError, match="unknown mission profile"):
-        resolve_registered_profile("workflow-recovery-v2")
+        resolve_registered_profile("workflow-recovery-v3")
     assert resolve_fixture_builder(WORKFLOW_CONSOLE_FIXTURE_ID, WORKFLOW_CONSOLE_FIXTURE_VERSION) is build_workflow_console_repository
     assert resolve_fixture_builder("local-incident-board", 1) is not build_workflow_console_repository
     assert resolve_fixture_builder("act-2a-canary-game-state", 2) is not build_workflow_console_repository
@@ -209,6 +218,105 @@ def test_profile_and_fixture_registries_are_exact_and_preserve_existing_entries(
         resolve_fixture_builder(WORKFLOW_CONSOLE_FIXTURE_ID, 2)
     with pytest.raises(ValueError, match="unknown fixture builder"):
         resolve_fixture_builder("workflow-console-alias", 1)
+
+
+def test_v2_exact_identity_shared_authorities_and_v1_immutability():
+    assert PROFILE.profile_fingerprint == "ed67459c803bf439ee3325cdf9fa069d48677408412ff283ab86a4234d9ae2f8"
+    assert V2_PROFILE.schema_version == MISSION_PROFILE_SCHEMA_VERSION
+    assert V2_PROFILE.profile_id == "workflow-recovery-v2"
+    assert (V2_PROFILE.fixture_id, V2_PROFILE.fixture_version) == ("local-workflow-console", 1)
+    assert V2_PROFILE.run_id == V2_PROFILE.session_id == "native-cursor-flagship-003"
+    assert V2_PROFILE.mission_id == "native-flagship-workflow-recovery-v2"
+    assert V2_PROFILE.gate_id == "workflow-recovery-v2-gate"
+    assert V2_PROFILE.model == "auto"
+    assert V2_PROFILE.timeout_seconds == 3600
+    assert (V2_PROFILE.stdout_byte_limit, V2_PROFILE.stderr_byte_limit) == (8_388_608, 1_048_576)
+    assert V2_PROFILE.fixture_initial_commit_message == WORKFLOW_CONSOLE_INITIAL_COMMIT_MESSAGE
+    assert V2_PROFILE.required_commit_message == WORKFLOW_RECOVERY_REQUIRED_COMMIT_MESSAGE
+    assert V2_PROFILE.budgets == (1, 1, 0, 0, 0)
+    assert V2_PROFILE.required_evidence_kinds == ("target_tree", "git_state", "verification_command")
+    assert V2_PROFILE.required_material_paths == PROFILE.required_material_paths == MATERIAL_PATHS
+    assert V2_PROFILE.completion_conditions_text == PROFILE.completion_conditions_text
+    assert V2_PROFILE.gate_clauses == PROFILE.gate_clauses
+    assert V2_PROFILE.verifier_source is PROFILE.verifier_source
+    assert V2_PROFILE.verifier_source_sha256 == "a4e2daf9179129a7929bea5825f95f494ed601eb4a9bbbbaf6a65eb3918149e1"
+    assert (V2_PROFILE.verifier_timeout_seconds, V2_PROFILE.verifier_output_limit_bytes) == (120, 524_288)
+    assert V2_PROFILE.checkpoint_commands == PROFILE.checkpoint_commands
+    assert V2_PROFILE.mission_text == WORKFLOW_RECOVERY_V2_MISSION_TEXT
+    assert WORKFLOW_RECOVERY_V2_INTEROPERABILITY_TEXT in V2_PROFILE.mission_text
+    assert NativeMissionProfile.from_dict(json.loads(json.dumps(V2_PROFILE.to_dict()))) == V2_PROFILE
+
+
+def test_v2_rendered_prompt_discloses_exact_public_contract_without_solution_leakage(tmp_path: Path):
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    state = create_canary_session(session_id=V2_PROFILE.session_id, profile=V2_PROFILE)
+    prompt = build_native_agent_prompt(
+        mission=state.mission,
+        gate_contract=state.current_gate,
+        work_workspace=workspace,
+        required_commit_message=V2_PROFILE.required_commit_message,
+        completion_conditions=V2_PROFILE.completion_conditions_text,
+    )
+    mission_block = prompt.split("Immutable mission:\n", 1)[1].split("\n\nCurrent gate objective:", 1)[0]
+    completion_block = prompt.split("Required completion conditions:\n", 1)[1]
+    for signature in (
+        "startRun({ runId, workflow })",
+        "advanceRun(runId)",
+        "cancelRun(runId)",
+        "recoverRun(runId)",
+        "run(runId)",
+        "listRuns()",
+        "exportRuns()",
+        "importRuns(serializedText)",
+        "nextAttemptAt",
+    ):
+        assert signature in prompt
+    for statement in (
+        "accepts one object argument",
+        "complete workflow definition object",
+        "returns an array",
+        "as JSON\n  text",
+        "as one positional string\n  argument",
+        "Internal architecture",
+        "remain implementation\nchoices",
+    ):
+        assert statement in prompt
+    for path in MATERIAL_PATHS:
+        assert path in mission_block
+        assert path in completion_block
+    assert "git log -1 --format=%B" in completion_block
+    assert "no commit-message body" in completion_block
+    assert "use no `--trailer`" in completion_block
+    assert "sibling run roots" in mission_block and "evidence directories" in mission_block
+    assert "sibling run roots" in completion_block and "evidence directories" in completion_block
+    assert "Do not perform\nfurther exploration or changes after those checks." in completion_block
+    for leaked in (
+        "orderingA",
+        "assert.deepEqual",
+        "native-cursor-flagship-002/work",
+        "819b4ee930da7736f4422fc564d778854586ea89",
+        "startRun(workflow, { runId })",
+        "function manualClock",
+    ):
+        assert leaked not in prompt
+
+
+def test_v2_v4_payload_embeds_complete_profile_and_substitution_changes_identity(tmp_path: Path):
+    harness = _payload_harness(tmp_path, V2_PROFILE)
+    assert harness.payload.schema_version == AUTHORIZATION_SCHEMA_VERSION_V4
+    assert harness.payload.mission_profile == V2_PROFILE
+    assert harness.payload.run_id == harness.payload.session_id == V2_PROFILE.run_id
+    substituted = _profile_variant_for(V2_PROFILE, mission_text=V2_PROFILE.mission_text + "\nUnauthorized substitution.")
+    substituted_payload = build_profile_authorization_payload(
+        source_repository=harness.source,
+        source_head=_source_head(harness.source),
+        attestation=harness.attestation,
+        run_root=harness.run_root,
+        profile=substituted,
+        initialized_workspace=harness.identity,
+    )
+    assert substituted_payload.payload_fingerprint != harness.payload.payload_fingerprint
 
 
 def test_rendered_prompt_exposes_material_and_git_contract_without_hidden_filename(tmp_path: Path):
@@ -235,6 +343,23 @@ def test_rendered_prompt_exposes_material_and_git_contract_without_hidden_filena
     assert "sibling run roots" in mission_block and "evidence directories" in mission_block
     assert "sibling run roots" in completion_block and "evidence directories" in completion_block
     assert "Do not perform\nfurther exploration or changes after those checks." in completion_block
+
+
+def test_v1_rendered_prompt_identity_remains_canonical():
+    workspace = Path(r"C:\Users\stris\Documents\Projets\ENTRE\native-cursor-flagship-002\work")
+    state = create_canary_session(session_id=PROFILE.session_id, profile=PROFILE)
+    with mock.patch.object(nc, "_safe_directory", return_value=(workspace, None)):
+        prompt = build_native_agent_prompt(
+            mission=state.mission,
+            gate_contract=state.current_gate,
+            work_workspace=workspace,
+            required_commit_message=PROFILE.required_commit_message,
+            completion_conditions=PROFILE.completion_conditions_text,
+        )
+    assert len(prompt.encode("utf-8")) == 7_786
+    assert hashlib.sha256(prompt.encode("utf-8")).hexdigest() == (
+        "6e73f1dbeebf65772caad08e21d38b3225f39b6bfd22384f7c447e06a826e3ef"
+    )
 
 
 def test_fixture_has_exact_inventory_size_behavior_and_mission_absences(built_fixture):

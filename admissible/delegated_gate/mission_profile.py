@@ -559,6 +559,59 @@ assigned workspace."""
 
 WORKFLOW_RECOVERY_REQUIRED_COMMIT_MESSAGE = "feat: add resumable workflow execution"
 
+WORKFLOW_RECOVERY_V2_INTEROPERABILITY_TEXT = """The behavioral verifier interacts only through the following public interface.
+Implement these exact calling conventions:
+
+- `createWorkflowEngine({ storage, clock, outcomes, maxConcurrency })`
+  returns the engine;
+
+- `startRun({ runId, workflow })` accepts one object argument containing the
+  non-empty run identifier and the complete workflow definition object;
+
+- `advanceRun(runId)` performs one complete deterministic scheduler cycle and
+  returns the current run-state object;
+
+- `cancelRun(runId)` cancels the identified run and returns its current
+  run-state object;
+
+- `recoverRun(runId)` recovers the identified persisted run and returns its
+  current run-state object;
+
+- `run(runId)` returns the current run-state object for that identifier;
+
+- `listRuns()` returns an array of current run-state objects;
+
+- `exportRuns()` returns the complete deterministic run-state export as JSON
+  text;
+
+- `importRuns(serializedText)` accepts that JSON text as one positional string
+  argument, validates it completely before mutation, and returns the imported
+  run-state collection.
+
+These are public interoperability requirements only. Internal architecture,
+state representation, graph algorithm, scheduler implementation, persistence
+layout, class structure and module decomposition remain implementation
+choices."""
+
+_WORKFLOW_RECOVERY_ENGINE_REQUIREMENT = """3. Expose `createWorkflowEngine({ storage, clock, outcomes, maxConcurrency })`
+from `src/execution/engine.js`. The engine must expose `startRun`,
+`advanceRun`, `cancelRun`, `recoverRun`, `run`, `listRuns`, `exportRuns` and
+`importRuns`. One `advanceRun` call represents one complete deterministic
+scheduler cycle: it starts eligible tasks until the configured concurrency
+limit is filled and consults the injected outcome adapter for currently running
+attempts during that cycle. `advanceRun` must not sleep."""
+
+# workflow-recovery-v2 exists because the persisted v1 mission named startRun
+# but did not disclose the one-object public calling convention already enforced
+# by the frozen verifier. V2 changes disclosure only; it does not change the
+# fixture, verifier or workflow semantics.
+WORKFLOW_RECOVERY_V2_MISSION_TEXT = WORKFLOW_RECOVERY_MISSION_TEXT.replace(
+    _WORKFLOW_RECOVERY_ENGINE_REQUIREMENT,
+    _WORKFLOW_RECOVERY_ENGINE_REQUIREMENT
+    + "\n\n"
+    + WORKFLOW_RECOVERY_V2_INTEROPERABILITY_TEXT,
+)
+
 WORKFLOW_RECOVERY_COMPLETION_CONDITIONS_TEXT = f"""Required completion conditions:
 - satisfy every mission requirement and gate clause;
 
@@ -1025,6 +1078,22 @@ WORKFLOW_RECOVERY_PROFILE = create_native_mission_profile(
     fixture_initial_commit_message="chore: initialize workflow console fixture",
 )
 
+WORKFLOW_RECOVERY_V2_PROFILE = create_native_mission_profile(
+    **{
+        **{
+            key: value
+            for key, value in WORKFLOW_RECOVERY_PROFILE.__dict__.items()
+            if key not in {"schema_version", "profile_fingerprint"}
+        },
+        "profile_id": "workflow-recovery-v2",
+        "run_id": "native-cursor-flagship-003",
+        "session_id": "native-cursor-flagship-003",
+        "mission_id": "native-flagship-workflow-recovery-v2",
+        "gate_id": "workflow-recovery-v2-gate",
+        "mission_text": WORKFLOW_RECOVERY_V2_MISSION_TEXT,
+    }
+)
+
 
 __all__ = [
     "FLAGSHIP_COMPLETION_CONDITIONS_TEXT",
@@ -1038,6 +1107,9 @@ __all__ = [
     "WORKFLOW_RECOVERY_MISSION_TEXT",
     "WORKFLOW_RECOVERY_PROFILE",
     "WORKFLOW_RECOVERY_REQUIRED_COMMIT_MESSAGE",
+    "WORKFLOW_RECOVERY_V2_INTEROPERABILITY_TEXT",
+    "WORKFLOW_RECOVERY_V2_MISSION_TEXT",
+    "WORKFLOW_RECOVERY_V2_PROFILE",
     "WORKFLOW_RECOVERY_VERIFIER_SOURCE",
     "NativeMissionProfile",
     "ProfileCheckpointCommand",
