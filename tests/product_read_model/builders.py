@@ -94,9 +94,21 @@ class RunRootBuilder:
             },
         }
         if secret:
-            payload["authorization_payload"]["owner_phrase"] = "hunter2-secret"
-            payload["authorization_payload"]["api_key"] = "sk-should-not-appear"
-            payload["authorization_payload"]["environment"] = {"PATH": "C:/x", "SECRET_ENV": "leak"}
+            ap = payload["authorization_payload"]
+            ap["owner_phrase"] = "hunter2-secret"
+            ap["api_key"] = "sk-should-not-appear"
+            ap["environment"] = {"PATH": "C:/x", "SECRET_ENV": "leak"}
+            # Extended structured secret material that must never reach output.
+            ap["owner_authorization"] = "owner-authorization-secret"
+            ap["authorization_phrase"] = "authorization-phrase-secret"
+            ap["cookie"] = "session=cookie-secret"
+            ap["token"] = "token-value-secret"
+            ap["secret"] = "bare-secret-value"
+            ap["password"] = "password-secret"
+            ap["credential"] = "credential-secret"
+            ap["env"] = {"PATH": "C:/y", "ANOTHER_SECRET_ENV": "env-leak"}
+            # A safe schema field that merely contains the substring must survive.
+            ap["authorized_model"] = "cursor-safe-model-id"
         _write(self.evidence / "canary-preflight.json", payload)
         return self
 
@@ -326,6 +338,23 @@ def build_behavioral_refusal(root: Path, *, provider_exit: int = 0) -> Path:
     b.eligibility(eligible=True).behavioral(exit_code=1)
     b.terminal().final_status()
     return root
+
+
+def build_incomplete_refusal(root: Path) -> RunRootBuilder:
+    """Refusal run with deliberately incomplete evidence.
+
+    Canonical classification is ``PRECAPTURE_ELIGIBILITY_FAILED`` (NON_SUCCESS),
+    the behavioral verifier failed, and required native records (process
+    observation, terminal) are missing so the evidence set is INCOMPLETE. No
+    product block is written; callers add one to exercise unverified claims.
+    """
+
+    b = RunRootBuilder(root)
+    b.preflight().delegated_gate().request().attempt_reserved().process_started()
+    b.eligibility(eligible=False).behavioral(exit_code=1)
+    b.final_status(status="PRECAPTURE_ELIGIBILITY_FAILED")
+    # Deliberately omit process_observation, result and terminal -> INCOMPLETE.
+    return b
 
 
 def build_full_records(root: Path) -> RunRootBuilder:

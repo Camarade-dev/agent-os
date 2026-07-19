@@ -12,15 +12,26 @@ from __future__ import annotations
 
 import html
 
-from .presentation_types import RunDetail
+from .enums import TruthStatus, VerdictSource
+from .presentation_types import ProductVerdictView, RunDetail
 
 RESULT_SCHEMA_VERSION = "admissible_product_read_model_result_v1"
 
 _NON_AUTHORITY_NOTICE = (
     "Presentation only. This view reconstructs persisted evidence and does not "
     "itself decide whether the run succeeded. A product admission verdict is "
-    "authoritative only when supplied by the audited reconstruction seam."
+    "authoritative only when supplied by the audited reconstruction seam. A "
+    "persisted product block is an unverified claim, not authority."
 )
+
+_DIAGNOSTICS_SENSITIVITY_NOTICE = (
+    "Diagnostics may contain sensitive workspace or provider output."
+)
+
+_SOURCE_LABELS = {
+    VerdictSource.AUTHORITATIVE_RECONSTRUCTION: "authoritative reconstruction (audited G1 seam)",
+    VerdictSource.NONE: "none (no authoritative reconstruction)",
+}
 
 
 def render_result_json(detail: RunDetail) -> dict:
@@ -86,8 +97,9 @@ def _row(label: str, value: object) -> str:
     return f"<tr><th>{html.escape(label)}</th><td>{_esc(value)}</td></tr>"
 
 
-def _badge(text: str, kind: str) -> str:
-    return f'<span class="badge badge-{html.escape(kind)}">{html.escape(text)}</span>'
+def _badge(text: str, kind: str, *, role: str | None = None) -> str:
+    role_attr = f' data-role="{html.escape(role)}"' if role else ""
+    return f'<span class="badge badge-{html.escape(kind)}"{role_attr}>{html.escape(text)}</span>'
 
 
 def _status_kind(status_value: str) -> str:
@@ -98,6 +110,33 @@ def _status_kind(status_value: str) -> str:
         "INCOMPLETE": "warn",
         "UNKNOWN": "unknown",
     }.get(status_value, "unknown")
+
+
+def _verdict_badge_kind(pv: ProductVerdictView) -> str:
+    """Badge kind for the *effective authoritative* verdict.
+
+    Only a recognised, authoritative admitted verdict may be green (``ok``). A
+    persisted-only claim leaves ``pv.verdict`` at ``UNKNOWN`` and so can never
+    colour this badge green.
+    """
+
+    if not pv.verdict_is_authoritative:
+        return "unknown"
+    return {
+        "ADMITTED_OBSERVED": "ok",
+        "ADMITTED_VERIFIED": "ok",
+        "REFUSED": "bad",
+    }.get(pv.verdict.value, "unknown")
+
+
+def _truth_badge_kind(truth_status: TruthStatus) -> str:
+    return {
+        TruthStatus.AUTHORITATIVE: "ok",
+        TruthStatus.NOT_CONFIGURED: "unknown",
+        TruthStatus.NO_VERDICT: "warn",
+        TruthStatus.UNAVAILABLE: "warn",
+        TruthStatus.ERROR: "bad",
+    }.get(truth_status, "unknown")
 
 
 def _outcome_kind(outcome_value: str) -> str:
@@ -134,6 +173,7 @@ pre { background: #8881; padding: .6rem; border-radius: 6px; overflow-x: auto; f
 .badge-unknown { background: #3b5bdb22; color: #6b8bff; border: 1px solid #3b5bdb66; }
 .trunc { color: #b8860b; font-size: .78rem; }
 .list { margin: .2rem 0; padding-left: 1.2rem; font-size: .88rem; }
+.top-badges { display: flex; flex-wrap: wrap; gap: .4rem; margin: .2rem 0 .4rem; }
 """.strip()
 
 
@@ -151,13 +191,34 @@ def render_run_html(detail: RunDetail) -> str:
     parts.append(f"<style>{_STYLE}</style></head><body>")
 
     parts.append(f"<h1>Admissible run: {_esc(detail.identity.run_id)}</h1>")
-    parts.append(
-        "<div>"
-        + _badge(f"presentation: {detail.presentation_status.value}", _status_kind(detail.presentation_status.value))
-        + " "
-        + _badge(f"product verdict: {pv.verdict.value}", _status_kind({"ADMITTED_OBSERVED": "ADMITTED", "ADMITTED_VERIFIED": "ADMITTED", "REFUSED": "REFUSED"}.get(pv.verdict.value, "UNKNOWN")))
-        + "</div>"
-    )
+    top_badges = [
+        _badge(
+            f"presentation: {detail.presentation_status.value}",
+            _status_kind(detail.presentation_status.value),
+            role="presentation-status",
+        ),
+        _badge(
+            f"product verdict: {pv.verdict.value}",
+            _verdict_badge_kind(pv),
+            role="authoritative-verdict",
+        ),
+        _badge(
+            f"authority: {pv.truth_status.value}",
+            _truth_badge_kind(pv.truth_status),
+            role="truth-status",
+        ),
+    ]
+    if pv.claim_present:
+        # A persisted product block is a claim, not authority: it is rendered as a
+        # non-admitted, explicitly UNVERIFIED badge and never coloured green.
+        top_badges.append(
+            _badge(
+                f"persisted claim: {pv.claimed_verdict.value} · UNVERIFIED",
+                "warn",
+                role="persisted-claim",
+            )
+        )
+    parts.append('<div class="top-badges">' + " ".join(top_badges) + "</div>")
     parts.append(f'<div class="notice">{html.escape(_NON_AUTHORITY_NOTICE)}</div>')
 
     # Execution state
@@ -171,14 +232,25 @@ def render_run_html(detail: RunDetail) -> str:
         parts.append(_row("observation vs result", "MISMATCH (harness observation authoritative)"))
     parts.append("</table>")
 
-    # Result admission state
+    # Result admission state. The effective authoritative verdict and the
+    # unverified persisted claim are shown as distinct, non-interchangeable rows.
     parts.append("<h2>Result admission state</h2><table>")
-    parts.append(_row("product verdict", pv.verdict.value + (f" (raw {pv.raw_verdict})" if pv.raw_verdict else "")))
+    parts.append(_row("authoritative product verdict", pv.verdict.value + (f" (raw {pv.raw_verdict})" if pv.raw_verdict else "")))
+    parts.append(_row("verdict is authoritative", pv.verdict_is_authoritative))
+    parts.append(_row("authority source", _SOURCE_LABELS.get(pv.source, pv.source.value)))
+    parts.append(_row("reconstruction authority", pv.truth_status.value))
+    parts.append(_row("truth available", pv.truth_available))
     parts.append(_row("verification mode", pv.verification_mode.value + (f" (raw {pv.raw_verification_mode})" if pv.raw_verification_mode else "")))
-    parts.append(_row("verdict source", pv.source.value))
     parts.append(_row("verdict consistent", pv.consistent))
     parts.append(_row("behavioral non-claim", pv.behavioral_non_claim))
+    if pv.claim_present:
+        claimed = pv.claimed_verdict.value + (f" (raw {pv.raw_claimed_verdict})" if pv.raw_claimed_verdict else "")
+        parts.append(_row("persisted claim (UNVERIFIED)", claimed))
+        parts.append(_row("persisted claim verification mode", pv.claimed_verification_mode.value))
+        parts.append(_row("claim authority", "UNVERIFIED" if not pv.claim_is_authoritative else "AUTHORITATIVE"))
     parts.append("</table>")
+    if pv.notes:
+        parts.append("<ul class=\"list\">" + "".join(f"<li>{_esc(n)}</li>" for n in pv.notes) + "</ul>")
 
     # Canonical classification
     parts.append("<h2>Exact canonical classification</h2><table>")
@@ -277,6 +349,7 @@ def render_run_html(detail: RunDetail) -> str:
     # Diagnostics
     if detail.diagnostics:
         parts.append("<h2>Diagnostics (bounded)</h2>")
+        parts.append(f'<div class="notice">{html.escape(_DIAGNOSTICS_SENSITIVITY_NOTICE)}</div>')
         for excerpt in detail.diagnostics:
             parts.append(f"<div><strong>{_esc(excerpt.label)}</strong>")
             if excerpt.total_byte_count is not None:

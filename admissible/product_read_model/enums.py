@@ -100,12 +100,35 @@ class VerificationMode(str, Enum):
 
 
 class VerdictSource(str, Enum):
-    """Where an authoritative product verdict came from."""
+    """Provenance of the *effective* product verdict.
+
+    Only an authoritative reconstruction may source an effective product verdict.
+    A persisted product block is NEVER an effective source: it is demoted to an
+    unverified claim (see :class:`TruthStatus` and the ``claimed_*`` fields on
+    ``ProductVerdictView``). A contradiction between an authoritative verdict and
+    a persisted claim is expressed via ``consistent=False``, not a distinct
+    source, so the authoritative verdict is never erased by the conflict.
+    """
 
     NONE = "NONE"
     AUTHORITATIVE_RECONSTRUCTION = "AUTHORITATIVE_RECONSTRUCTION"
-    PERSISTED_PRODUCT_BLOCK = "PERSISTED_PRODUCT_BLOCK"
-    CONFLICT = "CONFLICT"
+
+
+class TruthStatus(str, Enum):
+    """Availability of the authoritative reconstruction seam for a run.
+
+    This is the single signal that gates admission. ``AUTHORITATIVE`` is the only
+    value under which an ``ADMITTED_*``/``REFUSED`` product verdict may be
+    established. Provider absence (``NOT_CONFIGURED``) is deliberately distinct
+    from provider failure (``UNAVAILABLE``/``ERROR``); a provider that runs but
+    supplies no verdict is ``NO_VERDICT`` (still non-admitting).
+    """
+
+    NOT_CONFIGURED = "NOT_CONFIGURED"
+    AUTHORITATIVE = "AUTHORITATIVE"
+    NO_VERDICT = "NO_VERDICT"
+    UNAVAILABLE = "UNAVAILABLE"
+    ERROR = "ERROR"
 
 
 class HumanDisposition(str, Enum):

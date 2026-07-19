@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import os
 from pathlib import Path
 
@@ -106,6 +107,89 @@ def test_detail_json_never_contains_secret_values(tmp_path):
     assert "sk-should-not-appear" not in blob
     assert "SECRET_ENV" not in blob
     assert "leak" not in blob
+
+
+def test_reader_allowlists_authorization_container_but_redacts_inner(tmp_path):
+    """``authorization_payload`` survives (safe fingerprints), inner secrets do not."""
+
+    (tmp_path / "evidence").mkdir()
+    (tmp_path / "evidence" / "p.json").write_text(
+        json.dumps(
+            {
+                "authorization_payload": {
+                    "mission_fingerprint": "mfp",
+                    "gate_contract_fingerprint": "gfp",
+                    "owner_authorization": "owner-auth-leak",
+                    "authorization_phrase": "phrase-leak",
+                    "cookie": "cookie-leak",
+                    "authorized_model": "model-safe",
+                },
+                "authorization": "top-level-authorization-leak",
+                "authorized_model": "model-safe-top",
+                "owner_authorization_phrase": "combo-leak",
+            }
+        ),
+        encoding="utf-8",
+    )
+    read = read_json(resolve_root(tmp_path), "evidence/p.json")
+    assert read.ok
+    ap = read.data["authorization_payload"]
+    # Safe schema fingerprints survive.
+    assert ap["mission_fingerprint"] == "mfp"
+    assert ap["gate_contract_fingerprint"] == "gfp"
+    assert ap["authorized_model"] == "model-safe"
+    # Inner secret-like keys are redacted.
+    assert ap["owner_authorization"] == REDACTED_MARKER
+    assert ap["authorization_phrase"] == REDACTED_MARKER
+    assert ap["cookie"] == REDACTED_MARKER
+    # Bare / combo authorization keys at any level are redacted; safe label survives.
+    assert read.data["authorization"] == REDACTED_MARKER
+    assert read.data["owner_authorization_phrase"] == REDACTED_MARKER
+    assert read.data["authorized_model"] == "model-safe-top"
+
+
+def test_extended_structured_secret_material_never_reaches_output(tmp_path):
+    """Structured owner-authorization / cookie / phrase material stays out of output."""
+
+    b = RunRootBuilder(tmp_path / "run")
+    b.preflight(secret=True).delegated_gate().request().attempt_reserved().process_started()
+    b.process_observation(exit_code=0).result(exit_code=0).eligibility(eligible=True)
+    b.behavioral(exit_code=1).terminal().final_status()
+    # A persisted product claim that itself carries secret-like structured keys.
+    b.product_block(
+        {
+            "product_verdict": "REFUSED",
+            "owner_authorization": "claim-owner-auth-secret",
+            "cookie": "c=claim-cookie-secret",
+            "token": "claim-token-secret",
+        }
+    )
+    detail = load_run_detail(tmp_path / "run")
+    blob = (
+        json.dumps(detail.to_json())
+        + render_run_html(detail)
+        + json.dumps(render_result_json(detail))
+    )
+    for leaked in (
+        "owner-authorization-secret",
+        "authorization-phrase-secret",
+        "cookie-secret",
+        "token-value-secret",
+        "bare-secret-value",
+        "password-secret",
+        "credential-secret",
+        "env-leak",
+        "ANOTHER_SECRET_ENV",
+        "hunter2-secret",
+        "sk-should-not-appear",
+        "claim-owner-auth-secret",
+        "claim-cookie-secret",
+        "claim-token-secret",
+    ):
+        assert leaked not in blob, f"secret leaked: {leaked}"
+    # Over-redaction guard: safe authorization fingerprints still surface.
+    assert detail.authorization.mission_fingerprint == "mission-fp"
+    assert detail.authorization.required_commit_message == "feat: deliver"
 
 
 # --- reparse / symlink refusal ----------------------------------------------

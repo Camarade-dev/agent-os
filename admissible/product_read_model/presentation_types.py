@@ -29,6 +29,7 @@ from .enums import (
     PresentationStatus,
     PresenceState,
     ProductVerdict,
+    TruthStatus,
     VerdictSource,
     VerificationMode,
 )
@@ -339,21 +340,65 @@ class FailingBoundaryView:
 
 @dataclass(frozen=True)
 class ProductVerdictView:
-    """Authoritative product verdict + verification tier + behavioral non-claim.
+    """Effective authoritative product verdict, with the persisted claim demoted.
 
-    ``verdict`` is ``UNKNOWN`` unless supplied by an authoritative provider or an
-    explicit persisted product block. ``consistent`` is ``False`` when an
-    authoritative reconstruction and a persisted product block disagree.
+    Authority model (see :mod:`product_extractor`):
+
+    * ``verdict`` is the *effective authoritative* verdict. It is ``UNKNOWN``
+      unless an authoritative reconstruction (``truth_status == AUTHORITATIVE``)
+      supplies a recognised value. A persisted ``evidence/product-verdict.json``
+      block NEVER sets this field — it is evidence to display, not authority to
+      trust.
+    * ``source`` is the provenance of the *effective* verdict (``NONE`` or
+      ``AUTHORITATIVE_RECONSTRUCTION``).
+    * ``truth_status`` records the reconstruction seam's availability; only
+      ``AUTHORITATIVE`` may back an admitted/refused effective verdict.
+    * ``claimed_verdict`` / ``claimed_verification_mode`` carry the *unverified*
+      persisted claim, if any. ``claim_is_authoritative`` is ``False`` by
+      construction — a persisted claim can never be authoritative here.
+    * ``consistent`` is ``False`` when an authoritative verdict and a persisted
+      claim disagree, or when a persisted product claim survives a provider
+      failure; the authoritative verdict (when present) is retained regardless.
     """
 
+    # Effective authoritative verdict (never set by a persisted claim).
     verdict: ProductVerdict
     raw_verdict: str | None
     verification_mode: VerificationMode
     raw_verification_mode: str | None
     behavioral_non_claim: str | None
     source: VerdictSource
+    truth_status: TruthStatus
     consistent: bool
+    # Persisted claim (unverified, display-only).
+    claim_present: bool
+    claimed_verdict: ProductVerdict
+    raw_claimed_verdict: str | None
+    claimed_verification_mode: VerificationMode
+    raw_claimed_verification_mode: str | None
+    claim_is_authoritative: bool = False
     notes: tuple[str, ...] = ()
+
+    @property
+    def truth_available(self) -> bool:
+        """True only when the seam supplied an authoritative reconstruction."""
+
+        return self.truth_status is TruthStatus.AUTHORITATIVE
+
+    @property
+    def verdict_is_authoritative(self) -> bool:
+        """True only for a recognised admitted/refused authoritative verdict."""
+
+        return (
+            self.source is VerdictSource.AUTHORITATIVE_RECONSTRUCTION
+            and self.truth_status is TruthStatus.AUTHORITATIVE
+            and self.verdict
+            in (
+                ProductVerdict.ADMITTED_OBSERVED,
+                ProductVerdict.ADMITTED_VERIFIED,
+                ProductVerdict.REFUSED,
+            )
+        )
 
     def to_json(self) -> dict:
         return {
@@ -363,7 +408,16 @@ class ProductVerdictView:
             "raw_verification_mode": self.raw_verification_mode,
             "behavioral_non_claim": self.behavioral_non_claim,
             "source": self.source.value,
+            "truth_status": self.truth_status.value,
+            "truth_available": self.truth_available,
+            "verdict_is_authoritative": self.verdict_is_authoritative,
             "consistent": self.consistent,
+            "claim_present": self.claim_present,
+            "claimed_verdict": self.claimed_verdict.value,
+            "raw_claimed_verdict": self.raw_claimed_verdict,
+            "claimed_verification_mode": self.claimed_verification_mode.value,
+            "raw_claimed_verification_mode": self.raw_claimed_verification_mode,
+            "claim_is_authoritative": self.claim_is_authoritative,
             "notes": list(self.notes),
         }
 
@@ -444,6 +498,11 @@ class RunSummary:
     canonical_classification_kind: ClassificationKind
     presentation_status: PresentationStatus
     product_verdict: ProductVerdict
+    verdict_source: VerdictSource
+    verdict_is_authoritative: bool
+    verdict_consistent: bool
+    truth_status: TruthStatus
+    claimed_product_verdict: ProductVerdict
     verification_mode: VerificationMode
     human_disposition: HumanDisposition
     evidence_completeness: CompletenessState
@@ -459,7 +518,14 @@ class RunSummary:
             "canonical_classification": self.canonical_classification,
             "canonical_classification_kind": self.canonical_classification_kind.value,
             "presentation_status": self.presentation_status.value,
+            # Effective authoritative product verdict (never a persisted claim).
             "product_verdict": self.product_verdict.value,
+            "verdict_source": self.verdict_source.value,
+            "verdict_is_authoritative": self.verdict_is_authoritative,
+            "verdict_consistent": self.verdict_consistent,
+            "truth_status": self.truth_status.value,
+            # The unverified persisted claim, kept distinct from the verdict.
+            "claimed_product_verdict": self.claimed_product_verdict.value,
             "verification_mode": self.verification_mode.value,
             "human_disposition": self.human_disposition.value,
             "evidence_completeness": self.evidence_completeness.value,
@@ -505,6 +571,11 @@ class RunDetail:
             canonical_classification_kind=self.canonical_classification_kind,
             presentation_status=self.presentation_status,
             product_verdict=self.product_verdict.verdict,
+            verdict_source=self.product_verdict.source,
+            verdict_is_authoritative=self.product_verdict.verdict_is_authoritative,
+            verdict_consistent=self.product_verdict.consistent,
+            truth_status=self.product_verdict.truth_status,
+            claimed_product_verdict=self.product_verdict.claimed_verdict,
             verification_mode=self.product_verdict.verification_mode,
             human_disposition=self.human_disposition.disposition,
             evidence_completeness=self.evidence_completeness.state,

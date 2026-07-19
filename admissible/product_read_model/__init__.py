@@ -35,6 +35,7 @@ from .enums import (
     PresentationStatus,
     PresenceState,
     ProductVerdict,
+    TruthStatus,
     VerdictSource,
     VerificationMode,
 )
@@ -56,7 +57,11 @@ from .presentation_types import (
     RunSummary,
     WorkspaceGitView,
 )
-from .product_extractor import CANONICAL_BEHAVIORAL_NON_CLAIM, extract_product_verdict
+from .product_extractor import (
+    CANONICAL_BEHAVIORAL_NON_CLAIM,
+    TruthProviderOutcome,
+    extract_product_verdict,
+)
 from .read_model import load_run_detail, load_run_summary
 from .renderer import render_result_json, render_run_html
 from .truth_provider import (
@@ -89,6 +94,7 @@ __all__ = [
     "PresentationStatus",
     "PresenceState",
     "ProductVerdict",
+    "TruthStatus",
     "VerdictSource",
     "VerificationMode",
     # presentation types
@@ -110,6 +116,7 @@ __all__ = [
     "WorkspaceGitView",
     # extractor
     "CANONICAL_BEHAVIORAL_NON_CLAIM",
+    "TruthProviderOutcome",
     "extract_product_verdict",
     # loading
     "load_run_detail",

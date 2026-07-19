@@ -9,7 +9,6 @@ product verdict stays ``UNKNOWN`` unless authoritative data supplies it.
 
 from __future__ import annotations
 
-import dataclasses
 import os
 import stat
 from collections.abc import Mapping
@@ -25,6 +24,7 @@ from .enums import (
     PresentationStatus,
     PresenceState,
     ProductVerdict,
+    TruthStatus,
     VerdictSource,
     classify_classification,
     coerce_human_disposition,
@@ -47,7 +47,7 @@ from .presentation_types import (
     RunSummary,
     WorkspaceGitView,
 )
-from .product_extractor import extract_product_verdict
+from .product_extractor import TruthProviderOutcome, extract_product_verdict
 from .timeline import TimelineInput, build_timeline
 from .truth_provider import RunTruthProvider
 
@@ -65,21 +65,11 @@ _NATIVE_SUFFIXES = {
     "terminal": ".native-terminal.json",
 }
 
-# Optional forward-compatible persisted product block locations.
+# Optional forward-compatible persisted product block location. This is a
+# persisted *claim* only: it is never treated as authoritative (see
+# ``product_extractor``). ``_authorization_view`` lifts a small, explicit set of
+# safe authorization fields directly; there is no separate allow-list constant.
 _PERSISTED_PRODUCT_PATH = "evidence/product-verdict.json"
-
-# Authorization allow list: only these keys are lifted from the authorization
-# payload. Nothing else (and no environment map) is exposed.
-_AUTH_ALLOW = (
-    "run_id",
-    "session_id",
-    "mission_fingerprint",
-    "gate_contract_fingerprint",
-    "required_commit_message",
-    "selected_model",
-    "clean_worktree_required",
-    "timeout_seconds",
-)
 
 
 # --- typed accessors ---------------------------------------------------------
@@ -614,18 +604,45 @@ def _presentation_status(
     completeness: EvidenceCompletenessView,
     final_status_presence: PresenceState,
 ) -> PresentationStatus:
-    if product.source is VerdictSource.CONFLICT or not product.consistent:
+    """Derive the top-level status. ``ADMITTED`` requires authoritative truth.
+
+    ``ADMITTED`` is reachable only when the *effective* verdict is an authoritative
+    admission (``truth_status == AUTHORITATIVE`` and source is the reconstruction
+    seam). A persisted product claim never reaches this branch: under no provider
+    and under provider failure the effective verdict stays ``UNKNOWN`` and the
+    status falls back to the persisted canonical *execution* classification, which
+    is kept distinct from an authoritative product verdict.
+    """
+
+    # 1) A provider failure with a persisted product claim cannot be reconciled:
+    #    the claim is unverifiable, so surface it as inconsistent, never admitted.
+    if product.truth_status in (TruthStatus.ERROR, TruthStatus.UNAVAILABLE) and product.claim_present:
         return PresentationStatus.INCONSISTENT
+    # 2) An authoritative verdict that contradicts a persisted claim.
+    if not product.consistent:
+        return PresentationStatus.INCONSISTENT
+    # 3) Malformed evidence set.
     if completeness.state is CompletenessState.INCONSISTENT:
         return PresentationStatus.INCONSISTENT
-    if product.verdict in (ProductVerdict.ADMITTED_OBSERVED, ProductVerdict.ADMITTED_VERIFIED):
+    # 4) The ONLY admission path: an authoritative admitted verdict.
+    if (
+        product.verdict in (ProductVerdict.ADMITTED_OBSERVED, ProductVerdict.ADMITTED_VERIFIED)
+        and product.source is VerdictSource.AUTHORITATIVE_RECONSTRUCTION
+        and product.truth_status is TruthStatus.AUTHORITATIVE
+    ):
         return PresentationStatus.ADMITTED
-    if product.verdict is ProductVerdict.REFUSED:
+    # 5) An authoritative product refusal (distinct from a canonical execution refusal).
+    if (
+        product.verdict is ProductVerdict.REFUSED
+        and product.source is VerdictSource.AUTHORITATIVE_RECONSTRUCTION
+        and product.truth_status is TruthStatus.AUTHORITATIVE
+    ):
         return PresentationStatus.REFUSED
+    # 6) Authoritative but not understood: never guessed into a success/refusal.
     if product.verdict is ProductVerdict.UNSUPPORTED:
-        # Authoritative but not understood: never guessed into a success/refusal.
         return PresentationStatus.UNKNOWN
-    # verdict is UNKNOWN: fall back to persisted canonical classification only.
+    # 7) verdict is UNKNOWN: fall back to the persisted canonical classification
+    #    ONLY. A persisted product claim never drives the status here.
     if final_status_presence is PresenceState.ABSENT:
         return PresentationStatus.INCOMPLETE
     if final_status_presence is PresenceState.INCONSISTENT:
@@ -756,25 +773,37 @@ def load_run_detail(
     human_disposition = _human_disposition_view(delegated)
     completeness = _completeness_view(reads, material, behavioral_view)
 
-    # Authoritative product verdict via the truth-provider seam.
+    # Authoritative product verdict via the truth-provider seam. Provider absence,
+    # provider failure (exception), and a provider that returns invalid authority
+    # are kept distinct so a persisted claim can never fill an authority vacuum.
     authoritative: Mapping | None = None
+    truth_outcome = TruthProviderOutcome.NOT_CONFIGURED
     if truth_provider is not None:
         try:
             reconstructed = truth_provider.reconstruct(root_real)
-        except Exception as exc:  # truth-provider failure is surfaced, never fatal
-            read_notes.append(f"truth provider failed: {type(exc).__name__}: {exc}")
-            reconstructed = None
-        if reconstructed is not None and not isinstance(reconstructed, Mapping):
-            read_notes.append(f"truth provider returned non-mapping: {type(reconstructed).__name__}")
-            reconstructed = None
-        authoritative = reconstructed
+        except Exception as exc:  # truth-provider failure: fail closed, never fatal.
+            # Bounded diagnostic only; the exception message/traceback is not
+            # exposed (it may carry workspace or provider output).
+            truth_outcome = TruthProviderOutcome.RAISED
+            read_notes.append(f"truth provider failed: {type(exc).__name__}")
+        else:
+            if isinstance(reconstructed, Mapping):
+                truth_outcome = TruthProviderOutcome.RETURNED_MAPPING
+                authoritative = reconstructed
+            else:
+                truth_outcome = TruthProviderOutcome.RETURNED_INVALID
+                read_notes.append(
+                    f"truth provider returned non-mapping: {type(reconstructed).__name__}"
+                )
 
     persisted_product_read = evidence_reader.read_json(root_real, _PERSISTED_PRODUCT_PATH, max_bytes=max_bytes)
     persisted_product: Mapping | None = _data(persisted_product_read)
     if persisted_product_read.presence is PresenceState.INCONSISTENT:
         read_notes.append(f"persisted product block inconsistent: {persisted_product_read.reason}")
 
-    product_verdict = extract_product_verdict(authoritative, persisted_product)
+    product_verdict = extract_product_verdict(
+        authoritative, persisted_product, outcome=truth_outcome
+    )
 
     presentation_status = _presentation_status(
         product_verdict, classification_kind, completeness, final_status.presence

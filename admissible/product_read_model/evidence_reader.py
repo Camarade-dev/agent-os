@@ -37,9 +37,11 @@ _MAX_REDACT_DEPTH = 64
 _FILE_ATTRIBUTE_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 
 # Structured keys whose values are redacted wherever they appear. Matched as
-# case-insensitive substrings so ``session_token`` and ``owner_phrase`` are both
-# caught. ``authorization_payload`` and ``authorized_model`` are intentionally
-# NOT matched (they carry no secret substring).
+# case-insensitive substrings so ``session_token``, ``owner_phrase`` and
+# ``owner_authorization`` are all caught. The ``authorization`` / ``phrase``
+# substrings deliberately cover owner-authorization material and authorization
+# phrases; the ``_SAFE_KEY_ALLOWLIST`` below carves out the known structural
+# container keys so ordinary evidence fingerprints are not redacted.
 _SECRET_KEY_SUBSTRINGS = (
     "secret",
     "password",
@@ -52,7 +54,18 @@ _SECRET_KEY_SUBSTRINGS = (
     "owner_phrase",
     "access_key",
     "passphrase",
+    "authorization",  # covers owner_authorization, authorization_phrase, a bare authorization key
+    "phrase",         # covers authorization_phrase, owner_phrase, passphrase
+    "cookie",
 )
+
+# Structural / label keys that are known-safe schema fields and must NOT be
+# redacted even though they contain a denied substring. This is a narrow,
+# documented carve-out: the value is still recursed, so any secret-like *nested*
+# key inside remains redacted. ``authorization_payload`` is the container from
+# which only explicit safe authorization facts (run_id, mission_fingerprint, ...)
+# are lifted; ``authorized_model`` is a model identifier, not a secret.
+_SAFE_KEY_ALLOWLIST = frozenset({"authorization_payload", "authorized_model"})
 
 # Keys that name a full environment map. Never expanded; replaced with a marker.
 _ENV_MAP_KEYS = ("env", "environ", "environment", "envvars", "environment_variables")
@@ -161,6 +174,10 @@ def _redact(value: object, depth: int = 0) -> object:
             lowered = key_str.lower()
             if lowered in _ENV_MAP_KEYS:
                 redacted[key_str] = ENV_OMITTED_MARKER
+            elif lowered in _SAFE_KEY_ALLOWLIST:
+                # Known-safe container/label: keep the key but recurse so nested
+                # secret-like fields (owner_authorization, api_key, ...) redact.
+                redacted[key_str] = _redact(item, depth + 1)
             elif any(token in lowered for token in _SECRET_KEY_SUBSTRINGS):
                 redacted[key_str] = REDACTED_MARKER
             else:

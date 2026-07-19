@@ -7,6 +7,7 @@ checkpoint, server, browser or Node process is ever launched.
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -23,6 +24,8 @@ from admissible.product_read_model import (
     PresenceState,
     ProductVerdict,
     RaisingTruthProvider,
+    TruthProviderOutcome,
+    TruthStatus,
     VerdictSource,
     VerificationMode,
     extract_product_verdict,
@@ -36,9 +39,28 @@ from tests.product_read_model.builders import (
     RunRootBuilder,
     build_behavioral_refusal,
     build_full_records,
+    build_incomplete_refusal,
     build_material_refusal,
     snapshot,
 )
+
+
+def _badge_class_for_role(html_text: str, role: str) -> tuple[str | None, str | None]:
+    """Extract (badge-kind, text) for a top-level badge with the given data-role.
+
+    Semantic (not substring) probe: returns ``(None, None)`` when no badge with
+    that role is present.
+    """
+
+    match = re.search(
+        r'<span class="badge badge-([a-z]+)"[^>]*data-role="'
+        + re.escape(role)
+        + r'"[^>]*>([^<]*)</span>',
+        html_text,
+    )
+    if not match:
+        return None, None
+    return match.group(1), match.group(2)
 
 
 # --- refusal scenarios -------------------------------------------------------
@@ -137,8 +159,13 @@ def test_conflicting_product_verdict_is_inconsistent(tmp_path):
     b.product_block({"product_verdict": "REFUSED"})
     provider = FakeTruthProvider({"product_verdict": "ADMITTED_VERIFIED"})
     detail = load_run_detail(tmp_path / "run", truth_provider=provider)
-    assert detail.product_verdict.source is VerdictSource.CONFLICT
-    assert detail.product_verdict.consistent is False
+    pv = detail.product_verdict
+    # The authoritative verdict wins as the effective verdict; the contradicting
+    # persisted claim is retained and flags inconsistency (never erases it).
+    assert pv.source is VerdictSource.AUTHORITATIVE_RECONSTRUCTION
+    assert pv.verdict is ProductVerdict.ADMITTED_VERIFIED
+    assert pv.claimed_verdict is ProductVerdict.REFUSED
+    assert pv.consistent is False
     assert detail.presentation_status is PresentationStatus.INCONSISTENT
 
 
@@ -151,12 +178,22 @@ def test_unknown_future_verdict_is_unsupported_raw(tmp_path):
     assert detail.presentation_status is PresentationStatus.UNKNOWN
 
 
-def test_persisted_product_block_alone_supplies_verdict(tmp_path):
+def test_persisted_product_block_alone_is_unverified_claim(tmp_path):
+    """A persisted product block WITHOUT a provider is an unverified claim only."""
+
     b = build_full_records(tmp_path / "run")
     b.product_block({"product_verdict": "REFUSED"})
     detail = load_run_detail(tmp_path / "run")
-    assert detail.product_verdict.verdict is ProductVerdict.REFUSED
-    assert detail.product_verdict.source is VerdictSource.PERSISTED_PRODUCT_BLOCK
+    pv = detail.product_verdict
+    # The persisted block never becomes the effective authoritative verdict.
+    assert pv.verdict is ProductVerdict.UNKNOWN
+    assert pv.source is VerdictSource.NONE
+    assert pv.truth_status is TruthStatus.NOT_CONFIGURED
+    assert pv.verdict_is_authoritative is False
+    # It is retained, verbatim, as an unverified claim.
+    assert pv.claim_present is True
+    assert pv.claimed_verdict is ProductVerdict.REFUSED
+    assert pv.claim_is_authoritative is False
 
 
 # --- absent / missing evidence -----------------------------------------------
@@ -345,3 +382,273 @@ def test_extractor_agreeing_sources_are_consistent():
     assert view.consistent is True
     assert view.verdict is ProductVerdict.REFUSED
     assert view.source is VerdictSource.AUTHORITATIVE_RECONSTRUCTION
+
+
+def test_extractor_persisted_only_is_never_effective():
+    """A persisted-only claim (no provider) never sets the effective verdict."""
+
+    view = extract_product_verdict(
+        None, {"product_verdict": "ADMITTED_VERIFIED"}, outcome=TruthProviderOutcome.NOT_CONFIGURED
+    )
+    assert view.verdict is ProductVerdict.UNKNOWN
+    assert view.source is VerdictSource.NONE
+    assert view.claimed_verdict is ProductVerdict.ADMITTED_VERIFIED
+    assert view.claim_is_authoritative is False
+
+
+def test_extractor_full_authority_matrix():
+    """Every row of the section-5 authority matrix, probed at the boundary."""
+
+    admitted = {"product_verdict": "ADMITTED_VERIFIED"}
+    refused = {"product_verdict": "REFUSED"}
+    out = TruthProviderOutcome
+
+    # absent auth, absent claim -> UNKNOWN, unknown
+    v = extract_product_verdict(None, None, outcome=out.NOT_CONFIGURED)
+    assert v.verdict is ProductVerdict.UNKNOWN
+    assert v.truth_status is TruthStatus.NOT_CONFIGURED
+    assert v.consistent is True
+
+    # absent auth, ADMITTED claim -> UNKNOWN, unverified claim (NOT inconsistent)
+    v = extract_product_verdict(None, admitted, outcome=out.NOT_CONFIGURED)
+    assert v.verdict is ProductVerdict.UNKNOWN
+    assert v.claimed_verdict is ProductVerdict.ADMITTED_VERIFIED
+    assert v.consistent is True
+
+    # error, ADMITTED claim -> UNKNOWN, inconsistent/unavailable
+    v = extract_product_verdict(None, admitted, outcome=out.RAISED)
+    assert v.verdict is ProductVerdict.UNKNOWN
+    assert v.truth_status is TruthStatus.ERROR
+    assert v.consistent is False
+
+    # unavailable, ADMITTED claim -> UNKNOWN, inconsistent/unavailable
+    v = extract_product_verdict(None, admitted, outcome=out.RETURNED_INVALID)
+    assert v.verdict is ProductVerdict.UNKNOWN
+    assert v.truth_status is TruthStatus.UNAVAILABLE
+    assert v.consistent is False
+
+    # REFUSED auth, absent claim -> REFUSED, authoritative
+    v = extract_product_verdict(refused, None, outcome=out.RETURNED_MAPPING)
+    assert v.verdict is ProductVerdict.REFUSED
+    assert v.source is VerdictSource.AUTHORITATIVE_RECONSTRUCTION
+    assert v.consistent is True
+
+    # REFUSED auth, REFUSED claim -> REFUSED, authoritative, consistent
+    v = extract_product_verdict(refused, refused, outcome=out.RETURNED_MAPPING)
+    assert v.verdict is ProductVerdict.REFUSED
+    assert v.consistent is True
+
+    # REFUSED auth, ADMITTED claim -> REFUSED, inconsistent
+    v = extract_product_verdict(refused, admitted, outcome=out.RETURNED_MAPPING)
+    assert v.verdict is ProductVerdict.REFUSED
+    assert v.consistent is False
+    assert v.claimed_verdict is ProductVerdict.ADMITTED_VERIFIED
+
+    # ADMITTED auth, absent claim -> ADMITTED, authoritative
+    v = extract_product_verdict(admitted, None, outcome=out.RETURNED_MAPPING)
+    assert v.verdict is ProductVerdict.ADMITTED_VERIFIED
+    assert v.verdict_is_authoritative is True
+
+    # ADMITTED auth, ADMITTED claim -> ADMITTED, authoritative, consistent
+    v = extract_product_verdict(admitted, admitted, outcome=out.RETURNED_MAPPING)
+    assert v.verdict is ProductVerdict.ADMITTED_VERIFIED
+    assert v.consistent is True
+
+    # ADMITTED auth, REFUSED claim -> ADMITTED, inconsistent
+    v = extract_product_verdict(admitted, refused, outcome=out.RETURNED_MAPPING)
+    assert v.verdict is ProductVerdict.ADMITTED_VERIFIED
+    assert v.consistent is False
+    assert v.claimed_verdict is ProductVerdict.REFUSED
+
+
+# --- adversarial authority repair (G4A cold-audit blockers) ------------------
+
+
+def test_10_1_persisted_admission_claim_without_provider(tmp_path):
+    b = build_incomplete_refusal(tmp_path / "run")
+    b.product_block({"product_verdict": "ADMITTED_VERIFIED", "verification_mode": "FROZEN_BEHAVIORAL"})
+    detail = load_run_detail(tmp_path / "run")  # no truth provider
+    pv = detail.product_verdict
+    assert pv.verdict is ProductVerdict.UNKNOWN
+    assert pv.claimed_verdict is ProductVerdict.ADMITTED_VERIFIED
+    assert pv.claim_is_authoritative is False
+    assert pv.truth_status is TruthStatus.NOT_CONFIGURED
+    assert detail.canonical_classification == "PRECAPTURE_ELIGIBILITY_FAILED"
+    assert detail.presentation_status is not PresentationStatus.ADMITTED
+    # Summary keeps the source/authority distinction.
+    summary = detail.summary()
+    assert summary.product_verdict is ProductVerdict.UNKNOWN
+    assert summary.claimed_product_verdict is ProductVerdict.ADMITTED_VERIFIED
+    assert summary.verdict_is_authoritative is False
+    assert summary.verdict_source is VerdictSource.NONE
+    # HTML shows no authoritative admitted badge.
+    html = render_run_html(detail)
+    kind, _ = _badge_class_for_role(html, "authoritative-verdict")
+    assert kind != "ok"
+    claim_kind, claim_text = _badge_class_for_role(html, "persisted-claim")
+    assert claim_kind is not None and claim_kind != "ok"
+    assert "UNVERIFIED" in claim_text
+
+
+def test_10_2_provider_failure_plus_persisted_admission_claim(tmp_path):
+    b = build_full_records(tmp_path / "run")
+    b.product_block({"product_verdict": "ADMITTED_VERIFIED"})
+    detail = load_run_detail(tmp_path / "run", truth_provider=RaisingTruthProvider())
+    pv = detail.product_verdict
+    assert pv.verdict is ProductVerdict.UNKNOWN
+    assert pv.truth_status is TruthStatus.ERROR
+    assert pv.claimed_verdict is ProductVerdict.ADMITTED_VERIFIED
+    assert pv.claim_is_authoritative is False
+    assert detail.presentation_status is PresentationStatus.INCONSISTENT
+    assert detail.presentation_status is not PresentationStatus.ADMITTED
+    # Bounded diagnostic; no traceback / message leak.
+    assert any("truth provider failed" in n for n in detail.read_notes)
+
+
+def test_10_2b_provider_invalid_plus_persisted_admission_claim(tmp_path):
+    class BadProvider:
+        def reconstruct(self, run_root):  # noqa: ANN001
+            return ["not", "a", "mapping"]
+
+    b = build_full_records(tmp_path / "run")
+    b.product_block({"product_verdict": "ADMITTED_VERIFIED"})
+    detail = load_run_detail(tmp_path / "run", truth_provider=BadProvider())
+    pv = detail.product_verdict
+    assert pv.verdict is ProductVerdict.UNKNOWN
+    assert pv.truth_status is TruthStatus.UNAVAILABLE
+    assert detail.presentation_status is not PresentationStatus.ADMITTED
+
+
+def test_10_3_authoritative_refusal_vs_persisted_admission(tmp_path):
+    b = build_full_records(tmp_path / "run")
+    b.product_block({"product_verdict": "ADMITTED_VERIFIED"})
+    provider = FakeTruthProvider({"product_verdict": "REFUSED"})
+    detail = load_run_detail(tmp_path / "run", truth_provider=provider)
+    pv = detail.product_verdict
+    assert pv.verdict is ProductVerdict.REFUSED
+    assert pv.source is VerdictSource.AUTHORITATIVE_RECONSTRUCTION
+    assert pv.consistent is False
+    assert pv.claimed_verdict is ProductVerdict.ADMITTED_VERIFIED  # both retained
+    assert detail.presentation_status is PresentationStatus.INCONSISTENT
+
+
+def test_10_4_authoritative_admission_vs_persisted_refusal(tmp_path):
+    b = build_full_records(tmp_path / "run")
+    b.product_block({"product_verdict": "REFUSED"})
+    provider = FakeTruthProvider({"product_verdict": "ADMITTED_VERIFIED", "verification_mode": "FROZEN_BEHAVIORAL"})
+    detail = load_run_detail(tmp_path / "run", truth_provider=provider)
+    pv = detail.product_verdict
+    assert pv.verdict is ProductVerdict.ADMITTED_VERIFIED  # authoritative admission retained
+    assert pv.verdict_is_authoritative is True
+    assert pv.consistent is False
+    assert pv.claimed_verdict is ProductVerdict.REFUSED  # both retained
+    assert detail.presentation_status is PresentationStatus.INCONSISTENT
+    # Presentation is inconsistent rather than silently green.
+    html = render_run_html(detail)
+    pres_kind, _ = _badge_class_for_role(html, "presentation-status")
+    assert pres_kind != "ok"
+
+
+def test_10_5_matching_authoritative_and_persisted(tmp_path):
+    b = build_full_records(tmp_path / "run")
+    b.product_block({"product_verdict": "ADMITTED_VERIFIED", "verification_mode": "FROZEN_BEHAVIORAL"})
+    provider = FakeTruthProvider({"product_verdict": "ADMITTED_VERIFIED", "verification_mode": "FROZEN_BEHAVIORAL"})
+    detail = load_run_detail(tmp_path / "run", truth_provider=provider)
+    pv = detail.product_verdict
+    assert pv.source is VerdictSource.AUTHORITATIVE_RECONSTRUCTION
+    assert pv.consistent is True
+    assert pv.verdict is ProductVerdict.ADMITTED_VERIFIED
+    assert detail.presentation_status is PresentationStatus.ADMITTED
+    html = render_run_html(detail)
+    kind, _ = _badge_class_for_role(html, "authoritative-verdict")
+    assert kind == "ok"
+
+
+def test_10_6_no_provider_no_claim(tmp_path):
+    root = build_behavioral_refusal(tmp_path / "run")
+    detail = load_run_detail(root)
+    pv = detail.product_verdict
+    assert pv.verdict is ProductVerdict.UNKNOWN
+    assert pv.claim_present is False
+    assert pv.claimed_verdict is ProductVerdict.UNKNOWN
+    assert pv.source is VerdictSource.NONE
+    assert pv.truth_status is TruthStatus.NOT_CONFIGURED
+    assert detail.presentation_status is not PresentationStatus.ADMITTED
+    summary = detail.summary()
+    assert summary.verdict_source is VerdictSource.NONE
+    assert summary.claimed_product_verdict is ProductVerdict.UNKNOWN
+
+
+def test_10_7_summary_serialization_distinguishes_states(tmp_path):
+    admitted = {"product_verdict": "ADMITTED_VERIFIED", "verification_mode": "FROZEN_BEHAVIORAL"}
+
+    # (a) authoritative admission
+    build_full_records(tmp_path / "a")
+    ja = load_run_detail(tmp_path / "a", truth_provider=FakeTruthProvider(admitted)).summary().to_json()
+    assert ja["product_verdict"] == "ADMITTED_VERIFIED"
+    assert ja["verdict_is_authoritative"] is True
+    assert ja["truth_status"] == "AUTHORITATIVE"
+
+    # (b) unverified persisted claim (no provider)
+    bb = build_full_records(tmp_path / "b")
+    bb.product_block({"product_verdict": "ADMITTED_VERIFIED"})
+    jb = load_run_detail(tmp_path / "b").summary().to_json()
+    assert jb["product_verdict"] == "UNKNOWN"
+    assert jb["verdict_is_authoritative"] is False
+    assert jb["claimed_product_verdict"] == "ADMITTED_VERIFIED"
+    assert jb["truth_status"] == "NOT_CONFIGURED"
+
+    # (c) provider unavailable (raises) with the same persisted claim
+    jc = load_run_detail(tmp_path / "b", truth_provider=RaisingTruthProvider()).summary().to_json()
+    assert jc["product_verdict"] == "UNKNOWN"
+    assert jc["truth_status"] == "ERROR"
+    assert jc["claimed_product_verdict"] == "ADMITTED_VERIFIED"
+
+    # (d) conflict: authoritative refusal vs persisted admission
+    jd = load_run_detail(tmp_path / "b", truth_provider=FakeTruthProvider({"product_verdict": "REFUSED"})).summary().to_json()
+    assert jd["product_verdict"] == "REFUSED"
+    assert jd["verdict_consistent"] is False
+    assert jd["claimed_product_verdict"] == "ADMITTED_VERIFIED"
+
+    # The four serializations are mutually distinguishable.
+    blobs = {json.dumps(x, sort_keys=True) for x in (ja, jb, jc, jd)}
+    assert len(blobs) == 4
+
+
+def test_10_8_html_badges_are_authority_semantic(tmp_path):
+    admitted = {"product_verdict": "ADMITTED_VERIFIED", "verification_mode": "FROZEN_BEHAVIORAL"}
+
+    # Authoritative admitted -> green authoritative-verdict badge, no claim badge.
+    build_full_records(tmp_path / "a")
+    da = load_run_detail(tmp_path / "a", truth_provider=FakeTruthProvider(admitted))
+    ha = render_run_html(da)
+    assert _badge_class_for_role(ha, "authoritative-verdict")[0] == "ok"
+    assert _badge_class_for_role(ha, "persisted-claim")[0] is None
+
+    # Persisted-only admission claim -> NO admitted badge; explicit UNVERIFIED claim.
+    bb = build_full_records(tmp_path / "b")
+    bb.product_block({"product_verdict": "ADMITTED_VERIFIED"})
+    db = load_run_detail(tmp_path / "b")
+    hb = render_run_html(db)
+    assert _badge_class_for_role(hb, "authoritative-verdict")[0] != "ok"
+    claim_kind, claim_text = _badge_class_for_role(hb, "persisted-claim")
+    assert claim_kind is not None and claim_kind != "ok"
+    assert "UNVERIFIED" in claim_text
+
+    # Provider failure -> non-admitted presentation and verdict badges.
+    dc = load_run_detail(tmp_path / "b", truth_provider=RaisingTruthProvider())
+    hc = render_run_html(dc)
+    assert _badge_class_for_role(hc, "presentation-status")[0] != "ok"
+    assert _badge_class_for_role(hc, "authoritative-verdict")[0] != "ok"
+
+
+def test_persisted_claim_raw_value_is_escaped(tmp_path):
+    b = build_full_records(tmp_path / "run")
+    b.product_block({"product_verdict": "<script>alert(1)</script>"})
+    detail = load_run_detail(tmp_path / "run")
+    pv = detail.product_verdict
+    assert pv.claimed_verdict is ProductVerdict.UNSUPPORTED
+    assert pv.raw_claimed_verdict == "<script>alert(1)</script>"
+    html = render_run_html(detail)
+    assert "<script>alert(1)" not in html
+    assert "&lt;script&gt;" in html
