@@ -18,6 +18,10 @@ from admissible.product_launcher.configuration import (
     verify_required_source_head,
 )
 from admissible.product_launcher.preflight import (
+    INTERACTIVE_AUTHORIZATION_NOTICE,
+    OWNER_AUTHORIZATION_ENCODING,
+    PRECOMMITTED_AUTHORIZATION_NOTICE,
+    STATE_BLOCKED,
     STATE_FAILED,
     STATE_QUEUED,
     STATE_READY,
@@ -194,12 +198,19 @@ class ProductLauncher:
                     self._csrf_nonce = ""
 
     def bootstrap(self, csrf_nonce: str) -> dict[str, object]:
+        notice = (
+            INTERACTIVE_AUTHORIZATION_NOTICE
+            if self.authorization_mode == AUTHORIZATION_MODE_INTERACTIVE
+            else PRECOMMITTED_AUTHORIZATION_NOTICE
+        )
         return {
             "service": SERVICE_NAME,
             "version": SERVICE_VERSION,
             "repository_display_path": str(self.configuration.source_repository),
             "required_source_head": self.configuration.required_source_head,
             "authorization_mode": self.authorization_mode,
+            "authorization_semantics_notice": notice,
+            "owner_authorization_encoding": OWNER_AUTHORIZATION_ENCODING,
             "g2_ready": not self._closed,
             "g2_api_version": "v1",
             "csrf_nonce": csrf_nonce,
@@ -312,7 +323,9 @@ class ProductLauncher:
                 apply_ready_payload(preparation, payload)
             else:
                 preparation.state = state
-                preparation.blocked_summary = blocked
+                # Only a true BLOCKED result carries a blocked summary; protocol
+                # mismatches and failures must never be described as BLOCKED.
+                preparation.blocked_summary = blocked if state == STATE_BLOCKED else None
                 preparation.error_type = None if blocked is None else str(blocked.get("error_type"))
                 preparation.canonical_payload_bytes = None
             self._preparations.update(preparation)
@@ -343,7 +356,12 @@ class ProductLauncher:
         phrase = owner_authorization
         digest = owner_authorization_digest
         forwarded_digest = ""
+        canonical_payload = None
+        preparation = None
+        reserved = False
         try:
+            # Reservation phase: resolve, verify binding and READY state, and
+            # take the one-shot launch reservation atomically under the lock.
             with self._lock:
                 if self._closed:
                     return 409, {"error": "LAUNCHER_CLOSED"}
@@ -359,25 +377,38 @@ class ProductLauncher:
                     return 409, {"error": "PREPARATION_CONSUMED"}
                 if preparation.state != STATE_READY or preparation.canonical_payload_bytes is None:
                     return 409, {"error": "PREPARATION_NOT_READY"}
-                if not isinstance(phrase, str) or phrase == "":
-                    return 400, {"error": "OWNER_AUTHORIZATION_REQUIRED"}
-                mode = self.authorization_mode
-                if mode == AUTHORIZATION_MODE_PRECOMMITTED:
-                    if digest is None:
-                        return 400, {"error": "OWNER_AUTHORIZATION_DIGEST_INVALID"}
-                    try:
-                        forwarded_digest = require_precommitted_digest(digest)
-                    except ValueError:
-                        return 400, {"error": "OWNER_AUTHORIZATION_DIGEST_INVALID"}
-                elif mode == AUTHORIZATION_MODE_INTERACTIVE:
-                    if digest is not None:
-                        return 400, {"error": "DIGEST_NOT_ACCEPTED_IN_INTERACTIVE_MODE"}
-                    forwarded_digest = compute_interactive_digest(
-                        phrase=phrase,
-                        canonical_payload=preparation.canonical_payload_bytes,
-                    )
-                else:
-                    return 500, {"error": "UNSUPPORTED_AUTHORIZATION_MODE"}
+                if preparation.launch_reserved:
+                    return 409, {"error": "PREPARATION_IN_USE"}
+                preparation.launch_reserved = True
+                reserved = True
+                canonical_payload = preparation.canonical_payload_bytes
+            # The lock is released before phrase validation and the potentially
+            # blocking G2 request; the reservation alone serializes this launch.
+            if not isinstance(phrase, str) or phrase == "":
+                return 400, {"error": "OWNER_AUTHORIZATION_REQUIRED"}
+            try:
+                phrase.encode(OWNER_AUTHORIZATION_ENCODING, "strict")
+            except UnicodeEncodeError:
+                # The shared G2 header boundary cannot carry this phrase
+                # losslessly; fail before any digest calculation or G2 call.
+                return 400, {"error": "OWNER_AUTHORIZATION_ENCODING_UNSUPPORTED"}
+            mode = self.authorization_mode
+            if mode == AUTHORIZATION_MODE_PRECOMMITTED:
+                if digest is None:
+                    return 400, {"error": "OWNER_AUTHORIZATION_DIGEST_INVALID"}
+                try:
+                    forwarded_digest = require_precommitted_digest(digest)
+                except ValueError:
+                    return 400, {"error": "OWNER_AUTHORIZATION_DIGEST_INVALID"}
+            elif mode == AUTHORIZATION_MODE_INTERACTIVE:
+                if digest is not None:
+                    return 400, {"error": "DIGEST_NOT_ACCEPTED_IN_INTERACTIVE_MODE"}
+                forwarded_digest = compute_interactive_digest(
+                    phrase=phrase,
+                    canonical_payload=canonical_payload,
+                )
+            else:
+                return 500, {"error": "UNSUPPORTED_AUTHORIZATION_MODE"}
             headers = {
                 OWNER_HEADER: phrase,
                 DIGEST_HEADER: forwarded_digest,
@@ -389,12 +420,20 @@ class ProductLauncher:
                 extra_headers=headers,
             )
             if status == 202:
-                self._preparations.mark_consumed(preparation_id)
+                # Exactly one accepted G2 launch consumes the preparation.
+                with self._lock:
+                    self._preparations.mark_consumed(preparation_id)
             return status, body
         finally:
+            if reserved:
+                # Unconditional release: a non-202 response, local validation
+                # error, or proxy exception must never strand the reservation.
+                with self._lock:
+                    preparation.launch_reserved = False
             phrase = ""
             digest = ""
             forwarded_digest = ""
+            canonical_payload = None
 
     def proxy_g2(
         self,

@@ -5,6 +5,7 @@ from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import hmac
 import json
+import re
 import secrets
 import threading
 from typing import Any, Callable
@@ -19,6 +20,10 @@ DIGEST_HEADER = "X-Admissible-Owner-Authorization-Digest"
 G2_TOKEN_HEADER = "X-Admissible-Control-Token"
 MAX_REQUEST_BYTES = 1024 * 1024
 MAX_ERROR_BYTES = 4096
+# Header values are parsed from wire bytes as Latin-1, so string length equals
+# physical wire byte count for the bound below.
+MAX_OWNER_PHRASE_BYTES = 4096
+_DECIMAL_LENGTH = re.compile(r"[0-9]+")
 SERVICE_NAME = "admissible-product-launcher"
 SERVICE_VERSION = "g2.5"
 
@@ -99,49 +104,71 @@ class _UIHandler(BaseHTTPRequestHandler):
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         if len(encoded) > MAX_ERROR_BYTES:
             payload = {"error": code}
+        # A rejected request may leave an unread body; never let those bytes be
+        # parsed as a follow-up pipelined request.
+        self.close_connection = True
         self._send(status, payload)
 
+    def _all_headers(self, name: str) -> list[str]:
+        values = self.headers.get_all(name)
+        return list(values) if values is not None else []
+
     def _host_ok(self) -> bool:
+        hosts = self._all_headers("Host")
         expected = f"{LOOPBACK_HOST}:{self.server.server_port}"
-        if self.headers.get("Host") != expected:
+        if len(hosts) != 1 or hosts[0] != expected:
             self._error(403, "INVALID_HOST")
             return False
         return True
 
     def _origin_ok(self, *, mutating: bool) -> bool:
-        origin = self.headers.get("Origin")
-        if origin is None:
+        origins = self._all_headers("Origin")
+        if not origins:
             return True
         expected = f"http://{LOOPBACK_HOST}:{self.server.server_port}"
-        if origin != expected:
+        if len(origins) != 1 or origins[0] != expected:
             self._error(403, "INVALID_ORIGIN")
             return False
         return True
 
     def _csrf_ok(self) -> bool:
-        supplied = self.headers.get(CSRF_HEADER)
-        if supplied is None or not hmac.compare_digest(supplied, self.server.csrf_nonce):
+        supplied = self._all_headers(CSRF_HEADER)
+        if len(supplied) != 1:
+            self._error(403, "INVALID_CSRF")
+            return False
+        if not hmac.compare_digest(
+            supplied[0].encode("utf-8"), self.server.csrf_nonce.encode("utf-8")
+        ):
             self._error(403, "INVALID_CSRF")
             return False
         return True
 
-    def _json(self, fields: set[str]) -> dict[str, Any] | None:
+    def _framed_length(self) -> int | None:
+        if self._all_headers("Transfer-Encoding"):
+            self._error(400, "UNBOUNDED_BODY")
+            return None
+        lengths = self._all_headers("Content-Length")
+        if not lengths:
+            self._error(411, "CONTENT_LENGTH_REQUIRED")
+            return None
+        if len(lengths) != 1:
+            self._error(400, "CONTENT_LENGTH_INVALID")
+            return None
+        if not _DECIMAL_LENGTH.fullmatch(lengths[0]):
+            self._error(400, "CONTENT_LENGTH_INVALID")
+            return None
+        length = int(lengths[0])
+        if length > MAX_REQUEST_BYTES:
+            self._error(413, "BODY_TOO_LARGE")
+            return None
+        return length
+
+    def _read_body_object(self) -> dict[str, Any] | None:
         if self.headers.get("Content-Type") != "application/json":
             self._error(415, "JSON_REQUIRED")
             return None
-        if self.headers.get("Transfer-Encoding") is not None:
-            self._error(400, "UNBOUNDED_BODY")
-            return None
-        raw = self.headers.get("Content-Length")
-        try:
-            length = int(raw) if raw is not None else -1
-        except ValueError:
-            length = -1
-        if length < 0:
-            self._error(411, "CONTENT_LENGTH_REQUIRED")
-            return None
-        if length > MAX_REQUEST_BYTES:
-            self._error(413, "BODY_TOO_LARGE")
+        length = self._framed_length()
+        if length is None:
             return None
         try:
             obj = json.loads(self.rfile.read(length).decode("utf-8"), object_pairs_hook=_pairs)
@@ -150,6 +177,12 @@ class _UIHandler(BaseHTTPRequestHandler):
             return None
         if not isinstance(obj, dict):
             self._error(400, "JSON_OBJECT_REQUIRED")
+            return None
+        return obj
+
+    def _json(self, fields: set[str]) -> dict[str, Any] | None:
+        obj = self._read_body_object()
+        if obj is None:
             return None
         if set(obj) != fields:
             self._error(400, "INVALID_FIELDS")
@@ -163,6 +196,8 @@ class _UIHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         launcher = self.server.context.launcher
         if path == "/":
+            if not self._host_ok() or not self._origin_ok(mutating=False):
+                return
             html = SHELL_HTML.format(
                 csrf=self.server.csrf_nonce,
                 mode=getattr(launcher, "authorization_mode"),
@@ -240,8 +275,15 @@ class _UIHandler(BaseHTTPRequestHandler):
                 body = self._json({"contract_id", "preparation_id"})
                 if body is None:
                     return
-                phrase = self.headers.get(OWNER_HEADER)
-                digests = self.headers.get_all(DIGEST_HEADER, failobj=[])
+                phrases = self._all_headers(OWNER_HEADER)
+                if not phrases:
+                    self._error(400, "OWNER_AUTHORIZATION_REQUIRED")
+                    return
+                if len(phrases) != 1 or len(phrases[0]) > MAX_OWNER_PHRASE_BYTES:
+                    self._error(400, "OWNER_AUTHORIZATION_INVALID")
+                    return
+                phrase = phrases[0]
+                digests = self._all_headers(DIGEST_HEADER)
                 if len(digests) > 1:
                     self._error(400, "OWNER_AUTHORIZATION_DIGEST_INVALID")
                     return
@@ -264,32 +306,7 @@ class _UIHandler(BaseHTTPRequestHandler):
         self._error(404, "NOT_FOUND")
 
     def _read_authoring_body(self) -> dict[str, Any] | None:
-        if self.headers.get("Content-Type") != "application/json":
-            self._error(415, "JSON_REQUIRED")
-            return None
-        if self.headers.get("Transfer-Encoding") is not None:
-            self._error(400, "UNBOUNDED_BODY")
-            return None
-        raw = self.headers.get("Content-Length")
-        try:
-            length = int(raw) if raw is not None else -1
-        except ValueError:
-            length = -1
-        if length < 0:
-            self._error(411, "CONTENT_LENGTH_REQUIRED")
-            return None
-        if length > MAX_REQUEST_BYTES:
-            self._error(413, "BODY_TOO_LARGE")
-            return None
-        try:
-            obj = json.loads(self.rfile.read(length).decode("utf-8"), object_pairs_hook=_pairs)
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
-            self._error(400, "INVALID_JSON")
-            return None
-        if not isinstance(obj, dict):
-            self._error(400, "JSON_OBJECT_REQUIRED")
-            return None
-        return obj
+        return self._read_body_object()
 
     def do_PUT(self) -> None:
         self._error(405, "METHOD_NOT_ALLOWED")

@@ -347,28 +347,74 @@ def _safe_document_name(document_id: str) -> str:
     return f"contract-{document_id}.json"
 
 
-def _write_once(path: Path, payload: bytes) -> None:
+def _remove_created_document(path: Path, *, unlink: Callable[[str], None]) -> None:
+    """Remove exactly the path this invocation created inside the documents
+    directory; a pre-existing collision path is never routed here."""
+
+    try:
+        unlink(str(path))
+    except OSError:
+        failure = AuthoringError(
+            "DOCUMENT_CLEANUP_FAILED",
+            safe_message_key="authoring.document_cleanup_failed",
+        )
+        # Internal-only diagnostic: to_dict() never includes this attribute,
+        # so the residual path is never shown to the browser.
+        failure.internal_residual_path = str(path)
+        raise failure from None
+
+
+def _write_once(
+    path: Path,
+    payload: bytes,
+    *,
+    write: Callable[[int, bytes], int] | None = None,
+    fsync: Callable[[int], None] | None = None,
+    close: Callable[[int], None] | None = None,
+    unlink: Callable[[str], None] | None = None,
+) -> None:
+    # Resolved at call time so the production os primitives stay authoritative
+    # while failure injection remains possible for committed tests.
+    write_op = write if write is not None else os.write
+    fsync_op = fsync if fsync is not None else os.fsync
+    close_op = close if close is not None else os.close
+    unlink_op = unlink if unlink is not None else os.unlink
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_BINARY"):
         flags |= os.O_BINARY
     try:
         fd = os.open(str(path), flags, 0o600)
-    except FileExistsError as exc:
+    except FileExistsError:
+        # The collision path pre-existed this invocation and is never unlinked.
         raise AuthoringError(
             "DOCUMENT_EXISTS",
             safe_message_key="authoring.document_exists",
         ) from None
-    except OSError as exc:
+    except OSError:
         raise AuthoringError(
             "DOCUMENT_WRITE_FAILED",
             safe_message_key="authoring.document_write_failed",
         ) from None
+    # From here the path was created by this invocation: any failure before a
+    # complete write+fsync+close must remove exactly this path and the document
+    # must never be registered by the caller.
+    fd_open = True
     try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-    except OSError as exc:
+        view = memoryview(payload)
+        while view:
+            view = view[write_op(fd, view):]
+        # Raw os.write is unbuffered, so there is no userspace buffer left to
+        # flush before the durability fsync.
+        fsync_op(fd)
+        fd_open = False
+        close_op(fd)
+    except OSError:
+        if fd_open:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        _remove_created_document(path, unlink=unlink_op)
         raise AuthoringError(
             "DOCUMENT_WRITE_FAILED",
             safe_message_key="authoring.document_write_failed",

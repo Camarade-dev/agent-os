@@ -16,12 +16,17 @@ from admissible.product_launcher.configuration import (
 
 PREFLIGHT_READY = "PREFLIGHT_READY"
 PREFLIGHT_BLOCKED = "PREFLIGHT_BLOCKED"
+PREFLIGHT_PROTOCOL_MISMATCH = "PREFLIGHT_PROTOCOL_MISMATCH"
 STATE_QUEUED = "QUEUED"
 STATE_RUNNING = "RUNNING"
 STATE_READY = "READY"
 STATE_BLOCKED = "BLOCKED"
 STATE_FAILED = "FAILED"
 STATE_EXPIRED = "EXPIRED"
+
+# The G2 HTTP phrase boundary carries header values as ISO-8859-1 wire bytes;
+# only losslessly Latin-1-encodable owner phrases are transportable.
+OWNER_AUTHORIZATION_ENCODING = "latin-1"
 
 INTERACTIVE_AUTHORIZATION_NOTICE = (
     "The local launcher derives an invocation digest from the owner-entered phrase "
@@ -30,7 +35,7 @@ INTERACTIVE_AUTHORIZATION_NOTICE = (
     "Fresh G1 launch observations may still reject on drift."
 )
 PRECOMMITTED_AUTHORIZATION_NOTICE = (
-    "The launcher forwards the owner-supplied digest unchanged. "
+    "The launcher forwards the owner-supplied digest unchanged and never derives it. "
     "G1 remains the only authority that validates phrase and digest against a fresh payload."
 )
 
@@ -85,6 +90,9 @@ class AuthorizationPreparation:
     state: str
     created_at: str
     consumed: bool = False
+    # Transient one-shot launch reservation (F-005). In-memory only: never
+    # persisted and never exposed on the status surface.
+    launch_reserved: bool = False
     payload_fingerprint: str | None = None
     safe_payload_summary: dict[str, object] | None = None
     owner_visible_payload: dict[str, object] | None = None
@@ -164,7 +172,7 @@ def consume_ready_preflight(
     except PreflightParseError:
         return STATE_FAILED, None, {"error_type": "MALFORMED_PREFLIGHT"}
     status = parsed.get("status")
-    if return_code == 0 and status == PREFLIGHT_READY:
+    if status == PREFLIGHT_READY and return_code == 0:
         raw_payload = parsed.get("authorization_payload")
         if not isinstance(raw_payload, Mapping):
             return STATE_FAILED, None, {"error_type": "MALFORMED_PREFLIGHT"}
@@ -175,14 +183,17 @@ def consume_ready_preflight(
         except Exception:
             return STATE_FAILED, None, {"error_type": "PAYLOAD_INVALID"}
         return STATE_READY, validated, None
-    if status == PREFLIGHT_BLOCKED or return_code == 2:
+    if status == PREFLIGHT_BLOCKED and return_code == 2:
         summary = {
             "error_type": "PREFLIGHT_BLOCKED",
             "reason_code": parsed.get("reason_code") if isinstance(parsed.get("reason_code"), str) else None,
             "status": PREFLIGHT_BLOCKED,
         }
         return STATE_BLOCKED, None, summary
-    return STATE_FAILED, None, {"error_type": "UNEXPECTED_PREFLIGHT_STATUS"}
+    # Every other status/return pairing is a terminal protocol mismatch: the
+    # payload is never loaded, so no fingerprint, canonical bytes, or digest
+    # material can be retained, and the state is never described as BLOCKED.
+    return STATE_FAILED, None, {"error_type": PREFLIGHT_PROTOCOL_MISMATCH}
 
 
 def compute_interactive_digest(*, phrase: str, canonical_payload: bytes) -> str:
@@ -264,8 +275,10 @@ def apply_ready_payload(preparation: AuthorizationPreparation, payload: NativeCa
 __all__ = [
     "AuthorizationPreparation",
     "INTERACTIVE_AUTHORIZATION_NOTICE",
+    "OWNER_AUTHORIZATION_ENCODING",
     "PRECOMMITTED_AUTHORIZATION_NOTICE",
     "PREFLIGHT_BLOCKED",
+    "PREFLIGHT_PROTOCOL_MISMATCH",
     "PREFLIGHT_READY",
     "PreparationStore",
     "PreflightParseError",
