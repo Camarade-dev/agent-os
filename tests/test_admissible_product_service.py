@@ -9,8 +9,9 @@ from admissible.product_service import create_loopback_server, create_product_co
 from admissible.product_service.control import ActiveRunConflict, ContractConsumed, ProductControlPlane, ResultNotReady
 from admissible.product_service.models import ControlState
 from admissible.delegated_gate.mission_profile import load_native_mission_profile_document
-from admissible.delegated_gate.native_canary import run_native_mission_application
+from admissible.product_launcher import ProductionChildApplication
 from admissible.product_read_model import discover_runs, load_run_detail, load_run_summary, render_result_json
+DIGEST="d"*64
 
 @dataclass(frozen=True)
 class Profile:
@@ -49,7 +50,7 @@ def test_construction_injection_and_import_safety(tmp_path):
 
 def test_production_defaults_are_canonical_g1_g4a_seams():
     defaults=ProductControlPlane.__init__.__kwdefaults__
-    assert defaults["application"] is run_native_mission_application
+    assert defaults["application"] is None
     assert defaults["profile_validator"] is load_native_mission_profile_document
     assert defaults["detail_loader"] is load_run_detail and defaults["summary_loader"] is load_run_summary
     assert defaults["run_discovery"] is discover_runs and defaults["result_renderer"] is render_result_json
@@ -102,51 +103,70 @@ def test_validation_never_executes_and_rejects_authorization_json(tmp_path):
 
 def test_transient_authorization_and_terminal_not_succeeded(tmp_path):
     seen=[]
-    def app(**kw): seen.append(kw["owner_authorization"]); Path(kw["run_root"]).mkdir(parents=True)
+    def app(**kw): seen.append(kw["owner_authorization"]); Path(kw["run_root"]).mkdir(parents=True); return 0
     p=plane(tmp_path,application=app); c=p.validate_contract(str((tmp_path/"p.json").resolve()))
-    run=p.start_run(c["contract_id"],"phrase-top-secret"); wait_state(p,run.control_run_id,"TERMINAL")
+    run=p.start_run(c["contract_id"],"phrase-top-secret",DIGEST); wait_state(p,run.control_run_id,"TERMINAL")
     assert seen==["phrase-top-secret"] and p.status(run.control_run_id)["control_state"]=="TERMINAL"
     assert "phrase-top-secret" not in repr(p._contracts) and "phrase-top-secret" not in repr(p._runs)
     p.close()
 
 def test_single_active_run_and_exactly_one_invocation(tmp_path):
     entered=threading.Event(); release=threading.Event(); calls=[]
-    def app(**kw): calls.append(kw); entered.set(); release.wait(2)
+    def app(**kw): calls.append(kw); entered.set(); release.wait(2); return 0
     ids=iter(["c1","r1","c2","r2"]); p=plane(tmp_path,application=app,id_generator=ids.__next__)
     c1=p.validate_contract(str((tmp_path/"1").resolve())); c2=p.validate_contract(str((tmp_path/"2").resolve()))
-    first=p.start_run(c1["contract_id"],"one"); assert entered.wait(1)
-    with pytest.raises(ActiveRunConflict): p.start_run(c2["contract_id"],"two")
+    first=p.start_run(c1["contract_id"],"one",DIGEST); assert entered.wait(1)
+    with pytest.raises(ActiveRunConflict): p.start_run(c2["contract_id"],"two",DIGEST)
     assert len(calls)==1; release.set(); wait_state(p,first.control_run_id,"TERMINAL"); p.close()
 
 def test_http_start_is_202_and_second_active_is_409(tmp_path):
     entered=threading.Event(); release=threading.Event()
-    def app(**_kw): entered.set(); release.wait(2)
+    def app(**_kw): entered.set(); release.wait(2); return 0
     ids=iter(["c1","c2","r1"]); p=plane(tmp_path,application=app,id_generator=ids.__next__)
     c1=p.validate_contract(str((tmp_path/"1").resolve())); c2=p.validate_contract(str((tmp_path/"2").resolve()))
     s=create_loopback_server(p).start()
     try:
-        headers=auth(s,**{"X-Admissible-Owner-Authorization":"secret"})
+        headers=auth(s,**{"X-Admissible-Owner-Authorization":"secret","X-Admissible-Owner-Authorization-Digest":DIGEST})
+        missing=auth(s,**{"X-Admissible-Owner-Authorization":"secret"})
+        malformed=auth(s,**{"X-Admissible-Owner-Authorization":"secret","X-Admissible-Owner-Authorization-Digest":"D"*64})
+        missing_status,_,missing_body=request(s,"POST","/api/v1/runs",{"contract_id":c1["contract_id"]},missing)
+        assert (missing_status,missing_body)==(400,{"error":"OWNER_AUTHORIZATION_DIGEST_INVALID"})
+        assert request(s,"POST","/api/v1/runs",{"contract_id":c1["contract_id"]},malformed)[0]==400
         status,_,body=request(s,"POST","/api/v1/runs",{"contract_id":c1["contract_id"]},headers)
         assert status==202 and body["control_state"] in {"QUEUED","STARTING"} and "product_verdict" not in body
         assert entered.wait(1)
         assert request(s,"POST","/api/v1/runs",{"contract_id":c2["contract_id"]},headers)[0]==409
     finally: release.set(); s.stop()
 
+def test_result_http_409_then_terminal_absent_410(tmp_path):
+    release=threading.Event()
+    def app(**_kw): release.wait(2); return 1
+    p=plane(tmp_path,application=app); c=p.validate_contract(str((tmp_path/"p").resolve())); s=create_loopback_server(p).start()
+    try:
+        headers=auth(s,**{"X-Admissible-Owner-Authorization":"owner","X-Admissible-Owner-Authorization-Digest":DIGEST})
+        status,_,body=request(s,"POST","/api/v1/runs",{"contract_id":c["contract_id"]},headers); rid=body["control_run_id"]
+        assert request(s,"GET",f"/api/v1/runs/{rid}/result",headers={"X-Admissible-Control-Token":s.control_token})[0:3:2]==(409,{"error":"RESULT_NOT_READY"})
+        release.set(); wait_state(p,rid,"TERMINAL")
+        status,_,body=request(s,"GET",f"/api/v1/runs/{rid}/result",headers={"X-Admissible-Control-Token":s.control_token})
+        assert status==410 and body=={"error":"NO_AUTHORITATIVE_RESULT","control_state":"TERMINAL","application_return_code":1,"terminal_evidence":"RUN_ROOT_ABSENT","start_error_type":None}
+        assert "product_verdict" not in body
+    finally:release.set(); s.stop()
+
 def test_exception_is_start_failed_type_only(tmp_path):
     def app(**_kw): raise RuntimeError("phrase and provider output")
-    p=plane(tmp_path,application=app); c=p.validate_contract(str((tmp_path/"p").resolve())); r=p.start_run(c["contract_id"],"phrase")
+    p=plane(tmp_path,application=app); c=p.validate_contract(str((tmp_path/"p").resolve())); r=p.start_run(c["contract_id"],"phrase",DIGEST)
     wait_state(p,r.control_run_id,"START_FAILED"); status=p.status(r.control_run_id)
     assert status["start_error_type"]=="RuntimeError" and "phrase" not in json.dumps(status); p.close()
 
 def test_result_uses_detail_and_renderer_and_is_not_ready_early(tmp_path):
     release=threading.Event(); calls=[]
-    def app(**kw): Path(kw["run_root"]).mkdir(parents=True); release.wait(2)
+    def app(**kw): Path(kw["run_root"]).mkdir(parents=True); release.wait(2); return 0
     class Summary:
         def to_json(self): return {"run_id":"run-1","run_root":"secret","product_verdict":"UNKNOWN"}
     def detail(root,**kw): calls.append(("detail",root,kw)); return "DETAIL"
     def render(value): calls.append(("render",value)); return {"run_root":"secret","diagnostics":["secret"],"result_admission_state":{"verdict":"INCONSISTENT","source":"AUTHORITATIVE_RECONSTRUCTION"}}
     p=plane(tmp_path,application=app,detail_loader=detail,summary_loader=lambda *a,**k:Summary(),result_renderer=render)
-    c=p.validate_contract(str((tmp_path/"p").resolve())); r=p.start_run(c["contract_id"],"x")
+    c=p.validate_contract(str((tmp_path/"p").resolve())); r=p.start_run(c["contract_id"],"x",DIGEST)
     with pytest.raises(ResultNotReady): p.result(r.control_run_id)
     release.set(); wait_state(p,r.control_run_id,"TERMINAL"); result=p.result(r.control_run_id)
     assert result=={"result_admission_state":{"verdict":"INCONSISTENT","source":"AUTHORITATIVE_RECONSTRUCTION"},
@@ -169,12 +189,12 @@ def test_transport_redaction_contract_preserves_g4a_semantics_and_source_mapping
                      "persisted_claims":dict(source_result["persisted_claims"]),"future_g4a_field":{"nested":[1,"two"]}}
     original_summary=dict(source_summary)
     release=threading.Event()
-    def app(**kw): Path(kw["run_root"]).mkdir(parents=True); release.wait(2)
+    def app(**kw): Path(kw["run_root"]).mkdir(parents=True); release.wait(2); return 0
     class Summary:
         def to_json(self): return source_summary
     p=plane(tmp_path,application=app,summary_loader=lambda *_a,**_k:Summary(),
             detail_loader=lambda *_a,**_k:object(),result_renderer=lambda _detail:source_result)
-    c=p.validate_contract(str((tmp_path/"p").resolve())); r=p.start_run(c["contract_id"],"x")
+    c=p.validate_contract(str((tmp_path/"p").resolve())); r=p.start_run(c["contract_id"],"x",DIGEST)
     release.set(); wait_state(p,r.control_run_id,"TERMINAL")
     assert p.result(r.control_run_id)=={
         "schema_version":"admissible_product_read_model_result_v1",
@@ -210,8 +230,8 @@ def test_status_and_list_summary_redactions_are_adjacent_and_conditional(tmp_pat
     p.close()
 
 def test_status_has_no_summary_redaction_marker_without_product_summary(tmp_path):
-    p=plane(tmp_path,application=lambda **_kw:None); c=p.validate_contract(str((tmp_path/"p").resolve()))
-    run=p.start_run(c["contract_id"],"x"); wait_state(p,run.control_run_id,"TERMINAL")
+    p=plane(tmp_path,application=lambda **_kw:0); c=p.validate_contract(str((tmp_path/"p").resolve()))
+    run=p.start_run(c["contract_id"],"x",DIGEST); wait_state(p,run.control_run_id,"TERMINAL")
     status=p.status(run.control_run_id)
     assert status["product_summary"] is None and "product_summary_transport_redactions" not in status
     p.close()
@@ -226,14 +246,14 @@ def test_simultaneous_distinct_contract_starts_are_atomic(tmp_path):
             def app(**_kw):
                 nonlocal invocation_count
                 with counter_lock: invocation_count+=1
-                entered.set(); release.wait(5)
+                entered.set(); release.wait(5); return 0
             ids=iter([f"contract-{round_number}-{i}" for i in range(contender_count)]+[f"control-{round_number}-{i}" for i in range(contender_count)])
             p=plane(tmp_path/f"round-{round_number}",application=app,id_generator=ids.__next__)
             contracts=[p.validate_contract(str((tmp_path/f"round-{round_number}"/f"profile-{i}").resolve()))["contract_id"] for i in range(contender_count)]
             outcomes=[]; outcome_lock=threading.Lock()
             def contend(contract_id):
                 barrier.wait()
-                try: outcome=("success",p.start_run(contract_id,"owner-authorization"))
+                try: outcome=("success",p.start_run(contract_id,"owner-authorization",DIGEST))
                 except ActiveRunConflict as exc: outcome=("conflict",exc)
                 except ContractConsumed as exc: outcome=("consumed",exc)
                 with outcome_lock: outcomes.append((contract_id,outcome))

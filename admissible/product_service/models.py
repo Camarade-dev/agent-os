@@ -7,6 +7,11 @@ from typing import Any
 class ControlState(str, Enum):
     VALIDATED="VALIDATED"; QUEUED="QUEUED"; STARTING="STARTING"; RUNNING="RUNNING"; TERMINAL="TERMINAL"; START_FAILED="START_FAILED"
 
+class TerminalEvidence(str, Enum):
+    EVIDENCE_ROOT_PRESENT="EVIDENCE_ROOT_PRESENT"
+    RUN_ROOT_WITHOUT_EVIDENCE_DIRECTORY="RUN_ROOT_WITHOUT_EVIDENCE_DIRECTORY"
+    RUN_ROOT_ABSENT="RUN_ROOT_ABSENT"
+
 @dataclass(frozen=True)
 class ValidatedContract:
     contract_id: str
@@ -27,5 +32,7 @@ class ControlRun:
     started_at: str|None=None
     ended_at: str|None=None
     start_error_type: str|None=None
+    application_return_code: int|None=None
+    terminal_evidence: TerminalEvidence|None=None
     def transition(self, state: ControlState, **changes: object):
         return replace(self, control_state=state, **changes)

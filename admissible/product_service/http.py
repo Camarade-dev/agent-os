@@ -4,8 +4,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import hmac,json,secrets,threading
 from typing import Any,Callable
 from urllib.parse import urlsplit
-from .control import ActiveRunConflict,ContractConsumed,ProductControlPlane,ResultNotReady,UnknownContract,UnknownControlRun
-API_PREFIX="/api/v1"; TOKEN_HEADER="X-Admissible-Control-Token"; OWNER_HEADER="X-Admissible-Owner-Authorization"; MAX_REQUEST_BYTES=1024*1024
+from .control import ActiveRunConflict,ContractConsumed,NoAuthoritativeResult,ProductControlPlane,ResultNotReady,UnknownContract,UnknownControlRun
+API_PREFIX="/api/v1"; TOKEN_HEADER="X-Admissible-Control-Token"; OWNER_HEADER="X-Admissible-Owner-Authorization"; DIGEST_HEADER="X-Admissible-Owner-Authorization-Digest"; MAX_REQUEST_BYTES=1024*1024
 def _pairs(pairs: list[tuple[str,Any]]):
     out={}
     for k,v in pairs:
@@ -58,6 +58,7 @@ class _Handler(BaseHTTPRequestHandler):
             if len(parts)==6 and parts[4] and parts[5]=="result": self._send(200,self.server.control_plane.result(parts[4])); return
         except UnknownControlRun: self._error(404,"RUN_NOT_FOUND"); return
         except ResultNotReady: self._error(409,"RESULT_NOT_READY"); return
+        except NoAuthoritativeResult as exc: self._send(410,exc.payload); return
         except Exception: self._error(500,"READ_UNAVAILABLE"); return
         self._error(404,"NOT_FOUND")
     def do_POST(self):
@@ -77,11 +78,13 @@ class _Handler(BaseHTTPRequestHandler):
             if not isinstance(body["contract_id"],str): self._error(400,"INVALID_CONTRACT_ID"); return
             phrase=self.headers.get(OWNER_HEADER)
             if not phrase: self._error(400,"OWNER_AUTHORIZATION_REQUIRED"); return
-            try: run=self.server.control_plane.start_run(body["contract_id"],phrase)
+            digest=self.headers.get(DIGEST_HEADER)
+            if digest is None or len(digest)!=64 or any(c not in "0123456789abcdef" for c in digest): self._error(400,"OWNER_AUTHORIZATION_DIGEST_INVALID"); return
+            try: run=self.server.control_plane.start_run(body["contract_id"],phrase,digest)
             except UnknownContract: self._error(404,"CONTRACT_NOT_FOUND"); return
             except (ContractConsumed,ActiveRunConflict): self._error(409,"RUN_CONFLICT"); return
             except Exception: self._error(500,"START_UNAVAILABLE"); return
-            finally: phrase=""
+            finally: phrase=""; digest=""
             self._send(202,{"control_run_id":run.control_run_id,"control_state":run.control_state.value}); return
         self._error(404,"NOT_FOUND")
     def do_PUT(self): self._error(405,"METHOD_NOT_ALLOWED")
