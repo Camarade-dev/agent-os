@@ -2,7 +2,7 @@
 
 This lane is NOT a reconstruction authority. It never decides whether a run
 succeeded. It only defines a narrow protocol through which an *already
-authoritative* reconstruction can be supplied later by the audited G1
+authoritative* reconstruction can be supplied by the audited G1
 implementation.
 
 Three concrete providers are shipped:
@@ -10,13 +10,14 @@ Three concrete providers are shipped:
 * :class:`FakeTruthProvider` - deterministic canned truth for tests;
 * :class:`LegacyPersistedFactsProvider` - returns raw persisted historical facts
   and never claims a product admission verdict;
-* :class:`G1ReconstructionAdapter` - a documented placeholder that will wrap the
-  future ``reconstruct_completed_native_mission(...)`` function. It contains no
-  reconstruction logic of its own.
+* :class:`G1ReconstructionAdapter` - the integration boundary that calls
+  ``reconstruct_completed_native_mission(...)`` and returns its canonical
+  mapping. It contains no reconstruction logic of its own.
 """
 
 from __future__ import annotations
 
+import importlib
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -31,7 +32,7 @@ class TruthProviderError(RuntimeError):
 
 
 class TruthProviderUnavailable(TruthProviderError):
-    """Raised by the G1 adapter placeholder when no reconstruct function is wired."""
+    """Raised when the G1 seam is unwired or the run root is structurally unsupported."""
 
 
 @runtime_checkable
@@ -132,20 +133,123 @@ class LegacyPersistedFactsProvider:
         return facts
 
 
-class G1ReconstructionAdapter:
-    """Documented placeholder for the future audited G1 reconstruction seam.
+def _resolve_session_id(root_real: Path) -> str | None:
+    """Resolve the durable session id from persisted run-root evidence only."""
 
-    When G1 is audited and committed, wire its authoritative function here::
+    final_status = evidence_reader.read_json(root_real, "evidence/final-status.json")
+    if final_status.ok and isinstance(final_status.data, Mapping):
+        candidate = final_status.data.get("session_id")
+        if isinstance(candidate, str) and candidate:
+            return candidate
 
-        from admissible.delegated_gate.native_canary import (
-            reconstruct_completed_native_mission,
+    preflight = evidence_reader.read_json(root_real, "evidence/canary-preflight.json")
+    if preflight.ok and isinstance(preflight.data, Mapping):
+        payload = preflight.data.get("authorization_payload")
+        if isinstance(payload, Mapping):
+            candidate = payload.get("session_id")
+            if isinstance(candidate, str) and candidate:
+                return candidate
+
+    delegated_dir = evidence_reader.safe_child_path(root_real, "evidence/delegated-state")
+    if delegated_dir is not None and delegated_dir.is_dir():
+        for path in sorted(delegated_dir.glob("*.delegated-gate.json")):
+            try:
+                parsed = evidence_reader.read_json(
+                    root_real, f"evidence/delegated-state/{path.name}"
+                )
+            except OSError:
+                continue
+            if parsed.ok and isinstance(parsed.data, Mapping):
+                candidate = parsed.data.get("session_id")
+                if isinstance(candidate, str) and candidate:
+                    return candidate
+    return None
+
+
+def _call_canonical_g1_reconstruction(run_root: Path) -> Mapping[str, object]:
+    """Open durable stores under ``run_root`` and call audited G1 reconstruction.
+
+    G1 symbols are resolved through ``importlib`` at call time so this module
+    stays free of static production imports, import-time side effects, and
+    circular-import pressure. Exception messages from G1 are not forwarded:
+    they may contain persisted workspace or authorization detail.
+    """
+
+    native_canary = importlib.import_module("admissible.delegated_gate.native_canary")
+    native_executor = importlib.import_module("admissible.delegated_gate.native_executor")
+    delegated_store = importlib.import_module("admissible.delegated_gate.store")
+    reconstruct_completed_native_mission = native_canary.reconstruct_completed_native_mission
+    AtomicNativeExecutionStore = native_executor.AtomicNativeExecutionStore
+    NativeEvidenceInvalid = native_executor.NativeEvidenceInvalid
+    NativeEvidenceNotFound = native_executor.NativeEvidenceNotFound
+    NativeExecutionStoreError = native_executor.NativeExecutionStoreError
+    AtomicDelegatedSessionStore = delegated_store.AtomicDelegatedSessionStore
+    DelegatedGateStoreError = delegated_store.DelegatedGateStoreError
+
+    root_real = evidence_reader.resolve_root(run_root)
+    evidence = evidence_reader.safe_child_path(root_real, "evidence")
+    if evidence is None or not evidence.is_dir():
+        raise TruthProviderUnavailable("G1 reconstruction requires an evidence directory")
+
+    session_dir = evidence / "delegated-state"
+    execution_dir = evidence / "native-execution"
+    artifacts_dir = execution_dir / "artifacts"
+    if not session_dir.is_dir() or not execution_dir.is_dir() or not artifacts_dir.is_dir():
+        raise TruthProviderUnavailable(
+            "G1 reconstruction requires durable delegated-state, native-execution, and artifacts directories"
         )
-        provider = G1ReconstructionAdapter(reconstruct_completed_native_mission)
 
-    The adapter deliberately implements NO reconstruction logic. It only calls
-    the supplied authoritative function and returns its already-authoritative,
-    JSON-compatible mapping. Integration therefore changes this module and the
-    product extractor only, never the presentation types.
+    session_id = _resolve_session_id(root_real)
+    if session_id is None:
+        raise TruthProviderUnavailable("G1 reconstruction could not resolve a session id")
+
+    try:
+        outcome = reconstruct_completed_native_mission(
+            session_store=AtomicDelegatedSessionStore(session_dir),
+            execution_store=AtomicNativeExecutionStore(execution_dir),
+            evidence_directory=evidence,
+            session_id=session_id,
+        )
+    except NativeEvidenceInvalid:
+        # Evidence present but not reconstructable under the audited G1 contract
+        # (incomplete, inconsistent, or non-runtime-v2). Never invent admission.
+        raise TruthProviderError(
+            "authoritative G1 reconstruction rejected persisted evidence"
+        ) from None
+    except (NativeEvidenceNotFound, NativeExecutionStoreError, DelegatedGateStoreError, OSError, ValueError, TypeError):
+        raise TruthProviderError(
+            "authoritative G1 reconstruction could not load persisted evidence"
+        ) from None
+
+    mapping = outcome.to_dict()
+    if not isinstance(mapping, Mapping):
+        raise TruthProviderError(
+            f"authoritative reconstruction returned a non-mapping: {type(mapping).__name__}"
+        )
+    return mapping
+
+
+def create_g1_reconstruction_provider() -> G1ReconstructionAdapter:
+    """Construct the production G1 truth provider without injecting a function."""
+
+    return G1ReconstructionAdapter.from_canonical_g1()
+
+
+class G1ReconstructionAdapter:
+    """Integration boundary for the audited G1 reconstruction seam.
+
+    Production construction::
+
+        provider = G1ReconstructionAdapter.from_canonical_g1()
+        # or
+        provider = create_g1_reconstruction_provider()
+
+    Tests may still inject an explicit ``reconstruct_fn`` / ``to_mapping`` pair.
+    Explicit injection is never silently replaced by the canonical G1 wiring.
+
+    The adapter implements NO reconstruction logic. It only resolves durable
+    store roots from the run directory, calls the authoritative G1 function, and
+    returns that function's canonical ``to_dict()`` mapping.
     """
 
     def __init__(
@@ -158,6 +262,12 @@ class G1ReconstructionAdapter:
         self._reconstruct_fn = reconstruct_fn
         self._to_mapping = to_mapping
         self._call_kwargs = call_kwargs
+
+    @classmethod
+    def from_canonical_g1(cls) -> G1ReconstructionAdapter:
+        """Wire the audited ``reconstruct_completed_native_mission`` seam."""
+
+        return cls(_call_canonical_g1_reconstruction)
 
     def reconstruct(self, run_root: Path) -> Mapping[str, object]:
         if self._reconstruct_fn is None:
