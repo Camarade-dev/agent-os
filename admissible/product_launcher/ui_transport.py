@@ -12,6 +12,7 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from admissible.product_launcher.configuration import LOOPBACK_HOST
+from admissible.product_ui import get_asset, render_document
 
 UI_API_PREFIX = "/ui/api/v1"
 CSRF_HEADER = "X-Admissible-UI-CSRF"
@@ -35,31 +36,6 @@ def _pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise ValueError("duplicate")
         out[key] = value
     return out
-
-
-SHELL_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>Admissible Product Launcher</title>
-<meta name="admissible-ui-csrf" content="{csrf}">
-<meta name="admissible-authorization-mode" content="{mode}">
-<script>
-window.__ADMISSIBLE_PRODUCT_LAUNCHER__ = {{
-  csrf: {csrf_json},
-  authorization_mode: {mode_json},
-  visual_ui_available: false
-}};
-</script>
-</head>
-<body>
-<main>
-<h1>Admissible Product Launcher</h1>
-<p>Visual Compose/Contract/Authorize interface is not installed in G2.5.</p>
-</main>
-</body>
-</html>
-"""
 
 
 class UIRequestContext:
@@ -95,6 +71,13 @@ class _UIHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; script-src 'self'; style-src 'self'; "
+            "connect-src 'self'; img-src 'self'; base-uri 'none'; "
+            "form-action 'none'; frame-ancestors 'none'",
+        )
         self.end_headers()
         self.wfile.write(body)
 
@@ -198,13 +181,18 @@ class _UIHandler(BaseHTTPRequestHandler):
         if path == "/":
             if not self._host_ok() or not self._origin_ok(mutating=False):
                 return
-            html = SHELL_HTML.format(
-                csrf=self.server.csrf_nonce,
-                mode=getattr(launcher, "authorization_mode"),
-                csrf_json=json.dumps(self.server.csrf_nonce),
-                mode_json=json.dumps(getattr(launcher, "authorization_mode")),
+            html = render_document(
+                csrf_nonce=self.server.csrf_nonce,
+                authorization_mode=getattr(launcher, "authorization_mode"),
             )
-            self._send(200, html.encode("utf-8"), content_type="text/html; charset=utf-8")
+            self._send(200, html, content_type="text/html; charset=utf-8")
+            return
+        asset = get_asset(path)
+        if asset is not None:
+            if not self._host_ok() or not self._origin_ok(mutating=False):
+                return
+            body, content_type = asset
+            self._send(200, body, content_type=content_type)
             return
         if not path.startswith(UI_API_PREFIX + "/") and path != UI_API_PREFIX:
             self._error(404, "NOT_FOUND")

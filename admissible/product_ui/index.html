@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="admissible-ui-csrf" content="{{CSRF_NONCE}}">
+  <meta name="admissible-authorization-mode" content="{{AUTHORIZATION_MODE}}">
+  <title>Admissible — Mission authority</title>
+  <link rel="stylesheet" href="/ui/assets/app.css">
+  <script src="/ui/assets/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#workspace">Skip to mission workspace</a>
+  <header class="masthead">
+    <a class="wordmark" href="/" aria-label="Admissible local launcher home">ADMISSIBLE<span> / LOCAL</span></a>
+    <p class="local-mark"><span aria-hidden="true"></span> Loopback only</p>
+  </header>
+  <main id="workspace" tabindex="-1">
+    <section class="hero" aria-labelledby="page-title">
+      <p class="eyebrow">Mission authority console</p>
+      <h1 id="page-title"><span>The model proposes.</span><span>Admissible authorizes.</span></h1>
+      <p class="hero-note">Compose intent, inspect the canonical boundary, then bind owner authority.</p>
+    </section>
+
+    <nav class="steps" aria-label="Mission launch steps">
+      <ol>
+        <li data-step="compose"><span>1</span><strong>Compose</strong></li>
+        <li data-step="contract"><span>2</span><strong>Contract</strong></li>
+        <li data-step="authorize"><span>3</span><strong>Authorize</strong></li>
+      </ol>
+    </nav>
+
+    <div class="layout">
+      <div class="surface">
+        <section id="loading-view" class="view" aria-labelledby="loading-title">
+          <p class="section-index">00 / Bootstrap</p><h2 id="loading-title">Opening local authority</h2>
+          <p>Reading the accepted launcher contract.</p>
+        </section>
+
+        <section id="compose-view" class="view" hidden aria-labelledby="compose-title">
+          <p class="section-index">01 / Owner-authored intent</p><h2 id="compose-title">Describe the mission</h2>
+          <form id="compose-form" novalidate>
+            <div class="field field-primary">
+              <label for="mission-text">Mission</label>
+              <textarea id="mission-text" rows="5" maxlength="65536" required aria-describedby="mission-help mission-error"></textarea>
+              <p id="mission-help" class="hint">State the bounded work to complete.</p><p id="mission-error" class="field-error"></p>
+            </div>
+            <div class="split-fields">
+              <div class="field"><label for="gate-objective">Gate objective</label><textarea id="gate-objective" rows="3" maxlength="8192" required aria-describedby="objective-error"></textarea><p id="objective-error" class="field-error"></p></div>
+              <div class="field"><label for="completion-conditions">Completion conditions</label><textarea id="completion-conditions" rows="3" maxlength="65536" required aria-describedby="conditions-error"></textarea><p id="conditions-error" class="field-error"></p></div>
+            </div>
+            <fieldset class="materials"><legend>Required material paths</legend><p class="hint">Repository-relative paths only.</p><div id="material-list"></div><button id="add-material" class="button quiet" type="button">+ Add path</button></fieldset>
+            <div class="field"><label for="commit-message">Intended Git end-state commit</label><input id="commit-message" type="text" maxlength="1024" required aria-describedby="commit-error"><p id="commit-error" class="field-error"></p></div>
+            <div class="field"><label for="template-id">Authoring template</label><select id="template-id" required></select></div>
+            <details class="advanced"><summary>Advanced mission settings</summary><div class="split-fields"><div class="field"><label for="model">Model</label><input id="model" type="text" maxlength="256" value="auto"></div><div class="field"><label for="timeout-seconds">Timeout (seconds)</label><input id="timeout-seconds" type="number" min="1" step="1" value="60"></div></div></details>
+            <div class="actions"><button id="author-button" class="button primary" type="submit">Author canonical contract</button></div>
+          </form>
+        </section>
+
+        <section id="contract-view" class="view" hidden aria-labelledby="contract-title">
+          <p class="section-index">02 / Canonical contract identity</p><h2 id="contract-title">Review the contract</h2>
+          <p class="truth-line">Validated by the existing launcher. Execution has not started.</p>
+          <dl id="contract-facts" class="fact-grid"></dl>
+          <details><summary>Owner-authored intent</summary><dl id="intent-facts" class="detail-list"></dl></details>
+          <div class="actions"><button id="back-to-compose" class="button quiet" type="button">Back to compose</button><button id="prepare-button" class="button primary" type="button">Prepare authorization</button></div>
+        </section>
+
+        <section id="preparation-view" class="view" hidden aria-labelledby="preparation-title">
+          <p class="section-index">03 / Canonical preflight</p><h2 id="preparation-title">Preparing authority</h2>
+          <p id="preparation-copy">Preflight is queued. Execution has not started.</p>
+          <div class="actions"><button id="retry-preparation" class="button primary" type="button" hidden>Retry preparation</button><button class="button quiet reset-flow" type="button">Return to compose</button></div>
+        </section>
+
+        <section id="authorize-view" class="view" hidden aria-labelledby="authorize-title">
+          <p class="section-index">03 / Fixed launcher authority</p><h2 id="authorize-title">Inspect, then authorize</h2>
+          <div class="authority-inspector">
+            <dl id="preparation-facts" class="fact-grid"></dl>
+            <details open><summary>Canonical payload shown for inspection</summary><pre id="canonical-payload" tabindex="0"></pre></details>
+            <details><summary>Safe summary</summary><pre id="safe-summary" tabindex="0"></pre></details>
+            <details><summary>Transport redactions</summary><p>No transport-redaction metadata was returned by this preparation.</p></details>
+          </div>
+          <form id="authorize-form" novalidate>
+            <div class="authorization-box"><p id="mode-label" class="mode-label"></p><p id="authorization-notice"></p><p id="encoding-notice" class="hint"></p></div>
+            <div class="field"><label for="owner-phrase">Owner authorization phrase</label><div class="secret-row"><input id="owner-phrase" type="password" autocomplete="off" required aria-describedby="owner-phrase-error"><button id="toggle-phrase" class="button quiet" type="button" aria-pressed="false">Show</button></div><p id="owner-phrase-error" class="field-error"></p></div>
+            <div id="digest-slot"></div>
+            <div class="actions"><button class="button quiet reset-flow" type="button">Return to compose</button><button id="launch-button" class="button primary" type="submit">Launch mission</button></div>
+          </form>
+        </section>
+
+        <section id="accepted-view" class="view accepted" hidden aria-labelledby="accepted-title">
+          <p class="section-index">Accepted handoff</p><h2 id="accepted-title">Mission accepted</h2>
+          <p class="truth-line">Execution was accepted. HTTP 202 is not a verified result.</p>
+          <dl id="accepted-facts" class="fact-grid"></dl>
+          <div class="actions"><button class="button primary reset-flow" type="button">Compose another mission</button></div>
+        </section>
+      </div>
+
+      <aside class="authority-rail" aria-labelledby="authority-title">
+        <p class="section-index">Fixed authority</p><h2 id="authority-title">Launcher boundary</h2>
+        <dl id="bootstrap-facts" class="rail-facts"></dl>
+        <p class="rail-note">The browser proposes fields. The launcher constructs and validates authority.</p>
+      </aside>
+    </div>
+    <section id="status-area" class="status-area" aria-label="Request status" hidden><p id="status-message" role="alert"></p><code id="status-code"></code><button id="retry-bootstrap" class="button quiet" type="button" hidden>Retry bootstrap</button></section>
+    <div id="live-status" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+  </main>
+</body>
+</html>

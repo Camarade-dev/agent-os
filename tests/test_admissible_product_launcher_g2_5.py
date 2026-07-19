@@ -574,13 +574,13 @@ def test_csrf_host_origin_and_no_get_mutation(tmp_path):
         )
         assert status == 200
         text = raw.decode("utf-8")
-        assert "Admissible Product Launcher" in text
-        assert "Visual Compose/Contract/Authorize interface is not installed in G2.5." in text
+        assert "Admissible" in text and "The model proposes." in text
+        assert "Visual Compose/Contract/Authorize interface is not installed in G2.5." not in text
         assert launcher.csrf_nonce in text
         assert launcher._g2_token not in text
         assert "localStorage" not in text and "sessionStorage" not in text
         assert "http" not in text.lower().split("cdn")[0] or "cdn" not in text.lower()
-        assert 'src="http' not in text and "<link" not in text
+        assert 'src="http' not in text and 'href="http' not in text
         # wrong csrf
         status, _, body, _ = _request(
             "127.0.0.1",
