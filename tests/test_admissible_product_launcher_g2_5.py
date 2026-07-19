@@ -8,6 +8,7 @@ import itertools
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import sys
@@ -1551,3 +1552,103 @@ def test_bootstrap_authorization_disclosure_both_modes(tmp_path):
             launcher.close()
     assert "unchanged and never derives it" in PRECOMMITTED_AUTHORIZATION_NOTICE
     assert "interactive bound confirmation" in INTERACTIVE_AUTHORIZATION_NOTICE
+
+
+def test_rejected_request_closes_connection_before_pipelined_follow_up(tmp_path, monkeypatch):
+    """Rejected UI requests must close TCP before unread body can feed a pipelined follow-up."""
+    before_threads = {t.name for t in threading.enumerate()}
+    launcher, gate, _fake = _gate_stack(tmp_path, monkeypatch, id_start=90_000)
+    phrase = "pipeline-owner"
+    try:
+        cid, pid = _make_ready(launcher)
+        preparation = launcher._preparations.get(pid)
+        assert preparation is not None
+        assert preparation.consumed is False
+        assert preparation.launch_reserved is False
+        assert len(gate.run_calls) == 0
+
+        port = launcher.ui_port
+        host = f"127.0.0.1:{port}"
+        nonce = launcher.csrf_nonce
+        run_body = json.dumps(
+            {"contract_id": cid, "preparation_id": pid},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        assert len(run_body) > 0
+
+        rejected = b"\r\n".join(
+            [
+                b"POST /ui/api/v1/runs HTTP/1.1",
+                f"Host: {host}".encode("latin-1"),
+                b"Content-Type: application/json",
+                b"X-Admissible-UI-CSRF: not-the-csrf-nonce",
+                f"Content-Length: {len(run_body)}".encode("ascii"),
+                b"",
+                run_body,
+            ]
+        )
+        valid = b"\r\n".join(
+            [
+                b"POST /ui/api/v1/runs HTTP/1.1",
+                f"Host: {host}".encode("latin-1"),
+                b"Content-Type: application/json",
+                f"{CSRF_HEADER}: {nonce}".encode("latin-1"),
+                f"{OWNER_HEADER}: {phrase}".encode("latin-1"),
+                f"{DIGEST_HEADER}: {DIGEST}".encode("latin-1"),
+                f"Content-Length: {len(run_body)}".encode("ascii"),
+                b"",
+                run_body,
+            ]
+        )
+        assert b"Connection: close" not in rejected
+        assert b"Connection: close" not in valid
+
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
+            conn.settimeout(5)
+            # Transmit both requests on one write before reading any response.
+            conn.sendall(rejected + valid)
+            chunks: list[bytes] = []
+            saw_eof = False
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    chunk = conn.recv(65536)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    saw_eof = True
+                    break
+                chunks.append(chunk)
+            raw = b"".join(chunks)
+
+        assert saw_eof, raw
+        # Count every wire status-line token. Pipelined keep-alive responses may
+        # be concatenated directly after a prior body with no intervening LF, so
+        # a ^/MULTILINE scan would miss the follow-up.
+        status_lines = re.findall(rb"HTTP/1\.[01] \d{3} ", raw)
+        assert len(status_lines) == 1, raw
+        assert status_lines[0] == b"HTTP/1.1 403 "
+        assert raw.startswith(b"HTTP/1.1 403 ")
+        assert b'"error":"INVALID_CSRF"' in raw
+        assert b"HTTP/1.1 202 " not in raw
+
+        assert len(gate.run_calls) == 0
+        preparation = launcher._preparations.get(pid)
+        assert preparation is not None
+        assert preparation.consumed is False
+        assert preparation.launch_reserved is False
+        assert cid in launcher._contracts
+        _, _, prep_body, _ = _ui(launcher, "GET", f"/ui/api/v1/preparations/{pid}")
+        assert prep_body["state"] == STATE_READY
+        assert prep_body["consumed"] is False
+
+        text = raw.decode("utf-8", "replace")
+        assert phrase not in text
+        assert DIGEST not in text
+        assert nonce not in text
+    finally:
+        launcher.close()
+
+    leftover = {t.name for t in threading.enumerate()} - before_threads
+    assert not any(name.startswith("admissible-") for name in leftover), leftover
