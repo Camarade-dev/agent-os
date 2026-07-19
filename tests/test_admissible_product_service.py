@@ -138,6 +138,21 @@ def test_http_start_is_202_and_second_active_is_409(tmp_path):
         assert request(s,"POST","/api/v1/runs",{"contract_id":c2["contract_id"]},headers)[0]==409
     finally: release.set(); s.stop()
 
+@pytest.mark.parametrize("values",[(DIGEST,DIGEST),(DIGEST,"e"*64),(DIGEST,DIGEST,DIGEST),(DIGEST+","+DIGEST,)])
+def test_digest_header_requires_exactly_one_raw_occurrence(tmp_path,values):
+    calls=[]; p=plane(tmp_path,application=lambda **kw:calls.append(kw)); c=p.validate_contract(str((tmp_path/"p").resolve()))
+    s=create_loopback_server(p).start(); payload=json.dumps({"contract_id":c["contract_id"]}).encode()
+    try:
+        conn=HTTPConnection(s.host,s.port,timeout=3); conn.putrequest("POST","/api/v1/runs",skip_host=True)
+        conn.putheader("Host",f"127.0.0.1:{s.port}"); conn.putheader("X-Admissible-Control-Token",s.control_token)
+        conn.putheader("Content-Type","application/json"); conn.putheader("Content-Length",str(len(payload)))
+        conn.putheader("X-Admissible-Owner-Authorization","owner")
+        for value in values: conn.putheader("X-Admissible-Owner-Authorization-Digest",value)
+        conn.endheaders(payload); response=conn.getresponse(); body=json.loads(response.read()); conn.close()
+        assert response.status==400 and body=={"error":"OWNER_AUTHORIZATION_DIGEST_INVALID"}
+        assert not calls and not p._runs and not p._contracts[c["contract_id"]].consumed
+    finally:s.stop()
+
 def test_result_http_409_then_terminal_absent_410(tmp_path):
     release=threading.Event()
     def app(**_kw): release.wait(2); return 1

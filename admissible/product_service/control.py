@@ -21,6 +21,8 @@ class ContractConsumed(ControlPlaneError): pass
 class ActiveRunConflict(ControlPlaneError): pass
 class UnknownControlRun(ControlPlaneError): pass
 class ResultNotReady(ControlPlaneError): pass
+class ControlPlaneClosed(ControlPlaneError): pass
+class WorkerSubmissionFailed(ControlPlaneError): pass
 class NoAuthoritativeResult(ControlPlaneError):
     def __init__(self,payload:Mapping[str,object]): self.payload=dict(payload)
 _TRANSPORT_SCHEMA_VERSION="admissible_product_service_transport_v1"
@@ -78,6 +80,7 @@ class ProductControlPlane:
 
     def start_run(self, contract_id: str, owner_authorization: str, owner_authorization_digest: str)->ControlRun:
         with self._lock:
+            if self._closed: raise ControlPlaneClosed()
             contract=self._contracts.get(contract_id)
             if contract is None: raise UnknownContract()
             if contract.consumed: raise ContractConsumed()
@@ -85,7 +88,12 @@ class ProductControlPlane:
             p=contract.profile; rid=self._id_generator(); root=self.run_parent/p.run_id
             run=ControlRun(rid,contract_id,ControlState.QUEUED,p.session_id,str(root),self._clock())
             self._contracts[contract_id]=contract.consumed_copy(); self._runs[rid]=run
-            future=self._worker.submit(self._invoke,rid,p,root,contract.profile_document,owner_authorization,owner_authorization_digest)
+            try:
+                future=self._worker.submit(self._invoke,rid,p,root,contract.profile_document,owner_authorization,owner_authorization_digest)
+            except Exception as exc:
+                self._runs[rid]=run.transition(ControlState.START_FAILED,ended_at=self._clock(),
+                    start_error_type=type(exc).__name__,terminal_evidence=_terminal_evidence(root))
+                raise WorkerSubmissionFailed() from None
             self._futures.append(future); return run
 
     def _transition(self,rid: str,state: ControlState,**changes: object):
@@ -157,6 +165,8 @@ class ProductControlPlane:
             if self._closed:return
             self._closed=True
         terminator=getattr(self._application,"terminate_active",None)
-        if callable(terminator): terminator()
-        self._worker.shutdown(wait=True,cancel_futures=False)
+        try:
+            if callable(terminator): terminator()
+        finally:
+            self._worker.shutdown(wait=True,cancel_futures=False)
 def create_product_control_plane(**kwargs: object)->ProductControlPlane: return ProductControlPlane(**kwargs)

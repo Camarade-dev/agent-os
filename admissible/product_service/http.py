@@ -4,7 +4,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import hmac,json,secrets,threading
 from typing import Any,Callable
 from urllib.parse import urlsplit
-from .control import ActiveRunConflict,ContractConsumed,NoAuthoritativeResult,ProductControlPlane,ResultNotReady,UnknownContract,UnknownControlRun
+from .control import ActiveRunConflict,ContractConsumed,ControlPlaneClosed,NoAuthoritativeResult,ProductControlPlane,ResultNotReady,UnknownContract,UnknownControlRun,WorkerSubmissionFailed
 API_PREFIX="/api/v1"; TOKEN_HEADER="X-Admissible-Control-Token"; OWNER_HEADER="X-Admissible-Owner-Authorization"; DIGEST_HEADER="X-Admissible-Owner-Authorization-Digest"; MAX_REQUEST_BYTES=1024*1024
 def _pairs(pairs: list[tuple[str,Any]]):
     out={}
@@ -78,11 +78,15 @@ class _Handler(BaseHTTPRequestHandler):
             if not isinstance(body["contract_id"],str): self._error(400,"INVALID_CONTRACT_ID"); return
             phrase=self.headers.get(OWNER_HEADER)
             if not phrase: self._error(400,"OWNER_AUTHORIZATION_REQUIRED"); return
-            digest=self.headers.get(DIGEST_HEADER)
-            if digest is None or len(digest)!=64 or any(c not in "0123456789abcdef" for c in digest): self._error(400,"OWNER_AUTHORIZATION_DIGEST_INVALID"); return
+            digests=self.headers.get_all(DIGEST_HEADER,failobj=[])
+            if len(digests)!=1: self._error(400,"OWNER_AUTHORIZATION_DIGEST_INVALID"); return
+            digest=digests[0]
+            if len(digest)!=64 or "," in digest or any(c not in "0123456789abcdef" for c in digest): self._error(400,"OWNER_AUTHORIZATION_DIGEST_INVALID"); return
             try: run=self.server.control_plane.start_run(body["contract_id"],phrase,digest)
             except UnknownContract: self._error(404,"CONTRACT_NOT_FOUND"); return
             except (ContractConsumed,ActiveRunConflict): self._error(409,"RUN_CONFLICT"); return
+            except ControlPlaneClosed: self._error(409,"CONTROL_PLANE_CLOSED"); return
+            except WorkerSubmissionFailed: self._error(503,"START_UNAVAILABLE"); return
             except Exception: self._error(500,"START_UNAVAILABLE"); return
             finally: phrase=""; digest=""
             self._send(202,{"control_run_id":run.control_run_id,"control_state":run.control_state.value}); return
