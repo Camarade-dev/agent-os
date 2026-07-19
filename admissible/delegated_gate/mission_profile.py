@@ -20,7 +20,11 @@ reconstruction never consults a registry after execution.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 import hashlib
+import json
+import os
+from pathlib import Path
 from typing import Any, Mapping
 
 from admissible.delegated_gate.canonical import (
@@ -37,6 +41,7 @@ from admissible.delegated_gate.models import EvidenceKind, VerificationCommand
 
 
 MISSION_PROFILE_SCHEMA_VERSION = "admissible_native_mission_profile_v1"
+MISSION_PROFILE_SCHEMA_VERSION_V2 = "admissible_native_mission_profile_v2"
 # The one authorized one-shot budget shape:
 # (provider invocations, native attempts, repair rounds, auditors, retries).
 ONE_SHOT_PROFILE_BUDGETS: tuple[int, int, int, int, int] = (1, 1, 0, 0, 0)
@@ -44,6 +49,253 @@ ONE_SHOT_PROFILE_BUDGETS: tuple[int, int, int, int, int] = (1, 1, 0, 0, 0)
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+class WorkspaceSourceKind(str, Enum):
+    REGISTERED_FIXTURE = "REGISTERED_FIXTURE"
+    EXISTING_LOCAL_GIT_REPOSITORY = "EXISTING_LOCAL_GIT_REPOSITORY"
+
+
+class VerificationMode(str, Enum):
+    OBSERVED_ONLY = "OBSERVED_ONLY"
+    FROZEN_BEHAVIORAL = "FROZEN_BEHAVIORAL"
+
+
+@dataclass(frozen=True)
+class WorkspaceSourceAuthority:
+    """Immutable authority for the only two v0 workspace-source kinds."""
+
+    kind: WorkspaceSourceKind
+    fixture_id: str | None = None
+    fixture_version: int | None = None
+    local_repository_path: str | None = None
+
+    def validated(self) -> "WorkspaceSourceAuthority":
+        if not isinstance(self.kind, WorkspaceSourceKind):
+            raise ValueError("workspace source kind is invalid")
+        if self.kind is WorkspaceSourceKind.REGISTERED_FIXTURE:
+            require_identifier(self.fixture_id, "workspace source fixture_id")
+            require_strict_int(
+                self.fixture_version,
+                "workspace source fixture_version",
+                minimum=1,
+                maximum=1_000_000,
+            )
+            if self.local_repository_path is not None:
+                raise ValueError("registered fixture source cannot carry a local repository path")
+        else:
+            if self.fixture_id is not None or self.fixture_version is not None:
+                raise ValueError("local repository source cannot carry fixture authority")
+            if not isinstance(self.local_repository_path, str) or not self.local_repository_path:
+                raise ValueError("local repository source path is required")
+            path = Path(self.local_repository_path)
+            canonical = Path(os.path.abspath(os.fspath(path)))
+            if not path.is_absolute() or str(canonical) != self.local_repository_path:
+                raise ValueError("local repository source path must be canonical and absolute")
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind.value,
+            "fixture_id": self.fixture_id,
+            "fixture_version": self.fixture_version,
+            "local_repository_path": self.local_repository_path,
+        }
+
+    @property
+    def identity_fingerprint(self) -> str:
+        return fingerprint(self.to_dict())
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "WorkspaceSourceAuthority":
+        require_exact_keys(
+            data,
+            {"kind", "fixture_id", "fixture_version", "local_repository_path"},
+            "workspace source authority",
+        )
+        try:
+            kind = WorkspaceSourceKind(data["kind"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("workspace source kind is invalid") from exc
+        return cls(
+            kind=kind,
+            fixture_id=data["fixture_id"],
+            fixture_version=data["fixture_version"],
+            local_repository_path=data["local_repository_path"],
+        ).validated()
+
+
+@dataclass(frozen=True)
+class GitEndStatePolicy:
+    """Profile-owned Git/material eligibility policy for one strict attempt."""
+
+    required_commits_added: int
+    required_complete_commit_message: str | None
+    final_worktree_clean: bool
+    final_index_clean: bool
+    final_remotes_absent: bool
+    required_material_paths: tuple[str, ...]
+
+    def validated(self) -> "GitEndStatePolicy":
+        # G1 deliberately does not broaden native execution to arbitrary
+        # histories: every runtime mission still requires exactly one commit.
+        require_strict_int(
+            self.required_commits_added,
+            "required commits added",
+            minimum=1,
+            maximum=1,
+        )
+        if self.required_complete_commit_message is not None:
+            require_nonempty_text(
+                self.required_complete_commit_message,
+                "required complete commit message",
+                max_bytes=1024,
+            )
+            if "\n" in self.required_complete_commit_message or "\r" in self.required_complete_commit_message:
+                raise ValueError("required complete commit message must be one exact single line")
+        for name in ("final_worktree_clean", "final_index_clean", "final_remotes_absent"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be a boolean")
+        if not isinstance(self.required_material_paths, tuple) or not self.required_material_paths:
+            raise ValueError("required material paths must be a non-empty ordered tuple")
+        for path in self.required_material_paths:
+            require_safe_relative_path(path, "required material path")
+        if len(set(self.required_material_paths)) != len(self.required_material_paths):
+            raise ValueError("required material paths must be unique")
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "required_commits_added": self.required_commits_added,
+            "required_complete_commit_message": self.required_complete_commit_message,
+            "final_worktree_clean": self.final_worktree_clean,
+            "final_index_clean": self.final_index_clean,
+            "final_remotes_absent": self.final_remotes_absent,
+            "required_material_paths": list(self.required_material_paths),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "GitEndStatePolicy":
+        require_exact_keys(data, set(cls.__dataclass_fields__), "Git end-state policy")
+        return cls(
+            required_commits_added=data["required_commits_added"],
+            required_complete_commit_message=data["required_complete_commit_message"],
+            final_worktree_clean=data["final_worktree_clean"],
+            final_index_clean=data["final_index_clean"],
+            final_remotes_absent=data["final_remotes_absent"],
+            required_material_paths=require_string_list(
+                data["required_material_paths"], "required material paths"
+            ),
+        ).validated()
+
+
+@dataclass(frozen=True)
+class VerificationAuthority:
+    """Explicit observed-only or owner-frozen behavioral authority."""
+
+    mode: VerificationMode
+    verifier_source: str | None
+    verifier_source_sha256: str | None
+    verifier_timeout_seconds: int | None
+    verifier_output_limit_bytes: int | None
+    disclose_complete_source: bool
+
+    def validated(self) -> "VerificationAuthority":
+        if not isinstance(self.mode, VerificationMode):
+            raise ValueError("verification mode is invalid")
+        if not isinstance(self.disclose_complete_source, bool):
+            raise ValueError("verifier disclosure policy must be boolean")
+        values = (
+            self.verifier_source,
+            self.verifier_source_sha256,
+            self.verifier_timeout_seconds,
+            self.verifier_output_limit_bytes,
+        )
+        if self.mode is VerificationMode.OBSERVED_ONLY:
+            if any(value is not None for value in values) or self.disclose_complete_source:
+                raise ValueError("observed-only verification cannot carry behavioral verifier authority")
+            return self
+        if any(value is None for value in values):
+            raise ValueError("frozen behavioral verification requires source, digest, and bounds")
+        require_nonempty_text(self.verifier_source, "verifier source", max_bytes=262144)
+        require_sha256(self.verifier_source_sha256, "verifier source digest")
+        if self.verifier_source_sha256 != _sha256_text(self.verifier_source):
+            raise ValueError("verifier source digest contradicts the embedded source")
+        require_strict_int(
+            self.verifier_timeout_seconds, "verifier timeout", minimum=1, maximum=600
+        )
+        require_strict_int(
+            self.verifier_output_limit_bytes,
+            "verifier output limit",
+            minimum=1,
+            maximum=1024 * 1024,
+        )
+        if not self.disclose_complete_source:
+            raise ValueError("runtime frozen behavioral verifier source must be owner-visible")
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode.value,
+            "verifier_source": self.verifier_source,
+            "verifier_source_sha256": self.verifier_source_sha256,
+            "verifier_timeout_seconds": self.verifier_timeout_seconds,
+            "verifier_output_limit_bytes": self.verifier_output_limit_bytes,
+            "disclose_complete_source": self.disclose_complete_source,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "VerificationAuthority":
+        require_exact_keys(data, set(cls.__dataclass_fields__), "verification authority")
+        try:
+            mode = VerificationMode(data["mode"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("verification mode is invalid") from exc
+        return cls(
+            mode=mode,
+            verifier_source=data["verifier_source"],
+            verifier_source_sha256=data["verifier_source_sha256"],
+            verifier_timeout_seconds=data["verifier_timeout_seconds"],
+            verifier_output_limit_bytes=data["verifier_output_limit_bytes"],
+            disclose_complete_source=data["disclose_complete_source"],
+        ).validated()
+
+
+@dataclass(frozen=True)
+class RuntimePromptAuthority:
+    """Execution-relevant effect and stop authority rendered to the agent."""
+
+    permitted_effects: tuple[str, ...]
+    forbidden_effects: tuple[str, ...]
+    stop_clause: str
+
+    def validated(self) -> "RuntimePromptAuthority":
+        for name in ("permitted_effects", "forbidden_effects"):
+            values = getattr(self, name)
+            if not isinstance(values, tuple) or not values:
+                raise ValueError(f"{name} must be a non-empty ordered tuple")
+            for value in values:
+                require_nonempty_text(value, name, max_bytes=2048)
+            if len(set(values)) != len(values):
+                raise ValueError(f"{name} must be unique")
+        require_nonempty_text(self.stop_clause, "runtime stop clause", max_bytes=4096)
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "permitted_effects": list(self.permitted_effects),
+            "forbidden_effects": list(self.forbidden_effects),
+            "stop_clause": self.stop_clause,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "RuntimePromptAuthority":
+        require_exact_keys(data, set(cls.__dataclass_fields__), "runtime prompt authority")
+        return cls(
+            permitted_effects=require_string_list(data["permitted_effects"], "permitted effects"),
+            forbidden_effects=require_string_list(data["forbidden_effects"], "forbidden effects"),
+            stop_clause=data["stop_clause"],
+        ).validated()
 
 
 @dataclass(frozen=True)
@@ -100,8 +352,8 @@ class NativeMissionProfile:
 
     schema_version: str
     profile_id: str
-    fixture_id: str
-    fixture_version: int
+    fixture_id: str | None
+    fixture_version: int | None
     run_id: str
     session_id: str
     gate_id: str
@@ -111,39 +363,150 @@ class NativeMissionProfile:
     gate_clauses: tuple[tuple[str, str], ...]
     required_evidence_kinds: tuple[str, ...]
     checkpoint_commands: tuple[ProfileCheckpointCommand, ...]
-    required_commit_message: str
+    required_commit_message: str | None
     required_material_paths: tuple[str, ...]
     completion_conditions_text: str
-    verifier_source: str
-    verifier_source_sha256: str
-    verifier_timeout_seconds: int
-    verifier_output_limit_bytes: int
+    verifier_source: str | None
+    verifier_source_sha256: str | None
+    verifier_timeout_seconds: int | None
+    verifier_output_limit_bytes: int | None
     budgets: tuple[int, int, int, int, int]
     timeout_seconds: int
     stdout_byte_limit: int
     stderr_byte_limit: int
     model: str
-    fixture_initial_commit_message: str
+    fixture_initial_commit_message: str | None
     profile_fingerprint: str
+    workspace_source: WorkspaceSourceAuthority | None = None
+    git_end_state_policy: GitEndStatePolicy | None = None
+    verification: VerificationAuthority | None = None
+    runtime_prompt: RuntimePromptAuthority | None = None
 
     def _body(self) -> dict[str, Any]:
         """The complete canonical profile body, fingerprint field excluded."""
 
         data = dict(self.__dict__)
+        if self.schema_version == MISSION_PROFILE_SCHEMA_VERSION_V2:
+            for key in (
+                "fixture_id",
+                "fixture_version",
+                "required_commit_message",
+                "required_material_paths",
+                "verifier_source",
+                "verifier_source_sha256",
+                "verifier_timeout_seconds",
+                "verifier_output_limit_bytes",
+                "fixture_initial_commit_message",
+            ):
+                data.pop(key)
+            data["workspace_source"] = self.workspace_source.to_dict()
+            data["git_end_state_policy"] = self.git_end_state_policy.to_dict()
+            data["verification"] = self.verification.to_dict()
+            data["runtime_prompt"] = self.runtime_prompt.to_dict()
+        else:
+            for key in (
+                "workspace_source",
+                "git_end_state_policy",
+                "verification",
+                "runtime_prompt",
+            ):
+                data.pop(key)
         data["gate_clauses"] = [list(clause) for clause in self.gate_clauses]
         data["required_evidence_kinds"] = list(self.required_evidence_kinds)
         data["checkpoint_commands"] = [command.to_dict() for command in self.checkpoint_commands]
-        data["required_material_paths"] = list(self.required_material_paths)
+        if self.schema_version == MISSION_PROFILE_SCHEMA_VERSION:
+            data["required_material_paths"] = list(self.required_material_paths)
         data["budgets"] = list(self.budgets)
         data.pop("profile_fingerprint")
         return data
 
+    @property
+    def is_runtime_profile(self) -> bool:
+        return self.schema_version == MISSION_PROFILE_SCHEMA_VERSION_V2
+
+    @property
+    def effective_workspace_source(self) -> WorkspaceSourceAuthority:
+        if self.workspace_source is not None:
+            return self.workspace_source.validated()
+        return WorkspaceSourceAuthority(
+            kind=WorkspaceSourceKind.REGISTERED_FIXTURE,
+            fixture_id=self.fixture_id,
+            fixture_version=self.fixture_version,
+        ).validated()
+
+    @property
+    def effective_git_end_state_policy(self) -> GitEndStatePolicy:
+        if self.git_end_state_policy is not None:
+            return self.git_end_state_policy.validated()
+        return GitEndStatePolicy(
+            required_commits_added=1,
+            required_complete_commit_message=self.required_commit_message,
+            final_worktree_clean=True,
+            final_index_clean=True,
+            final_remotes_absent=True,
+            required_material_paths=self.required_material_paths,
+        ).validated()
+
+    @property
+    def verification_mode(self) -> VerificationMode:
+        return self.verification.mode if self.verification is not None else VerificationMode.FROZEN_BEHAVIORAL
+
     def validated(self) -> "NativeMissionProfile":
-        if self.schema_version != MISSION_PROFILE_SCHEMA_VERSION:
+        if self.schema_version not in {
+            MISSION_PROFILE_SCHEMA_VERSION,
+            MISSION_PROFILE_SCHEMA_VERSION_V2,
+        }:
             raise ValueError("unsupported native mission profile schema")
         require_identifier(self.profile_id, "profile_id")
-        require_identifier(self.fixture_id, "profile fixture_id")
-        require_strict_int(self.fixture_version, "profile fixture_version", minimum=1, maximum=1_000_000)
+        if self.schema_version == MISSION_PROFILE_SCHEMA_VERSION:
+            require_identifier(self.fixture_id, "profile fixture_id")
+            require_strict_int(
+                self.fixture_version, "profile fixture_version", minimum=1, maximum=1_000_000
+            )
+            if any(
+                value is not None
+                for value in (
+                    self.workspace_source,
+                    self.git_end_state_policy,
+                    self.verification,
+                    self.runtime_prompt,
+                )
+            ):
+                raise ValueError("v1 profile cannot carry v2 runtime authority")
+        else:
+            if not isinstance(self.workspace_source, WorkspaceSourceAuthority):
+                raise ValueError("v2 profile must carry workspace source authority")
+            if not isinstance(self.git_end_state_policy, GitEndStatePolicy):
+                raise ValueError("v2 profile must carry Git end-state authority")
+            if not isinstance(self.verification, VerificationAuthority):
+                raise ValueError("v2 profile must carry verification authority")
+            if not isinstance(self.runtime_prompt, RuntimePromptAuthority):
+                raise ValueError("v2 profile must carry runtime prompt authority")
+            source = self.workspace_source.validated()
+            policy = self.git_end_state_policy.validated()
+            verification = self.verification.validated()
+            self.runtime_prompt.validated()
+            if self.fixture_id != source.fixture_id or self.fixture_version != source.fixture_version:
+                raise ValueError("internal v2 fixture mirrors contradict workspace source authority")
+            if self.required_commit_message != policy.required_complete_commit_message:
+                raise ValueError("internal v2 commit-message mirror contradicts Git policy")
+            if self.required_material_paths != policy.required_material_paths:
+                raise ValueError("internal v2 material-path mirror contradicts Git policy")
+            expected_verifier = (
+                verification.verifier_source,
+                verification.verifier_source_sha256,
+                verification.verifier_timeout_seconds,
+                verification.verifier_output_limit_bytes,
+            )
+            if (
+                self.verifier_source,
+                self.verifier_source_sha256,
+                self.verifier_timeout_seconds,
+                self.verifier_output_limit_bytes,
+            ) != expected_verifier:
+                raise ValueError("internal v2 verifier mirrors contradict verification authority")
+            if self.fixture_initial_commit_message is not None:
+                raise ValueError("v2 initialized commit identity is observed into the payload, not profile-supplied")
         require_identifier(self.run_id, "profile run_id")
         require_identifier(self.session_id, "profile session_id")
         require_identifier(self.gate_id, "profile gate_id")
@@ -170,7 +533,9 @@ class NativeMissionProfile:
                 raise ValueError("profile evidence kind is not a known evidence kind")
         if len(set(self.required_evidence_kinds)) != len(self.required_evidence_kinds):
             raise ValueError("profile evidence kinds must be unique")
-        if not isinstance(self.checkpoint_commands, tuple) or not self.checkpoint_commands:
+        if not isinstance(self.checkpoint_commands, tuple):
+            raise ValueError("profile checkpoint commands must be an ordered tuple")
+        if self.schema_version == MISSION_PROFILE_SCHEMA_VERSION and not self.checkpoint_commands:
             raise ValueError("profile checkpoint commands must be a non-empty ordered tuple")
         command_ids: list[str] = []
         for command in self.checkpoint_commands:
@@ -180,9 +545,15 @@ class NativeMissionProfile:
             command_ids.append(command.command_id)
         if len(set(command_ids)) != len(command_ids):
             raise ValueError("profile checkpoint command identities must be unique")
-        require_nonempty_text(self.required_commit_message, "profile commit message", max_bytes=1024)
-        if "\n" in self.required_commit_message or "\r" in self.required_commit_message:
-            raise ValueError("profile commit message must be one exact single line")
+        has_command_evidence = EvidenceKind.VERIFICATION_COMMAND.value in self.required_evidence_kinds
+        if bool(self.checkpoint_commands) != has_command_evidence:
+            raise ValueError(
+                "profile checkpoint commands and verification-command evidence authority must agree"
+            )
+        if self.required_commit_message is not None:
+            require_nonempty_text(self.required_commit_message, "profile commit message", max_bytes=1024)
+            if "\n" in self.required_commit_message or "\r" in self.required_commit_message:
+                raise ValueError("profile commit message must be one exact single line")
         if not isinstance(self.required_material_paths, tuple) or not self.required_material_paths:
             raise ValueError("profile material paths must be a non-empty ordered tuple")
         for path in self.required_material_paths:
@@ -190,14 +561,20 @@ class NativeMissionProfile:
         if len(set(self.required_material_paths)) != len(self.required_material_paths):
             raise ValueError("profile material paths must be unique")
         require_nonempty_text(self.completion_conditions_text, "profile completion conditions", max_bytes=16384)
-        require_nonempty_text(self.verifier_source, "profile verifier source", max_bytes=262144)
-        require_sha256(self.verifier_source_sha256, "profile verifier source digest")
-        if self.verifier_source_sha256 != _sha256_text(self.verifier_source):
-            raise ValueError("profile verifier source digest contradicts the embedded source")
-        require_strict_int(self.verifier_timeout_seconds, "profile verifier timeout", minimum=1, maximum=600)
-        require_strict_int(
-            self.verifier_output_limit_bytes, "profile verifier output limit", minimum=1, maximum=1024 * 1024
-        )
+        if self.schema_version == MISSION_PROFILE_SCHEMA_VERSION:
+            require_nonempty_text(self.verifier_source, "profile verifier source", max_bytes=262144)
+            require_sha256(self.verifier_source_sha256, "profile verifier source digest")
+            if self.verifier_source_sha256 != _sha256_text(self.verifier_source):
+                raise ValueError("profile verifier source digest contradicts the embedded source")
+            require_strict_int(
+                self.verifier_timeout_seconds, "profile verifier timeout", minimum=1, maximum=600
+            )
+            require_strict_int(
+                self.verifier_output_limit_bytes,
+                "profile verifier output limit",
+                minimum=1,
+                maximum=1024 * 1024,
+            )
         if not isinstance(self.budgets, tuple) or len(self.budgets) != 5:
             raise ValueError("profile budgets must be a five-item ordered tuple")
         for value in self.budgets:
@@ -208,11 +585,14 @@ class NativeMissionProfile:
         require_strict_int(self.stdout_byte_limit, "profile stdout limit", minimum=1, maximum=16 * 1024 * 1024)
         require_strict_int(self.stderr_byte_limit, "profile stderr limit", minimum=1, maximum=16 * 1024 * 1024)
         require_nonempty_text(self.model, "profile model", max_bytes=256)
-        require_nonempty_text(
-            self.fixture_initial_commit_message, "profile fixture initial commit message", max_bytes=1024
-        )
-        if "\n" in self.fixture_initial_commit_message or "\r" in self.fixture_initial_commit_message:
-            raise ValueError("profile fixture initial commit message must be one exact single line")
+        if self.schema_version == MISSION_PROFILE_SCHEMA_VERSION:
+            require_nonempty_text(
+                self.fixture_initial_commit_message,
+                "profile fixture initial commit message",
+                max_bytes=1024,
+            )
+            if "\n" in self.fixture_initial_commit_message or "\r" in self.fixture_initial_commit_message:
+                raise ValueError("profile fixture initial commit message must be one exact single line")
         require_sha256(self.profile_fingerprint, "profile fingerprint")
         if fingerprint(self._body()) != self.profile_fingerprint:
             raise ValueError("native mission profile fingerprint mismatch")
@@ -225,7 +605,47 @@ class NativeMissionProfile:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "NativeMissionProfile":
-        require_exact_keys(data, set(cls.__dataclass_fields__), "native mission profile")
+        if not isinstance(data, Mapping):
+            raise ValueError("native mission profile must be a JSON object")
+        if "schema_version" not in data:
+            raise ValueError("native mission profile keys are incomplete")
+        schema = data.get("schema_version")
+        v2_fields = {
+            "schema_version",
+            "profile_id",
+            "run_id",
+            "session_id",
+            "gate_id",
+            "mission_id",
+            "mission_text",
+            "gate_objective",
+            "gate_clauses",
+            "required_evidence_kinds",
+            "checkpoint_commands",
+            "completion_conditions_text",
+            "budgets",
+            "timeout_seconds",
+            "stdout_byte_limit",
+            "stderr_byte_limit",
+            "model",
+            "workspace_source",
+            "git_end_state_policy",
+            "verification",
+            "runtime_prompt",
+            "profile_fingerprint",
+        }
+        v1_fields = set(cls.__dataclass_fields__) - {
+            "workspace_source",
+            "git_end_state_policy",
+            "verification",
+            "runtime_prompt",
+        }
+        if schema == MISSION_PROFILE_SCHEMA_VERSION:
+            require_exact_keys(data, v1_fields, "native mission profile v1")
+        elif schema == MISSION_PROFILE_SCHEMA_VERSION_V2:
+            require_exact_keys(data, v2_fields, "native mission profile v2")
+        else:
+            raise ValueError("unsupported native mission profile schema")
         values = dict(data)
         raw_clauses = data["gate_clauses"]
         if not isinstance(raw_clauses, list) or any(
@@ -238,18 +658,55 @@ class NativeMissionProfile:
             data["required_evidence_kinds"], "profile evidence kinds"
         )
         raw_commands = data["checkpoint_commands"]
-        if not isinstance(raw_commands, list) or not raw_commands:
-            raise ValueError("profile checkpoint commands must be a non-empty ordered array")
+        if not isinstance(raw_commands, list) or (
+            schema == MISSION_PROFILE_SCHEMA_VERSION and not raw_commands
+        ):
+            raise ValueError("profile checkpoint commands must be an ordered array")
         values["checkpoint_commands"] = tuple(
             ProfileCheckpointCommand.from_dict(item) for item in raw_commands
-        )
-        values["required_material_paths"] = require_string_list(
-            data["required_material_paths"], "profile material paths"
         )
         raw_budgets = data["budgets"]
         if not isinstance(raw_budgets, list) or len(raw_budgets) != 5:
             raise ValueError("profile budgets must be a five-item ordered array")
         values["budgets"] = tuple(raw_budgets)
+        if schema == MISSION_PROFILE_SCHEMA_VERSION:
+            values["required_material_paths"] = require_string_list(
+                data["required_material_paths"], "profile material paths"
+            )
+            values.update(
+                workspace_source=None,
+                git_end_state_policy=None,
+                verification=None,
+                runtime_prompt=None,
+            )
+        else:
+            for key in (
+                "workspace_source",
+                "git_end_state_policy",
+                "verification",
+                "runtime_prompt",
+            ):
+                if not isinstance(data[key], Mapping):
+                    raise ValueError(f"profile {key} must be a canonical object")
+            source = WorkspaceSourceAuthority.from_dict(data["workspace_source"])
+            policy = GitEndStatePolicy.from_dict(data["git_end_state_policy"])
+            verification = VerificationAuthority.from_dict(data["verification"])
+            runtime_prompt = RuntimePromptAuthority.from_dict(data["runtime_prompt"])
+            values.update(
+                workspace_source=source,
+                git_end_state_policy=policy,
+                verification=verification,
+                runtime_prompt=runtime_prompt,
+                fixture_id=source.fixture_id,
+                fixture_version=source.fixture_version,
+                required_commit_message=policy.required_complete_commit_message,
+                required_material_paths=policy.required_material_paths,
+                verifier_source=verification.verifier_source,
+                verifier_source_sha256=verification.verifier_source_sha256,
+                verifier_timeout_seconds=verification.verifier_timeout_seconds,
+                verifier_output_limit_bytes=verification.verifier_output_limit_bytes,
+                fixture_initial_commit_message=None,
+            )
         return cls(**values).validated()
 
 
@@ -260,14 +717,88 @@ def create_native_mission_profile(**values: Any) -> NativeMissionProfile:
     fingerprint field excluded, so it can never participate in its own input.
     """
 
+    schema_version = values.pop("schema_version", MISSION_PROFILE_SCHEMA_VERSION)
+    if schema_version == MISSION_PROFILE_SCHEMA_VERSION_V2:
+        source = values.get("workspace_source")
+        policy = values.get("git_end_state_policy")
+        verification = values.get("verification")
+        runtime_prompt = values.get("runtime_prompt")
+        if isinstance(source, Mapping):
+            source = WorkspaceSourceAuthority.from_dict(source)
+        if isinstance(policy, Mapping):
+            policy = GitEndStatePolicy.from_dict(policy)
+        if isinstance(verification, Mapping):
+            verification = VerificationAuthority.from_dict(verification)
+        if isinstance(runtime_prompt, Mapping):
+            runtime_prompt = RuntimePromptAuthority.from_dict(runtime_prompt)
+        if not all(
+            (
+                isinstance(source, WorkspaceSourceAuthority),
+                isinstance(policy, GitEndStatePolicy),
+                isinstance(verification, VerificationAuthority),
+                isinstance(runtime_prompt, RuntimePromptAuthority),
+            )
+        ):
+            raise ValueError("v2 profile requires complete nested runtime authority")
+        values.update(
+            workspace_source=source,
+            git_end_state_policy=policy,
+            verification=verification,
+            runtime_prompt=runtime_prompt,
+            fixture_id=source.fixture_id,
+            fixture_version=source.fixture_version,
+            required_commit_message=policy.required_complete_commit_message,
+            required_material_paths=policy.required_material_paths,
+            verifier_source=verification.verifier_source,
+            verifier_source_sha256=verification.verifier_source_sha256,
+            verifier_timeout_seconds=verification.verifier_timeout_seconds,
+            verifier_output_limit_bytes=verification.verifier_output_limit_bytes,
+            fixture_initial_commit_message=None,
+        )
+    elif schema_version != MISSION_PROFILE_SCHEMA_VERSION:
+        raise ValueError("unsupported native mission profile schema")
     provisional = NativeMissionProfile(
-        schema_version=MISSION_PROFILE_SCHEMA_VERSION,
+        schema_version=schema_version,
         profile_fingerprint="0" * 64,
         **values,
     )
     return NativeMissionProfile(
         **{**provisional.__dict__, "profile_fingerprint": fingerprint(provisional._body())}
     ).validated()
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON field: {key}")
+        result[key] = value
+    return result
+
+
+def load_native_mission_profile_document(document_path: str | Path) -> NativeMissionProfile:
+    """Load one exact, immutable runtime-profile JSON document fail closed."""
+
+    path = Path(document_path)
+    if not path.is_absolute():
+        raise ValueError("profile document path must be absolute")
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"profile document is unreadable: {exc}") from exc
+    try:
+        parsed = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"profile document is not exact UTF-8 JSON: {exc}") from exc
+    if not isinstance(parsed, Mapping):
+        raise ValueError("profile document root must be one JSON object")
+    profile = NativeMissionProfile.from_dict(parsed)
+    if profile.schema_version != MISSION_PROFILE_SCHEMA_VERSION_V2:
+        raise ValueError("runtime profile document must use the v2 schema")
+    # Canonical validation is intentionally semantic: the supplied document
+    # bytes remain immutable, while the parsed object's fingerprint is derived
+    # from exact canonical JSON and must already match.
+    return profile
 
 
 # ---------------------------------------------------------------------------
@@ -1102,6 +1633,7 @@ __all__ = [
     "FLAGSHIP_REQUIRED_COMMIT_MESSAGE",
     "FLAGSHIP_VERIFIER_SOURCE",
     "MISSION_PROFILE_SCHEMA_VERSION",
+    "MISSION_PROFILE_SCHEMA_VERSION_V2",
     "ONE_SHOT_PROFILE_BUDGETS",
     "WORKFLOW_RECOVERY_COMPLETION_CONDITIONS_TEXT",
     "WORKFLOW_RECOVERY_MISSION_TEXT",
@@ -1112,6 +1644,13 @@ __all__ = [
     "WORKFLOW_RECOVERY_V2_PROFILE",
     "WORKFLOW_RECOVERY_VERIFIER_SOURCE",
     "NativeMissionProfile",
+    "GitEndStatePolicy",
     "ProfileCheckpointCommand",
+    "RuntimePromptAuthority",
+    "VerificationAuthority",
+    "VerificationMode",
+    "WorkspaceSourceAuthority",
+    "WorkspaceSourceKind",
     "create_native_mission_profile",
+    "load_native_mission_profile_document",
 ]

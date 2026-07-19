@@ -64,6 +64,7 @@ WINDOWS_WHERE_DIAGNOSTIC_SCHEMA_VERSION = "admissible_windows_where_diagnostic_v
 ATTESTATION_CLASS_PACKAGE_BIN = "PACKAGE_BIN_PROVENANCE"
 ATTESTATION_CLASS_WRAPPER_CHAIN = "LOCAL_WRAPPER_CHAIN"
 CAPTURE_ATTEMPT_SCHEMA_VERSION = "admissible_native_capture_attempt_v1"
+CAPTURE_ATTEMPT_SCHEMA_VERSION_V2 = "admissible_native_capture_attempt_v2"
 CAPTURE_EXPECTED_SUCCESS_STATUS = "CHECKPOINT_CAPTURED"
 TERMINAL_SCHEMA_VERSION = "admissible_native_canary_terminal_v1"
 TERMINAL_SCHEMA_VERSION_V2 = "admissible_native_canary_terminal_v2"
@@ -120,6 +121,18 @@ DEFAULT_ENVIRONMENT_ALLOWLIST: tuple[str, ...] = (
     "LOCALAPPDATA", "PATH", "PATHEXT", "SHELL", "SYSTEMROOT", "TEMP", "TMP",
     "TMPDIR", "USERPROFILE",
 )
+_HARDENED_GIT_ENVIRONMENT: dict[str, str] = {
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": "NUL" if os.name == "nt" else os.devnull,
+    "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_NO_LAZY_FETCH": "1",
+    "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_PAGER": "",
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "core.fsmonitor",
+    "GIT_CONFIG_VALUE_0": "false",
+}
 WINDOWS_SHELL_WRAPPER_SUFFIXES = (".bat", ".cmd", ".ps1")
 _FLAG_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])(--[A-Za-z0-9][A-Za-z0-9-]*)")
 _PROBE_LIMIT = 128 * 1024
@@ -455,6 +468,16 @@ class CursorNativeBackendConfig:
         source = os.environ if base is None else base
         allowed = {name.upper() for name in self.environment_allowlist}
         return {key: value for key, value in source.items() if key.upper() in allowed}
+
+
+def _hardened_git_environment(
+    *, base: Mapping[str, str] | None = None
+) -> dict[str, str]:
+    """Return a child-only environment that cannot consult owner Git config."""
+
+    environment = dict(os.environ if base is None else base)
+    environment.update(_HARDENED_GIT_ENVIRONMENT)
+    return environment
 
 
 @dataclass(frozen=True)
@@ -2525,7 +2548,7 @@ class NativeExecutionResult:
         data.pop("result_fingerprint")
         return data
 
-    def validated(self) -> "NativeExecutionResult":
+    def validated(self, *, harden_git: bool | None = None) -> "NativeExecutionResult":
         if self.schema_version != RESULT_SCHEMA_VERSION or self.backend_identity != BACKEND_IDENTITY: raise ValueError("unsupported native execution result")
         require_sha256(self.request_fingerprint, "result request fingerprint"); require_identifier(self.invocation_id, "invocation_id")
         if not isinstance(self.status, NativeExecutionStatus): raise ValueError("unknown native result status")
@@ -2566,7 +2589,7 @@ class NativeExecutionResult:
         # These are success-critical Git facts.  A self-fingerprint merely says
         # a record is internally serialised; it is not authority for claims
         # that can be re-observed from the assigned workspace.
-        observed_final = _repository_observation(cwd)
+        observed_final = _repository_observation(cwd, harden_git=harden_git)
         if (
             observed_final.material_tree_hash != self.final_material_tree_hash
             or observed_final.git_head != self.final_git_head
@@ -2576,11 +2599,11 @@ class NativeExecutionResult:
         ):
             raise ValueError("result final workspace/Git observations no longer match the assigned repository")
         if self.initial_git_head is not None and self.final_git_head is not None and self.initial_git_head != self.final_git_head:
-            if not _is_ancestor(cwd, self.initial_git_head, self.final_git_head):
+            if not _is_ancestor(cwd, self.initial_git_head, self.final_git_head, harden_git=harden_git):
                 raise ValueError("result final Git HEAD is outside the initial HEAD ancestry")
-        if self.commits_added != _commits_added(cwd, self.initial_git_head, self.final_git_head):
+        if self.commits_added != _commits_added(cwd, self.initial_git_head, self.final_git_head, harden_git=harden_git):
             raise ValueError("result commit count contradicts the observed Git ancestry")
-        if self.changed_material_files != _changed_files(cwd, self.initial_git_head, self.final_git_head):
+        if self.changed_material_files != _changed_files(cwd, self.initial_git_head, self.final_git_head, harden_git=harden_git):
             raise ValueError("result changed paths contradict the observed Git range")
         require_sha256(self.result_fingerprint, "result fingerprint")
         if fingerprint(self._body()) != self.result_fingerprint: raise ValueError("native result fingerprint mismatch")
@@ -2718,43 +2741,127 @@ def _material_snapshot(root: Path) -> tuple[str, tuple[str, ...]]:
     return digest.hexdigest(), tuple(entry[0] for entry in entries)
 
 
-def _git(repository: Path, *arguments: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+def _is_sanitized_local_repository(repository: Path) -> bool:
+    """Recognize only the exact deterministic target config emitted by G1."""
+
+    config = repository / ".git" / "config"
+    try:
+        if config.stat().st_size > 1024 * 1024:
+            return False
+        data = config.read_bytes()
+    except OSError:
+        return False
+    hooks = (repository / ".git" / "hooks").as_posix()
+    # Markers must byte-match the plain `\t{name} = {value}\n` lines emitted by
+    # the sanitizing target-config renderer.  This helper is defense in depth
+    # for callers without the runtime decision; authority-bearing runtime
+    # observations pass `harden_git` explicitly instead.
+    return all(
+        marker in data
+        for marker in (
+            f"\thooksPath = {hooks}\n".encode("utf-8"),
+            b"\temail = admissible-native@local.invalid\n",
+            b"\tgpgSign = false\n",
+        )
+    )
+
+
+def _git(
+    repository: Path,
+    *arguments: str,
+    timeout: int = 30,
+    harden_git: bool | None = None,
+) -> subprocess.CompletedProcess[str]:
     # Git may opportunistically refresh the index during otherwise observational
     # commands.  The native evidence boundary must not depend on its caller's
     # environment for read-only repository observations.
-    environment = dict(os.environ)
-    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    harden = _is_sanitized_local_repository(repository) if harden_git is None else harden_git
+    if harden:
+        environment = _hardened_git_environment()
+    else:
+        environment = dict(os.environ)
+        environment["GIT_OPTIONAL_LOCKS"] = "0"
     result = subprocess.run(["git", *arguments], cwd=repository, env=environment, shell=False, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
     if len(result.stdout.encode("utf-8")) > 2 * 1024 * 1024 or len(result.stderr.encode("utf-8")) > 2 * 1024 * 1024: raise NativeEvidenceInvalid("Git observation exceeded its output bound")
     return result
 
 
-def _repository_observation(repository: Path) -> _RepositoryObservation:
+def _repository_observation(
+    repository: Path, *, harden_git: bool | None = None
+) -> _RepositoryObservation:
     tree_hash, files = _material_snapshot(repository)
-    root = _git(repository, "rev-parse", "--show-toplevel")
+    root = _git(repository, "rev-parse", "--show-toplevel", harden_git=harden_git)
     if root.returncode != 0 or Path(root.stdout.strip()).resolve() != repository.resolve(): raise NativeEvidenceInvalid("observed repository is not the exact Git root")
-    head_result = _git(repository, "rev-parse", "--verify", "HEAD"); head = head_result.stdout.strip().lower() if head_result.returncode == 0 else None; require_optional_git_oid(head, "observed Git HEAD")
-    status_result = _git(repository, "status", "--porcelain=v1", "--untracked-files=all")
-    remotes_result = _git(repository, "remote")
+    head_result = _git(repository, "rev-parse", "--verify", "HEAD", harden_git=harden_git); head = head_result.stdout.strip().lower() if head_result.returncode == 0 else None; require_optional_git_oid(head, "observed Git HEAD")
+    status_result = _git(repository, "status", "--porcelain=v1", "--untracked-files=all", harden_git=harden_git)
+    remotes_result = _git(repository, "remote", harden_git=harden_git)
     if status_result.returncode != 0 or remotes_result.returncode != 0: raise NativeEvidenceInvalid("Git observation failed")
     message: str | None = None
     if head is not None:
-        message_result = _git(repository, "log", "-1", "--format=%B")
+        message_result = _git(repository, "log", "-1", "--format=%B", harden_git=harden_git)
         if message_result.returncode != 0: raise NativeEvidenceInvalid("Git commit-message observation failed")
         message = message_result.stdout.rstrip("\r\n")
     return _RepositoryObservation(tree_hash, files, head, status_result.stdout, tuple(line for line in remotes_result.stdout.splitlines() if line), message)
 
 
-def _changed_files(repository: Path, initial_head: str | None, final_head: str | None) -> tuple[str, ...]:
+def _repository_authority_fingerprint(
+    repository: Path,
+    observation: _RepositoryObservation,
+    *,
+    harden_git: bool | None = None,
+) -> str:
+    """Bind source material plus Git config, refs, index and remote authority.
+
+    Native execution cannot sandbox a hostile provider globally, so the source
+    repository is observed before and after the process.  Folding these Git
+    control-plane bytes into the existing source-tree evidence fields detects
+    config/ref/index/remote mutation without changing legacy record schemas.
+    """
+
+    def git_path(name: str) -> Path:
+        result = _git(repository, "rev-parse", "--git-path", name, harden_git=harden_git)
+        if result.returncode != 0 or not result.stdout.strip():
+            raise NativeEvidenceInvalid(f"source Git authority path is unavailable: {name}")
+        path = Path(result.stdout.strip())
+        return path if path.is_absolute() else repository / path
+
+    def file_hash_or_absent(path: Path) -> str:
+        if not path.exists():
+            return hashlib.sha256(b"<ABSENT>").hexdigest()
+        safe, _ = _safe_file(path, "source Git authority file")
+        return hashlib.sha256(safe.read_bytes()).hexdigest()
+
+    refs = _git(repository, "for-each-ref", "--format=%(refname)%00%(objectname)", harden_git=harden_git)
+    remotes = _git(repository, "remote", "-v", harden_git=harden_git)
+    if refs.returncode != 0 or remotes.returncode != 0:
+        raise NativeEvidenceInvalid("source Git refs/remotes observation failed")
+    return fingerprint(
+        {
+            "material_tree_hash": observation.material_tree_hash,
+            "git_head": observation.git_head,
+            "git_status": observation.git_status,
+            "git_remotes": list(observation.git_remotes),
+            "remote_configuration": remotes.stdout.splitlines(),
+            "refs_sha256": hashlib.sha256(refs.stdout.encode("utf-8")).hexdigest(),
+            "config_sha256": file_hash_or_absent(git_path("config")),
+            "index_sha256": file_hash_or_absent(git_path("index")),
+        }
+    )
+
+
+def _changed_files(repository: Path, initial_head: str | None, final_head: str | None, *, harden_git: bool | None = None) -> tuple[str, ...]:
     if initial_head is None or final_head is None or initial_head == final_head: return ()
-    result = _git(repository, "diff", "--name-only", initial_head, final_head)
+    result = _git(
+        repository, "diff", "--no-ext-diff", "--no-textconv", "--name-only",
+        initial_head, final_head, harden_git=harden_git,
+    )
     if result.returncode != 0: raise NativeEvidenceInvalid("Git changed-file observation failed")
     return tuple(sorted(line for line in result.stdout.splitlines() if line))
 
 
-def _commits_added(repository: Path, initial_head: str | None, final_head: str | None) -> int:
+def _commits_added(repository: Path, initial_head: str | None, final_head: str | None, *, harden_git: bool | None = None) -> int:
     if initial_head is None or final_head is None or initial_head == final_head: return 0
-    result = _git(repository, "rev-list", "--count", f"{initial_head}..{final_head}")
+    result = _git(repository, "rev-list", "--count", f"{initial_head}..{final_head}", harden_git=harden_git)
     if result.returncode != 0: raise NativeEvidenceInvalid("Git commit-count observation failed")
     try: count = int(result.stdout.strip())
     except ValueError as exc: raise NativeEvidenceInvalid("Git commit-count observation is malformed") from exc
@@ -2762,8 +2869,8 @@ def _commits_added(repository: Path, initial_head: str | None, final_head: str |
     return count
 
 
-def _is_ancestor(repository: Path, initial_head: str, final_head: str) -> bool:
-    result = _git(repository, "merge-base", "--is-ancestor", initial_head, final_head)
+def _is_ancestor(repository: Path, initial_head: str, final_head: str, *, harden_git: bool | None = None) -> bool:
+    result = _git(repository, "merge-base", "--is-ancestor", initial_head, final_head, harden_git=harden_git)
     if result.returncode not in {0, 1}:
         raise NativeEvidenceInvalid("Git ancestry observation failed")
     return result.returncode == 0
@@ -2975,7 +3082,7 @@ def _observe_backend_drift(
     return _BackendDrift(executable, launchers, wrappers, command_resolution, catalog, selected, tuple(diagnostics))
 
 
-def _result_from_observation(observation: NativeProcessObservation, *, backend_attestation_fingerprint: str) -> NativeExecutionResult:
+def _result_from_observation(observation: NativeProcessObservation, *, backend_attestation_fingerprint: str, harden_git: bool | None = None) -> NativeExecutionResult:
     process=dict(observation.process); initial=dict(observation.initial_workspace); final=dict(observation.final_workspace); source=dict(observation.source_observation); parent=dict(observation.parent_observation)
     cleanup_confirmed=process["cleanup_confirmed"]
     status=NativeExecutionStatus.CLEANUP_UNCERTAIN if not cleanup_confirmed else NativeExecutionStatus.TIMED_OUT if process["timed_out"] else NativeExecutionStatus.PROCESS_SUCCEEDED if process["exit_code"]==0 else NativeExecutionStatus.PROCESS_FAILED
@@ -2993,8 +3100,8 @@ def _result_from_observation(observation: NativeProcessObservation, *, backend_a
         observation.stdout_artifact, observation.stderr_artifact, process["output_truncation_occurred"],
         initial["material_tree_hash"], final["material_tree_hash"], initial["git_head"], final["git_head"],
         final["git_status"], tuple(final["git_remotes"]), final["commit_message"],
-        _commits_added(Path(process["cwd"]), initial["git_head"], final["git_head"]),
-        _changed_files(Path(process["cwd"]), initial["git_head"], final["git_head"]),
+        _commits_added(Path(process["cwd"]), initial["git_head"], final["git_head"], harden_git=harden_git),
+        _changed_files(Path(process["cwd"]), initial["git_head"], final["git_head"], harden_git=harden_git),
         source["tree_hash_before"], source["tree_hash_after"], source["git_head_before"], source["git_head_after"],
         source["git_status_before"], source["git_status_after"], source["mutated"],
         tuple(parent["inventory_before"]), tuple(parent["inventory_after"]), tuple(parent["unexpected_sibling_mutations"]),
@@ -3019,8 +3126,8 @@ class _IssuedNativeResultRecord:
 _ISSUED_NATIVE_RESULTS: dict[int, _IssuedNativeResultRecord] = {}
 
 
-def _issue_native_result(result: NativeExecutionResult) -> _IssuedNativeResult:
-    result = result.validated(); handle = _IssuedNativeResult(); identity = id(handle)
+def _issue_native_result(result: NativeExecutionResult, *, harden_git: bool | None = None) -> _IssuedNativeResult:
+    result = result.validated(harden_git=harden_git); handle = _IssuedNativeResult(); identity = id(handle)
     def _cleanup(reference: weakref.ReferenceType[_IssuedNativeResult]) -> None:
         current = _ISSUED_NATIVE_RESULTS.get(identity)
         if current is not None and current.handle_ref is reference: del _ISSUED_NATIVE_RESULTS[identity]
@@ -3041,9 +3148,17 @@ def _consume_issued_native_result(handle: object) -> None:
 
 class NativeDelegatedExecutor:
     """Capture one attested native process and independently observed effects."""
-    def __init__(self, *, config: CursorNativeBackendConfig, process_runner: NativeProcessRunner | None = None, clock: Callable[[], str] = _utc_now, local_attestor: Callable[[CursorNativeBackendConfig], BackendAttestation] | None = None) -> None:
+    def __init__(self, *, config: CursorNativeBackendConfig, process_runner: NativeProcessRunner | None = None, clock: Callable[[], str] = _utc_now, local_attestor: Callable[[CursorNativeBackendConfig], BackendAttestation] | None = None, harden_git_environment: bool = False, git_metadata_inspector: Callable[[Path, bool], None] | None = None) -> None:
+        if not isinstance(harden_git_environment, bool):
+            raise ValueError("Git environment hardening selection must be boolean")
+        if harden_git_environment and git_metadata_inspector is None:
+            raise ValueError("hardened Git execution requires a direct metadata inspector")
+        if git_metadata_inspector is not None and not callable(git_metadata_inspector):
+            raise ValueError("Git metadata inspector must be callable")
         self.config = config; self.process_runner = process_runner or ManagedNativeProcessRunner(); self.clock = clock
         self._local_attestor = local_attestor or _attest_local_backend
+        self.harden_git_environment = harden_git_environment
+        self._git_metadata_inspector = git_metadata_inspector
 
     def attest_local_backend(self) -> BackendAttestation:
         """Explicit authority-bearing local re-attestation; never implicit parse work."""
@@ -3058,8 +3173,12 @@ class NativeDelegatedExecutor:
         source_repository: str | Path, canary_parent: str | Path,
         allowed_parent_children: frozenset[str], evidence_store_root: str | Path,
         artifact_directory: str | Path,
-        required_commit_message: str,
+        required_commit_message: str | None,
         required_material_paths: frozenset[str],
+        required_commits_added: int = 1,
+        final_worktree_clean_required: bool = True,
+        final_index_clean_required: bool = True,
+        final_remotes_absent_required: bool = True,
         execution_store: "AtomicNativeExecutionStore | None" = None,
     ) -> _IssuedNativeResult:
         current = self.attest_local_backend()
@@ -3097,7 +3216,10 @@ class NativeDelegatedExecutor:
             raise NativeEvidenceInvalid("in-memory request differs from the strict durable pre-spawn request")
         evidence_child=evidence_root.relative_to(parent).parts[0]
         measured_parent_exclusions=allowed_parent_children | frozenset({evidence_child})
-        initial = _repository_observation(workspace); source_before = _repository_observation(source); parent_before = _parent_inventory(parent, allowed_children=measured_parent_exclusions)
+        if self._git_metadata_inspector is not None:
+            self._git_metadata_inspector(workspace, True)
+            self._git_metadata_inspector(source, False)
+        initial = _repository_observation(workspace, harden_git=self.harden_git_environment); source_before = _repository_observation(source, harden_git=self.harden_git_environment); source_authority_before = _repository_authority_fingerprint(source, source_before, harden_git=self.harden_git_environment); parent_before = _parent_inventory(parent, allowed_children=measured_parent_exclusions)
         argv = request.backend_attestation.argv(prompt=prompt)
         argv_fingerprint = hashlib.sha256(canonical_bytes(list(argv))).hexdigest()
         reservation = store.create_attempt_reserved(
@@ -3111,8 +3233,11 @@ class NativeDelegatedExecutor:
                 binding=store.load_request_structural(request.session_id, request.gate_id, 0),
                 reservation=reservation, proof=proof, started_at=self.clock(),
             )
+        provider_environment = self.config.build_environment()
+        if self.harden_git_environment:
+            provider_environment = _hardened_git_environment(base=provider_environment)
         invocation = NativeProcessInvocation(
-            argv, str(workspace), self.config.build_environment(), request.timeout_seconds,
+            argv, str(workspace), provider_environment, request.timeout_seconds,
             max(request.stdout_byte_limit, request.stderr_byte_limit), process_started,
         )
         outcome = self.process_runner.run(invocation)
@@ -3126,7 +3251,10 @@ class NativeDelegatedExecutor:
         if post_parent != parent or not _same_directory_identity(post_parent_identity, parent_identity): raise NativeEvidenceInvalid("canary parent identity changed during execution")
         if post_evidence != evidence_root or not _same_mutable_directory_entry(post_evidence_identity, evidence_identity): raise NativeEvidenceInvalid("execution evidence root identity changed during execution")
         if post_artifacts != artifacts or not _same_mutable_directory_entry(post_artifacts_identity, artifacts_identity): raise NativeEvidenceInvalid("native artifact directory identity changed during execution")
-        final = _repository_observation(workspace); source_after = _repository_observation(source); parent_after = _parent_inventory(parent, allowed_children=measured_parent_exclusions)
+        if self._git_metadata_inspector is not None:
+            self._git_metadata_inspector(workspace, True)
+            self._git_metadata_inspector(source, False)
+        final = _repository_observation(workspace, harden_git=self.harden_git_environment); source_after = _repository_observation(source, harden_git=self.harden_git_environment); source_authority_after = _repository_authority_fingerprint(source, source_after, harden_git=self.harden_git_environment); parent_after = _parent_inventory(parent, allowed_children=measured_parent_exclusions)
         stdout_data, stdout_truncated = _bounded(outcome.stdout, request.stdout_byte_limit, outcome.observed_stdout_bytes, outcome.output_truncated)
         stderr_data, stderr_truncated = _bounded(outcome.stderr, request.stderr_byte_limit, outcome.observed_stderr_bytes, outcome.output_truncated)
         prefix = f"{request.session_id}.{request.gate_id}.attempt-{request.execution_attempt_index}"
@@ -3134,7 +3262,7 @@ class NativeDelegatedExecutor:
         stderr_ref = _write_artifact(store_root=evidence_root, artifact_directory=artifacts, artifact_id=f"{prefix}.native.stderr", purpose="stderr", data=stderr_data, truncated=stderr_truncated)
         cleanup_confirmed = outcome.cleanup_confirmed and outcome.cleanup_observation == OBSERVATION_PROVEN_EMPTY and not outcome.orphan_process_ids
         status = NativeExecutionStatus.CLEANUP_UNCERTAIN if not cleanup_confirmed else NativeExecutionStatus.TIMED_OUT if outcome.timed_out else NativeExecutionStatus.PROCESS_SUCCEEDED if outcome.returncode == 0 else NativeExecutionStatus.PROCESS_FAILED
-        source_mutated = source_before.material_tree_hash != source_after.material_tree_hash or source_before.git_head != source_after.git_head or source_before.git_status != source_after.git_status
+        source_mutated = source_authority_before != source_authority_after
         sibling_mutations = tuple(sorted(set(parent_before).symmetric_difference(parent_after)))
         process_data = {
             "started_at": started_record.process_started_at, "ended_at": ended_at,
@@ -3150,7 +3278,7 @@ class NativeDelegatedExecutor:
             request.request_fingerprint, reservation.reservation_fingerprint,
             started_record.process_started_fingerprint, True, process_data, stdout_ref, stderr_ref,
             _repository_observation_dict(initial), _repository_observation_dict(final),
-            {"tree_hash_before":source_before.material_tree_hash,"tree_hash_after":source_after.material_tree_hash,"git_head_before":source_before.git_head,"git_head_after":source_after.git_head,"git_status_before":source_before.git_status,"git_status_after":source_after.git_status,"mutated":source_mutated},
+            {"tree_hash_before":source_authority_before,"tree_hash_after":source_authority_after,"git_head_before":source_before.git_head,"git_head_after":source_after.git_head,"git_status_before":source_before.git_status,"git_status_after":source_after.git_status,"mutated":source_mutated},
             {"inventory_before":list(parent_before),"inventory_after":list(parent_after),"unexpected_sibling_mutations":list(sibling_mutations)},
             "0"*64,
         )
@@ -3176,11 +3304,28 @@ class NativeDelegatedExecutor:
             post_run_wrapper_chain_attestation=post_run_wrapper_chain_attestation,
         )
         process_ok = status is NativeExecutionStatus.PROCESS_SUCCEEDED and not outcome.timed_out and cleanup_confirmed and not outcome.orphan_process_ids
-        commit_ok = final.commit_message == required_commit_message
-        workspace_clean = final.git_status == ""
-        remotes_absent = not final.git_remotes
-        one_commit = _commits_added(workspace, initial.git_head, final.git_head) == 1
-        material_ok = required_material_paths.issubset(set(_changed_files(workspace, initial.git_head, final.git_head)))
+        commit_ok = (
+            required_commit_message is None or final.commit_message == required_commit_message
+        )
+        status_lines = tuple(line for line in final.git_status.splitlines() if line)
+        worktree_is_clean = all(
+            len(line) >= 2 and line[1] == " " and not line.startswith("??")
+            for line in status_lines
+        )
+        index_is_clean = all(
+            len(line) >= 2 and line[0] in {" ", "?"}
+            for line in status_lines
+        )
+        workspace_clean = (
+            (not final_worktree_clean_required or worktree_is_clean)
+            and (not final_index_clean_required or index_is_clean)
+        )
+        remotes_absent = not final.git_remotes or not final_remotes_absent_required
+        one_commit = (
+            _commits_added(workspace, initial.git_head, final.git_head, harden_git=self.harden_git_environment)
+            == required_commits_added
+        )
+        material_ok = required_material_paths.issubset(set(_changed_files(workspace, initial.git_head, final.git_head, harden_git=self.harden_git_environment)))
         boundary_ok = not source_mutated and not sibling_mutations
         reasons: list[str] = []
         if not drift.post_run_eligible: reasons.append("post_run_backend_drift")
@@ -3202,9 +3347,9 @@ class NativeDelegatedExecutor:
         eligibility = store.create_execution_eligibility(eligibility)
         if not eligibility.eligible:
             raise NativeResultIneligible(eligibility)
-        provisional = _result_from_observation(observation, backend_attestation_fingerprint=request.backend_attestation_fingerprint)
-        result = NativeExecutionResult(**{**provisional.__dict__, "result_fingerprint": fingerprint(provisional._body())}).validated()
-        return _issue_native_result(result)
+        provisional = _result_from_observation(observation, backend_attestation_fingerprint=request.backend_attestation_fingerprint, harden_git=self.harden_git_environment)
+        result = NativeExecutionResult(**{**provisional.__dict__, "result_fingerprint": fingerprint(provisional._body())}).validated(harden_git=self.harden_git_environment)
+        return _issue_native_result(result, harden_git=self.harden_git_environment)
 
 
 @dataclass(frozen=True)
@@ -3217,21 +3362,37 @@ class NativeCheckpointCaptureAttempt:
     result_fingerprint: str
     gate_plan_fingerprint: str
     checkpoint_contract_fingerprint: str
-    behavioral_evidence_fingerprint: str
+    behavioral_evidence_fingerprint: str | None
     required_command_ids: tuple[str, ...]
     capture_attempt_id: str
     expected_terminal_status: str
     started_at: str
     state_revision: int
     attempt_fingerprint: str
+    verification_mode: str | None = None
 
     def _body(self) -> dict[str, Any]:
-        data = dict(self.__dict__); data["required_command_ids"] = list(self.required_command_ids); data.pop("attempt_fingerprint"); return data
+        data = dict(self.__dict__); data["required_command_ids"] = list(self.required_command_ids); data.pop("attempt_fingerprint")
+        if self.schema_version == CAPTURE_ATTEMPT_SCHEMA_VERSION:
+            data.pop("verification_mode")
+        return data
     def validated(self) -> "NativeCheckpointCaptureAttempt":
-        if self.schema_version != CAPTURE_ATTEMPT_SCHEMA_VERSION: raise ValueError("unsupported capture attempt schema")
+        if self.schema_version not in {CAPTURE_ATTEMPT_SCHEMA_VERSION,CAPTURE_ATTEMPT_SCHEMA_VERSION_V2}: raise ValueError("unsupported capture attempt schema")
         require_identifier(self.session_id, "capture session ID"); require_identifier(self.gate_id, "capture gate ID"); require_strict_int(self.execution_attempt_index, "capture attempt", minimum=0, maximum=0)
-        for label, value in (("request_fingerprint", self.request_fingerprint), ("result_fingerprint", self.result_fingerprint), ("gate_plan_fingerprint", self.gate_plan_fingerprint), ("checkpoint_contract_fingerprint", self.checkpoint_contract_fingerprint), ("behavioral_evidence_fingerprint", self.behavioral_evidence_fingerprint), ("attempt_fingerprint", self.attempt_fingerprint)): require_sha256(value, label)
-        if not isinstance(self.required_command_ids, tuple) or not self.required_command_ids: raise ValueError("capture attempt requires command identities")
+        for label, value in (("request_fingerprint", self.request_fingerprint), ("result_fingerprint", self.result_fingerprint), ("gate_plan_fingerprint", self.gate_plan_fingerprint), ("checkpoint_contract_fingerprint", self.checkpoint_contract_fingerprint), ("attempt_fingerprint", self.attempt_fingerprint)): require_sha256(value, label)
+        if self.schema_version == CAPTURE_ATTEMPT_SCHEMA_VERSION:
+            require_sha256(self.behavioral_evidence_fingerprint, "behavioral_evidence_fingerprint")
+            if self.verification_mode is not None:
+                raise ValueError("legacy capture attempt cannot invent verification mode")
+        elif self.verification_mode == "OBSERVED_ONLY":
+            if self.behavioral_evidence_fingerprint is not None:
+                raise ValueError("observed-only capture cannot bind behavioral evidence")
+        elif self.verification_mode == "FROZEN_BEHAVIORAL":
+            require_sha256(self.behavioral_evidence_fingerprint, "behavioral_evidence_fingerprint")
+        else:
+            raise ValueError("runtime capture attempt verification mode is invalid")
+        if not isinstance(self.required_command_ids, tuple): raise ValueError("capture attempt command identities must be a tuple")
+        if self.schema_version == CAPTURE_ATTEMPT_SCHEMA_VERSION and not self.required_command_ids: raise ValueError("capture attempt requires command identities")
         for command_id in self.required_command_ids: require_identifier(command_id, "capture command ID")
         if len(set(self.required_command_ids)) != len(self.required_command_ids): raise ValueError("capture command identities must be unique")
         require_identifier(self.capture_attempt_id, "capture attempt ID")
@@ -3243,8 +3404,13 @@ class NativeCheckpointCaptureAttempt:
     def to_dict(self) -> dict[str, Any]: data=self._body(); data["attempt_fingerprint"]=self.attempt_fingerprint; return data
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "NativeCheckpointCaptureAttempt":
-        require_exact_keys(data, set(cls.__dataclass_fields__), "capture attempt")
-        values=dict(data); values["required_command_ids"]=require_string_list(data["required_command_ids"], "capture command IDs")
+        if data.get("schema_version") == CAPTURE_ATTEMPT_SCHEMA_VERSION:
+            require_exact_keys(data, set(cls.__dataclass_fields__) - {"verification_mode"}, "capture attempt")
+            values=dict(data); values["verification_mode"] = None
+        else:
+            require_exact_keys(data, set(cls.__dataclass_fields__), "capture attempt")
+            values=dict(data)
+        values["required_command_ids"]=require_string_list(data["required_command_ids"], "capture command IDs")
         return cls(**values).validated()
 
 
@@ -3557,9 +3723,10 @@ class AtomicNativeExecutionStore:
         eligibility=self.load_execution_eligibility(session_id,gate_id,attempt)
         if not eligibility.eligible: raise NativeEvidenceInvalid("accepted result has ineligible execution evidence")
         self._validate_result_binding(request,result); self._verify_artifact(result.stdout_artifact); self._verify_artifact(result.stderr_artifact); return result
-    def create_capture_attempt(self, *, request: NativeExecutionRequest, result: NativeExecutionResult, gate_plan_fingerprint: str, checkpoint_contract_fingerprint: str, behavioral_evidence_fingerprint: str, required_command_ids: tuple[str, ...], state_revision: int, clock: Callable[[], str] = _utc_now) -> NativeCheckpointCaptureAttempt:
+    def create_capture_attempt(self, *, request: NativeExecutionRequest, result: NativeExecutionResult, gate_plan_fingerprint: str, checkpoint_contract_fingerprint: str, behavioral_evidence_fingerprint: str | None, required_command_ids: tuple[str, ...], state_revision: int, verification_mode: str | None = None, clock: Callable[[], str] = _utc_now) -> NativeCheckpointCaptureAttempt:
         if self.has_capture_attempt(request.session_id,request.gate_id,request.execution_attempt_index): raise NativeResultAlreadyExists("capture attempt is write-once")
-        provisional=NativeCheckpointCaptureAttempt(CAPTURE_ATTEMPT_SCHEMA_VERSION,request.session_id,request.gate_id,0,request.request_fingerprint,result.result_fingerprint,gate_plan_fingerprint,checkpoint_contract_fingerprint,behavioral_evidence_fingerprint,required_command_ids,f"capture:{request.session_id}:{request.gate_id}:0",CAPTURE_EXPECTED_SUCCESS_STATUS,clock(),state_revision,"0"*64)
+        schema = CAPTURE_ATTEMPT_SCHEMA_VERSION if verification_mode is None else CAPTURE_ATTEMPT_SCHEMA_VERSION_V2
+        provisional=NativeCheckpointCaptureAttempt(schema,request.session_id,request.gate_id,0,request.request_fingerprint,result.result_fingerprint,gate_plan_fingerprint,checkpoint_contract_fingerprint,behavioral_evidence_fingerprint,required_command_ids,f"capture:{request.session_id}:{request.gate_id}:0",CAPTURE_EXPECTED_SUCCESS_STATUS,clock(),state_revision,"0"*64,verification_mode)
         item=NativeCheckpointCaptureAttempt(**{**provisional.__dict__,"attempt_fingerprint":fingerprint(provisional._body())}).validated(); path=self._path("capture-attempt",item.session_id,item.gate_id,0)
         with self._lock(item.session_id,item.gate_id,0): self._atomic_create(path,item.to_dict(),operation="capture attempt")
         return self.load_capture_attempt(item.session_id,item.gate_id,0)
@@ -3583,6 +3750,6 @@ class AtomicNativeExecutionStore:
 
 
 __all__ = [
-    "ARTIFACT_SCHEMA_VERSION", "ATTESTATION_CLASS_PACKAGE_BIN", "ATTESTATION_CLASS_WRAPPER_CHAIN", "ATTESTATION_SCHEMA_VERSION", "ATTEMPT_RESERVED_SCHEMA_VERSION", "BACKEND_IDENTITY", "BACKEND_PROTOCOL_VERSION", "CAPTURE_ATTEMPT_SCHEMA_VERSION", "CAPTURE_EXPECTED_SUCCESS_STATUS", "CURSOR_DISCOVERY_COMMAND", "CURSOR_DISCOVERY_MECHANISM", "DEFAULT_ENVIRONMENT_ALLOWLIST", "EXECUTION_ELIGIBILITY_SCHEMA_VERSION", "EXPECTED_CURSOR_PACKAGE_NAME", "NATIVE_PROMPT_HEADER", "PACKAGE_BIN_NON_CLAIMS", "PROCESS_OBSERVATION_SCHEMA_VERSION", "PROCESS_STARTED_SCHEMA_VERSION", "REQUEST_SCHEMA_VERSION", "RESULT_SCHEMA_VERSION", "TERMINAL_SCHEMA_VERSION", "TERMINAL_SCHEMA_VERSION_V2", "WINDOWS_COMMAND_RESOLUTION_SCHEMA_VERSION", "WINDOWS_WHERE_DIAGNOSTIC_SCHEMA_VERSION", "WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION", "WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION_LEGACY_V1", "WRAPPER_CHAIN_BLOCKED_REASON", "WRAPPER_CHAIN_CLAIMS", "WRAPPER_CHAIN_DISCOVERY_MECHANISM", "WRAPPER_CHAIN_NON_CLAIMS", "WRAPPER_CHAIN_READY_REASON",
+    "ARTIFACT_SCHEMA_VERSION", "ATTESTATION_CLASS_PACKAGE_BIN", "ATTESTATION_CLASS_WRAPPER_CHAIN", "ATTESTATION_SCHEMA_VERSION", "ATTEMPT_RESERVED_SCHEMA_VERSION", "BACKEND_IDENTITY", "BACKEND_PROTOCOL_VERSION", "CAPTURE_ATTEMPT_SCHEMA_VERSION", "CAPTURE_ATTEMPT_SCHEMA_VERSION_V2", "CAPTURE_EXPECTED_SUCCESS_STATUS", "CURSOR_DISCOVERY_COMMAND", "CURSOR_DISCOVERY_MECHANISM", "DEFAULT_ENVIRONMENT_ALLOWLIST", "EXECUTION_ELIGIBILITY_SCHEMA_VERSION", "EXPECTED_CURSOR_PACKAGE_NAME", "NATIVE_PROMPT_HEADER", "PACKAGE_BIN_NON_CLAIMS", "PROCESS_OBSERVATION_SCHEMA_VERSION", "PROCESS_STARTED_SCHEMA_VERSION", "REQUEST_SCHEMA_VERSION", "RESULT_SCHEMA_VERSION", "TERMINAL_SCHEMA_VERSION", "TERMINAL_SCHEMA_VERSION_V2", "WINDOWS_COMMAND_RESOLUTION_SCHEMA_VERSION", "WINDOWS_WHERE_DIAGNOSTIC_SCHEMA_VERSION", "WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION", "WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION_LEGACY_V1", "WRAPPER_CHAIN_BLOCKED_REASON", "WRAPPER_CHAIN_CLAIMS", "WRAPPER_CHAIN_DISCOVERY_MECHANISM", "WRAPPER_CHAIN_NON_CLAIMS", "WRAPPER_CHAIN_READY_REASON",
     "AtomicNativeExecutionStore", "BackendAttestation", "CursorInstallationProvenance", "CursorNativeBackendConfig", "CursorWrapperChainResolution", "DeterministicWindowsCommandResolution", "HostWrapperChainDiscovery", "PowerShellCommandCandidate", "PowerShellCommandObservation", "WhereCommandObservation", "WindowsPathCandidate", "WindowsWhereDiagnostic", "WindowsWhereDiagnosticStatus", "WrapperChainBackendAttestation", "WrapperChainDiscovery", "attestation_from_dict", "ManagedNativeProcessRunner", "NativeArtifactReference", "NativeAttemptReserved", "NativeBackendAttestation", "NativeBackendFileAttestation", "NativeCanaryTerminalRecord", "NativeCaptureTerminalStatus", "NativeCheckpointCaptureAttempt", "NativeCommittedButDurabilityUncertain", "NativeDelegatedExecutor", "NativeEvidenceInvalid", "NativeEvidenceNotFound", "NativeExecutionEligibility", "NativeExecutionRequest", "NativeExecutionRequestBinding", "NativeExecutionResult", "NativeExecutionStatus", "NativeExecutionStoreError", "NativeFilesystemIdentity", "NativeLifecycleCounts", "NativePreflightDecision", "NativePreflightStatus", "NativeProcessInvocation", "NativeProcessObservation", "NativeProcessObservationPublicationError", "NativeProcessOutcome", "NativeProcessRunner", "NativeProcessStarted", "NativeProcessStartError", "NativeRequestAlreadyExists", "NativeResultAlreadyExists", "NativeResultIneligible", "preflight_native_cursor",
 ]
