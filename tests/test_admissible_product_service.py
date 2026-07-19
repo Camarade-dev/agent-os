@@ -1,12 +1,12 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from http.client import HTTPConnection
-import json, threading, time
+import json, sys, threading, time
 from pathlib import Path
 from types import SimpleNamespace
 import pytest
 from admissible.product_service import create_loopback_server, create_product_control_plane
-from admissible.product_service.control import ActiveRunConflict, ProductControlPlane, ResultNotReady
+from admissible.product_service.control import ActiveRunConflict, ContractConsumed, ProductControlPlane, ResultNotReady
 from admissible.product_service.models import ControlState
 from admissible.delegated_gate.mission_profile import load_native_mission_profile_document
 from admissible.delegated_gate.native_canary import run_native_mission_application
@@ -217,40 +217,49 @@ def test_status_has_no_summary_redaction_marker_without_product_summary(tmp_path
     p.close()
 
 def test_simultaneous_distinct_contract_starts_are_atomic(tmp_path):
-    contender_count=8; barrier=threading.Barrier(contender_count)
-    entered=threading.Event(); release=threading.Event(); counter_lock=threading.Lock(); invocation_count=0
-    def app(**_kw):
-        nonlocal invocation_count
-        with counter_lock: invocation_count+=1
-        entered.set(); release.wait(5)
-    ids=iter([f"contract-{i}" for i in range(contender_count)]+["control-winner"])
-    p=plane(tmp_path,application=app,id_generator=ids.__next__)
-    contracts=[p.validate_contract(str((tmp_path/f"profile-{i}").resolve()))["contract_id"] for i in range(contender_count)]
-    outcomes=[]; outcome_lock=threading.Lock()
-    def contend(contract_id):
-        barrier.wait()
-        try: outcome=("success",p.start_run(contract_id,"owner-authorization"))
-        except ActiveRunConflict as exc: outcome=("conflict",exc)
-        with outcome_lock: outcomes.append((contract_id,outcome))
-    threads=[threading.Thread(target=contend,args=(cid,),name=f"g2-contender-{i}") for i,cid in enumerate(contracts)]
+    original_switch_interval=sys.getswitchinterval()
     try:
-        for thread in threads: thread.start()
-        for thread in threads: thread.join(3)
-        assert all(not thread.is_alive() for thread in threads)
-        successes=[outcome for _,outcome in outcomes if outcome[0]=="success"]
-        conflicts=[outcome for _,outcome in outcomes if outcome[0]=="conflict"]
-        assert len(successes)==1 and len(conflicts)==7 and entered.wait(1)
-        assert invocation_count==1 and len(p._runs)==1
-        assert sum(contract.consumed for contract in p._contracts.values())==1
-        winning_contract=successes[0][1].contract_id
-        assert all(not p._contracts[cid].consumed for cid in contracts if cid!=winning_contract)
-        release.set(); wait_state(p,successes[0][1].control_run_id,"TERMINAL")
-        assert all(not p._contracts[cid].consumed for cid in contracts if cid!=winning_contract)
+        sys.setswitchinterval(1e-6)
+        for round_number in range(20):
+            contender_count=8; barrier=threading.Barrier(contender_count)
+            entered=threading.Event(); release=threading.Event(); counter_lock=threading.Lock(); invocation_count=0
+            def app(**_kw):
+                nonlocal invocation_count
+                with counter_lock: invocation_count+=1
+                entered.set(); release.wait(5)
+            ids=iter([f"contract-{round_number}-{i}" for i in range(contender_count)]+[f"control-{round_number}-{i}" for i in range(contender_count)])
+            p=plane(tmp_path/f"round-{round_number}",application=app,id_generator=ids.__next__)
+            contracts=[p.validate_contract(str((tmp_path/f"round-{round_number}"/f"profile-{i}").resolve()))["contract_id"] for i in range(contender_count)]
+            outcomes=[]; outcome_lock=threading.Lock()
+            def contend(contract_id):
+                barrier.wait()
+                try: outcome=("success",p.start_run(contract_id,"owner-authorization"))
+                except ActiveRunConflict as exc: outcome=("conflict",exc)
+                except ContractConsumed as exc: outcome=("consumed",exc)
+                with outcome_lock: outcomes.append((contract_id,outcome))
+            threads=[threading.Thread(target=contend,args=(cid,),name=f"g2-contender-{round_number}-{i}") for i,cid in enumerate(contracts)]
+            try:
+                for thread in threads: thread.start()
+                for thread in threads: thread.join(3)
+                assert all(not thread.is_alive() for thread in threads)
+                successes=[outcome for _,outcome in outcomes if outcome[0]=="success"]
+                conflicts=[outcome for _,outcome in outcomes if outcome[0]=="conflict"]
+                consumed=[outcome for _,outcome in outcomes if outcome[0]=="consumed"]
+                assert len(successes)==1 and len(conflicts)==7 and len(consumed)==0 and entered.wait(1)
+                assert invocation_count==1 and len(p._runs)==1
+                assert sum(contract.consumed for contract in p._contracts.values())==1
+                winning_contract=successes[0][1].contract_id
+                assert sum(not p._contracts[cid].consumed for cid in contracts if cid!=winning_contract)==7
+                release.set(); wait_state(p,successes[0][1].control_run_id,"TERMINAL")
+                assert p.status(successes[0][1].control_run_id)["control_state"]=="TERMINAL"
+            finally:
+                release.set()
+                for thread in threads: thread.join(1)
+                p.close()
+            assert all(not thread.is_alive() for thread in threads)
+            assert not any(thread.is_alive() and thread.name.startswith("admissible-g2-worker") for thread in threading.enumerate())
     finally:
-        release.set()
-        for thread in threads: thread.join(1)
-        p.close()
-    assert all(not thread.is_alive() for thread in threads)
+        sys.setswitchinterval(original_switch_interval)
 
 def test_discovery_is_deterministic_and_malformed_sibling_survives(tmp_path):
     class S:
