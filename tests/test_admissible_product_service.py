@@ -149,8 +149,108 @@ def test_result_uses_detail_and_renderer_and_is_not_ready_early(tmp_path):
     c=p.validate_contract(str((tmp_path/"p").resolve())); r=p.start_run(c["contract_id"],"x")
     with pytest.raises(ResultNotReady): p.result(r.control_run_id)
     release.set(); wait_state(p,r.control_run_id,"TERMINAL"); result=p.result(r.control_run_id)
-    assert result=={"result_admission_state":{"verdict":"INCONSISTENT","source":"AUTHORITATIVE_RECONSTRUCTION"}}
+    assert result=={"result_admission_state":{"verdict":"INCONSISTENT","source":"AUTHORITATIVE_RECONSTRUCTION"},
+                    "transport_schema_version":"admissible_product_service_transport_v1",
+                    "transport_redactions":["diagnostics","run_root"]}
     assert [x[0] for x in calls]==["detail","render"]; p.close()
+
+def test_transport_redaction_contract_preserves_g4a_semantics_and_source_mappings(tmp_path):
+    source_result={
+        "schema_version":"admissible_product_read_model_result_v1",
+        "run_root":"C:/private/run", "diagnostics":{"private":"detail"},
+        "result_admission_state":{"verdict":"CONSISTENT","source":"AUTHORITATIVE_RECONSTRUCTION"},
+        "product_verdict":"PASS", "source_status":"AVAILABLE", "truth_status":"RECONSTRUCTED",
+        "consistency_status":"CONSISTENT", "persisted_claims":{"claim":"value"},
+        "presentation_status":"AVAILABLE", "future_g4a_field":{"nested":[1,"two"]},
+    }
+    source_summary={"schema_version":"summary-v1","run_id":"run-1","run_root":"C:/private/run",
+                    "product_verdict":"PASS","presentation_status":"AVAILABLE","future_summary_field":17}
+    original_result={**source_result,"diagnostics":{"private":"detail"},"result_admission_state":dict(source_result["result_admission_state"]),
+                     "persisted_claims":dict(source_result["persisted_claims"]),"future_g4a_field":{"nested":[1,"two"]}}
+    original_summary=dict(source_summary)
+    release=threading.Event()
+    def app(**kw): Path(kw["run_root"]).mkdir(parents=True); release.wait(2)
+    class Summary:
+        def to_json(self): return source_summary
+    p=plane(tmp_path,application=app,summary_loader=lambda *_a,**_k:Summary(),
+            detail_loader=lambda *_a,**_k:object(),result_renderer=lambda _detail:source_result)
+    c=p.validate_contract(str((tmp_path/"p").resolve())); r=p.start_run(c["contract_id"],"x")
+    release.set(); wait_state(p,r.control_run_id,"TERMINAL")
+    assert p.result(r.control_run_id)=={
+        "schema_version":"admissible_product_read_model_result_v1",
+        "result_admission_state":{"verdict":"CONSISTENT","source":"AUTHORITATIVE_RECONSTRUCTION"},
+        "product_verdict":"PASS", "source_status":"AVAILABLE", "truth_status":"RECONSTRUCTED",
+        "consistency_status":"CONSISTENT", "persisted_claims":{"claim":"value"},
+        "presentation_status":"AVAILABLE", "future_g4a_field":{"nested":[1,"two"]},
+        "transport_schema_version":"admissible_product_service_transport_v1",
+        "transport_redactions":["diagnostics","run_root"],
+    }
+    assert p.status(r.control_run_id)["product_summary"]=={
+        "schema_version":"summary-v1","run_id":"run-1","product_verdict":"PASS",
+        "presentation_status":"AVAILABLE","future_summary_field":17}
+    assert p.status(r.control_run_id)["product_summary_transport_redactions"]==["run_root"]
+    assert source_result==original_result and source_summary==original_summary
+    p.close()
+
+def test_status_and_list_summary_redactions_are_adjacent_and_conditional(tmp_path):
+    redacted={"run_id":"redacted","run_root":"hidden","product_verdict":"PASS","future":True}
+    plain={"run_id":"plain","product_verdict":"UNKNOWN","future":False}
+    originals={"redacted":dict(redacted),"plain":dict(plain)}
+    class Summary:
+        def __init__(self,source): self.source=source
+        def to_json(self): return self.source
+    runs=(SimpleNamespace(run_id="plain",run_root="plain"),SimpleNamespace(run_id="redacted",run_root="redacted"))
+    p=plane(tmp_path,run_discovery=lambda _p:SimpleNamespace(runs=runs),
+            summary_loader=lambda root,**_k:Summary(redacted if root=="redacted" else plain))
+    assert p.list_runs()["persisted_runs"]==[
+        {"run_id":"plain","product_verdict":"UNKNOWN","future":False},
+        {"run_id":"redacted","product_verdict":"PASS","future":True,"transport_redactions":["run_root"]},
+    ]
+    assert redacted==originals["redacted"] and plain==originals["plain"]
+    p.close()
+
+def test_status_has_no_summary_redaction_marker_without_product_summary(tmp_path):
+    p=plane(tmp_path,application=lambda **_kw:None); c=p.validate_contract(str((tmp_path/"p").resolve()))
+    run=p.start_run(c["contract_id"],"x"); wait_state(p,run.control_run_id,"TERMINAL")
+    status=p.status(run.control_run_id)
+    assert status["product_summary"] is None and "product_summary_transport_redactions" not in status
+    p.close()
+
+def test_simultaneous_distinct_contract_starts_are_atomic(tmp_path):
+    contender_count=8; barrier=threading.Barrier(contender_count)
+    entered=threading.Event(); release=threading.Event(); counter_lock=threading.Lock(); invocation_count=0
+    def app(**_kw):
+        nonlocal invocation_count
+        with counter_lock: invocation_count+=1
+        entered.set(); release.wait(5)
+    ids=iter([f"contract-{i}" for i in range(contender_count)]+["control-winner"])
+    p=plane(tmp_path,application=app,id_generator=ids.__next__)
+    contracts=[p.validate_contract(str((tmp_path/f"profile-{i}").resolve()))["contract_id"] for i in range(contender_count)]
+    outcomes=[]; outcome_lock=threading.Lock()
+    def contend(contract_id):
+        barrier.wait()
+        try: outcome=("success",p.start_run(contract_id,"owner-authorization"))
+        except ActiveRunConflict as exc: outcome=("conflict",exc)
+        with outcome_lock: outcomes.append((contract_id,outcome))
+    threads=[threading.Thread(target=contend,args=(cid,),name=f"g2-contender-{i}") for i,cid in enumerate(contracts)]
+    try:
+        for thread in threads: thread.start()
+        for thread in threads: thread.join(3)
+        assert all(not thread.is_alive() for thread in threads)
+        successes=[outcome for _,outcome in outcomes if outcome[0]=="success"]
+        conflicts=[outcome for _,outcome in outcomes if outcome[0]=="conflict"]
+        assert len(successes)==1 and len(conflicts)==7 and entered.wait(1)
+        assert invocation_count==1 and len(p._runs)==1
+        assert sum(contract.consumed for contract in p._contracts.values())==1
+        winning_contract=successes[0][1].contract_id
+        assert all(not p._contracts[cid].consumed for cid in contracts if cid!=winning_contract)
+        release.set(); wait_state(p,successes[0][1].control_run_id,"TERMINAL")
+        assert all(not p._contracts[cid].consumed for cid in contracts if cid!=winning_contract)
+    finally:
+        release.set()
+        for thread in threads: thread.join(1)
+        p.close()
+    assert all(not thread.is_alive() for thread in threads)
 
 def test_discovery_is_deterministic_and_malformed_sibling_survives(tmp_path):
     class S:
@@ -161,7 +261,9 @@ def test_discovery_is_deterministic_and_malformed_sibling_survives(tmp_path):
     runs=(SimpleNamespace(run_id="z",run_root="z"),SimpleNamespace(run_id="bad",run_root="bad"),SimpleNamespace(run_id="a",run_root="a"))
     p=plane(tmp_path,run_discovery=lambda _p:SimpleNamespace(runs=runs),summary_loader=lambda root,**_k:S(root))
     got=p.list_runs()["persisted_runs"]
-    assert [x["run_id"] for x in got]==["a","bad","z"] and all("run_root" not in x for x in got); p.close()
+    assert [x["run_id"] for x in got]==["a","bad","z"] and all("run_root" not in x for x in got)
+    assert got[0]["transport_redactions"]==["run_root"] and "transport_redactions" not in got[1] and got[2]["transport_redactions"]==["run_root"]
+    p.close()
 
 def test_server_shutdown_releases_port_and_threads(tmp_path):
     before={t.ident for t in threading.enumerate()}; p=plane(tmp_path); s=create_loopback_server(p); port=s.port; s.start(); s.stop()

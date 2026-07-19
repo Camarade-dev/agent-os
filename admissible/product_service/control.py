@@ -21,8 +21,16 @@ class ContractConsumed(ControlPlaneError): pass
 class ActiveRunConflict(ControlPlaneError): pass
 class UnknownControlRun(ControlPlaneError): pass
 class ResultNotReady(ControlPlaneError): pass
+_TRANSPORT_SCHEMA_VERSION="admissible_product_service_transport_v1"
+_RESULT_TRANSPORT_REDACTIONS=("diagnostics","run_root")
 def _now(): return datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
 def _id(): return secrets.token_hex(16)
+
+def _transport_summary(source: Mapping[str,object])->tuple[dict[str,object],list[str]]:
+    transported=dict(source); redactions=[]
+    if "run_root" in transported:
+        transported.pop("run_root"); redactions.append("run_root")
+    return transported,redactions
 
 class ProductControlPlane:
     def __init__(self, *, run_parent: str|Path, source_repository: str|Path,
@@ -97,25 +105,36 @@ class ProductControlPlane:
             if rid not in self._runs: raise UnknownControlRun()
             return self._runs[rid]
     def status(self,rid: str)->dict[str,object]:
-        r=self._snapshot(rid); summary=None
+        r=self._snapshot(rid); summary=None; summary_redactions=[]
         if r.run_root and Path(r.run_root).is_dir():
-            try: summary=self._summary_loader(r.run_root,truth_provider=self._truth_provider).to_json(); summary.pop("run_root",None)
+            try:
+                source_summary=self._summary_loader(r.run_root,truth_provider=self._truth_provider).to_json()
+                summary,summary_redactions=_transport_summary(source_summary)
             except Exception: summary=None
-        return {"control_state":r.control_state.value,"control_run_id":r.control_run_id,
+        response={"control_state":r.control_state.value,"control_run_id":r.control_run_id,
                 "authoritative_session_id":r.authoritative_session_id,"started_at":r.started_at,"ended_at":r.ended_at,
                 "start_error_type":r.start_error_type,"product_summary":summary}
+        if summary_redactions: response["product_summary_transport_redactions"]=summary_redactions
+        return response
     def result(self,rid: str)->dict[str,object]:
         r=self._snapshot(rid)
         if r.control_state not in {ControlState.TERMINAL,ControlState.START_FAILED} or not r.run_root or not Path(r.run_root).is_dir(): raise ResultNotReady()
         payload=dict(self._result_renderer(self._detail_loader(r.run_root,truth_provider=self._truth_provider)))
-        payload.pop("run_root",None); payload.pop("diagnostics",None); return payload
+        for field in _RESULT_TRANSPORT_REDACTIONS: payload.pop(field,None)
+        payload["transport_schema_version"]=_TRANSPORT_SCHEMA_VERSION
+        payload["transport_redactions"]=list(_RESULT_TRANSPORT_REDACTIONS)
+        return payload
     def list_runs(self)->dict[str,object]:
         with self._lock: controls=[self.status(rid) for rid in sorted(self._runs)]
         persisted=[]
         for run in self._run_discovery(self.run_parent).runs:
-            try: item=self._summary_loader(run.run_root,truth_provider=self._truth_provider).to_json()
+            try:
+                source_item=self._summary_loader(run.run_root,truth_provider=self._truth_provider).to_json()
+                item,item_redactions=_transport_summary(source_item)
             except Exception as exc: item={"run_id":run.run_id,"presentation_status":"UNAVAILABLE","error_type":type(exc).__name__}
-            item.pop("run_root",None); persisted.append(item)
+            else:
+                if item_redactions: item["transport_redactions"]=item_redactions
+            persisted.append(item)
         persisted.sort(key=lambda x:str(x.get("run_id") or "")); return {"control_runs":controls,"persisted_runs":persisted}
     def close(self):
         with self._lock:
