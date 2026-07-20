@@ -559,7 +559,7 @@ function jsonResponse(status, body) {
   };
 }
 
-function installDefaultFetch(mode = "happy") {
+function installDefaultFetch(mode = "happy", authMode = "PRECOMMITTED_DIGEST") {
   let poll = 0;
   fetchImpl = async (url, options = {}) => {
     const method = (options.method || "GET").toUpperCase();
@@ -571,7 +571,7 @@ function installDefaultFetch(mode = "happy") {
       return jsonResponse(200, {
         service: "admissible-product-launcher", version: "g2.5",
         repository_display_path: "safe-repository", required_source_head: "a".repeat(40),
-        authorization_mode: "PRECOMMITTED_DIGEST",
+        authorization_mode: authMode,
         authorization_semantics_notice: "notice",
         owner_authorization_encoding: "latin-1", g2_ready: true, g2_api_version: "v1",
         csrf_nonce: "c".repeat(64), supported_authoring_template_ids: ["observed_local_git_v1"],
@@ -579,6 +579,7 @@ function installDefaultFetch(mode = "happy") {
       });
     }
     if (url === "/ui/api/v1/contracts" && method === "POST") {
+      if (mode === "author_network") throw new TypeError("Failed to fetch");
       const input = JSON.parse(options.body || "{}");
       return jsonResponse(200, {
         contract_id: "contract-xss-1",
@@ -591,7 +592,7 @@ function installDefaultFetch(mode = "happy") {
         },
         generated_ids: { profile_id: "gen-<script>alert(1)</script>" },
         execution_started: false,
-        authorization_mode: "PRECOMMITTED_DIGEST",
+        authorization_mode: authMode,
         echo_mission: input.mission_text
       });
     }
@@ -603,7 +604,7 @@ function installDefaultFetch(mode = "happy") {
       if (mode === "stay_queued") {
         return jsonResponse(200, {
           preparation_id: "preparation-1", contract_id: "contract-xss-1", state: "QUEUED",
-          authorization_mode: "PRECOMMITTED_DIGEST", authorization_semantics_notice: "notice",
+          authorization_mode: authMode, authorization_semantics_notice: "notice",
           consumed: false, created_at: "now", updated_at: "now",
           payload_fingerprint: null, safe_payload_summary: null, authorization_payload: null,
           blocked_summary: null, error_type: null
@@ -612,7 +613,7 @@ function installDefaultFetch(mode = "happy") {
       const state = poll === 1 ? "RUNNING" : "READY";
       return jsonResponse(200, {
         preparation_id: "preparation-1", contract_id: "contract-xss-1", state,
-        authorization_mode: "PRECOMMITTED_DIGEST",
+        authorization_mode: authMode,
         authorization_semantics_notice: "notice <svg onload=1>",
         consumed: false, created_at: "now", updated_at: "now",
         payload_fingerprint: state === "READY" ? "c".repeat(64) : null,
@@ -627,6 +628,7 @@ function installDefaultFetch(mode = "happy") {
       if (mode === "launch_409") return jsonResponse(409, { error: "RUN_CONFLICT" });
       if (mode === "launch_500") return jsonResponse(500, { error: "WRITE_UNAVAILABLE" });
       if (mode === "launch_network") { const err = new Error("network"); throw err; }
+      if (mode === "launch_network_typeerror") throw new TypeError("Failed to fetch");
       return jsonResponse(202, { control_run_id: "control-1", control_state: "QUEUED" });
     }
     return jsonResponse(404, { error: "NOT_FOUND" });
@@ -1094,6 +1096,94 @@ async function runResetDuringLaunch() {
   };
 }
 
+async function runAuthoringNetworkFailure() {
+  installDefaultFetch("author_network");
+  loadApp();
+  await waitState("COMPOSE");
+  const g3 = windowObj.AdmissibleG3Test;
+  g3.setField("mission-text", "mission retained");
+  g3.setField("gate-objective", "objective retained");
+  g3.setField("completion-conditions", "conditions retained");
+  g3.setField("commit-message", "feat: retained");
+  fetchLog.length = 0;
+  g3.submit("compose-form");
+  await settle();
+  await flushTimers(10);
+  const snap = g3.snapshot();
+  const failure = {
+    state: snap.state,
+    statusVisible: document.getElementById("status-area").hidden === false,
+    statusMessage: snap.statusMessage,
+    statusCode: snap.statusCode,
+    missionValue: document.getElementById("mission-text").value,
+    objectiveValue: document.getElementById("gate-objective").value,
+    conditionsValue: document.getElementById("completion-conditions").value,
+    commitValue: document.getElementById("commit-message").value,
+    materialValues: document.getElementById("material-list").querySelectorAll("input").map(x => x.value),
+    authorPosts: fetchLog.filter(x => x.method === "POST" && x.url === "/ui/api/v1/contracts").length,
+    totalRequests: fetchLog.length,
+  };
+  // Manual retry once the launcher is reachable again must still work.
+  installDefaultFetch("happy");
+  g3.submit("compose-form");
+  await waitState("CONTRACT_READY");
+  return { scenario: "authoring_network", ...failure, retryState: g3.getState() };
+}
+
+async function runLaunchNetworkFailure(authMode) {
+  installDefaultFetch("launch_network_typeerror", authMode);
+  loadApp();
+  await waitState("COMPOSE");
+  const g3 = windowObj.AdmissibleG3Test;
+  await fillCompose("mission");
+  g3.setField("gate-objective", "objective");
+  g3.setField("completion-conditions", "complete");
+  g3.setField("commit-message", "feat: mission");
+  g3.submit("compose-form");
+  await waitState("CONTRACT_READY");
+  g3.click("prepare-button");
+  await flushTimers(30);
+  await waitState("PREPARATION_READY");
+  g3.setField("owner-phrase", "owner-secret-phrase");
+  const digestInput = document.getElementById("owner-digest");
+  if (digestInput) g3.setField("owner-digest", "d".repeat(64));
+  document.getElementById("owner-phrase").type = "text";
+  document.getElementById("toggle-phrase").textContent = "Hide";
+  document.getElementById("toggle-phrase").setAttribute("aria-pressed", "true");
+  const phrasePopulatedBefore = g3.snapshot().phraseValue === "owner-secret-phrase";
+  fetchLog.length = 0;
+  g3.submit("authorize-form");
+  await settle();
+  await flushTimers(20);
+  const snap = g3.snapshot();
+  const phrase = document.getElementById("owner-phrase");
+  const toggle = document.getElementById("toggle-phrase");
+  const requests = fetchLog.map(x => ({ url: x.url, method: x.method }));
+  return {
+    scenario: "launch_network_failure",
+    authMode,
+    digestFieldPresent: !!digestInput,
+    phrasePopulatedBefore,
+    stateAfterFailure: snap.state,
+    statusVisible: document.getElementById("status-area").hidden === false,
+    statusMessage: snap.statusMessage,
+    statusCode: snap.statusCode,
+    phraseValue: phrase.value,
+    phraseType: phrase.type,
+    revealText: toggle.textContent,
+    revealPressed: toggle.getAttribute("aria-pressed"),
+    digestValue: snap.digestValue,
+    contractId: snap.contractId,
+    preparationId: snap.preparationId,
+    preparationState: snap.preparationState,
+    canonicalPayload: snap.canonicalPayload,
+    launchDisabled: snap.launchDisabled,
+    requests,
+    launchPosts: requests.filter(r => r.method === "POST" && r.url === "/ui/api/v1/runs").length,
+    nonLaunchRequests: requests.filter(r => !(r.method === "POST" && r.url === "/ui/api/v1/runs")).length,
+  };
+}
+
 (async () => {
   try {
     let out;
@@ -1103,6 +1193,8 @@ async function runResetDuringLaunch() {
     else if (scenario === "no_post_202") out = await runNoPost202();
     else if (scenario === "duplicate_prepare") out = await runDuplicatePrepare();
     else if (scenario === "reset_during_launch") out = await runResetDuringLaunch();
+    else if (scenario === "authoring_network") out = await runAuthoringNetworkFailure();
+    else if (scenario.startsWith("launch_network_failure")) out = await runLaunchNetworkFailure(scenario.split(":")[1] || "PRECOMMITTED_DIGEST");
     else throw new Error("unknown scenario");
     process.stdout.write(JSON.stringify(out));
   } catch (error) {
@@ -1114,7 +1206,7 @@ async function runResetDuringLaunch() {
 
 
 def _run_node_scenario(tmp_path: Path, scenario: str) -> dict:
-    harness = tmp_path / f"g3_harness_{scenario}.js"
+    harness = tmp_path / f"g3_harness_{re.sub(r'[^A-Za-z0-9_]+', '_', scenario)}.js"
     harness.write_text(NODE_HARNESS, encoding="utf-8")
     completed = subprocess.run(
         [NODE, str(harness), scenario, str(JS_PATH)],
@@ -1335,6 +1427,55 @@ def test_production_ui_send_closes_connection_for_multi_asset_delivery():
         server.stop()
     leftover = {t.ident for t in threading.enumerate()} - before_threads
     assert not leftover
+
+
+def test_production_send_sets_close_flag_independently_of_header():
+    from admissible.product_launcher.ui_transport import _UIHandler
+
+    for status, payload, content_type, expected_body in (
+        (200, {"ok": True}, "application/json", b'{"ok":true}'),
+        (404, {"error": "NOT_FOUND"}, "application/json", b'{"error":"NOT_FOUND"}'),
+        (200, b"body-bytes", "text/css; charset=utf-8", b"body-bytes"),
+    ):
+        handler = object.__new__(_UIHandler)
+        sent = {"status": [], "headers": [], "ended": 0}
+        handler.send_response = lambda code, *a, sent=sent: sent["status"].append(code)
+        # Capture-only stub: unlike BaseHTTPRequestHandler.send_header, it must
+        # never touch close_connection, so only the explicit production
+        # assignment in _send can flip the flag observed below.
+        handler.send_header = lambda name, value, sent=sent: sent["headers"].append((name, value))
+
+        def _end(sent=sent):
+            sent["ended"] += 1
+
+        handler.end_headers = _end
+
+        class _WFile:
+            def __init__(self):
+                self.chunks = []
+
+            def write(self, data):
+                self.chunks.append(bytes(data))
+
+        handler.wfile = _WFile()
+        handler.close_connection = False
+        if content_type == "application/json":
+            _UIHandler._send(handler, status, payload)
+        else:
+            _UIHandler._send(handler, status, payload, content_type=content_type)
+        assert handler.close_connection is True
+        headers = dict(sent["headers"])
+        assert len(headers) == len(sent["headers"])
+        assert headers["Connection"] == "close"
+        assert sent["status"] == [status]
+        assert headers["Content-Type"] == content_type
+        assert headers["Content-Length"] == str(len(expected_body))
+        assert headers["Cache-Control"] == "no-store"
+        assert headers["X-Content-Type-Options"] == "nosniff"
+        assert headers["Referrer-Policy"] == "no-referrer"
+        assert "frame-ancestors 'none'" in headers["Content-Security-Policy"]
+        assert sent["ended"] == 1
+        assert handler.wfile.chunks == [expected_body]
 
 
 def test_real_chrome_loads_all_assets_and_reaches_compose(tmp_path):
@@ -1559,6 +1700,268 @@ def _chrome_cdp_wait_compose(ws_url: str, version: dict, timeout: float = 15) ->
             sock.close()
         except Exception:
             pass
+
+
+def _cdp_connect(ws_url: str):
+    import base64
+    import os as _os
+    import struct
+
+    assert ws_url.startswith("ws://")
+    hostport, _, path = ws_url[len("ws://") :].partition("/")
+    host, _, port_s = hostport.partition(":")
+    port = int(port_s or "80")
+    sock = socket.create_connection((host, port), timeout=5)
+    sock.settimeout(5)
+    key = base64.b64encode(_os.urandom(16)).decode()
+    sock.sendall(
+        (
+            f"GET /{path} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        ).encode()
+    )
+    data = b""
+    while b"\r\n\r\n" not in data:
+        data += sock.recv(4096)
+    assert b"101" in data.split(b"\r\n", 1)[0]
+
+    def encode(payload: bytes) -> bytes:
+        length = len(payload)
+        if length < 126:
+            header = struct.pack("!BB", 0x81, 0x80 | length)
+        elif length < 65536:
+            header = struct.pack("!BBH", 0x81, 0x80 | 126, length)
+        else:
+            header = struct.pack("!BBQ", 0x81, 0x80 | 127, length)
+        mask = _os.urandom(4)
+        return header + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+    def recv_exact(n: int) -> bytes:
+        out = b""
+        while len(out) < n:
+            out += sock.recv(n - len(out))
+        return out
+
+    def decode() -> dict:
+        hdr = recv_exact(2)
+        length = hdr[1] & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", recv_exact(2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", recv_exact(8))[0]
+        return json.loads(recv_exact(length).decode())
+
+    state = {"msg_id": 0}
+
+    def send(method: str, params: dict | None = None) -> dict:
+        state["msg_id"] += 1
+        sock.sendall(
+            encode(json.dumps({"id": state["msg_id"], "method": method, "params": params or {}}).encode())
+        )
+        while True:
+            msg = decode()
+            if msg.get("id") == state["msg_id"]:
+                return msg
+
+    def close() -> None:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+    return send, close
+
+
+BOUNDED_NETWORK_COPY = "The local launcher is unavailable. Check that it is still running, then retry."
+
+
+def test_real_chrome_network_failure_renders_bounded_copy(tmp_path):
+    if not CHROME.is_file():
+        pytest.skip("Chrome not installed")
+    launcher = FakeLauncher()
+    server = create_ui_loopback_server(launcher, csrf_generator=lambda _n: "e" * 64).start()
+    profile = tmp_path / "chrome-profile-netfail"
+    profile.mkdir()
+    debug_port = 9222 + ((os.getpid() + 383) % 1000)
+    url = f"http://{server.host}:{server.port}/"
+    cmd = [
+        str(CHROME),
+        f"--user-data-dir={profile}",
+        f"--remote-debugging-port={debug_port}",
+        "--headless=new",
+        "--disable-gpu",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-extensions",
+        "--disable-background-networking",
+        url,
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    server_stopped = False
+    close_cdp = None
+    try:
+        deadline = time.time() + 20
+        version = None
+        while time.time() < deadline:
+            try:
+                with urlopen(f"http://127.0.0.1:{debug_port}/json/version", timeout=1) as resp:
+                    version = json.loads(resp.read().decode())
+                break
+            except Exception:
+                time.sleep(0.2)
+        assert version is not None, "Chrome debug port did not open"
+        page = None
+        while time.time() < deadline:
+            with urlopen(f"http://127.0.0.1:{debug_port}/json", timeout=1) as resp:
+                targets = json.loads(resp.read().decode())
+            page = next(
+                (t for t in targets if t.get("type") == "page" and url.rstrip("/") in t.get("url", "")),
+                None,
+            )
+            if page:
+                break
+            time.sleep(0.2)
+        assert page is not None
+        send, close_cdp = _cdp_connect(page["webSocketDebuggerUrl"])
+        send("Runtime.enable")
+
+        def evaluate(expression: str):
+            got = send("Runtime.evaluate", {"expression": expression, "returnByValue": True})
+            return ((got.get("result") or {}).get("result") or {}).get("value")
+
+        def wait_for(expression: str, wanted, timeout_s: float = 20.0):
+            end = time.time() + timeout_s
+            last = None
+            while time.time() < end:
+                last = evaluate(expression)
+                if last == wanted:
+                    return last
+                time.sleep(0.2)
+            raise AssertionError(f"CDP wait for {wanted!r} timed out; last={last!r}")
+
+        wait_for("window.AdmissibleG3Test && window.AdmissibleG3Test.getState()", "COMPOSE")
+        fill = (
+            "window.AdmissibleG3Test.setField('mission-text','browser mission');"
+            "window.AdmissibleG3Test.setField('gate-objective','browser objective');"
+            "window.AdmissibleG3Test.setField('completion-conditions','browser conditions');"
+            "window.AdmissibleG3Test.setField('commit-message','feat: browser');"
+        )
+        evaluate(fill + "window.AdmissibleG3Test.submit('compose-form'); 'submitted'")
+        wait_for("window.AdmissibleG3Test.getState()", "CONTRACT_READY")
+        evaluate("window.AdmissibleG3Test.click('prepare-button'); 'clicked'")
+        wait_for("window.AdmissibleG3Test.getState()", "PREPARATION_READY")
+        evaluate(
+            "window.AdmissibleG3Test.setField('owner-phrase','owner-secret-phrase');"
+            "window.AdmissibleG3Test.setField('owner-digest','" + "d" * 64 + "'); 'set'"
+        )
+        # Kill the launcher so the very next browser fetch fails at the socket
+        # with no HTTP response, exactly the case-B copy under test.
+        server.stop()
+        server_stopped = True
+        evaluate("window.AdmissibleG3Test.submit('authorize-form'); 'submitted'")
+        wait_for(
+            "document.getElementById('status-area').hidden === false"
+            " && window.AdmissibleG3Test.getState() === 'PREPARATION_READY'",
+            True,
+        )
+        launch_banner = evaluate("document.getElementById('status-message').textContent")
+        launch_code = evaluate("document.getElementById('status-code').textContent")
+        phrase_state = evaluate(
+            "document.getElementById('owner-phrase').value + '|' + document.getElementById('owner-phrase').type"
+        )
+        assert launch_banner == BOUNDED_NETWORK_COPY
+        assert "undefined" not in launch_banner and "null" not in launch_banner
+        assert "TypeError" not in launch_banner and "owner-secret-phrase" not in launch_banner
+        assert launch_code == "LAUNCHER_UNAVAILABLE"
+        assert phrase_state == "|password"
+        evaluate("window.AdmissibleG3Test.reset(); 'reset'")
+        wait_for("window.AdmissibleG3Test.getState()", "COMPOSE")
+        evaluate(fill + "window.AdmissibleG3Test.submit('compose-form'); 'submitted'")
+        wait_for(
+            "document.getElementById('status-area').hidden === false"
+            " && window.AdmissibleG3Test.getState() === 'COMPOSE'",
+            True,
+        )
+        author_banner = evaluate("document.getElementById('status-message').textContent")
+        author_code = evaluate("document.getElementById('status-code').textContent")
+        mission_kept = evaluate("document.getElementById('mission-text').value")
+        assert author_banner == BOUNDED_NETWORK_COPY
+        assert "undefined" not in author_banner and "null" not in author_banner
+        assert "TypeError" not in author_banner
+        assert author_code == "LAUNCHER_UNAVAILABLE"
+        assert mission_kept == "browser mission"
+    finally:
+        if close_cdp:
+            close_cdp()
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        if not server_stopped:
+            server.stop()
+    probe = socket.socket()
+    try:
+        probe.settimeout(0.5)
+        assert probe.connect_ex((server.host, server.port)) != 0
+    finally:
+        probe.close()
+
+
+def test_executed_client_authoring_network_failure(tmp_path):
+    out = _run_node_scenario(tmp_path, "authoring_network")
+    assert out["state"] == "COMPOSE"
+    assert out["statusVisible"] is True
+    assert out["statusMessage"] == BOUNDED_NETWORK_COPY
+    assert out["statusCode"] == "LAUNCHER_UNAVAILABLE"
+    for banned in ("undefined", "null", "TypeError", "Failed to fetch"):
+        assert banned not in out["statusMessage"] + out["statusCode"]
+    assert out["missionValue"] == "mission retained"
+    assert out["objectiveValue"] == "objective retained"
+    assert out["conditionsValue"] == "conditions retained"
+    assert out["commitValue"] == "feat: retained"
+    assert out["materialValues"] == ["README.md"]
+    assert out["authorPosts"] == 1
+    assert out["totalRequests"] == 1
+    assert out["retryState"] == "CONTRACT_READY"
+
+
+@pytest.mark.parametrize("mode", ["PRECOMMITTED_DIGEST", "INTERACTIVE_BOUND_CONFIRMATION"])
+def test_executed_client_launch_network_failure(tmp_path, mode):
+    out = _run_node_scenario(tmp_path, f"launch_network_failure:{mode}")
+    assert out["authMode"] == mode
+    assert out["phrasePopulatedBefore"] is True
+    assert out["stateAfterFailure"] == "PREPARATION_READY"
+    assert out["statusVisible"] is True
+    assert out["statusMessage"] == BOUNDED_NETWORK_COPY
+    assert out["statusCode"] == "LAUNCHER_UNAVAILABLE"
+    rendered = out["statusMessage"] + out["statusCode"] + out["canonicalPayload"]
+    for banned in ("undefined", "TypeError", "Failed to fetch", "owner-secret-phrase", "d" * 64):
+        assert banned not in rendered
+    assert "already been used" not in out["statusMessage"]
+    assert out["phraseValue"] == ""
+    assert out["phraseType"] == "password"
+    assert out["revealText"] == "Show"
+    assert out["revealPressed"] == "false"
+    if mode == "PRECOMMITTED_DIGEST":
+        assert out["digestFieldPresent"] is True
+        assert out["digestValue"] == ""
+    else:
+        assert out["digestFieldPresent"] is False
+    assert out["contractId"] == "contract-xss-1"
+    assert out["preparationId"] == "preparation-1"
+    assert out["preparationState"] == "READY"
+    assert out["canonicalPayload"].strip() != ""
+    assert '"payload"' in out["canonicalPayload"]
+    assert out["launchDisabled"] is False
+    assert out["launchPosts"] == 1
+    assert out["nonLaunchRequests"] == 0
+    assert [r["url"] for r in out["requests"]] == ["/ui/api/v1/runs"]
 
 
 def test_executed_client_dom_injection_is_inert(tmp_path):

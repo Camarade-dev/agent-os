@@ -63,6 +63,7 @@
   }
   function clearError(){byId("status-area").hidden=true;byId("status-message").textContent="";byId("status-code").textContent="";byId("retry-bootstrap").hidden=true;}
   function boundedMessage(status,body){
+    if(!Number.isInteger(status))return {code:"LAUNCHER_UNAVAILABLE",message:"The local launcher is unavailable. Check that it is still running, then retry."};
     const code=body&&typeof body.error==="string"?body.error:"REQUEST_FAILED";
     const messages={AUTHORING_REJECTED:"The launcher rejected one or more contract fields.",PREFLIGHT_BUSY:"Another canonical preflight is already active.",PREPARATION_NOT_READY:"This preparation is not ready for authorization.",PREPARATION_IN_USE:"This preparation is already being authorized.",PREPARATION_CONSUMED:"This authorization preparation has already been used.",OWNER_AUTHORIZATION_REQUIRED:"Enter the owner authorization phrase.",OWNER_AUTHORIZATION_INVALID:"The owner authorization phrase was rejected.",OWNER_AUTHORIZATION_ENCODING_UNSUPPORTED:"The phrase cannot be transported with the required Latin-1 encoding.",OWNER_AUTHORIZATION_DIGEST_INVALID:"Enter the owner-supplied lowercase 64-hex digest.",RUN_CONFLICT:"The launcher reported a launch conflict.",LAUNCHER_CLOSED:"The local launcher is unavailable.",WRITE_UNAVAILABLE:"The launcher could not complete this request.",READ_UNAVAILABLE:"The launcher could not read preparation status."};
     return {code,message:messages[code]||(`The launcher returned a bounded ${status} response.`)};
@@ -171,7 +172,7 @@
   async function launch(event){
     event.preventDefault();clearError();if(!validateAuthorization())return;setState(STATES.LAUNCHING);
     const headers={"X-Admissible-Owner-Authorization":byId("owner-phrase").value};const digest=byId("owner-digest");if(digest)headers["X-Admissible-Owner-Authorization-Digest"]=digest.value;
-    try{const {status,body}=await api("/ui/api/v1/runs",{method:"POST",headers,body:JSON.stringify({contract_id:ui.contract.response.contract_id,preparation_id:ui.preparation.id})});if(status!==202)throw new Error("LAUNCH_NOT_ACCEPTED");stopPolling();renderAccepted(body);setState(STATES.LAUNCH_ACCEPTED);}
+    try{const {status,body}=await api("/ui/api/v1/runs",{method:"POST",headers,body:JSON.stringify({contract_id:ui.contract.response.contract_id,preparation_id:ui.preparation.id})});if(status!==202){const err=new Error("LAUNCH_NOT_ACCEPTED");err.status=status;err.body=body;throw err;}stopPolling();renderAccepted(body);setState(STATES.LAUNCH_ACCEPTED);}
     catch(error){const mapped=boundedMessage(error.status,error.body);setState(STATES.PREPARATION_READY);showError(mapped.code,mapped.message,STATES.PREPARATION_READY);}
     finally{headers["X-Admissible-Owner-Authorization"]="";if(headers["X-Admissible-Owner-Authorization-Digest"])headers["X-Admissible-Owner-Authorization-Digest"]="";clearSecrets();}
   }
