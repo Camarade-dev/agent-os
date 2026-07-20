@@ -832,16 +832,20 @@ def test_child_runner_unchanged_and_protected_paths_unmodified():
     # The golden result-presentation repair re-opened exactly one read-model
     # file (the run reconstruction); the governed backend-drift rerun slice
     # additionally authorizes exactly the renderer (secret-safe authorization
-    # exposure in result JSON). Every other path in that tree - and the
-    # delegated gate, product service and checkpoint executor in full - stays
-    # frozen against launcher-slice drift.
-    AUTHORIZED_READ_MODEL_PATHS = {
+    # exposure in result JSON); the behavioral backend-authority consistency
+    # repair authorizes exactly the native canary (behavioral-entry policy)
+    # and the native executor (behavioral-lane store binding). Every other
+    # path in those trees - and the product service and checkpoint executor
+    # in full - stays frozen against launcher-slice drift.
+    AUTHORIZED_REPAIR_PATHS = {
         "admissible/product_read_model/read_model.py",
         "admissible/product_read_model/renderer.py",
+        "admissible/delegated_gate/native_canary.py",
+        "admissible/delegated_gate/native_executor.py",
     }
     residual = "\n".join(
         line for line in (raw.strip() for raw in changed.splitlines())
-        if line and line not in AUTHORIZED_READ_MODEL_PATHS
+        if line and line not in AUTHORIZED_REPAIR_PATHS
     )
     for forbidden in (
         "admissible/delegated_gate/",

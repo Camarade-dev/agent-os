@@ -1253,7 +1253,9 @@ def test_git_source_preflight_run_forces_optional_locks_when_parent_absent(
     assert observed["env"]["GIT_OPTIONAL_LOCKS"] == "0"
     assert observed["env"]["NATIVE_PREFLIGHT_INHERITED_TEST"] == "preserved"
     assert "GIT_OPTIONAL_LOCKS" not in os.environ
-    assert observed["command"] == ["git", "status", "--porcelain=v1"]
+    # The hardened read-only Git argv pins fsmonitor off and disables the
+    # pager; the observation arguments follow that committed prefix.
+    assert observed["command"] == ["git", "-c", "core.fsmonitor=false", "--no-pager", "status", "--porcelain=v1"]
     assert observed["cwd"] == repository and observed["timeout"] == 17
     assert observed["shell"] is False and observed["capture_output"] is True
     assert observed["text"] is True and observed["encoding"] == "utf-8"

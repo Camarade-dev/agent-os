@@ -3638,8 +3638,22 @@ class AtomicNativeExecutionStore:
         if len(data) != reference.byte_count or hashlib.sha256(data).hexdigest()!=reference.sha256: raise NativeEvidenceInvalid("native artifact hash or byte count mismatch")
     def verify_artifact(self, reference: NativeArtifactReference) -> None:
         self._verify_artifact(reference)
+    def _behavioral_request_binding(self, request: NativeExecutionRequest) -> NativeExecutionRequestBinding:
+        """Bind a behavioral-lane write to the durable request snapshot only.
+
+        Behavioral evidence exists only after the one authorized provider
+        attempt, so its store writes bind the durable canonical request bytes
+        exactly the way terminal publication does.  The mutable live backend
+        catalog is never re-observed here: post-run backend-drift authority
+        belongs solely to the persisted execution-eligibility decision.
+        """
+
+        binding = self.load_request_structural(request.session_id, request.gate_id, request.execution_attempt_index)
+        if request.request_fingerprint != binding.request_fingerprint:
+            raise NativeEvidenceInvalid("behavioral evidence request binding differs")
+        return binding
     def write_behavioral_artifact(self, *, request: NativeExecutionRequest, artifact_id: str, purpose: str, data: bytes) -> NativeArtifactReference:
-        request.validated(); require_identifier(artifact_id, "behavioral artifact ID")
+        self._behavioral_request_binding(request); require_identifier(artifact_id, "behavioral artifact ID")
         if purpose not in {"behavioral-script", "behavioral-stdout", "behavioral-stderr"}:
             raise NativeEvidenceInvalid("unsupported behavioral artifact purpose")
         if not isinstance(data, bytes) or len(data) > 2 * 1024 * 1024:
@@ -3670,7 +3684,7 @@ class AtomicNativeExecutionStore:
             if not isinstance(reference, NativeArtifactReference) or reference.purpose != purpose:
                 raise NativeEvidenceInvalid("behavioral evidence artifact roles differ")
     def create_behavioral_evidence(self, *, request: NativeExecutionRequest, evidence: Any, loader: Callable[[Mapping[str, Any]], Any]) -> Any:
-        request.validated(); evidence.validated(); self._validate_behavioral_binding(request, evidence)
+        self._behavioral_request_binding(request); evidence.validated(); self._validate_behavioral_binding(request, evidence)
         for reference in (evidence.script, evidence.stdout, evidence.stderr): self._verify_artifact(reference)
         path = self._path("behavioral", request.session_id, request.gate_id, request.execution_attempt_index)
         with self._lock(request.session_id, request.gate_id, request.execution_attempt_index):

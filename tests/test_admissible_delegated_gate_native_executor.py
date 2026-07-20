@@ -1265,34 +1265,24 @@ def _bump_directory_mtime(path: Path) -> None:
     os.utime(path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 10_000_000))
 
 
-def test_selected_version_directory_mtime_only_is_persisted_diagnostic_and_reaches_behavioral_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_selected_version_directory_mtime_only_is_persisted_diagnostic_and_admits_behavioral_verification(tmp_path: Path):
     h, _ = _wrapper_chain_harness(tmp_path)
     selected = Path(h.attestation.selected_version_root)
     h.runner.after_start = lambda: _bump_directory_mtime(selected)
-    reached = {"behavioral": 0, "capture": 0}
-
-    def stop_at_behavioral(**kwargs: object) -> object:
-        assert h.store.has_result(h.session_id, CANARY_GATE_ID, 0)
-        reached["behavioral"] += 1
-        raise RuntimeError("synthetic behavioral boundary reached")
-
-    def capture_must_not_run(**kwargs: object) -> object:
-        reached["capture"] += 1
-        raise AssertionError("checkpoint must not run after synthetic behavioral stop")
-
-    monkeypatch.setattr("admissible.delegated_gate.native_canary.run_behavioral_verifier", stop_at_behavioral)
-    monkeypatch.setattr("admissible.delegated_gate.native_canary.capture_checkpoint", capture_must_not_run)
     outcome = h.coordinator.run(session_id=h.session_id)
     eligibility = h.store.load_execution_eligibility(h.session_id, CANARY_GATE_ID, 0)
-    assert outcome.status is NativeCanaryStatus.PRECAPTURE_ELIGIBILITY_FAILED
+    assert outcome.status is NativeCanaryStatus.CHECKPOINT_CAPTURED_CANARY_SUCCESS
     assert eligibility.eligible and "post_run_backend_drift" not in eligibility.ineligibility_reasons
     assert eligibility.selected_version_validation == "METADATA_ONLY_DRIFT"
     assert "selected_version:METADATA_ONLY_DRIFT" in eligibility.backend_drift_diagnostics
     assert "selected_version:METADATA_ONLY_DRIFT:FUTURE_ATTESTATION_REFRESH_REQUIRED" in eligibility.backend_drift_diagnostics
     assert h.store.has_process_observation(h.session_id, CANARY_GATE_ID, 0)
     assert h.store.has_result(h.session_id, CANARY_GATE_ID, 0)
-    assert not h.store.has_behavioral_evidence(h.session_id, CANARY_GATE_ID, 0)
-    assert reached == {"behavioral": 1, "capture": 0}
+    binding = h.store.load_request_structural(h.session_id, CANARY_GATE_ID, 0)
+    behavioral = load_behavioral_verifier(request=binding, execution_store=h.store)
+    assert behavioral.exit_code == 0 and not behavioral.timed_out
+    assert h.store.has_capture_attempt(h.session_id, CANARY_GATE_ID, 0)
+    assert outcome.checkpoint_fingerprint is not None and len(h.runner.invocations) == 1
 
 
 def test_selected_version_directory_mtime_change_before_spawn_still_blocks_exact_reattestation(tmp_path: Path):

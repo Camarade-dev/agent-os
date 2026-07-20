@@ -96,6 +96,8 @@ from admissible.delegated_gate.native_executor import (
     _safe_directory,
     _safe_file,
     _same_directory_identity,
+    _same_mutable_directory_entry,
+    _structural_request_binding,
     preflight_native_cursor,
 )
 from admissible.delegated_gate.reducer import reduce
@@ -679,8 +681,40 @@ class BehavioralVerifierEvidence:
         require_exact_keys(data, set(cls.__dataclass_fields__), "behavioral verifier evidence"); values=dict(data); values["workspace_identity"]=NativeFilesystemIdentity.from_dict(data["workspace_identity"]); values["argv"]=tuple(data["argv"]); values["script"]=NativeArtifactReference.from_dict(data["script"]); values["stdout"]=NativeArtifactReference.from_dict(data["stdout"]); values["stderr"]=NativeArtifactReference.from_dict(data["stderr"]); return cls(**values).validated()
 
 
+def _behavioral_entry_validated(*, request: NativeExecutionRequest, execution_store: AtomicNativeExecutionStore) -> None:
+    """Validate behavioral-verifier entry without re-observing the live backend.
+
+    Backend authority follows one coherent law: before provider spawn the
+    executor requires full strict wrapper-chain attestation equality, and
+    after provider completion the persisted post-run eligibility decision is
+    the only backend-drift authority.  Re-running the strict live attestation
+    here would compare the stale pre-run selected-version-root identity
+    against a catalog the provider itself legitimately touched (for example
+    its own ``.running`` marker), re-refusing exactly the isolated
+    metadata-only condition the eligibility lane already admitted.  This
+    entry therefore validates the immutable request structure against the
+    durable canonical request bytes and defers drift adjudication to the
+    persisted eligibility record.  It cannot substitute for pre-spawn
+    attestation: without a durable post-run eligibility decision it always
+    fails closed, and blocking drift keeps ``eligible`` false upstream.
+    """
+
+    structural = _structural_request_binding(request.to_dict())
+    durable = execution_store.load_request_structural(request.session_id, request.gate_id, request.execution_attempt_index)
+    if structural != durable:
+        raise NativeEvidenceInvalid("behavioral entry request differs from the durable native request")
+    if not execution_store.has_execution_eligibility(request.session_id, request.gate_id, request.execution_attempt_index):
+        raise NativeEvidenceInvalid("behavioral verification requires the persisted post-run eligibility decision")
+    eligibility = execution_store.load_execution_eligibility(request.session_id, request.gate_id, request.execution_attempt_index)
+    if not eligibility.eligible or eligibility.ineligibility_reasons:
+        raise NativeEvidenceInvalid("persisted post-run eligibility rejects behavioral verification")
+
+
 def run_behavioral_verifier(*, request: NativeExecutionRequest, execution_store: AtomicNativeExecutionStore, timeout_seconds: int = 60, output_limit: int = 128 * 1024, verifier_source: str | None = None) -> BehavioralVerifierEvidence:
-    request.validated(); workspace, identity = _safe_directory(request.work_workspace, "behavioral verifier workspace")
+    _behavioral_entry_validated(request=request, execution_store=execution_store)
+    workspace, identity = _safe_directory(request.work_workspace, "behavioral verifier workspace")
+    if str(workspace) != request.work_workspace or not _same_mutable_directory_entry(identity, request.work_workspace_identity):
+        raise NativeEvidenceInvalid("behavioral verifier workspace path or identity changed")
     source = verifier_source if verifier_source is not None else _BEHAVIORAL_SCRIPT
     require_nonempty_text(source, "behavioral verifier source", max_bytes=262144)
     if execution_store.has_behavioral_evidence(request.session_id,request.gate_id,request.execution_attempt_index):
