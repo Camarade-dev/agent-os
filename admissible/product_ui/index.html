@@ -22,11 +22,13 @@
       <p class="hero-note">Compose intent, inspect the canonical boundary, then bind owner authority.</p>
     </section>
 
-    <nav class="steps" aria-label="Mission launch steps">
+    <nav class="steps" aria-label="Mission lifecycle steps">
       <ol>
         <li data-step="compose"><span>1</span><strong>Compose</strong></li>
         <li data-step="contract"><span>2</span><strong>Contract</strong></li>
         <li data-step="authorize"><span>3</span><strong>Authorize</strong></li>
+        <li data-step="run"><span>4</span><strong>Run</strong></li>
+        <li data-step="result"><span>5</span><strong>Result</strong></li>
       </ol>
     </nav>
 
@@ -87,10 +89,34 @@
           </form>
         </section>
 
-        <section id="accepted-view" class="view accepted" hidden aria-labelledby="accepted-title">
-          <p class="section-index">Accepted handoff</p><h2 id="accepted-title">Mission accepted</h2>
-          <p class="truth-line">Execution was accepted. HTTP 202 is not a verified result.</p>
+        <section id="accepted-view" class="view run-view" hidden aria-labelledby="accepted-title">
+          <p class="section-index">04 / Control-run observation</p><h2 id="accepted-title" tabindex="-1">Mission accepted — observe the run</h2>
+          <div class="run-state-band">
+            <p class="state-label">Control state</p>
+            <p id="run-state-value" class="state-value">Accepted</p>
+            <p id="run-state-copy" class="state-copy">Execution was accepted. HTTP 202 is not a verified result.</p>
+          </div>
           <dl id="accepted-facts" class="fact-grid"></dl>
+          <p id="run-verdict-pending" class="pending-verdict">No product verdict exists yet.</p>
+          <div class="actions"><button class="button primary reset-flow" type="button">Compose another mission</button></div>
+        </section>
+
+        <section id="result-view" class="view result-view" hidden aria-labelledby="result-title">
+          <p class="section-index">05 / Authoritative reconstruction</p><h2 id="result-title" tabindex="-1">Result and evidence</h2>
+          <div id="result-classification" class="classification-ledger" aria-label="Result classification"></div>
+          <p id="result-summary" class="result-summary"></p>
+          <p id="non-authority-notice" class="non-authority-notice"></p>
+          <div id="evidence-glance" class="evidence-glance" aria-label="Essential evidence at a glance"></div>
+          <div id="essential-evidence" class="evidence-sections"></div>
+          <div id="supplemental-evidence" class="evidence-sections"></div>
+          <div class="actions"><button class="button primary reset-flow" type="button">Compose another mission</button></div>
+        </section>
+
+        <section id="no-result-view" class="view no-result-view" hidden aria-labelledby="no-result-title">
+          <p class="section-index">05 / Terminal evidence boundary</p><h2 id="no-result-title" tabindex="-1">No authoritative result</h2>
+          <p class="truth-line neutral">The evidence root was unavailable, so no authoritative product result can be presented.</p>
+          <dl id="no-result-facts" class="fact-grid"></dl>
+          <p class="pending-verdict">No refusal, success, or failure verdict is inferred from these transport facts.</p>
           <div class="actions"><button class="button primary reset-flow" type="button">Compose another mission</button></div>
         </section>
       </div>
@@ -101,7 +127,7 @@
         <p class="rail-note">The browser proposes fields. The launcher constructs and validates authority.</p>
       </aside>
     </div>
-    <section id="status-area" class="status-area" aria-label="Request status" hidden><p id="status-message" role="alert"></p><code id="status-code"></code><button id="retry-bootstrap" class="button quiet" type="button" hidden>Retry bootstrap</button></section>
+    <section id="status-area" class="status-area" aria-label="Request status" aria-live="assertive" aria-atomic="true" hidden><p id="status-message" role="alert"></p><code id="status-code"></code><button id="retry-bootstrap" class="button quiet" type="button" hidden>Retry bootstrap</button></section>
     <div id="live-status" class="sr-only" aria-live="polite" aria-atomic="true"></div>
   </main>
 </body>

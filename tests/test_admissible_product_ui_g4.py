@@ -1,0 +1,718 @@
+from __future__ import annotations
+
+from html.parser import HTMLParser
+import ast
+import json
+import os
+from pathlib import Path
+import re
+import socket
+import subprocess
+import time
+from urllib.request import urlopen
+
+import pytest
+
+from admissible.product_launcher.ui_transport import create_ui_loopback_server
+from admissible.product_ui import render_document
+from test_admissible_product_ui_g3 import (
+    CHROME,
+    FakeLauncher,
+    NODE_HARNESS as G3_NODE_HARNESS,
+    _cdp_connect,
+)
+
+
+ROOT = Path(__file__).parents[1]
+HTML = render_document(csrf_nonce="c" * 64, authorization_mode="PRECOMMITTED_DIGEST").decode()
+CSS = (ROOT / "admissible/product_ui/app.css").read_text(encoding="utf-8")
+JS_PATH = ROOT / "admissible/product_ui/app.js"
+JS = JS_PATH.read_text(encoding="utf-8")
+NODE = "node"
+
+
+G4_DOM = r'''
+function installG4Dom() {
+  FakeNode.prototype.scrollIntoView = function() {};
+  const accepted = byId["accepted-view"];
+  accepted.append(
+    el("h2", { id: "accepted-title" }),
+    el("p", { id: "run-state-value" }),
+    el("p", { id: "run-state-copy" }),
+    el("p", { id: "run-verdict-pending", text: "No product verdict exists yet." })
+  );
+  const result = el("section", { id: "result-view", hidden: "true" }, [
+    el("h2", { id: "result-title" }),
+    el("div", { id: "result-classification" }),
+    el("p", { id: "result-summary" }),
+    el("p", { id: "non-authority-notice" }),
+    el("div", { id: "evidence-glance" }),
+    el("div", { id: "essential-evidence" }),
+    el("div", { id: "supplemental-evidence" }),
+    el("button", { type: "button", className: "button primary reset-flow", text: "Compose another mission" }),
+  ]);
+  const noResult = el("section", { id: "no-result-view", hidden: "true" }, [
+    el("h2", { id: "no-result-title", text: "No authoritative result" }),
+    el("dl", { id: "no-result-facts" }),
+    el("p", { text: "The evidence root was unavailable." }),
+    el("button", { type: "button", className: "button primary reset-flow", text: "Compose another mission" }),
+  ]);
+  body.append(result, noResult);
+  const list = documentElement.querySelector("ol");
+  if (list) {
+    const run = el("li", { "data-step": "run" }); run.dataset.step = "run";
+    const resultStep = el("li", { "data-step": "result" }); resultStep.dataset.step = "result";
+    list.append(run, resultStep);
+  }
+  register(documentElement);
+}
+'''
+
+
+G4_SCENARIOS = r'''
+function resultFixture(options = {}) {
+  const marker = options.malicious ? `<img src=x onerror="${MARKER}()"><script>${MARKER}()</script>` : "evidence note";
+  const verdict = options.verdict || "ADMITTED_VERIFIED";
+  const presentation = options.presentation || "ADMITTED";
+  const completeness = options.completeness || "COMPLETE";
+  const boundary = options.boundary || "NONE";
+  const verification = options.verification || (verdict === "ADMITTED_OBSERVED" ? "OBSERVED" : verdict === "ADMITTED_VERIFIED" ? "INDEPENDENT" : "NONE");
+  return {
+    schema_version: "admissible_product_read_model_result_v1",
+    non_authority_notice: `Persisted claims do not create authority. ${marker}`,
+    run_id: options.malicious ? marker : "run-authoritative-1",
+    presentation_status: presentation,
+    execution_state: { state: "COMPLETED", provider_exit_code: 0, timed_out: false, termination_reason: null },
+    result_admission_state: {
+      verdict, verification_mode: verification, source: "AUTHORITATIVE_RECONSTRUCTION",
+      truth_status: "AUTHORITATIVE", verdict_is_authoritative: verdict.startsWith("ADMITTED_") || verdict === "REFUSED",
+      consistent: presentation !== "INCONSISTENT", claimed_verdict: "UNKNOWN", claim_is_authoritative: false,
+    },
+    failing_boundary: { boundary, failure_category: boundary === "NONE" ? null : "POLICY", detail: boundary === "NONE" ? null : marker, reasons: boundary === "NONE" ? [] : [marker] },
+    material_git_result: {
+      git: { present: "PRESENT", initial_git_head: "a".repeat(40), final_git_head: "b".repeat(40), commits_added: 1, source_repository_mutated: false, final_git_porcelain_status: "" },
+      material: { present: "PRESENT", result: "PASSED", eligible: true, material_paths_compliant: true, workspace_clean: true, ineligibility_reasons: [] },
+    },
+    checkpoint_result: { present: "PRESENT", result: "PASSED", attempted: true, checkpoint_fingerprint: "c".repeat(64), verification_command_ids: [marker] },
+    behavioral_verifier_result: { present: "PRESENT", result: "PASSED", exit_code: 0, timed_out: false, evidence_fingerprint: "d".repeat(64), notes: [marker] },
+    evidence_completeness: { state: completeness, present_records: ["final-status"], absent_records: [], inconsistent_records: [], missing_required: [], notes: [marker] },
+    human_disposition: { present: "ABSENT", disposition: "UNKNOWN", reason: null },
+    timeline: [{ event_key: "terminal", label: marker, timestamp: "2026-07-20T10:00:04Z", presence: "PRESENT" }],
+    artifacts: [{ artifact_id: "checkpoint", purpose: marker, relative_path: "evidence/checkpoint.json", sha256: "e".repeat(64), file_presence: "PRESENT" }],
+    read_notes: [marker],
+    transport_schema_version: "admissible_product_service_transport_v1",
+    transport_redactions: ["diagnostics", "run_root"],
+    run_root: `C:/private/${marker}`,
+    diagnostics: [{ excerpt: marker }],
+  };
+}
+
+function installRunFetch({ statuses, results }) {
+  let statusIndex = 0;
+  let resultIndex = 0;
+  let inFlight = 0;
+  let maxInFlight = 0;
+  fetchImpl = async (url, options = {}) => {
+    const method = (options.method || "GET").toUpperCase();
+    fetchLog.push({ url, method, headers: { ...(options.headers || {}) } });
+    inFlight += 1; maxInFlight = Math.max(maxInFlight, inFlight);
+    try {
+      if (url === "/ui/api/v1/runs" && method === "POST") return jsonResponse(202, { control_run_id: "control-g4-1", control_state: "QUEUED" });
+      if (url.endsWith("/result")) {
+        const item = results[Math.min(resultIndex++, results.length - 1)];
+        return jsonResponse(item.status, item.body);
+      }
+      if (/\/ui\/api\/v1\/runs\/[^/]+$/.test(url)) {
+        const item = statuses[Math.min(statusIndex++, statuses.length - 1)];
+        return jsonResponse(200, {
+          control_run_id: "control-g4-1", control_state: item,
+          authoritative_session_id: item === "QUEUED" ? null : "session-authoritative-1",
+          started_at: item === "QUEUED" ? null : "2026-07-20T10:00:00Z",
+          ended_at: item === "TERMINAL" || item === "START_FAILED" ? "2026-07-20T10:00:04Z" : null,
+          application_return_code: item === "TERMINAL" ? 7 : null,
+          start_error_type: item === "START_FAILED" ? "RuntimeError" : null,
+          terminal_evidence: item === "TERMINAL" ? "RUN_ROOT_PRESENT" : item === "START_FAILED" ? "RUN_ROOT_ABSENT" : null,
+          product_summary: { product_verdict: "PASS", presentation_status: "AVAILABLE" },
+        });
+      }
+      return jsonResponse(404, { error: "NOT_FOUND" });
+    } finally { inFlight -= 1; }
+  };
+  return { get maxInFlight() { return maxInFlight; } };
+}
+
+async function readyForLaunch() {
+  await goToReady("happy");
+  fetchLog.length = 0;
+}
+
+async function runLifecycle() {
+  await readyForLaunch();
+  const tracker = installRunFetch({
+    statuses: ["QUEUED", "STARTING", "RUNNING", "TERMINAL"],
+    results: [{ status: 409, body: { error: "RESULT_NOT_READY" } }, { status: 200, body: resultFixture() }],
+  });
+  windowObj.AdmissibleG3Test.submit("authorize-form"); await settle();
+  const accepted = windowObj.AdmissibleG4Test.snapshot();
+  const states = [];
+  for (let i = 0; i < 4; i++) { await flushTimers(1); await settle(); states.push(windowObj.AdmissibleG4Test.getState()); }
+  const terminalText = document.getElementById("accepted-view").textContent;
+  const verdictBeforeResult = document.getElementById("result-classification").textContent;
+  await flushTimers(1); await settle();
+  const after409 = windowObj.AdmissibleG4Test.snapshot();
+  await flushTimers(1); await settle();
+  const final = windowObj.AdmissibleG4Test.snapshot();
+  const countAtResolution = fetchLog.length;
+  await flushTimers(40); await settle();
+  const g3 = windowObj.AdmissibleG3Test.snapshot();
+  return {
+    accepted, states, terminalText, verdictBeforeResult, after409, final,
+    resultText: document.getElementById("result-view").textContent,
+    classificationText: document.getElementById("result-classification").textContent,
+    essentialText: document.getElementById("essential-evidence").textContent,
+    supplementalText: document.getElementById("supplemental-evidence").textContent,
+    requestUrls: fetchLog.map(x => x.url), maxInFlight: tracker.maxInFlight,
+    noRequestsAfterResolution: fetchLog.length === countAtResolution,
+    secretsEmpty: g3.phraseValue === "" && g3.digestValue === "",
+    storageEmpty: Object.keys(storage.local).length === 0 && Object.keys(storage.session).length === 0,
+  };
+}
+
+async function runStartFailed() {
+  await readyForLaunch();
+  installRunFetch({ statuses: ["START_FAILED"], results: [{ status: 410, body: { error: "NO_AUTHORITATIVE_RESULT", control_state: "START_FAILED", application_return_code: null, terminal_evidence: "RUN_ROOT_ABSENT", start_error_type: "RuntimeError" } }] });
+  windowObj.AdmissibleG3Test.submit("authorize-form"); await settle();
+  await flushTimers(1); await settle(); const startFailed = windowObj.AdmissibleG4Test.snapshot();
+  await flushTimers(1); await settle(); const noResult = windowObj.AdmissibleG4Test.snapshot();
+  const count = fetchLog.length; await flushTimers(30); await settle();
+  return { startFailed, noResult, noResultText: document.getElementById("no-result-view").textContent, noRequestsAfter410: count === fetchLog.length };
+}
+
+async function runVariant(name) {
+  const variants = {
+    ADMITTED_OBSERVED: { verdict: "ADMITTED_OBSERVED", verification: "OBSERVED", presentation: "ADMITTED" },
+    ADMITTED_VERIFIED: { verdict: "ADMITTED_VERIFIED", verification: "INDEPENDENT", presentation: "ADMITTED" },
+    REFUSED: { verdict: "REFUSED", verification: "INDEPENDENT", presentation: "REFUSED", boundary: "BEHAVIORAL_VERIFICATION" },
+    INCOMPLETE: { verdict: "UNKNOWN", verification: "NONE", presentation: "INCOMPLETE", completeness: "INCOMPLETE" },
+    INCONSISTENT: { verdict: "UNKNOWN", verification: "NONE", presentation: "INCONSISTENT", completeness: "INCONSISTENT" },
+    UNKNOWN: { verdict: "UNKNOWN", verification: "NONE", presentation: "UNKNOWN", completeness: "UNKNOWN" },
+    UNSUPPORTED: { verdict: "UNSUPPORTED", verification: "UNSUPPORTED", presentation: "UNKNOWN", completeness: "UNKNOWN" },
+  };
+  await readyForLaunch();
+  installRunFetch({ statuses: ["TERMINAL"], results: [{ status: 200, body: resultFixture(variants[name]) }] });
+  windowObj.AdmissibleG3Test.submit("authorize-form"); await settle(); await flushTimers(2); await settle();
+  return { state: windowObj.AdmissibleG4Test.getState(), text: document.getElementById("result-view").textContent, classification: document.getElementById("result-classification").textContent };
+}
+
+async function runMalicious() {
+  await readyForLaunch();
+  installRunFetch({ statuses: ["TERMINAL"], results: [{ status: 200, body: resultFixture({ malicious: true }) }] });
+  windowObj.AdmissibleG3Test.submit("authorize-form"); await settle(); await flushTimers(2); await settle();
+  return {
+    state: windowObj.AdmissibleG4Test.getState(), markerInvoked, unsafeHtmlApi,
+    createdScriptTags: createdTags.filter(x => x === "script").length,
+    assignedHandlers: assignedHandlers.slice(), text: document.getElementById("result-view").textContent,
+    forbiddenVisible: document.getElementById("result-view").textContent.includes("C:/private/") || document.getElementById("result-view").textContent.includes("excerpt"),
+  };
+}
+
+async function runStaleAndSingleFlight() {
+  await readyForLaunch();
+  let statusResolve;
+  fetchImpl = (url, options = {}) => {
+    const method = (options.method || "GET").toUpperCase(); fetchLog.push({ url, method, headers: { ...(options.headers || {}) } });
+    if (url === "/ui/api/v1/runs" && method === "POST") return Promise.resolve(jsonResponse(202, { control_run_id: "control-stale-status", control_state: "QUEUED" }));
+    return new Promise(resolve => { statusResolve = resolve; });
+  };
+  windowObj.AdmissibleG3Test.submit("authorize-form"); await settle(); await flushTimers(1); await settle();
+  const pendingStatus = windowObj.AdmissibleG4Test.snapshot(); const statusReadsBefore = fetchLog.length;
+  await flushTimers(20); await settle(); const oneStatusInFlight = fetchLog.length === statusReadsBefore && pendingStatus.requestInFlight;
+  windowObj.AdmissibleG3Test.reset(); statusResolve(jsonResponse(200, { control_state: "RUNNING", control_run_id: "control-stale-status" })); await settle();
+  const staleStatusIgnored = windowObj.AdmissibleG4Test.getState() === "COMPOSE";
+
+  await readyForLaunch();
+  let resultResolve;
+  fetchImpl = (url, options = {}) => {
+    const method = (options.method || "GET").toUpperCase(); fetchLog.push({ url, method, headers: { ...(options.headers || {}) } });
+    if (url === "/ui/api/v1/runs" && method === "POST") return Promise.resolve(jsonResponse(202, { control_run_id: "control-stale-result", control_state: "QUEUED" }));
+    if (url.endsWith("/result")) return new Promise(resolve => { resultResolve = resolve; });
+    return Promise.resolve(jsonResponse(200, { control_run_id: "control-stale-result", control_state: "TERMINAL", terminal_evidence: "RUN_ROOT_PRESENT", application_return_code: 0 }));
+  };
+  windowObj.AdmissibleG3Test.submit("authorize-form"); await settle(); await flushTimers(2); await settle();
+  const pendingResult = windowObj.AdmissibleG4Test.snapshot();
+  windowObj.AdmissibleG3Test.reset(); resultResolve(jsonResponse(200, resultFixture())); await settle();
+  const staleResultIgnored = windowObj.AdmissibleG4Test.getState() === "COMPOSE" && document.getElementById("result-classification").textContent === "";
+  return { oneStatusInFlight, pendingResultInFlight: pendingResult.requestInFlight, staleStatusIgnored, staleResultIgnored, resetAborted: !windowObj.AdmissibleG4Test.snapshot().hasAbortOwner && !windowObj.AdmissibleG4Test.snapshot().hasTimer };
+}
+
+async function runAuthoringSafeDetail() {
+  installDefaultFetch("happy");
+  loadApp();
+  await waitState("COMPOSE");
+  const g3 = windowObj.AdmissibleG3Test;
+  g3.setField("mission-text", "owner mission retained");
+  g3.setField("gate-objective", "owner objective retained");
+  g3.setField("completion-conditions", "owner conditions retained");
+  g3.setField("commit-message", "feat: owner commit retained");
+  fetchImpl = async (url, options = {}) => {
+    const method = (options.method || "GET").toUpperCase();
+    fetchLog.push({ url, method, headers: { ...(options.headers || {}) } });
+    if (url === "/ui/api/v1/bootstrap") {
+      return jsonResponse(200, {
+        service: "admissible-product-launcher", version: "g2.5",
+        repository_display_path: "safe-repository", required_source_head: "a".repeat(40),
+        authorization_mode: "PRECOMMITTED_DIGEST", authorization_semantics_notice: "notice",
+        owner_authorization_encoding: "latin-1", g2_ready: true, g2_api_version: "v1",
+        csrf_nonce: "c".repeat(64), supported_authoring_template_ids: ["observed_local_git_v1"],
+        visual_ui_available: false
+      });
+    }
+    if (url === "/ui/api/v1/contracts" && method === "POST") {
+      return jsonResponse(400, {
+        error: "AUTHORING_REJECTED",
+        error_code: "GOLDEN_CONTRACT_MISMATCH",
+        field: "mission_text",
+        safe_message_key: "authoring.golden_contract_mismatch",
+        detail: "C:/secret/path stack Traceback https://evil.example/leak owner-secret-phrase",
+        nested: { exception: "RuntimeError: boom", stack: "File /tmp/x.py, line 1" },
+        owner_value: "owner mission retained",
+      });
+    }
+    return jsonResponse(404, { error: "NOT_FOUND" });
+  };
+  g3.submit("compose-form"); await settle(); await flushTimers(5); await settle();
+  const matched = {
+    state: windowObj.AdmissibleG4Test.getState(),
+    statusVisible: document.getElementById("status-area").hidden === false,
+    statusMessage: document.getElementById("status-message").textContent,
+    statusCode: document.getElementById("status-code").textContent,
+    errorArea: document.getElementById("status-area").textContent,
+    missionValue: document.getElementById("mission-text").value,
+    objectiveValue: document.getElementById("gate-objective").value,
+    conditionsValue: document.getElementById("completion-conditions").value,
+    commitValue: document.getElementById("commit-message").value,
+    materialValues: Array.from(document.getElementById("material-list").querySelectorAll("input")).map(x => x.value),
+    composeHidden: document.getElementById("compose-view").hidden,
+    executionClaim: document.getElementById("status-area").textContent + document.getElementById("live-status").textContent,
+  };
+
+  fetchImpl = async (url, options = {}) => {
+    const method = (options.method || "GET").toUpperCase();
+    fetchLog.push({ url, method, headers: { ...(options.headers || {}) } });
+    if (url === "/ui/api/v1/contracts" && method === "POST") {
+      return jsonResponse(400, {
+        error: "AUTHORING_REJECTED",
+        error_code: "C:/unsafe/path",
+        field: "<script>alert(1)</script>",
+        detail: "raw body must stay invisible",
+        nested: { boom: true },
+        message: "do-not-echo",
+      });
+    }
+    return jsonResponse(404, { error: "NOT_FOUND" });
+  };
+  g3.submit("compose-form"); await settle(); await flushTimers(5); await settle();
+  const unsafe = {
+    statusMessage: document.getElementById("status-message").textContent,
+    statusCode: document.getElementById("status-code").textContent,
+    errorArea: document.getElementById("status-area").textContent,
+    missionValue: document.getElementById("mission-text").value,
+  };
+
+  fetchImpl = async (url, options = {}) => {
+    const method = (options.method || "GET").toUpperCase();
+    fetchLog.push({ url, method, headers: { ...(options.headers || {}) } });
+    if (url === "/ui/api/v1/contracts" && method === "POST") {
+      return jsonResponse(400, {
+        error: "AUTHORING_REJECTED",
+        error_code: 12,
+        field: ["mission_text"],
+        detail: { raw: true },
+      });
+    }
+    return jsonResponse(404, { error: "NOT_FOUND" });
+  };
+  g3.submit("compose-form"); await settle(); await flushTimers(5); await settle();
+  const malformed = {
+    statusMessage: document.getElementById("status-message").textContent,
+    statusCode: document.getElementById("status-code").textContent,
+    errorArea: document.getElementById("status-area").textContent,
+  };
+  return { matched, unsafe, malformed };
+}
+
+(async () => {
+  try {
+    let out;
+    if (scenario === "g4_lifecycle") out = await runLifecycle();
+    else if (scenario === "g4_start_failed") out = await runStartFailed();
+    else if (scenario.startsWith("g4_variant:")) out = await runVariant(scenario.split(":")[1]);
+    else if (scenario === "g4_malicious") out = await runMalicious();
+    else if (scenario === "g4_stale") out = await runStaleAndSingleFlight();
+    else if (scenario === "g4_authoring_detail") out = await runAuthoringSafeDetail();
+    else throw new Error("unknown scenario");
+    process.stdout.write(JSON.stringify(out));
+  } catch (error) {
+    process.stdout.write(JSON.stringify({ scenario, error: String(error && error.stack || error) }));
+    process.exitCode = 1;
+  }
+})();
+'''
+
+
+def _build_node_harness() -> str:
+    harness = G3_NODE_HARNESS.replace(
+        "\nbuildDom();\n\nconst document =",
+        "\n" + G4_DOM + "\nbuildDom();\ninstallG4Dom();\n\nconst document =",
+    )
+    harness = harness.replace(
+        "  buildDom();\n  // trap marker side effects",
+        "  buildDom();\n  installG4Dom();\n  // trap marker side effects",
+    )
+    harness = harness.replace(
+        "Object, Array, String, Number, Boolean, JSON, Error, Promise, Math, RegExp, Date,",
+        "Object, Array, String, Number, Boolean, JSON, Error, Promise, Math, RegExp, Date: class FakeDate extends Date { static now() { return nowMs; } },",
+    )
+    return harness.rsplit("(async () => {", 1)[0] + G4_SCENARIOS
+
+
+NODE_HARNESS = _build_node_harness()
+
+
+def _run_node(tmp_path: Path, scenario: str) -> dict:
+    harness = tmp_path / f"g4_harness_{re.sub(r'[^A-Za-z0-9_]+', '_', scenario)}.js"
+    harness.write_text(NODE_HARNESS, encoding="utf-8")
+    completed = subprocess.run(
+        [NODE, str(harness), scenario, str(JS_PATH)],
+        capture_output=True,
+        text=True,
+        timeout=25,
+        cwd=str(tmp_path),
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+    assert completed.returncode == 0, completed.stdout + "\n" + completed.stderr
+    payload = json.loads(completed.stdout)
+    assert "error" not in payload, payload
+    return payload
+
+
+class ShellAudit(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ids: set[str] = set()
+        self.headings: list[str] = []
+        self.current_heading = False
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        data = dict(attrs)
+        if "id" in data:
+            self.ids.add(data["id"])
+        if tag in {"h1", "h2", "h3"}:
+            self.current_heading = True
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"h1", "h2", "h3"}:
+            self.current_heading = False
+
+    def handle_data(self, data: str) -> None:
+        if self.current_heading and data.strip():
+            self.headings.append(data.strip())
+
+
+def test_g4_shell_semantics_accessibility_and_lifecycle_steps():
+    audit = ShellAudit()
+    audit.feed(HTML)
+    assert {"accepted-view", "result-view", "no-result-view", "live-status", "status-area"}.issubset(audit.ids)
+    assert all(step in HTML for step in ("Compose", "Contract", "Authorize", "Run", "Result"))
+    assert "Mission accepted" in HTML and "No authoritative result" in audit.headings
+    assert 'aria-live="polite"' in HTML and 'aria-live="assertive"' in HTML and 'role="alert"' in HTML
+    assert 'tabindex="-1"' in HTML and "Compose another mission" in HTML
+
+
+def test_explicit_g4_state_machine_routes_and_polling_law():
+    for state in (
+        "RUN_ACCEPTED", "RUN_LOADING", "RUN_QUEUED", "RUN_STARTING", "RUN_RUNNING",
+        "RUN_TERMINAL_LOADING_RESULT", "RUN_RESULT_READY", "RUN_NO_AUTHORITATIVE_RESULT",
+        "RUN_START_FAILED", "RUN_REQUEST_ERROR",
+    ):
+        assert state in JS
+    assert "POLL_INTERVAL_MS = 750" in JS and "MAX_STATUS_ATTEMPTS = 120" in JS
+    assert "MAX_RESULT_ATTEMPTS = 120" in JS and "flowEpoch" in JS and "AbortController" in JS
+    assert "pagehide" in JS and "beforeunload" in JS and "requestInFlight" in JS
+    assert "product_summary" not in JS.replace('"product_summary"', "")
+    assert "/ui/api/v1/runs" in JS and "authoritativeResultPath" in JS
+    assert not re.search(r'api\("/ui/api/v1/runs"\)', JS)
+
+
+def test_security_scans_and_bounded_observation_hook():
+    assert all(api not in JS for api in ("innerHTML", "outerHTML=", "insertAdjacentHTML", "document.write", "eval(", "new Function"))
+    assert "localStorage" not in JS and "sessionStorage" not in JS
+    assert "run_root" in JS and "diagnostics" in JS and "FORBIDDEN_RESULT_FIELDS" in JS
+    hook = JS.split('Object.defineProperty(window,"AdmissibleG4Test"', 1)[1].split("bootstrap();", 1)[0]
+    assert all(secret not in hook.lower() for secret in ("csrf", "nonce", "token", "phrase", "digest", "authorization"))
+    assert 'credentials:"omit"' in JS and 'cache:"no-store"' in JS and 'referrerPolicy:"no-referrer"' in JS
+    assert "/api/v1/" not in JS.replace("/ui/api/v1/", "")
+
+
+def test_mobile_overflow_focus_and_reduced_motion_contract():
+    assert "@media(max-width:760px)" in CSS and "@media(max-width:420px)" in CSS
+    assert "@media(prefers-reduced-motion:reduce)" in CSS and ":focus-visible" in CSS
+    assert "overflow-x:hidden" in CSS and "overflow-wrap:anywhere" in CSS and "word-break:break-word" in CSS
+    assert "grid-template-columns:repeat(5,1fr)" in CSS and CSS.count("{") == CSS.count("}")
+
+
+def test_javascript_syntax_python_ast_and_test_harness_ast():
+    subprocess.run([NODE, "--check", str(JS_PATH)], check=True, capture_output=True, text=True, timeout=10)
+    ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    assert "fs.readFileSync(appJsPath" in NODE_HARNESS and "setTimeoutFn" in NODE_HARNESS
+
+
+def test_202_lifecycle_409_then_200_and_terminal_truth_boundaries(tmp_path):
+    out = _run_node(tmp_path, "g4_lifecycle")
+    assert out["accepted"]["state"] == "RUN_ACCEPTED" and out["accepted"]["initialControlState"] == "QUEUED"
+    assert out["requestUrls"][:1] == ["/ui/api/v1/runs"]
+    assert out["states"] == ["RUN_QUEUED", "RUN_STARTING", "RUN_RUNNING", "RUN_TERMINAL_LOADING_RESULT"]
+    assert "not a success verdict" in out["terminalText"] and out["verdictBeforeResult"] == ""
+    assert out["after409"]["state"] == "RUN_TERMINAL_LOADING_RESULT" and out["after409"]["resultAttempts"] == 1
+    assert out["final"]["state"] == "RUN_RESULT_READY" and out["final"]["resultResolved"] is True
+    assert out["maxInFlight"] == 1 and out["noRequestsAfterResolution"] is True
+
+
+def test_result_evidence_and_transport_return_code_are_separate(tmp_path):
+    out = _run_node(tmp_path, "g4_lifecycle")
+    assert "ADMITTED_VERIFIED" in out["classificationText"] and "INDEPENDENT" in out["classificationText"] and "COMPLETE" in out["classificationText"]
+    assert "Application return code (transport only)7" in out["terminalText"]
+    for expected in ("Run identity", "Git and workspace result", "Required materials", "Checkpoint result", "Independent behavioral verification", "Completeness and failing boundary"):
+        assert expected in out["essentialText"]
+    for expected in ("Process facts", "Evidence inventory", "Notices and transport", "admissible_product_service_transport_v1"):
+        assert expected in out["supplementalText"]
+    assert "b" * 40 in out["resultText"] and "c" * 64 in out["resultText"] and "d" * 64 in out["resultText"]
+    assert out["secretsEmpty"] and out["storageEmpty"]
+
+
+def test_start_failed_and_410_no_authoritative_result(tmp_path):
+    out = _run_node(tmp_path, "g4_start_failed")
+    assert out["startFailed"]["state"] == "RUN_START_FAILED"
+    assert out["noResult"]["state"] == "RUN_NO_AUTHORITATIVE_RESULT"
+    assert "No authoritative result" in out["noResultText"]
+    assert "START_FAILED" in out["noResultText"] and "RUN_ROOT_ABSENT" in out["noResultText"] and "RuntimeError" in out["noResultText"]
+    assert "transport only" in out["noResultText"] and out["noRequestsAfter410"] is True
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("ADMITTED_OBSERVED", "ADMITTED_OBSERVED"),
+        ("ADMITTED_VERIFIED", "ADMITTED_VERIFIED"),
+        ("REFUSED", "BEHAVIORAL_VERIFICATION"),
+        ("INCOMPLETE", "INCOMPLETE"),
+        ("INCONSISTENT", "INCONSISTENT"),
+        ("UNKNOWN", "UNKNOWN"),
+        ("UNSUPPORTED", "UNSUPPORTED"),
+    ],
+)
+def test_exact_result_classifications_are_not_renamed(tmp_path, name, expected):
+    out = _run_node(tmp_path, f"g4_variant:{name}")
+    assert out["state"] == "RUN_RESULT_READY" and expected in out["classification"]
+    if name == "REFUSED":
+        assert "REFUSED" in out["classification"]
+
+
+def test_html_shaped_result_values_are_inert_and_private_fields_hidden(tmp_path):
+    out = _run_node(tmp_path, "g4_malicious")
+    assert out["state"] == "RUN_RESULT_READY" and out["markerInvoked"] == 0
+    assert out["unsafeHtmlApi"] == 0 and out["createdScriptTags"] == 0 and out["assignedHandlers"] == []
+    assert "<script>" in out["text"] and out["forbiddenVisible"] is False
+
+
+def test_stale_status_and_result_single_flight_and_reset_abort(tmp_path):
+    out = _run_node(tmp_path, "g4_stale")
+    assert out == {
+        "oneStatusInFlight": True,
+        "pendingResultInFlight": True,
+        "staleStatusIgnored": True,
+        "staleResultIgnored": True,
+        "resetAborted": True,
+    }
+
+
+def test_authoring_rejected_shows_safe_error_code_and_field(tmp_path):
+    out = _run_node(tmp_path, "g4_authoring_detail")
+    matched = out["matched"]
+    assert matched["state"] == "COMPOSE"
+    assert matched["statusVisible"] is True
+    assert matched["statusMessage"] == "The launcher rejected one or more contract fields."
+    assert matched["statusCode"] == "AUTHORING_REJECTED / GOLDEN_CONTRACT_MISMATCH (mission_text)"
+    assert matched["composeHidden"] is False
+    assert matched["missionValue"] == "owner mission retained"
+    assert matched["objectiveValue"] == "owner objective retained"
+    assert matched["conditionsValue"] == "owner conditions retained"
+    assert matched["commitValue"] == "feat: owner commit retained"
+    assert matched["materialValues"] == ["README.md"]
+    rendered = matched["errorArea"] + matched["executionClaim"]
+    for banned in (
+        "C:/secret/path", "Traceback", "https://evil.example", "owner-secret-phrase",
+        "RuntimeError", "/tmp/x.py", "authoring.golden_contract_mismatch", "execution started",
+        '{"error"', "nested",
+    ):
+        assert banned not in rendered
+    assert "owner mission retained" not in matched["errorArea"]
+
+    unsafe = out["unsafe"]
+    assert unsafe["statusMessage"] == "The launcher rejected one or more contract fields."
+    assert unsafe["statusCode"] == "AUTHORING_REJECTED"
+    for banned in ("C:/unsafe/path", "<script>", "alert(1)", "raw body must stay invisible", "do-not-echo"):
+        assert banned not in unsafe["errorArea"]
+    assert unsafe["missionValue"] == "owner mission retained"
+
+    malformed = out["malformed"]
+    assert malformed["statusMessage"] == "The launcher rejected one or more contract fields."
+    assert malformed["statusCode"] == "AUTHORING_REJECTED"
+    assert "12" not in malformed["statusCode"]
+    assert "mission_text" not in malformed["statusCode"]
+    assert "raw" not in malformed["errorArea"]
+
+
+def _result_payload() -> dict:
+    return {
+        "non_authority_notice": "Persisted claims do not create authority.",
+        "run_id": "run-real-server-1",
+        "presentation_status": "ADMITTED",
+        "execution_state": {"state": "COMPLETED", "provider_exit_code": 0},
+        "result_admission_state": {"verdict": "ADMITTED_VERIFIED", "verification_mode": "INDEPENDENT"},
+        "failing_boundary": {"boundary": "NONE", "reasons": []},
+        "material_git_result": {
+            "git": {"present": "PRESENT", "final_git_head": "b" * 40, "source_repository_mutated": False},
+            "material": {"present": "PRESENT", "result": "PASSED", "eligible": True},
+        },
+        "checkpoint_result": {"present": "PRESENT", "result": "PASSED", "attempted": True},
+        "behavioral_verifier_result": {"present": "PRESENT", "result": "PASSED", "exit_code": 0},
+        "evidence_completeness": {"state": "COMPLETE", "missing_required": []},
+        "timeline": [],
+        "artifacts": [],
+        "transport_schema_version": "admissible_product_service_transport_v1",
+        "transport_redactions": ["diagnostics", "run_root"],
+        "read_notes": [],
+        "human_disposition": {"present": "ABSENT", "disposition": "UNKNOWN"},
+    }
+
+
+class SequenceLauncher(FakeLauncher):
+    def __init__(self) -> None:
+        super().__init__("PRECOMMITTED_DIGEST")
+        self.statuses = ["QUEUED", "STARTING", "RUNNING", "TERMINAL"]
+        self.proxy_calls: list[str] = []
+        self.result_calls = 0
+
+    def proxy_g2(self, method: str, path: str):
+        assert method == "GET"
+        self.proxy_calls.append(path)
+        if path.endswith("/result"):
+            self.result_calls += 1
+            if self.result_calls == 1:
+                return 409, {"error": "RESULT_NOT_READY"}
+            return 200, _result_payload()
+        state = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
+        return 200, {
+            "control_run_id": "control-1",
+            "control_state": state,
+            "authoritative_session_id": None if state == "QUEUED" else "session-real-1",
+            "started_at": None if state == "QUEUED" else "2026-07-20T10:00:00Z",
+            "ended_at": "2026-07-20T10:00:04Z" if state == "TERMINAL" else None,
+            "application_return_code": 0 if state == "TERMINAL" else None,
+            "start_error_type": None,
+            "terminal_evidence": "RUN_ROOT_PRESENT" if state == "TERMINAL" else None,
+            "product_summary": {"product_verdict": "PASS"},
+        }
+
+
+def _free_port() -> int:
+    probe = socket.socket()
+    try:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+    finally:
+        probe.close()
+
+
+def test_full_real_server_browser_rehearsal_with_injected_sequences(tmp_path):
+    if not CHROME.is_file():
+        pytest.skip("Chrome not installed")
+    launcher = SequenceLauncher()
+    server = create_ui_loopback_server(launcher, csrf_generator=lambda _n: "f" * 64).start()
+    profile = tmp_path / "chrome-profile-g4"
+    profile.mkdir()
+    debug_port = _free_port()
+    url = f"http://{server.host}:{server.port}/"
+    cmd = [
+        str(CHROME), f"--user-data-dir={profile}", f"--remote-debugging-port={debug_port}",
+        "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+        "--disable-extensions", "--disable-background-networking", url,
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    close_cdp = None
+    try:
+        deadline = time.time() + 20
+        targets = None
+        while time.time() < deadline:
+            try:
+                with urlopen(f"http://127.0.0.1:{debug_port}/json", timeout=1) as response:
+                    targets = json.loads(response.read().decode())
+                break
+            except Exception:
+                time.sleep(0.2)
+        assert targets is not None
+        page = next(item for item in targets if item.get("type") == "page" and url.rstrip("/") in item.get("url", ""))
+        send, close_cdp = _cdp_connect(page["webSocketDebuggerUrl"])
+        send("Runtime.enable")
+
+        def evaluate(expression: str):
+            got = send("Runtime.evaluate", {"expression": expression, "returnByValue": True})
+            return ((got.get("result") or {}).get("result") or {}).get("value")
+
+        def wait_for(expression: str, wanted, timeout_s: float = 20.0):
+            end = time.time() + timeout_s
+            last = None
+            while time.time() < end:
+                last = evaluate(expression)
+                if last == wanted:
+                    return last
+                time.sleep(0.15)
+            raise AssertionError(f"wait for {wanted!r} timed out; last={last!r}")
+
+        wait_for("window.AdmissibleG3Test && window.AdmissibleG3Test.getState()", "COMPOSE")
+        evaluate(
+            "window.AdmissibleG3Test.setField('mission-text','browser mission');"
+            "window.AdmissibleG3Test.setField('gate-objective','browser objective');"
+            "window.AdmissibleG3Test.setField('completion-conditions','browser complete');"
+            "window.AdmissibleG3Test.setField('commit-message','feat: browser');"
+            "window.AdmissibleG3Test.submit('compose-form');"
+        )
+        wait_for("window.AdmissibleG3Test.getState()", "CONTRACT_READY")
+        evaluate("window.AdmissibleG3Test.click('prepare-button')")
+        wait_for("window.AdmissibleG3Test.getState()", "PREPARATION_READY")
+        evaluate(
+            "window.AdmissibleG3Test.setField('owner-phrase','owner-secret-phrase');"
+            f"window.AdmissibleG3Test.setField('owner-digest','{'d' * 64}');"
+            "window.AdmissibleG3Test.submit('authorize-form');"
+        )
+        wait_for("window.AdmissibleG4Test && window.AdmissibleG4Test.getState()", "RUN_RESULT_READY", 20)
+        text = evaluate("document.getElementById('result-view').textContent")
+        secret_state = evaluate("document.getElementById('owner-phrase').value + '|' + document.getElementById('owner-digest').value")
+        overflow = evaluate("document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+        assert "ADMITTED_VERIFIED" in text and "COMPLETE" in text and "Git and workspace result" in text
+        assert secret_state == "|" and overflow is True
+        assert launcher.proxy_calls == [
+            "/api/v1/runs/control-1", "/api/v1/runs/control-1", "/api/v1/runs/control-1", "/api/v1/runs/control-1",
+            "/api/v1/runs/control-1/result", "/api/v1/runs/control-1/result",
+        ]
+    finally:
+        if close_cdp:
+            close_cdp()
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        server.stop()

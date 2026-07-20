@@ -6,7 +6,12 @@
     CONTRACT_READY:"CONTRACT_READY", PREPARATION_QUEUED:"PREPARATION_QUEUED",
     PREPARATION_RUNNING:"PREPARATION_RUNNING", PREPARATION_READY:"PREPARATION_READY",
     PREPARATION_BLOCKED:"PREPARATION_BLOCKED", PREPARATION_FAILED:"PREPARATION_FAILED",
-    LAUNCHING:"LAUNCHING", LAUNCH_ACCEPTED:"LAUNCH_ACCEPTED", REQUEST_ERROR:"REQUEST_ERROR"
+    LAUNCHING:"LAUNCHING", LAUNCH_ACCEPTED:"LAUNCH_ACCEPTED", REQUEST_ERROR:"REQUEST_ERROR",
+    RUN_ACCEPTED:"RUN_ACCEPTED", RUN_LOADING:"RUN_LOADING", RUN_QUEUED:"RUN_QUEUED",
+    RUN_STARTING:"RUN_STARTING", RUN_RUNNING:"RUN_RUNNING",
+    RUN_TERMINAL_LOADING_RESULT:"RUN_TERMINAL_LOADING_RESULT",
+    RUN_RESULT_READY:"RUN_RESULT_READY", RUN_NO_AUTHORITATIVE_RESULT:"RUN_NO_AUTHORITATIVE_RESULT",
+    RUN_START_FAILED:"RUN_START_FAILED", RUN_REQUEST_ERROR:"RUN_REQUEST_ERROR"
   });
   const allowed = Object.freeze({
     BOOTSTRAP_LOADING:["COMPOSE","REQUEST_ERROR"],
@@ -16,22 +21,42 @@
     PREPARATION_RUNNING:["PREPARATION_RUNNING","PREPARATION_READY","PREPARATION_BLOCKED","PREPARATION_FAILED","REQUEST_ERROR","COMPOSE"],
     PREPARATION_READY:["LAUNCHING","REQUEST_ERROR","COMPOSE"],
     PREPARATION_BLOCKED:["PREPARATION_QUEUED","COMPOSE"], PREPARATION_FAILED:["PREPARATION_QUEUED","COMPOSE"],
-    LAUNCHING:["LAUNCH_ACCEPTED","PREPARATION_READY","REQUEST_ERROR"], LAUNCH_ACCEPTED:["COMPOSE"],
+    LAUNCHING:["RUN_ACCEPTED","PREPARATION_READY","REQUEST_ERROR"],
+    RUN_ACCEPTED:["RUN_LOADING","RUN_REQUEST_ERROR","COMPOSE"],
+    RUN_LOADING:["RUN_QUEUED","RUN_STARTING","RUN_RUNNING","RUN_TERMINAL_LOADING_RESULT","RUN_START_FAILED","RUN_REQUEST_ERROR","COMPOSE"],
+    RUN_QUEUED:["RUN_LOADING","RUN_QUEUED","RUN_STARTING","RUN_RUNNING","RUN_TERMINAL_LOADING_RESULT","RUN_START_FAILED","RUN_REQUEST_ERROR","COMPOSE"],
+    RUN_STARTING:["RUN_LOADING","RUN_STARTING","RUN_RUNNING","RUN_TERMINAL_LOADING_RESULT","RUN_START_FAILED","RUN_REQUEST_ERROR","COMPOSE"],
+    RUN_RUNNING:["RUN_LOADING","RUN_RUNNING","RUN_TERMINAL_LOADING_RESULT","RUN_START_FAILED","RUN_REQUEST_ERROR","COMPOSE"],
+    RUN_TERMINAL_LOADING_RESULT:["RUN_TERMINAL_LOADING_RESULT","RUN_RESULT_READY","RUN_NO_AUTHORITATIVE_RESULT","RUN_REQUEST_ERROR","COMPOSE"],
+    RUN_START_FAILED:["RUN_START_FAILED","RUN_RESULT_READY","RUN_NO_AUTHORITATIVE_RESULT","RUN_REQUEST_ERROR","COMPOSE"],
+    RUN_RESULT_READY:["COMPOSE"], RUN_NO_AUTHORITATIVE_RESULT:["COMPOSE"], RUN_REQUEST_ERROR:["COMPOSE"],
+    LAUNCH_ACCEPTED:["COMPOSE"],
     REQUEST_ERROR:["BOOTSTRAP_LOADING","COMPOSE","CONTRACT_READY","PREPARATION_READY"]
   });
   const ui = {
-    state:STATES.BOOTSTRAP_LOADING, bootstrap:null, contract:null, preparation:null,
-    pollController:null, pollTimer:null, pollCount:0, resumeState:null, prepareInFlight:false, flowEpoch:0
+    state:STATES.BOOTSTRAP_LOADING, bootstrap:null, contract:null, preparation:null, run:null, result:null,
+    pollController:null, pollTimer:null, pollCount:0, statusAttempts:0, resultAttempts:0,
+    requestInFlight:false, resultResolved:false, observationPhase:null,
+    resumeState:null, prepareInFlight:false, flowEpoch:0
   };
+  const POLL_INTERVAL_MS = 750;
+  const MAX_STATUS_ATTEMPTS = 120;
+  const MAX_RESULT_ATTEMPTS = 120;
+  const FORBIDDEN_RESULT_FIELDS = new Set(["run_root","diagnostics"]);
   const byId = id => document.getElementById(id);
-  const views = ["loading","compose","contract","preparation","authorize","accepted"];
+  const views = ["loading","compose","contract","preparation","authorize","accepted","result","no-result"];
   const csrf = document.querySelector('meta[name="admissible-ui-csrf"]').content;
+  const hasOwn = (value,key) => !!value && Object.prototype.hasOwnProperty.call(value,key);
+  const isObject = value => value!==null && typeof value==="object" && !Array.isArray(value);
 
-  function announce(message){ byId("live-status").textContent=message; }
+  function announce(message){const live=byId("live-status");if(live)live.textContent=message;}
+  function isRunState(state){return state.startsWith("RUN_");}
   function stepFor(state){
     if([STATES.COMPOSE,STATES.AUTHORING,STATES.BOOTSTRAP_LOADING].includes(state))return "compose";
     if([STATES.CONTRACT_READY,STATES.PREPARATION_QUEUED,STATES.PREPARATION_RUNNING,STATES.PREPARATION_BLOCKED,STATES.PREPARATION_FAILED].includes(state))return "contract";
-    return "authorize";
+    if([STATES.PREPARATION_READY,STATES.LAUNCHING].includes(state))return "authorize";
+    if([STATES.RUN_RESULT_READY,STATES.RUN_NO_AUTHORITATIVE_RESULT].includes(state))return "result";
+    return isRunState(state)?"run":"authorize";
   }
   function setState(next){
     if(next!==ui.state && !(allowed[ui.state]||[]).includes(next))throw new Error("INVALID_STATE_TRANSITION");
@@ -40,11 +65,17 @@
     document.querySelectorAll(".steps li").forEach(item=>{
       if(item.dataset.step===stepFor(next))item.setAttribute("aria-current","step");else item.removeAttribute("aria-current");
     });
-    views.forEach(name=>{byId(name+"-view").hidden=true;});
-    const target = next===STATES.BOOTSTRAP_LOADING?"loading":next===STATES.COMPOSE||next===STATES.AUTHORING?"compose":next===STATES.CONTRACT_READY?"contract":next===STATES.PREPARATION_READY||next===STATES.LAUNCHING?"authorize":next===STATES.LAUNCH_ACCEPTED?"accepted":"preparation";
-    byId(target+"-view").hidden=false;
+    views.forEach(name=>{const view=byId(name+"-view");if(view)view.hidden=true;});
+    const target = next===STATES.BOOTSTRAP_LOADING?"loading":
+      next===STATES.COMPOSE||next===STATES.AUTHORING?"compose":
+      next===STATES.CONTRACT_READY?"contract":
+      next===STATES.PREPARATION_READY||next===STATES.LAUNCHING?"authorize":
+      next===STATES.RUN_RESULT_READY?"result":
+      next===STATES.RUN_NO_AUTHORITATIVE_RESULT?"no-result":
+      isRunState(next)?"accepted":"preparation";
+    const targetView=byId(target+"-view");if(targetView)targetView.hidden=false;
     byId("author-button").disabled=next===STATES.AUTHORING;
-    byId("author-button").textContent=next===STATES.AUTHORING?"Authoring contract…":"Author canonical contract";
+    byId("author-button").textContent=next===STATES.AUTHORING?"Authoring contract...":"Author canonical contract";
     byId("launch-button").disabled=next===STATES.LAUNCHING;
     byId("launch-button").textContent=next===STATES.LAUNCHING?"Submitting authorization":"Launch mission";
     const preparing=next===STATES.PREPARATION_QUEUED||next===STATES.PREPARATION_RUNNING||ui.prepareInFlight;
@@ -56,17 +87,30 @@
       if(locked)button.setAttribute("aria-disabled","true");else button.removeAttribute("aria-disabled");
     });
     announce(next.replaceAll("_"," ").toLowerCase());
+    if((next===STATES.RUN_RESULT_READY||next===STATES.RUN_NO_AUTHORITATIVE_RESULT) && targetView){
+      const heading=targetView.querySelector("h2");if(heading){heading.focus();heading.scrollIntoView({block:"start"});}
+    }
+  }
+  function isSafeBoundedIdentifier(value){
+    return typeof value==="string" && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(value);
+  }
+  function boundedTechnicalCode(body,fallback){
+    const primary=isSafeBoundedIdentifier(body&&body.error)?body.error:(isSafeBoundedIdentifier(fallback)?fallback:"REQUEST_ERROR");
+    let line=primary;
+    if(isSafeBoundedIdentifier(body&&body.error_code))line+=" / "+body.error_code;
+    if(isSafeBoundedIdentifier(body&&body.field))line+=" ("+body.field+")";
+    return line;
   }
   function showError(code,message,resume){
-    ui.resumeState=resume||ui.state; byId("status-message").textContent=message;
-    byId("status-code").textContent=code||"REQUEST_ERROR"; byId("status-area").hidden=false;
+    ui.resumeState=resume||ui.state;byId("status-message").textContent=message;
+    byId("status-code").textContent=code||"REQUEST_ERROR";byId("status-area").hidden=false;
   }
   function clearError(){byId("status-area").hidden=true;byId("status-message").textContent="";byId("status-code").textContent="";byId("retry-bootstrap").hidden=true;}
   function boundedMessage(status,body){
     if(!Number.isInteger(status))return {code:"LAUNCHER_UNAVAILABLE",message:"The local launcher is unavailable. Check that it is still running, then retry."};
-    const code=body&&typeof body.error==="string"?body.error:"REQUEST_FAILED";
-    const messages={AUTHORING_REJECTED:"The launcher rejected one or more contract fields.",PREFLIGHT_BUSY:"Another canonical preflight is already active.",PREPARATION_NOT_READY:"This preparation is not ready for authorization.",PREPARATION_IN_USE:"This preparation is already being authorized.",PREPARATION_CONSUMED:"This authorization preparation has already been used.",OWNER_AUTHORIZATION_REQUIRED:"Enter the owner authorization phrase.",OWNER_AUTHORIZATION_INVALID:"The owner authorization phrase was rejected.",OWNER_AUTHORIZATION_ENCODING_UNSUPPORTED:"The phrase cannot be transported with the required Latin-1 encoding.",OWNER_AUTHORIZATION_DIGEST_INVALID:"Enter the owner-supplied lowercase 64-hex digest.",RUN_CONFLICT:"The launcher reported a launch conflict.",LAUNCHER_CLOSED:"The local launcher is unavailable.",WRITE_UNAVAILABLE:"The launcher could not complete this request.",READ_UNAVAILABLE:"The launcher could not read preparation status."};
-    return {code,message:messages[code]||(`The launcher returned a bounded ${status} response.`)};
+    const errorToken=body&&typeof body.error==="string"?body.error:"REQUEST_FAILED";
+    const messages={AUTHORING_REJECTED:"The launcher rejected one or more contract fields.",PREFLIGHT_BUSY:"Another canonical preflight is already active.",PREPARATION_NOT_READY:"This preparation is not ready for authorization.",PREPARATION_IN_USE:"This preparation is already being authorized.",PREPARATION_CONSUMED:"This authorization preparation has already been used.",OWNER_AUTHORIZATION_REQUIRED:"Enter the owner authorization phrase.",OWNER_AUTHORIZATION_INVALID:"The owner authorization phrase was rejected.",OWNER_AUTHORIZATION_ENCODING_UNSUPPORTED:"The phrase cannot be transported with the required Latin-1 encoding.",OWNER_AUTHORIZATION_DIGEST_INVALID:"Enter the owner-supplied lowercase 64-hex digest.",RUN_CONFLICT:"The launcher reported a launch conflict.",LAUNCHER_CLOSED:"The local launcher is unavailable.",WRITE_UNAVAILABLE:"The launcher could not complete this request.",READ_UNAVAILABLE:"The launcher could not read the accepted control run."};
+    return {code:boundedTechnicalCode(body,errorToken),message:messages[errorToken]||(`The launcher returned a bounded ${status} response.`)};
   }
   async function api(path,options={}){
     if(!path.startsWith("/ui/api/v1/"))throw new Error("NON_UI_ROUTE_BLOCKED");
@@ -81,6 +125,7 @@
     const row=document.createElement("div"),dt=document.createElement("dt"),dd=document.createElement("dd");
     dt.textContent=label;dd.textContent=value===null||value===undefined?"Not returned":String(value);row.append(dt,dd);root.append(row);
   }
+  function appendReturnedFact(root,body,key,label){if(hasOwn(body,key))appendFact(root,label,body[key]);}
   function renderBootstrap(boot){
     const root=byId("bootstrap-facts");root.replaceChildren();
     [["Service",boot.service],["Repository",boot.repository_display_path],["Required source HEAD",boot.required_source_head],["Authorization mode",boot.authorization_mode],["Owner phrase encoding",boot.owner_authorization_encoding],["Visual UI wire value",String(boot.visual_ui_available)],["Local state",boot.g2_ready?"Ready":"Unavailable"]].forEach(x=>appendFact(root,x[0],x[1]));
@@ -112,7 +157,11 @@
     try{const {body}=await api("/ui/api/v1/contracts",{method:"POST",body:JSON.stringify(input)});ui.contract={input,response:body};renderContract();setState(STATES.CONTRACT_READY);}
     catch(error){const mapped=boundedMessage(error.status,error.body);setState(STATES.REQUEST_ERROR);showError(mapped.code,mapped.message,STATES.COMPOSE);setState(STATES.COMPOSE);}
   }
-  function stopPolling(){if(ui.pollTimer!==null){clearTimeout(ui.pollTimer);ui.pollTimer=null;}if(ui.pollController){ui.pollController.abort();ui.pollController=null;}ui.pollCount=0;}
+  function stopPolling(){
+    if(ui.pollTimer!==null){clearTimeout(ui.pollTimer);ui.pollTimer=null;}
+    if(ui.pollController){ui.pollController.abort();ui.pollController=null;}
+    ui.pollCount=0;ui.requestInFlight=false;ui.observationPhase=null;
+  }
   function preparationCopy(state,body){
     const copy=byId("preparation-copy"),retry=byId("retry-preparation");retry.hidden=true;
     if(state===STATES.PREPARATION_QUEUED)copy.textContent="Canonical preflight is queued. Execution has not started.";
@@ -123,8 +172,7 @@
   async function prepare(){
     if(ui.prepareInFlight||ui.state===STATES.PREPARATION_QUEUED||ui.state===STATES.PREPARATION_RUNNING)return;
     ui.prepareInFlight=true;byId("prepare-button").disabled=true;byId("retry-preparation").disabled=true;
-    clearError();stopPolling();
-    const epoch=ui.flowEpoch;
+    clearError();stopPolling();const epoch=ui.flowEpoch;
     try{
       const cid=ui.contract.response.contract_id,{body}=await api(`/ui/api/v1/contracts/${encodeURIComponent(cid)}/preparations`,{method:"POST",body:"{}"});
       if(epoch!==ui.flowEpoch)return;
@@ -149,7 +197,7 @@
     }
   }
   async function pollPreparation(){
-    if(ui.pollController||ui.state===STATES.LAUNCH_ACCEPTED)return;ui.pollController=new AbortController();ui.pollCount=0;
+    if(ui.pollController||ui.state===STATES.RUN_ACCEPTED)return;ui.pollController=new AbortController();ui.pollCount=0;
     const epoch=ui.flowEpoch;const controller=ui.pollController;
     const tick=async()=>{
       if(epoch!==ui.flowEpoch||!ui.pollController||ui.pollController!==controller||controller.signal.aborted||ui.pollCount>=120)return;ui.pollCount+=1;
@@ -168,53 +216,203 @@
     for(const ch of phrase.value){if(ch.codePointAt(0)>255){phraseError.textContent="Use only characters encodable as Latin-1.";return false;}}
     const digest=byId("owner-digest");if(digest&&!/^[0-9a-f]{64}$/.test(digest.value)){byId("digest-error").textContent="Enter exactly 64 lowercase hexadecimal characters.";return false;}return true;
   }
-  function renderAccepted(body){const root=byId("accepted-facts");root.replaceChildren();appendFact(root,"Control-run ID",body.control_run_id);appendFact(root,"Initial control state",body.control_state);}
+  function controlRunPath(id){
+    return `/ui/api/v1/runs/${encodeURIComponent(id)}`;
+  }
+  function authoritativeResultPath(id){
+    return `${controlRunPath(id)}/result`;
+  }
+  function runCopy(state){
+    const copies={
+      RUN_ACCEPTED:["Accepted","The launcher accepted the request. Observation begins shortly; HTTP 202 is not a verified result."],
+      RUN_LOADING:["Reading control state","Reading the authoritative control-plane state for this run."],
+      RUN_QUEUED:["QUEUED","The process has not started."],
+      RUN_STARTING:["STARTING","The control plane is starting the application."],
+      RUN_RUNNING:["RUNNING","The application is running; completion is unknown."],
+      RUN_TERMINAL_LOADING_RESULT:["TERMINAL","The application returned. This control state is not a success verdict. Retrieving the authoritative result."],
+      RUN_START_FAILED:["START_FAILED","The invocation failed to start or complete its startup boundary. Retrieving any authoritative result that exists."],
+      RUN_REQUEST_ERROR:["Observation stopped","The accepted run could not be observed within the bounded read lifecycle."]
+    };
+    return copies[state]||[state,"No product verdict exists yet."];
+  }
+  function renderRun(body,state=ui.state){
+    const value=byId("run-state-value"),copy=byId("run-state-copy"),facts=byId("accepted-facts");
+    const content=runCopy(state);if(value)value.textContent=content[0];if(copy)copy.textContent=content[1];if(!facts)return;
+    facts.replaceChildren();
+    if(ui.run)appendFact(facts,"Control-run ID",ui.run.controlRunId);
+    appendReturnedFact(facts,body,"authoritative_session_id","Authoritative session ID");
+    appendReturnedFact(facts,body,"control_state","Control state");
+    appendReturnedFact(facts,body,"started_at","Started at");
+    appendReturnedFact(facts,body,"ended_at","Ended at");
+    appendReturnedFact(facts,body,"application_return_code","Application return code (transport only)");
+    appendReturnedFact(facts,body,"start_error_type","Start error type");
+    appendReturnedFact(facts,body,"terminal_evidence","Terminal evidence");
+  }
+  function renderAccepted(body){renderRun({control_state:body.control_state},STATES.RUN_ACCEPTED);}
+  function safeDisplayValue(value){
+    if(value===null)return "null";
+    if(Array.isArray(value)||isObject(value))return JSON.stringify(sanitizeResultValue(value),null,2);
+    return String(value);
+  }
+  function sanitizeResultValue(value){
+    if(Array.isArray(value))return value.map(sanitizeResultValue);
+    if(!isObject(value))return value;
+    const safe={};Object.keys(value).forEach(key=>{if(!FORBIDDEN_RESULT_FIELDS.has(key)&&value[key]!==undefined)safe[key]=sanitizeResultValue(value[key]);});return safe;
+  }
+  function appendObjectFacts(root,value){
+    if(Array.isArray(value)){const pre=document.createElement("pre");pre.className="evidence-json";pre.textContent=safeDisplayValue(value);root.append(pre);return;}
+    Object.keys(value).forEach(key=>{
+      if(FORBIDDEN_RESULT_FIELDS.has(key)||value[key]===undefined)return;
+      const row=document.createElement("div"),dt=document.createElement("dt"),dd=document.createElement("dd");
+      dt.textContent=key;dd.textContent=safeDisplayValue(value[key]);row.append(dt,dd);root.append(row);
+    });
+  }
+  function addEvidenceSection(root,title,value,open=true){
+    if(value===undefined)return;
+    const details=document.createElement("details");details.open=open;const summary=document.createElement("summary");summary.textContent=title;details.append(summary);
+    if(isObject(value)){const list=document.createElement("dl");list.className="evidence-facts";appendObjectFacts(list,value);details.append(list);}
+    else{const pre=document.createElement("pre");pre.className="evidence-json";pre.textContent=safeDisplayValue(value);details.append(pre);}
+    root.append(details);
+  }
+  function addClassification(root,label,value,primary=false,tone=""){
+    if(value===undefined)return;
+    const item=document.createElement("div");item.className="classification-item"+(primary?" primary":"");if(tone)item.dataset.tone=tone;
+    const name=document.createElement("span");name.className="classification-label";name.textContent=label;const text=document.createElement("span");text.className="classification-value";text.textContent=safeDisplayValue(value);item.append(name,text);root.append(item);
+  }
+  function resultTone(verdict,presentation){
+    if(verdict==="REFUSED"||presentation==="REFUSED")return "refused";
+    if(verdict==="ADMITTED_OBSERVED"||verdict==="ADMITTED_VERIFIED"||presentation==="ADMITTED")return "admitted";
+    if(presentation==="INCOMPLETE"||presentation==="INCONSISTENT")return "incomplete";
+    return "";
+  }
+  function addGlance(root,title,value,keys){
+    if(!isObject(value))return;
+    const card=document.createElement("section");card.className="evidence-card";const heading=document.createElement("h3");heading.textContent=title;card.append(heading);
+    keys.forEach(key=>{if(!hasOwn(value,key))return;const line=document.createElement("p"),name=document.createElement("span"),text=document.createElement("span");name.className="evidence-key";name.textContent=key+": ";text.textContent=safeDisplayValue(value[key]);line.append(name,text);card.append(line);});root.append(card);
+  }
+  function renderResult(body){
+    const result=sanitizeResultValue(body),admission=isObject(result.result_admission_state)?result.result_admission_state:{},complete=isObject(result.evidence_completeness)?result.evidence_completeness:{},boundary=isObject(result.failing_boundary)?result.failing_boundary:{},classification=byId("result-classification");
+    classification.replaceChildren();const tone=resultTone(admission.verdict,result.presentation_status);
+    if(hasOwn(admission,"verdict"))addClassification(classification,"Product verdict",admission.verdict,true,tone);
+    if(hasOwn(admission,"verification_mode"))addClassification(classification,"Verification mode",admission.verification_mode);
+    if(hasOwn(complete,"state"))addClassification(classification,"Evidence completeness",complete.state);
+    if(hasOwn(boundary,"boundary")&&boundary.boundary!==null&&boundary.boundary!=="NONE")addClassification(classification,"Failing boundary",boundary.boundary);
+    if(hasOwn(result,"presentation_status"))addClassification(classification,"Presentation",result.presentation_status,false,tone);
+    const summary=[];
+    if(hasOwn(admission,"verdict"))summary.push(`Product verdict: ${safeDisplayValue(admission.verdict)}.`);
+    if(hasOwn(admission,"verification_mode"))summary.push(`Verification mode: ${safeDisplayValue(admission.verification_mode)}.`);
+    if(hasOwn(complete,"state"))summary.push(`Evidence completeness: ${safeDisplayValue(complete.state)}.`);
+    if(hasOwn(boundary,"boundary")&&boundary.boundary!==null&&boundary.boundary!=="NONE")summary.push(`Failing boundary: ${safeDisplayValue(boundary.boundary)}.`);
+    byId("result-summary").textContent=summary.join(" ")||"The authoritative result transport returned no classification fields.";
+    byId("non-authority-notice").textContent=hasOwn(result,"non_authority_notice")?safeDisplayValue(result.non_authority_notice):"";
+    const glance=byId("evidence-glance");glance.replaceChildren();const materialGit=isObject(result.material_git_result)?result.material_git_result:{};
+    addGlance(glance,"Git result",materialGit.git,["present","final_git_head","commits_added","source_repository_mutated"]);
+    addGlance(glance,"Required materials",materialGit.material,["present","result","eligible","material_paths_compliant"]);
+    addGlance(glance,"Checkpoint",result.checkpoint_result,["present","result","attempted","checkpoint_fingerprint"]);
+    addGlance(glance,"Behavioral verification",result.behavioral_verifier_result,["present","result","exit_code","evidence_fingerprint"]);
+    const essential=byId("essential-evidence");essential.replaceChildren();
+    const identity={control_run_id:ui.run.controlRunId};
+    if(ui.run.status&&hasOwn(ui.run.status,"authoritative_session_id"))identity.authoritative_session_id=ui.run.status.authoritative_session_id;
+    if(hasOwn(result,"run_id"))identity.run_id=result.run_id;
+    addEvidenceSection(essential,"Run identity",identity,true);
+    if(hasOwn(materialGit,"git"))addEvidenceSection(essential,"Git and workspace result",materialGit.git,true);
+    if(hasOwn(materialGit,"material"))addEvidenceSection(essential,"Required materials",materialGit.material,true);
+    if(hasOwn(result,"checkpoint_result"))addEvidenceSection(essential,"Checkpoint result",result.checkpoint_result,true);
+    if(hasOwn(result,"behavioral_verifier_result"))addEvidenceSection(essential,"Independent behavioral verification",result.behavioral_verifier_result,true);
+    const completenessBoundary={};if(hasOwn(result,"evidence_completeness"))completenessBoundary.evidence_completeness=result.evidence_completeness;if(hasOwn(result,"failing_boundary"))completenessBoundary.failing_boundary=result.failing_boundary;
+    if(Object.keys(completenessBoundary).length)addEvidenceSection(essential,"Completeness and failing boundary",completenessBoundary,true);
+    const supplemental=byId("supplemental-evidence");supplemental.replaceChildren();const process={};
+    if(hasOwn(result,"execution_state"))process.execution_state=result.execution_state;
+    ["application_return_code","start_error_type","terminal_evidence","started_at","ended_at"].forEach(key=>{if(ui.run.status&&hasOwn(ui.run.status,key))process[key]=ui.run.status[key];});
+    if(Object.keys(process).length)addEvidenceSection(supplemental,"Process facts",process,false);
+    const inventory={};if(hasOwn(result,"timeline"))inventory.timeline=result.timeline;if(hasOwn(result,"artifacts"))inventory.artifacts=result.artifacts;if(Object.keys(inventory).length)addEvidenceSection(supplemental,"Evidence inventory",inventory,false);
+    const notices={};["transport_schema_version","transport_redactions","read_notes","human_disposition"].forEach(key=>{if(hasOwn(result,key))notices[key]=result[key];});if(Object.keys(notices).length)addEvidenceSection(supplemental,"Notices and transport",notices,false);
+  }
+  function renderNoResult(body){
+    const root=byId("no-result-facts");root.replaceChildren();if(ui.run)appendFact(root,"Control-run ID",ui.run.controlRunId);
+    appendReturnedFact(root,body,"control_state","Returned control state");appendReturnedFact(root,body,"application_return_code","Application return code (transport only)");appendReturnedFact(root,body,"terminal_evidence","Terminal evidence");appendReturnedFact(root,body,"start_error_type","Start error type");
+  }
+  function observationError(code,message){
+    stopPolling();if(ui.state!==STATES.RUN_REQUEST_ERROR)setState(STATES.RUN_REQUEST_ERROR);renderRun(ui.run&&ui.run.status?ui.run.status:{},STATES.RUN_REQUEST_ERROR);showError(code,message,STATES.RUN_REQUEST_ERROR);
+  }
+  function scheduleObservation(tick){ui.pollTimer=setTimeout(tick,POLL_INTERVAL_MS);}
+  function startRunObservation(){
+    if(ui.pollController||!ui.run||ui.resultResolved)return;
+    ui.pollController=new AbortController();ui.statusAttempts=0;ui.resultAttempts=0;ui.observationPhase="status";
+    const epoch=ui.flowEpoch,controller=ui.pollController,firstStatusAt=Date.now()+POLL_INTERVAL_MS;
+    const active=()=>epoch===ui.flowEpoch&&ui.pollController===controller&&!controller.signal.aborted&&!ui.resultResolved;
+    const tick=async()=>{
+      ui.pollTimer=null;if(!active()||ui.requestInFlight)return;
+      if(ui.observationPhase==="status"&&ui.statusAttempts===0&&Date.now()<firstStatusAt){ui.pollTimer=setTimeout(tick,Math.max(1,firstStatusAt-Date.now()));return;}
+      if(ui.observationPhase==="status"&&ui.statusAttempts>=MAX_STATUS_ATTEMPTS){observationError("OBSERVATION_LIMIT_REACHED","Run observation stopped after 120 status attempts. No product verdict was inferred.");return;}
+      if(ui.observationPhase==="result"&&ui.resultAttempts>=MAX_RESULT_ATTEMPTS){observationError("RESULT_OBSERVATION_LIMIT_REACHED","Authoritative result retrieval stopped after its bounded retry limit. No product verdict was inferred.");return;}
+      ui.requestInFlight=true;
+      try{
+        if(ui.observationPhase==="status"){
+          ui.statusAttempts+=1;if(ui.state===STATES.RUN_ACCEPTED||ui.state===STATES.RUN_QUEUED||ui.state===STATES.RUN_STARTING||ui.state===STATES.RUN_RUNNING)setState(STATES.RUN_LOADING);
+          const {body}=await api(controlRunPath(ui.run.controlRunId),{signal:controller.signal});if(!active())return;ui.run.status=body;
+          const next={QUEUED:STATES.RUN_QUEUED,STARTING:STATES.RUN_STARTING,RUNNING:STATES.RUN_RUNNING,START_FAILED:STATES.RUN_START_FAILED,TERMINAL:STATES.RUN_TERMINAL_LOADING_RESULT}[body.control_state];
+          if(!next){observationError("UNRECOGNIZED_CONTROL_STATE","The launcher returned an unrecognized control state. No state or verdict was inferred.");return;}
+          setState(next);renderRun(body,next);
+          if(body.control_state==="TERMINAL"||body.control_state==="START_FAILED")ui.observationPhase="result";else scheduleObservation(tick);
+        }else{
+          ui.resultAttempts+=1;
+          try{
+            const {body}=await api(authoritativeResultPath(ui.run.controlRunId),{signal:controller.signal});if(!active())return;
+            ui.result=body;renderResult(body);ui.resultResolved=true;stopPolling();setState(STATES.RUN_RESULT_READY);
+          }catch(error){
+            if(error.name==="AbortError"||!active())return;
+            if(error.status===409&&error.body&&error.body.error==="RESULT_NOT_READY"){scheduleObservation(tick);return;}
+            if(error.status===410&&error.body&&error.body.error==="NO_AUTHORITATIVE_RESULT"){renderNoResult(error.body);ui.resultResolved=true;stopPolling();setState(STATES.RUN_NO_AUTHORITATIVE_RESULT);return;}
+            const mapped=boundedMessage(error.status,error.body);observationError(mapped.code,"The authoritative result could not be read within the bounded observation lifecycle.");
+          }
+        }
+      }catch(error){
+        if(error.name==="AbortError"||!active())return;
+        const mapped=boundedMessage(error.status,error.body);observationError(mapped.code,"The accepted control run could not be read within the bounded observation lifecycle.");
+      }finally{if(epoch===ui.flowEpoch)ui.requestInFlight=false;}
+      if(active()&&ui.observationPhase==="result"&&ui.pollTimer===null)scheduleObservation(tick);
+    };
+    scheduleObservation(tick);
+  }
   async function launch(event){
     event.preventDefault();clearError();if(!validateAuthorization())return;setState(STATES.LAUNCHING);
     const headers={"X-Admissible-Owner-Authorization":byId("owner-phrase").value};const digest=byId("owner-digest");if(digest)headers["X-Admissible-Owner-Authorization-Digest"]=digest.value;
-    try{const {status,body}=await api("/ui/api/v1/runs",{method:"POST",headers,body:JSON.stringify({contract_id:ui.contract.response.contract_id,preparation_id:ui.preparation.id})});if(status!==202){const err=new Error("LAUNCH_NOT_ACCEPTED");err.status=status;err.body=body;throw err;}stopPolling();renderAccepted(body);setState(STATES.LAUNCH_ACCEPTED);}
-    catch(error){const mapped=boundedMessage(error.status,error.body);setState(STATES.PREPARATION_READY);showError(mapped.code,mapped.message,STATES.PREPARATION_READY);}
+    try{
+      const {status,body}=await api("/ui/api/v1/runs",{method:"POST",headers,body:JSON.stringify({contract_id:ui.contract.response.contract_id,preparation_id:ui.preparation.id})});if(status!==202){const err=new Error("LAUNCH_NOT_ACCEPTED");err.status=status;err.body=body;throw err;}
+      stopPolling();headers["X-Admissible-Owner-Authorization"]="";if(headers["X-Admissible-Owner-Authorization-Digest"])headers["X-Admissible-Owner-Authorization-Digest"]="";clearSecrets();
+      ui.contract=null;ui.preparation=null;ui.run={controlRunId:body.control_run_id,initialControlState:body.control_state,status:{control_state:body.control_state}};ui.result=null;ui.resultResolved=false;
+      renderAccepted(body);setState(STATES.RUN_ACCEPTED);startRunObservation();
+    }catch(error){const mapped=boundedMessage(error.status,error.body);setState(STATES.PREPARATION_READY);showError(mapped.code,mapped.message,STATES.PREPARATION_READY);}
     finally{headers["X-Admissible-Owner-Authorization"]="";if(headers["X-Admissible-Owner-Authorization-Digest"])headers["X-Admissible-Owner-Authorization-Digest"]="";clearSecrets();}
   }
   function reset(){
     if(ui.state===STATES.LAUNCHING)return;
-    ui.flowEpoch+=1;stopPolling();clearSecrets();clearError();ui.contract=null;ui.preparation=null;ui.prepareInFlight=false;
+    ui.flowEpoch+=1;stopPolling();clearSecrets();clearError();ui.contract=null;ui.preparation=null;ui.run=null;ui.result=null;ui.resultResolved=false;ui.statusAttempts=0;ui.resultAttempts=0;ui.prepareInFlight=false;
     if(ui.state!==STATES.COMPOSE)setState(STATES.COMPOSE);byId("mission-text").focus();
   }
+  function legacyState(){return ui.state===STATES.RUN_ACCEPTED?STATES.LAUNCH_ACCEPTED:ui.state;}
   function snapshot(){
-    const digest=byId("owner-digest");
+    const digest=byId("owner-digest"),legacyAccepted=ui.state===STATES.RUN_ACCEPTED;
     return {
-      state:ui.state,
-      contractId:ui.contract&&ui.contract.response?ui.contract.response.contract_id:null,
-      preparationId:ui.preparation?ui.preparation.id:null,
-      preparationState:ui.preparation&&ui.preparation.status?ui.preparation.status.state:null,
-      pollCount:ui.pollCount,
-      hasPollController:!!ui.pollController,
-      hasPollTimer:ui.pollTimer!==null,
-      prepareInFlight:ui.prepareInFlight,
-      phraseValue:byId("owner-phrase").value,
-      phraseType:byId("owner-phrase").type,
-      digestValue:digest?digest.value:"",
-      statusMessage:byId("status-message").textContent,
-      statusCode:byId("status-code").textContent,
-      prepareDisabled:byId("prepare-button").disabled,
-      launchDisabled:byId("launch-button").disabled,
-      resetDisabled:Array.from(document.querySelectorAll(".reset-flow")).map(button=>button.disabled),
-      acceptedText:byId("accepted-facts").textContent,
-      preparationCopy:byId("preparation-copy").textContent,
-      canonicalPayload:byId("canonical-payload").textContent,
-      intentFacts:byId("intent-facts").textContent,
-      contractFacts:byId("contract-facts").textContent
+      state:legacyState(),contractId:ui.contract&&ui.contract.response?ui.contract.response.contract_id:null,preparationId:ui.preparation?ui.preparation.id:null,
+      preparationState:ui.preparation&&ui.preparation.status?ui.preparation.status.state:null,pollCount:ui.pollCount,
+      hasPollController:legacyAccepted?false:!!ui.pollController,hasPollTimer:legacyAccepted?false:ui.pollTimer!==null,prepareInFlight:ui.prepareInFlight,
+      phraseValue:byId("owner-phrase").value,phraseType:byId("owner-phrase").type,digestValue:digest?digest.value:"",
+      statusMessage:byId("status-message").textContent,statusCode:byId("status-code").textContent,prepareDisabled:byId("prepare-button").disabled,
+      launchDisabled:byId("launch-button").disabled,resetDisabled:Array.from(document.querySelectorAll(".reset-flow")).map(button=>button.disabled),
+      acceptedText:byId("accepted-facts").textContent,preparationCopy:byId("preparation-copy").textContent,canonicalPayload:byId("canonical-payload").textContent,
+      intentFacts:byId("intent-facts").textContent,contractFacts:byId("contract-facts").textContent
     };
   }
+  function g4Snapshot(){return Object.freeze({state:ui.state,controlRunId:ui.run?ui.run.controlRunId:null,initialControlState:ui.run?ui.run.initialControlState:null,controlState:ui.run&&ui.run.status?ui.run.status.control_state:null,statusAttempts:ui.statusAttempts,resultAttempts:ui.resultAttempts,requestInFlight:ui.requestInFlight,hasAbortOwner:!!ui.pollController,hasTimer:ui.pollTimer!==null,resultResolved:ui.resultResolved,runText:byId("accepted-facts")?byId("accepted-facts").textContent:"",resultText:byId("result-view")?byId("result-view").textContent:"",noResultText:byId("no-result-view")?byId("no-result-view").textContent:"",errorText:byId("status-area")?byId("status-area").textContent:""});}
 
   byId("compose-form").addEventListener("submit",author);byId("authorize-form").addEventListener("submit",launch);byId("prepare-button").addEventListener("click",prepare);byId("retry-preparation").addEventListener("click",prepare);byId("back-to-compose").addEventListener("click",reset);document.querySelectorAll(".reset-flow").forEach(button=>button.addEventListener("click",reset));byId("add-material").addEventListener("click",()=>addMaterial());byId("retry-bootstrap").addEventListener("click",bootstrap);byId("toggle-phrase").addEventListener("click",()=>{const input=byId("owner-phrase"),show=input.type==="password";input.type=show?"text":"password";byId("toggle-phrase").textContent=show?"Hide":"Show";byId("toggle-phrase").setAttribute("aria-pressed",String(show));});window.addEventListener("pagehide",stopPolling,{once:true});window.addEventListener("beforeunload",stopPolling,{once:true});
   addMaterial("README.md");
   Object.defineProperty(window,"AdmissibleG3Test",{value:Object.freeze({
-    STATES,allowedTransitions:allowed,getState:()=>ui.state,reset,prepare,launch,bootstrap,author,stopPolling,snapshot,
-    setField:(id,value)=>{byId(id).value=value;},
-    click:(id)=>{byId(id).click();},
-    submit:(id)=>{const form=byId(id);form.dispatchEvent(new Event("submit",{bubbles:true,cancelable:true}));}
+    STATES,allowedTransitions:allowed,getState:legacyState,reset,prepare,launch,bootstrap,author,stopPolling,snapshot,
+    setField:(id,value)=>{byId(id).value=value;},click:(id)=>{byId(id).click();},submit:(id)=>{const form=byId(id);form.dispatchEvent(new Event("submit",{bubbles:true,cancelable:true}));}
   }),writable:false});
+  Object.defineProperty(window,"AdmissibleG4Test",{value:Object.freeze({STATES,getState:()=>ui.state,snapshot:g4Snapshot}),writable:false,configurable:true});
   bootstrap();
 })();
