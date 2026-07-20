@@ -60,6 +60,7 @@ from admissible.product_launcher.preflight import (
     consume_ready_preflight,
     parse_preflight_stdout,
 )
+from admissible.product_launcher.preflight_runner import ProductionPreflightApplication
 from admissible.product_launcher.ui_transport import CSRF_HEADER, DIGEST_HEADER, OWNER_HEADER
 from admissible.product_service import create_loopback_server, create_product_control_plane
 from admissible.product_service.control import ProductControlPlane
@@ -2095,3 +2096,196 @@ def test_golden_preparation_payload_and_launch_both_modes(tmp_path, monkeypatch,
             assert gate.run_calls[0]["digest"] == DIGEST
     finally:
         launcher.close()
+
+
+def test_golden_preflight_authority_argv_and_operational_bounds_are_independent(tmp_path):
+    cfg = _cfg(
+        tmp_path,
+        timeout_maximum=3600,
+        stdout_byte_limit=333_333,
+        stderr_byte_limit=222_222,
+        preflight_timeout_seconds=120,
+        preflight_stdout_byte_limit=55_555,
+        preflight_stderr_byte_limit=44_444,
+        executable="cursor-agent",
+        attestation_class="wrapper-chain",
+    )
+    invocation = {}
+
+    def capture_preflight(**kwargs):
+        invocation.update(kwargs)
+        return 1, json.dumps(
+            {
+                "status": "PREFLIGHT_BLOCKED",
+                "error_type": "test-stop",
+                "provider_invocations": 0,
+                "native_processes_started": 0,
+            }
+        ).encode()
+
+    launcher = ProductLauncher(
+        cfg,
+        preflight_application=capture_preflight,
+        id_generator=_hex_ids(150_000),
+        browser_opener=lambda _u: None,
+    )
+    try:
+        launcher.start()
+        status, _, authored, _ = _ui(
+            launcher, "POST", "/ui/api/v1/contracts", _golden_owner_input()
+        )
+        assert status == 200, authored
+        profile = load_native_mission_profile_document(
+            launcher._contracts[authored["contract_id"]].document_path
+        )
+        status, _, _, _ = _ui(
+            launcher,
+            "POST",
+            f"/ui/api/v1/contracts/{authored['contract_id']}/preparations",
+            {},
+        )
+        assert status == 202
+        for _ in range(400):
+            if invocation:
+                break
+            time.sleep(0.01)
+        assert invocation
+    finally:
+        launcher.close()
+
+    assert (
+        invocation["authority_timeout_seconds"],
+        invocation["authority_stdout_byte_limit"],
+        invocation["authority_stderr_byte_limit"],
+    ) == (
+        profile.timeout_seconds,
+        profile.stdout_byte_limit,
+        profile.stderr_byte_limit,
+    ) == (1800, 333_333, 222_222)
+    assert (
+        invocation["process_timeout_seconds"],
+        invocation["process_stdout_capture_limit"],
+        invocation["process_stderr_capture_limit"],
+    ) == (120, 55_555, 44_444)
+
+    observed = {}
+
+    class FakeProcess:
+        def __init__(self, argv, **kwargs):
+            observed["argv"] = argv
+            observed["constructor"] = kwargs
+
+        def start(self):
+            return None
+
+        def wait(self, *, timeout):
+            observed["wait_timeout"] = timeout
+            return 1
+
+        def poll(self):
+            return 1
+
+        def finish(self, *, reason):
+            return SimpleNamespace(
+                cleanup_proven=True,
+                termination_reason=reason,
+                exit_code=1,
+            )
+
+        def captured_stdout(self):
+            return '{"status":"PREFLIGHT_BLOCKED"}'
+
+    ProductionPreflightApplication(process_factory=FakeProcess)(**invocation)
+    argv = observed["argv"]
+    authority_flags = {
+        "--model": profile.model,
+        "--timeout-seconds": str(profile.timeout_seconds),
+        "--stdout-byte-limit": str(profile.stdout_byte_limit),
+        "--stderr-byte-limit": str(profile.stderr_byte_limit),
+    }
+    for flag, expected in authority_flags.items():
+        assert argv[argv.index(flag) + 1] == expected
+    assert argv[argv.index("--run-id") + 1] == profile.run_id
+    assert argv[argv.index("--session-id") + 1] == profile.session_id
+    assert argv[argv.index("--profile-document") + 1] == str(invocation["profile_document"])
+    assert observed["wait_timeout"] == 120.0
+    assert observed["constructor"]["max_capture_bytes"] == 55_555
+
+
+def test_real_golden_preflight_ready_and_contradiction_remains_fail_closed(tmp_path):
+    standalone = (tmp_path / "standalone-product-source").resolve()
+    product_root = Path(__file__).resolve().parents[1]
+    subprocess.run(
+        ["git", "clone", "--no-local", "--no-checkout", str(product_root), str(standalone)],
+        check=True,
+        capture_output=True,
+    )
+    tested_head = subprocess.check_output(
+        ["git", "-C", str(product_root), "rev-parse", "HEAD"], text=True
+    ).strip()
+    _git(standalone, "checkout", "--detach", tested_head)
+    _git(standalone, "remote", "remove", "origin")
+    _git(standalone, "config", "core.autocrlf", "false")
+    _git(standalone, "reset", "--hard", tested_head)
+    cfg = _cfg(
+        tmp_path,
+        source_repository=standalone,
+        required_source_head=tested_head,
+        timeout_maximum=3600,
+        stdout_byte_limit=333_333,
+        stderr_byte_limit=222_222,
+        preflight_timeout_seconds=120,
+        preflight_stdout_byte_limit=55_555,
+        preflight_stderr_byte_limit=44_444,
+        executable="cursor-agent",
+        attestation_class="wrapper-chain",
+    )
+    authored = author_runtime_contract(
+        _golden_owner_input(),
+        launcher_configuration=cfg,
+        documents_directory=cfg.contract_documents_directory,
+        id_generator=lambda: "fa" * 16,
+    )
+    profile = load_native_mission_profile_document(authored.document_path)
+    (cfg.run_parent / "ready").mkdir(parents=True)
+    (cfg.run_parent / "contradiction").mkdir()
+    application = ProductionPreflightApplication()
+    common = dict(
+        profile_document=authored.document_path,
+        source_repository=cfg.source_repository,
+        required_source_head=cfg.required_source_head,
+        run_id=profile.run_id,
+        session_id=profile.session_id,
+        executable=cfg.executable,
+        executable_prefix_args=cfg.executable_prefix_args,
+        model=profile.model,
+        authority_stdout_byte_limit=profile.stdout_byte_limit,
+        authority_stderr_byte_limit=profile.stderr_byte_limit,
+        process_timeout_seconds=cfg.preflight_timeout_seconds,
+        process_stdout_capture_limit=cfg.preflight_stdout_byte_limit,
+        process_stderr_capture_limit=cfg.preflight_stderr_byte_limit,
+        attestation_class=cfg.attestation_class,
+    )
+    ready_run_root = cfg.run_parent / "ready" / profile.run_id
+    code, stdout = application(
+        **common,
+        run_root=ready_run_root,
+        authority_timeout_seconds=profile.timeout_seconds,
+    )
+    ready = parse_preflight_stdout(stdout)
+    assert code == 0, ready
+    assert ready["status"] == "PREFLIGHT_READY"
+    # PREPARE_ONLY returns before run-root creation, reservation, or process start.
+    assert not ready_run_root.exists()
+
+    code, stdout = application(
+        **common,
+        run_root=cfg.run_parent / "contradiction" / profile.run_id,
+        authority_timeout_seconds=120,
+    )
+    blocked = parse_preflight_stdout(stdout)
+    assert code != 0
+    assert blocked["status"] == "PREFLIGHT_BLOCKED"
+    assert blocked["provider_invocations"] == 0
+    assert blocked["native_processes_started"] == 0
+    assert "--timeout-seconds contradicts the selected profile" in json.dumps(blocked)

@@ -76,11 +76,14 @@ class ProductionPreflightApplication:
         run_id: str,
         session_id: str,
         executable: str,
+        authority_timeout_seconds: int,
+        authority_stdout_byte_limit: int,
+        authority_stderr_byte_limit: int,
+        process_timeout_seconds: int,
+        process_stdout_capture_limit: int,
+        process_stderr_capture_limit: int,
         executable_prefix_args: tuple[str, ...] = (),
         model: str | None = None,
-        timeout_seconds: int | None = None,
-        stdout_byte_limit: int | None = None,
-        stderr_byte_limit: int | None = None,
         attestation_class: str = "package-bin",
         **_unused: object,
     ) -> tuple[int, bytes]:
@@ -112,13 +115,17 @@ class ProductionPreflightApplication:
                 argv.extend(("--executable-prefix-arg", value))
             for flag, value in (
                 ("--model", model),
-                ("--timeout-seconds", timeout_seconds),
-                ("--stdout-byte-limit", stdout_byte_limit),
-                ("--stderr-byte-limit", stderr_byte_limit),
+                ("--timeout-seconds", authority_timeout_seconds),
+                ("--stdout-byte-limit", authority_stdout_byte_limit),
+                ("--stderr-byte-limit", authority_stderr_byte_limit),
             ):
                 if value is not None:
                     argv.extend((flag, str(value)))
-        capture = max(int(stdout_byte_limit or 0), int(stderr_byte_limit or 0), 1024)
+        capture = max(
+            int(process_stdout_capture_limit),
+            int(process_stderr_capture_limit),
+            1024,
+        )
         environment = _curated_environment(os.environ)
         proc = self._process_factory(
             argv,
@@ -133,7 +140,7 @@ class ProductionPreflightApplication:
                     raise RuntimeError("preflight launcher closed")
                 proc.start()
                 self._active = proc
-            code = proc.wait(timeout=float(timeout_seconds or 1))
+            code = proc.wait(timeout=float(process_timeout_seconds))
             with self._process_lock:
                 result = (
                     proc.terminate(reason=TERMINATION_HARD_TIMEOUT)

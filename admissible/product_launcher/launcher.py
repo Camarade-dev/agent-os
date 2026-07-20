@@ -313,9 +313,12 @@ class ProductLauncher:
                 executable=self.configuration.executable,
                 executable_prefix_args=self.configuration.executable_prefix_args,
                 model=record.model,
-                timeout_seconds=self.configuration.preflight_timeout_seconds,
-                stdout_byte_limit=self.configuration.preflight_stdout_byte_limit,
-                stderr_byte_limit=self.configuration.preflight_stderr_byte_limit,
+                authority_timeout_seconds=record.timeout_seconds,
+                authority_stdout_byte_limit=record.stdout_byte_limit,
+                authority_stderr_byte_limit=record.stderr_byte_limit,
+                process_timeout_seconds=self.configuration.preflight_timeout_seconds,
+                process_stdout_capture_limit=self.configuration.preflight_stdout_byte_limit,
+                process_stderr_capture_limit=self.configuration.preflight_stderr_byte_limit,
                 attestation_class=self.configuration.attestation_class,
             )
             state, payload, blocked = consume_ready_preflight(return_code=code, stdout=stdout)
