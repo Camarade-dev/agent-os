@@ -47,6 +47,11 @@ def render_result_json(detail: RunDetail) -> dict:
         "run_id": detail.identity.run_id,
         "run_root": detail.run_root,
         "presentation_status": detail.presentation_status.value,
+        # Secret-safe allow-listed authorization facts (AuthorizationView). This
+        # never carries the owner phrase, digest, or any token; it exposes the
+        # persisted backend identity needed for a truthful parent-versus-child
+        # backend delta after a post_run_backend_drift refusal.
+        "authorization": detail.authorization.to_json(),
         "execution_state": {
             "state": detail.process.execution_state.value,
             "provider_exit_code": detail.process.exit_code,

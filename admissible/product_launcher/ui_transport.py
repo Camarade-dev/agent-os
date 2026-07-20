@@ -211,6 +211,12 @@ class _UIHandler(BaseHTTPRequestHandler):
             if len(parts) == 6 and parts[4] == "preparations" and parts[5]:
                 self._send(200, launcher.preparation_status(parts[5]))
                 return
+            if path == UI_API_PREFIX + "/recoveries":
+                self._send(200, launcher.list_recoveries())
+                return
+            if len(parts) == 6 and parts[4] == "recoveries" and parts[5]:
+                self._send(200, launcher.recovery_status(parts[5]))
+                return
             if path == UI_API_PREFIX + "/runs":
                 status, body = launcher.proxy_g2("GET", "/api/v1/runs")
                 self._send(status, body)
@@ -261,6 +267,20 @@ class _UIHandler(BaseHTTPRequestHandler):
                 if body is None:
                     return
                 status, payload = launcher.enqueue_preparation(parts[5])
+                self._send(status, payload)
+                return
+            if (
+                len(parts) == 7
+                and parts[4] == "runs"
+                and parts[5]
+                and parts[6] == "recovery"
+            ):
+                # Governed backend-drift rerun: an empty strict JSON object; the
+                # launcher re-classifies eligibility from server-side truth.
+                body = self._json(set())
+                if body is None:
+                    return
+                status, payload = launcher.create_recovery(parts[5])
                 self._send(status, payload)
                 return
             if path == UI_API_PREFIX + "/runs":

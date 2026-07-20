@@ -15,7 +15,7 @@
   });
   const allowed = Object.freeze({
     BOOTSTRAP_LOADING:["COMPOSE","REQUEST_ERROR"],
-    COMPOSE:["AUTHORING","REQUEST_ERROR"], AUTHORING:["CONTRACT_READY","REQUEST_ERROR","COMPOSE"],
+    COMPOSE:["AUTHORING","REQUEST_ERROR","PREPARATION_QUEUED"], AUTHORING:["CONTRACT_READY","REQUEST_ERROR","COMPOSE"],
     CONTRACT_READY:["PREPARATION_QUEUED","REQUEST_ERROR","COMPOSE"],
     PREPARATION_QUEUED:["PREPARATION_RUNNING","PREPARATION_READY","PREPARATION_BLOCKED","PREPARATION_FAILED","REQUEST_ERROR","COMPOSE"],
     PREPARATION_RUNNING:["PREPARATION_RUNNING","PREPARATION_READY","PREPARATION_BLOCKED","PREPARATION_FAILED","REQUEST_ERROR","COMPOSE"],
@@ -29,7 +29,7 @@
     RUN_RUNNING:["RUN_LOADING","RUN_RUNNING","RUN_TERMINAL_LOADING_RESULT","RUN_START_FAILED","RUN_REQUEST_ERROR","COMPOSE"],
     RUN_TERMINAL_LOADING_RESULT:["RUN_TERMINAL_LOADING_RESULT","RUN_RESULT_READY","RUN_NO_AUTHORITATIVE_RESULT","RUN_REQUEST_ERROR","COMPOSE"],
     RUN_START_FAILED:["RUN_START_FAILED","RUN_RESULT_READY","RUN_NO_AUTHORITATIVE_RESULT","RUN_REQUEST_ERROR","COMPOSE"],
-    RUN_RESULT_READY:["COMPOSE"], RUN_NO_AUTHORITATIVE_RESULT:["COMPOSE"], RUN_REQUEST_ERROR:["COMPOSE"],
+    RUN_RESULT_READY:["COMPOSE","PREPARATION_QUEUED"], RUN_NO_AUTHORITATIVE_RESULT:["COMPOSE"], RUN_REQUEST_ERROR:["COMPOSE"],
     LAUNCH_ACCEPTED:["COMPOSE"],
     REQUEST_ERROR:["BOOTSTRAP_LOADING","COMPOSE","CONTRACT_READY","PREPARATION_READY"]
   });
@@ -38,7 +38,8 @@
     pollController:null, pollTimer:null, pollCount:0, statusAttempts:0, resultAttempts:0,
     requestInFlight:false, resultResolved:false, observationPhase:null,
     resumeState:null, prepareInFlight:false, flowEpoch:0,
-    observationBudgetMs:0, observationDeadlineAt:null
+    observationBudgetMs:0, observationDeadlineAt:null,
+    recovery:null, recoveryInFlight:false
   };
   const POLL_INTERVAL_MS = 750;
   // Observation is bounded by a wall-clock deadline derived from the canonical
@@ -157,7 +158,7 @@
   }
   async function bootstrap(){
     clearError();setState(STATES.BOOTSTRAP_LOADING);
-    try{const {body}=await api("/ui/api/v1/bootstrap");ui.bootstrap=body;renderBootstrap(body);setState(STATES.COMPOSE);}
+    try{const {body}=await api("/ui/api/v1/bootstrap");ui.bootstrap=body;renderBootstrap(body);setState(STATES.COMPOSE);await resumeRecovery();}
     catch(error){setState(STATES.REQUEST_ERROR);const mapped=boundedMessage(error.status,error.body);showError(mapped.code,"The local launcher bootstrap is unavailable.",STATES.BOOTSTRAP_LOADING);byId("retry-bootstrap").hidden=false;}
   }
   function addMaterial(value=""){
@@ -210,6 +211,7 @@
     }
   }
   function renderPreparation(body){
+    const stale=byId("recovery-authority");if(stale)stale.remove();
     const root=byId("preparation-facts");root.replaceChildren();[["Preparation ID",body.preparation_id],["Payload fingerprint",body.payload_fingerprint],["Authorization mode",body.authorization_mode]].forEach(x=>appendFact(root,x[0],x[1]));
     byId("canonical-payload").textContent=JSON.stringify(body.authorization_payload,null,2);byId("safe-summary").textContent=JSON.stringify(body.safe_payload_summary,null,2);
     byId("mode-label").textContent=body.authorization_mode;byId("authorization-notice").textContent=body.authorization_semantics_notice;byId("encoding-notice").textContent=`Owner phrase transport is limited to ${ui.bootstrap.owner_authorization_encoding}.`;
@@ -229,7 +231,7 @@
         if(epoch!==ui.flowEpoch||ui.pollController!==controller)return;
         ui.preparation.status=body;
         if(body.state==="QUEUED"||body.state==="RUNNING"){setState(body.state==="QUEUED"?STATES.PREPARATION_QUEUED:STATES.PREPARATION_RUNNING);preparationCopy(ui.state,body);ui.pollTimer=setTimeout(tick,750);return;}
-        stopPolling();if(body.state==="READY"){renderPreparation(body);setState(STATES.PREPARATION_READY);}else if(body.state==="BLOCKED"){setState(STATES.PREPARATION_BLOCKED);preparationCopy(ui.state,body);}else{setState(STATES.PREPARATION_FAILED);preparationCopy(ui.state,body);}
+        stopPolling();if(body.state==="READY"){renderPreparation(body);if(ui.recovery)renderRecoveryAuthority(body);setState(STATES.PREPARATION_READY);}else if(body.state==="BLOCKED"){setState(STATES.PREPARATION_BLOCKED);preparationCopy(ui.state,body);}else{setState(STATES.PREPARATION_FAILED);preparationCopy(ui.state,body);}
       }catch(error){if(error.name==="AbortError"||epoch!==ui.flowEpoch)return;stopPolling();const mapped=boundedMessage(error.status,error.body);setState(STATES.REQUEST_ERROR);showError(mapped.code,mapped.message,STATES.CONTRACT_READY);}
     };tick();
   }
@@ -264,6 +266,7 @@
     const content=runCopy(state);if(value)value.textContent=content[0];if(copy)copy.textContent=content[1];if(!facts)return;
     facts.replaceChildren();
     if(ui.run)appendFact(facts,"Control-run ID",ui.run.controlRunId);
+    if(ui.run&&ui.run.recoveryChild)appendFact(facts,"Recovery from run",ui.run.recoveryParentControlRunId);
     appendReturnedFact(facts,body,"authoritative_session_id","Authoritative session ID");
     appendReturnedFact(facts,body,"control_state","Control state");
     appendReturnedFact(facts,body,"started_at","Started at");
@@ -351,10 +354,135 @@
     if(Object.keys(process).length)addEvidenceSection(supplemental,"Process facts",process,false);
     const inventory={};if(hasOwn(result,"timeline"))inventory.timeline=result.timeline;if(hasOwn(result,"artifacts"))inventory.artifacts=result.artifacts;if(Object.keys(inventory).length)addEvidenceSection(supplemental,"Evidence inventory",inventory,false);
     const notices={};["transport_schema_version","transport_redactions","read_notes","human_disposition"].forEach(key=>{if(hasOwn(result,key))notices[key]=result[key];});if(Object.keys(notices).length)addEvidenceSection(supplemental,"Notices and transport",notices,false);
+    renderRecoveryOffer(result);
   }
   function renderNoResult(body){
     const root=byId("no-result-facts");root.replaceChildren();if(ui.run)appendFact(root,"Control-run ID",ui.run.controlRunId);
     appendReturnedFact(root,body,"control_state","Returned control state");appendReturnedFact(root,body,"application_return_code","Application return code (transport only)");appendReturnedFact(root,body,"terminal_evidence","Terminal evidence");appendReturnedFact(root,body,"start_error_type","Start error type");
+  }
+  // --- Governed backend-drift rerun (REFUSED: post_run_backend_drift) --------
+  // The browser only mirrors the server truth for display; the launcher
+  // re-classifies eligibility from the authoritative result on every POST.
+  const RECOVERY_REASON="post_run_backend_drift";
+  function recoveryEligible(result){
+    if(!isObject(result))return false;
+    const admission=isObject(result.result_admission_state)?result.result_admission_state:{};
+    const boundary=isObject(result.failing_boundary)?result.failing_boundary:{};
+    return admission.verdict==="REFUSED"
+      &&admission.verdict_is_authoritative===true
+      &&Array.isArray(boundary.reasons)
+      &&boundary.reasons.includes(RECOVERY_REASON);
+  }
+  function renderRecoveryOffer(result){
+    const existing=byId("recovery-offer");if(existing)existing.remove();
+    const view=byId("result-view");if(!view||!ui.run)return;
+    if(ui.run.recoveryChild||!recoveryEligible(result))return;
+    const section=document.createElement("section");section.id="recovery-offer";section.className="evidence-card";
+    const heading=document.createElement("h3");heading.textContent="REFUSED";section.append(heading);
+    ["Backend changed during execution.",
+     "The candidate workspace and evidence were preserved.",
+     "A new owner authorization is required before rerunning."].forEach(text=>{
+      const line=document.createElement("p");line.textContent=text;section.append(line);
+    });
+    const origin=document.createElement("p");origin.className="hint";origin.textContent=`Recovery from run ${ui.run.controlRunId}`;section.append(origin);
+    const actions=document.createElement("div");actions.className="actions";
+    const button=document.createElement("button");button.type="button";button.className="button primary";button.textContent="Prepare governed rerun";
+    button.id="prepare-recovery";
+    button.addEventListener("click",prepareRecovery);
+    actions.append(button);section.append(actions);
+    view.append(section);
+  }
+  function adoptRecovery(view,parentTruth){
+    if(!isObject(view)||typeof view.child_contract_id!=="string"||!view.child_contract_id
+      ||typeof view.preparation_id!=="string"||!view.preparation_id){
+      showError("RECOVERY_VIEW_INVALID","The launcher returned an unusable recovery view.",ui.state);
+      return;
+    }
+    stopPolling();
+    ui.recovery={view,parentControlRunId:typeof view.parent_control_run_id==="string"?view.parent_control_run_id:"",parentTruth:isObject(parentTruth)?parentTruth:null};
+    ui.contract={input:null,response:{contract_id:view.child_contract_id}};
+    ui.preparation={id:view.preparation_id,status:null};
+    ui.run=null;ui.result=null;ui.resultResolved=false;
+    setState(STATES.PREPARATION_QUEUED);
+    preparationCopy(STATES.PREPARATION_QUEUED,{});
+    pollPreparation();
+  }
+  async function prepareRecovery(){
+    if(ui.recoveryInFlight||!ui.run)return;
+    ui.recoveryInFlight=true;
+    const offerButton=byId("prepare-recovery");if(offerButton)offerButton.disabled=true;
+    clearError();
+    const epoch=ui.flowEpoch;
+    const parentId=ui.run.controlRunId;
+    const parentTruth=ui.result&&isObject(ui.result.authorization)?sanitizeResultValue(ui.result.authorization):null;
+    try{
+      const {body}=await api(`/ui/api/v1/runs/${encodeURIComponent(parentId)}/recovery`,{method:"POST",body:"{}"});
+      if(epoch!==ui.flowEpoch)return;
+      adoptRecovery(body,parentTruth);
+    }catch(error){
+      if(epoch!==ui.flowEpoch)return;
+      const mapped=boundedMessage(error.status,error.body);
+      showError(mapped.code,"The launcher did not accept the governed rerun request.",ui.state);
+      const retry=byId("prepare-recovery");if(retry)retry.disabled=false;
+    }finally{
+      ui.recoveryInFlight=false;
+    }
+  }
+  async function resumeRecovery(){
+    // Browser refresh: pending launcher-resident recoveries are reconstructed
+    // from the recovery GET routes. This state is not restart-durable.
+    if(ui.state!==STATES.COMPOSE)return;
+    const epoch=ui.flowEpoch;
+    let pending=null;
+    try{
+      const {body}=await api("/ui/api/v1/recoveries");
+      const list=Array.isArray(body.recoveries)?body.recoveries:[];
+      pending=list.find(item=>isObject(item)&&(item.state==="PREPARING"||item.state==="AWAITING_OWNER_AUTHORIZATION"))||null;
+    }catch(_error){return;}
+    if(!pending||epoch!==ui.flowEpoch||ui.state!==STATES.COMPOSE)return;
+    let parentTruth=null;
+    try{
+      const parent=await api(authoritativeResultPath(pending.parent_control_run_id));
+      if(parent.body&&isObject(parent.body.authorization))parentTruth=sanitizeResultValue(parent.body.authorization);
+    }catch(_error){}
+    if(epoch!==ui.flowEpoch||ui.state!==STATES.COMPOSE)return;
+    adoptRecovery(pending,parentTruth);
+  }
+  function recoveryBackendDelta(parent,payload){
+    const parentIdentity=typeof parent.backend_identity==="string"&&parent.backend_identity?parent.backend_identity:null;
+    const freshFingerprint=typeof payload.backend_attestation_fingerprint==="string"&&payload.backend_attestation_fingerprint?payload.backend_attestation_fingerprint:null;
+    const pieces=["The parent refusal proved the backend changed during the parent run."];
+    pieces.push(parentIdentity?`Persisted parent backend identity: ${parentIdentity}.`:"The parent evidence records no backend identity.");
+    pieces.push(freshFingerprint?`The child run is authorized only against the fresh attestation fingerprint ${freshFingerprint}.`:"The fresh preparation returned no attestation fingerprint.");
+    return pieces.join(" ");
+  }
+  function renderRecoveryAuthority(body){
+    const existing=byId("recovery-authority");if(existing)existing.remove();
+    const view=byId("authorize-view");if(!view||!ui.recovery)return;
+    const payload=isObject(body.authorization_payload)?body.authorization_payload:{};
+    const record=isObject(ui.recovery.view)?ui.recovery.view:{};
+    const parent={};
+    if(isObject(ui.recovery.parentTruth))Object.keys(ui.recovery.parentTruth).forEach(key=>{parent[key]=ui.recovery.parentTruth[key];});
+    if(typeof parent.backend_identity!=="string"&&typeof record.parent_backend_identity==="string")parent.backend_identity=record.parent_backend_identity;
+    const section=document.createElement("section");section.id="recovery-authority";section.className="authority-inspector";
+    const heading=document.createElement("h3");heading.textContent=`Recovery from run ${ui.recovery.parentControlRunId}`;section.append(heading);
+    const note=document.createElement("p");note.className="hint";
+    note.textContent="The original refusal remains authoritative and immutable. This child uses a fresh contract, a fresh preparation and a fresh backend attestation; no authority from the parent run is reused.";
+    section.append(note);
+    const facts=document.createElement("dl");facts.className="fact-grid";
+    appendFact(facts,"Recovery ID",record.recovery_id);
+    appendFact(facts,"Fresh preparation ID",body.preparation_id);
+    appendFact(facts,"Fresh payload fingerprint",body.payload_fingerprint);
+    appendFact(facts,"Parent backend identity (persisted)",typeof parent.backend_identity==="string"&&parent.backend_identity?parent.backend_identity:"Not recorded in parent evidence");
+    appendFact(facts,"Child backend executable (fresh)",payload.executable);
+    appendFact(facts,"Child backend attestation class (fresh)",payload.backend_attestation_class);
+    appendFact(facts,"Child backend attestation fingerprint (fresh)",payload.backend_attestation_fingerprint);
+    const parentModel=parent.authorized_model===null||parent.authorized_model===undefined?"Not recorded":String(parent.authorized_model);
+    const childModel=payload.selected_model===undefined?"Not returned":String(payload.selected_model);
+    appendFact(facts,"Model (parent, then child)",`${parentModel}, then ${childModel}`);
+    appendFact(facts,"Backend delta",recoveryBackendDelta(parent,payload));
+    section.append(facts);
+    view.append(section);
   }
   function observationError(code,message){
     stopPolling();if(ui.state!==STATES.RUN_REQUEST_ERROR)setState(STATES.RUN_REQUEST_ERROR);renderRun(ui.run&&ui.run.status?ui.run.status:{},STATES.RUN_REQUEST_ERROR);showError(code,message,STATES.RUN_REQUEST_ERROR);
@@ -439,14 +567,17 @@
       // Reduce the canonical preparation authority to a single number BEFORE the
       // payload custody is released, so nothing but the numeric budget survives.
       ui.observationBudgetMs=derivedObservationBudgetMs(ui.preparation&&ui.preparation.status?ui.preparation.status.authorization_payload:null);
-      ui.contract=null;ui.preparation=null;ui.run={controlRunId:body.control_run_id,initialControlState:body.control_state,status:{control_state:body.control_state}};ui.result=null;ui.resultResolved=false;
+      const fromRecovery=ui.recovery!==null;
+      ui.contract=null;ui.preparation=null;ui.run={controlRunId:body.control_run_id,initialControlState:body.control_state,status:{control_state:body.control_state},recoveryChild:fromRecovery,recoveryParentControlRunId:fromRecovery?ui.recovery.parentControlRunId:null};ui.recovery=null;ui.result=null;ui.resultResolved=false;
       renderAccepted(body);setState(STATES.RUN_ACCEPTED);startRunObservation();
     }catch(error){const mapped=boundedMessage(error.status,error.body);setState(STATES.PREPARATION_READY);showError(mapped.code,mapped.message,STATES.PREPARATION_READY);}
     finally{headers["X-Admissible-Owner-Authorization"]="";if(headers["X-Admissible-Owner-Authorization-Digest"])headers["X-Admissible-Owner-Authorization-Digest"]="";clearSecrets();}
   }
   function reset(){
     if(ui.state===STATES.LAUNCHING)return;
-    ui.flowEpoch+=1;stopPolling();clearSecrets();clearError();ui.contract=null;ui.preparation=null;ui.run=null;ui.result=null;ui.resultResolved=false;ui.statusAttempts=0;ui.resultAttempts=0;ui.prepareInFlight=false;ui.observationBudgetMs=0;ui.observationDeadlineAt=null;
+    ui.flowEpoch+=1;stopPolling();clearSecrets();clearError();ui.contract=null;ui.preparation=null;ui.run=null;ui.result=null;ui.resultResolved=false;ui.statusAttempts=0;ui.resultAttempts=0;ui.prepareInFlight=false;ui.observationBudgetMs=0;ui.observationDeadlineAt=null;ui.recovery=null;ui.recoveryInFlight=false;
+    const staleOffer=byId("recovery-offer");if(staleOffer)staleOffer.remove();
+    const staleAuthority=byId("recovery-authority");if(staleAuthority)staleAuthority.remove();
     if(ui.state!==STATES.COMPOSE)setState(STATES.COMPOSE);byId("mission-text").focus();
   }
   function legacyState(){return ui.state===STATES.RUN_ACCEPTED?STATES.LAUNCH_ACCEPTED:ui.state;}
@@ -471,6 +602,17 @@
     STATES,allowedTransitions:allowed,getState:legacyState,reset,prepare,launch,bootstrap,author,stopPolling,snapshot,
     setField:(id,value)=>{byId(id).value=value;},click:(id)=>{byId(id).click();},submit:(id)=>{const form=byId(id);form.dispatchEvent(new Event("submit",{bubbles:true,cancelable:true}));}
   }),writable:false});
+  function attachedById(id){const node=byId(id);return node&&node.parentNode?node:null;}
+  Object.defineProperty(window,"AdmissibleG5Test",{value:Object.freeze({
+    getRecovery:()=>ui.recovery?Object.freeze({parentControlRunId:ui.recovery.parentControlRunId,recoveryId:ui.recovery.view&&typeof ui.recovery.view.recovery_id==="string"?ui.recovery.view.recovery_id:null,hasParentTruth:!!ui.recovery.parentTruth}):null,
+    recoveryInFlight:()=>ui.recoveryInFlight,
+    offerPresent:()=>!!attachedById("recovery-offer"),
+    offerText:()=>{const node=attachedById("recovery-offer");return node?node.textContent:"";},
+    offerDisabled:()=>{const node=attachedById("prepare-recovery");return node?node.disabled:null;},
+    recoveryFactsText:()=>{const node=attachedById("recovery-authority");return node?node.textContent:"";},
+    clickOffer:()=>{const node=attachedById("prepare-recovery");if(node)node.click();},
+    runIsRecoveryChild:()=>!!(ui.run&&ui.run.recoveryChild)
+  }),writable:false,configurable:true});
   Object.defineProperty(window,"AdmissibleG4Test",{value:Object.freeze({STATES,getState:()=>ui.state,snapshot:g4Snapshot}),writable:false,configurable:true});
   bootstrap();
 })();

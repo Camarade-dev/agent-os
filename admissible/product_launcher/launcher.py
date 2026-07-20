@@ -10,10 +10,15 @@ import threading
 import webbrowser
 from typing import Any, Callable, Mapping
 
-from admissible.product_launcher.authoring import AuthoringError, author_runtime_contract
+from admissible.product_launcher.authoring import (
+    AuthoringError,
+    GOLDEN_EXACT_CONTRACT_FIELDS,
+    author_runtime_contract,
+)
 from admissible.product_launcher.configuration import (
     AUTHORIZATION_MODE_INTERACTIVE,
     AUTHORIZATION_MODE_PRECOMMITTED,
+    GOLDEN_TEMPLATE_ID,
     LauncherConfiguration,
     verify_required_source_head,
 )
@@ -22,6 +27,7 @@ from admissible.product_launcher.preflight import (
     OWNER_AUTHORIZATION_ENCODING,
     PRECOMMITTED_AUTHORIZATION_NOTICE,
     STATE_BLOCKED,
+    STATE_EXPIRED,
     STATE_FAILED,
     STATE_QUEUED,
     STATE_READY,
@@ -32,6 +38,21 @@ from admissible.product_launcher.preflight import (
     compute_interactive_digest,
     consume_ready_preflight,
     require_precommitted_digest,
+)
+from admissible.product_launcher.recovery import (
+    CLASSIFICATION_REAUTHORIZATION_REQUIRED,
+    OWNER_DECISION_AUTHORIZED_RERUN,
+    RECOVERY_REASON_BACKEND_DRIFT,
+    RECOVERY_STATE_AWAITING_OWNER_AUTHORIZATION,
+    RECOVERY_STATE_CHILD_RUN_CREATED,
+    RECOVERY_STATE_COMPLETED,
+    RECOVERY_STATE_PREPARING,
+    RecoveryPersistenceError,
+    RecoveryRecord,
+    RecoveryStore,
+    TERMINAL_CONTROL_STATES,
+    classify_recovery,
+    emit_recovery_record,
 )
 from admissible.product_launcher.preflight_runner import ProductionPreflightApplication
 from admissible.product_launcher.ui_transport import (
@@ -96,6 +117,16 @@ class ProductLauncher:
         self._closed = False
         self._browser_opened = False
         self._contracts: dict[str, AuthoredContractRecord] = {}
+        # Governed backend-drift rerun state. All of it is launcher-resident:
+        # pending recoveries survive browser refresh through GET routes but are
+        # not claimed to survive launcher restart. The durable write-once
+        # recovery record is emitted only at CHILD_RUN_CREATED.
+        self._recoveries = RecoveryStore()
+        self._launched_runs: dict[str, str] = {}
+        self._recovery_creation_lock = threading.Lock()
+        self._recoveries_directory = (
+            Path(self.configuration.contract_documents_directory) / "recoveries"
+        )
         self._preparations = PreparationStore(
             max_preparations=self.configuration.max_preparations,
             ttl_seconds=self.configuration.preparation_ttl_seconds,
@@ -194,6 +225,8 @@ class ProductLauncher:
                 finally:
                     self._preparations.clear()
                     self._contracts.clear()
+                    self._recoveries.clear()
+                    self._launched_runs.clear()
                     self._g2_token = ""
                     self._csrf_nonce = ""
 
@@ -348,6 +381,199 @@ class ProductLauncher:
             raise KeyError(preparation_id)
         return preparation.to_status_dict()
 
+    def create_recovery(self, parent_control_run_id: str) -> tuple[int, dict[str, object]]:
+        """Create (or idempotently return) the governed rerun for one refused parent.
+
+        Server-side truth decides eligibility: the parent control state and the
+        authoritative result are re-fetched through the launcher-to-G2 proxy on
+        every creation attempt. The browser is never trusted to classify.
+        """
+
+        if not isinstance(parent_control_run_id, str) or not parent_control_run_id:
+            return 404, {"error": "RUN_NOT_FOUND"}
+        # One creation at a time: a concurrent duplicate waits and then receives
+        # the identical existing recovery instead of creating a second one.
+        with self._recovery_creation_lock:
+            with self._lock:
+                if self._closed:
+                    return 409, {"error": "LAUNCHER_CLOSED"}
+            existing = self._recoveries.get_by_parent(parent_control_run_id)
+            if existing is not None:
+                return 200, self._recovery_view(existing)
+            if self._recoveries.is_recovery_child(parent_control_run_id):
+                # Maximum recovery depth is one child rerun; a recovery child
+                # can never become a recovery parent through this slice.
+                return 409, {"error": "RECOVERY_DEPTH_EXCEEDED"}
+            status, state_body = self.proxy_g2(
+                "GET", f"/api/v1/runs/{parent_control_run_id}"
+            )
+            if status == 404:
+                return 404, {"error": "RUN_NOT_FOUND"}
+            if status != 200:
+                return 502, {"error": "RECOVERY_PARENT_STATE_UNAVAILABLE"}
+            control_state = state_body.get("control_state")
+            if control_state not in TERMINAL_CONTROL_STATES:
+                return 409, {"error": "RECOVERY_PARENT_NOT_TERMINAL"}
+            result_status, result_body = self.proxy_g2(
+                "GET", f"/api/v1/runs/{parent_control_run_id}/result"
+            )
+            if result_status == 409:
+                return 409, {"error": "RECOVERY_PARENT_NOT_TERMINAL"}
+            if result_status != 200:
+                # Includes 410 NO_AUTHORITATIVE_RESULT: without an authoritative
+                # result there is no supported recovery class.
+                return 409, {"error": "RECOVERY_PARENT_RESULT_UNAVAILABLE"}
+            classification = classify_recovery(
+                result_body,
+                control_state=control_state,
+                parent_is_recovery_child=False,
+            )
+            if classification != CLASSIFICATION_REAUTHORIZATION_REQUIRED:
+                return 409, {"error": "RECOVERY_NOT_ELIGIBLE"}
+            with self._lock:
+                parent_contract_id = self._launched_runs.get(parent_control_run_id)
+                parent_record = (
+                    self._contracts.get(parent_contract_id) if parent_contract_id else None
+                )
+            if parent_record is None:
+                # The functional template identity comes from the launcher-owned
+                # parent contract record; a run launched by another launcher
+                # process cannot be imported into this slice.
+                return 409, {"error": "RECOVERY_PARENT_CONTRACT_UNKNOWN"}
+            template_id = parent_record.contract_summary.get("template_id")
+            if template_id != GOLDEN_TEMPLATE_ID:
+                return 409, {"error": "RECOVERY_TEMPLATE_UNSUPPORTED"}
+            # Fresh child contract: the launcher-owned golden exact fields plus
+            # only the allowed owner variables retained from the parent record.
+            # No parent contract, preparation, phrase, digest, fingerprint, run
+            # or session identity is ever reused.
+            child_inputs: dict[str, Any] = {
+                field_name: (list(value) if isinstance(value, tuple) else value)
+                for field_name, value in GOLDEN_EXACT_CONTRACT_FIELDS.items()
+            }
+            child_inputs["template_id"] = template_id
+            child_inputs["model"] = parent_record.model
+            child_inputs["timeout_seconds"] = parent_record.timeout_seconds
+            authored_status, authored = self.author_and_validate(child_inputs)
+            if authored_status != 200:
+                return authored_status, authored
+            child_contract_id = authored.get("contract_id")
+            if not isinstance(child_contract_id, str) or not child_contract_id:
+                return 502, {"error": "G2_VALIDATE_INVALID"}
+            # Enforced freshness, never assumed: every child identity must
+            # differ from the parent record (contract, fingerprint, and each
+            # generated profile/run/session/gate/mission/document ID).
+            child_generated = authored.get("generated_ids")
+            child_fingerprint = authored.get("profile_fingerprint")
+            parent_identity = {parent_record.contract_id, parent_record.profile_fingerprint}
+            parent_identity.update(parent_record.generated_ids.values())
+            child_identity = {child_contract_id}
+            if isinstance(child_fingerprint, str):
+                child_identity.add(child_fingerprint)
+            if isinstance(child_generated, Mapping):
+                child_identity.update(
+                    value for value in child_generated.values() if isinstance(value, str)
+                )
+            if not isinstance(child_generated, Mapping) or parent_identity & child_identity:
+                return 409, {"error": "RECOVERY_CHILD_IDENTITY_NOT_FRESH"}
+            prep_status, prep = self.enqueue_preparation(child_contract_id)
+            if prep_status != 202:
+                # No recovery exists yet (e.g. PREFLIGHT_BUSY); the owner may
+                # retry, which authors another fresh child contract.
+                return prep_status, prep
+            authorization = result_body.get("authorization")
+            parent_backend_identity = (
+                authorization.get("backend_identity")
+                if isinstance(authorization, Mapping)
+                else None
+            )
+            session_id = state_body.get("authoritative_session_id")
+            record = self._recoveries.create(
+                RecoveryRecord(
+                    recovery_id=self._id_generator(),
+                    parent_control_run_id=parent_control_run_id,
+                    parent_session_id=session_id if isinstance(session_id, str) else None,
+                    refusal_reason=RECOVERY_REASON_BACKEND_DRIFT,
+                    classification=classification,
+                    preparation_id=str(prep.get("preparation_id")),
+                    created_at=self._clock(),
+                    child_contract_id=child_contract_id,
+                    parent_backend_identity=(
+                        parent_backend_identity
+                        if isinstance(parent_backend_identity, str)
+                        else None
+                    ),
+                )
+            )
+            return 201, self._recovery_view(record)
+
+    def recovery_status(self, recovery_key: str) -> dict[str, object]:
+        record = self._recoveries.get(recovery_key)
+        if record is None:
+            record = self._recoveries.get_by_parent(recovery_key)
+        if record is None:
+            raise KeyError(recovery_key)
+        return self._recovery_view(record)
+
+    def list_recoveries(self) -> dict[str, object]:
+        return {
+            "recoveries": [self._recovery_view(record) for record in self._recoveries.values()]
+        }
+
+    def _recovery_view(self, record: RecoveryRecord) -> dict[str, object]:
+        """Secret-safe browser view of one recovery with its truthful state.
+
+        The state is computed from the existing preparation lifecycle and the
+        live child control state; preparation BLOCKED/FAILED/EXPIRED terminates
+        the recovery through the existing preparation error surface.
+        """
+
+        preparation = self._preparations.get(record.preparation_id)
+        child_control_state: str | None = None
+        if record.child_control_run_id:
+            status, body = self.proxy_g2(
+                "GET", f"/api/v1/runs/{record.child_control_run_id}"
+            )
+            if status == 200:
+                raw_state = body.get("control_state")
+                child_control_state = raw_state if isinstance(raw_state, str) else None
+            state = (
+                RECOVERY_STATE_COMPLETED
+                if child_control_state in TERMINAL_CONTROL_STATES
+                else RECOVERY_STATE_CHILD_RUN_CREATED
+            )
+        elif preparation is None:
+            state = STATE_EXPIRED
+        elif preparation.state in (STATE_QUEUED, STATE_RUNNING):
+            state = RECOVERY_STATE_PREPARING
+        elif preparation.state == STATE_READY:
+            state = RECOVERY_STATE_AWAITING_OWNER_AUTHORIZATION
+        else:
+            state = preparation.state
+        view: dict[str, object] = record.to_durable_json()
+        view["state"] = state
+        view["child_contract_id"] = record.child_contract_id
+        view["child_control_state"] = child_control_state
+        view["parent_backend_identity"] = record.parent_backend_identity
+        view["durable_record_written"] = record.durable_record_written
+        view["durable_record_error"] = record.durable_record_error
+        view["authorization_mode"] = self.authorization_mode
+        view["preparation"] = (
+            preparation.to_status_dict() if preparation is not None else None
+        )
+        return view
+
+    def _emit_durable_recovery(self, record: RecoveryRecord) -> None:
+        """Write the one durable recovery record; never disturb the 202 launch."""
+
+        try:
+            emit_recovery_record(record, directory=self._recoveries_directory)
+        except RecoveryPersistenceError as exc:
+            record.durable_record_error = exc.error_code
+        else:
+            record.durable_record_written = True
+            record.durable_record_error = None
+
     def launch_run(
         self,
         *,
@@ -424,8 +650,22 @@ class ProductLauncher:
             )
             if status == 202:
                 # Exactly one accepted G2 launch consumes the preparation.
+                control_run_id = body.get("control_run_id")
+                bound_recovery = None
                 with self._lock:
                     self._preparations.mark_consumed(preparation_id)
+                    if isinstance(control_run_id, str) and control_run_id:
+                        # Launcher-resident association only; the parent run
+                        # root and evidence are never touched.
+                        self._launched_runs[control_run_id] = contract_id
+                        recovery = self._recoveries.get_by_child_contract(contract_id)
+                        if recovery is not None and recovery.child_control_run_id is None:
+                            recovery.child_control_run_id = control_run_id
+                            recovery.owner_decision = OWNER_DECISION_AUTHORIZED_RERUN
+                            recovery.authorized_at = self._clock()
+                            bound_recovery = recovery
+                if bound_recovery is not None:
+                    self._emit_durable_recovery(bound_recovery)
             return status, body
         finally:
             if reserved:

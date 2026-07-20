@@ -645,6 +645,12 @@ function deferredFetchController() {
   fetchImpl = (url, options = {}) => new Promise((resolve, reject) => {
     const entry = { url, options, resolve, reject, method: (options.method || "GET").toUpperCase() };
     fetchLog.push({ url, method: entry.method, headers: { ...(options.headers || {}) } });
+    // The governed-rerun bootstrap probe is answered immediately with an empty
+    // pending set so deferred scenarios keep their exact resolveNext ordering.
+    if (entry.method === "GET" && url === "/ui/api/v1/recoveries") {
+      resolve(jsonResponse(200, { recoveries: [] }));
+      return;
+    }
     if (options.signal) {
       options.signal.addEventListener("abort", () => {
         const err = new Error("Aborted"); err.name = "AbortError"; reject(err);

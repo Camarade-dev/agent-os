@@ -829,14 +829,19 @@ def test_child_runner_unchanged_and_protected_paths_unmodified():
         cwd=root,
         text=True,
     )
-    # The golden result-presentation repair re-opens exactly one read-model file
-    # (the run reconstruction) under explicit authorization. Every other path in
-    # that tree - and the delegated gate, product service and checkpoint executor
-    # in full - stays frozen against launcher-slice drift.
-    AUTHORIZED_READ_MODEL_PATH = "admissible/product_read_model/read_model.py"
+    # The golden result-presentation repair re-opened exactly one read-model
+    # file (the run reconstruction); the governed backend-drift rerun slice
+    # additionally authorizes exactly the renderer (secret-safe authorization
+    # exposure in result JSON). Every other path in that tree - and the
+    # delegated gate, product service and checkpoint executor in full - stays
+    # frozen against launcher-slice drift.
+    AUTHORIZED_READ_MODEL_PATHS = {
+        "admissible/product_read_model/read_model.py",
+        "admissible/product_read_model/renderer.py",
+    }
     residual = "\n".join(
         line for line in (raw.strip() for raw in changed.splitlines())
-        if line and line != AUTHORIZED_READ_MODEL_PATH
+        if line and line not in AUTHORIZED_READ_MODEL_PATHS
     )
     for forbidden in (
         "admissible/delegated_gate/",
