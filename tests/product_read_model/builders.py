@@ -8,12 +8,21 @@ test touches a real historical run root.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
 SESSION_ID = "run-synthetic"
 GATE_ID = "synthetic-gate"
 ATTEMPT = 0
+
+# Defaults for the checkpoint-reconstruction fixtures. The shape mirrors the real
+# delegated schema: ``command_id`` lives inside the ``verification_command``
+# evidence record, never on the checkpoint-history entry.
+CHECKPOINT_COMMAND_ID = "npm-test"
+CHECKPOINT_ARGV = ["npm.cmd", "test"]
+CHECKPOINT_STDOUT = b"synthetic checkpoint stdout\n"
+CHECKPOINT_STDERR = b""
 
 
 def _write(path: Path, obj: object) -> None:
@@ -57,7 +66,14 @@ class RunRootBuilder:
         _write(self.evidence / "final-status.json", payload)
         return self
 
-    def delegated_gate(self, *, human_disposition: object = None, human_boundary_reason: object = None, objective: str = "Deliver the thing.", mission_id: str = "mission-synthetic", checkpoint_history: list | None = None) -> "RunRootBuilder":
+    def delegated_gate(self, *, human_disposition: object = None, human_boundary_reason: object = None, objective: str = "Deliver the thing.", mission_id: str = "mission-synthetic", checkpoint_history: list | None = None, checkpoint_verification_commands: list | None = None) -> "RunRootBuilder":
+        contract: dict[str, object] = {
+            "gate_id": self.gate_id,
+            "objective": objective,
+            "contract_fingerprint": "contract-fp",
+        }
+        if checkpoint_verification_commands is not None:
+            contract["checkpoint_verification_commands"] = checkpoint_verification_commands
         payload = {
             "schema_version": "admissible_delegated_gate_session_v1",
             "session_id": self.session_id,
@@ -67,16 +83,12 @@ class RunRootBuilder:
             "checkpoint_history": checkpoint_history if checkpoint_history is not None else [],
             "audit_history": [],
             "mission": {"mission_id": mission_id, "mission_fingerprint": "mission-fp"},
-            "gate_plan": {
-                "ordered_gate_contracts": [
-                    {"gate_id": self.gate_id, "objective": objective, "contract_fingerprint": "contract-fp"}
-                ]
-            },
+            "gate_plan": {"ordered_gate_contracts": [contract]},
         }
         _write(self.evidence / "delegated-state" / f"{self.session_id}.delegated-gate.json", payload)
         return self
 
-    def preflight(self, *, secret: bool = False) -> "RunRootBuilder":
+    def preflight(self, *, secret: bool = False, checkpoint_commands: list | None = None) -> "RunRootBuilder":
         payload = {
             "classification": "act-2a-native-delegated-executor-canary",
             "authorization_payload": {
@@ -93,6 +105,11 @@ class RunRootBuilder:
                 "attestation_non_claims": ["publisher identity is not established"],
             },
         }
+        if checkpoint_commands is not None:
+            payload["authorization_payload"]["mission_profile"] = {
+                "profile_id": "profile-synthetic",
+                "checkpoint_commands": checkpoint_commands,
+            }
         if secret:
             ap = payload["authorization_payload"]
             ap["owner_phrase"] = "hunter2-secret"
@@ -305,6 +322,140 @@ class RunRootBuilder:
         )
         return self
 
+    def capture_attempt(self, *, required_command_ids: list | None = None, **extra: object) -> "RunRootBuilder":
+        """Write the success-lane native terminal record.
+
+        The success lane deliberately never writes ``native-terminal.json``; this
+        record is the positive evidence that the capture lane was entered.
+        """
+
+        payload = {
+            "schema_version": "admissible_native_capture_attempt_v2",
+            "session_id": self.session_id,
+            "gate_id": self.gate_id,
+            "capture_attempt_id": f"capture:{self.session_id}:{self.gate_id}:{ATTEMPT}",
+            "execution_attempt_index": ATTEMPT,
+            "expected_terminal_status": "CHECKPOINT_CAPTURED",
+            "required_command_ids": required_command_ids if required_command_ids is not None else [CHECKPOINT_COMMAND_ID],
+            "attempt_fingerprint": "capture-fp",
+            "request_fingerprint": "rq-fp",
+            "result_fingerprint": "rs-fp",
+            "started_at": "2026-07-18T23:49:01.000000Z",
+            "state_revision": 1,
+            "verification_mode": "FROZEN_BEHAVIORAL",
+        }
+        payload.update(extra)
+        _write(self._native("native-capture-attempt.json"), payload)
+        return self
+
+    def checkpoint(
+        self,
+        *,
+        commands: list | None = None,
+        record_overrides: dict | None = None,
+        stdout_payloads: dict | None = None,
+        declared_sha_overrides: dict | None = None,
+        omit_records: tuple = (),
+        omit_artifact_files: tuple = (),
+        omit_references: tuple = (),
+        authority: str = "preflight",
+        checkpoint_fingerprint: str = "cp-fp",
+        **gate_kwargs: object,
+    ) -> "RunRootBuilder":
+        """Write real-shaped delegated checkpoint evidence plus its artefacts.
+
+        ``authority`` selects where the *expected* command definitions are
+        persisted: ``"preflight"`` (canonical authorization payload),
+        ``"gate_plan"`` (delegated gate contract) or ``"none"``. The knobs allow a
+        single expected command to be dropped, mutated, or given a stale hash so a
+        test can require ``INCONSISTENT`` without reimplementing the production
+        reconstruction algorithm.
+        """
+
+        definitions = commands if commands is not None else [
+            {
+                "command_id": CHECKPOINT_COMMAND_ID,
+                "argv": list(CHECKPOINT_ARGV),
+                "timeout_seconds": 300,
+                "max_capture_bytes": 1048576,
+            }
+        ]
+        record_overrides = record_overrides or {}
+        stdout_payloads = stdout_payloads or {}
+        declared_sha_overrides = declared_sha_overrides or {}
+
+        artifact_dir = self.evidence / "checkpoint-artifacts"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+
+        references: list[dict] = []
+        records: list[dict] = [
+            {"evidence_id": "target-tree", "kind": "target_tree", "status": "observed", "file_count": 3, "tree_hash": "tree-hash"},
+            {"evidence_id": "git-state", "kind": "git_state", "status": "observed", "head": "b" * 40, "porcelain_status": ""},
+        ]
+
+        for definition in definitions:
+            command_id = definition["command_id"]
+            stem = f"{self.session_id}.{self.gate_id}.attempt-{ATTEMPT}.{command_id}"
+            for purpose, default in (("stdout", CHECKPOINT_STDOUT), ("stderr", CHECKPOINT_STDERR)):
+                artifact_id = f"{stem}.{purpose}"
+                relative_path = f"{stem}.{purpose}.txt"
+                content = stdout_payloads.get((command_id, purpose), default)
+                if command_id not in omit_artifact_files:
+                    (artifact_dir / relative_path).write_bytes(content)
+                declared = declared_sha_overrides.get(
+                    (command_id, purpose), hashlib.sha256(content).hexdigest()
+                )
+                if command_id not in omit_references:
+                    references.append(
+                        {
+                            "artifact_id": artifact_id,
+                            "purpose": purpose,
+                            "relative_path": relative_path,
+                            "byte_count": len(content),
+                            "sha256": declared,
+                            "truncated": False,
+                        }
+                    )
+            if command_id in omit_records:
+                continue
+            record = {
+                "evidence_id": f"command.{command_id}",
+                "kind": "verification_command",
+                "command_id": command_id,
+                "argv": list(definition["argv"]),
+                "status": "passed",
+                "exit_code": 0,
+                "timed_out": False,
+                "output_truncated": False,
+                "cleanup_proven": True,
+                "stdout_artifact_id": f"{stem}.stdout",
+                "stderr_artifact_id": f"{stem}.stderr",
+            }
+            record.update(record_overrides.get(command_id, {}))
+            records.append(record)
+
+        history = [
+            {
+                "schema_version": "admissible_delegated_checkpoint_v1",
+                "session_id": self.session_id,
+                "gate_id": self.gate_id,
+                "execution_attempt_index": ATTEMPT,
+                "checkpoint_fingerprint": checkpoint_fingerprint,
+                "git_head": "b" * 40,
+                "git_worktree_status": "",
+                "material_tree_hash": "tree-hash",
+                "artifact_references": references,
+                "evidence_records": records,
+            }
+        ]
+        self.delegated_gate(
+            checkpoint_history=history,
+            checkpoint_verification_commands=definitions if authority == "gate_plan" else None,
+            **gate_kwargs,
+        )
+        self.preflight(checkpoint_commands=definitions if authority == "preflight" else None)
+        return self
+
     def product_block(self, payload: dict) -> "RunRootBuilder":
         """Write an explicit persisted product-verdict block (forward-compat)."""
 
@@ -365,6 +516,33 @@ def build_full_records(root: Path) -> RunRootBuilder:
     b.process_observation(exit_code=0).result(exit_code=0)
     b.eligibility(eligible=True).behavioral(exit_code=1)
     b.terminal().final_status()
+    return b
+
+
+def build_capture_success(root: Path, **checkpoint_kwargs: object) -> RunRootBuilder:
+    """A complete success-lane run: capture-attempt persisted, terminal absent.
+
+    Mirrors the real golden shape - the success lane writes
+    ``native-capture-attempt.json`` and deliberately never writes
+    ``native-terminal.json``. Callers drop or corrupt individual records to
+    exercise the incomplete and inconsistent paths.
+    """
+
+    b = RunRootBuilder(root)
+    b.request().attempt_reserved().process_started()
+    b.process_observation(exit_code=0).result(exit_code=0)
+    b.eligibility(eligible=True).behavioral(exit_code=0)
+    b.checkpoint(**checkpoint_kwargs)
+    b.capture_attempt()
+    b.final_status(
+        status="CHECKPOINT_CAPTURED_CANARY_SUCCESS",
+        detail="All native, behavioral, capture, checkpoint, and state evidence reloaded from disk.",
+        canary_success=True,
+        phase="CHECKPOINT_CAPTURED",
+        checkpoint_status="PASSED",
+        checkpoint_fingerprint="cp-fp",
+        verification_mode="FROZEN_BEHAVIORAL",
+    )
     return b
 
 

@@ -9,9 +9,10 @@ product verdict stays ``UNKNOWN`` unless authoritative data supplies it.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from . import evidence_reader
@@ -53,6 +54,7 @@ from .truth_provider import RunTruthProvider
 
 _NATIVE_DIR = "evidence/native-execution"
 _DELEGATED_DIR = "evidence/delegated-state"
+_CHECKPOINT_ARTIFACT_DIR = "evidence/checkpoint-artifacts"
 
 _NATIVE_SUFFIXES = {
     "request": ".native-request.json",
@@ -62,8 +64,14 @@ _NATIVE_SUFFIXES = {
     "result": ".native-result.json",
     "eligibility": ".native-execution-eligibility.json",
     "behavioral": ".native-behavioral.json",
+    "capture_attempt": ".native-capture-attempt.json",
     "terminal": ".native-terminal.json",
 }
+
+# Bounded hashing of persisted checkpoint artefacts. A declared artefact larger
+# than this is treated as unresolvable (never as a silent pass).
+_MAX_CHECKPOINT_ARTIFACT_BYTES = 64 * 1024 * 1024
+_CHECKPOINT_HASH_CHUNK_BYTES = 1024 * 1024
 
 # Optional forward-compatible persisted product block location. This is a
 # persisted *claim* only: it is never treated as authoritative (see
@@ -429,40 +437,279 @@ def _behavioral_view(root_real: Path, behavioral: EvidenceRead) -> BehavioralVer
     )
 
 
-def _checkpoint_view(final_status: EvidenceRead, terminal: EvidenceRead, delegated: EvidenceRead) -> CheckpointView:
+def _hash_persisted_file(root_real: Path, relative: str) -> str | None:
+    """Return the SHA-256 of a persisted file, or ``None`` when unresolvable.
+
+    ``None`` covers every unsafe or unreadable case (containment refusal, absent
+    file, non-regular file, oversize, I/O error). Callers must treat ``None`` as
+    an unresolved condition, never as a match.
+    """
+
+    target = evidence_reader.safe_child_path(root_real, relative)
+    if target is None:
+        return None
+    try:
+        st = os.lstat(target)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        if st.st_size > _MAX_CHECKPOINT_ARTIFACT_BYTES:
+            return None
+        digest = hashlib.sha256()
+        with open(target, "rb") as handle:
+            while True:
+                chunk = handle.read(_CHECKPOINT_HASH_CHUNK_BYTES)
+                if not chunk:
+                    break
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def _checkpoint_command_definitions(raw: object) -> tuple[tuple[str, tuple[str, ...]], ...] | None:
+    """Normalise a persisted checkpoint-command list to ``(command_id, argv)`` pairs."""
+
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        return None
+    pairs: list[tuple[str, tuple[str, ...]]] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            return None
+        command_id = item.get("command_id")
+        argv = item.get("argv")
+        if not isinstance(command_id, str) or not command_id:
+            return None
+        if not isinstance(argv, list) or not argv:
+            return None
+        if not all(isinstance(part, str) for part in argv):
+            return None
+        pairs.append((command_id, tuple(argv)))
+    if not pairs:
+        return None
+    if len({command_id for command_id, _ in pairs}) != len(pairs):
+        return None
+    return tuple(pairs)
+
+
+def _expected_checkpoint_commands(
+    preflight: EvidenceRead, delegated: EvidenceRead, gate_id: str | None
+) -> tuple[tuple[str, tuple[str, ...]], ...] | None:
+    """Resolve the expected checkpoint commands from persisted authority.
+
+    The canonical preflight authorization payload is preferred; the persisted
+    delegated gate contract is the fallback. ``None`` means no authority could be
+    resolved, which keeps the checkpoint unresolved rather than trusting the
+    executor's own evidence records to define what was required.
+    """
+
+    payload = _msub(_data(preflight), "authorization_payload")
+    profile = _msub(payload, "mission_profile")
+    if profile is not None:
+        pairs = _checkpoint_command_definitions(profile.get("checkpoint_commands"))
+        if pairs is not None:
+            return pairs
+
+    plan = _msub(_data(delegated), "gate_plan")
+    if plan is not None:
+        contracts = plan.get("ordered_gate_contracts")
+        if isinstance(contracts, list):
+            candidates = [item for item in contracts if isinstance(item, Mapping)]
+            chosen: Mapping | None = None
+            if gate_id is not None:
+                matching = [item for item in candidates if item.get("gate_id") == gate_id]
+                if len(matching) == 1:
+                    chosen = matching[0]
+            if chosen is None and len(candidates) == 1:
+                chosen = candidates[0]
+            if chosen is not None:
+                pairs = _checkpoint_command_definitions(
+                    chosen.get("checkpoint_verification_commands")
+                )
+                if pairs is not None:
+                    return pairs
+    return None
+
+
+def _artifact_reference_index(entry: Mapping) -> dict[str, Mapping] | None:
+    """Index a checkpoint-history entry's artefact references by artifact id."""
+
+    references = entry.get("artifact_references")
+    if not isinstance(references, list):
+        return None
+    index: dict[str, Mapping] = {}
+    for reference in references:
+        if not isinstance(reference, Mapping):
+            return None
+        artifact_id = reference.get("artifact_id")
+        if not isinstance(artifact_id, str) or artifact_id in index:
+            return None
+        index[artifact_id] = reference
+    return index
+
+
+def _checkpoint_artifact_resolved(
+    root_real: Path, references: dict[str, Mapping], artifact_id: object
+) -> bool:
+    """True only when the referenced artefact exists and its declared hash matches."""
+
+    if not isinstance(artifact_id, str) or artifact_id not in references:
+        return False
+    reference = references[artifact_id]
+    if reference.get("truncated") is not False:
+        return False
+    relative_path = reference.get("relative_path")
+    declared = reference.get("sha256")
+    if not isinstance(relative_path, str) or not relative_path:
+        return False
+    if not isinstance(declared, str) or not declared:
+        return False
+    actual = _hash_persisted_file(root_real, f"{_CHECKPOINT_ARTIFACT_DIR}/{relative_path}")
+    if actual is None:
+        return False
+    return actual == declared
+
+
+def _verification_command_records(entry: Mapping) -> tuple[Mapping, ...] | None:
+    """Return the ``verification_command`` evidence records of one history entry.
+
+    ``command_id`` lives inside each evidence record, not on the history entry.
+    """
+
+    records = entry.get("evidence_records")
+    if not isinstance(records, list):
+        return None
+    selected: list[Mapping] = []
+    for record in records:
+        if not isinstance(record, Mapping):
+            return None
+        if record.get("kind") == "verification_command":
+            selected.append(record)
+    return tuple(selected)
+
+
+def _checkpoint_command_resolved(
+    root_real: Path,
+    record: Mapping,
+    expected_argv: tuple[str, ...],
+    references: dict[str, Mapping],
+) -> bool:
+    """True only when every required condition for one command is independently met."""
+
+    argv = record.get("argv")
+    if not isinstance(argv, list) or tuple(argv) != expected_argv:
+        return False
+    if record.get("status") != "passed":
+        return False
+    exit_code = record.get("exit_code")
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int) or exit_code != 0:
+        return False
+    if record.get("timed_out") is not False:
+        return False
+    if record.get("output_truncated") is not False:
+        return False
+    if record.get("cleanup_proven") is not True:
+        return False
+    if not _checkpoint_artifact_resolved(root_real, references, record.get("stdout_artifact_id")):
+        return False
+    if not _checkpoint_artifact_resolved(root_real, references, record.get("stderr_artifact_id")):
+        return False
+    return True
+
+
+def _checkpoint_view(
+    root_real: Path,
+    final_status: EvidenceRead,
+    terminal: EvidenceRead,
+    delegated: EvidenceRead,
+    preflight: EvidenceRead,
+) -> CheckpointView:
+    """Reconstruct the checkpoint outcome from persisted evidence only.
+
+    ``PASSED`` requires that every command named by persisted preflight/contract
+    authority is independently resolved from persisted checkpoint evidence and
+    that the persisted final status agrees. Every other shape stays
+    ``INCONSISTENT``: a later manual command never implies a pass.
+    """
+
     fs = _data(final_status)
     tm = _data(terminal)
     dg = _data(delegated)
     checkpoint_fingerprint = _mstr(fs, "checkpoint_fingerprint") or _mstr(tm, "capture_attempt_fingerprint")
     history = dg.get("checkpoint_history") if isinstance(dg, Mapping) else None
-    history_entries = history if isinstance(history, list) else []
+    history_entries = [entry for entry in history if isinstance(entry, Mapping)] if isinstance(history, list) else []
+    malformed_history = isinstance(history, list) and len(history_entries) != len(history)
     attempted = bool(history_entries) or checkpoint_fingerprint is not None
-    command_ids: tuple[str, ...] = ()
-    if history_entries:
-        ids: list[str] = []
-        for entry in history_entries:
-            if isinstance(entry, Mapping):
-                cid = entry.get("command_id")
-                if isinstance(cid, str):
-                    ids.append(cid)
-        command_ids = tuple(ids)
+
     if not attempted:
-        present = PresenceState.ABSENT
-        result = OutcomeState.ABSENT
-        notes = ("no checkpoint was attempted (ABSENT); this is not a failure",)
-    else:
-        present = PresenceState.PRESENT
-        # A checkpoint fingerprint without a captured terminal is ambiguous; keep
-        # it visible rather than asserting pass/fail from indirect signals.
-        result = OutcomeState.INCONSISTENT
-        notes = ("checkpoint attempt recorded; capture outcome not independently resolved by this lane",)
+        return CheckpointView(
+            present=PresenceState.ABSENT,
+            result=OutcomeState.ABSENT,
+            attempted=False,
+            checkpoint_fingerprint=None,
+            verification_command_ids=(),
+            notes=("no checkpoint was attempted (ABSENT); this is not a failure",),
+        )
+
+    entry = history_entries[-1] if history_entries else None
+    records = _verification_command_records(entry) if entry is not None else None
+    command_ids = tuple(
+        record["command_id"]
+        for record in (records or ())
+        if isinstance(record.get("command_id"), str)
+    )
+
+    def inconsistent(reason: str) -> CheckpointView:
+        return CheckpointView(
+            present=PresenceState.PRESENT,
+            result=OutcomeState.INCONSISTENT,
+            attempted=True,
+            checkpoint_fingerprint=checkpoint_fingerprint,
+            verification_command_ids=command_ids,
+            notes=(reason,),
+        )
+
+    if malformed_history:
+        return inconsistent("checkpoint history contains malformed entries; outcome not resolved")
+    if entry is None or records is None:
+        return inconsistent("checkpoint evidence records are absent or malformed; outcome not resolved")
+
+    expected = _expected_checkpoint_commands(preflight, delegated, _mstr(entry, "gate_id"))
+    if expected is None:
+        return inconsistent("no persisted authority defines the expected checkpoint commands; outcome not resolved")
+
+    by_id: dict[str, Mapping] = {}
+    for record in records:
+        command_id = record.get("command_id")
+        if not isinstance(command_id, str) or command_id in by_id:
+            return inconsistent("checkpoint command evidence is malformed or duplicated; outcome not resolved")
+        by_id[command_id] = record
+
+    expected_ids = {command_id for command_id, _ in expected}
+    if set(by_id) != expected_ids:
+        return inconsistent("persisted checkpoint commands do not match the authorized command set; outcome not resolved")
+
+    references = _artifact_reference_index(entry)
+    if references is None:
+        return inconsistent("checkpoint artefact references are malformed; outcome not resolved")
+
+    for command_id, expected_argv in expected:
+        if not _checkpoint_command_resolved(root_real, by_id[command_id], expected_argv, references):
+            return inconsistent(
+                f"checkpoint command {command_id!r} is not independently resolved from persisted evidence"
+            )
+
+    if _mstr(fs, "checkpoint_status") != "PASSED":
+        return inconsistent("persisted final checkpoint_status does not agree with the resolved commands")
+
     return CheckpointView(
-        present=present,
-        result=result,
-        attempted=attempted,
+        present=PresenceState.PRESENT,
+        result=OutcomeState.PASSED,
+        attempted=True,
         checkpoint_fingerprint=checkpoint_fingerprint,
         verification_command_ids=command_ids,
-        notes=notes,
+        notes=(
+            "every authorized checkpoint command is independently resolved from persisted evidence",
+        ),
     )
 
 
@@ -536,9 +783,12 @@ _SLOT_LABELS = {
     "eligibility": "native-execution-eligibility.json",
     "result": "native-result.json",
     "behavioral": "native-behavioral.json",
+    "capture_attempt": "native-capture-attempt.json",
     "terminal": "native-terminal.json",
 }
 
+# Required in every lane. The lane-specific native terminal record is added by
+# ``_completeness_view`` from the resolved evidence lane.
 _BASE_REQUIRED = (
     "final_status",
     "request",
@@ -546,11 +796,38 @@ _BASE_REQUIRED = (
     "process_started",
     "process_observation",
     "eligibility",
-    "terminal",
 )
 
 
-def _completeness_view(reads: dict[str, EvidenceRead], material: MaterialView, behavioral: BehavioralVerificationView) -> EvidenceCompletenessView:
+def _evidence_lane(final_status: EvidenceRead, classification_kind: ClassificationKind) -> str:
+    """Resolve which native terminal record this run's lane must carry.
+
+    The success lane is entered only on *positive* persisted evidence: a present
+    final status carrying a canonical SUCCESS classification together with an
+    explicit ``canary_success`` of ``True``. The success lane deliberately never
+    writes ``native-terminal.json``; it writes ``native-capture-attempt.json``
+    instead, so that record becomes the required one.
+
+    Every other shape - failure, contradictory, unsupported, absent or
+    unreadable final status - stays in the terminal-requiring lane. Absence of
+    ``native-terminal.json`` alone never selects the success lane.
+    """
+
+    if final_status.presence is not PresenceState.PRESENT:
+        return "OTHER"
+    if classification_kind is not ClassificationKind.SUCCESS:
+        return "OTHER"
+    if _mbool(_data(final_status), "canary_success") is not True:
+        return "OTHER"
+    return "SUCCESS"
+
+
+def _completeness_view(
+    reads: dict[str, EvidenceRead],
+    material: MaterialView,
+    behavioral: BehavioralVerificationView,
+    lane: str,
+) -> EvidenceCompletenessView:
     present: list[str] = []
     absent: list[str] = []
     inconsistent: list[str] = []
@@ -567,6 +844,9 @@ def _completeness_view(reads: dict[str, EvidenceRead], material: MaterialView, b
             absent.append(label)
 
     required = set(_BASE_REQUIRED)
+    # Lane-specific native terminal record. Exactly one of the two is required;
+    # neither lane may pass without its own positive terminal evidence.
+    required.add("capture_attempt" if lane == "SUCCESS" else "terminal")
     if material.result is OutcomeState.PASSED:
         # Material eligibility passing means the behavioral verifier and an
         # accepted result are expected to exist.
@@ -738,6 +1018,7 @@ def load_run_detail(
     result = _read_native(root_real, matches, "result", max_bytes)
     eligibility = _read_native(root_real, matches, "eligibility", max_bytes)
     behavioral = _read_native(root_real, matches, "behavioral", max_bytes)
+    capture_attempt = _read_native(root_real, matches, "capture_attempt", max_bytes)
     terminal = _read_native(root_real, matches, "terminal", max_bytes)
 
     reads = {
@@ -751,6 +1032,7 @@ def load_run_detail(
         "eligibility": eligibility,
         "result": result,
         "behavioral": behavioral,
+        "capture_attempt": capture_attempt,
         "terminal": terminal,
     }
 
@@ -760,7 +1042,7 @@ def load_run_detail(
     workspace_git = _workspace_git_view(result, process_observation)
     material = _material_view(eligibility)
     behavioral_view = _behavioral_view(root_real, behavioral)
-    checkpoint = _checkpoint_view(final_status, terminal, delegated)
+    checkpoint = _checkpoint_view(root_real, final_status, terminal, delegated, preflight)
 
     canonical_classification = _mstr(_data(final_status), "status")
     classification_kind = classify_classification(canonical_classification)
@@ -771,7 +1053,9 @@ def load_run_detail(
         final_status, terminal, material, behavioral_view, checkpoint, process_view, classification_kind
     )
     human_disposition = _human_disposition_view(delegated)
-    completeness = _completeness_view(reads, material, behavioral_view)
+    completeness = _completeness_view(
+        reads, material, behavioral_view, _evidence_lane(final_status, classification_kind)
+    )
 
     # Authoritative product verdict via the truth-provider seam. Provider absence,
     # provider failure (exception), and a provider that returns invalid authority

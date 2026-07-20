@@ -829,13 +829,22 @@ def test_child_runner_unchanged_and_protected_paths_unmodified():
         cwd=root,
         text=True,
     )
+    # The golden result-presentation repair re-opens exactly one read-model file
+    # (the run reconstruction) under explicit authorization. Every other path in
+    # that tree - and the delegated gate, product service and checkpoint executor
+    # in full - stays frozen against launcher-slice drift.
+    AUTHORIZED_READ_MODEL_PATH = "admissible/product_read_model/read_model.py"
+    residual = "\n".join(
+        line for line in (raw.strip() for raw in changed.splitlines())
+        if line and line != AUTHORIZED_READ_MODEL_PATH
+    )
     for forbidden in (
         "admissible/delegated_gate/",
         "admissible/product_service/",
         "admissible/product_read_model/",
         "admissible/checkpoint.py",
     ):
-        assert forbidden not in changed
+        assert forbidden not in residual
     # child_runner substantive body unchanged vs base unless import-only
     base = subprocess.check_output(
         ["git", "show", "1f2949d42fb79e9407035822c65b6f889650d689:admissible/product_launcher/child_runner.py"],

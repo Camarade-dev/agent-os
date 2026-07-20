@@ -36,8 +36,11 @@ from admissible.product_read_model import (
 )
 from admissible.product_read_model.product_extractor import CANONICAL_BEHAVIORAL_NON_CLAIM
 from tests.product_read_model.builders import (
+    CHECKPOINT_ARGV,
+    CHECKPOINT_COMMAND_ID,
     RunRootBuilder,
     build_behavioral_refusal,
+    build_capture_success,
     build_full_records,
     build_incomplete_refusal,
     build_material_refusal,
@@ -141,12 +144,17 @@ def test_missing_authoritative_verdict_stays_unknown(tmp_path):
 
 
 def test_green_canary_without_authoritative_verdict_is_unknown(tmp_path):
-    """A SUCCESS canary classification does not imply product admission."""
+    """A SUCCESS canary classification does not imply product admission.
 
-    b = build_full_records(tmp_path / "run")
-    b.final_status(status="CHECKPOINT_CAPTURED_CANARY_SUCCESS", detail="ok", canary_success=True)
+    The run is a *complete* success-lane run with a PASSED checkpoint, so nothing
+    but the absent authoritative verdict can explain the non-admission.
+    """
+
+    build_capture_success(tmp_path / "run")
     detail = load_run_detail(tmp_path / "run")
     assert detail.canonical_classification_kind is ClassificationKind.SUCCESS
+    assert detail.evidence_completeness.state is CompletenessState.COMPLETE
+    assert detail.checkpoint.result is OutcomeState.PASSED
     assert detail.product_verdict.verdict is ProductVerdict.UNKNOWN
     assert detail.presentation_status is PresentationStatus.UNKNOWN
 
@@ -652,3 +660,238 @@ def test_persisted_claim_raw_value_is_escaped(tmp_path):
     html = render_run_html(detail)
     assert "<script>alert(1)" not in html
     assert "&lt;script&gt;" in html
+
+
+# --- success-lane evidence completeness --------------------------------------
+#
+# The success lane deliberately never writes ``native-terminal.json``: it writes
+# ``native-capture-attempt.json`` instead. The lane is resolved from positive
+# persisted evidence, so the absence of a terminal record never by itself relaxes
+# a completeness requirement.
+
+
+def test_success_lane_without_terminal_but_with_capture_attempt_is_complete(tmp_path):
+    build_capture_success(tmp_path / "run")
+    detail = load_run_detail(tmp_path / "run")
+    slots = set(detail.evidence_completeness.present_records)
+    assert "native-capture-attempt.json" in slots
+    assert "native-terminal.json" in detail.evidence_completeness.absent_records
+    assert detail.evidence_completeness.missing_required == ()
+    assert detail.evidence_completeness.state is CompletenessState.COMPLETE
+
+
+def test_success_lane_without_capture_attempt_is_incomplete(tmp_path):
+    """The very same success evidence, minus the capture attempt, stays INCOMPLETE."""
+
+    build_capture_success(tmp_path / "run")
+    target = tmp_path / "run" / "evidence" / "native-execution"
+    captures = list(target.glob("*.native-capture-attempt.json"))
+    assert len(captures) == 1
+    captures[0].unlink()
+    detail = load_run_detail(tmp_path / "run")
+    assert detail.evidence_completeness.state is CompletenessState.INCOMPLETE
+    assert "native-capture-attempt.json" in detail.evidence_completeness.missing_required
+    assert detail.presentation_status is PresentationStatus.INCOMPLETE
+
+
+def test_failure_lane_without_terminal_is_incomplete(tmp_path):
+    """A non-success run still requires native-terminal.json; capture cannot stand in."""
+
+    b = build_full_records(tmp_path / "run")
+    b.capture_attempt()
+    terminal = (tmp_path / "run" / "evidence" / "native-execution")
+    for path in terminal.glob("*.native-terminal.json"):
+        path.unlink()
+    detail = load_run_detail(tmp_path / "run")
+    assert detail.canonical_classification_kind is ClassificationKind.NON_SUCCESS
+    assert detail.evidence_completeness.state is CompletenessState.INCOMPLETE
+    assert "native-terminal.json" in detail.evidence_completeness.missing_required
+
+
+def test_success_classification_contradicted_by_canary_flag_stays_in_terminal_lane(tmp_path):
+    """A SUCCESS string without a positive canary_success is ambiguous, not success."""
+
+    b = build_capture_success(tmp_path / "run")
+    b.final_status(
+        status="CHECKPOINT_CAPTURED_CANARY_SUCCESS",
+        detail="ok",
+        canary_success=False,
+        checkpoint_status="PASSED",
+        checkpoint_fingerprint="cp-fp",
+    )
+    detail = load_run_detail(tmp_path / "run")
+    assert detail.evidence_completeness.state is CompletenessState.INCOMPLETE
+    assert "native-terminal.json" in detail.evidence_completeness.missing_required
+
+
+# --- checkpoint reconstruction ------------------------------------------------
+
+
+def test_checkpoint_command_ids_come_from_verification_command_records(tmp_path):
+    """command_id lives inside the evidence record, not on the history entry."""
+
+    build_capture_success(tmp_path / "run")
+    detail = load_run_detail(tmp_path / "run")
+    assert detail.checkpoint.verification_command_ids == (CHECKPOINT_COMMAND_ID,)
+
+
+def test_fully_bound_checkpoint_evidence_is_passed(tmp_path):
+    build_capture_success(tmp_path / "run")
+    detail = load_run_detail(tmp_path / "run")
+    assert detail.checkpoint.attempted is True
+    assert detail.checkpoint.present is PresenceState.PRESENT
+    assert detail.checkpoint.result is OutcomeState.PASSED
+
+
+def test_checkpoint_passes_from_gate_plan_authority(tmp_path):
+    """The delegated gate contract is an equally valid expected-command authority."""
+
+    build_capture_success(tmp_path / "run", authority="gate_plan")
+    detail = load_run_detail(tmp_path / "run")
+    assert detail.checkpoint.result is OutcomeState.PASSED
+    assert detail.checkpoint.verification_command_ids == (CHECKPOINT_COMMAND_ID,)
+
+
+@pytest.mark.parametrize(
+    "label,kwargs",
+    [
+        ("missing_command", {"omit_records": (CHECKPOINT_COMMAND_ID,)}),
+        ("failed_status", {"record_overrides": {CHECKPOINT_COMMAND_ID: {"status": "failed"}}}),
+        ("non_zero_exit", {"record_overrides": {CHECKPOINT_COMMAND_ID: {"exit_code": 1}}}),
+        ("timed_out", {"record_overrides": {CHECKPOINT_COMMAND_ID: {"timed_out": True}}}),
+        ("output_truncated", {"record_overrides": {CHECKPOINT_COMMAND_ID: {"output_truncated": True}}}),
+        ("cleanup_unproven", {"record_overrides": {CHECKPOINT_COMMAND_ID: {"cleanup_proven": False}}}),
+        ("missing_artefact", {"omit_artifact_files": (CHECKPOINT_COMMAND_ID,)}),
+        ("hash_mismatch", {"declared_sha_overrides": {(CHECKPOINT_COMMAND_ID, "stdout"): "f" * 64}}),
+        ("argv_mismatch", {"record_overrides": {CHECKPOINT_COMMAND_ID: {"argv": ["npm.cmd", "run", "other"]}}}),
+        ("unreferenced_artefact", {"omit_references": (CHECKPOINT_COMMAND_ID,)}),
+        ("no_expected_authority", {"authority": "none"}),
+    ],
+)
+def test_unresolved_checkpoint_conditions_stay_inconsistent(tmp_path, label, kwargs):
+    build_capture_success(tmp_path / label, **kwargs)
+    detail = load_run_detail(tmp_path / label)
+    assert detail.checkpoint.attempted is True
+    assert detail.checkpoint.result is OutcomeState.INCONSISTENT, label
+    assert detail.checkpoint.result is not OutcomeState.PASSED
+
+
+def test_checkpoint_requires_final_status_agreement(tmp_path):
+    """Resolved commands still may not report PASSED against a disagreeing status."""
+
+    b = build_capture_success(tmp_path / "run")
+    b.final_status(
+        status="CHECKPOINT_CAPTURED_CANARY_SUCCESS",
+        detail="ok",
+        canary_success=True,
+        checkpoint_status="FAILED",
+        checkpoint_fingerprint="cp-fp",
+    )
+    detail = load_run_detail(tmp_path / "run")
+    assert detail.checkpoint.result is OutcomeState.INCONSISTENT
+
+
+def test_checkpoint_ignores_extra_unauthorized_command(tmp_path):
+    """A later manual command present in evidence never contributes to a pass."""
+
+    extra = {
+        "command_id": "manual-npm-test",
+        "argv": ["npm.cmd", "test"],
+        "timeout_seconds": 300,
+        "max_capture_bytes": 1048576,
+    }
+    b = RunRootBuilder(tmp_path / "run")
+    b.request().attempt_reserved().process_started()
+    b.process_observation(exit_code=0).result(exit_code=0)
+    b.eligibility(eligible=True).behavioral(exit_code=0)
+    # Evidence carries two commands; persisted authority names only one.
+    b.checkpoint(
+        commands=[
+            {"command_id": CHECKPOINT_COMMAND_ID, "argv": list(CHECKPOINT_ARGV), "timeout_seconds": 300, "max_capture_bytes": 1048576},
+            extra,
+        ],
+    )
+    b.preflight(
+        checkpoint_commands=[
+            {"command_id": CHECKPOINT_COMMAND_ID, "argv": list(CHECKPOINT_ARGV), "timeout_seconds": 300, "max_capture_bytes": 1048576}
+        ]
+    )
+    b.capture_attempt()
+    b.final_status(
+        status="CHECKPOINT_CAPTURED_CANARY_SUCCESS",
+        detail="ok",
+        canary_success=True,
+        checkpoint_status="PASSED",
+        checkpoint_fingerprint="cp-fp",
+    )
+    detail = load_run_detail(tmp_path / "run")
+    assert detail.checkpoint.result is OutcomeState.INCONSISTENT
+
+
+def test_checkpoint_absent_when_never_attempted(tmp_path):
+    b = build_full_records(tmp_path / "run")
+    b.final_status(checkpoint_fingerprint=None)
+    detail = load_run_detail(tmp_path / "run")
+    assert detail.checkpoint.attempted is False
+    assert detail.checkpoint.result is OutcomeState.ABSENT
+
+
+# --- archived real golden run (opt-in, read-only) -----------------------------
+#
+# Replays the preserved real golden run through the repaired read model. The root
+# is opt-in via an environment variable so no machine-specific path is committed
+# and the suite stays hermetic everywhere else. The run root is asserted
+# byte-identical after loading: this replay is strictly read-only.
+
+_ARCHIVED_GOLDEN_RUN_ENV = "ADMISSIBLE_GOLDEN_ARCHIVED_RUN_ROOT"
+
+
+def _archived_manifest(root) -> dict:
+    import hashlib as _hashlib
+
+    return {
+        str(path.relative_to(root)): (path.stat().st_size, _hashlib.sha256(path.read_bytes()).hexdigest())
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def test_archived_real_golden_run_reconstructs_as_repaired():
+    import os as _os
+    from pathlib import Path as _Path
+
+    from admissible.product_read_model.truth_provider import create_g1_reconstruction_provider
+
+    raw = _os.environ.get(_ARCHIVED_GOLDEN_RUN_ENV)
+    if not raw:
+        pytest.skip(f"archived golden run not opted in via {_ARCHIVED_GOLDEN_RUN_ENV}")
+    root = _Path(raw)
+    if not root.is_dir():
+        pytest.skip(f"archived golden run root absent: {root}")
+
+    before = _archived_manifest(root)
+    detail = load_run_detail(root, truth_provider=create_g1_reconstruction_provider())
+
+    # Authoritative G1 reconstruction is unchanged by this repair.
+    assert detail.product_verdict.verdict is ProductVerdict.ADMITTED_VERIFIED
+    assert detail.product_verdict.truth_status is TruthStatus.AUTHORITATIVE
+    assert detail.product_verdict.source is VerdictSource.AUTHORITATIVE_RECONSTRUCTION
+    assert detail.product_verdict.verification_mode is VerificationMode.FROZEN_BEHAVIORAL
+    assert detail.presentation_status is PresentationStatus.ADMITTED
+
+    # Repaired presentation.
+    assert detail.evidence_completeness.state is CompletenessState.COMPLETE
+    assert detail.evidence_completeness.missing_required == ()
+    assert detail.checkpoint.result is OutcomeState.PASSED
+    assert detail.checkpoint.verification_command_ids == ("npm-test",)
+    assert detail.behavioral.result is OutcomeState.PASSED
+    assert detail.material.result is OutcomeState.PASSED
+
+    # The success lane requires the capture attempt and has no terminal record.
+    assert "native-capture-attempt.json" in detail.evidence_completeness.present_records
+    assert "native-terminal.json" in detail.evidence_completeness.absent_records
+    native = root / "evidence" / "native-execution"
+    assert list(native.glob("*.native-terminal.json")) == []
+    assert len(list(native.glob("*.native-capture-attempt.json"))) == 1
+
+    assert _archived_manifest(root) == before

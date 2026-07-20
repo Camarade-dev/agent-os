@@ -478,10 +478,290 @@ async function run410TerminalOwnership() {
   }
 }
 
+// --- long-run observation -----------------------------------------------------
+//
+// These scenarios drive the virtual clock far past the old 120-attempt bound and
+// past the first real golden run's 396-second duration. The canonical preparation
+// payload is supplied per scenario so the derived observation budget is an
+// input to the test, never a constant copied from production.
+
+function goldenAuthority(overrides = {}) {
+  const payload = {
+    schema_version: "admissible_native_canary_authorization_v4",
+    payload_fingerprint: "c".repeat(64),
+    run_id: "run-long-1",
+    session_id: "session-long-1",
+    selected_model: "auto",
+    timeout_seconds: 1800,
+    mission_profile: {
+      profile_id: "profile-long-1",
+      timeout_seconds: 1800,
+      checkpoint_commands: [
+        { command_id: "npm-test", argv: ["npm.cmd", "test"], timeout_seconds: 300, max_capture_bytes: 1048576 },
+      ],
+      verification: { mode: "FROZEN_BEHAVIORAL", verifier_timeout_seconds: 120, verifier_output_limit_bytes: 524288 },
+    },
+  };
+  return Object.assign(payload, overrides);
+}
+
+function installAuthorityFetch(canonicalPayload) {
+  let poll = 0;
+  fetchImpl = async (url, options = {}) => {
+    const method = (options.method || "GET").toUpperCase();
+    fetchLog.push({ url, method, headers: { ...(options.headers || {}) } });
+    if (options.signal && options.signal.aborted) { const err = new Error("Aborted"); err.name = "AbortError"; throw err; }
+    if (url === "/ui/api/v1/bootstrap") {
+      return jsonResponse(200, {
+        service: "admissible-product-launcher", version: "g2.5",
+        repository_display_path: "safe-repository", required_source_head: "a".repeat(40),
+        authorization_mode: "PRECOMMITTED_DIGEST", authorization_semantics_notice: "notice",
+        owner_authorization_encoding: "latin-1", g2_ready: true, g2_api_version: "v1",
+        csrf_nonce: "c".repeat(64), supported_authoring_template_ids: ["observed_local_git_v1"],
+        visual_ui_available: false,
+      });
+    }
+    if (url === "/ui/api/v1/contracts" && method === "POST") {
+      return jsonResponse(200, {
+        contract_id: "contract-long-1", profile_fingerprint: "b".repeat(64),
+        contract_summary: { profile_id: "profile-long-1", run_id: "run-long-1", session_id: "session-long-1", gate_id: "gate-long-1", mission_id: "mission-long-1", workspace_source_kind: "REGISTERED_FIXTURE", verification_mode: "FROZEN_BEHAVIORAL", template_id: "observed_local_git_v1" },
+        generated_ids: { profile_id: "profile-long-1" }, execution_started: false,
+        authorization_mode: "PRECOMMITTED_DIGEST",
+      });
+    }
+    if (url.includes("/preparations") && method === "POST") return jsonResponse(202, { preparation_id: "preparation-long-1", state: "QUEUED" });
+    if (url.startsWith("/ui/api/v1/preparations/") && method === "GET") {
+      poll += 1;
+      const state = poll === 1 ? "RUNNING" : "READY";
+      return jsonResponse(200, {
+        preparation_id: "preparation-long-1", contract_id: "contract-long-1", state,
+        authorization_mode: "PRECOMMITTED_DIGEST", authorization_semantics_notice: "notice",
+        consumed: false, created_at: "now", updated_at: "now",
+        payload_fingerprint: state === "READY" ? "c".repeat(64) : null,
+        safe_payload_summary: state === "READY" ? { note: "summary" } : null,
+        authorization_payload: state === "READY" ? canonicalPayload : null,
+        blocked_summary: null, error_type: null,
+      });
+    }
+    return jsonResponse(404, { error: "NOT_FOUND" });
+  };
+}
+
+async function readyWithAuthority(canonicalPayload) {
+  installAuthorityFetch(canonicalPayload);
+  loadApp();
+  await waitState("COMPOSE");
+  await fillCompose("mission");
+  const g3 = windowObj.AdmissibleG3Test;
+  g3.setField("gate-objective", "objective");
+  g3.setField("completion-conditions", "complete");
+  g3.setField("commit-message", "feat: mission");
+  g3.submit("compose-form");
+  await waitState("CONTRACT_READY");
+  g3.click("prepare-button");
+  await flushTimers(30);
+  await waitState("PREPARATION_READY");
+  g3.setField("owner-phrase", "owner-secret-phrase");
+  g3.setField("owner-digest", "d".repeat(64));
+  document.getElementById("owner-phrase").type = "text";
+  fetchLog.length = 0;
+}
+
+// Long observation with a controllable control-plane state sequence. `runningTicks`
+// status reads report RUNNING before the run finally reports TERMINAL.
+function installLongRunFetch({ runningTicks, terminate = true, resultBody = null }) {
+  let statusIndex = 0;
+  let inFlight = 0;
+  let maxInFlight = 0;
+  fetchImpl = async (url, options = {}) => {
+    const method = (options.method || "GET").toUpperCase();
+    fetchLog.push({ url, method, headers: { ...(options.headers || {}) } });
+    if (options.signal && options.signal.aborted) { const err = new Error("Aborted"); err.name = "AbortError"; throw err; }
+    inFlight += 1; maxInFlight = Math.max(maxInFlight, inFlight);
+    try {
+      if (url === "/ui/api/v1/runs" && method === "POST") return jsonResponse(202, { control_run_id: "control-long-1", control_state: "QUEUED" });
+      if (url.endsWith("/result")) return jsonResponse(200, resultBody || resultFixture());
+      if (/\/ui\/api\/v1\/runs\/[^/]+$/.test(url)) {
+        statusIndex += 1;
+        const running = !terminate || statusIndex <= runningTicks;
+        return jsonResponse(200, {
+          control_run_id: "control-long-1",
+          control_state: running ? "RUNNING" : "TERMINAL",
+          authoritative_session_id: "session-long-1",
+          started_at: "2026-07-20T10:00:00Z",
+          ended_at: running ? null : "2026-07-20T10:06:36Z",
+          application_return_code: running ? null : 0,
+          start_error_type: null,
+          terminal_evidence: running ? null : "RUN_ROOT_PRESENT",
+        });
+      }
+      return jsonResponse(404, { error: "NOT_FOUND" });
+    } finally { inFlight -= 1; }
+  };
+  return {
+    get maxInFlight() { return maxInFlight; },
+    get statusReads() { return statusIndex; },
+  };
+}
+
+function ownerAuthHeadersOnReads() {
+  return fetchLog.filter(entry => entry.method === "GET").filter(entry =>
+    Object.keys(entry.headers || {}).some(key => key.toLowerCase().includes("owner-authorization"))
+  ).length;
+}
+
+// A virtual run that stays RUNNING well past 120 polls and past 396 seconds,
+// then reaches TERMINAL and renders its authoritative result.
+async function runLongObservation() {
+  await readyWithAuthority(goldenAuthority());
+  const RUNNING_TICKS = 600;   // 600 * 750 ms = 450 s of virtual time
+  const tracker = installLongRunFetch({ runningTicks: RUNNING_TICKS });
+  windowObj.AdmissibleG3Test.submit("authorize-form"); await settle();
+  const accepted = windowObj.AdmissibleG4Test.snapshot();
+  const clockAtStart = nowMs;
+  await flushTimers(RUNNING_TICKS + 40); await settle();
+  const midway = windowObj.AdmissibleG4Test.snapshot();
+  await flushTimers(40); await settle();
+  const final = windowObj.AdmissibleG4Test.snapshot();
+  const g3 = windowObj.AdmissibleG3Test.snapshot();
+  return {
+    budgetMs: accepted.observationBudgetMs,
+    ceilingMs: accepted.observationCeilingMs,
+    maxObservationAttempts: accepted.maxObservationAttempts,
+    preparationClearedAt202: accepted.hasPreparation === false,
+    statusAttempts: final.statusAttempts,
+    midwayStatusAttempts: midway.statusAttempts,
+    virtualElapsedMs: nowMs - clockAtStart,
+    state: final.state,
+    resultResolved: final.resultResolved,
+    resultText: document.getElementById("result-view").textContent,
+    classificationText: document.getElementById("result-classification").textContent,
+    errorText: document.getElementById("status-area").textContent,
+    maxInFlight: tracker.maxInFlight,
+    statusReads: tracker.statusReads,
+    ownerAuthHeadersOnReads: ownerAuthHeadersOnReads(),
+    secretsEmpty: g3.phraseValue === "" && g3.digestValue === "",
+    phraseType: g3.phraseType,
+    storageEmpty: Object.keys(storage.local).length === 0 && Object.keys(storage.session).length === 0,
+    hasTimer: final.hasTimer,
+    hasAbortOwner: final.hasAbortOwner,
+  };
+}
+
+// A run that never terminates must stop exactly at the derived deadline.
+async function runDeadlineStop() {
+  // No mission profile: budget is native timeout + finalization margin only.
+  await readyWithAuthority(goldenAuthority({ timeout_seconds: 60, mission_profile: undefined }));
+  const tracker = installLongRunFetch({ runningTicks: 0, terminate: false });
+  windowObj.AdmissibleG3Test.submit("authorize-form"); await settle();
+  const accepted = windowObj.AdmissibleG4Test.snapshot();
+  const expectedTicks = Math.ceil(accepted.observationBudgetMs / 750) + 50;
+  const clockAtStart = nowMs;
+  await flushTimers(expectedTicks); await settle();
+  const final = windowObj.AdmissibleG4Test.snapshot();
+  const requestsAtStop = fetchLog.length;
+  await flushTimers(60); await settle();
+  return {
+    budgetMs: accepted.observationBudgetMs,
+    deadlineAt: accepted.observationDeadlineAt,
+    statusAttempts: final.statusAttempts,
+    maxObservationAttempts: accepted.maxObservationAttempts,
+    virtualElapsedMs: nowMs - clockAtStart,
+    state: final.state,
+    errorText: document.getElementById("status-area").textContent,
+    resultResolved: final.resultResolved,
+    resultClassification: document.getElementById("result-classification").textContent,
+    hasTimer: final.hasTimer,
+    hasAbortOwner: final.hasAbortOwner,
+    stoppedIssuingRequests: fetchLog.length === requestsAtStop,
+    maxInFlight: tracker.maxInFlight,
+  };
+}
+
+// A backward-moving wall clock can never satisfy the deadline. The independent
+// attempt-count backstop must still terminate observation.
+async function runBackwardClock() {
+  await readyWithAuthority(goldenAuthority());
+  const tracker = installLongRunFetch({ runningTicks: 0, terminate: false });
+  const RealDate = context.Date;
+  let backward = 1000000000;
+  // Timers still advance (nowMs), but every Date.now() reading moves backwards.
+  context.Date = class BackwardDate extends Date { static now() { backward -= 1000; return backward; } };
+  try {
+    windowObj.AdmissibleG3Test.submit("authorize-form"); await settle();
+    const accepted = windowObj.AdmissibleG4Test.snapshot();
+    await flushTimers(accepted.maxObservationAttempts + 200); await settle();
+    const final = windowObj.AdmissibleG4Test.snapshot();
+    const requestsAtStop = fetchLog.length;
+    await flushTimers(60); await settle();
+    return {
+      maxObservationAttempts: accepted.maxObservationAttempts,
+      statusAttempts: final.statusAttempts,
+      state: final.state,
+      errorText: document.getElementById("status-area").textContent,
+      resultResolved: final.resultResolved,
+      resultClassification: document.getElementById("result-classification").textContent,
+      hasTimer: final.hasTimer,
+      hasAbortOwner: final.hasAbortOwner,
+      stoppedIssuingRequests: fetchLog.length === requestsAtStop,
+      maxInFlight: tracker.maxInFlight,
+    };
+  } finally {
+    context.Date = RealDate;
+  }
+}
+
+// Reset / abort / epoch invalidation must remain effective deep into a long run.
+async function runLongResetInvalidation() {
+  await readyWithAuthority(goldenAuthority());
+  let statusResolve = null;
+  let statusReads = 0;
+  fetchImpl = (url, options = {}) => {
+    const method = (options.method || "GET").toUpperCase();
+    fetchLog.push({ url, method, headers: { ...(options.headers || {}) } });
+    if (url === "/ui/api/v1/runs" && method === "POST") return Promise.resolve(jsonResponse(202, { control_run_id: "control-long-reset", control_state: "QUEUED" }));
+    if (/\/ui\/api\/v1\/runs\/[^/]+$/.test(url)) {
+      statusReads += 1;
+      if (statusReads > 200) return new Promise(resolve => { statusResolve = resolve; });
+      return Promise.resolve(jsonResponse(200, { control_run_id: "control-long-reset", control_state: "RUNNING", authoritative_session_id: "session-long-1" }));
+    }
+    return Promise.resolve(jsonResponse(404, { error: "NOT_FOUND" }));
+  };
+  windowObj.AdmissibleG3Test.submit("authorize-form"); await settle();
+  await flushTimers(240); await settle();
+  const deep = windowObj.AdmissibleG4Test.snapshot();
+  const timersBeforeReset = timers.size;
+  windowObj.AdmissibleG3Test.reset(); await settle();
+  const afterReset = windowObj.AdmissibleG4Test.snapshot();
+  const requestsAtReset = fetchLog.length;
+  // A stale in-flight status response landing after reset must change nothing.
+  if (statusResolve) statusResolve(jsonResponse(200, { control_run_id: "control-long-reset", control_state: "TERMINAL", terminal_evidence: "RUN_ROOT_PRESENT" }));
+  await settle();
+  await flushTimers(60); await settle();
+  const settled = windowObj.AdmissibleG4Test.snapshot();
+  return {
+    deepStatusAttempts: deep.statusAttempts,
+    timersBeforeReset,
+    stateAfterReset: afterReset.state,
+    abortOwnerCleared: afterReset.hasAbortOwner === false,
+    timerCleared: afterReset.hasTimer === false,
+    budgetCleared: afterReset.observationBudgetMs === 0 && afterReset.observationDeadlineAt === null,
+    noPendingTimers: timers.size === 0,
+    staleIgnoredState: settled.state,
+    resultClassification: document.getElementById("result-classification").textContent,
+    noRequestsAfterReset: fetchLog.length === requestsAtReset,
+    statusAttemptsAfterReset: settled.statusAttempts,
+  };
+}
+
 (async () => {
   try {
     let out;
     if (scenario === "g4_lifecycle") out = await runLifecycle();
+    else if (scenario === "g4_long_observation") out = await runLongObservation();
+    else if (scenario === "g4_deadline_stop") out = await runDeadlineStop();
+    else if (scenario === "g4_backward_clock") out = await runBackwardClock();
+    else if (scenario === "g4_long_reset") out = await runLongResetInvalidation();
     else if (scenario === "g4_start_failed") out = await runStartFailed();
     else if (scenario.startsWith("g4_variant:")) out = await runVariant(scenario.split(":")[1]);
     else if (scenario === "g4_malicious") out = await runMalicious();
@@ -528,14 +808,14 @@ def _build_node_harness() -> str:
 NODE_HARNESS = _build_node_harness()
 
 
-def _run_node(tmp_path: Path, scenario: str, js_path: Path | None = None) -> dict:
+def _run_node(tmp_path: Path, scenario: str, js_path: Path | None = None, timeout: int = 25) -> dict:
     harness = tmp_path / f"g4_harness_{re.sub(r'[^A-Za-z0-9_]+', '_', scenario)}.js"
     harness.write_text(NODE_HARNESS, encoding="utf-8")
     completed = subprocess.run(
         [NODE, str(harness), scenario, str(js_path or JS_PATH)],
         capture_output=True,
         text=True,
-        timeout=25,
+        timeout=timeout,
         cwd=str(tmp_path),
         env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
     )
@@ -585,7 +865,13 @@ def test_explicit_g4_state_machine_routes_and_polling_law():
         "RUN_START_FAILED", "RUN_REQUEST_ERROR",
     ):
         assert state in JS
-    assert "POLL_INTERVAL_MS = 750" in JS and "MAX_STATUS_ATTEMPTS = 120" in JS
+    assert "POLL_INTERVAL_MS = 750" in JS
+    # The primary status bound is a derived wall-clock deadline, not the poll
+    # interval multiplied by a fixed attempt count. An interval-coupled bound
+    # stops observing an authorized long run long before it can finish.
+    assert "MAX_STATUS_ATTEMPTS" not in JS
+    assert "observationDeadlineAt" in JS and "derivedObservationBudgetMs" in JS
+    assert "MAX_OBSERVATION_ATTEMPTS" in JS and "OBSERVATION_CEILING_MS" in JS
     assert "MAX_RESULT_ATTEMPTS = 120" in JS and "flowEpoch" in JS and "AbortController" in JS
     assert "pagehide" in JS and "beforeunload" in JS and "requestInFlight" in JS
     assert "product_summary" not in JS.replace('"product_summary"', "")
@@ -1159,3 +1445,112 @@ def test_result_summary_and_notice_declare_explicit_containment():
         assert "word-break:break-word" in rule, f"{selector} lost word-break containment"
         assert "text-overflow" not in rule and "white-space:nowrap" not in rule
         assert "width:" not in rule.replace("max-width:100%", "").replace("min-width:0", "")
+
+
+# --- long-run observation -----------------------------------------------------
+#
+# The first real golden run took 396 seconds. The previous client bound
+# (120 attempts x 750 ms) stopped observing after roughly 90 seconds, so a
+# successful authorized run could never render its own result. The bound is now a
+# wall-clock deadline derived from the launcher-authored canonical preparation
+# payload, with an independent attempt-count backstop.
+
+FIRST_REAL_GOLDEN_RUN_MS = 396_000
+OLD_INTERVAL_COUPLED_ATTEMPTS = 120
+
+
+def test_long_run_stays_observed_past_the_old_bound_and_renders_result(tmp_path):
+    out = _run_node(tmp_path, "g4_long_observation", timeout=60)
+
+    # Budget derived from the canonical payload: 1800 native + 300 checkpoint
+    # + 120 verifier + 300 finalization margin.
+    assert out["budgetMs"] == (1800 + 300 + 120 + 300) * 1000
+    assert out["budgetMs"] <= out["ceilingMs"]
+    # The ceiling must cover the launcher's maximum native timeout plus the rest.
+    assert out["ceilingMs"] >= (3600 + 300 + 120 + 300) * 1000
+
+    # Observation survived well past the old bound and past the real run duration.
+    assert out["statusAttempts"] > OLD_INTERVAL_COUPLED_ATTEMPTS
+    assert out["statusReads"] > OLD_INTERVAL_COUPLED_ATTEMPTS
+    assert out["virtualElapsedMs"] > FIRST_REAL_GOLDEN_RUN_MS
+
+    # ... and then reached TERMINAL and rendered the authoritative result.
+    assert out["state"] == "RUN_RESULT_READY"
+    assert out["resultResolved"] is True
+    assert "ADMITTED_VERIFIED" in out["classificationText"]
+    assert out["errorText"] == ""
+    assert out["hasTimer"] is False and out["hasAbortOwner"] is False
+
+
+def test_long_observation_preserves_single_flight(tmp_path):
+    out = _run_node(tmp_path, "g4_long_observation", timeout=60)
+    assert out["maxInFlight"] == 1
+    assert out["statusAttempts"] > OLD_INTERVAL_COUPLED_ATTEMPTS
+
+
+def test_long_observation_reads_never_carry_owner_authorization(tmp_path):
+    out = _run_node(tmp_path, "g4_long_observation", timeout=60)
+    assert out["ownerAuthHeadersOnReads"] == 0
+
+
+def test_secrets_and_payload_custody_cleared_after_202(tmp_path):
+    out = _run_node(tmp_path, "g4_long_observation", timeout=60)
+    assert out["preparationClearedAt202"] is True
+    assert out["secretsEmpty"] is True
+    assert out["phraseType"] == "password"
+    assert out["storageEmpty"] is True
+    # Only the numeric budget survives the preparation custody release.
+    assert isinstance(out["budgetMs"], int) and out["budgetMs"] > 0
+
+
+def test_run_that_never_terminates_stops_at_the_derived_deadline(tmp_path):
+    out = _run_node(tmp_path, "g4_deadline_stop", timeout=60)
+
+    # 60 s native timeout + 300 s finalization margin, no profile bounds.
+    assert out["budgetMs"] == (60 + 300) * 1000
+    assert out["deadlineAt"] is not None
+
+    assert out["state"] == "RUN_REQUEST_ERROR"
+    assert "OBSERVATION_LIMIT_REACHED" in out["errorText"]
+    # Bounded by the deadline, not by the attempt backstop.
+    assert out["statusAttempts"] < out["maxObservationAttempts"]
+    assert out["statusAttempts"] > OLD_INTERVAL_COUPLED_ATTEMPTS
+    assert out["virtualElapsedMs"] >= out["budgetMs"]
+
+    # No verdict was invented and observation genuinely stopped.
+    assert out["resultResolved"] is False
+    assert out["resultClassification"] == ""
+    assert out["hasTimer"] is False and out["hasAbortOwner"] is False
+    assert out["stoppedIssuingRequests"] is True
+    assert out["maxInFlight"] == 1
+
+
+def test_backward_moving_clock_still_terminates_through_the_count_backstop(tmp_path):
+    out = _run_node(tmp_path, "g4_backward_clock", timeout=180)
+
+    # The deadline can never be reached when every clock reading moves backwards,
+    # so the independent attempt-count backstop is what terminates observation.
+    assert out["statusAttempts"] == out["maxObservationAttempts"]
+    assert out["state"] == "RUN_REQUEST_ERROR"
+    assert "OBSERVATION_LIMIT_REACHED" in out["errorText"]
+    assert out["resultResolved"] is False
+    assert out["resultClassification"] == ""
+    assert out["hasTimer"] is False and out["hasAbortOwner"] is False
+    assert out["stoppedIssuingRequests"] is True
+    assert out["maxInFlight"] == 1
+
+
+def test_reset_and_epoch_invalidation_remain_effective_after_many_ticks(tmp_path):
+    out = _run_node(tmp_path, "g4_long_reset", timeout=60)
+
+    assert out["deepStatusAttempts"] > OLD_INTERVAL_COUPLED_ATTEMPTS
+    assert out["timersBeforeReset"] >= 0
+    assert out["stateAfterReset"] == "COMPOSE"
+    assert out["abortOwnerCleared"] is True
+    assert out["timerCleared"] is True
+    assert out["budgetCleared"] is True
+    assert out["noPendingTimers"] is True
+    # A stale status response landing after reset changes nothing.
+    assert out["staleIgnoredState"] == "COMPOSE"
+    assert out["resultClassification"] == ""
+    assert out["noRequestsAfterReset"] is True

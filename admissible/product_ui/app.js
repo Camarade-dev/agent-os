@@ -37,10 +37,34 @@
     state:STATES.BOOTSTRAP_LOADING, bootstrap:null, contract:null, preparation:null, run:null, result:null,
     pollController:null, pollTimer:null, pollCount:0, statusAttempts:0, resultAttempts:0,
     requestInFlight:false, resultResolved:false, observationPhase:null,
-    resumeState:null, prepareInFlight:false, flowEpoch:0
+    resumeState:null, prepareInFlight:false, flowEpoch:0,
+    observationBudgetMs:0, observationDeadlineAt:null
   };
   const POLL_INTERVAL_MS = 750;
-  const MAX_STATUS_ATTEMPTS = 120;
+  // Observation is bounded by a wall-clock deadline derived from the canonical
+  // preparation authority, NOT by a poll count multiplied by the poll interval.
+  // The interval is a request-rate choice; it must never decide how long an
+  // authorized run may take.
+  //
+  // The ceiling below is a fixed client-side clamp that must cover the largest
+  // run the launcher can authorize: its maximum native timeout, plus the
+  // checkpoint commands, plus the behavioral verifier, plus a finalization
+  // margin for evidence persistence and authoritative result assembly.
+  const LAUNCHER_MAX_NATIVE_TIMEOUT_SECONDS = 3600;
+  const MAX_CHECKPOINT_ALLOWANCE_SECONDS = 1800;   // protocol bound: 300 s per command
+  const MAX_VERIFIER_TIMEOUT_SECONDS = 600;        // protocol bound on the frozen verifier
+  const FINALIZATION_MARGIN_SECONDS = 300;
+  const OBSERVATION_CEILING_MS = (
+    LAUNCHER_MAX_NATIVE_TIMEOUT_SECONDS + MAX_CHECKPOINT_ALLOWANCE_SECONDS +
+    MAX_VERIFIER_TIMEOUT_SECONDS + FINALIZATION_MARGIN_SECONDS
+  ) * 1000;
+  const MIN_OBSERVATION_MS = 60000;
+  // Independent backstop. A wall clock that jumps backwards can defer the
+  // deadline indefinitely, so observation is additionally bounded by attempt
+  // count alone. Sized above the ceiling so it never truncates a run that the
+  // deadline would still allow.
+  const MAX_OBSERVATION_ATTEMPTS = Math.ceil(OBSERVATION_CEILING_MS / POLL_INTERVAL_MS) + 120;
+  const MAX_FIRST_STATUS_DEFERRALS = 4;
   const MAX_RESULT_ATTEMPTS = 120;
   const FORBIDDEN_RESULT_FIELDS = new Set(["run_root","diagnostics"]);
   const byId = id => document.getElementById(id);
@@ -160,7 +184,7 @@
   function stopPolling(){
     if(ui.pollTimer!==null){clearTimeout(ui.pollTimer);ui.pollTimer=null;}
     if(ui.pollController){ui.pollController.abort();ui.pollController=null;}
-    ui.pollCount=0;ui.requestInFlight=false;ui.observationPhase=null;
+    ui.pollCount=0;ui.requestInFlight=false;ui.observationPhase=null;ui.observationDeadlineAt=null;
   }
   function preparationCopy(state,body){
     const copy=byId("preparation-copy"),retry=byId("retry-preparation");retry.hidden=true;
@@ -336,15 +360,46 @@
     stopPolling();if(ui.state!==STATES.RUN_REQUEST_ERROR)setState(STATES.RUN_REQUEST_ERROR);renderRun(ui.run&&ui.run.status?ui.run.status:{},STATES.RUN_REQUEST_ERROR);showError(code,message,STATES.RUN_REQUEST_ERROR);
   }
   function scheduleObservation(tick){ui.pollTimer=setTimeout(tick,POLL_INTERVAL_MS);}
+  function boundedSeconds(value,maximum){
+    return Number.isInteger(value)&&value>0&&value<=maximum?value:0;
+  }
+  function derivedObservationBudgetMs(payload){
+    // Derived ONLY from the launcher-authored canonical preparation payload.
+    // Browser-authored compose fields are never consulted: the owner's typed
+    // timeout is an authoring request, not the authority the launcher accepted.
+    if(!isObject(payload))return OBSERVATION_CEILING_MS;
+    const profile=isObject(payload.mission_profile)?payload.mission_profile:{};
+    const native=boundedSeconds(payload.timeout_seconds,LAUNCHER_MAX_NATIVE_TIMEOUT_SECONDS)
+      ||boundedSeconds(profile.timeout_seconds,LAUNCHER_MAX_NATIVE_TIMEOUT_SECONDS)
+      ||LAUNCHER_MAX_NATIVE_TIMEOUT_SECONDS;
+    let checkpoint=0;
+    const commands=Array.isArray(profile.checkpoint_commands)?profile.checkpoint_commands:[];
+    commands.forEach(command=>{if(isObject(command))checkpoint+=boundedSeconds(command.timeout_seconds,MAX_CHECKPOINT_ALLOWANCE_SECONDS);});
+    const verification=isObject(profile.verification)?profile.verification:{};
+    const verifier=boundedSeconds(verification.verifier_timeout_seconds,MAX_VERIFIER_TIMEOUT_SECONDS);
+    const seconds=native+checkpoint+verifier+FINALIZATION_MARGIN_SECONDS;
+    // Clamp to the fixed safe client ceiling; never unbounded, never below the floor.
+    return Math.min(OBSERVATION_CEILING_MS,Math.max(MIN_OBSERVATION_MS,seconds*1000));
+  }
   function startRunObservation(){
     if(ui.pollController||!ui.run||ui.resultResolved)return;
     ui.pollController=new AbortController();ui.statusAttempts=0;ui.resultAttempts=0;ui.observationPhase="status";
     const epoch=ui.flowEpoch,controller=ui.pollController,firstStatusAt=Date.now()+POLL_INTERVAL_MS;
+    // Captured once, when observation starts. The budget is the numeric value
+    // retained from the canonical preparation authority before HTTP 202.
+    const budgetMs=Number.isFinite(ui.observationBudgetMs)&&ui.observationBudgetMs>0?ui.observationBudgetMs:OBSERVATION_CEILING_MS;
+    const observationDeadlineAt=Date.now()+budgetMs;
+    ui.observationDeadlineAt=observationDeadlineAt;
+    let firstStatusDeferrals=0;
     const active=()=>epoch===ui.flowEpoch&&ui.pollController===controller&&!controller.signal.aborted&&!ui.resultResolved;
     const tick=async()=>{
       ui.pollTimer=null;if(!active()||ui.requestInFlight)return;
-      if(ui.observationPhase==="status"&&ui.statusAttempts===0&&Date.now()<firstStatusAt){ui.pollTimer=setTimeout(tick,Math.max(1,firstStatusAt-Date.now()));return;}
-      if(ui.observationPhase==="status"&&ui.statusAttempts>=MAX_STATUS_ATTEMPTS){observationError("OBSERVATION_LIMIT_REACHED","Run observation stopped after 120 status attempts. No product verdict was inferred.");return;}
+      // The pre-first-attempt guard is also clock-coupled, so it carries its own
+      // count bound: a backward-moving clock must not defer the first status read
+      // forever, and the re-arm delay stays clamped to one poll interval.
+      if(ui.observationPhase==="status"&&ui.statusAttempts===0&&firstStatusDeferrals<MAX_FIRST_STATUS_DEFERRALS&&Date.now()<firstStatusAt){firstStatusDeferrals+=1;ui.pollTimer=setTimeout(tick,Math.max(1,Math.min(POLL_INTERVAL_MS,firstStatusAt-Date.now())));return;}
+      if(ui.observationPhase==="status"&&ui.statusAttempts>=MAX_OBSERVATION_ATTEMPTS){observationError("OBSERVATION_LIMIT_REACHED","Run observation stopped at its bounded attempt backstop. No product verdict was inferred.");return;}
+      if(ui.observationPhase==="status"&&Date.now()>=observationDeadlineAt){observationError("OBSERVATION_LIMIT_REACHED","Run observation stopped at its bounded deadline. No product verdict was inferred.");return;}
       if(ui.observationPhase==="result"&&ui.resultAttempts>=MAX_RESULT_ATTEMPTS){observationError("RESULT_OBSERVATION_LIMIT_REACHED","Authoritative result retrieval stopped after its bounded retry limit. No product verdict was inferred.");return;}
       ui.requestInFlight=true;
       try{
@@ -381,6 +436,9 @@
     try{
       const {status,body}=await api("/ui/api/v1/runs",{method:"POST",headers,body:JSON.stringify({contract_id:ui.contract.response.contract_id,preparation_id:ui.preparation.id})});if(status!==202){const err=new Error("LAUNCH_NOT_ACCEPTED");err.status=status;err.body=body;throw err;}
       stopPolling();headers["X-Admissible-Owner-Authorization"]="";if(headers["X-Admissible-Owner-Authorization-Digest"])headers["X-Admissible-Owner-Authorization-Digest"]="";clearSecrets();
+      // Reduce the canonical preparation authority to a single number BEFORE the
+      // payload custody is released, so nothing but the numeric budget survives.
+      ui.observationBudgetMs=derivedObservationBudgetMs(ui.preparation&&ui.preparation.status?ui.preparation.status.authorization_payload:null);
       ui.contract=null;ui.preparation=null;ui.run={controlRunId:body.control_run_id,initialControlState:body.control_state,status:{control_state:body.control_state}};ui.result=null;ui.resultResolved=false;
       renderAccepted(body);setState(STATES.RUN_ACCEPTED);startRunObservation();
     }catch(error){const mapped=boundedMessage(error.status,error.body);setState(STATES.PREPARATION_READY);showError(mapped.code,mapped.message,STATES.PREPARATION_READY);}
@@ -388,7 +446,7 @@
   }
   function reset(){
     if(ui.state===STATES.LAUNCHING)return;
-    ui.flowEpoch+=1;stopPolling();clearSecrets();clearError();ui.contract=null;ui.preparation=null;ui.run=null;ui.result=null;ui.resultResolved=false;ui.statusAttempts=0;ui.resultAttempts=0;ui.prepareInFlight=false;
+    ui.flowEpoch+=1;stopPolling();clearSecrets();clearError();ui.contract=null;ui.preparation=null;ui.run=null;ui.result=null;ui.resultResolved=false;ui.statusAttempts=0;ui.resultAttempts=0;ui.prepareInFlight=false;ui.observationBudgetMs=0;ui.observationDeadlineAt=null;
     if(ui.state!==STATES.COMPOSE)setState(STATES.COMPOSE);byId("mission-text").focus();
   }
   function legacyState(){return ui.state===STATES.RUN_ACCEPTED?STATES.LAUNCH_ACCEPTED:ui.state;}
@@ -405,7 +463,7 @@
       intentFacts:byId("intent-facts").textContent,contractFacts:byId("contract-facts").textContent
     };
   }
-  function g4Snapshot(){return Object.freeze({state:ui.state,controlRunId:ui.run?ui.run.controlRunId:null,initialControlState:ui.run?ui.run.initialControlState:null,controlState:ui.run&&ui.run.status?ui.run.status.control_state:null,statusAttempts:ui.statusAttempts,resultAttempts:ui.resultAttempts,requestInFlight:ui.requestInFlight,hasAbortOwner:!!ui.pollController,hasTimer:ui.pollTimer!==null,resultResolved:ui.resultResolved,runText:byId("accepted-facts")?byId("accepted-facts").textContent:"",resultText:byId("result-view")?byId("result-view").textContent:"",noResultText:byId("no-result-view")?byId("no-result-view").textContent:"",errorText:byId("status-area")?byId("status-area").textContent:""});}
+  function g4Snapshot(){return Object.freeze({state:ui.state,controlRunId:ui.run?ui.run.controlRunId:null,initialControlState:ui.run?ui.run.initialControlState:null,controlState:ui.run&&ui.run.status?ui.run.status.control_state:null,statusAttempts:ui.statusAttempts,resultAttempts:ui.resultAttempts,requestInFlight:ui.requestInFlight,hasAbortOwner:!!ui.pollController,hasTimer:ui.pollTimer!==null,resultResolved:ui.resultResolved,observationBudgetMs:ui.observationBudgetMs,observationDeadlineAt:ui.observationDeadlineAt,maxObservationAttempts:MAX_OBSERVATION_ATTEMPTS,observationCeilingMs:OBSERVATION_CEILING_MS,hasPreparation:ui.preparation!==null,runText:byId("accepted-facts")?byId("accepted-facts").textContent:"",resultText:byId("result-view")?byId("result-view").textContent:"",noResultText:byId("no-result-view")?byId("no-result-view").textContent:"",errorText:byId("status-area")?byId("status-area").textContent:""});}
 
   byId("compose-form").addEventListener("submit",author);byId("authorize-form").addEventListener("submit",launch);byId("prepare-button").addEventListener("click",prepare);byId("retry-preparation").addEventListener("click",prepare);byId("back-to-compose").addEventListener("click",reset);document.querySelectorAll(".reset-flow").forEach(button=>button.addEventListener("click",reset));byId("add-material").addEventListener("click",()=>addMaterial());byId("retry-bootstrap").addEventListener("click",bootstrap);byId("toggle-phrase").addEventListener("click",()=>{const input=byId("owner-phrase"),show=input.type==="password";input.type=show?"text":"password";byId("toggle-phrase").textContent=show?"Hide":"Show";byId("toggle-phrase").setAttribute("aria-pressed",String(show));});window.addEventListener("pagehide",stopPolling,{once:true});window.addEventListener("beforeunload",stopPolling,{once:true});
   addMaterial("README.md");

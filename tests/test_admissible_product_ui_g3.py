@@ -2046,12 +2046,28 @@ def test_executed_client_stale_response_and_polling_cancellation(tmp_path):
     assert out["teardownClearedTimers"] is True
 
 
-def test_executed_client_no_post_202_read(tmp_path):
+def test_executed_client_post_202_begins_bounded_observation(tmp_path):
+    """After HTTP 202 the client begins bounded observation of the control run.
+
+    The pre-G4 law asserted here was "no reads at all after 202", and it held
+    only because this harness's fake timer clock advances instantly while the
+    app's first-tick guard consulted the real wall clock. Allowing 900 ms of real
+    wall-clock time at base commit fe980fe7 produced exactly this same status
+    read, so the old assertion was wall-clock-dependent rather than a real law.
+
+    G4 observes an authorized run until its bounded terminal result, so one
+    control-run status read is correct. What must still hold: the launch POST is
+    the only write, no authoritative result is read before a terminal control
+    state, and no run collection is ever listed.
+    """
+
     out = _run_node_scenario(tmp_path, "no_post_202")
-    assert out["state"] == "LAUNCH_ACCEPTED"
-    assert out["onlyLaunchPost"] is True
-    assert out["noRunIdRead"] and out["noResultRead"] and out["noRunsList"]
+    assert [u for u in out["fetchAfterLaunch"] if u == "/ui/api/v1/runs"] == ["/ui/api/v1/runs"]
+    assert out["noResultRead"] and out["noRunsList"]
     assert out["acceptedRendered"] is True
+    assert [
+        u for u in out["fetchAfterLaunch"] if re.fullmatch(r"/ui/api/v1/runs/[^/]+", u)
+    ] == ["/ui/api/v1/runs/control-1"]
 
 
 def test_executed_client_duplicate_prepare_deduped(tmp_path):
