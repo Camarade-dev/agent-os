@@ -20,18 +20,32 @@ import pytest
 
 from admissible.delegated_gate.canonical import canonical_bytes
 from admissible.delegated_gate.mission_profile import (
+    WORKFLOW_RECOVERY_COMPLETION_CONDITIONS_TEXT,
+    WORKFLOW_RECOVERY_V2_MISSION_TEXT,
+    WORKFLOW_RECOVERY_VERIFIER_SOURCE,
     create_native_mission_profile,
     load_native_mission_profile_document,
 )
 from admissible.delegated_gate.native_canary import NativeCanaryAuthorizationPayloadV4
 from admissible.product_launcher.authoring import (
     AuthoringError,
+    GOLDEN_TEMPLATE_RECOMMENDED_TIMEOUT_SECONDS,
+    GOLDEN_WORKFLOW_COMMIT_MESSAGE,
+    GOLDEN_WORKFLOW_COMPLETION_CONDITIONS_TEXT,
+    GOLDEN_WORKFLOW_GATE_OBJECTIVE,
+    GOLDEN_WORKFLOW_INTEROPERABILITY_DISCLOSURE_TEXT,
+    GOLDEN_WORKFLOW_MATERIAL_PATHS,
+    GOLDEN_WORKFLOW_MISSION_TEXT,
+    GOLDEN_WORKFLOW_VERIFIER_SOURCE_SHA256,
     _write_once,
     author_runtime_contract,
 )
 from admissible.product_launcher.configuration import (
     AUTHORIZATION_MODE_INTERACTIVE,
     AUTHORIZATION_MODE_PRECOMMITTED,
+    DEFAULT_TEMPLATE_ID,
+    GOLDEN_TEMPLATE_ID,
+    SUPPORTED_TEMPLATE_IDS,
     LauncherConfiguration,
 )
 from admissible.product_launcher.launcher import ProductLauncher
@@ -1651,3 +1665,433 @@ def test_rejected_request_closes_connection_before_pipelined_follow_up(tmp_path,
 
     leftover = {t.name for t in threading.enumerate()} - before_threads
     assert not any(name.startswith("admissible-") for name in leftover), leftover
+
+
+# ---------------------------------------------------------------------------
+# Golden trusted template battery: workflow-recovery-verified-v1
+# ---------------------------------------------------------------------------
+
+GOLDEN_PINNED_VERIFIER_SHA256 = (
+    "a4e2daf9179129a7929bea5825f95f494ed601eb4a9bbbbaf6a65eb3918149e1"
+)
+
+
+def _golden_owner_input(**extra):
+    body = {
+        "mission_text": GOLDEN_WORKFLOW_MISSION_TEXT,
+        "gate_objective": GOLDEN_WORKFLOW_GATE_OBJECTIVE,
+        "completion_conditions_text": GOLDEN_WORKFLOW_COMPLETION_CONDITIONS_TEXT,
+        "required_material_paths": list(GOLDEN_WORKFLOW_MATERIAL_PATHS),
+        "commit_message": GOLDEN_WORKFLOW_COMMIT_MESSAGE,
+        "template_id": GOLDEN_TEMPLATE_ID,
+    }
+    body.update(extra)
+    return body
+
+
+def test_trusted_template_set_and_bootstrap_expose_exactly_both(tmp_path):
+    assert DEFAULT_TEMPLATE_ID == "observed-local-git-v1"
+    assert GOLDEN_TEMPLATE_ID == "workflow-recovery-verified-v1"
+    assert SUPPORTED_TEMPLATE_IDS == (DEFAULT_TEMPLATE_ID, GOLDEN_TEMPLATE_ID)
+    cfg = _cfg(tmp_path)
+    launcher = ProductLauncher(
+        cfg, id_generator=_hex_ids(110_000), browser_opener=lambda _u: None
+    )
+    try:
+        launcher.start()
+        status, _, boot, _ = _ui(launcher, "GET", "/ui/api/v1/bootstrap")
+        assert status == 200
+        assert boot["supported_authoring_template_ids"] == [
+            "observed-local-git-v1",
+            "workflow-recovery-verified-v1",
+        ]
+    finally:
+        launcher.close()
+
+
+def test_observed_template_authority_non_regression(tmp_path):
+    cfg = _cfg(tmp_path)
+    inputs = _owner_input()
+    inputs.pop("model")
+    inputs.pop("timeout_seconds")
+    authored = author_runtime_contract(
+        inputs,
+        launcher_configuration=cfg,
+        documents_directory=cfg.contract_documents_directory,
+        id_generator=lambda: "ba" * 16,
+    )
+    assert authored.contract_summary["template_id"] == DEFAULT_TEMPLATE_ID
+    loaded = load_native_mission_profile_document(authored.document_path)
+    source = loaded.effective_workspace_source
+    assert source.kind.value == "EXISTING_LOCAL_GIT_REPOSITORY"
+    assert source.local_repository_path == str(cfg.source_repository)
+    assert source.fixture_id is None and source.fixture_version is None
+    assert loaded.verification_mode.value == "OBSERVED_ONLY"
+    assert loaded.verification.disclose_complete_source is False
+    assert loaded.verifier_source is None and loaded.verifier_source_sha256 is None
+    assert [command.to_dict() for command in loaded.checkpoint_commands] == [
+        {
+            "command_id": "workspace-marker-check",
+            "argv": ["git", "status", "--porcelain"],
+            "timeout_seconds": 30,
+            "max_capture_bytes": 65_536,
+        }
+    ]
+    assert loaded.budgets == (1, 1, 0, 0, 0)
+    assert loaded.timeout_seconds == cfg.timeout_default
+    assert loaded.model == cfg.model_default
+    policy = loaded.effective_git_end_state_policy
+    assert policy.required_complete_commit_message == inputs["commit_message"]
+    assert policy.required_material_paths == ("README.md",)
+
+
+def test_golden_template_exact_authoring_and_frozen_authority(tmp_path):
+    cfg = _cfg(tmp_path, timeout_maximum=3600)
+    authored = author_runtime_contract(
+        _golden_owner_input(),
+        launcher_configuration=cfg,
+        documents_directory=cfg.contract_documents_directory,
+        id_generator=lambda: "ca" * 16,
+    )
+    assert authored.contract_summary["workspace_source_kind"] == "REGISTERED_FIXTURE"
+    assert authored.contract_summary["verification_mode"] == "FROZEN_BEHAVIORAL"
+    assert authored.contract_summary["template_id"] == GOLDEN_TEMPLATE_ID
+    loaded = load_native_mission_profile_document(authored.document_path)
+    assert loaded.schema_version == "admissible_native_mission_profile_v2"
+    source = loaded.effective_workspace_source
+    assert (source.kind.value, source.fixture_id, source.fixture_version) == (
+        "REGISTERED_FIXTURE",
+        "local-workflow-console",
+        1,
+    )
+    assert source.local_repository_path is None
+    verification = loaded.verification
+    assert verification.mode.value == "FROZEN_BEHAVIORAL"
+    assert verification.disclose_complete_source is True
+    assert verification.verifier_source == WORKFLOW_RECOVERY_VERIFIER_SOURCE
+    independent = hashlib.sha256(
+        verification.verifier_source.encode("utf-8")
+    ).hexdigest()
+    assert independent == GOLDEN_PINNED_VERIFIER_SHA256
+    assert verification.verifier_source_sha256 == GOLDEN_PINNED_VERIFIER_SHA256
+    assert GOLDEN_WORKFLOW_VERIFIER_SOURCE_SHA256 == GOLDEN_PINNED_VERIFIER_SHA256
+    assert verification.verifier_timeout_seconds == 120
+    assert verification.verifier_output_limit_bytes == 524_288
+    assert [command.to_dict() for command in loaded.checkpoint_commands] == [
+        {
+            "command_id": "npm-test",
+            "argv": ["npm.cmd", "test"],
+            "timeout_seconds": 300,
+            "max_capture_bytes": 1_048_576,
+        }
+    ]
+    assert loaded.budgets == (1, 1, 0, 0, 0)
+    policy = loaded.effective_git_end_state_policy
+    assert policy.required_commits_added == 1
+    assert policy.required_complete_commit_message == "feat: add resumable workflow execution"
+    assert policy.final_worktree_clean is True
+    assert policy.final_index_clean is True
+    assert policy.final_remotes_absent is True
+    assert policy.required_material_paths == (
+        "README.md",
+        "index.html",
+        "src/app.js",
+        "src/execution/engine.js",
+        "src/storage/run-store.js",
+        "src/ui/render.js",
+    )
+    assert loaded.mission_text == GOLDEN_WORKFLOW_MISSION_TEXT
+    assert loaded.mission_text.startswith(WORKFLOW_RECOVERY_V2_MISSION_TEXT)
+    assert loaded.mission_text.endswith(GOLDEN_WORKFLOW_INTEROPERABILITY_DISCLOSURE_TEXT)
+    assert "test/fixtures/legacy-run-state-v0.json" in loaded.mission_text
+    assert "createMemoryStorage" in loaded.mission_text
+    assert "src/storage/memory-storage.js" in loaded.mission_text
+    assert loaded.gate_objective == GOLDEN_WORKFLOW_GATE_OBJECTIVE
+    assert "verified" in loaded.gate_objective
+    assert loaded.completion_conditions_text == WORKFLOW_RECOVERY_COMPLETION_CONDITIONS_TEXT
+    assert loaded.timeout_seconds == GOLDEN_TEMPLATE_RECOMMENDED_TIMEOUT_SECONDS == 1800
+    assert loaded.model == cfg.model_default
+    assert not (cfg.run_parent / loaded.run_id).exists()
+    assert canonical_bytes(loaded.to_dict()) == Path(authored.document_path).read_bytes()
+
+
+def test_golden_owner_variable_law_and_timeout_bounds(tmp_path):
+    cfg = _cfg(tmp_path, timeout_maximum=600)
+    authored = author_runtime_contract(
+        _golden_owner_input(),
+        launcher_configuration=cfg,
+        documents_directory=cfg.contract_documents_directory,
+        id_generator=lambda: "da" * 16,
+    )
+    defaulted = load_native_mission_profile_document(authored.document_path)
+    # The recommended golden timeout stays inside the current safe limits.
+    assert defaulted.timeout_seconds == 600
+    varied = author_runtime_contract(
+        _golden_owner_input(model="cursor-fast", timeout_seconds=300),
+        launcher_configuration=cfg,
+        documents_directory=cfg.contract_documents_directory,
+        id_generator=lambda: "db" * 16,
+    )
+    loaded = load_native_mission_profile_document(varied.document_path)
+    assert (loaded.model, loaded.timeout_seconds) == ("cursor-fast", 300)
+    # Owner-variable values never move the frozen authority.
+    assert loaded.verification.verifier_source_sha256 == GOLDEN_PINNED_VERIFIER_SHA256
+    assert loaded.effective_workspace_source.fixture_id == "local-workflow-console"
+    for bad_timeout in (601, 0, -1, True, "300"):
+        with pytest.raises(AuthoringError) as exc:
+            author_runtime_contract(
+                _golden_owner_input(timeout_seconds=bad_timeout),
+                launcher_configuration=cfg,
+                documents_directory=cfg.contract_documents_directory,
+                id_generator=lambda: "dc" * 16,
+            )
+        assert exc.value.error_code == "INVALID_FIELD"
+        assert exc.value.field == "timeout_seconds"
+    with pytest.raises(AuthoringError) as model_exc:
+        author_runtime_contract(
+            _golden_owner_input(model="   "),
+            launcher_configuration=cfg,
+            documents_directory=cfg.contract_documents_directory,
+            id_generator=lambda: "dd" * 16,
+        )
+    assert model_exc.value.field == "model"
+
+
+def test_golden_contract_mismatch_battery(tmp_path):
+    cfg = _cfg(tmp_path)
+    documents = Path(cfg.contract_documents_directory)
+    cases = [
+        ("mission_text", GOLDEN_WORKFLOW_MISSION_TEXT + " drifted"),
+        ("mission_text", WORKFLOW_RECOVERY_V2_MISSION_TEXT),
+        ("gate_objective", GOLDEN_WORKFLOW_GATE_OBJECTIVE.replace("verified ", "")),
+        (
+            "completion_conditions_text",
+            GOLDEN_WORKFLOW_COMPLETION_CONDITIONS_TEXT + "\n- extra owner condition.",
+        ),
+        ("commit_message", "feat: add resumable workflow executions"),
+        ("required_material_paths", list(GOLDEN_WORKFLOW_MATERIAL_PATHS[:-1])),
+        (
+            "required_material_paths",
+            list(GOLDEN_WORKFLOW_MATERIAL_PATHS) + ["src/extra.js"],
+        ),
+        ("required_material_paths", list(reversed(GOLDEN_WORKFLOW_MATERIAL_PATHS))),
+    ]
+    for field, value in cases:
+        with pytest.raises(AuthoringError) as exc:
+            author_runtime_contract(
+                _golden_owner_input(**{field: value}),
+                launcher_configuration=cfg,
+                documents_directory=cfg.contract_documents_directory,
+                id_generator=lambda: "ea" * 16,
+            )
+        assert exc.value.error_code == "GOLDEN_CONTRACT_MISMATCH", field
+        assert exc.value.field == field
+        assert "drifted" not in json.dumps(exc.value.to_dict())
+    # Rejection happens before any document write.
+    assert not documents.exists() or list(documents.glob("*")) == []
+
+
+def test_golden_browser_authority_inputs_rejected(tmp_path):
+    cfg = _cfg(tmp_path)
+    for field, value in (
+        ("fixture_id", "evil-fixture"),
+        ("fixture_version", 2),
+        ("verifier_source", "process.exit(0);"),
+        ("verifier_source_sha256", "0" * 64),
+        (
+            "checkpoint_commands",
+            [{"command_id": "x", "argv": ["cmd"], "timeout_seconds": 1, "max_capture_bytes": 1}],
+        ),
+        ("workspace_source", {"kind": "REGISTERED_FIXTURE"}),
+        ("verification", {"mode": "OBSERVED_ONLY"}),
+        ("git_end_state_policy", {}),
+        ("runtime_prompt", {}),
+        ("budgets", [1, 1, 0, 0, 0]),
+        ("disclose_complete_source", True),
+        ("profile_document", str(tmp_path / "evil.json")),
+    ):
+        with pytest.raises(AuthoringError) as exc:
+            author_runtime_contract(
+                _golden_owner_input(**{field: value}),
+                launcher_configuration=cfg,
+                documents_directory=cfg.contract_documents_directory,
+                id_generator=lambda: "eb" * 16,
+            )
+        assert exc.value.error_code in {"UNKNOWN_FIELD", "FORBIDDEN_FIELD"}, field
+        assert exc.value.field == field
+    # An unsupported template identity is rejected before any authority assembly.
+    with pytest.raises(AuthoringError) as template_exc:
+        author_runtime_contract(
+            _golden_owner_input(template_id="workflow-recovery-verified-v2"),
+            launcher_configuration=cfg,
+            documents_directory=cfg.contract_documents_directory,
+            id_generator=lambda: "ec" * 16,
+        )
+    assert template_exc.value.field == "template_id"
+
+
+def test_golden_document_validates_through_real_g2_boundary(tmp_path):
+    cfg = _cfg(tmp_path, timeout_maximum=3600)
+    launcher = ProductLauncher(
+        cfg,
+        verify_head=True,
+        id_generator=_hex_ids(120_000),
+        browser_opener=lambda _u: None,
+    )
+    try:
+        launcher.start()
+        status, headers, body, raw = _ui(
+            launcher, "POST", "/ui/api/v1/contracts", _golden_owner_input()
+        )
+        assert status == 200
+        assert body["execution_started"] is False
+        assert body["authorization_mode"] == AUTHORIZATION_MODE_PRECOMMITTED
+        summary = body["contract_summary"]
+        assert summary["workspace_source_kind"] == "REGISTERED_FIXTURE"
+        assert summary["verification_mode"] == "FROZEN_BEHAVIORAL"
+        assert summary["template_id"] == GOLDEN_TEMPLATE_ID
+        assert launcher._g2_token not in raw.decode("utf-8", "replace")
+        assert all(launcher._g2_token not in f"{k}:{v}" for k, v in headers.items())
+        record = launcher._contracts[body["contract_id"]]
+        loaded = load_native_mission_profile_document(record.document_path)
+        assert loaded.profile_fingerprint == body["profile_fingerprint"]
+        assert not any(Path(cfg.run_parent).rglob("*"))
+        # A golden contract mismatch surfaces the one stable bounded error.
+        status, _, rejected, _ = _ui(
+            launcher,
+            "POST",
+            "/ui/api/v1/contracts",
+            _golden_owner_input(mission_text=WORKFLOW_RECOVERY_V2_MISSION_TEXT),
+        )
+        assert status == 400
+        assert rejected["error"] == "AUTHORING_REJECTED"
+        assert rejected["error_code"] == "GOLDEN_CONTRACT_MISMATCH"
+        assert rejected["field"] == "mission_text"
+    finally:
+        launcher.close()
+
+
+class _GoldenPayload:
+    """Test seam payload embedding the complete authored golden profile."""
+
+    schema_version = "admissible_native_canary_authorization_payload_v4"
+    payload_fingerprint = "e" * 64
+    backend_attestation_class = "package-bin"
+    source_head = "b" * 40
+
+    def __init__(self, profile):
+        self.mission_profile = profile
+        self.run_id = profile.run_id
+        self.session_id = profile.session_id
+        self.selected_model = profile.model
+        self.timeout_seconds = profile.timeout_seconds
+
+    def to_dict(self):
+        return {
+            "schema_version": self.schema_version,
+            "payload_fingerprint": self.payload_fingerprint,
+            "run_id": self.run_id,
+            "session_id": self.session_id,
+            "selected_model": self.selected_model,
+            "timeout_seconds": self.timeout_seconds,
+            "backend_attestation_class": self.backend_attestation_class,
+            "source_head": self.source_head,
+            "mission_profile": self.mission_profile.to_dict(),
+        }
+
+
+@pytest.mark.parametrize(
+    "mode", [AUTHORIZATION_MODE_PRECOMMITTED, AUTHORIZATION_MODE_INTERACTIVE]
+)
+def test_golden_preparation_payload_and_launch_both_modes(tmp_path, monkeypatch, mode):
+    cfg = _cfg(tmp_path / mode.lower(), mode=mode, timeout_maximum=3600)
+    holder = {}
+
+    def preflight(**_kwargs):
+        return 0, json.dumps(
+            {
+                "status": "PREFLIGHT_READY",
+                "authorization_payload": holder["payload"].to_dict(),
+            }
+        ).encode()
+
+    monkeypatch.setattr(
+        "admissible.product_launcher.launcher.consume_ready_preflight",
+        lambda **kwargs: consume_ready_preflight(
+            **{**kwargs, "payload_loader": lambda _d: holder["payload"]}
+        ),
+    )
+    gate = _GateG2Server()
+    launcher = ProductLauncher(
+        cfg,
+        control_plane=SimpleNamespace(),
+        g2_server=gate,
+        preflight_application=preflight,
+        id_generator=_hex_ids(130_000 if mode == AUTHORIZATION_MODE_PRECOMMITTED else 140_000),
+        browser_opener=lambda _u: None,
+    )
+    try:
+        launcher.start()
+        status, _, authored, _ = _ui(
+            launcher, "POST", "/ui/api/v1/contracts", _golden_owner_input()
+        )
+        assert status == 200, authored
+        cid = authored["contract_id"]
+        profile = load_native_mission_profile_document(
+            launcher._contracts[cid].document_path
+        )
+        holder["payload"] = _GoldenPayload(profile)
+        status, _, prep, _ = _ui(
+            launcher, "POST", f"/ui/api/v1/contracts/{cid}/preparations", {}
+        )
+        assert status == 202, prep
+        pid = prep["preparation_id"]
+        for _ in range(400):
+            _, _, body, raw = _ui(launcher, "GET", f"/ui/api/v1/preparations/{pid}")
+            if body["state"] == STATE_READY:
+                break
+            time.sleep(0.01)
+        assert body["state"] == STATE_READY, body
+        # The complete frozen authority is disclosed in the visible payload.
+        visible_profile = body["authorization_payload"]["mission_profile"]
+        assert visible_profile["verification"]["verifier_source"] == WORKFLOW_RECOVERY_VERIFIER_SOURCE
+        assert visible_profile["verification"]["verifier_source_sha256"] == GOLDEN_PINNED_VERIFIER_SHA256
+        assert visible_profile["verification"]["disclose_complete_source"] is True
+        assert visible_profile["workspace_source"]["kind"] == "REGISTERED_FIXTURE"
+        assert visible_profile["workspace_source"]["fixture_id"] == "local-workflow-console"
+        assert visible_profile["workspace_source"]["fixture_version"] == 1
+        assert visible_profile["checkpoint_commands"] == [
+            {
+                "command_id": "npm-test",
+                "argv": ["npm.cmd", "test"],
+                "timeout_seconds": 300,
+                "max_capture_bytes": 1_048_576,
+            }
+        ]
+        assert visible_profile["budgets"] == [1, 1, 0, 0, 0]
+        canonical = launcher._preparations.get(pid).canonical_payload_bytes
+        parsed = json.loads(canonical.decode("utf-8"))
+        assert parsed["mission_profile"]["verification"]["verifier_source"] == WORKFLOW_RECOVERY_VERIFIER_SOURCE
+        assert launcher._g2_token not in raw.decode("utf-8", "replace")
+        headers = {OWNER_HEADER: "golden-owner"}
+        if mode == AUTHORIZATION_MODE_PRECOMMITTED:
+            headers[DIGEST_HEADER] = DIGEST
+        status, _, launch, launch_raw = _ui(
+            launcher,
+            "POST",
+            "/ui/api/v1/runs",
+            {"contract_id": cid, "preparation_id": pid},
+            **headers,
+        )
+        assert status == 202, launch
+        assert launcher._g2_token not in launch_raw.decode("utf-8", "replace")
+        assert len(gate.run_calls) == 1
+        if mode == AUTHORIZATION_MODE_INTERACTIVE:
+            expected = hashlib.sha256(
+                b"golden-owner" + b"\x00" + canonical
+            ).hexdigest()
+            assert gate.run_calls[0]["digest"] == expected
+        else:
+            assert gate.run_calls[0]["digest"] == DIGEST
+    finally:
+        launcher.close()

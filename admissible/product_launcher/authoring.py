@@ -11,6 +11,11 @@ from admissible.delegated_gate.canonical import canonical_bytes, require_safe_re
 from admissible.delegated_gate.mission_profile import (
     MISSION_PROFILE_SCHEMA_VERSION_V2,
     ONE_SHOT_PROFILE_BUDGETS,
+    WORKFLOW_RECOVERY_COMPLETION_CONDITIONS_TEXT,
+    WORKFLOW_RECOVERY_REQUIRED_COMMIT_MESSAGE,
+    WORKFLOW_RECOVERY_V2_MISSION_TEXT,
+    WORKFLOW_RECOVERY_V2_PROFILE,
+    WORKFLOW_RECOVERY_VERIFIER_SOURCE,
     GitEndStatePolicy,
     ProfileCheckpointCommand,
     RuntimePromptAuthority,
@@ -23,6 +28,7 @@ from admissible.delegated_gate.mission_profile import (
 from admissible.delegated_gate.models import EvidenceKind
 from admissible.product_launcher.configuration import (
     DEFAULT_TEMPLATE_ID,
+    GOLDEN_TEMPLATE_ID,
     LauncherConfiguration,
     SUPPORTED_TEMPLATE_IDS,
 )
@@ -84,6 +90,60 @@ MAX_COMMIT_MESSAGE_BYTES = 1_024
 MAX_MODEL_BYTES = 256
 MAX_MATERIAL_PATHS = 64
 MAX_MATERIAL_PATH_BYTES = 512
+
+# ---------------------------------------------------------------------------
+# workflow-recovery-verified-v1: launcher-owned canonical golden contract.
+#
+# The golden template does not let the frozen behavioral verifier judge
+# arbitrary mission text: every authority-defining contract field must equal
+# the launcher-owned canonical value below, so the verifier and the visible
+# contract can never diverge.  Only ``model`` and ``timeout_seconds`` remain
+# owner-variable.
+# ---------------------------------------------------------------------------
+
+# The flagship v2 mission already disclosed the one-object startRun calling
+# convention; the two remaining verifier dependencies it did not name are the
+# supplied migration fixture and the fixture-provided storage adapter.
+GOLDEN_WORKFLOW_INTEROPERABILITY_DISCLOSURE_TEXT = """The assigned workspace supplies the interoperability materials the behavioral
+verifier relies on:
+
+- the supplied legacy version-0 fixture is
+  `test/fixtures/legacy-run-state-v0.json`;
+
+- the verifier uses the fixture-provided storage adapter `createMemoryStorage`
+  from `src/storage/memory-storage.js`."""
+
+GOLDEN_WORKFLOW_MISSION_TEXT = (
+    WORKFLOW_RECOVERY_V2_MISSION_TEXT
+    + "\n\n"
+    + GOLDEN_WORKFLOW_INTEROPERABILITY_DISCLOSURE_TEXT
+)
+GOLDEN_WORKFLOW_GATE_OBJECTIVE = (
+    "Deliver a deterministic, durable and resumable workflow engine while preserving "
+    "existing workflow-definition behavior and satisfying the one-commit offline "
+    "verified contract."
+)
+GOLDEN_WORKFLOW_COMPLETION_CONDITIONS_TEXT = WORKFLOW_RECOVERY_COMPLETION_CONDITIONS_TEXT
+GOLDEN_WORKFLOW_COMMIT_MESSAGE = WORKFLOW_RECOVERY_REQUIRED_COMMIT_MESSAGE
+GOLDEN_WORKFLOW_MATERIAL_PATHS = WORKFLOW_RECOVERY_V2_PROFILE.required_material_paths
+# Independently pinned: authoring fails closed if the source-controlled
+# verifier bytes ever drift from this launcher-recorded digest.
+GOLDEN_WORKFLOW_VERIFIER_SOURCE_SHA256 = (
+    "a4e2daf9179129a7929bea5825f95f494ed601eb4a9bbbbaf6a65eb3918149e1"
+)
+GOLDEN_WORKFLOW_VERIFIER_TIMEOUT_SECONDS = 120
+GOLDEN_WORKFLOW_VERIFIER_OUTPUT_LIMIT_BYTES = 524_288
+GOLDEN_TEMPLATE_RECOMMENDED_TIMEOUT_SECONDS = 1800
+
+# Exact owner inputs the golden template requires for authority-defining
+# contract fields; differing owner text is rejected, never silently replaced.
+GOLDEN_EXACT_CONTRACT_FIELDS: dict[str, object] = {
+    "mission_text": GOLDEN_WORKFLOW_MISSION_TEXT,
+    "gate_objective": GOLDEN_WORKFLOW_GATE_OBJECTIVE,
+    "completion_conditions_text": GOLDEN_WORKFLOW_COMPLETION_CONDITIONS_TEXT,
+    "required_material_paths": GOLDEN_WORKFLOW_MATERIAL_PATHS,
+    "commit_message": GOLDEN_WORKFLOW_COMMIT_MESSAGE,
+}
 
 
 class AuthoringError(Exception):
@@ -228,25 +288,14 @@ def _validate_owner_inputs(inputs: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _trusted_template_parts(
+def _owner_variable_values(
     *,
     configuration: LauncherConfiguration,
     validated: Mapping[str, Any],
-    generated: Mapping[str, str],
-) -> dict[str, Any]:
-    """Assemble trusted non-owner authority for one observed-local-git template.
+    default_timeout: int,
+) -> tuple[str, int]:
+    """Resolve the only owner-variable authority values: model and timeout."""
 
-    Owner values fill mission content only. Schema version, budgets, source
-    repository authority, verification, checkpoint argv, and runtime effect
-    authority come exclusively from launcher configuration/templates.
-    """
-
-    if validated["template_id"] != DEFAULT_TEMPLATE_ID:
-        raise AuthoringError(
-            "INVALID_FIELD",
-            field="template_id",
-            safe_message_key="authoring.unsupported_template",
-        )
     model = validated["model"]
     if model is None:
         model = configuration.model_default
@@ -254,7 +303,7 @@ def _trusted_template_parts(
         model = _require_text(model, "model", max_bytes=MAX_MODEL_BYTES)
     timeout = validated["timeout_seconds"]
     if timeout is None:
-        timeout = configuration.timeout_default
+        timeout = default_timeout
     elif isinstance(timeout, bool) or not isinstance(timeout, int):
         raise AuthoringError(
             "INVALID_FIELD",
@@ -267,6 +316,143 @@ def _trusted_template_parts(
             field="timeout_seconds",
             safe_message_key="authoring.timeout_out_of_bounds",
         )
+    return model, timeout
+
+
+def _require_exact_golden_contract(validated: Mapping[str, Any]) -> None:
+    """Require exact launcher-owned canonical golden contract text.
+
+    Differing owner content is rejected with one stable bounded error and is
+    never silently replaced with the canonical value.
+    """
+
+    for field_name, canonical_value in GOLDEN_EXACT_CONTRACT_FIELDS.items():
+        if validated[field_name] != canonical_value:
+            raise AuthoringError(
+                "GOLDEN_CONTRACT_MISMATCH",
+                field=field_name,
+                safe_message_key="authoring.golden_contract_mismatch",
+            )
+
+
+def _golden_template_parts(
+    *,
+    configuration: LauncherConfiguration,
+    validated: Mapping[str, Any],
+    generated: Mapping[str, str],
+) -> dict[str, Any]:
+    """Assemble the fixed trusted authority of workflow-recovery-verified-v1.
+
+    Workspace fixture, frozen verifier, checkpoint, budgets, Git-policy
+    structure, and effect authority are launcher-owned and never
+    browser-variable; the exact-contract law above already pinned every
+    owner-entered authority text to its canonical value.
+    """
+
+    _require_exact_golden_contract(validated)
+    model, timeout = _owner_variable_values(
+        configuration=configuration,
+        validated=validated,
+        default_timeout=min(
+            GOLDEN_TEMPLATE_RECOMMENDED_TIMEOUT_SECONDS, configuration.timeout_maximum
+        ),
+    )
+    return {
+        "schema_version": MISSION_PROFILE_SCHEMA_VERSION_V2,
+        "profile_id": generated["profile_id"],
+        "run_id": generated["run_id"],
+        "session_id": generated["session_id"],
+        "gate_id": generated["gate_id"],
+        "mission_id": generated["mission_id"],
+        "mission_text": validated["mission_text"],
+        "gate_objective": validated["gate_objective"],
+        "gate_clauses": WORKFLOW_RECOVERY_V2_PROFILE.gate_clauses,
+        "required_evidence_kinds": (
+            EvidenceKind.TARGET_TREE.value,
+            EvidenceKind.GIT_STATE.value,
+            EvidenceKind.VERIFICATION_COMMAND.value,
+        ),
+        "checkpoint_commands": WORKFLOW_RECOVERY_V2_PROFILE.checkpoint_commands,
+        "completion_conditions_text": validated["completion_conditions_text"],
+        "budgets": ONE_SHOT_PROFILE_BUDGETS,
+        "timeout_seconds": timeout,
+        "stdout_byte_limit": configuration.stdout_byte_limit,
+        "stderr_byte_limit": configuration.stderr_byte_limit,
+        "model": model,
+        "workspace_source": WorkspaceSourceAuthority(
+            kind=WorkspaceSourceKind.REGISTERED_FIXTURE,
+            fixture_id=WORKFLOW_RECOVERY_V2_PROFILE.fixture_id,
+            fixture_version=WORKFLOW_RECOVERY_V2_PROFILE.fixture_version,
+        ),
+        "git_end_state_policy": GitEndStatePolicy(
+            required_commits_added=1,
+            required_complete_commit_message=validated["commit_message"],
+            final_worktree_clean=True,
+            final_index_clean=True,
+            final_remotes_absent=True,
+            required_material_paths=validated["required_material_paths"],
+        ),
+        "verification": VerificationAuthority(
+            mode=VerificationMode.FROZEN_BEHAVIORAL,
+            verifier_source=WORKFLOW_RECOVERY_VERIFIER_SOURCE,
+            verifier_source_sha256=GOLDEN_WORKFLOW_VERIFIER_SOURCE_SHA256,
+            verifier_timeout_seconds=GOLDEN_WORKFLOW_VERIFIER_TIMEOUT_SECONDS,
+            verifier_output_limit_bytes=GOLDEN_WORKFLOW_VERIFIER_OUTPUT_LIMIT_BYTES,
+            disclose_complete_source=True,
+        ),
+        "runtime_prompt": RuntimePromptAuthority(
+            permitted_effects=(
+                "Edit and commit files only in the assigned fixture workspace.",
+            ),
+            forbidden_effects=(
+                "Do not install dependencies, use the network, add remotes, push, "
+                "deploy, or modify anything outside the assigned workspace.",
+            ),
+            stop_clause=(
+                "Stop immediately after the complete npm test suite, the exact "
+                "one-commit policy and the configured checkpoints pass."
+            ),
+        ),
+    }
+
+
+def _trusted_template_parts(
+    *,
+    configuration: LauncherConfiguration,
+    validated: Mapping[str, Any],
+    generated: Mapping[str, str],
+) -> dict[str, Any]:
+    """Assemble trusted non-owner authority for one launcher-owned template.
+
+    Owner values fill mission content only. Schema version, budgets, source
+    repository authority, verification, checkpoint argv, and runtime effect
+    authority come exclusively from launcher configuration/templates.
+    """
+
+    template_id = validated["template_id"]
+    if template_id not in configuration.template_ids:
+        raise AuthoringError(
+            "INVALID_FIELD",
+            field="template_id",
+            safe_message_key="authoring.unsupported_template",
+        )
+    if template_id == GOLDEN_TEMPLATE_ID:
+        return _golden_template_parts(
+            configuration=configuration,
+            validated=validated,
+            generated=generated,
+        )
+    if template_id != DEFAULT_TEMPLATE_ID:
+        raise AuthoringError(
+            "INVALID_FIELD",
+            field="template_id",
+            safe_message_key="authoring.unsupported_template",
+        )
+    model, timeout = _owner_variable_values(
+        configuration=configuration,
+        validated=validated,
+        default_timeout=configuration.timeout_default,
+    )
     checkpoint = ProfileCheckpointCommand(
         command_id="workspace-marker-check",
         argv=("git", "status", "--porcelain"),
@@ -518,6 +704,17 @@ def author_runtime_contract(
 __all__ = [
     "AuthoringError",
     "AuthoredContractDocument",
+    "GOLDEN_EXACT_CONTRACT_FIELDS",
+    "GOLDEN_TEMPLATE_RECOMMENDED_TIMEOUT_SECONDS",
+    "GOLDEN_WORKFLOW_COMMIT_MESSAGE",
+    "GOLDEN_WORKFLOW_COMPLETION_CONDITIONS_TEXT",
+    "GOLDEN_WORKFLOW_GATE_OBJECTIVE",
+    "GOLDEN_WORKFLOW_INTEROPERABILITY_DISCLOSURE_TEXT",
+    "GOLDEN_WORKFLOW_MATERIAL_PATHS",
+    "GOLDEN_WORKFLOW_MISSION_TEXT",
+    "GOLDEN_WORKFLOW_VERIFIER_OUTPUT_LIMIT_BYTES",
+    "GOLDEN_WORKFLOW_VERIFIER_SOURCE_SHA256",
+    "GOLDEN_WORKFLOW_VERIFIER_TIMEOUT_SECONDS",
     "OWNER_AUTHORING_FIELDS",
     "author_runtime_contract",
 ]

@@ -17,6 +17,11 @@ from urllib.request import urlopen
 
 import pytest
 
+from admissible.product_launcher.configuration import (
+    DEFAULT_TEMPLATE_ID,
+    GOLDEN_TEMPLATE_ID,
+    SUPPORTED_TEMPLATE_IDS,
+)
 from admissible.product_launcher.ui_transport import create_ui_loopback_server
 from admissible.product_ui import get_asset, render_document
 
@@ -1184,6 +1189,51 @@ async function runLaunchNetworkFailure(authMode) {
   };
 }
 
+async function runGoldenTemplateReview() {
+  const ctl = deferredFetchController();
+  loadApp();
+  await settle();
+  await ctl.resolveNext(200, {
+    service: "admissible-product-launcher", version: "g2.5",
+    repository_display_path: "safe-repository", required_source_head: "a".repeat(40),
+    authorization_mode: "PRECOMMITTED_DIGEST", authorization_semantics_notice: "notice",
+    owner_authorization_encoding: "latin-1", g2_ready: true, g2_api_version: "v1",
+    csrf_nonce: "c".repeat(64),
+    supported_authoring_template_ids: ["observed-local-git-v1", "workflow-recovery-verified-v1"],
+    visual_ui_available: false
+  });
+  await waitState("COMPOSE");
+  const select = document.getElementById("template-id");
+  const optionValues = select.children.map(option => option.value);
+  await fillCompose("golden mission body");
+  windowObj.AdmissibleG3Test.setField("gate-objective", "golden objective");
+  windowObj.AdmissibleG3Test.setField("completion-conditions", "golden conditions");
+  windowObj.AdmissibleG3Test.setField("commit-message", "feat: add resumable workflow execution");
+  select.value = "workflow-recovery-verified-v1";
+  windowObj.AdmissibleG3Test.submit("compose-form");
+  await settle();
+  const authorEntry = ctl.queue[0];
+  const submitted = JSON.parse((authorEntry && authorEntry.options.body) || "{}");
+  await ctl.resolveNext(200, {
+    contract_id: "contract-golden", profile_fingerprint: "b".repeat(64),
+    contract_summary: { profile_id: "p", run_id: "r", session_id: "s", gate_id: "g", mission_id: "m",
+      workspace_source_kind: "REGISTERED_FIXTURE", verification_mode: "FROZEN_BEHAVIORAL",
+      template_id: "workflow-recovery-verified-v1" },
+    generated_ids: {}, execution_started: false, authorization_mode: "PRECOMMITTED_DIGEST"
+  });
+  await waitState("CONTRACT_READY");
+  const snap = windowObj.AdmissibleG3Test.snapshot();
+  return {
+    scenario: "golden_template_review",
+    optionValues,
+    submittedTemplateId: submitted.template_id,
+    submittedCommit: submitted.commit_message,
+    state: snap.state,
+    contractFacts: snap.contractFacts,
+    intentFacts: snap.intentFacts,
+  };
+}
+
 (async () => {
   try {
     let out;
@@ -1194,6 +1244,7 @@ async function runLaunchNetworkFailure(authMode) {
     else if (scenario === "duplicate_prepare") out = await runDuplicatePrepare();
     else if (scenario === "reset_during_launch") out = await runResetDuringLaunch();
     else if (scenario === "authoring_network") out = await runAuthoringNetworkFailure();
+    else if (scenario === "golden_template_review") out = await runGoldenTemplateReview();
     else if (scenario.startsWith("launch_network_failure")) out = await runLaunchNetworkFailure(scenario.split(":")[1] || "PRECOMMITTED_DIGEST");
     else throw new Error("unknown scenario");
     process.stdout.write(JSON.stringify(out));
@@ -2011,6 +2062,29 @@ def test_executed_client_duplicate_prepare_deduped(tmp_path):
     assert out["prepareDisabledQueued"] is True
     assert out["stateQueued"] is True
     assert out["onePoll"] is True
+
+
+def test_executed_client_golden_template_selector_and_review(tmp_path):
+    payload = _run_node_scenario(tmp_path, "golden_template_review")
+    # The selector displays exactly the bootstrap-served trusted IDs, which are
+    # exactly the launcher's finite trusted-template set.
+    assert payload["optionValues"] == list(SUPPORTED_TEMPLATE_IDS)
+    assert payload["optionValues"] == [DEFAULT_TEMPLATE_ID, GOLDEN_TEMPLATE_ID]
+    assert payload["optionValues"] == [
+        "observed-local-git-v1",
+        "workflow-recovery-verified-v1",
+    ]
+    assert payload["submittedTemplateId"] == "workflow-recovery-verified-v1"
+    assert payload["submittedCommit"] == "feat: add resumable workflow execution"
+    assert payload["state"] == "CONTRACT_READY"
+    facts = payload["contractFacts"]
+    assert "REGISTERED_FIXTURE" in facts
+    assert "FROZEN_BEHAVIORAL" in facts
+    assert "PRECOMMITTED_DIGEST" in facts
+    assert "false" in facts  # execution_started rendered truthfully
+    # The review shows exactly what the owner submitted, unreplaced.
+    assert "golden mission body" in payload["intentFacts"]
+    assert "feat: add resumable workflow execution" in payload["intentFacts"]
 
 
 def test_executed_client_reset_during_launching_is_safe(tmp_path):
