@@ -716,3 +716,256 @@ def test_full_real_server_browser_rehearsal_with_injected_sequences(tmp_path):
             proc.kill()
             proc.wait(timeout=5)
         server.stop()
+
+
+UNBROKEN_TOKEN = ("OVERFLOWPROBE" * 200)[:1800]
+HOSTILE_PREFIX = '<script>window.__g4_marker++</script><img src=x onerror="window.__g4_marker++">'
+CONTAINED_SELECTORS = (".result-summary", ".non-authority-notice")
+OVERFLOW_VIEWPORTS = ((1280, 800, False), (390, 844, True))
+
+MEASURE_JS = r"""
+(function(){
+  const surface=document.getElementById("result-view");
+  const rail=document.querySelector(".authority-rail");
+  const surfaceRect=surface?surface.getBoundingClientRect():null;
+  const railRect=rail?rail.getBoundingClientRect():null;
+  const out={
+    docScrollWidth:document.documentElement.scrollWidth,
+    docClientWidth:document.documentElement.clientWidth,
+    bodyScrollWidth:document.body.scrollWidth,
+    surfaceRight:surfaceRect?surfaceRect.right:null,
+    railLeft:railRect?railRect.left:null,
+    marker:window.__g4_marker===undefined?-1:window.__g4_marker,
+    injectedNodes:document.querySelectorAll("#result-view script,#result-view img,#result-view iframe,#result-view svg,#result-view object,#result-view embed").length,
+    classificationLabels:Array.from(document.querySelectorAll("#result-classification .classification-label")).map(n=>n.textContent),
+    classificationItems:document.querySelectorAll("#result-classification .classification-item").length,
+    evidenceCards:document.querySelectorAll("#evidence-glance .evidence-card").length,
+    evidenceSections:document.querySelectorAll("#essential-evidence details,#supplemental-evidence details").length,
+    elements:{}
+  };
+  ["result-summary","non-authority-notice"].forEach(function(id){
+    const node=document.getElementById(id);
+    if(!node){out.elements[id]=null;return;}
+    const rect=node.getBoundingClientRect();
+    const range=document.createRange();
+    range.selectNodeContents(node);
+    const paint=range.getBoundingClientRect();
+    out.elements[id]={
+      scrollWidth:node.scrollWidth,
+      clientWidth:node.clientWidth,
+      left:rect.left,
+      right:rect.right,
+      width:rect.width,
+      paintLeft:paint.left,
+      paintRight:paint.right,
+      textLength:node.textContent.length,
+      text:node.textContent.slice(0,120)
+    };
+  });
+  return JSON.stringify(out);
+})()
+"""
+
+
+class OverflowLauncher(SequenceLauncher):
+    """Serves one caller-chosen authoritative result payload through the real G4 flow."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.payload = _result_payload()
+
+    def load(self, payload: dict) -> None:
+        self.payload = payload
+        self.statuses = ["QUEUED", "STARTING", "RUNNING", "TERMINAL"]
+        self.result_calls = 0
+        self.proxy_calls = []
+
+    def proxy_g2(self, method: str, path: str):
+        status, body = super().proxy_g2(method, path)
+        if path.endswith("/result") and status == 200:
+            return status, self.payload
+        return status, body
+
+
+def _notice_overflow_payload() -> dict:
+    payload = _result_payload()
+    payload["non_authority_notice"] = UNBROKEN_TOKEN
+    return payload
+
+
+def _summary_overflow_payload() -> dict:
+    payload = _result_payload()
+    payload["result_admission_state"] = {"verdict": UNBROKEN_TOKEN, "verification_mode": "INDEPENDENT"}
+    return payload
+
+
+def _hostile_overflow_payload() -> dict:
+    payload = _result_payload()
+    payload["presentation_status"] = "REFUSED"
+    payload["result_admission_state"] = {"verdict": "REFUSED", "verification_mode": HOSTILE_PREFIX + UNBROKEN_TOKEN}
+    payload["failing_boundary"] = {"boundary": HOSTILE_PREFIX + UNBROKEN_TOKEN, "reasons": []}
+    payload["non_authority_notice"] = HOSTILE_PREFIX + UNBROKEN_TOKEN
+    return payload
+
+
+OVERFLOW_SCENARIOS = (
+    ("notice_long_token", _notice_overflow_payload, True),
+    ("summary_long_token", _summary_overflow_payload, True),
+    ("refused_hostile_long_token", _hostile_overflow_payload, True),
+    ("normal_admitted_verified", _result_payload, False),
+)
+
+
+def test_long_result_text_is_contained_in_summary_and_notice_surfaces(tmp_path):
+    if not CHROME.is_file():
+        pytest.skip("Chrome not installed")
+    launcher = OverflowLauncher()
+    server = create_ui_loopback_server(launcher, csrf_generator=lambda _n: "f" * 64).start()
+    profile = tmp_path / "chrome-profile-g4-overflow"
+    profile.mkdir()
+    debug_port = _free_port()
+    url = f"http://{server.host}:{server.port}/"
+    cmd = [
+        str(CHROME), f"--user-data-dir={profile}", f"--remote-debugging-port={debug_port}",
+        "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+        "--disable-extensions", "--disable-background-networking", url,
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    close_cdp = None
+    baseline_structure = None
+    try:
+        deadline = time.time() + 20
+        targets = None
+        while time.time() < deadline:
+            try:
+                with urlopen(f"http://127.0.0.1:{debug_port}/json", timeout=1) as response:
+                    targets = json.loads(response.read().decode())
+                break
+            except Exception:
+                time.sleep(0.2)
+        assert targets is not None
+        page = next(item for item in targets if item.get("type") == "page" and url.rstrip("/") in item.get("url", ""))
+        send, close_cdp = _cdp_connect(page["webSocketDebuggerUrl"])
+        send("Runtime.enable")
+        send("Page.enable")
+
+        def evaluate(expression: str):
+            got = send("Runtime.evaluate", {"expression": expression, "returnByValue": True})
+            return ((got.get("result") or {}).get("result") or {}).get("value")
+
+        def wait_for(expression: str, wanted, timeout_s: float = 25.0):
+            end = time.time() + timeout_s
+            last = None
+            while time.time() < end:
+                last = evaluate(expression)
+                if last == wanted:
+                    return last
+                time.sleep(0.15)
+            raise AssertionError(f"wait for {wanted!r} timed out; last={last!r}")
+
+        def drive_to_result():
+            wait_for("window.AdmissibleG3Test && window.AdmissibleG3Test.getState()", "COMPOSE")
+            evaluate("window.__g4_marker=0")
+            evaluate(
+                "window.AdmissibleG3Test.setField('mission-text','overflow mission');"
+                "window.AdmissibleG3Test.setField('gate-objective','overflow objective');"
+                "window.AdmissibleG3Test.setField('completion-conditions','overflow complete');"
+                "window.AdmissibleG3Test.setField('commit-message','feat: overflow');"
+                "window.AdmissibleG3Test.submit('compose-form');"
+            )
+            wait_for("window.AdmissibleG3Test.getState()", "CONTRACT_READY")
+            evaluate("window.AdmissibleG3Test.click('prepare-button')")
+            wait_for("window.AdmissibleG3Test.getState()", "PREPARATION_READY")
+            evaluate(
+                "window.AdmissibleG3Test.setField('owner-phrase','owner-secret-phrase');"
+                f"window.AdmissibleG3Test.setField('owner-digest','{'d' * 64}');"
+                "window.AdmissibleG3Test.submit('authorize-form');"
+            )
+            wait_for("window.AdmissibleG4Test && window.AdmissibleG4Test.getState()", "RUN_RESULT_READY", 25)
+
+        for index, (name, build_payload, injected) in enumerate(OVERFLOW_SCENARIOS):
+            launcher.load(build_payload())
+            if index:
+                send("Page.navigate", {"url": url})
+                send("Runtime.enable")
+                time.sleep(0.4)
+            drive_to_result()
+
+            for width, height, mobile in OVERFLOW_VIEWPORTS:
+                send("Emulation.setDeviceMetricsOverride", {
+                    "width": width, "height": height, "deviceScaleFactor": 1, "mobile": mobile,
+                })
+                time.sleep(0.3)
+                evaluate("document.documentElement.offsetWidth")
+                raw = evaluate(MEASURE_JS)
+                assert isinstance(raw, str), f"{name} @{width}x{height}: measurement failed"
+                m = json.loads(raw)
+                where = f"{name} @{width}x{height}"
+
+                assert m["marker"] == 0, f"{where}: hostile handler executed"
+                assert m["injectedNodes"] == 0, f"{where}: hostile DOM node created"
+
+                for element_id in ("result-summary", "non-authority-notice"):
+                    e = m["elements"][element_id]
+                    assert e is not None, f"{where}/{element_id}: element missing"
+                    assert e["scrollWidth"] <= e["clientWidth"] + 1, (
+                        f"{where}/{element_id}: scrollWidth {e['scrollWidth']} > clientWidth {e['clientWidth']}"
+                    )
+                    assert e["paintRight"] <= e["right"] + 1, (
+                        f"{where}/{element_id}: text paints to {e['paintRight']} past element right {e['right']}"
+                    )
+                    assert e["right"] <= m["surfaceRight"] + 1, (
+                        f"{where}/{element_id}: element right {e['right']} past result surface {m['surfaceRight']}"
+                    )
+                    assert e["paintRight"] <= m["surfaceRight"] + 1, f"{where}/{element_id}: paint past result surface"
+                    if m["railLeft"] is not None and m["railLeft"] >= m["surfaceRight"] - 2:
+                        assert e["paintRight"] <= m["railLeft"] + 1, (
+                            f"{where}/{element_id}: text crosses the authority rail at {m['railLeft']}"
+                        )
+                    assert e["width"] > 0, f"{where}/{element_id}: element collapsed"
+
+                assert m["docScrollWidth"] <= m["docClientWidth"] + 1, f"{where}: document overflow"
+                assert m["bodyScrollWidth"] <= m["docClientWidth"] + 1, f"{where}: body overflow"
+
+                notice = m["elements"]["non-authority-notice"]
+                summary = m["elements"]["result-summary"]
+                if injected:
+                    assert max(notice["textLength"], summary["textLength"]) >= 1800, f"{where}: token not delivered"
+                if name == "refused_hostile_long_token":
+                    assert notice["text"].startswith("<script>"), f"{where}: HTML-shaped value was not literal text"
+                    assert "REFUSED" in summary["text"], f"{where}: refusal verdict missing"
+
+                if name == "normal_admitted_verified":
+                    structure = (
+                        tuple(m["classificationLabels"]), m["classificationItems"],
+                        m["evidenceCards"], m["evidenceSections"], summary["text"], notice["text"],
+                    )
+                    if baseline_structure is None:
+                        baseline_structure = structure
+                    assert structure == baseline_structure, f"{where}: normal result structure changed"
+                    assert m["classificationItems"] == 4 and m["evidenceCards"] == 4
+                    assert summary["text"].startswith("Product verdict: ADMITTED_VERIFIED.")
+                    assert notice["text"] == "Persisted claims do not create authority."
+
+            send("Emulation.clearDeviceMetricsOverride")
+
+        assert baseline_structure is not None
+    finally:
+        if close_cdp:
+            close_cdp()
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        server.stop()
+
+
+def test_result_summary_and_notice_declare_explicit_containment():
+    for selector in CONTAINED_SELECTORS:
+        rule = CSS.split(selector + "{", 1)[1].split("}", 1)[0]
+        assert "overflow-wrap:anywhere" in rule, f"{selector} lost overflow-wrap containment"
+        assert "word-break:break-word" in rule, f"{selector} lost word-break containment"
+        assert "text-overflow" not in rule and "white-space:nowrap" not in rule
+        assert "width:" not in rule.replace("max-width:100%", "").replace("min-width:0", "")
