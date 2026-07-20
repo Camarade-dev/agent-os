@@ -21,7 +21,7 @@
   });
   const ui = {
     state:STATES.BOOTSTRAP_LOADING, bootstrap:null, contract:null, preparation:null,
-    pollController:null, pollTimer:null, pollCount:0, resumeState:null
+    pollController:null, pollTimer:null, pollCount:0, resumeState:null, prepareInFlight:false, flowEpoch:0
   };
   const byId = id => document.getElementById(id);
   const views = ["loading","compose","contract","preparation","authorize","accepted"];
@@ -47,6 +47,14 @@
     byId("author-button").textContent=next===STATES.AUTHORING?"Authoring contract…":"Author canonical contract";
     byId("launch-button").disabled=next===STATES.LAUNCHING;
     byId("launch-button").textContent=next===STATES.LAUNCHING?"Submitting authorization":"Launch mission";
+    const preparing=next===STATES.PREPARATION_QUEUED||next===STATES.PREPARATION_RUNNING||ui.prepareInFlight;
+    byId("prepare-button").disabled=preparing;
+    byId("retry-preparation").disabled=preparing;
+    document.querySelectorAll(".reset-flow").forEach(button=>{
+      const locked=next===STATES.LAUNCHING;
+      button.disabled=locked;
+      if(locked)button.setAttribute("aria-disabled","true");else button.removeAttribute("aria-disabled");
+    });
     announce(next.replaceAll("_"," ").toLowerCase());
   }
   function showError(code,message,resume){
@@ -112,9 +120,21 @@
     else{copy.textContent=`Preflight failed within the launcher boundary. Execution has not started. ${body.error_type||"PREFLIGHT_FAILED"}`;retry.hidden=false;}
   }
   async function prepare(){
+    if(ui.prepareInFlight||ui.state===STATES.PREPARATION_QUEUED||ui.state===STATES.PREPARATION_RUNNING)return;
+    ui.prepareInFlight=true;byId("prepare-button").disabled=true;byId("retry-preparation").disabled=true;
     clearError();stopPolling();
-    try{const cid=ui.contract.response.contract_id,{body}=await api(`/ui/api/v1/contracts/${encodeURIComponent(cid)}/preparations`,{method:"POST",body:"{}"});ui.preparation={id:body.preparation_id,status:body};setState(STATES.PREPARATION_QUEUED);preparationCopy(ui.state,body);pollPreparation();}
-    catch(error){const mapped=boundedMessage(error.status,error.body);setState(STATES.REQUEST_ERROR);showError(mapped.code,mapped.message,STATES.CONTRACT_READY);setState(STATES.CONTRACT_READY);}
+    const epoch=ui.flowEpoch;
+    try{
+      const cid=ui.contract.response.contract_id,{body}=await api(`/ui/api/v1/contracts/${encodeURIComponent(cid)}/preparations`,{method:"POST",body:"{}"});
+      if(epoch!==ui.flowEpoch)return;
+      ui.preparation={id:body.preparation_id,status:body};setState(STATES.PREPARATION_QUEUED);preparationCopy(ui.state,body);pollPreparation();
+    }catch(error){
+      if(epoch!==ui.flowEpoch||error.name==="AbortError")return;
+      const mapped=boundedMessage(error.status,error.body);setState(STATES.REQUEST_ERROR);showError(mapped.code,mapped.message,STATES.CONTRACT_READY);setState(STATES.CONTRACT_READY);
+    }finally{
+      if(epoch===ui.flowEpoch){ui.prepareInFlight=false;const preparing=ui.state===STATES.PREPARATION_QUEUED||ui.state===STATES.PREPARATION_RUNNING;byId("prepare-button").disabled=preparing;byId("retry-preparation").disabled=preparing;}
+      else ui.prepareInFlight=false;
+    }
   }
   function renderPreparation(body){
     const root=byId("preparation-facts");root.replaceChildren();[["Preparation ID",body.preparation_id],["Payload fingerprint",body.payload_fingerprint],["Authorization mode",body.authorization_mode]].forEach(x=>appendFact(root,x[0],x[1]));
@@ -129,12 +149,15 @@
   }
   async function pollPreparation(){
     if(ui.pollController||ui.state===STATES.LAUNCH_ACCEPTED)return;ui.pollController=new AbortController();ui.pollCount=0;
+    const epoch=ui.flowEpoch;const controller=ui.pollController;
     const tick=async()=>{
-      if(!ui.pollController||ui.pollController.signal.aborted||ui.pollCount>=120)return;ui.pollCount+=1;
-      try{const {body}=await api(`/ui/api/v1/preparations/${encodeURIComponent(ui.preparation.id)}`,{signal:ui.pollController.signal});ui.preparation.status=body;
+      if(epoch!==ui.flowEpoch||!ui.pollController||ui.pollController!==controller||controller.signal.aborted||ui.pollCount>=120)return;ui.pollCount+=1;
+      try{const {body}=await api(`/ui/api/v1/preparations/${encodeURIComponent(ui.preparation.id)}`,{signal:controller.signal});
+        if(epoch!==ui.flowEpoch||ui.pollController!==controller)return;
+        ui.preparation.status=body;
         if(body.state==="QUEUED"||body.state==="RUNNING"){setState(body.state==="QUEUED"?STATES.PREPARATION_QUEUED:STATES.PREPARATION_RUNNING);preparationCopy(ui.state,body);ui.pollTimer=setTimeout(tick,750);return;}
         stopPolling();if(body.state==="READY"){renderPreparation(body);setState(STATES.PREPARATION_READY);}else if(body.state==="BLOCKED"){setState(STATES.PREPARATION_BLOCKED);preparationCopy(ui.state,body);}else{setState(STATES.PREPARATION_FAILED);preparationCopy(ui.state,body);}
-      }catch(error){if(error.name==="AbortError")return;stopPolling();const mapped=boundedMessage(error.status,error.body);setState(STATES.REQUEST_ERROR);showError(mapped.code,mapped.message,STATES.CONTRACT_READY);}
+      }catch(error){if(error.name==="AbortError"||epoch!==ui.flowEpoch)return;stopPolling();const mapped=boundedMessage(error.status,error.body);setState(STATES.REQUEST_ERROR);showError(mapped.code,mapped.message,STATES.CONTRACT_READY);}
     };tick();
   }
   function clearSecrets(){const phrase=byId("owner-phrase"),digest=byId("owner-digest");phrase.value="";phrase.type="password";byId("toggle-phrase").textContent="Show";byId("toggle-phrase").setAttribute("aria-pressed","false");if(digest)digest.value="";}
@@ -152,10 +175,45 @@
     catch(error){const mapped=boundedMessage(error.status,error.body);setState(STATES.PREPARATION_READY);showError(mapped.code,mapped.message,STATES.PREPARATION_READY);}
     finally{headers["X-Admissible-Owner-Authorization"]="";if(headers["X-Admissible-Owner-Authorization-Digest"])headers["X-Admissible-Owner-Authorization-Digest"]="";clearSecrets();}
   }
-  function reset(){stopPolling();clearSecrets();clearError();ui.contract=null;ui.preparation=null;if(ui.state!==STATES.COMPOSE)setState(STATES.COMPOSE);byId("mission-text").focus();}
+  function reset(){
+    if(ui.state===STATES.LAUNCHING)return;
+    ui.flowEpoch+=1;stopPolling();clearSecrets();clearError();ui.contract=null;ui.preparation=null;ui.prepareInFlight=false;
+    if(ui.state!==STATES.COMPOSE)setState(STATES.COMPOSE);byId("mission-text").focus();
+  }
+  function snapshot(){
+    const digest=byId("owner-digest");
+    return {
+      state:ui.state,
+      contractId:ui.contract&&ui.contract.response?ui.contract.response.contract_id:null,
+      preparationId:ui.preparation?ui.preparation.id:null,
+      preparationState:ui.preparation&&ui.preparation.status?ui.preparation.status.state:null,
+      pollCount:ui.pollCount,
+      hasPollController:!!ui.pollController,
+      hasPollTimer:ui.pollTimer!==null,
+      prepareInFlight:ui.prepareInFlight,
+      phraseValue:byId("owner-phrase").value,
+      phraseType:byId("owner-phrase").type,
+      digestValue:digest?digest.value:"",
+      statusMessage:byId("status-message").textContent,
+      statusCode:byId("status-code").textContent,
+      prepareDisabled:byId("prepare-button").disabled,
+      launchDisabled:byId("launch-button").disabled,
+      resetDisabled:Array.from(document.querySelectorAll(".reset-flow")).map(button=>button.disabled),
+      acceptedText:byId("accepted-facts").textContent,
+      preparationCopy:byId("preparation-copy").textContent,
+      canonicalPayload:byId("canonical-payload").textContent,
+      intentFacts:byId("intent-facts").textContent,
+      contractFacts:byId("contract-facts").textContent
+    };
+  }
 
   byId("compose-form").addEventListener("submit",author);byId("authorize-form").addEventListener("submit",launch);byId("prepare-button").addEventListener("click",prepare);byId("retry-preparation").addEventListener("click",prepare);byId("back-to-compose").addEventListener("click",reset);document.querySelectorAll(".reset-flow").forEach(button=>button.addEventListener("click",reset));byId("add-material").addEventListener("click",()=>addMaterial());byId("retry-bootstrap").addEventListener("click",bootstrap);byId("toggle-phrase").addEventListener("click",()=>{const input=byId("owner-phrase"),show=input.type==="password";input.type=show?"text":"password";byId("toggle-phrase").textContent=show?"Hide":"Show";byId("toggle-phrase").setAttribute("aria-pressed",String(show));});window.addEventListener("pagehide",stopPolling,{once:true});window.addEventListener("beforeunload",stopPolling,{once:true});
   addMaterial("README.md");
-  Object.defineProperty(window,"AdmissibleG3Test",{value:Object.freeze({STATES,allowedTransitions:allowed,getState:()=>ui.state,reset}),writable:false});
+  Object.defineProperty(window,"AdmissibleG3Test",{value:Object.freeze({
+    STATES,allowedTransitions:allowed,getState:()=>ui.state,reset,prepare,launch,bootstrap,author,stopPolling,snapshot,
+    setField:(id,value)=>{byId(id).value=value;},
+    click:(id)=>{byId(id).click();},
+    submit:(id)=>{const form=byId(id);form.dispatchEvent(new Event("submit",{bubbles:true,cancelable:true}));}
+  }),writable:false});
   bootstrap();
 })();

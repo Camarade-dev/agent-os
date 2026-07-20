@@ -66,6 +66,9 @@ class _UIHandler(BaseHTTPRequestHandler):
             body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         else:
             body = payload if isinstance(payload, bytes) else str(payload).encode("utf-8")
+        # Every UI response closes the connection so serial HTTP/1.1 delivery
+        # cannot leave a keep-alive socket holding subsequent asset fetches.
+        self.close_connection = True
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -78,6 +81,7 @@ class _UIHandler(BaseHTTPRequestHandler):
             "connect-src 'self'; img-src 'self'; base-uri 'none'; "
             "form-action 'none'; frame-ancestors 'none'",
         )
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 

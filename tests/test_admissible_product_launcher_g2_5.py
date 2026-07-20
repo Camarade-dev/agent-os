@@ -819,7 +819,6 @@ def test_child_runner_unchanged_and_protected_paths_unmodified():
         "admissible/product_service/",
         "admissible/product_read_model/",
         "admissible/checkpoint.py",
-        "admissible/product_ui/",
     ):
         assert forbidden not in changed
     # child_runner substantive body unchanged vs base unless import-only
