@@ -341,6 +341,143 @@ async function runAuthoringSafeDetail() {
   return { matched, unsafe, malformed };
 }
 
+const G4_TEST_HOOK_NEEDLE = 'Object.defineProperty(window,"AdmissibleG4Test",{value:Object.freeze({STATES,getState:()=>ui.state,snapshot:g4Snapshot}),writable:false,configurable:true});';
+const G4_OBS_HOOK = 'Object.defineProperty(window,"AdmissibleG4Test",{value:Object.freeze({STATES,getState:()=>ui.state,snapshot:g4Snapshot,startRunObservation,observationFacts:()=>({pollController:ui.pollController,pollTimer:ui.pollTimer,resultResolved:ui.resultResolved,observationPhase:ui.observationPhase,requestInFlight:ui.requestInFlight,statusAttempts:ui.statusAttempts,resultAttempts:ui.resultAttempts})}),writable:false,configurable:true});';
+
+function instrumentObservationSurface(source) {
+  if (!source.includes(G4_TEST_HOOK_NEEDLE)) throw new Error("missing committed AdmissibleG4Test hook");
+  const out = source.split(G4_TEST_HOOK_NEEDLE).join(G4_OBS_HOOK);
+  const strip = (text) => text.split(G4_TEST_HOOK_NEEDLE).join("").split(G4_OBS_HOOK).join("");
+  if (strip(source) !== strip(out)) throw new Error("instrumentation altered a non-observation surface");
+  if ((out.match(/startRunObservation,observationFacts/g) || []).length !== 1) throw new Error("observation surface not uniquely instrumented");
+  return { source: out, alteredOnlyObservationSurface: true };
+}
+
+function installCountingAbortController() {
+  let created = 0;
+  class CountingAbortController extends FakeAbortController {
+    constructor() { super(); created += 1; }
+  }
+  context.AbortController = CountingAbortController;
+  windowObj.AbortController = CountingAbortController;
+  return {
+    get created() { return created; },
+    reset() { created = 0; },
+  };
+}
+
+function statusRequestCount() {
+  return fetchLog.filter((entry) => /\/ui\/api\/v1\/runs\/[^/]+$/.test(entry.url)).length;
+}
+
+function resultRequestCount() {
+  return fetchLog.filter((entry) => String(entry.url).endsWith("/result")).length;
+}
+
+async function runSingleObservationOwnership() {
+  const instrumented = instrumentObservationSurface(appJs);
+  activeAppJs = instrumented.source;
+  const controllers = installCountingAbortController();
+  try {
+    await readyForLaunch();
+    controllers.reset();
+    let inFlight = 0;
+    let maxInFlight = 0;
+    fetchImpl = (url, options = {}) => {
+      const method = (options.method || "GET").toUpperCase();
+      fetchLog.push({ url, method, headers: { ...(options.headers || {}) } });
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      if (url === "/ui/api/v1/runs" && method === "POST") {
+        inFlight -= 1;
+        return Promise.resolve(jsonResponse(202, { control_run_id: "control-obs-owner-1", control_state: "QUEUED" }));
+      }
+      return new Promise(() => {});
+    };
+    windowObj.AdmissibleG3Test.submit("authorize-form"); await settle();
+    await flushTimers(1); await settle();
+    const g4 = windowObj.AdmissibleG4Test;
+    const before = g4.observationFacts();
+    const ownerController = before.pollController;
+    const timersBeforeSecondStart = timers.size;
+    const controllersAtOwner = controllers.created;
+    const statusBeforeSecondStart = statusRequestCount();
+    g4.startRunObservation();
+    await settle();
+    const after = g4.observationFacts();
+    return {
+      alteredOnlyObservationSurface: instrumented.alteredOnlyObservationSurface,
+      ownerPresent: ownerController !== null && ownerController !== undefined,
+      sameController: after.pollController === ownerController,
+      controllersCreatedAfterOwner: controllers.created - controllersAtOwner,
+      timerCountBeforeSecondStart: timersBeforeSecondStart,
+      timerCountAfterSecondStart: timers.size,
+      noSecondTimer: timers.size === timersBeforeSecondStart,
+      statusRequestCount: statusRequestCount(),
+      onlyOneStatusRequest: statusBeforeSecondStart === 1 && statusRequestCount() === 1,
+      maxInFlight,
+      requestInFlight: after.requestInFlight,
+      resultResolved: after.resultResolved,
+      observationPhase: after.observationPhase,
+    };
+  } finally {
+    activeAppJs = appJs;
+    context.AbortController = FakeAbortController;
+    windowObj.AbortController = FakeAbortController;
+  }
+}
+
+async function run410TerminalOwnership() {
+  const instrumented = instrumentObservationSurface(appJs);
+  activeAppJs = instrumented.source;
+  try {
+    await readyForLaunch();
+    const tracker = installRunFetch({
+      statuses: ["TERMINAL"],
+      results: [{
+        status: 410,
+        body: {
+          error: "NO_AUTHORITATIVE_RESULT",
+          control_state: "TERMINAL",
+          application_return_code: 7,
+          terminal_evidence: "RUN_ROOT_ABSENT",
+          start_error_type: null,
+        },
+      }],
+    });
+    windowObj.AdmissibleG3Test.submit("authorize-form"); await settle();
+    await flushTimers(2); await settle();
+    const terminal = windowObj.AdmissibleG4Test.snapshot();
+    const facts = windowObj.AdmissibleG4Test.observationFacts();
+    const requestsAtTerminal = fetchLog.length;
+    const statusAtTerminal = statusRequestCount();
+    const resultAtTerminal = resultRequestCount();
+    await flushTimers(40); await settle();
+    return {
+      alteredOnlyObservationSurface: instrumented.alteredOnlyObservationSurface,
+      state: terminal.state,
+      visibleState: windowObj.AdmissibleG4Test.getState(),
+      resultResolved: facts.resultResolved === true && terminal.resultResolved === true,
+      abortOwnerCleared: terminal.hasAbortOwner === false && facts.pollController === null,
+      timerCleared: terminal.hasTimer === false && facts.pollTimer === null,
+      observationPhaseCleared: facts.observationPhase === null,
+      requestNotInFlight: facts.requestInFlight === false,
+      noPendingPollTimer: timers.size === 0,
+      requestsAtTerminal,
+      requestsAfterAdvance: fetchLog.length,
+      statusAtTerminal,
+      statusAfterAdvance: statusRequestCount(),
+      resultAtTerminal,
+      resultAfterAdvance: resultRequestCount(),
+      requestCountsStable: fetchLog.length === requestsAtTerminal && statusRequestCount() === statusAtTerminal && resultRequestCount() === resultAtTerminal,
+      maxInFlight: tracker.maxInFlight,
+      noResultText: document.getElementById("no-result-view").textContent,
+    };
+  } finally {
+    activeAppJs = appJs;
+  }
+}
+
 (async () => {
   try {
     let out;
@@ -350,6 +487,8 @@ async function runAuthoringSafeDetail() {
     else if (scenario === "g4_malicious") out = await runMalicious();
     else if (scenario === "g4_stale") out = await runStaleAndSingleFlight();
     else if (scenario === "g4_authoring_detail") out = await runAuthoringSafeDetail();
+    else if (scenario === "g4_single_observation_owner") out = await runSingleObservationOwnership();
+    else if (scenario === "g4_410_terminal_ownership") out = await run410TerminalOwnership();
     else throw new Error("unknown scenario");
     process.stdout.write(JSON.stringify(out));
   } catch (error) {
@@ -373,17 +512,27 @@ def _build_node_harness() -> str:
         "Object, Array, String, Number, Boolean, JSON, Error, Promise, Math, RegExp, Date,",
         "Object, Array, String, Number, Boolean, JSON, Error, Promise, Math, RegExp, Date: class FakeDate extends Date { static now() { return nowMs; } },",
     )
+    harness = harness.replace(
+        'const appJs = fs.readFileSync(appJsPath, "utf8");',
+        'const appJs = fs.readFileSync(appJsPath, "utf8");\nlet activeAppJs = appJs;',
+        1,
+    )
+    harness = harness.replace(
+        'vm.runInNewContext(appJs, context, { filename: "app.js", timeout: 5000 });',
+        'vm.runInNewContext(activeAppJs, context, { filename: "app.js", timeout: 5000 });',
+        1,
+    )
     return harness.rsplit("(async () => {", 1)[0] + G4_SCENARIOS
 
 
 NODE_HARNESS = _build_node_harness()
 
 
-def _run_node(tmp_path: Path, scenario: str) -> dict:
+def _run_node(tmp_path: Path, scenario: str, js_path: Path | None = None) -> dict:
     harness = tmp_path / f"g4_harness_{re.sub(r'[^A-Za-z0-9_]+', '_', scenario)}.js"
     harness.write_text(NODE_HARNESS, encoding="utf-8")
     completed = subprocess.run(
-        [NODE, str(harness), scenario, str(JS_PATH)],
+        [NODE, str(harness), scenario, str(js_path or JS_PATH)],
         capture_output=True,
         text=True,
         timeout=25,
@@ -465,6 +614,11 @@ def test_javascript_syntax_python_ast_and_test_harness_ast():
     subprocess.run([NODE, "--check", str(JS_PATH)], check=True, capture_output=True, text=True, timeout=10)
     ast.parse(Path(__file__).read_text(encoding="utf-8"))
     assert "fs.readFileSync(appJsPath" in NODE_HARNESS and "setTimeoutFn" in NODE_HARNESS
+    assert "let activeAppJs = appJs" in NODE_HARNESS
+    assert "instrumentObservationSurface" in NODE_HARNESS
+    assert "g4_single_observation_owner" in NODE_HARNESS and "g4_410_terminal_ownership" in NODE_HARNESS
+    assert "function startRunObservation" not in NODE_HARNESS
+    assert "resultResolved = true" not in NODE_HARNESS.replace("facts.resultResolved === true", "")
 
 
 def test_202_lifecycle_409_then_200_and_terminal_truth_boundaries(tmp_path):
@@ -534,6 +688,42 @@ def test_stale_status_and_result_single_flight_and_reset_abort(tmp_path):
         "staleResultIgnored": True,
         "resetAborted": True,
     }
+
+
+def test_second_start_run_observation_is_noop_while_owner_exists(tmp_path):
+    out = _run_node(tmp_path, "g4_single_observation_owner")
+    assert out["alteredOnlyObservationSurface"] is True
+    assert out["ownerPresent"] is True
+    assert out["sameController"] is True
+    assert out["controllersCreatedAfterOwner"] == 0
+    assert out["noSecondTimer"] is True
+    assert out["timerCountBeforeSecondStart"] == 0
+    assert out["timerCountAfterSecondStart"] == 0
+    assert out["onlyOneStatusRequest"] is True
+    assert out["statusRequestCount"] == 1
+    assert out["maxInFlight"] == 1
+    assert out["requestInFlight"] is True
+    assert out["resultResolved"] is False
+    assert out["observationPhase"] == "status"
+
+
+def test_result_410_clears_observation_terminal_ownership(tmp_path):
+    out = _run_node(tmp_path, "g4_410_terminal_ownership")
+    assert out["alteredOnlyObservationSurface"] is True
+    assert out["state"] == "RUN_NO_AUTHORITATIVE_RESULT"
+    assert out["visibleState"] == "RUN_NO_AUTHORITATIVE_RESULT"
+    assert out["resultResolved"] is True
+    assert out["abortOwnerCleared"] is True
+    assert out["timerCleared"] is True
+    assert out["observationPhaseCleared"] is True
+    assert out["requestNotInFlight"] is True
+    assert out["noPendingPollTimer"] is True
+    assert out["requestCountsStable"] is True
+    assert out["maxInFlight"] == 1
+    assert out["resultAtTerminal"] == 1
+    assert out["statusAtTerminal"] == 1
+    assert "No authoritative result" in out["noResultText"]
+    assert "TERMINAL" in out["noResultText"] and "RUN_ROOT_ABSENT" in out["noResultText"]
 
 
 def test_authoring_rejected_shows_safe_error_code_and_field(tmp_path):
