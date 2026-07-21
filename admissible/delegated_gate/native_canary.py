@@ -29,14 +29,18 @@ from admissible.delegated_gate.checkpoint import capture_checkpoint
 from admissible.delegated_gate.fixture_registry import (
     INCIDENT_BOARD_FIXTURE_ID,
     INCIDENT_BOARD_FIXTURE_VERSION,
+    NEON_SIEGE_FIXTURE_ID,
+    NEON_SIEGE_FIXTURE_VERSION,
     WORKFLOW_CONSOLE_FIXTURE_ID,
     WORKFLOW_CONSOLE_FIXTURE_VERSION,
     build_incident_board_repository,
+    build_neon_siege_blank_repository,
     build_workflow_console_repository,
     fixture_material_tree_hash,
 )
 from admissible.delegated_gate.mission_profile import (
     FLAGSHIP_INCIDENT_REPLAY_PROFILE,
+    NEON_SIEGE_PROFILE,
     ONE_SHOT_PROFILE_BUDGETS,
     WORKFLOW_RECOVERY_PROFILE,
     WORKFLOW_RECOVERY_V2_PROFILE,
@@ -453,6 +457,7 @@ def registered_profiles() -> dict[str, NativeMissionProfile]:
             FLAGSHIP_INCIDENT_REPLAY_PROFILE,
             WORKFLOW_RECOVERY_PROFILE,
             WORKFLOW_RECOVERY_V2_PROFILE,
+            NEON_SIEGE_PROFILE,
         )
     }
 
@@ -471,6 +476,7 @@ def fixture_builder_registry() -> dict[tuple[str, int], Any]:
         (LEGACY_CANARY_FIXTURE_ID, LEGACY_CANARY_FIXTURE_VERSION): build_canary_repository,
         (INCIDENT_BOARD_FIXTURE_ID, INCIDENT_BOARD_FIXTURE_VERSION): build_incident_board_repository,
         (WORKFLOW_CONSOLE_FIXTURE_ID, WORKFLOW_CONSOLE_FIXTURE_VERSION): build_workflow_console_repository,
+        (NEON_SIEGE_FIXTURE_ID, NEON_SIEGE_FIXTURE_VERSION): build_neon_siege_blank_repository,
     }
 
 

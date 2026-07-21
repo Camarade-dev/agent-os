@@ -72,6 +72,7 @@ LEGACY_IDENTITIES = {
     "incident-replay-v1": "ceac9c5dc344d7f5b5d24c530cd28a29012c3dcbb0f4fa7906884caec6845bc3",
     "workflow-recovery-v1": "ed67459c803bf439ee3325cdf9fa069d48677408412ff283ab86a4234d9ae2f8",
     "workflow-recovery-v2": "e4bdcf5a2f5ae1cae6435bc8881eff40e6154762e9cbd76c6054bd0e61e78724",
+    "neon-siege-v1": "da7a93272544a05b60887973a80c72e2541104053162646c5daa5a30920a5b35",
 }
 
 

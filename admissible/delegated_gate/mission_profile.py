@@ -1626,6 +1626,90 @@ WORKFLOW_RECOVERY_V2_PROFILE = create_native_mission_profile(
 )
 
 
+# ---------------------------------------------------------------------------
+# Comparison-experiment profile: neon-siege-v1.
+# ---------------------------------------------------------------------------
+
+from admissible.delegated_gate.fixture_registry import (  # noqa: E402
+    NEON_SIEGE_FIXTURE_ID,
+    NEON_SIEGE_FIXTURE_VERSION,
+    NEON_SIEGE_INITIAL_COMMIT_MESSAGE,
+)
+from admissible.delegated_gate.neon_siege_mission import (  # noqa: E402
+    NEON_SIEGE_COMPLETION_CONDITIONS_TEXT,
+    NEON_SIEGE_EXACT_USER_PROMPT,
+    NEON_SIEGE_REQUIRED_COMMIT_MESSAGE,
+    NEON_SIEGE_REQUIRED_MATERIAL_PATHS,
+    NEON_SIEGE_VERIFIER_SOURCE,
+    NEON_SIEGE_VERIFIER_SOURCE_SHA256,
+)
+
+NEON_SIEGE_PROFILE = create_native_mission_profile(
+    profile_id="neon-siege-v1",
+    fixture_id=NEON_SIEGE_FIXTURE_ID,
+    fixture_version=NEON_SIEGE_FIXTURE_VERSION,
+    run_id="native-cursor-neon-siege-001",
+    session_id="native-cursor-neon-siege-001",
+    gate_id="neon-siege-gate",
+    mission_id="native-neon-siege",
+    mission_text=NEON_SIEGE_EXACT_USER_PROMPT,
+    gate_objective=(
+        "Deliver a complete, dependency-free, statically deployable Neon Siege browser "
+        "game that satisfies the immutable mission text and the one-commit offline contract."
+    ),
+    gate_clauses=(
+        (
+            "neon-siege.material",
+            "Required material paths exist, the project is free of external runtime or test "
+            "dependencies, and the tree is suitable for static deployment.",
+        ),
+        (
+            "neon-siege.tests",
+            "The complete npm test suite passes independently at checkpoint capture and "
+            "covers core game-state logic rather than only file existence.",
+        ),
+        (
+            "neon-siege.behavior",
+            "The independent behavioral verifier observes core gameplay and lifecycle "
+            "behavior, including start, pause/resume, game-over, restart, waves, upgrades, "
+            "health/damage, score, high score, dash, enemy archetype diversity, and a "
+            "bounded local-start probe with proven cleanup.",
+        ),
+        (
+            "neon-siege.git",
+            "Exactly one clean local task commit exists with the required complete message "
+            "and zero remotes.",
+        ),
+    ),
+    required_evidence_kinds=(
+        EvidenceKind.TARGET_TREE.value,
+        EvidenceKind.GIT_STATE.value,
+        EvidenceKind.VERIFICATION_COMMAND.value,
+    ),
+    checkpoint_commands=(
+        ProfileCheckpointCommand(
+            command_id="npm-test",
+            argv=("npm.cmd", "test"),
+            timeout_seconds=300,
+            max_capture_bytes=1024 * 1024,
+        ),
+    ),
+    required_commit_message=NEON_SIEGE_REQUIRED_COMMIT_MESSAGE,
+    required_material_paths=NEON_SIEGE_REQUIRED_MATERIAL_PATHS,
+    completion_conditions_text=NEON_SIEGE_COMPLETION_CONDITIONS_TEXT,
+    verifier_source=NEON_SIEGE_VERIFIER_SOURCE,
+    verifier_source_sha256=NEON_SIEGE_VERIFIER_SOURCE_SHA256,
+    verifier_timeout_seconds=60,
+    verifier_output_limit_bytes=262144,
+    budgets=ONE_SHOT_PROFILE_BUDGETS,
+    timeout_seconds=3600,
+    stdout_byte_limit=8_388_608,
+    stderr_byte_limit=1_048_576,
+    model="auto",
+    fixture_initial_commit_message=NEON_SIEGE_INITIAL_COMMIT_MESSAGE,
+)
+
+
 __all__ = [
     "FLAGSHIP_COMPLETION_CONDITIONS_TEXT",
     "FLAGSHIP_INCIDENT_REPLAY_PROFILE",
@@ -1634,6 +1718,7 @@ __all__ = [
     "FLAGSHIP_VERIFIER_SOURCE",
     "MISSION_PROFILE_SCHEMA_VERSION",
     "MISSION_PROFILE_SCHEMA_VERSION_V2",
+    "NEON_SIEGE_PROFILE",
     "ONE_SHOT_PROFILE_BUDGETS",
     "WORKFLOW_RECOVERY_COMPLETION_CONDITIONS_TEXT",
     "WORKFLOW_RECOVERY_MISSION_TEXT",

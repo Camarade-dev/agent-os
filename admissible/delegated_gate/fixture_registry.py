@@ -31,6 +31,9 @@ INCIDENT_BOARD_INITIAL_COMMIT_MESSAGE = "chore: initialize incident board fixtur
 WORKFLOW_CONSOLE_FIXTURE_ID = "local-workflow-console"
 WORKFLOW_CONSOLE_FIXTURE_VERSION = 1
 WORKFLOW_CONSOLE_INITIAL_COMMIT_MESSAGE = "chore: initialize workflow console fixture"
+NEON_SIEGE_FIXTURE_ID = "local-neon-siege"
+NEON_SIEGE_FIXTURE_VERSION = 1
+NEON_SIEGE_INITIAL_COMMIT_MESSAGE = "chore: initialize neon siege blank fixture"
 
 
 @dataclass(frozen=True)
@@ -1427,15 +1430,114 @@ def build_workflow_console_repository(
     return BuiltFixture(repository, head, fixture_material_tree_hash(repository), message)
 
 
+_NEON_SIEGE_PACKAGE_JSON = {
+    "name": "neon-siege-blank-fixture",
+    "version": "0.0.0",
+    "private": True,
+    "type": "module",
+    "scripts": {
+        "test": "node --preserve-symlinks --preserve-symlinks-main --test",
+        "start": "node -e \"console.error('blank fixture: implement a local static start server'); process.exit(1)\"",
+    },
+}
+
+
+def _neon_siege_blank_files() -> dict[str, bytes]:
+    """Neutral blank-repository scaffolding with no gameplay or visuals."""
+
+    package = (json.dumps(_NEON_SIEGE_PACKAGE_JSON, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    readme = (
+        "# Neon Siege blank fixture\n"
+        "\n"
+        "This repository is the deterministic Admissible blank fixture for the\n"
+        "Neon Siege native comparison experiment (`local-neon-siege` @ v1).\n"
+        "\n"
+        "It intentionally contains no gameplay, rendering, audio, upgrade,\n"
+        "enemy, wave, HUD, or persistence implementation. The coding agent must\n"
+        "build the complete static browser game from this empty scaffold.\n"
+        "\n"
+        "Fixture marker: `NEON_SIEGE_BLANK_FIXTURE_V1`\n"
+    ).encode("utf-8")
+    gitignore = b"node_modules/\n.cache/\n.DS_Store\n"
+    identity_test = (
+        "import assert from 'node:assert/strict';\n"
+        "import { readFileSync } from 'node:fs';\n"
+        "import { describe, it } from 'node:test';\n"
+        "\n"
+        "describe('neon-siege blank fixture identity', () => {\n"
+        "  it('retains the blank fixture marker and no game implementation', () => {\n"
+        "    const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');\n"
+        "    assert.match(readme, /NEON_SIEGE_BLANK_FIXTURE_V1/);\n"
+        "    assert.match(readme, /no gameplay/i);\n"
+        "  });\n"
+        "});\n"
+    ).encode("utf-8")
+    return {
+        "README.md": readme,
+        "package.json": package,
+        ".gitignore": gitignore,
+        "test/fixture-identity.test.js": identity_test,
+    }
+
+
+def build_neon_siege_blank_repository(
+    temporary_root: str | Path, *, repository_name: str = "work"
+) -> BuiltFixture:
+    """Create the deterministic blank Neon Siege fixture (no game features)."""
+
+    parent, _ = _safe_directory(temporary_root, "fixture temporary root")
+    if not repository_name or any(char in repository_name for char in "\\/\x00") or repository_name in {".", ".."}:
+        raise ValueError("repository name must be one safe component")
+    repository = parent / repository_name
+    if repository.exists():
+        raise ValueError("fixture repository path must be fresh")
+    repository.mkdir()
+    _safe_directory(repository, "fixture repository")
+    files = _neon_siege_blank_files()
+    if len(files) != 4:
+        raise RuntimeError("neon-siege blank fixture must contain exactly 4 material files")
+    for relative, content in files.items():
+        destination = repository / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content)
+    _run(["git", "init", "--quiet", "--initial-branch=main"], cwd=repository)
+    _run(["git", "config", "core.autocrlf", "false"], cwd=repository)
+    _run(["git", "config", "core.filemode", "false"], cwd=repository)
+    _run(["git", "config", "commit.gpgsign", "false"], cwd=repository)
+    _run(["git", "add", "--all"], cwd=repository)
+    git_env = dict(os.environ)
+    git_env.update({
+        "GIT_AUTHOR_NAME": "Admissible Fixture", "GIT_AUTHOR_EMAIL": "fixture@invalid.example",
+        "GIT_COMMITTER_NAME": "Admissible Fixture", "GIT_COMMITTER_EMAIL": "fixture@invalid.example",
+        "GIT_AUTHOR_DATE": "2026-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2026-01-01T00:00:00Z",
+    })
+    _run(["git", "commit", "--quiet", "-m", NEON_SIEGE_INITIAL_COMMIT_MESSAGE], cwd=repository, env=git_env)
+    head = _run(["git", "rev-parse", "HEAD"], cwd=repository).stdout.strip().lower()
+    if _run(["git", "remote"], cwd=repository).stdout.strip():
+        raise RuntimeError("fixture unexpectedly has a remote")
+    if _run(["git", "rev-list", "--count", "HEAD"], cwd=repository).stdout.strip() != "1":
+        raise RuntimeError("fixture must have exactly one commit")
+    message = _run(["git", "log", "-1", "--format=%B"], cwd=repository).stdout.rstrip("\r\n")
+    if message != NEON_SIEGE_INITIAL_COMMIT_MESSAGE:
+        raise RuntimeError("fixture initial commit message is not exact")
+    if _run(["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=repository).stdout:
+        raise RuntimeError("fixture initial worktree is not clean")
+    return BuiltFixture(repository, head, fixture_material_tree_hash(repository), message)
+
+
 __all__ = [
     "INCIDENT_BOARD_FIXTURE_ID",
     "INCIDENT_BOARD_FIXTURE_VERSION",
     "INCIDENT_BOARD_INITIAL_COMMIT_MESSAGE",
+    "NEON_SIEGE_FIXTURE_ID",
+    "NEON_SIEGE_FIXTURE_VERSION",
+    "NEON_SIEGE_INITIAL_COMMIT_MESSAGE",
     "WORKFLOW_CONSOLE_FIXTURE_ID",
     "WORKFLOW_CONSOLE_FIXTURE_VERSION",
     "WORKFLOW_CONSOLE_INITIAL_COMMIT_MESSAGE",
     "BuiltFixture",
     "build_incident_board_repository",
+    "build_neon_siege_blank_repository",
     "build_workflow_console_repository",
     "fixture_material_tree_hash",
 ]
