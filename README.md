@@ -1,379 +1,332 @@
-# agent-os (repository)
+# Admissible
 
-This repository is **historically named `agent-os`** but hosts **two sibling systems** that do not share runtime authority:
+Admissible is a local developer tool for governed delegation to coding agents.
+An operator defines a bounded mission, reviews the exact execution contract,
+authorizes it, runs a compatible native coding agent, and receives an
+evidence-backed result in a browser UI.
 
-| System | Role | Active surface |
-|--------|------|----------------|
-| **Admissible** | Benchmarkable action-admission layer for side-effecting AI-agent actions | `admissible/`, `benchmark/`, Admissible docs/tests |
-| **Agent OS** | Historical governed-delegation substrate (CLI, planning, evidence registrar) | `agent_os/`, Agent OS docs/tests |
+An agent's completion message is a claim. Admissible authorizes a bounded
+mission, captures execution evidence, independently reconstructs the result,
+and accepts or refuses the run based on that evidence.
 
-**Admissible modules must not import `agent_os`.** See [`docs/admissible-agent-os-lineage.md`](docs/admissible-agent-os-lineage.md) and [`docs/admissible-agent-os-boundary-audit.md`](docs/admissible-agent-os-boundary-audit.md).
+Admissible does not make agents reliable, formally verify arbitrary software,
+provide an OS sandbox, or treat an agent's own success message as proof.
 
----
+## OpenAI Build Week submission
 
-## Agent OS
+The judge-facing product is:
 
-**v0.1.0** — local governed-delegation prototype · [release notes](docs/release-notes-v0.1.0.md) · [why Agent OS](docs/why-agent-os.md)
-
-**Live static demo:** https://camarade-dev.github.io/agent-os-demo-governed-agent-chat/ — see how Agent OS wraps a familiar coding-agent chat with mission, scope, evidence, audit, owner decision, and closure.
-
-Agent OS is a **local filesystem protocol and CLI** for governed delegation to fallible coding and research agents. It is not a dashboard, SaaS, runtime, orchestrator, benchmark, or agent panel.
-
-## Admissible
-
-This repository also hosts **Admissible** — a benchmark/spec/prototype direction for evaluating whether proposed side-effecting AI-agent actions should be admitted at the execution boundary. It is separate from the Agent OS v0 CLI surface below.
-
-**Core distinction:** The model may propose what could be done. Admissible evaluates what may be done.
-
-Canonical objects in the current harness:
-
-- **action envelope** — one proposed side-effecting action at the execution boundary;
-- **admission decision** — ALLOW, ALLOW_WITH_LIMITS, REQUEST_MORE_EVIDENCE, REQUIRE_HUMAN_APPROVAL, or REFUSE;
-- **gold annotation** — benchmark ground truth, stored separately from the envelope;
-- **scoring result** — comparison of a system's decision against gold;
-- **run trace** — structured record of a benchmark run;
-- **visual trace viewer** — static HTML report over a run trace;
-- **demo scenario pack** — curated subset of seed cases for walkthroughs.
-
-### Current status
-
-The repo currently contains:
-
-- canonical Admissible docs;
-- JSON schemas;
-- 25 Tier 1 enriched seed cases;
-- gold annotations;
-- rules-only reference evaluator;
-- frontier-direct mock baseline runner;
-- scoring harness;
-- comparison runner;
-- run trace schema/generator;
-- static trace viewer;
-- curated 8-case demo pack;
-- demo script narrative.
-
-This is a smoke-tested internal harness, not a public benchmark result.
-
-### Admissible quickstart
-
-**Focused tests:**
-
-```bash
-python -m unittest tests.test_admissible_decision tests.test_admissible_rules_only tests.test_admissible_scoring tests.test_admissible_baseline_runner tests.test_admissible_compare_runner tests.test_admissible_trace tests.test_admissible_visual_trace_viewer tests.test_admissible_demo_pack tests.test_admissible_demo_trace tests.test_admissible_demo_script tests.test_admissible_boundary -v
+```text
+admissible/product_launcher/
+admissible/product_service/
+admissible/product_ui/
+admissible/product_read_model/
+admissible/delegated_gate/
 ```
 
-**Generate demo trace and HTML:**
+Historical Agent OS code, V0 controllers, benchmark materials, reports, and
+earlier demonstrations remain in this repository for provenance and regression
+coverage. They are not the judge-facing execution path. In particular, the
+historical `agent-os` console script remains supported but does not launch the
+Admissible product UI.
 
-```bash
-python -m admissible.runner.demo_trace \
-  --demo-pack benchmark/reports/demo-pack.json \
-  --gold benchmark/annotations/gold_labels.jsonl \
-  --mock-response benchmark/examples/mock_frontier_response.json \
-  --trace-out benchmark/reports/demo_trace.json \
-  --html-out benchmark/reports/demo_trace.html
+## What the operator does
+
+1. Enter a goal.
+2. Receive a structured mission proposal.
+3. Review and authorize the frozen contract.
+4. Launch the coding agent within that authority.
+5. Capture checkpoint, Git, workspace, and behavioral evidence.
+6. Reconstruct the result independently from persisted evidence.
+7. Refuse unsupported completion claims or present an evidence-backed accepted
+   result.
+8. Inspect the evidence and final workspace through the browser UI.
+
+The incident-replay workflow demonstrates why the final two steps are separate
+from agent execution. The agent claims completion in both attempts. The first
+run is refused because replay behavior is inconsistent with the required
+behavior. The corrected run is accepted only after the required behavior and
+the independently reconstructed evidence agree. Provider-free tests reproduce
+these authority outcomes with deterministic fixtures; they do not pretend to
+reproduce a real provider execution.
+
+## Architecture
+
+```text
+Browser UI
+  -> authenticated loopback product service
+  -> product launcher and frozen authorization contract
+  -> governed native child execution
+  -> checkpoint and evidence capture
+  -> independent product read model
+  -> authoritative accepted/refused presentation
 ```
 
-Open `benchmark/reports/demo_trace.html` in a browser.
+The model proposes work. The owner grants bounded authority. The native child
+executes under that contract. Evidence records what happened. The product read
+model reconstructs the outcome without trusting the child's completion claim.
+The final disposition shown to the owner comes from that reconstruction, not
+from the model proposal or agent output.
 
-### Hugging Face live provider
+Mission profile v2 and authorization payload V4 are active authority contracts
+for the verified workflow template. Compatibility schemas remain in the tree
+for historical evidence and fail-closed loading.
 
-For a practical live demo, configure Hugging Face Inference Providers:
+## Supported platform and prerequisites
 
-```powershell
-$env:ADMISSIBLE_HF_TOKEN="hf_..."
-$env:ADMISSIBLE_HF_MODEL="<model>"
-$env:ADMISSIBLE_HF_MAX_TOKENS="4000"
-$env:ADMISSIBLE_HF_BASE_URL="https://router.huggingface.co/v1"
-```
+Primary supported platform: **Windows**.
 
-Then run:
+Validated environment:
 
-```powershell
-python -m admissible.runner.demo_trace `
-  --demo-pack benchmark/reports/demo-pack.json `
-  --gold benchmark/annotations/gold_labels.jsonl `
-  --provider hf `
-  --trace-out benchmark/reports/hf_demo_trace.json `
-  --html-out benchmark/reports/hf_demo_trace.html
-```
+- Python 3.12
+- Git 2.45
+- Node.js 22
+- npm 10
 
-This remains a Tier 1 enriched smoke trace, not a benchmark result.
+The package declares Python 3.10 or newer, but the final product flow was
+validated on Windows with Python 3.12. Linux and macOS are not currently claimed
+as validated product platforms.
 
-### Gemini live provider
-
-For a free-tier Google Gemini auxiliary baseline (extractor/parser-style frontier
-direct), configure:
-
-```powershell
-$env:ADMISSIBLE_GEMINI_API_KEY="AIza..."
-$env:ADMISSIBLE_GEMINI_MODEL="gemini-2.5-flash"
-$env:ADMISSIBLE_GEMINI_MAX_OUTPUT_TOKENS="4096"
-$env:ADMISSIBLE_GEMINI_THINKING_BUDGET="0"
-$env:ADMISSIBLE_GEMINI_REQUEST_DELAY_SECONDS="6"
-```
-
-`gemini-2.5-flash` spends internal thinking tokens inside the same
-`maxOutputTokens` budget. Keep `ADMISSIBLE_GEMINI_THINKING_BUDGET=0` for
-structured JSON demos, and use 4096+ output tokens for longer envelopes.
-
-`ADMISSIBLE_GEMINI_API_KEY` is preferred. `GEMINI_API_KEY` is accepted as an
-optional fallback if you already export it in your shell. Do not commit keys;
-`.admissible/` is gitignored for local settings only.
-
-Then run:
-
-```powershell
-python -m admissible.runner.demo_trace `
-  --demo-pack benchmark/reports/demo-pack.json `
-  --gold benchmark/annotations/gold_labels.jsonl `
-  --provider gemini `
-  --trace-out benchmark/reports/gemini_demo_trace.json `
-  --html-out benchmark/reports/gemini_demo_trace.html
-```
-
-macOS/Linux/Git Bash equivalent:
-
-```bash
-export ADMISSIBLE_GEMINI_API_KEY="AIza..."
-export ADMISSIBLE_GEMINI_MODEL="gemini-2.5-flash"
-python -m admissible.runner.demo_trace \
-  --demo-pack benchmark/reports/demo-pack.json \
-  --gold benchmark/annotations/gold_labels.jsonl \
-  --provider gemini \
-  --trace-out benchmark/reports/gemini_demo_trace.json \
-  --html-out benchmark/reports/gemini_demo_trace.html
-```
-
-Single-case smoke test:
-
-```powershell
-python -m admissible.runner.baseline_runner `
-  --case benchmark/cases/tier_1_enriched/customer_communication/customer_refund_draft_allowed.envelope.json `
-  --provider gemini
-```
-
-This remains a Tier 1 enriched smoke trace, not a benchmark result.
-
-Optional local settings helper:
-
-```bash
-python -m admissible.harness.provider_settings --out .admissible/local_provider_settings.json
-```
-
-### Optional live model provider (env-http)
-
-The default demo path uses `frontier_direct_mock`.
-
-A generic env-http live frontier-direct baseline can still be run by configuring:
-
-- `ADMISSIBLE_MODEL_API_URL`
-- `ADMISSIBLE_MODEL_API_KEY`
-- `ADMISSIBLE_MODEL_NAME`
-- optionally `ADMISSIBLE_MODEL_TIMEOUT_SECONDS`
-
-Live model execution is optional and is not required for tests.
-
-Live runs remain Tier 1 enriched smoke tests, not benchmark results.
-
-### Documentation
-
-- [`docs/Admissible_THESIS.md`](docs/Admissible_THESIS.md) — thesis and design rationale
-- [`docs/Admissible_ACTION_ENVELOPE.md`](docs/Admissible_ACTION_ENVELOPE.md) — action envelope specification
-- [`docs/Admissible_BENCHMARK_SPEC.md`](docs/Admissible_BENCHMARK_SPEC.md) — benchmark design: cases, gold, baselines, scoring
-- [`docs/admissible-agent-os-lineage.md`](docs/admissible-agent-os-lineage.md) — canonical boundary between Admissible and Agent OS
-- [`docs/admissible-agent-os-boundary-audit.md`](docs/admissible-agent-os-boundary-audit.md) — repository boundary audit and file classification
-- [`benchmark/reports/demo-pack.md`](benchmark/reports/demo-pack.md) — curated demo scenario pack
-- [`benchmark/reports/demo-script.md`](benchmark/reports/demo-script.md) — narrated demo walkthrough
-
-### Agent OS boundary
-
-**Agent OS** is the prior/internal governed-delegation substrate (mission, scope, evidence, audit, owner decision, closure). **Admissible** is the current benchmark/prototype direction for execution-boundary action admission.
-
-Existing Agent OS CLI/orchestrator concepts are not automatically Admissible benchmark semantics. Agent OS "admissible for promotion" (a planning artifact ready for owner review) is not Admissible action admissibility (whether a side-effecting action may execute).
-
-### Non-claims
-
-- This is not a benchmark result.
-- The current frontier baseline in the demo path is a mock plumbing baseline, not a live frontier model.
-- The rules-only evaluator is designed for Tier 1 enriched cases.
-- The current seed set is small, hand-authored, and single-author annotated.
-- The project does not yet show generalization to raw or adversarial cases.
-- The project is not production-ready infrastructure.
-
-### Next technical step
-
-A live model provider boundary is available behind `ModelClient` (`admissible.runner.model_clients`). The default demo and test paths remain mock-only; optional live runs use `--provider hf` (Hugging Face), `--provider gemini` (Google Gemini), `--provider env-http`, or compare-runner systems `frontier_direct_hf` / `frontier_direct_gemini` / `frontier_direct_live` when environment variables are set.
-
-## What problem it solves
-
-Coding and research agents are useful but fallible. Ad-hoc prompts and chat threads do not reliably preserve mission, authority, evidence, audit, owner decision, or closure. Agent OS structures those concerns as inspectable markdown artifacts so delegation stays bounded and reviewable. It does **not** make agents reliable by itself, execute agents, or replace owner judgment.
-
-## What is in v0.1.0
-
-- **CLI** (`init`, `mission`, `status`, `audit`, `close`) plus registrar-only **evidence** helpers (`add`, `add-file`, `add-command-output`, `snapshot-git`, `list`)
-- **Templates** for mission, scope, authority, autonomy, evidence, audit, owner decision, closure, and memory update; plus planning artifact contracts under `agent_os/templates/planning/` (doctrine extension — not v0 CLI)
-- **Fail-closed closure** — runs cannot close until required fields are filled
-- **Stdlib-only Python package** — install from source, Python 3.10+, no runtime dependencies
-- **Documentation** — protocol primitives, operating loop, evidence doctrine, dogfood examples
-
-## What is not included
-
-Agent OS v0.1.0 is **not**: a UI or dashboard, an agent executor or orchestrator, a cloud service or API, multi-user auth, billing, benchmarks, LLM calls, auto-audit, or auto-close. See [`docs/v0-release-boundary.md`](docs/v0-release-boundary.md) for the formal boundary.
-
-## Who it is for
-
-Owners who delegate non-trivial work to agents and need **governed handoffs** — real scope risk, reviewable artifacts, and closure that waits on explicit fields, not on the agent stopping. Skip it for one-shot prompts where structure would be overhead.
-
-## Try it locally
-
-```bash
-git clone https://github.com/Camarade-dev/agent-os.git
-cd agent-os
-pip install -e .
-agent-os init .
-agent-os mission .
-agent-os status .
-```
-
-Fill run artifacts under `.agent-os/runs/<run-id>/`, then `agent-os audit <run-id> .` and `agent-os close <run-id> .`. Full walkthrough below.
-
----
-
-## When to use Agent OS (v0)
-
-Agent OS v0 is **not** meant for tiny one-shot tasks where a normal prompt is enough. It is meant for **governed delegation** where mission, authority, evidence, audit, and closure matter — work with real scope risk, a need for reviewable artifacts, or handoffs that must not close until required fields are filled.
-
-For concrete dogfood evidence and the usage-threshold tradeoff, see `docs/dogfood-001-todo-cli.md` (first run), `docs/dogfood-002-markdown-evidence-pack.md` (medium-scope local CLI), `docs/dogfood-003-local-site-audit.md` (medium-risk local site audit), and `docs/dogfood-004-json-config-linter.md` (full evidence stack on a JSON config linter). For what counts as acceptable evidence and how to capture it without turning Agent OS into a runtime, see `docs/evidence-capture-doctrine-v0.md`. For what evidence helpers may and may not do, see `docs/evidence-capture-boundaries-v0.md` (`agent-os evidence add`, `agent-os evidence add-file`, `agent-os evidence add-command-output`, and `agent-os evidence snapshot-git` are implemented as registrar-only; `snapshot-git` is the narrow explicit read-only Git exception — not arbitrary command execution).
-
-For an end-to-end local planning lifecycle demo, see [`docs/planning-end-to-end-demo.md`](docs/planning-end-to-end-demo.md). For the `PLANNING_RUN_SLICE` JSON contract (future runner import; optional in workspaces today), see [`docs/planning-structured-slice-format.md`](docs/planning-structured-slice-format.md).
-
-## Requirements
+Provider-free tests and UI smoke require:
 
 - Python 3.10+
-- Standard library only (no runtime dependencies)
+- Git
+- Node.js and npm for the behavioral/UI test paths
+- pytest, installed by the `test` extra
 
-## Install from source
+A real governed execution additionally requires:
 
-```bash
+- an available compatible coding-agent executable;
+- successful local executable attestation;
+- an environment-specific source repository and exact source HEAD;
+- separate run and contract-document directories;
+- owner review and authorization.
+
+Provider availability and provider authentication are external to Admissible.
+
+## Fresh-clone installation
+
+```powershell
 git clone https://github.com/Camarade-dev/agent-os.git
 cd agent-os
-pip install -e .
-```
 
-Verify the CLI:
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install ".[test]"
 
-```bash
+admissible --help
+python -m admissible.product_launcher --help
 agent-os --help
 ```
 
-## Run tests
+`admissible` and `python -m admissible.product_launcher` invoke the same final
+launcher. `agent-os` is retained for compatibility with the historical Agent OS
+CLI.
 
-```bash
-python -m unittest discover -s tests -v
+## Judge-facing provider-free path
+
+### 1. Start the local UI without a provider
+
+From the repository root in the activated virtual environment:
+
+```powershell
+$source = (Resolve-Path .).Path
+$head = (git rev-parse HEAD).Trim()
+$smoke = Join-Path $env:TEMP "admissible-judge-smoke"
+
+admissible `
+  --source-repository "$source" `
+  --required-source-head "$head" `
+  --run-parent "$smoke\runs" `
+  --contract-documents-directory "$smoke\contracts" `
+  --executable "definitely-not-a-provider" `
+  --attestation-class package-bin `
+  --authorization-mode PRECOMMITTED_DIGEST
 ```
 
-## Minimal example workflow
+The launcher prints a URL such as `http://127.0.0.1:<ephemeral-port>/`. Both
+product HTTP planes bind to `127.0.0.1`; port `0` selects free ephemeral ports.
+The UI can compose and review a mission without a provider. Preparing execution
+with the deliberately nonexistent executable must terminate in a safe
+`BLOCKED` preflight state because local capability attestation is unavailable;
+it must not create a governed run or invoke a provider. Stop the launcher with
+`Ctrl+C`.
 
-In any local project directory:
+### 2. Run the quick deterministic authority check
 
-```bash
-# 1. Bootstrap a workspace
-agent-os init .
+Use a short Windows temporary path to avoid nested-Git path-length failures:
 
-# 1b. Bootstrap a planning workspace (registrar only; no runs or agents)
-agent-os planning init <plan-id> .
+```powershell
+New-Item -ItemType Directory -Force C:\abw | Out-Null
+$env:PYTHONDONTWRITEBYTECODE = "1"
+$env:PYTHONHASHSEED = "0"
 
-# 1c. Inspect an existing planning workspace (read-only)
-agent-os planning status <plan-id> .
-
-# 1d. Weak read-only validation of a planning workspace (does not approve execution)
-agent-os planning validate <plan-id> .
-
-# 1e. Record an owner decision (evidence only; does not execute or create runs)
-agent-os planning decide <plan-id> . --decision REQUEST_REVISION --summary "fix scope"
-
-# 1f. List owner decision records (read-only)
-agent-os planning decisions list <plan-id> .
-
-# 1g. Apply artifact-progress manifest transitions (no owner decision)
-agent-os planning progress <plan-id> . --to CONTEXT_READY
-
-# 1h. Apply an explicit manifest transition authorized by owner decision
-agent-os planning transition <plan-id> . --to APPROVED_FOR_RUN_PROPOSALS
-
-# 2. Create a run from templates
-agent-os mission .
-
-# 3. Check status and unfilled required fields
-agent-os status .
-
-# 4. Fill run artifacts under .agent-os/runs/<run-id>/ (mission, scope,
-#    authority, autonomy, evidence, owner decision, closure verdict)
-#    Or append evidence with the registrar helper:
-#    agent-os evidence add <run-id> . --note "pytest: 6 passed"
-#    agent-os evidence add-file <run-id> . --file path/to/report.txt --note "build report"
-#    agent-os evidence add-command-output <run-id> . \
-#      --command "python -m unittest discover -s tests -v" \
-#      --output-file /tmp/test-out.txt --note "unit test output from local shell"
-#    agent-os evidence snapshot-git <run-id> . --note "pre-commit repository state"
-#    agent-os evidence list <run-id> .   # read-only index of structured entries
-
-# 5. Record an audit verdict
-agent-os audit <run-id> . --verdict pass
-
-# 6. Attempt closure (fail-closed until all required fields are filled)
-agent-os close <run-id> .
+python -m pytest -p no:cacheprovider --basetemp C:\abw\quick -q -ra `
+  tests/test_admissible_product_launcher_g2_5.py::test_golden_preparation_payload_and_launch_both_modes `
+  tests/test_admissible_product_service.py::test_http_start_is_202_and_second_active_is_409 `
+  tests/test_admissible_product_read_model.py::test_refused_before_behavioral_verification `
+  tests/test_admissible_product_read_model.py::test_verified_authoritative_verdict `
+  tests/test_admissible_product_ui_g4.py::test_result_evidence_and_transport_return_code_are_separate `
+  tests/test_admissible_behavioral_backend_authority_consistency.py::test_blocking_backend_drift_classes_remain_refused_with_truthful_terminal
 ```
 
-Required fields for closure:
+This provider-free set covers compose/authorize boundaries, product-service
+lifecycle, authoritative accepted/refused reconstruction, browser result
+presentation, and behavioral/backend authority consistency. Submission
+verification produced `11 passed` for this quick command.
 
-- mission statement
-- scope
-- authority
-- autonomy level or autonomy gates
-- at least one evidence item
-- audit verdict
-- owner decision
-- closure verdict
+A broader provider-free selection covering the launcher, service, read model,
+G1 integration, G3/G4 UI, workflow-recovery profile, behavioral/backend
+authority consistency, native checkpoint acceptance, and governed rerun
+produced:
 
-## CLI
-
-```bash
-agent-os --help
-agent-os init [PATH]          # bootstrap .agent-os/ in a target project
-agent-os planning init PLAN_ID [PATH]  # bootstrap DRAFT planning workspace (registrar only)
-agent-os planning status PLAN_ID [PATH]  # inspect planning workspace structure (read-only)
-agent-os planning validate PLAN_ID [PATH]  # weak read-only validation (does not approve execution)
-agent-os planning decide PLAN_ID [PATH] --decision DECISION --summary "..."  # record owner decision (evidence only)
-agent-os planning decisions list PLAN_ID [PATH]  # list owner decision records (read-only)
-agent-os planning progress PLAN_ID [PATH] --to STATUS  # artifact-progress manifest transition (no owner decision)
-agent-os planning transition PLAN_ID [PATH] --to STATUS  # explicit manifest transition (owner decision required)
-agent-os mission [PATH]       # create a new run from templates
-agent-os status [PATH]        # list runs and fields blocking closure
-agent-os audit RUN_ID [PATH]  # record an audit verdict
-agent-os evidence add RUN_ID [PATH] --note "..."  # append evidence block (registrar only)
-agent-os evidence add-file RUN_ID [PATH] --file <path> --note "..."  # register file path (reference only)
-agent-os evidence add-command-output RUN_ID [PATH] --command "..." --output-file <path> --note "..."  # register command + output (no execution)
-agent-os evidence snapshot-git RUN_ID [PATH] --note "..." [--repo <path>] [--no-include-diff-stat]  # read-only git snapshot (fixed allowlist only)
-agent-os evidence list RUN_ID [PATH]  # read-only index of structured evidence entries
-agent-os close RUN_ID [PATH]  # attempt fail-closed run closure
+```text
+74 focused product and authority tests passed without invoking a provider.
 ```
 
-## Repository layout
+## Real governed execution
 
-```
-agent-os/                 # historical repo name — two sibling systems, not a parent/child tree
-  admissible/             # ACTIVE: action-admission core, runners, harness (must not import agent_os)
-  benchmark/              # ACTIVE: schemas, cases, gold, scoring, demo artifacts
-  agent_os/               # LEGACY/SUBSTRATE: governed-delegation CLI and planning package
-    templates/            # run + planning artifact templates (packaged with install)
-  docs/                   # protocol + Admissible specification + boundary docs
-  examples/               # Agent OS planning workflow examples
-  tests/                  # unittest suite (test_admissible_* vs test_agent_os.py)
+The launcher entry points are:
+
+```text
+admissible
+python -m admissible.product_launcher
 ```
 
-## Philosophy
+The environment-specific form is:
 
-Agent OS v0 is intentionally minimal: CLI and scripts only, local-only, no cloud, no UI, no API server, no multi-user features, no billing, and no autonomous agent execution. The protocol lives in markdown artifacts under `.agent-os/` inside projects that adopt it.
+```powershell
+admissible `
+  --source-repository "<absolute-source-repository>" `
+  --required-source-head "<exact-lowercase-Git-object-id>" `
+  --run-parent "<absolute-run-parent>" `
+  --contract-documents-directory "<separate-absolute-directory>" `
+  --executable "<attested-compatible-agent-executable>" `
+  --attestation-class "<package-bin-or-wrapper-chain>" `
+  --authorization-mode INTERACTIVE_BOUND_CONFIRMATION
+```
 
-See [`docs/why-agent-os.md`](docs/why-agent-os.md) for the epistemic rationale, `docs/v0-release-boundary.md` for the v0 release boundary, `docs/thesis.md` for the product thesis, `docs/dogfood-001-todo-cli.md`, `docs/dogfood-002-markdown-evidence-pack.md`, `docs/dogfood-003-local-site-audit.md`, and `docs/dogfood-004-json-config-linter.md` for dogfood synthesis, `docs/evidence-capture-doctrine-v0.md` for evidence capture doctrine, `docs/evidence-capture-boundaries-v0.md` for evidence helper boundaries, [`docs/planning-layer-doctrine.md`](docs/planning-layer-doctrine.md) for the governed planning layer (doctrine extension, not v0 core), [`docs/planning-workspace-layout.md`](docs/planning-workspace-layout.md) for where planning packages live on disk, [`docs/planning-structured-slice-format.md`](docs/planning-structured-slice-format.md) for structured plan slice JSON (future runner import), [`docs/planning-decision-transition-doctrine.md`](docs/planning-decision-transition-doctrine.md) for how owner decisions relate to future manifest transitions, and `examples/manual-agent-workflow.md` for a walkthrough.
+The mission/template, workspace fixture, backend attestation, model selection,
+timeouts, and owner authorization must match the intended run. Never place an
+owner authorization phrase, authorization digest, capability token, or API key
+in source control or command history. This repository does not bundle a
+portable real-provider execution.
+
+## Security boundary and limitations
+
+The final product implements:
+
+- exact loopback-only product HTTP binding;
+- Host and Origin validation;
+- CSRF and capability-token boundaries;
+- Content Security Policy, `no-store`, and content-type hardening;
+- bounded request and output handling;
+- frozen mission, source, and authorization identities;
+- independent evidence reconstruction before an authoritative disposition.
+
+Important limits:
+
+- Admissible does not provide an OS-level filesystem or network sandbox.
+- Local same-user processes are not a cryptographic adversarial boundary and
+  can potentially tamper with resources available to that user.
+- Admissible does not make arbitrary agent output correct.
+- A completion claim can be refused when required evidence is missing,
+  inconsistent, or invalid.
+- Windows is the currently verified product platform.
+- Provider availability, provider behavior, and provider credentials remain
+  external dependencies.
+
+## What was built during OpenAI Build Week
+
+### Pre-existing work
+
+The repository predates the submission period. Pre-existing work includes:
+
+- the Agent OS protocol and CLI;
+- the early Admissible thesis and action-admission research;
+- benchmark schemas, cases, scoring material, and prior research artifacts.
+
+These materials are retained to make the lineage inspectable; they are not
+presented as newly created Build Week product work.
+
+### Added or meaningfully extended during July 13-21, 2026
+
+Verified Git history records:
+
+- bounded governed execution (`decf0a3`, `e70c287`);
+- the delegated gate and native executor (`1396467`, `ab8b47d`);
+- executable attestation and owner authorization payloads (`e5b267f`,
+  `6ee8293`);
+- checkpoint, evidence reconstruction, and acceptance (`4805479`, `faac579`);
+- the Build Week evidence replay (`d62e1ea`);
+- native mission execution (`51a4c50`);
+- independent product read model and authoritative reconstruction (`692c3e1`,
+  `15eb739`, `e57d0b4`);
+- authenticated loopback product service (`911adec`);
+- contract authoring and browser-safe launcher (`d3b5a0e`);
+- browser compose/authorize flow (`be8ed07`);
+- browser result/evidence flow (`b2a20ed`);
+- verified incident-replay workflow (`c3dd831`);
+- governed rerun recovery (`226eb07`);
+- final behavioral/backend authority consistency (`16e7024`).
+
+This list is representative. It does not claim that every historical file in
+the repository was created during Build Week.
+
+## Codex and GPT-5.6 collaboration
+
+Codex was used throughout the Build Week implementation and verification
+process. GPT-5.6 was used in the final submission-hardening session to:
+
+- perform an adversarial repository audit;
+- identify the wrong public source and stale product narrative;
+- repair installable UI packaging;
+- prepare the judge-facing repository documentation;
+- run provider-free verification.
+
+This README does not attribute earlier implementation work to GPT-5.6 without
+an identified session. The submission form contains the `/feedback` Session ID
+for the primary core build thread; no unknown or fabricated Session ID is
+stored here.
+
+## Repository map
+
+```text
+admissible/
+  product_launcher/     final CLI, preflight, authorization and child launch
+  product_service/      authenticated loopback product control plane
+  product_ui/           source-controlled browser UI
+  product_read_model/   independent evidence reconstruction and presentation
+  delegated_gate/       mission profiles, executor, checkpoints and evidence
+
+tests/
+  test_admissible_product_*       final product and UI coverage
+  test_admissible_workflow_*      trusted workflow profile coverage
+  test_admissible_v0_*            historical regression coverage
+
+benchmark/
+  schemas, fixtures, reports and earlier demonstration material
+
+agent_os/
+  historical Agent OS protocol and CLI package
+
+docs/
+  current architecture, security, protocol, and historical documentation
+```
+
+The trusted workflow profile and local fixture registry live under
+`admissible/delegated_gate/`. Historical evidence and reports are test or
+provenance inputs, not runtime authority merely because they are present.
+
+## Further technical documentation
+
+- [Native executor and authority boundary](docs/admissible-native-executor-canary.md)
+- [Build Week read-only evidence replay](docs/admissible-build-week-demo.md)
+- [Admissible thesis](docs/Admissible_THESIS.md)
+- [Agent OS lineage boundary](docs/admissible-agent-os-lineage.md)
+
+## License
+
+Admissible and the retained repository materials are distributed under the
+[MIT License](LICENSE).

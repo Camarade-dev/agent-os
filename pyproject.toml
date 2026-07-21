@@ -5,13 +5,17 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agent-os"
 version = "0.1.0"
-description = "Local epistemic protocol for governed agentic execution"
+description = "Admissible local developer tool for governed coding-agent execution and evidence-backed acceptance"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 
+[project.optional-dependencies]
+test = ["pytest"]
+
 [project.scripts]
 agent-os = "agent_os.cli:main"
+admissible = "admissible.product_launcher.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -19,6 +23,7 @@ include = ["agent_os*", "admissible*"]
 
 [tool.setuptools.package-data]
 agent_os = ["templates/*.md"]
+"admissible.product_ui" = ["index.html", "app.css", "app.js"]
 
 [tool.pytest.ini_options]
 markers = [

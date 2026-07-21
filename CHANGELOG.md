@@ -1,5 +1,27 @@
 # Changelog
 
+## Admissible OpenAI Build Week submission — 2026-07-21
+
+Submission hardening for the final Admissible product, distinct from the
+historical Agent OS v0.1.0 release below.
+
+### Product surface
+
+- Added the governed native product launcher and authenticated loopback service.
+- Added browser compose/authorize and result/evidence flows.
+- Added independent evidence reconstruction with authoritative accepted/refused
+  presentation.
+- Added the verified incident-replay workflow, governed rerun recovery, and
+  behavioral/backend authority consistency.
+
+### Submission
+
+- Made the source-controlled product UI assets installable with the Python
+  distribution.
+- Added the `admissible` launcher entry point while preserving `agent-os`.
+- Added provider-free judge instructions, Build Week provenance, security
+  boundaries, and the root MIT license.
+
 ## v0.1.0 — 2026-07-04
 
 Initial local governed-delegation prototype.
