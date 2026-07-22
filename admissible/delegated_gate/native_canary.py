@@ -492,6 +492,8 @@ def resolve_fixture_builder(fixture_id: str, fixture_version: int) -> Any:
 
 def create_canary_session(*, session_id: str, profile: NativeMissionProfile | None = None) -> DelegatedSessionState:
     profile = (profile if profile is not None else legacy_canary_profile()).validated()
+    if profile.has_nested_runtime_authority and not profile.is_launchable_runtime_profile:
+        raise ValueError("native canary sessions require the launchable runtime-v2 schema")
     mission = Mission.create(mission_id=profile.mission_id, specification=profile.mission_text)
     gate = GateContract.create(
         gate_id=profile.gate_id, objective=profile.gate_objective,
@@ -507,7 +509,9 @@ def build_native_agent_prompt(*, mission: Mission, gate_contract: GateContract, 
     clauses = "\n".join(f"- [{clause.clause_id}] {clause.text}" for clause in gate_contract.clauses)
     if profile is not None:
         profile = profile.validated()
-    if profile is not None and profile.is_runtime_profile:
+        if profile.has_nested_runtime_authority and not profile.is_launchable_runtime_profile:
+            raise ValueError("native agent prompts require the launchable runtime-v2 schema")
+    if profile is not None and profile.is_launchable_runtime_profile:
         policy = profile.effective_git_end_state_policy
         verification = profile.verification.validated()
         prompt_authority = profile.runtime_prompt.validated()
@@ -856,7 +860,7 @@ class EvidenceOnlyCanaryReconstruction:
         checkpoint_status: str | None = None
         verifier_source_sha256: str | None = None
         behavioral_verifier_passed: bool | None = None
-        if profile is not None and profile.is_runtime_profile:
+        if profile is not None and profile.is_launchable_runtime_profile:
             verification_mode = profile.verification_mode.value
             exact_classification = status.value
             if status is NativeCanaryStatus.CHECKPOINT_CAPTURED_CANARY_SUCCESS:
@@ -969,7 +973,7 @@ class EvidenceOnlyCanaryReconstruction:
         expected_behavioral_fingerprint = (
             behavioral.evidence_fingerprint if behavioral is not None else None
         )
-        expected_verification_mode = profile.verification_mode.value if profile.is_runtime_profile else None
+        expected_verification_mode = profile.verification_mode.value if profile.is_launchable_runtime_profile else None
         if (
             attempt.session_id!=state.session_id or attempt.gate_id!=state.current_gate.gate_id or attempt.execution_attempt_index!=0
             or attempt.request_fingerprint!=request.request_fingerprint or attempt.result_fingerprint!=result.result_fingerprint
@@ -1092,7 +1096,7 @@ class NativeCanaryCoordinator(EvidenceOnlyCanaryReconstruction):
         reason=_pre_capture_reason(result,behavioral,self.profile)
         if reason is not None:
             return self._publish_failure_terminal(state=state,request=request,result=result,status=NativeCaptureTerminalStatus.PRECAPTURE_FAILED,failure_category="pre_capture_eligibility",diagnostic=reason)
-        try: capture_attempt=self.execution_store.create_capture_attempt(request=request,result=result,gate_plan_fingerprint=state.gate_plan.plan_fingerprint,checkpoint_contract_fingerprint=gate.contract_fingerprint,behavioral_evidence_fingerprint=behavioral.evidence_fingerprint if behavioral is not None else None,required_command_ids=tuple(command.command_id for command in gate.checkpoint_verification_commands),state_revision=state.revision,verification_mode=self.profile.verification_mode.value if self.profile.is_runtime_profile else None)
+        try: capture_attempt=self.execution_store.create_capture_attempt(request=request,result=result,gate_plan_fingerprint=state.gate_plan.plan_fingerprint,checkpoint_contract_fingerprint=gate.contract_fingerprint,behavioral_evidence_fingerprint=behavioral.evidence_fingerprint if behavioral is not None else None,required_command_ids=tuple(command.command_id for command in gate.checkpoint_verification_commands),state_revision=state.revision,verification_mode=self.profile.verification_mode.value if self.profile.is_launchable_runtime_profile else None)
         except NativeCommittedButDurabilityUncertain as exc: return self._publish_failure_terminal(state=state,request=request,result=result,status=NativeCaptureTerminalStatus.DURABILITY_UNCERTAIN,failure_category="capture_attempt_durability_uncertain",diagnostic=str(exc))
         try:
             captured=capture_checkpoint(repository=self.work_workspace,artifact_directory=self.evidence_directory / "checkpoint-artifacts",session_id=session_id,gate_contract=gate,execution_attempt_index=0)
@@ -1146,7 +1150,7 @@ def reconstruct_completed_native_mission(*, session_store: AtomicDelegatedSessio
         execution_store=execution_store, evidence_directory=evidence
     )
     profile = reconstruction._persisted_profile()
-    if not profile.is_runtime_profile:
+    if not profile.is_launchable_runtime_profile:
         raise NativeEvidenceInvalid("general product reconstruction requires a runtime-v2 profile")
     binding = execution_store.load_request_structural(session_id, gate.gate_id, 0)
     if execution_store.has_terminal(session_id, gate.gate_id, 0):
@@ -2261,7 +2265,7 @@ def _observe_built_fixture(built: Any, profile: NativeMissionProfile) -> Initial
         raise NativeEvidenceInvalid("fixture builder facts contradict the independent observation")
     if count_text != "1":
         raise NativeEvidenceInvalid("initialized workspace must contain exactly one commit")
-    if not profile.is_runtime_profile and message != profile.fixture_initial_commit_message:
+    if not profile.has_nested_runtime_authority and message != profile.fixture_initial_commit_message:
         raise NativeEvidenceInvalid("initialized workspace initial commit message is not exact")
     if status:
         raise NativeEvidenceInvalid("initialized workspace worktree is not clean")
@@ -2270,7 +2274,7 @@ def _observe_built_fixture(built: Any, profile: NativeMissionProfile) -> Initial
     source = profile.effective_workspace_source
     if source.kind is not WorkspaceSourceKind.REGISTERED_FIXTURE:
         raise NativeEvidenceInvalid("fixture observation requires registered fixture authority")
-    if profile.is_runtime_profile:
+    if profile.has_nested_runtime_authority:
         return InitializedWorkspaceIdentity(
             head,
             tree,
@@ -2291,6 +2295,8 @@ def observe_initialized_workspace_identity(profile: NativeMissionProfile) -> Ini
     """
 
     profile.validated()
+    if profile.has_nested_runtime_authority and not profile.is_launchable_runtime_profile:
+        raise ValueError("initialized workspace observation requires the launchable runtime-v2 schema")
     source = profile.effective_workspace_source
     scratch = Path(tempfile.mkdtemp(prefix="admissible-fixture-rehearsal-"))
     try:
@@ -2409,6 +2415,8 @@ class NativeCanaryAuthorizationPayloadV4:
         if not isinstance(self.mission_profile, NativeMissionProfile):
             raise ValueError("v4 authorization payload must embed the complete mission profile")
         profile = self.mission_profile.validated()
+        if profile.has_nested_runtime_authority and not profile.is_launchable_runtime_profile:
+            raise ValueError("runtime-v4 authorization requires the launchable runtime-v2 schema")
         if not isinstance(self.initialized_workspace, InitializedWorkspaceIdentity):
             raise ValueError("v4 authorization payload must bind the initialized workspace identity")
         self.initialized_workspace.validated()
@@ -2474,7 +2482,7 @@ class NativeCanaryAuthorizationPayloadV4:
         if Path(self.run_root).name != profile.run_id:
             raise ValueError("authorization run root basename must equal the profile run ID")
         source_authority = profile.effective_workspace_source
-        if profile.is_runtime_profile:
+        if profile.is_launchable_runtime_profile:
             if (
                 self.initialized_workspace.source_kind != source_authority.kind.value
                 or self.initialized_workspace.source_identity != source_authority.identity_fingerprint
@@ -2770,6 +2778,8 @@ def run_native_mission_application(
         if profile is not None
         else load_native_mission_profile_document(profile_document)
     )
+    if selected.has_nested_runtime_authority and not selected.is_launchable_runtime_profile:
+        raise ValueError("native mission execution requires the launchable runtime-v2 schema")
     arguments = [
         "--source-repository", str(source_repository),
         "--required-source-head", required_source_head,

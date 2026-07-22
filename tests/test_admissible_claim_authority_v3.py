@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -14,6 +15,9 @@ from admissible.delegated_gate.mission_profile import (
     ClaimSetCoverageStatus,
     GitEndStatePolicy,
     MISSION_PROFILE_SCHEMA_VERSION_V3,
+    MAX_CLAIMS_PER_AUTHORITY,
+    MAX_DEPENDENCIES_PER_CLAIM,
+    MAX_NON_CLAIMS_PER_CLAIM,
     NativeMissionProfile,
     ResultClaim,
     RuntimePromptAuthority,
@@ -22,8 +26,15 @@ from admissible.delegated_gate.mission_profile import (
     WorkspaceSourceAuthority,
     WorkspaceSourceKind,
     create_native_mission_profile,
+    load_native_mission_profile_document,
 )
 from admissible.delegated_gate.models import EvidenceKind
+from admissible.delegated_gate.native_canary import (
+    build_native_agent_prompt,
+    create_canary_session,
+    observe_initialized_workspace_identity,
+    run_native_mission_application,
+)
 
 
 def _claim(
@@ -201,6 +212,78 @@ def test_claim_authority_accepts_ordered_dependency_dag():
     assert _authority(claims=claims).validated().claims == claims
 
 
+def test_claim_authority_collection_bounds_are_inclusive():
+    claims = tuple(_claim(f"claim.{index}") for index in range(MAX_CLAIMS_PER_AUTHORITY))
+    assert len(_authority(claims=claims).validated().claims) == MAX_CLAIMS_PER_AUTHORITY
+    with pytest.raises(ValueError, match="claims cannot exceed"):
+        _authority(claims=claims + (_claim("claim.overflow"),)).validated()
+
+    dependencies = tuple(f"dependency.{index}" for index in range(MAX_DEPENDENCIES_PER_CLAIM))
+    dependency_claims = (_claim("root", depends_on=dependencies),) + tuple(
+        _claim(dependency) for dependency in dependencies
+    )
+    assert len(_authority(claims=dependency_claims).validated().claims[0].depends_on) == 64
+    with pytest.raises(ValueError, match="dependencies cannot exceed"):
+        _claim(depends_on=dependencies + ("dependency.overflow",)).validated()
+
+    non_claims = tuple(f"Excluded assertion {index}" for index in range(MAX_NON_CLAIMS_PER_CLAIM))
+    assert len(_claim(non_claims=non_claims).validated().non_claims) == 64
+    with pytest.raises(ValueError, match="non-claims cannot exceed"):
+        _claim(non_claims=non_claims + ("Excluded overflow",)).validated()
+
+
+def test_claim_authority_iterative_graph_validation_covers_deep_and_disconnected_graphs():
+    chain = tuple(
+        _claim(f"chain.{index}", depends_on=((f"chain.{index + 1}",) if index + 1 < 256 else ()))
+        for index in range(256)
+    )
+    assert _authority(claims=chain).validated().claims == chain
+
+    long_cycle = tuple(
+        _claim(f"cycle.{index}", depends_on=(f"cycle.{(index + 1) % 256}",))
+        for index in range(256)
+    )
+    with pytest.raises(ValueError, match="acyclic"):
+        _authority(claims=long_cycle).validated()
+
+    disconnected_cycle = (
+        _claim("dag.root", depends_on=("dag.leaf",)), _claim("dag.leaf"),
+        _claim("cycle.a", depends_on=("cycle.b",)), _claim("cycle.b", depends_on=("cycle.a",)),
+    )
+    with pytest.raises(ValueError, match="acyclic"):
+        _authority(claims=disconnected_cycle).validated()
+
+    disconnected_dag = (
+        _claim("left.root", depends_on=("left.leaf",)), _claim("left.leaf"),
+        _claim("right.root", depends_on=("right.leaf",)), _claim("right.leaf"),
+    )
+    assert _authority(claims=disconnected_dag).validated().claims == disconnected_dag
+    diamond = (
+        _claim("top", depends_on=("left", "right")),
+        _claim("left", depends_on=("bottom",)),
+        _claim("right", depends_on=("bottom",)), _claim("bottom"),
+    )
+    assert _authority(claims=diamond).validated().claims == diamond
+
+
+@pytest.mark.parametrize("field", ["depends_on", "non_claims"])
+@pytest.mark.parametrize("invalid", [True, 1])
+def test_result_claim_rejects_boolean_and_non_string_collection_values(field, invalid):
+    values = {"depends_on": (), "non_claims": ()}
+    values[field] = (invalid,)
+    with pytest.raises(ValueError):
+        _claim(**values).validated()
+
+
+def test_direct_invalid_coverage_status_and_unknown_nested_keys_fail_closed():
+    with pytest.raises(ValueError, match="coverage"):
+        replace(_authority(), coverage_status="NOT_ASSESSED").validated()
+    data = _authority().to_dict()
+    data["claims"][0]["unknown"] = "closed"
+    with pytest.raises(ValueError, match="keys"):
+        ClaimAuthority.from_dict(data)
+
+
 def test_v3_construction_round_trip_and_fingerprint_participation():
     profile = _profile()
     assert profile.schema_version == MISSION_PROFILE_SCHEMA_VERSION_V3
@@ -208,6 +291,80 @@ def test_v3_construction_round_trip_and_fingerprint_participation():
     assert profile.profile_fingerprint == fingerprint(profile._body())
     assert NativeMissionProfile.from_dict(profile.to_dict()) == profile
     assert canonical_bytes(NativeMissionProfile.from_dict(profile.to_dict()).to_dict()) == canonical_bytes(profile.to_dict())
+
+
+def test_predicates_separate_nested_shape_from_launchability():
+    v1 = FLAGSHIP_INCIDENT_REPLAY_PROFILE
+    v3 = _profile()
+    v2_data = v3.to_dict()
+    v2_data["schema_version"] = "admissible_native_mission_profile_v2"
+    v2_data.pop("claim_authority")
+    v2 = NativeMissionProfile.from_dict(_refingerprint(v2_data))
+    assert (v1.has_nested_runtime_authority, v1.is_launchable_runtime_profile) == (False, False)
+    assert (v2.has_nested_runtime_authority, v2.is_launchable_runtime_profile) == (True, True)
+    assert (v3.has_nested_runtime_authority, v3.is_launchable_runtime_profile) == (True, False)
+
+
+def test_v3_runtime_prompt_session_and_document_loading_fail_closed(tmp_path):
+    v3 = _profile()
+    with pytest.raises(ValueError, match="launchable runtime-v2"):
+        create_canary_session(session_id=v3.session_id, profile=v3)
+
+    v2_data = v3.to_dict()
+    v2_data["schema_version"] = "admissible_native_mission_profile_v2"
+    v2_data.pop("claim_authority")
+    v2 = NativeMissionProfile.from_dict(_refingerprint(v2_data))
+    state = create_canary_session(session_id=v2.session_id, profile=v2)
+    v2_prompt = build_native_agent_prompt(
+        mission=state.mission, gate_contract=state.current_gate,
+        work_workspace=tmp_path.resolve(), profile=v2,
+    )
+    assert "Permitted effects:" in v2_prompt
+    assert "Exact stop clause:" in v2_prompt
+    with pytest.raises(ValueError, match="launchable runtime-v2"):
+        build_native_agent_prompt(
+            mission=state.mission, gate_contract=state.current_gate,
+            work_workspace=tmp_path.resolve(), profile=v3,
+        )
+
+    document = tmp_path / "v3.json"
+    document.write_text(json.dumps(v3.to_dict()), encoding="utf-8")
+    with pytest.raises(ValueError, match="v2 schema"):
+        load_native_mission_profile_document(document.resolve())
+
+    with pytest.raises(ValueError, match="launchable runtime-v2"):
+        observe_initialized_workspace_identity(v3)
+    with pytest.raises(ValueError, match="launchable runtime-v2"):
+        run_native_mission_application(
+            source_repository=tmp_path,
+            required_source_head="0" * 40,
+            run_root=tmp_path / "run",
+            run_id=v3.run_id,
+            session_id=v3.session_id,
+            executable="unreachable-provider",
+            profile=v3,
+            preflight_only=True,
+        )
+
+
+def test_claim_authority_identity_and_order_fingerprints_are_derived_and_order_sensitive():
+    first = _claim("first", non_claims=("one", "two"))
+    second = _claim("second")
+    claims_a = _authority(claims=(first, second))
+    claims_b = _authority(claims=(second, first))
+    assert _profile(claims_a).profile_fingerprint != _profile(claims_b).profile_fingerprint
+
+    non_claims_reordered = _authority(claims=(replace(first, non_claims=("two", "one")), second))
+    assert _profile(claims_a).profile_fingerprint != _profile(non_claims_reordered).profile_fingerprint
+
+    dependency_targets = (_claim("root", depends_on=("left", "right")), _claim("left"), _claim("right"))
+    dependencies_reordered = (replace(dependency_targets[0], depends_on=("right", "left")),) + dependency_targets[1:]
+    assert _profile(_authority(claims=dependency_targets)).profile_fingerprint != _profile(_authority(claims=dependencies_reordered)).profile_fingerprint
+
+    authority = claims_a.validated()
+    assert "identity_fingerprint" not in authority.to_dict()
+    assert authority.identity_fingerprint == authority.identity_fingerprint == fingerprint(authority.to_dict())
+    assert authority.identity_fingerprint != non_claims_reordered.validated().identity_fingerprint
 
 
 @pytest.mark.parametrize("authority", [

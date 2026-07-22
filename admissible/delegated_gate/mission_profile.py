@@ -43,6 +43,9 @@ from admissible.delegated_gate.models import EvidenceKind, VerificationCommand
 MISSION_PROFILE_SCHEMA_VERSION = "admissible_native_mission_profile_v1"
 MISSION_PROFILE_SCHEMA_VERSION_V2 = "admissible_native_mission_profile_v2"
 MISSION_PROFILE_SCHEMA_VERSION_V3 = "admissible_native_mission_profile_v3"
+MAX_CLAIMS_PER_AUTHORITY = 256
+MAX_DEPENDENCIES_PER_CLAIM = 64
+MAX_NON_CLAIMS_PER_CLAIM = 64
 # The one authorized one-shot budget shape:
 # (provider invocations, native attempts, repair rounds, auditors, retries).
 ONE_SHOT_PROFILE_BUDGETS: tuple[int, int, int, int, int] = (1, 1, 0, 0, 0)
@@ -94,6 +97,8 @@ class ResultClaim:
             raise ValueError("claim obligation level is invalid")
         if not isinstance(self.depends_on, tuple):
             raise ValueError("claim dependencies must be an ordered tuple")
+        if len(self.depends_on) > MAX_DEPENDENCIES_PER_CLAIM:
+            raise ValueError(f"claim dependencies cannot exceed {MAX_DEPENDENCIES_PER_CLAIM}")
         for dependency in self.depends_on:
             require_identifier(dependency, "claim dependency")
         if len(set(self.depends_on)) != len(self.depends_on):
@@ -102,6 +107,8 @@ class ResultClaim:
             raise ValueError("claim cannot depend on itself")
         if not isinstance(self.non_claims, tuple):
             raise ValueError("non-claims must be an ordered tuple")
+        if len(self.non_claims) > MAX_NON_CLAIMS_PER_CLAIM:
+            raise ValueError(f"non-claims cannot exceed {MAX_NON_CLAIMS_PER_CLAIM}")
         for statement in self.non_claims:
             require_nonempty_text(statement, "non-claim statement", max_bytes=4096)
         if len(set(self.non_claims)) != len(self.non_claims):
@@ -120,6 +127,16 @@ class ResultClaim:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "ResultClaim":
         require_exact_keys(data, set(cls.__dataclass_fields__), "result claim")
+        raw_dependencies = data["depends_on"]
+        if not isinstance(raw_dependencies, list):
+            raise ValueError("claim dependencies must be an ordered array")
+        if len(raw_dependencies) > MAX_DEPENDENCIES_PER_CLAIM:
+            raise ValueError(f"claim dependencies cannot exceed {MAX_DEPENDENCIES_PER_CLAIM}")
+        raw_non_claims = data["non_claims"]
+        if not isinstance(raw_non_claims, list):
+            raise ValueError("non-claims must be an ordered array")
+        if len(raw_non_claims) > MAX_NON_CLAIMS_PER_CLAIM:
+            raise ValueError(f"non-claims cannot exceed {MAX_NON_CLAIMS_PER_CLAIM}")
         try:
             obligation_level = ClaimObligationLevel(data["obligation_level"])
         except (TypeError, ValueError) as exc:
@@ -128,8 +145,8 @@ class ResultClaim:
             claim_id=data["claim_id"],
             statement=data["statement"],
             obligation_level=obligation_level,
-            depends_on=require_string_list(data["depends_on"], "claim dependencies"),
-            non_claims=require_string_list(data["non_claims"], "non-claims"),
+            depends_on=require_string_list(raw_dependencies, "claim dependencies"),
+            non_claims=require_string_list(raw_non_claims, "non-claims"),
         ).validated()
 
 
@@ -148,6 +165,8 @@ class ClaimAuthority:
             raise ValueError("claim coverage status must be NOT_ASSESSED")
         if not isinstance(self.claims, tuple) or not self.claims:
             raise ValueError("claims must be a non-empty ordered tuple")
+        if len(self.claims) > MAX_CLAIMS_PER_AUTHORITY:
+            raise ValueError(f"claims cannot exceed {MAX_CLAIMS_PER_AUTHORITY}")
         claim_ids: list[str] = []
         for claim in self.claims:
             if not isinstance(claim, ResultClaim):
@@ -160,23 +179,32 @@ class ClaimAuthority:
         for claim in self.claims:
             if not set(claim.depends_on) <= known_ids:
                 raise ValueError("claim dependency target is missing")
-        dependencies = {claim.claim_id: claim.depends_on for claim in self.claims}
-        visiting: set[str] = set()
-        visited: set[str] = set()
-
-        def visit(claim_id: str) -> None:
-            if claim_id in visiting:
-                raise ValueError("claim dependency graph must be acyclic")
-            if claim_id in visited:
-                return
-            visiting.add(claim_id)
-            for dependency in dependencies[claim_id]:
-                visit(dependency)
-            visiting.remove(claim_id)
-            visited.add(claim_id)
-
-        for claim_id in claim_ids:
-            visit(claim_id)
+        index_by_id = {claim_id: index for index, claim_id in enumerate(claim_ids)}
+        dependencies = tuple(
+            tuple(index_by_id[dependency] for dependency in claim.depends_on)
+            for claim in self.claims
+        )
+        # 0 = unseen, 1 = active, 2 = complete.  Both roots and dependency
+        # edges retain owner-specified order; the indices are validation-only.
+        state = [0] * len(self.claims)
+        for root in range(len(self.claims)):
+            if state[root] != 0:
+                continue
+            state[root] = 1
+            stack: list[tuple[int, int]] = [(root, 0)]
+            while stack:
+                claim_index, dependency_offset = stack[-1]
+                if dependency_offset == len(dependencies[claim_index]):
+                    state[claim_index] = 2
+                    stack.pop()
+                    continue
+                dependency_index = dependencies[claim_index][dependency_offset]
+                stack[-1] = (claim_index, dependency_offset + 1)
+                if state[dependency_index] == 1:
+                    raise ValueError("claim dependency graph must be acyclic")
+                if state[dependency_index] == 0:
+                    state[dependency_index] = 1
+                    stack.append((dependency_index, 0))
         return self
 
     def to_dict(self) -> dict[str, Any]:
@@ -204,6 +232,8 @@ class ClaimAuthority:
         raw_claims = data["claims"]
         if not isinstance(raw_claims, list):
             raise ValueError("claims must be an ordered array")
+        if len(raw_claims) > MAX_CLAIMS_PER_AUTHORITY:
+            raise ValueError(f"claims cannot exceed {MAX_CLAIMS_PER_AUTHORITY}")
         return cls(
             authorship=authorship,
             coverage_status=coverage_status,
@@ -577,8 +607,21 @@ class NativeMissionProfile:
         return data
 
     @property
-    def is_runtime_profile(self) -> bool:
+    def has_nested_runtime_authority(self) -> bool:
+        return self.schema_version in {
+            MISSION_PROFILE_SCHEMA_VERSION_V2,
+            MISSION_PROFILE_SCHEMA_VERSION_V3,
+        }
+
+    @property
+    def is_launchable_runtime_profile(self) -> bool:
         return self.schema_version == MISSION_PROFILE_SCHEMA_VERSION_V2
+
+    @property
+    def is_runtime_profile(self) -> bool:
+        """Compatibility alias for the historically V2-only runtime boundary."""
+
+        return self.is_launchable_runtime_profile
 
     @property
     def effective_workspace_source(self) -> WorkspaceSourceAuthority:
@@ -1904,6 +1947,9 @@ __all__ = [
     "MISSION_PROFILE_SCHEMA_VERSION",
     "MISSION_PROFILE_SCHEMA_VERSION_V2",
     "MISSION_PROFILE_SCHEMA_VERSION_V3",
+    "MAX_CLAIMS_PER_AUTHORITY",
+    "MAX_DEPENDENCIES_PER_CLAIM",
+    "MAX_NON_CLAIMS_PER_CLAIM",
     "NEON_SIEGE_PROFILE",
     "ONE_SHOT_PROFILE_BUDGETS",
     "WORKFLOW_RECOVERY_COMPLETION_CONDITIONS_TEXT",

@@ -848,6 +848,8 @@ PROTECTED_PATH_PREFIXES = (
 #     fixture registry, mission profile and neon siege mission;
 #   - V0.3 Step 1 authorized gate-clause visibility (4da0b39) surfaced the
 #     existing clauses through the read-model view type and the control plane.
+#   - V0.3 Step 2A/2A.1 authorized the inert ClaimAuthority schema and its
+#     pre-integration hardening in mission_profile.py and native_canary.py.
 AUTHORIZED_REPAIR_PATHS = frozenset({
     "admissible/product_read_model/read_model.py",
     "admissible/product_read_model/renderer.py",
