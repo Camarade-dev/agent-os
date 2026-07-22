@@ -29,6 +29,7 @@ from typing import Any, Mapping
 
 from admissible.delegated_gate.canonical import (
     fingerprint,
+    require_bool,
     require_exact_keys,
     require_identifier,
     require_nonempty_text,
@@ -43,9 +44,15 @@ from admissible.delegated_gate.models import EvidenceKind, VerificationCommand
 MISSION_PROFILE_SCHEMA_VERSION = "admissible_native_mission_profile_v1"
 MISSION_PROFILE_SCHEMA_VERSION_V2 = "admissible_native_mission_profile_v2"
 MISSION_PROFILE_SCHEMA_VERSION_V3 = "admissible_native_mission_profile_v3"
+MISSION_PROFILE_SCHEMA_VERSION_V4 = "admissible_native_mission_profile_v4"
 MAX_CLAIMS_PER_AUTHORITY = 256
 MAX_DEPENDENCIES_PER_CLAIM = 64
 MAX_NON_CLAIMS_PER_CLAIM = 64
+MAX_VERIFICATION_OBLIGATIONS = 256
+MAX_CLAIM_REFERENCES_PER_OBLIGATION = 64
+MAX_NON_CLAIMS_PER_VERIFICATION_OBLIGATION = 64
+MAX_NEGATIVE_CONTROLS_PER_OBLIGATION = 64
+MAX_REFERENCE_CASES_PER_OBLIGATION = 64
 # The one authorized one-shot budget shape:
 # (provider invocations, native attempts, repair rounds, auditors, retries).
 ONE_SHOT_PROFILE_BUDGETS: tuple[int, int, int, int, int] = (1, 1, 0, 0, 0)
@@ -78,6 +85,26 @@ class ClaimObligationLevel(str, Enum):
 
 class ClaimSetCoverageStatus(str, Enum):
     NOT_ASSESSED = "NOT_ASSESSED"
+
+
+class VerificationPlanAuthorship(str, Enum):
+    OWNER_AUTHORED = "OWNER_AUTHORED"
+    TEMPLATE_AUTHORED = "TEMPLATE_AUTHORED"
+
+
+class VerificationPlanCoverageStatus(str, Enum):
+    NOT_ASSESSED = "NOT_ASSESSED"
+
+
+class VerificationStrategy(str, Enum):
+    CHECKPOINT_COMMAND = "CHECKPOINT_COMMAND"
+    FROZEN_BEHAVIORAL_VERIFIER = "FROZEN_BEHAVIORAL_VERIFIER"
+    HUMAN_RUBRIC_OBSERVATION = "HUMAN_RUBRIC_OBSERVATION"
+
+
+class VerificationAcceptancePredicate(str, Enum):
+    EXIT_CODE_ZERO = "EXIT_CODE_ZERO"
+    HUMAN_RUBRIC_PASS = "HUMAN_RUBRIC_PASS"
 
 
 @dataclass(frozen=True)
@@ -239,6 +266,237 @@ class ClaimAuthority:
             coverage_status=coverage_status,
             claims=tuple(ResultClaim.from_dict(claim) for claim in raw_claims),
         ).validated()
+
+
+@dataclass(frozen=True)
+class VerificationIndependenceRequirements:
+    """Independence properties required by an inert verification plan."""
+
+    temporal: bool
+    artifact: bool
+    process: bool
+    information: bool
+    model: bool
+    organizational: bool
+
+    def validated(self) -> "VerificationIndependenceRequirements":
+        for name in self.__dataclass_fields__:
+            require_bool(getattr(self, name), f"verification independence {name}")
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        return {name: getattr(self, name) for name in self.__dataclass_fields__}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "VerificationIndependenceRequirements":
+        require_exact_keys(data, set(cls.__dataclass_fields__), "verification independence requirements")
+        return cls(**dict(data)).validated()
+
+
+@dataclass(frozen=True)
+class VerificationNegativeControl:
+    """One owner-ordered negative control, without execution semantics."""
+
+    control_id: str
+    description: str
+
+    def validated(self) -> "VerificationNegativeControl":
+        require_identifier(self.control_id, "verification negative control id")
+        require_nonempty_text(self.description, "verification negative control description")
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"control_id": self.control_id, "description": self.description}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "VerificationNegativeControl":
+        require_exact_keys(data, set(cls.__dataclass_fields__), "verification negative control")
+        return cls(control_id=data["control_id"], description=data["description"]).validated()
+
+
+@dataclass(frozen=True)
+class VerificationObligation:
+    """Canonical intended evidence-acquisition content; never an execution result."""
+
+    obligation_id: str
+    claim_ids: tuple[str, ...]
+    strategy: VerificationStrategy
+    procedure_reference: str
+    acceptance_predicate: VerificationAcceptancePredicate
+    declared_coverage: str
+    non_claims: tuple[str, ...]
+    oracle_disclosed_to_subject: bool
+    independence_requirements: VerificationIndependenceRequirements
+    negative_controls: tuple[VerificationNegativeControl, ...]
+    reference_cases: tuple[str, ...]
+
+    def validated(self) -> "VerificationObligation":
+        require_identifier(self.obligation_id, "verification obligation id")
+        if not isinstance(self.claim_ids, tuple) or not self.claim_ids:
+            raise ValueError("verification obligation claim_ids must be a non-empty ordered tuple")
+        if len(self.claim_ids) > MAX_CLAIM_REFERENCES_PER_OBLIGATION:
+            raise ValueError(f"verification obligation claim_ids cannot exceed {MAX_CLAIM_REFERENCES_PER_OBLIGATION}")
+        for claim_id in self.claim_ids:
+            require_identifier(claim_id, "verification obligation claim id")
+        if len(set(self.claim_ids)) != len(self.claim_ids):
+            raise ValueError("verification obligation claim_ids must be unique")
+        if not isinstance(self.strategy, VerificationStrategy):
+            raise ValueError("verification strategy is invalid")
+        require_identifier(self.procedure_reference, "verification procedure reference")
+        if not isinstance(self.acceptance_predicate, VerificationAcceptancePredicate):
+            raise ValueError("verification acceptance predicate is invalid")
+        valid_pairs = {
+            (VerificationStrategy.CHECKPOINT_COMMAND, VerificationAcceptancePredicate.EXIT_CODE_ZERO),
+            (VerificationStrategy.FROZEN_BEHAVIORAL_VERIFIER, VerificationAcceptancePredicate.EXIT_CODE_ZERO),
+            (VerificationStrategy.HUMAN_RUBRIC_OBSERVATION, VerificationAcceptancePredicate.HUMAN_RUBRIC_PASS),
+        }
+        if (self.strategy, self.acceptance_predicate) not in valid_pairs:
+            raise ValueError("verification strategy and acceptance predicate are incompatible")
+        require_nonempty_text(self.declared_coverage, "verification declared coverage")
+        if not isinstance(self.non_claims, tuple):
+            raise ValueError("verification non_claims must be an ordered tuple")
+        if len(self.non_claims) > MAX_NON_CLAIMS_PER_VERIFICATION_OBLIGATION:
+            raise ValueError(f"verification non_claims cannot exceed {MAX_NON_CLAIMS_PER_VERIFICATION_OBLIGATION}")
+        for statement in self.non_claims:
+            require_nonempty_text(statement, "verification non-claim")
+        if len(set(self.non_claims)) != len(self.non_claims):
+            raise ValueError("verification non_claims must be unique")
+        require_bool(self.oracle_disclosed_to_subject, "oracle_disclosed_to_subject")
+        if not isinstance(self.independence_requirements, VerificationIndependenceRequirements):
+            raise ValueError("verification independence requirements are required")
+        self.independence_requirements.validated()
+        if self.oracle_disclosed_to_subject and self.independence_requirements.information:
+            raise ValueError("oracle disclosure is incompatible with required information independence")
+        if not isinstance(self.negative_controls, tuple):
+            raise ValueError("verification negative_controls must be an ordered tuple")
+        if len(self.negative_controls) > MAX_NEGATIVE_CONTROLS_PER_OBLIGATION:
+            raise ValueError(f"verification negative_controls cannot exceed {MAX_NEGATIVE_CONTROLS_PER_OBLIGATION}")
+        control_ids: list[str] = []
+        for control in self.negative_controls:
+            if not isinstance(control, VerificationNegativeControl):
+                raise ValueError("verification negative control has an invalid type")
+            control.validated()
+            control_ids.append(control.control_id)
+        if len(set(control_ids)) != len(control_ids):
+            raise ValueError("verification negative control identities must be unique")
+        if not isinstance(self.reference_cases, tuple):
+            raise ValueError("verification reference_cases must be an ordered tuple")
+        if len(self.reference_cases) > MAX_REFERENCE_CASES_PER_OBLIGATION:
+            raise ValueError(f"verification reference_cases cannot exceed {MAX_REFERENCE_CASES_PER_OBLIGATION}")
+        for reference in self.reference_cases:
+            require_identifier(reference, "verification reference case")
+        if len(set(self.reference_cases)) != len(self.reference_cases):
+            raise ValueError("verification reference_cases must be unique")
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "obligation_id": self.obligation_id,
+            "claim_ids": list(self.claim_ids),
+            "strategy": self.strategy.value,
+            "procedure_reference": self.procedure_reference,
+            "acceptance_predicate": self.acceptance_predicate.value,
+            "declared_coverage": self.declared_coverage,
+            "non_claims": list(self.non_claims),
+            "oracle_disclosed_to_subject": self.oracle_disclosed_to_subject,
+            "independence_requirements": self.independence_requirements.to_dict(),
+            "negative_controls": [control.to_dict() for control in self.negative_controls],
+            "reference_cases": list(self.reference_cases),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "VerificationObligation":
+        require_exact_keys(data, set(cls.__dataclass_fields__), "verification obligation")
+        for key, maximum in (
+            ("claim_ids", MAX_CLAIM_REFERENCES_PER_OBLIGATION),
+            ("non_claims", MAX_NON_CLAIMS_PER_VERIFICATION_OBLIGATION),
+            ("negative_controls", MAX_NEGATIVE_CONTROLS_PER_OBLIGATION),
+            ("reference_cases", MAX_REFERENCE_CASES_PER_OBLIGATION),
+        ):
+            if not isinstance(data[key], list):
+                raise ValueError(f"verification {key} must be an ordered array")
+            if len(data[key]) > maximum:
+                raise ValueError(f"verification {key} cannot exceed {maximum}")
+        try:
+            strategy = VerificationStrategy(data["strategy"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("verification strategy is invalid") from exc
+        try:
+            predicate = VerificationAcceptancePredicate(data["acceptance_predicate"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("verification acceptance predicate is invalid") from exc
+        if not isinstance(data["independence_requirements"], Mapping):
+            raise ValueError("verification independence requirements must be a canonical object")
+        return cls(
+            obligation_id=data["obligation_id"],
+            claim_ids=require_string_list(data["claim_ids"], "verification claim_ids"),
+            strategy=strategy,
+            procedure_reference=data["procedure_reference"],
+            acceptance_predicate=predicate,
+            declared_coverage=data["declared_coverage"],
+            non_claims=require_string_list(data["non_claims"], "verification non_claims"),
+            oracle_disclosed_to_subject=data["oracle_disclosed_to_subject"],
+            independence_requirements=VerificationIndependenceRequirements.from_dict(data["independence_requirements"]),
+            negative_controls=tuple(VerificationNegativeControl.from_dict(item) for item in data["negative_controls"]),
+            reference_cases=require_string_list(data["reference_cases"], "verification reference_cases"),
+        ).validated()
+
+
+@dataclass(frozen=True)
+class ClaimVerificationPlanAuthority:
+    """Canonical inert authority for owner-ordered claim verification obligations."""
+
+    authorship: VerificationPlanAuthorship
+    coverage_status: VerificationPlanCoverageStatus
+    verification_obligations: tuple[VerificationObligation, ...]
+
+    def validated(self) -> "ClaimVerificationPlanAuthority":
+        if not isinstance(self.authorship, VerificationPlanAuthorship):
+            raise ValueError("verification plan authorship is invalid")
+        if self.coverage_status is not VerificationPlanCoverageStatus.NOT_ASSESSED:
+            raise ValueError("verification plan coverage status must be NOT_ASSESSED")
+        if not isinstance(self.verification_obligations, tuple) or not self.verification_obligations:
+            raise ValueError("verification obligations must be a non-empty ordered tuple")
+        if len(self.verification_obligations) > MAX_VERIFICATION_OBLIGATIONS:
+            raise ValueError(f"verification obligations cannot exceed {MAX_VERIFICATION_OBLIGATIONS}")
+        obligation_ids: list[str] = []
+        for obligation in self.verification_obligations:
+            if not isinstance(obligation, VerificationObligation):
+                raise ValueError("verification obligation has an invalid type")
+            obligation.validated()
+            obligation_ids.append(obligation.obligation_id)
+        if len(set(obligation_ids)) != len(obligation_ids):
+            raise ValueError("verification obligation identities must be unique")
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "authorship": self.authorship.value,
+            "coverage_status": self.coverage_status.value,
+            "verification_obligations": [item.to_dict() for item in self.verification_obligations],
+        }
+
+    @property
+    def identity_fingerprint(self) -> str:
+        return fingerprint(self.to_dict())
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ClaimVerificationPlanAuthority":
+        require_exact_keys(data, set(cls.__dataclass_fields__), "claim verification plan authority")
+        try:
+            authorship = VerificationPlanAuthorship(data["authorship"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("verification plan authorship is invalid") from exc
+        try:
+            coverage = VerificationPlanCoverageStatus(data["coverage_status"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("verification plan coverage status must be NOT_ASSESSED") from exc
+        raw = data["verification_obligations"]
+        if not isinstance(raw, list):
+            raise ValueError("verification obligations must be an ordered array")
+        if len(raw) > MAX_VERIFICATION_OBLIGATIONS:
+            raise ValueError(f"verification obligations cannot exceed {MAX_VERIFICATION_OBLIGATIONS}")
+        return cls(authorship, coverage, tuple(VerificationObligation.from_dict(item) for item in raw)).validated()
 
 
 @dataclass(frozen=True)
@@ -562,12 +820,13 @@ class NativeMissionProfile:
     verification: VerificationAuthority | None = None
     runtime_prompt: RuntimePromptAuthority | None = None
     claim_authority: ClaimAuthority | None = None
+    claim_verification_plan_authority: ClaimVerificationPlanAuthority | None = None
 
     def _body(self) -> dict[str, Any]:
         """The complete canonical profile body, fingerprint field excluded."""
 
         data = dict(self.__dict__)
-        if self.schema_version in {MISSION_PROFILE_SCHEMA_VERSION_V2, MISSION_PROFILE_SCHEMA_VERSION_V3}:
+        if self.schema_version in {MISSION_PROFILE_SCHEMA_VERSION_V2, MISSION_PROFILE_SCHEMA_VERSION_V3, MISSION_PROFILE_SCHEMA_VERSION_V4}:
             for key in (
                 "fixture_id",
                 "fixture_version",
@@ -584,10 +843,14 @@ class NativeMissionProfile:
             data["git_end_state_policy"] = self.git_end_state_policy.to_dict()
             data["verification"] = self.verification.to_dict()
             data["runtime_prompt"] = self.runtime_prompt.to_dict()
-            if self.schema_version == MISSION_PROFILE_SCHEMA_VERSION_V3:
+            if self.schema_version in {MISSION_PROFILE_SCHEMA_VERSION_V3, MISSION_PROFILE_SCHEMA_VERSION_V4}:
                 data["claim_authority"] = self.claim_authority.to_dict()
             else:
                 data.pop("claim_authority")
+            if self.schema_version == MISSION_PROFILE_SCHEMA_VERSION_V4:
+                data["claim_verification_plan_authority"] = self.claim_verification_plan_authority.to_dict()
+            else:
+                data.pop("claim_verification_plan_authority")
         else:
             for key in (
                 "workspace_source",
@@ -595,6 +858,7 @@ class NativeMissionProfile:
                 "verification",
                 "runtime_prompt",
                 "claim_authority",
+                "claim_verification_plan_authority",
             ):
                 data.pop(key)
         data["gate_clauses"] = [list(clause) for clause in self.gate_clauses]
@@ -611,6 +875,7 @@ class NativeMissionProfile:
         return self.schema_version in {
             MISSION_PROFILE_SCHEMA_VERSION_V2,
             MISSION_PROFILE_SCHEMA_VERSION_V3,
+            MISSION_PROFILE_SCHEMA_VERSION_V4,
         }
 
     @property
@@ -655,6 +920,7 @@ class NativeMissionProfile:
             MISSION_PROFILE_SCHEMA_VERSION,
             MISSION_PROFILE_SCHEMA_VERSION_V2,
             MISSION_PROFILE_SCHEMA_VERSION_V3,
+            MISSION_PROFILE_SCHEMA_VERSION_V4,
         }:
             raise ValueError("unsupported native mission profile schema")
         require_identifier(self.profile_id, "profile_id")
@@ -671,6 +937,7 @@ class NativeMissionProfile:
                     self.verification,
                     self.runtime_prompt,
                     self.claim_authority,
+                    self.claim_verification_plan_authority,
                 )
             ):
                 raise ValueError("v1 profile cannot carry nested runtime or claim authority")
@@ -684,16 +951,30 @@ class NativeMissionProfile:
             if not isinstance(self.runtime_prompt, RuntimePromptAuthority):
                 raise ValueError("runtime profile must carry runtime prompt authority")
             if self.schema_version == MISSION_PROFILE_SCHEMA_VERSION_V2:
-                if self.claim_authority is not None:
-                    raise ValueError("v2 profile cannot carry claim authority")
+                if self.claim_authority is not None or self.claim_verification_plan_authority is not None:
+                    raise ValueError("v2 profile cannot carry claim or claim verification plan authority")
             elif not isinstance(self.claim_authority, ClaimAuthority):
-                raise ValueError("v3 profile must carry claim authority")
+                raise ValueError("v3/v4 profile must carry claim authority")
+            elif self.schema_version == MISSION_PROFILE_SCHEMA_VERSION_V3:
+                if self.claim_verification_plan_authority is not None:
+                    raise ValueError("v3 profile cannot carry claim verification plan authority")
+            elif not isinstance(self.claim_verification_plan_authority, ClaimVerificationPlanAuthority):
+                raise ValueError("v4 profile must carry claim verification plan authority")
             source = self.workspace_source.validated()
             policy = self.git_end_state_policy.validated()
             verification = self.verification.validated()
             self.runtime_prompt.validated()
             if self.claim_authority is not None:
                 self.claim_authority.validated()
+            if self.claim_verification_plan_authority is not None:
+                self.claim_verification_plan_authority.validated()
+                known_claim_ids = {claim.claim_id for claim in self.claim_authority.claims}
+                if any(
+                    claim_id not in known_claim_ids
+                    for obligation in self.claim_verification_plan_authority.verification_obligations
+                    for claim_id in obligation.claim_ids
+                ):
+                    raise ValueError("verification obligation claim reference is missing from claim authority")
             if self.fixture_id != source.fixture_id or self.fixture_version != source.fixture_version:
                 raise ValueError("internal v2 fixture mirrors contradict workspace source authority")
             if self.required_commit_message != policy.required_complete_commit_message:
@@ -848,6 +1129,7 @@ class NativeMissionProfile:
             "verification",
             "runtime_prompt",
             "claim_authority",
+            "claim_verification_plan_authority",
         }
         if schema == MISSION_PROFILE_SCHEMA_VERSION:
             require_exact_keys(data, v1_fields, "native mission profile v1")
@@ -855,6 +1137,8 @@ class NativeMissionProfile:
             require_exact_keys(data, v2_fields, "native mission profile v2")
         elif schema == MISSION_PROFILE_SCHEMA_VERSION_V3:
             require_exact_keys(data, v2_fields | {"claim_authority"}, "native mission profile v3")
+        elif schema == MISSION_PROFILE_SCHEMA_VERSION_V4:
+            require_exact_keys(data, v2_fields | {"claim_authority", "claim_verification_plan_authority"}, "native mission profile v4")
         else:
             raise ValueError("unsupported native mission profile schema")
         values = dict(data)
@@ -890,6 +1174,7 @@ class NativeMissionProfile:
                 verification=None,
                 runtime_prompt=None,
                 claim_authority=None,
+                claim_verification_plan_authority=None,
             )
         else:
             for key in (
@@ -906,7 +1191,12 @@ class NativeMissionProfile:
             runtime_prompt = RuntimePromptAuthority.from_dict(data["runtime_prompt"])
             claim_authority = (
                 ClaimAuthority.from_dict(data["claim_authority"])
-                if schema == MISSION_PROFILE_SCHEMA_VERSION_V3
+                if schema in {MISSION_PROFILE_SCHEMA_VERSION_V3, MISSION_PROFILE_SCHEMA_VERSION_V4}
+                else None
+            )
+            claim_verification_plan_authority = (
+                ClaimVerificationPlanAuthority.from_dict(data["claim_verification_plan_authority"])
+                if schema == MISSION_PROFILE_SCHEMA_VERSION_V4
                 else None
             )
             values.update(
@@ -915,6 +1205,7 @@ class NativeMissionProfile:
                 verification=verification,
                 runtime_prompt=runtime_prompt,
                 claim_authority=claim_authority,
+                claim_verification_plan_authority=claim_verification_plan_authority,
                 fixture_id=source.fixture_id,
                 fixture_version=source.fixture_version,
                 required_commit_message=policy.required_complete_commit_message,
@@ -936,12 +1227,13 @@ def create_native_mission_profile(**values: Any) -> NativeMissionProfile:
     """
 
     schema_version = values.pop("schema_version", MISSION_PROFILE_SCHEMA_VERSION)
-    if schema_version in {MISSION_PROFILE_SCHEMA_VERSION_V2, MISSION_PROFILE_SCHEMA_VERSION_V3}:
+    if schema_version in {MISSION_PROFILE_SCHEMA_VERSION_V2, MISSION_PROFILE_SCHEMA_VERSION_V3, MISSION_PROFILE_SCHEMA_VERSION_V4}:
         source = values.get("workspace_source")
         policy = values.get("git_end_state_policy")
         verification = values.get("verification")
         runtime_prompt = values.get("runtime_prompt")
         claim_authority = values.get("claim_authority")
+        claim_verification_plan_authority = values.get("claim_verification_plan_authority")
         if isinstance(source, Mapping):
             source = WorkspaceSourceAuthority.from_dict(source)
         if isinstance(policy, Mapping):
@@ -952,6 +1244,8 @@ def create_native_mission_profile(**values: Any) -> NativeMissionProfile:
             runtime_prompt = RuntimePromptAuthority.from_dict(runtime_prompt)
         if isinstance(claim_authority, Mapping):
             claim_authority = ClaimAuthority.from_dict(claim_authority)
+        if isinstance(claim_verification_plan_authority, Mapping):
+            claim_verification_plan_authority = ClaimVerificationPlanAuthority.from_dict(claim_verification_plan_authority)
         if not all(
             (
                 isinstance(source, WorkspaceSourceAuthority),
@@ -961,18 +1255,28 @@ def create_native_mission_profile(**values: Any) -> NativeMissionProfile:
             )
         ):
             raise ValueError("v2 profile requires complete nested runtime authority")
-        if schema_version == MISSION_PROFILE_SCHEMA_VERSION_V2 and claim_authority is not None:
-            raise ValueError("v2 profile cannot carry claim authority")
+        if schema_version == MISSION_PROFILE_SCHEMA_VERSION_V2 and (
+            claim_authority is not None or claim_verification_plan_authority is not None
+        ):
+            raise ValueError("v2 profile cannot carry claim or claim verification plan authority")
         if schema_version == MISSION_PROFILE_SCHEMA_VERSION_V3 and not isinstance(
             claim_authority, ClaimAuthority
         ):
             raise ValueError("v3 profile requires claim authority")
+        if schema_version == MISSION_PROFILE_SCHEMA_VERSION_V3 and claim_verification_plan_authority is not None:
+            raise ValueError("v3 profile cannot carry claim verification plan authority")
+        if schema_version == MISSION_PROFILE_SCHEMA_VERSION_V4 and not all((
+            isinstance(claim_authority, ClaimAuthority),
+            isinstance(claim_verification_plan_authority, ClaimVerificationPlanAuthority),
+        )):
+            raise ValueError("v4 profile requires claim and claim verification plan authority")
         values.update(
             workspace_source=source,
             git_end_state_policy=policy,
             verification=verification,
             runtime_prompt=runtime_prompt,
             claim_authority=claim_authority,
+            claim_verification_plan_authority=claim_verification_plan_authority,
             fixture_id=source.fixture_id,
             fixture_version=source.fixture_version,
             required_commit_message=policy.required_complete_commit_message,
@@ -1947,9 +2251,15 @@ __all__ = [
     "MISSION_PROFILE_SCHEMA_VERSION",
     "MISSION_PROFILE_SCHEMA_VERSION_V2",
     "MISSION_PROFILE_SCHEMA_VERSION_V3",
+    "MISSION_PROFILE_SCHEMA_VERSION_V4",
     "MAX_CLAIMS_PER_AUTHORITY",
     "MAX_DEPENDENCIES_PER_CLAIM",
     "MAX_NON_CLAIMS_PER_CLAIM",
+    "MAX_VERIFICATION_OBLIGATIONS",
+    "MAX_CLAIM_REFERENCES_PER_OBLIGATION",
+    "MAX_NON_CLAIMS_PER_VERIFICATION_OBLIGATION",
+    "MAX_NEGATIVE_CONTROLS_PER_OBLIGATION",
+    "MAX_REFERENCE_CASES_PER_OBLIGATION",
     "NEON_SIEGE_PROFILE",
     "ONE_SHOT_PROFILE_BUDGETS",
     "WORKFLOW_RECOVERY_COMPLETION_CONDITIONS_TEXT",
@@ -1965,12 +2275,20 @@ __all__ = [
     "ClaimAuthorship",
     "ClaimObligationLevel",
     "ClaimSetCoverageStatus",
+    "ClaimVerificationPlanAuthority",
     "GitEndStatePolicy",
     "ProfileCheckpointCommand",
     "RuntimePromptAuthority",
     "ResultClaim",
     "VerificationAuthority",
+    "VerificationAcceptancePredicate",
+    "VerificationIndependenceRequirements",
+    "VerificationNegativeControl",
+    "VerificationObligation",
     "VerificationMode",
+    "VerificationPlanAuthorship",
+    "VerificationPlanCoverageStatus",
+    "VerificationStrategy",
     "WorkspaceSourceAuthority",
     "WorkspaceSourceKind",
     "create_native_mission_profile",
