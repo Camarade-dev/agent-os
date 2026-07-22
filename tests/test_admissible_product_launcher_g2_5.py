@@ -232,6 +232,10 @@ def test_authoring_canonical_document_write_once_and_bounds(tmp_path):
     assert path.parent == cfg.contract_documents_directory
     loaded = load_native_mission_profile_document(path)
     assert loaded.profile_fingerprint == authored.profile_fingerprint
+    assert authored.contract_summary["gate_clauses"] == [
+        {"clause_id": clause_id, "text": text}
+        for clause_id, text in loaded.gate_clauses
+    ]
     assert canonical_bytes(loaded.to_dict()) == path.read_bytes()
     assert not (cfg.run_parent / loaded.run_id).exists()
     assert list(cfg.run_parent.glob("**/*")) == [] or not any(cfg.run_parent.rglob("*"))

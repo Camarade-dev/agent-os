@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import html
 
-from .enums import TruthStatus, VerdictSource
+from .enums import PresenceState, TruthStatus, VerdictSource
 from .presentation_types import ProductVerdictView, RunDetail
 
 RESULT_SCHEMA_VERSION = "admissible_product_read_model_result_v1"
@@ -52,6 +52,7 @@ def render_result_json(detail: RunDetail) -> dict:
         # persisted backend identity needed for a truthful parent-versus-child
         # backend delta after a post_run_backend_drift refusal.
         "authorization": detail.authorization.to_json(),
+        "authorized_gate_clauses": detail.gate_clauses.to_json(),
         "execution_state": {
             "state": detail.process.execution_state.value,
             "provider_exit_code": detail.process.exit_code,
@@ -178,6 +179,7 @@ pre { background: #8881; padding: .6rem; border-radius: 6px; overflow-x: auto; f
 .badge-unknown { background: #3b5bdb22; color: #6b8bff; border: 1px solid #3b5bdb66; }
 .trunc { color: #b8860b; font-size: .78rem; }
 .list { margin: .2rem 0; padding-left: 1.2rem; font-size: .88rem; }
+.clause-list { max-width: 60rem; overflow-wrap: anywhere; word-break: break-word; }
 .top-badges { display: flex; flex-wrap: wrap; gap: .4rem; margin: .2rem 0 .4rem; }
 """.strip()
 
@@ -225,6 +227,24 @@ def render_run_html(detail: RunDetail) -> str:
         )
     parts.append('<div class="top-badges">' + " ".join(top_badges) + "</div>")
     parts.append(f'<div class="notice">{html.escape(_NON_AUTHORITY_NOTICE)}</div>')
+
+    # Authorized clause visibility is presentation-only and carries no
+    # clause-level support inference from the product verdict.
+    clauses = detail.gate_clauses
+    parts.append("<h2>Authorized gate clauses</h2>")
+    parts.append(f'<div class="notice">{html.escape(clauses.to_json()["notice"])}</div>')
+    if clauses.present is PresenceState.PRESENT:
+        parts.append('<ol class="list clause-list">')
+        parts.extend(
+            f"<li><strong>{_esc(clause.clause_id)}</strong>: {_esc(clause.text)}</li>"
+            for clause in clauses.clauses
+        )
+        parts.append("</ol>")
+    else:
+        parts.append("<table>")
+        parts.append(_row("availability", clauses.present.value))
+        parts.append(_row("detail", clauses.note))
+        parts.append("</table>")
 
     # Execution state
     parts.append("<h2>Execution state</h2><table>")

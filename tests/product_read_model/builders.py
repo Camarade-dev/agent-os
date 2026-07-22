@@ -66,11 +66,15 @@ class RunRootBuilder:
         _write(self.evidence / "final-status.json", payload)
         return self
 
-    def delegated_gate(self, *, human_disposition: object = None, human_boundary_reason: object = None, objective: str = "Deliver the thing.", mission_id: str = "mission-synthetic", checkpoint_history: list | None = None, checkpoint_verification_commands: list | None = None) -> "RunRootBuilder":
+    def delegated_gate(self, *, human_disposition: object = None, human_boundary_reason: object = None, objective: str = "Deliver the thing.", mission_id: str = "mission-synthetic", checkpoint_history: list | None = None, checkpoint_verification_commands: list | None = None, clauses: object = None) -> "RunRootBuilder":
         contract: dict[str, object] = {
             "gate_id": self.gate_id,
             "objective": objective,
             "contract_fingerprint": "contract-fp",
+            "clauses": clauses if clauses is not None else [
+                {"clause_id": "synthetic.material", "text": "Required material exists."},
+                {"clause_id": "synthetic.git", "text": "The exact local commit exists."},
+            ],
         }
         if checkpoint_verification_commands is not None:
             contract["checkpoint_verification_commands"] = checkpoint_verification_commands

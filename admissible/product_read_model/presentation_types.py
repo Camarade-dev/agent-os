@@ -163,6 +163,37 @@ class AuthorizationView:
 
 
 @dataclass(frozen=True)
+class GateClauseView:
+    """One authorized clause, retained in canonical persisted order."""
+
+    clause_id: str
+    text: str
+
+    def to_json(self) -> dict:
+        return {"clause_id": self.clause_id, "text": self.text}
+
+
+@dataclass(frozen=True)
+class GateClausesView:
+    """Presentation-only availability of the persisted authorized clause set."""
+
+    present: PresenceState
+    clauses: tuple[GateClauseView, ...] = ()
+    note: str | None = None
+
+    def to_json(self) -> dict:
+        return {
+            "present": self.present.value,
+            "clauses": [clause.to_json() for clause in self.clauses],
+            "notice": (
+                "These clauses are part of the authorized contract. They are not "
+                "independently adjudicated unless linked to explicit verification evidence."
+            ),
+            "note": self.note,
+        }
+
+
+@dataclass(frozen=True)
 class ProcessView:
     """Native provider process lifecycle, preferring harness observation."""
 
@@ -541,6 +572,7 @@ class RunDetail:
     run_root: str
     identity: RunIdentityView
     authorization: AuthorizationView
+    gate_clauses: GateClausesView
     canonical_classification: str | None
     canonical_classification_kind: ClassificationKind
     canary_success: bool | None
@@ -589,6 +621,7 @@ class RunDetail:
             "run_root": self.run_root,
             "identity": self.identity.to_json(),
             "authorization": self.authorization.to_json(),
+            "gate_clauses": self.gate_clauses.to_json(),
             "canonical_classification": self.canonical_classification,
             "canonical_classification_kind": self.canonical_classification_kind.value,
             "canary_success": self.canary_success,

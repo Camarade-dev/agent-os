@@ -151,6 +151,24 @@
     dt.textContent=label;dd.textContent=value===null||value===undefined?"Not returned":String(value);row.append(dt,dd);root.append(row);
   }
   function appendReturnedFact(root,body,key,label){if(hasOwn(body,key))appendFact(root,label,body[key]);}
+  const GATE_CLAUSE_NOTICE="These clauses are part of the authorized contract. They are not independently adjudicated unless linked to explicit verification evidence.";
+  function normalizedGateClauses(value){
+    if(!Array.isArray(value)||!value.length)return null;
+    const seen=new Set(),clauses=[];
+    for(const item of value){
+      if(!isObject(item)||typeof item.clause_id!=="string"||!item.clause_id||seen.has(item.clause_id)||typeof item.text!=="string"||!item.text)return null;
+      seen.add(item.clause_id);clauses.push({clause_id:item.clause_id,text:item.text});
+    }
+    return clauses;
+  }
+  function renderGateClauses(rootId,value,availability){
+    const root=byId(rootId);if(!root)return;root.replaceChildren();
+    const notice=document.createElement("p");notice.className="gate-clause-notice";notice.textContent=GATE_CLAUSE_NOTICE;root.append(notice);
+    const clauses=normalizedGateClauses(value);
+    if(!clauses){const absent=document.createElement("p");absent.className="gate-clause-unavailable";absent.textContent=availability==="INCONSISTENT"?"Authorized gate clause evidence is malformed or inconsistent.":"Authorized gate clauses are unavailable in the persisted evidence.";root.append(absent);return;}
+    const list=document.createElement("ol");list.className="gate-clause-list";
+    clauses.forEach(clause=>{const item=document.createElement("li"),id=document.createElement("span"),text=document.createElement("span");id.className="gate-clause-id";id.textContent=clause.clause_id;text.textContent=": "+clause.text;item.append(id,text);list.append(item);});root.append(list);
+  }
   function renderBootstrap(boot){
     const root=byId("bootstrap-facts");root.replaceChildren();
     [["Service",boot.service],["Repository",boot.repository_display_path],["Required source HEAD",boot.required_source_head],["Authorization mode",boot.authorization_mode],["Owner phrase encoding",boot.owner_authorization_encoding],["Visual UI wire value",String(boot.visual_ui_available)],["Local state",boot.g2_ready?"Ready":"Unavailable"]].forEach(x=>appendFact(root,x[0],x[1]));
@@ -176,6 +194,7 @@
     const body=ui.contract.response,summary=body.contract_summary||{},ids=body.generated_ids||{},root=byId("contract-facts");root.replaceChildren();
     [["Contract ID",body.contract_id],["Canonical fingerprint",body.profile_fingerprint],["Profile ID",ids.profile_id||summary.profile_id],["Run ID",ids.run_id||summary.run_id],["Session ID",ids.session_id||summary.session_id],["Gate ID",ids.gate_id||summary.gate_id],["Mission ID",ids.mission_id||summary.mission_id],["Workspace source kind",summary.workspace_source_kind],["Verification mode",summary.verification_mode],["Authorization mode",body.authorization_mode],["Execution started",String(body.execution_started)]].forEach(x=>appendFact(root,x[0],x[1]));
     const intent=byId("intent-facts");intent.replaceChildren();[["Mission",ui.contract.input.mission_text],["Gate objective",ui.contract.input.gate_objective],["Completion conditions",ui.contract.input.completion_conditions_text],["Required materials",ui.contract.input.required_material_paths.join(", ")||"None"],["Intended commit",ui.contract.input.commit_message]].forEach(x=>appendFact(intent,x[0],x[1]));
+    renderGateClauses("contract-gate-clauses",summary.gate_clauses,"INCONSISTENT");
   }
   async function author(event){
     event.preventDefault();clearError();if(!validateCompose())return;const input=composeBody();setState(STATES.AUTHORING);
@@ -215,6 +234,7 @@
     const root=byId("preparation-facts");root.replaceChildren();[["Preparation ID",body.preparation_id],["Payload fingerprint",body.payload_fingerprint],["Authorization mode",body.authorization_mode]].forEach(x=>appendFact(root,x[0],x[1]));
     byId("canonical-payload").textContent=JSON.stringify(body.authorization_payload,null,2);byId("safe-summary").textContent=JSON.stringify(body.safe_payload_summary,null,2);
     byId("mode-label").textContent=body.authorization_mode;byId("authorization-notice").textContent=body.authorization_semantics_notice;byId("encoding-notice").textContent=`Owner phrase transport is limited to ${ui.bootstrap.owner_authorization_encoding}.`;
+    const summary=ui.contract&&ui.contract.response&&isObject(ui.contract.response.contract_summary)?ui.contract.response.contract_summary:{};renderGateClauses("authorization-gate-clauses",summary.gate_clauses,"INCONSISTENT");
     const slot=byId("digest-slot");slot.replaceChildren();
     if(body.authorization_mode==="PRECOMMITTED_DIGEST"){
       const wrap=document.createElement("div");wrap.className="field";const label=document.createElement("label");label.htmlFor="owner-digest";label.textContent="Owner-supplied authorization digest";
@@ -319,6 +339,7 @@
   }
   function renderResult(body){
     const result=sanitizeResultValue(body),admission=isObject(result.result_admission_state)?result.result_admission_state:{},complete=isObject(result.evidence_completeness)?result.evidence_completeness:{},boundary=isObject(result.failing_boundary)?result.failing_boundary:{},classification=byId("result-classification");
+    const clauseView=isObject(result.authorized_gate_clauses)?result.authorized_gate_clauses:{};renderGateClauses("result-gate-clauses",clauseView.clauses,clauseView.present);
     classification.replaceChildren();const tone=resultTone(admission.verdict,result.presentation_status);
     if(hasOwn(admission,"verdict"))addClassification(classification,"Product verdict",admission.verdict,true,tone);
     if(hasOwn(admission,"verification_mode"))addClassification(classification,"Verification mode",admission.verification_mode);

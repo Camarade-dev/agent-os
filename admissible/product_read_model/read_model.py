@@ -39,6 +39,8 @@ from .presentation_types import (
     DiagnosticExcerpt,
     EvidenceCompletenessView,
     FailingBoundaryView,
+    GateClauseView,
+    GateClausesView,
     HumanDispositionView,
     MaterialView,
     ProcessView,
@@ -281,6 +283,66 @@ def _authorization_view(preflight: EvidenceRead, delegated: EvidenceRead, reques
         objective=objective,
         non_claims=non_claims,
     )
+
+
+def _gate_clauses_view(delegated: EvidenceRead) -> GateClausesView:
+    """Read clauses only from the persisted authorized gate plan.
+
+    Historical absence stays absent. Any partially shaped clause authority is
+    inconsistent as a whole; no plausible-looking subset is displayed.
+    """
+
+    if delegated.presence is not PresenceState.PRESENT:
+        return GateClausesView(
+            present=delegated.presence,
+            note=(
+                "Authorized gate clauses are unavailable in the persisted evidence."
+                if delegated.presence is PresenceState.ABSENT
+                else "Authorized gate clause evidence is malformed or inconsistent."
+            ),
+        )
+    plan = _msub(_data(delegated), "gate_plan")
+    contracts = plan.get("ordered_gate_contracts") if plan is not None else None
+    if not isinstance(contracts, list) or not contracts:
+        return GateClausesView(
+            present=PresenceState.INCONSISTENT,
+            note="Authorized gate clause evidence is malformed or inconsistent.",
+        )
+    clauses: list[GateClauseView] = []
+    seen: set[str] = set()
+    for contract in contracts:
+        if not isinstance(contract, Mapping):
+            clauses = []
+            break
+        raw_clauses = contract.get("clauses")
+        if not isinstance(raw_clauses, list) or not raw_clauses:
+            clauses = []
+            break
+        for raw in raw_clauses:
+            if not isinstance(raw, Mapping):
+                clauses = []
+                break
+            clause_id = raw.get("clause_id")
+            text = raw.get("text")
+            if (
+                not isinstance(clause_id, str)
+                or not clause_id
+                or clause_id in seen
+                or not isinstance(text, str)
+                or not text
+            ):
+                clauses = []
+                break
+            seen.add(clause_id)
+            clauses.append(GateClauseView(clause_id=clause_id, text=text))
+        if not clauses:
+            break
+    if not clauses:
+        return GateClausesView(
+            present=PresenceState.INCONSISTENT,
+            note="Authorized gate clause evidence is malformed or inconsistent.",
+        )
+    return GateClausesView(present=PresenceState.PRESENT, clauses=tuple(clauses))
 
 
 def _process_view(
@@ -1038,6 +1100,7 @@ def load_run_detail(
 
     identity = _identity_view(root_real, final_status, request, delegated)
     authorization = _authorization_view(preflight, delegated, request)
+    gate_clauses = _gate_clauses_view(delegated)
     process_view = _process_view(process_started, process_observation, result, attempt_reserved)
     workspace_git = _workspace_git_view(result, process_observation)
     material = _material_view(eligibility)
@@ -1116,6 +1179,7 @@ def load_run_detail(
         run_root=str(root_real),
         identity=identity,
         authorization=authorization,
+        gate_clauses=gate_clauses,
         canonical_classification=canonical_classification,
         canonical_classification_kind=classification_kind,
         canary_success=canary_success,

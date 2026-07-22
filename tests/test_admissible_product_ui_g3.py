@@ -1323,6 +1323,24 @@ def test_client_security_and_exact_request_contract():
     assert "localStorage" not in HTML + CSS and "https://" not in HTML + CSS + JS
 
 
+def test_gate_clause_surfaces_use_safe_bounded_dom_rendering():
+    for element_id in (
+        "contract-gate-clauses",
+        "authorization-gate-clauses",
+        "result-gate-clauses",
+    ):
+        assert f'id="{element_id}"' in HTML
+        assert f'renderGateClauses("{element_id}"' in JS
+    assert (
+        "These clauses are part of the authorized contract. They are not independently "
+        "adjudicated unless linked to explicit verification evidence."
+    ) in JS
+    assert 'id.textContent=clause.clause_id' in JS
+    assert 'text.textContent=": "+clause.text' in JS
+    assert ".gate-clause-list li" in CSS
+    assert "overflow-wrap:anywhere" in CSS
+
+
 def test_explicit_state_machine_polling_and_secret_clearing_contract():
     for state in (
         "BOOTSTRAP_LOADING",

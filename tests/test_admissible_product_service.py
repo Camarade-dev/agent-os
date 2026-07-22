@@ -20,6 +20,7 @@ class Profile:
     timeout_seconds:int=10; stdout_byte_limit:int=1000; stderr_byte_limit:int=1000
     effective_workspace_source:object=field(default_factory=lambda:SimpleNamespace(kind=SimpleNamespace(value="EXISTING_LOCAL_GIT_REPOSITORY")))
     verification_mode:object=field(default_factory=lambda:SimpleNamespace(value="OBSERVED_ONLY"))
+    gate_clauses:tuple[tuple[str,str],...]=(("gate.first","First exact clause."),("gate.second","Second exact clause."))
 
 def plane(tmp_path, **kw):
     values=dict(run_parent=tmp_path/"runs",source_repository=tmp_path/"source",required_source_head="b"*40,
@@ -95,6 +96,10 @@ def test_validation_never_executes_and_rejects_authorization_json(tmp_path):
     calls=[]; p=plane(tmp_path,application=lambda **kw:calls.append(kw))
     response=p.validate_contract(str((tmp_path/"p.json").resolve()))
     assert response["control_state"]=="VALIDATED" and not calls and not (tmp_path/"runs").exists()
+    assert response["contract_summary"]["gate_clauses"]==[
+        {"clause_id":"gate.first","text":"First exact clause."},
+        {"clause_id":"gate.second","text":"Second exact clause."},
+    ]
     s=create_loopback_server(p).start()
     try:
         body={"profile_document":str((tmp_path/"p.json").resolve()),"owner_authorization":"secret"}

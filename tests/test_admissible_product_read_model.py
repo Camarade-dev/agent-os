@@ -81,6 +81,52 @@ def test_refused_before_behavioral_verification(tmp_path):
     assert detail.product_verdict.verdict is ProductVerdict.UNKNOWN
 
 
+def test_authorized_gate_clauses_preserve_order_escape_and_do_not_change_verdict(tmp_path):
+    hostile = '<script>window.claimSupported=true</script>'
+    long_text = "bounded " + ("x" * 3900)
+    root = build_full_records(tmp_path / "run").delegated_gate(
+        clauses=[
+            {"clause_id": "gate.first", "text": hostile},
+            {"clause_id": "gate.second", "text": long_text},
+        ]
+    ).root
+    authority = {
+        "product_verdict": "ADMITTED_VERIFIED",
+        "verification_mode": "FROZEN_BEHAVIORAL",
+    }
+    detail = load_run_detail(root, truth_provider=FakeTruthProvider(authority))
+    rendered = render_result_json(detail)
+    html = render_run_html(detail)
+
+    assert rendered["authorized_gate_clauses"]["clauses"] == [
+        {"clause_id": "gate.first", "text": hostile},
+        {"clause_id": "gate.second", "text": long_text},
+    ]
+    assert rendered["result_admission_state"]["verdict"] == "ADMITTED_VERIFIED"
+    assert rendered["result_admission_state"]["verification_mode"] == "FROZEN_BEHAVIORAL"
+    assert hostile not in html
+    assert "&lt;script&gt;window.claimSupported=true&lt;/script&gt;" in html
+    assert long_text in html
+    assert "overflow-wrap: anywhere" in html
+    assert "not independently adjudicated" in html
+
+
+def test_absent_or_malformed_gate_clause_authority_never_fabricates_clauses(tmp_path):
+    absent_root = build_full_records(tmp_path / "absent").root
+    delegated = next((absent_root / "evidence" / "delegated-state").glob("*.json"))
+    delegated.unlink()
+    absent = render_result_json(load_run_detail(absent_root))["authorized_gate_clauses"]
+    assert absent["present"] == "ABSENT"
+    assert absent["clauses"] == []
+
+    malformed_root = build_full_records(tmp_path / "malformed").delegated_gate(
+        clauses=[{"clause_id": "looks.valid"}]
+    ).root
+    malformed = render_result_json(load_run_detail(malformed_root))["authorized_gate_clauses"]
+    assert malformed["present"] == "INCONSISTENT"
+    assert malformed["clauses"] == []
+
+
 def test_refused_after_behavioral_verification(tmp_path):
     root = build_behavioral_refusal(tmp_path / "run")
     detail = load_run_detail(root)

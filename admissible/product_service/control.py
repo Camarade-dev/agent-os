@@ -76,7 +76,9 @@ class ProductControlPlane:
                 "contract_summary":{"schema_version":profile.schema_version,"profile_id":profile.profile_id,
                 "run_id":profile.run_id,"session_id":profile.session_id,"gate_id":profile.gate_id,
                 "mission_id":profile.mission_id,"workspace_source_kind":profile.effective_workspace_source.kind.value,
-                "verification_mode":profile.verification_mode.value}}
+                "verification_mode":profile.verification_mode.value,
+                "gate_clauses":[{"clause_id":clause_id,"text":text}
+                                for clause_id,text in getattr(profile,"gate_clauses",())]}}
 
     def start_run(self, contract_id: str, owner_authorization: str, owner_authorization_digest: str)->ControlRun:
         with self._lock:

@@ -683,6 +683,10 @@ def author_runtime_contract(
         "mission_id": profile.mission_id,
         "workspace_source_kind": profile.effective_workspace_source.kind.value,
         "verification_mode": profile.verification_mode.value,
+        "gate_clauses": [
+            {"clause_id": clause_id, "text": text}
+            for clause_id, text in profile.gate_clauses
+        ],
         "template_id": validated["template_id"],
     }
     return AuthoredContractDocument(
