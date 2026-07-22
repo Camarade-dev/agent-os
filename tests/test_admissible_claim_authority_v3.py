@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
+import subprocess
+import sys
 from dataclasses import replace
+from unittest import mock
 
 import pytest
 
@@ -30,11 +35,14 @@ from admissible.delegated_gate.mission_profile import (
 )
 from admissible.delegated_gate.models import EvidenceKind
 from admissible.delegated_gate.native_canary import (
+    NativeCanaryCoordinator,
+    NativeCanaryStatus,
     build_native_agent_prompt,
     create_canary_session,
     observe_initialized_workspace_identity,
     run_native_mission_application,
 )
+from admissible.delegated_gate.state import Phase
 
 
 def _claim(
@@ -266,6 +274,42 @@ def test_claim_authority_iterative_graph_validation_covers_deep_and_disconnected
     assert _authority(claims=diamond).validated().claims == diamond
 
 
+def test_claim_authority_deep_chain_validation_is_non_recursive_in_child_process():
+    script = """
+import sys
+from admissible.delegated_gate.mission_profile import (
+    ClaimAuthority, ClaimAuthorship, ClaimObligationLevel,
+    ClaimSetCoverageStatus, ResultClaim,
+)
+sys.setrecursionlimit(80)
+claims = tuple(
+    ResultClaim(
+        f"chain.{index}", "Bounded claim.", ClaimObligationLevel.MANDATORY,
+        ((f"chain.{index + 1}",) if index + 1 < 256 else ()), (),
+    )
+    for index in range(256)
+)
+ClaimAuthority(
+    ClaimAuthorship.OWNER_AUTHORED,
+    ClaimSetCoverageStatus.NOT_ASSESSED,
+    claims,
+).validated()
+"""
+    environment = os.environ.copy()
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["PYTHONHASHSEED"] = "0"
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 @pytest.mark.parametrize("field", ["depends_on", "non_claims"])
 @pytest.mark.parametrize("invalid", [True, 1])
 def test_result_claim_rejects_boolean_and_non_string_collection_values(field, invalid):
@@ -345,6 +389,96 @@ def test_v3_runtime_prompt_session_and_document_loading_fail_closed(tmp_path):
             profile=v3,
             preflight_only=True,
         )
+
+
+def test_v3_coordinator_construction_refuses_before_state_executor_or_evidence(tmp_path):
+    class UntouchedStore:
+        phase = Phase.READY_FOR_GATE
+        revision = 0
+        events = ()
+
+        def __getattribute__(self, name):
+            if name in {"phase", "revision", "events"}:
+                return object.__getattribute__(self, name)
+            raise AssertionError(f"delegated store was touched through {name}")
+
+    class UntouchedDependency:
+        def __getattribute__(self, name):
+            raise AssertionError(f"dependency was touched through {name}")
+
+    session_store = UntouchedStore()
+    execution_store = UntouchedDependency()
+    executor = UntouchedDependency()
+    backend = UntouchedDependency()
+    evidence = tmp_path / "must-not-exist-evidence"
+    coordinator = NativeCanaryCoordinator.__new__(NativeCanaryCoordinator)
+
+    with mock.patch(
+        "admissible.delegated_gate.native_canary.NativeCanaryOutcome",
+        side_effect=AssertionError("no outcome may be emitted"),
+    ), pytest.raises(ValueError, match="coordinator requires the launchable runtime-v2 schema"):
+        NativeCanaryCoordinator.__init__(
+            coordinator,
+            session_store=session_store,
+            execution_store=execution_store,
+            executor=executor,
+            backend_attestation=backend,
+            source_repository=tmp_path / "source",
+            work_workspace=tmp_path / "work",
+            canary_parent=tmp_path / "parent",
+            evidence_directory=evidence,
+            profile=_profile(),
+        )
+
+    assert (session_store.phase, session_store.revision, session_store.events) == (
+        Phase.READY_FOR_GATE, 0, (),
+    )
+    assert "profile" not in coordinator.__dict__
+    assert "_profile_cache" not in coordinator.__dict__
+    assert not evidence.exists()
+
+
+def test_v3_outcome_defense_in_depth_refuses_without_emitting_outcome():
+    coordinator = NativeCanaryCoordinator.__new__(NativeCanaryCoordinator)
+    coordinator._profile_cache = _profile()
+    coordinator.execution_store = mock.Mock()
+    state = mock.Mock(session_id="claim-model-run", phase=Phase.READY_FOR_GATE, checkpoint_history=())
+    with mock.patch(
+        "admissible.delegated_gate.native_canary.NativeCanaryOutcome",
+        side_effect=AssertionError("no outcome may be emitted"),
+    ), pytest.raises(ValueError, match="outcome requires the launchable runtime-v2 schema"):
+        coordinator._outcome(
+            status=NativeCanaryStatus.DURABILITY_UNCERTAIN,
+            state=state,
+            detail="unreachable",
+        )
+
+
+def test_v4_authorization_rejects_v3_at_schema_guard_and_accepts_v2(tmp_path):
+    from test_admissible_workflow_recovery_profile import _payload_harness
+
+    v3 = _profile()
+    v2_data = v3.to_dict()
+    v2_data["schema_version"] = "admissible_native_mission_profile_v2"
+    v2_data.pop("claim_authority")
+    v2 = NativeMissionProfile.from_dict(_refingerprint(v2_data))
+    harness = _payload_harness(tmp_path, v2)
+    assert harness.payload.validated() is harness.payload
+
+    candidate = replace(harness.payload, mission_profile=v3)
+    preflight = tmp_path / "durable-preflight-evidence.json"
+
+    with mock.patch(
+        "admissible.delegated_gate.native_canary.create_canary_session",
+        side_effect=AssertionError("V3 reached derived authorization fingerprints"),
+    ), mock.patch.dict(os.environ, {"ADMISSIBLE_NATIVE_OWNER_AUTHORIZATION_DIGEST": ""}), pytest.raises(
+        ValueError, match="runtime-v4 authorization requires the launchable runtime-v2 schema"
+    ):
+        candidate.validated()
+
+    assert candidate.payload_fingerprint == harness.payload.payload_fingerprint
+    assert "ADMISSIBLE_NATIVE_OWNER_AUTHORIZATION_DIGEST" not in os.environ
+    assert not preflight.exists()
 
 
 def test_claim_authority_identity_and_order_fingerprints_are_derived_and_order_sensitive():

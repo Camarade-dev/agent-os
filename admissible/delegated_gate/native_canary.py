@@ -853,6 +853,8 @@ class EvidenceOnlyCanaryReconstruction:
         if request is not None:
             counts=self.execution_store.lifecycle_counts(request.session_id,request.gate_id,request.execution_attempt_index)
         profile = self._profile_cache
+        if profile is not None and profile.has_nested_runtime_authority and not profile.is_launchable_runtime_profile:
+            raise ValueError("native canary outcome requires the launchable runtime-v2 schema")
         product_verdict: str | None = None
         verification_mode: str | None = None
         behavioral_non_claim: str | None = None
@@ -1010,11 +1012,14 @@ class EvidenceOnlyCanaryReconstruction:
 class NativeCanaryCoordinator(EvidenceOnlyCanaryReconstruction):
     """One READY_FOR_GATE -> CHECKPOINT_CAPTURED canary path, with no retry."""
     def __init__(self, *, session_store: AtomicDelegatedSessionStore, execution_store: AtomicNativeExecutionStore, executor: NativeDelegatedExecutor, backend_attestation: BackendAttestation, source_repository: str | Path, work_workspace: str | Path, canary_parent: str | Path, evidence_directory: str | Path, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS, stdout_byte_limit: int = DEFAULT_STDOUT_BYTE_LIMIT, stderr_byte_limit: int = DEFAULT_STDERR_BYTE_LIMIT, profile: NativeMissionProfile | None = None) -> None:
+        selected_profile = (profile if profile is not None else legacy_canary_profile()).validated()
+        if selected_profile.has_nested_runtime_authority and not selected_profile.is_launchable_runtime_profile:
+            raise ValueError("native canary coordinator requires the launchable runtime-v2 schema")
         super().__init__(execution_store=execution_store, evidence_directory=evidence_directory)
         self.session_store=session_store; self.executor=executor; self.backend_attestation=backend_attestation.validated()
         self.source_repository,_=_safe_directory(source_repository,"source repository"); self.work_workspace,_=_safe_directory(work_workspace,"work workspace"); self.canary_parent,_=_safe_directory(canary_parent,"canary parent")
         self.timeout_seconds=timeout_seconds; self.stdout_byte_limit=stdout_byte_limit; self.stderr_byte_limit=stderr_byte_limit
-        self.profile=(profile if profile is not None else legacy_canary_profile()).validated()
+        self.profile=selected_profile
         # The live coordinator's selected profile is the reconstruction
         # authority for its own run; the CLI persists the identical profile in
         # the v4 payload before any execution begins.
