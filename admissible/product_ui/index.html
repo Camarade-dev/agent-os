@@ -54,6 +54,7 @@
             <fieldset class="materials"><legend>Required material paths</legend><p class="hint">Repository-relative paths only.</p><div id="material-list"></div><button id="add-material" class="button quiet" type="button">+ Add path</button></fieldset>
             <div class="field"><label for="commit-message">Intended Git end-state commit</label><input id="commit-message" type="text" maxlength="1024" required aria-describedby="commit-error"><p id="commit-error" class="field-error"></p></div>
             <div class="field"><label for="template-id">Authoring template</label><select id="template-id" required></select></div>
+            <div class="field"><label for="result-claims">Owner-authored result claims (optional JSON array)</label><textarea id="result-claims" rows="6" aria-describedby="claims-help claims-error" placeholder='[{"claim_id":"delivery","statement":"The required artifact is delivered.","obligation_level":"MANDATORY","depends_on":[],"non_claims":[]}]'></textarea><p id="claims-help" class="hint">Each claim must contain exactly claim_id, statement, obligation_level, depends_on, and non_claims. An explicit empty array is rejected.</p><p id="claims-error" class="field-error"></p></div>
             <details class="advanced"><summary>Advanced mission settings</summary><div class="split-fields"><div class="field"><label for="model">Model</label><input id="model" type="text" maxlength="256" value="auto"></div><div class="field"><label for="timeout-seconds">Timeout (seconds)</label><input id="timeout-seconds" type="number" min="1" step="1" value="60"></div></div></details>
             <div class="actions"><button id="author-button" class="button primary" type="submit">Author canonical contract</button></div>
           </form>
@@ -64,6 +65,7 @@
           <p class="truth-line">Validated by the existing launcher. Execution has not started.</p>
           <dl id="contract-facts" class="fact-grid"></dl>
           <section class="gate-clauses" aria-labelledby="contract-clauses-title"><h3 id="contract-clauses-title">Authorized gate clauses</h3><div id="contract-gate-clauses"></div></section>
+          <section id="contract-claims" class="result-claims" aria-labelledby="contract-claims-title" hidden><h3 id="contract-claims-title">Owner-authored result claims</h3><div id="contract-claim-review"></div></section>
           <details><summary>Owner-authored intent</summary><dl id="intent-facts" class="detail-list"></dl></details>
           <div class="actions"><button id="back-to-compose" class="button quiet" type="button">Back to compose</button><button id="prepare-button" class="button primary" type="button">Prepare authorization</button></div>
         </section>

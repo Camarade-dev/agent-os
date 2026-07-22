@@ -83,6 +83,7 @@ class AuthoredContractRecord:
     timeout_seconds: int
     stdout_byte_limit: int
     stderr_byte_limit: int
+    is_launchable_runtime_profile: bool
 
 
 class ProductLauncher:
@@ -266,16 +267,22 @@ class ProductLauncher:
             )
         except AuthoringError as exc:
             return 400, {"error": "AUTHORING_REJECTED", **exc.to_dict()}
-        status, body = self.proxy_g2(
-            "POST",
-            "/api/v1/contracts/validate",
-            body={"profile_document": authored.document_path},
-        )
-        if status != 200:
-            return status, body
-        contract_id = body.get("contract_id")
-        if not isinstance(contract_id, str):
-            return 502, {"error": "G2_VALIDATE_INVALID"}
+        launchable = bool(getattr(authored.profile, "is_launchable_runtime_profile", False))
+        if launchable:
+            status, body = self.proxy_g2(
+                "POST",
+                "/api/v1/contracts/validate",
+                body={"profile_document": authored.document_path},
+            )
+            if status != 200:
+                return status, body
+            contract_id = body.get("contract_id")
+            if not isinstance(contract_id, str):
+                return 502, {"error": "G2_VALIDATE_INVALID"}
+        else:
+            # V3 is reviewable here only. It never crosses the runtime document
+            # loader, which intentionally remains V2-only.
+            contract_id = f"draft-{self._id_generator()}"
         record = AuthoredContractRecord(
             contract_id=contract_id,
             document_path=authored.document_path,
@@ -288,10 +295,11 @@ class ProductLauncher:
             timeout_seconds=int(getattr(authored.profile, "timeout_seconds")),
             stdout_byte_limit=int(getattr(authored.profile, "stdout_byte_limit")),
             stderr_byte_limit=int(getattr(authored.profile, "stderr_byte_limit")),
+            is_launchable_runtime_profile=launchable,
         )
         with self._lock:
             self._contracts[contract_id] = record
-        return 200, {
+        response = {
             "contract_id": contract_id,
             "profile_fingerprint": authored.profile_fingerprint,
             "contract_summary": authored.contract_summary,
@@ -299,6 +307,9 @@ class ProductLauncher:
             "execution_started": False,
             "authorization_mode": self.authorization_mode,
         }
+        if not launchable:
+            response["runtime_launchable"] = False
+        return 200, response
 
     def enqueue_preparation(self, contract_id: str) -> tuple[int, dict[str, object]]:
         with self._lock:
@@ -307,6 +318,8 @@ class ProductLauncher:
             record = self._contracts.get(contract_id)
             if record is None:
                 return 404, {"error": "CONTRACT_NOT_FOUND"}
+            if not record.is_launchable_runtime_profile:
+                return 409, {"error": "CLAIM_AWARE_V3_NOT_LAUNCHABLE"}
             if self._active_preflight is not None:
                 return 409, {"error": "PREFLIGHT_BUSY"}
             preparation_id = self._id_generator()
@@ -598,6 +611,8 @@ class ProductLauncher:
                 preparation = self._preparations.get(preparation_id)
                 if record is None:
                     return 404, {"error": "CONTRACT_NOT_FOUND"}
+                if not record.is_launchable_runtime_profile:
+                    return 409, {"error": "CLAIM_AWARE_V3_NOT_LAUNCHABLE"}
                 if preparation is None:
                     return 404, {"error": "PREPARATION_NOT_FOUND"}
                 if preparation.contract_id != contract_id:

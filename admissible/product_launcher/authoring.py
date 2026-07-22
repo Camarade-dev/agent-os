@@ -1,4 +1,4 @@
-"""Bounded owner-input → canonical runtime-v2 contract authoring."""
+"""Bounded owner-input → canonical V2 or inert claim-aware V3 authoring."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,6 +9,7 @@ from typing import Any, Callable, Mapping
 
 from admissible.delegated_gate.canonical import canonical_bytes, require_safe_relative_path
 from admissible.delegated_gate.mission_profile import (
+    MISSION_PROFILE_SCHEMA_VERSION_V3,
     MISSION_PROFILE_SCHEMA_VERSION_V2,
     ONE_SHOT_PROFILE_BUDGETS,
     WORKFLOW_RECOVERY_COMPLETION_CONDITIONS_TEXT,
@@ -16,6 +17,9 @@ from admissible.delegated_gate.mission_profile import (
     WORKFLOW_RECOVERY_V2_MISSION_TEXT,
     WORKFLOW_RECOVERY_V2_PROFILE,
     WORKFLOW_RECOVERY_VERIFIER_SOURCE,
+    ClaimAuthority,
+    ClaimAuthorship,
+    ClaimSetCoverageStatus,
     GitEndStatePolicy,
     ProfileCheckpointCommand,
     RuntimePromptAuthority,
@@ -43,6 +47,7 @@ OWNER_AUTHORING_FIELDS = frozenset(
         "model",
         "timeout_seconds",
         "template_id",
+        "result_claims",
     }
 )
 REQUIRED_OWNER_FIELDS = frozenset(
@@ -174,6 +179,17 @@ class AuthoredContractDocument:
     profile: object
 
 
+CLAIM_AUTHORSHIP_NOTICE = "These result claims were explicitly authored by the owner."
+CLAIM_COVERAGE_NOTICE = (
+    "Claim-set coverage has not been assessed. Requirements omitted from this "
+    "claim set may remain unrepresented."
+)
+CLAIM_ADJUDICATION_NOTICE = (
+    "These claims are part of the draft contract but have not been adjudicated."
+)
+CLAIM_RUNTIME_NOTICE = "Claim-aware V3 contracts are not launchable in the current runtime."
+
+
 def _require_text(value: object, field: str, *, max_bytes: int) -> str:
     if not isinstance(value, str) or not value.strip() or "\x00" in value:
         raise AuthoringError(
@@ -276,6 +292,29 @@ def _validate_owner_inputs(inputs: Mapping[str, Any]) -> dict[str, Any]:
         )
     model = inputs.get("model")
     timeout_seconds = inputs.get("timeout_seconds")
+    claim_authority = None
+    if "result_claims" in inputs:
+        raw_claims = inputs["result_claims"]
+        if not isinstance(raw_claims, list) or not raw_claims:
+            raise AuthoringError(
+                "INVALID_RESULT_CLAIMS",
+                field="result_claims",
+                safe_message_key="authoring.result_claims_nonempty_array_required",
+            )
+        try:
+            claim_authority = ClaimAuthority.from_dict(
+                {
+                    "authorship": ClaimAuthorship.OWNER_AUTHORED.value,
+                    "coverage_status": ClaimSetCoverageStatus.NOT_ASSESSED.value,
+                    "claims": raw_claims,
+                }
+            )
+        except (TypeError, ValueError):
+            raise AuthoringError(
+                "INVALID_RESULT_CLAIMS",
+                field="result_claims",
+                safe_message_key="authoring.invalid_result_claims",
+            ) from None
     return {
         "mission_text": mission_text,
         "gate_objective": gate_objective,
@@ -285,6 +324,7 @@ def _validate_owner_inputs(inputs: Mapping[str, Any]) -> dict[str, Any]:
         "template_id": template_id,
         "model": model,
         "timeout_seconds": timeout_seconds,
+        "claim_authority": claim_authority,
     }
 
 
@@ -615,7 +655,7 @@ def author_runtime_contract(
     id_generator: Callable[[], str] | None = None,
     profile_builder: Callable[..., object] = create_native_mission_profile,
 ) -> AuthoredContractDocument:
-    """Author one durable write-once runtime-v2 profile document.
+    """Author one durable write-once V2 profile or inert V3 draft document.
 
     The document intentionally persists owner mission content. It never executes,
     never creates a run root, and never creates an evidence root. Fingerprint
@@ -639,6 +679,10 @@ def author_runtime_contract(
         validated=validated,
         generated=generated,
     )
+    claim_authority = validated["claim_authority"]
+    if claim_authority is not None:
+        builder_kwargs["schema_version"] = MISSION_PROFILE_SCHEMA_VERSION_V3
+        builder_kwargs["claim_authority"] = claim_authority
     try:
         profile = profile_builder(**builder_kwargs)
     except Exception:
@@ -689,6 +733,15 @@ def author_runtime_contract(
         ],
         "template_id": validated["template_id"],
     }
+    if profile.schema_version == MISSION_PROFILE_SCHEMA_VERSION_V3:
+        summary["profile_fingerprint"] = fingerprint
+        summary["claim_authority"] = profile.claim_authority.to_dict()
+        summary["claim_review_notices"] = {
+            "authorship": CLAIM_AUTHORSHIP_NOTICE,
+            "coverage": CLAIM_COVERAGE_NOTICE,
+            "adjudication": CLAIM_ADJUDICATION_NOTICE,
+            "runtime": CLAIM_RUNTIME_NOTICE,
+        }
     return AuthoredContractDocument(
         document_path=str(path.resolve()),
         profile_fingerprint=fingerprint,
@@ -708,6 +761,10 @@ def author_runtime_contract(
 __all__ = [
     "AuthoringError",
     "AuthoredContractDocument",
+    "CLAIM_ADJUDICATION_NOTICE",
+    "CLAIM_AUTHORSHIP_NOTICE",
+    "CLAIM_COVERAGE_NOTICE",
+    "CLAIM_RUNTIME_NOTICE",
     "GOLDEN_EXACT_CONTRACT_FIELDS",
     "GOLDEN_TEMPLATE_RECOMMENDED_TIMEOUT_SECONDS",
     "GOLDEN_WORKFLOW_COMMIT_MESSAGE",

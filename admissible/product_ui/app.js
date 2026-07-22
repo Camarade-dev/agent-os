@@ -104,7 +104,8 @@
     byId("launch-button").disabled=next===STATES.LAUNCHING;
     byId("launch-button").textContent=next===STATES.LAUNCHING?"Submitting authorization":"Launch mission";
     const preparing=next===STATES.PREPARATION_QUEUED||next===STATES.PREPARATION_RUNNING||ui.prepareInFlight;
-    byId("prepare-button").disabled=preparing;
+    const v3=ui.contract&&ui.contract.response&&ui.contract.response.runtime_launchable===false;
+    byId("prepare-button").disabled=preparing||v3;
     byId("retry-preparation").disabled=preparing;
     document.querySelectorAll(".reset-flow").forEach(button=>{
       const locked=next===STATES.LAUNCHING;
@@ -152,6 +153,7 @@
   }
   function appendReturnedFact(root,body,key,label){if(hasOwn(body,key))appendFact(root,label,body[key]);}
   const GATE_CLAUSE_NOTICE="These clauses are part of the authorized contract. They are not independently adjudicated unless linked to explicit verification evidence.";
+  const CLAIM_NOTICE_KEYS=["authorship","coverage","adjudication","runtime"];
   function normalizedGateClauses(value){
     if(!Array.isArray(value)||!value.length)return null;
     const seen=new Set(),clauses=[];
@@ -169,6 +171,25 @@
     const list=document.createElement("ol");list.className="gate-clause-list";
     clauses.forEach(clause=>{const item=document.createElement("li"),id=document.createElement("span"),text=document.createElement("span");id.className="gate-clause-id";id.textContent=clause.clause_id;text.textContent=": "+clause.text;item.append(id,text);list.append(item);});root.append(list);
   }
+  function normalizedClaimReview(authority,notices){
+    if(!isObject(authority)||authority.authorship!=="OWNER_AUTHORED"||authority.coverage_status!=="NOT_ASSESSED"||!Array.isArray(authority.claims)||!authority.claims.length||!isObject(notices))return null;
+    if(!CLAIM_NOTICE_KEYS.every(key=>typeof notices[key]==="string"&&notices[key]))return null;
+    const seen=new Set(),claims=[];
+    for(const claim of authority.claims){
+      if(!isObject(claim)||Object.keys(claim).sort().join(",")!=="claim_id,depends_on,non_claims,obligation_level,statement"||typeof claim.claim_id!=="string"||!claim.claim_id||seen.has(claim.claim_id)||typeof claim.statement!=="string"||!claim.statement||!["MANDATORY","OPTIONAL","ADVISORY"].includes(claim.obligation_level)||!Array.isArray(claim.depends_on)||!claim.depends_on.every(x=>typeof x==="string")||!Array.isArray(claim.non_claims)||!claim.non_claims.every(x=>typeof x==="string"))return null;
+      seen.add(claim.claim_id);claims.push(claim);
+    }
+    return {claims,notices};
+  }
+  function renderClaimReview(summary){
+    const section=byId("contract-claims"),root=byId("contract-claim-review");if(!section||!root)return !hasOwn(summary,"claim_authority")&&!hasOwn(summary,"claim_review_notices");root.replaceChildren();
+    if(!hasOwn(summary,"claim_authority")&&!hasOwn(summary,"claim_review_notices")){section.hidden=true;return true;}
+    section.hidden=false;const review=normalizedClaimReview(summary.claim_authority,summary.claim_review_notices);
+    if(!review){const failure=document.createElement("p");failure.className="claim-review-error";failure.textContent="Claim review data is malformed. No partial claim list is shown.";root.append(failure);return false;}
+    CLAIM_NOTICE_KEYS.forEach(key=>{const notice=document.createElement("p");notice.className="claim-notice";notice.textContent=review.notices[key];root.append(notice);});
+    const meta=document.createElement("dl");meta.className="detail-list";appendFact(meta,"Authorship",summary.claim_authority.authorship);appendFact(meta,"Coverage status",summary.claim_authority.coverage_status);root.append(meta);
+    const list=document.createElement("ol");list.className="claim-list";review.claims.forEach(claim=>{const item=document.createElement("li"),title=document.createElement("p"),statement=document.createElement("p"),details=document.createElement("dl");title.className="claim-id";title.textContent=claim.claim_id;statement.className="claim-statement";statement.textContent=claim.statement;appendFact(details,"Obligation level",claim.obligation_level);appendFact(details,"Dependencies",claim.depends_on.join(", ")||"None");appendFact(details,"Non-claims",claim.non_claims.join("; ")||"None");item.append(title,statement,details);list.append(item);});root.append(list);return true;
+  }
   function renderBootstrap(boot){
     const root=byId("bootstrap-facts");root.replaceChildren();
     [["Service",boot.service],["Repository",boot.repository_display_path],["Required source HEAD",boot.required_source_head],["Authorization mode",boot.authorization_mode],["Owner phrase encoding",boot.owner_authorization_encoding],["Visual UI wire value",String(boot.visual_ui_available)],["Local state",boot.g2_ready?"Ready":"Unavailable"]].forEach(x=>appendFact(root,x[0],x[1]));
@@ -185,16 +206,18 @@
     const input=document.createElement("input");input.type="text";input.value=value;input.maxLength=4096;input.setAttribute("aria-label","Required material path");
     const remove=document.createElement("button");remove.type="button";remove.className="button quiet";remove.textContent="Remove";remove.addEventListener("click",()=>row.remove());row.append(input,remove);byId("material-list").append(row);
   }
+  function parsedClaims(){const field=byId("result-claims");if(!field)return undefined;const raw=field.value;if(!raw.trim())return undefined;try{return JSON.parse(raw);}catch(_error){return null;}}
   function validateCompose(){
     let valid=true;[["mission-text","mission-error","Enter the mission."],["gate-objective","objective-error","Enter the gate objective."],["completion-conditions","conditions-error","Enter completion conditions."],["commit-message","commit-error","Enter the intended commit message."]].forEach(([field,error,message])=>{const empty=!byId(field).value.trim();byId(error).textContent=empty?message:"";byId(field).setAttribute("aria-invalid",String(empty));if(empty)valid=false;});
-    if(/[\r\n]/.test(byId("commit-message").value)){byId("commit-error").textContent="Use one commit-message line.";valid=false;}return valid;
+    if(/[\r\n]/.test(byId("commit-message").value)){byId("commit-error").textContent="Use one commit-message line.";valid=false;}const claims=parsedClaims(),claimsError=byId("claims-error");if(claimsError)claimsError.textContent=claims===null?"Enter a valid JSON array.":"";if(claims===null)valid=false;return valid;
   }
-  function composeBody(){return {mission_text:byId("mission-text").value,gate_objective:byId("gate-objective").value,completion_conditions_text:byId("completion-conditions").value,required_material_paths:Array.from(byId("material-list").querySelectorAll("input")).map(x=>x.value).filter(Boolean),commit_message:byId("commit-message").value,model:byId("model").value,timeout_seconds:Number(byId("timeout-seconds").value),template_id:byId("template-id").value};}
+  function composeBody(){const body={mission_text:byId("mission-text").value,gate_objective:byId("gate-objective").value,completion_conditions_text:byId("completion-conditions").value,required_material_paths:Array.from(byId("material-list").querySelectorAll("input")).map(x=>x.value).filter(Boolean),commit_message:byId("commit-message").value,model:byId("model").value,timeout_seconds:Number(byId("timeout-seconds").value),template_id:byId("template-id").value},claims=parsedClaims();if(claims!==undefined)body.result_claims=claims;return body;}
   function renderContract(){
     const body=ui.contract.response,summary=body.contract_summary||{},ids=body.generated_ids||{},root=byId("contract-facts");root.replaceChildren();
     [["Contract ID",body.contract_id],["Canonical fingerprint",body.profile_fingerprint],["Profile ID",ids.profile_id||summary.profile_id],["Run ID",ids.run_id||summary.run_id],["Session ID",ids.session_id||summary.session_id],["Gate ID",ids.gate_id||summary.gate_id],["Mission ID",ids.mission_id||summary.mission_id],["Workspace source kind",summary.workspace_source_kind],["Verification mode",summary.verification_mode],["Authorization mode",body.authorization_mode],["Execution started",String(body.execution_started)]].forEach(x=>appendFact(root,x[0],x[1]));
     const intent=byId("intent-facts");intent.replaceChildren();[["Mission",ui.contract.input.mission_text],["Gate objective",ui.contract.input.gate_objective],["Completion conditions",ui.contract.input.completion_conditions_text],["Required materials",ui.contract.input.required_material_paths.join(", ")||"None"],["Intended commit",ui.contract.input.commit_message]].forEach(x=>appendFact(intent,x[0],x[1]));
     renderGateClauses("contract-gate-clauses",summary.gate_clauses,"INCONSISTENT");
+    const claimsValid=renderClaimReview(summary),launchable=body.runtime_launchable!==false;byId("prepare-button").hidden=!launchable;byId("prepare-button").disabled=!launchable||!claimsValid;
   }
   async function author(event){
     event.preventDefault();clearError();if(!validateCompose())return;const input=composeBody();setState(STATES.AUTHORING);
