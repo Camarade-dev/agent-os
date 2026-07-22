@@ -18,10 +18,13 @@ from urllib.request import urlopen
 import pytest
 
 from admissible.product_launcher.configuration import (
+    AUTHORIZATION_MODE_PRECOMMITTED,
     DEFAULT_TEMPLATE_ID,
     GOLDEN_TEMPLATE_ID,
+    LauncherConfiguration,
     SUPPORTED_TEMPLATE_IDS,
 )
+from admissible.product_launcher.launcher import ProductLauncher
 from admissible.product_launcher.ui_transport import create_ui_loopback_server
 from admissible.product_ui import get_asset, render_document
 
@@ -2405,3 +2408,167 @@ def test_gate_clause_rendering_is_safe_ordered_and_bounded_in_real_browser(tmp_p
             proc.kill()
             proc.wait(timeout=5)
         server.stop()
+
+
+OWNER_CLAIM_NOTICE_LITERALS = [
+    "These result claims were explicitly authored by the owner.",
+    "Claim-set coverage has not been assessed. Requirements omitted from this claim set may remain unrepresented.",
+    "These claims are part of the draft contract but have not been adjudicated.",
+    "Claim-aware V3 contracts are not launchable in the current runtime.",
+]
+OWNER_ORDERED_BROWSER_CLAIMS = [
+    {
+        "claim_id": "zulu-owner-first",
+        "statement": '<script>window.__claim_attack=1</script> owner text',
+        "obligation_level": "MANDATORY",
+        "depends_on": ["mike-owner-second", "alpha-owner-third", "tango-owner-fourth"],
+        "non_claims": ["Zulu exclusion", "Mike exclusion", "Alpha exclusion"],
+    },
+    {"claim_id": "mike-owner-second", "statement": "Second", "obligation_level": "OPTIONAL", "depends_on": [], "non_claims": []},
+    {"claim_id": "alpha-owner-third", "statement": "Third", "obligation_level": "ADVISORY", "depends_on": [], "non_claims": []},
+    {"claim_id": "tango-owner-fourth", "statement": "Fourth", "obligation_level": "MANDATORY", "depends_on": [], "non_claims": []},
+]
+
+
+def _claim_browser_configuration(tmp_path: Path) -> LauncherConfiguration:
+    source = tmp_path / "source"
+    source.mkdir()
+    return LauncherConfiguration(
+        source_repository=source.resolve(), required_source_head="a" * 40,
+        run_parent=(tmp_path / "runs").resolve(),
+        contract_documents_directory=(tmp_path / "documents").resolve(),
+        executable="provider", executable_prefix_args=(), attestation_class="package-bin",
+        model_default="model", timeout_default=60, timeout_maximum=3600,
+        stdout_byte_limit=65536, stderr_byte_limit=65536,
+        product_ui_bind_host="127.0.0.1", product_ui_bind_port=0,
+        g2_bind_host="127.0.0.1", g2_bind_port=0,
+        authorization_mode=AUTHORIZATION_MODE_PRECOMMITTED, open_browser=False,
+    )
+
+
+class OwnerClaimBrowserLauncher(ProductLauncher):
+    def __init__(self, configuration):
+        counter = iter(f"{value:032x}" for value in range(500, 700))
+        super().__init__(configuration, verify_head=False, id_generator=lambda: next(counter), browser_opener=lambda _url: None)
+        self.malformed_claim_response = False
+        self.preparation_attempts = 0
+        self.proxy_g2 = lambda method, path, body=None: (200, {"contract_id": "v2-browser-contract"})
+
+    def author_and_validate(self, body):
+        status, response = super().author_and_validate(body)
+        if status == 200 and self.malformed_claim_response and "claim_authority" in response["contract_summary"]:
+            response["contract_summary"]["claim_authority"]["claims"] = [
+                OWNER_ORDERED_BROWSER_CLAIMS[0], {"claim_id": "broken"}
+            ]
+        return status, response
+
+    def enqueue_preparation(self, contract_id):
+        self.preparation_attempts += 1
+        return super().enqueue_preparation(contract_id)
+
+
+def test_owner_claim_review_real_dom_preserves_authority_order_and_v3_boundary(tmp_path):
+    if not CHROME.is_file():
+        pytest.skip("Chrome not installed")
+    launcher = OwnerClaimBrowserLauncher(_claim_browser_configuration(tmp_path))
+    server = create_ui_loopback_server(launcher, csrf_generator=lambda _n: "f" * 64).start()
+    profile = tmp_path / "chrome-profile-owner-claims"
+    profile.mkdir()
+    with socket.socket() as port_probe:
+        port_probe.bind(("127.0.0.1", 0))
+        debug_port = port_probe.getsockname()[1]
+    url = f"http://{server.host}:{server.port}/"
+    proc = subprocess.Popen([
+        str(CHROME), f"--user-data-dir={profile}", f"--remote-debugging-port={debug_port}",
+        "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+        "--disable-extensions", "--disable-background-networking", "--remote-allow-origins=*", url,
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    close_cdp = None
+    try:
+        deadline = time.time() + 20
+        page = None
+        while time.time() < deadline:
+            try:
+                with urlopen(f"http://127.0.0.1:{debug_port}/json", timeout=1) as response:
+                    targets = json.loads(response.read().decode())
+                page = next((target for target in targets if target.get("type") == "page"), None)
+            except Exception:
+                page = None
+            if page:
+                break
+            time.sleep(0.2)
+        assert page is not None
+        send, close_cdp = _cdp_connect(page["webSocketDebuggerUrl"])
+        send("Runtime.enable")
+        send("Page.enable")
+        send("Page.navigate", {"url": url})
+
+        def evaluate(expression):
+            result = send("Runtime.evaluate", {"expression": expression, "returnByValue": True})
+            return ((result.get("result") or {}).get("result") or {}).get("value")
+
+        def wait_for(expression, wanted):
+            end = time.time() + 20
+            last = None
+            while time.time() < end:
+                last = evaluate(expression)
+                if last == wanted:
+                    return
+                time.sleep(0.15)
+            raise AssertionError(f"timed out waiting for {wanted!r}; last={last!r}")
+
+        def compose(claims):
+            evaluate("window.AdmissibleG3Test.reset()")
+            wait_for("window.AdmissibleG3Test.getState()", "COMPOSE")
+            fields = {
+                "mission-text": "claim mission", "gate-objective": "claim objective",
+                "completion-conditions": "claim conditions", "commit-message": "feat: claim",
+                "result-claims": "" if claims is None else json.dumps(claims, separators=(",", ":")),
+            }
+            for field, value in fields.items():
+                evaluate(f"window.AdmissibleG3Test.setField({json.dumps(field)},{json.dumps(value)})")
+            evaluate("window.AdmissibleG3Test.submit('compose-form')")
+            wait_for("window.AdmissibleG3Test.getState()", "CONTRACT_READY")
+
+        compose(OWNER_ORDERED_BROWSER_CLAIMS)
+        for width, height, mobile in ((1280, 800, False), (390, 844, True)):
+            send("Emulation.setDeviceMetricsOverride", {"width": width, "height": height, "deviceScaleFactor": 1, "mobile": mobile})
+            raw = evaluate("JSON.stringify((()=>{const c=document.getElementById('contract-claim-review'),g=document.getElementById('contract-gate-clauses'),b=document.getElementById('prepare-button');return {notices:Array.from(c.querySelectorAll('.claim-notice')).map(x=>x.textContent),ids:Array.from(c.querySelectorAll('.claim-id')).map(x=>x.textContent),statements:Array.from(c.querySelectorAll('.claim-statement')).map(x=>x.textContent),facts:Array.from(c.querySelectorAll('dd')).map(x=>x.textContent),claimItems:c.querySelectorAll('.claim-list>li').length,gateItems:g.querySelectorAll('.gate-clause-list>li').length,claimGateItems:c.querySelectorAll('.gate-clause-list>li').length,gateClaimItems:g.querySelectorAll('.claim-list>li').length,injected:c.querySelectorAll('script,img,svg,iframe,object,embed').length,hidden:b.hidden,disabled:b.disabled}})())")
+            measured = json.loads(raw)
+            assert measured["notices"] == OWNER_CLAIM_NOTICE_LITERALS
+            assert measured["ids"] == [claim["claim_id"] for claim in OWNER_ORDERED_BROWSER_CLAIMS]
+            assert measured["statements"] == [claim["statement"] for claim in OWNER_ORDERED_BROWSER_CLAIMS]
+            assert measured["facts"][2:5] == ["MANDATORY", "mike-owner-second, alpha-owner-third, tango-owner-fourth", "Zulu exclusion; Mike exclusion; Alpha exclusion"]
+            assert measured["claimItems"] == 4 and measured["gateItems"] == 2
+            assert measured["claimGateItems"] == 0 and measured["gateClaimItems"] == 0
+            assert measured["injected"] == 0
+            assert measured["hidden"] is True and measured["disabled"] is True
+
+        evaluate("const b=document.getElementById('prepare-button');b.hidden=false;b.disabled=false;b.click()")
+        refusal_deadline = time.time() + 5
+        while launcher.preparation_attempts != 1 and time.time() < refusal_deadline:
+            time.sleep(0.05)
+        assert launcher.preparation_attempts == 1
+        wait_for("window.AdmissibleG3Test.getState()", "CONTRACT_READY")
+        assert launcher._preparations._items == {}
+
+        launcher.malformed_claim_response = True
+        compose(OWNER_ORDERED_BROWSER_CLAIMS)
+        malformed = json.loads(evaluate("JSON.stringify({items:document.querySelectorAll('#contract-claim-review .claim-list>li').length,error:document.querySelector('#contract-claim-review .claim-review-error').textContent,disabled:document.getElementById('prepare-button').disabled})"))
+        assert malformed == {"items": 0, "error": "Claim review data is malformed. No partial claim list is shown.", "disabled": True}
+
+        launcher.malformed_claim_response = False
+        compose(None)
+        v2 = json.loads(evaluate("JSON.stringify({claimsHidden:document.getElementById('contract-claims').hidden,prepareHidden:document.getElementById('prepare-button').hidden,prepareDisabled:document.getElementById('prepare-button').disabled})"))
+        assert v2 == {"claimsHidden": True, "prepareHidden": False, "prepareDisabled": False}
+    finally:
+        if close_cdp:
+            close_cdp()
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        server.stop()
+        launcher.close()

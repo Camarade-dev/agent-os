@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -7,10 +8,6 @@ import pytest
 from admissible.delegated_gate.canonical import canonical_bytes
 from admissible.delegated_gate.mission_profile import NativeMissionProfile
 from admissible.product_launcher.authoring import (
-    CLAIM_ADJUDICATION_NOTICE,
-    CLAIM_AUTHORSHIP_NOTICE,
-    CLAIM_COVERAGE_NOTICE,
-    CLAIM_RUNTIME_NOTICE,
     AuthoringError,
     author_runtime_contract,
 )
@@ -19,6 +16,41 @@ from admissible.product_launcher.configuration import (
     LauncherConfiguration,
 )
 from admissible.product_launcher.launcher import ProductLauncher
+
+
+# Test-owned acceptance literals.  Do not replace these with imports from the
+# implementation: these assertions are intended to catch semantic rewording.
+EXPECTED_CLAIM_NOTICES = {
+    "authorship": "These result claims were explicitly authored by the owner.",
+    "coverage": (
+        "Claim-set coverage has not been assessed. Requirements omitted from this "
+        "claim set may remain unrepresented."
+    ),
+    "adjudication": (
+        "These claims are part of the draft contract but have not been adjudicated."
+    ),
+    "runtime": "Claim-aware V3 contracts are not launchable in the current runtime.",
+}
+FORBIDDEN_REVIEW_CLAIMS = (
+    "verified",
+    "fully supported",
+    "adjudicated successfully",
+    "coverage complete",
+    "admitted",
+    "passed",
+)
+V2_SUMMARY_KEYS = {
+    "schema_version",
+    "profile_id",
+    "run_id",
+    "session_id",
+    "gate_id",
+    "mission_id",
+    "workspace_source_kind",
+    "verification_mode",
+    "gate_clauses",
+    "template_id",
+}
 
 
 def _configuration(tmp_path: Path) -> LauncherConfiguration:
@@ -68,6 +100,29 @@ def _claim(claim_id: str, *, depends_on: list[str] | None = None) -> dict[str, o
     }
 
 
+def _ordered_claims() -> list[dict[str, object]]:
+    return [
+        {
+            **_claim("zulu-owner-first"),
+            "statement": "Required material paths exist, as a distinct result claim.",
+            "depends_on": ["mike-owner-second", "alpha-owner-third", "tango-owner-fourth"],
+            "non_claims": ["Zulu exclusion", "Mike exclusion", "Alpha exclusion"],
+        },
+        {
+            **_claim("mike-owner-second"),
+            "statement": "Exactly one local result is described by the owner.",
+        },
+        {
+            **_claim("alpha-owner-third"),
+            "statement": "Owner claim resembling, but not becoming, a gate clause.",
+        },
+        {
+            **_claim("tango-owner-fourth"),
+            "statement": "A fourth result keeps three dependencies non-vacuous.",
+        },
+    ]
+
+
 def _author(tmp_path: Path, inputs: dict[str, object], identity: str):
     return author_runtime_contract(
         inputs,
@@ -78,25 +133,46 @@ def _author(tmp_path: Path, inputs: dict[str, object], identity: str):
 
 
 def test_explicit_owner_claims_construct_canonical_ordered_v3_review(tmp_path):
-    claims = [_claim("foundation"), _claim("delivery", depends_on=["foundation"])]
+    claims = _ordered_claims()
     authored = _author(tmp_path, _owner_input(result_claims=claims), "a")
     profile = NativeMissionProfile.from_dict(authored.profile.to_dict())
     assert profile.schema_version == "admissible_native_mission_profile_v3"
     assert profile.is_launchable_runtime_profile is False
     assert profile.claim_authority.authorship.value == "OWNER_AUTHORED"
     assert profile.claim_authority.coverage_status.value == "NOT_ASSESSED"
-    assert [claim.claim_id for claim in profile.claim_authority.claims] == ["foundation", "delivery"]
-    assert profile.claim_authority.claims[1].depends_on == ("foundation",)
-    assert profile.claim_authority.claims[0].non_claims == ("Not promised by foundation",)
+    assert [claim.claim_id for claim in profile.claim_authority.claims] == [
+        "zulu-owner-first", "mike-owner-second", "alpha-owner-third", "tango-owner-fourth"
+    ]
+    assert profile.claim_authority.claims[0].depends_on == (
+        "mike-owner-second", "alpha-owner-third", "tango-owner-fourth"
+    )
+    assert profile.claim_authority.claims[0].non_claims == (
+        "Zulu exclusion", "Mike exclusion", "Alpha exclusion"
+    )
     summary = authored.contract_summary
     assert summary["claim_authority"] == profile.claim_authority.to_dict()
-    assert summary["gate_clauses"] and "claims" not in summary["gate_clauses"]
-    assert list(summary["claim_review_notices"].values()) == [
-        CLAIM_AUTHORSHIP_NOTICE,
-        CLAIM_COVERAGE_NOTICE,
-        CLAIM_ADJUDICATION_NOTICE,
-        CLAIM_RUNTIME_NOTICE,
+    assert summary["claim_review_notices"] == EXPECTED_CLAIM_NOTICES
+    review_text = " ".join(summary["claim_review_notices"].values()).lower()
+    assert all(term not in review_text for term in FORBIDDEN_REVIEW_CLAIMS)
+
+    clauses = summary["gate_clauses"]
+    result_claims = summary["claim_authority"]["claims"]
+    assert len(clauses) == 2
+    assert len(result_claims) == 4
+    assert [clause["clause_id"] for clause in clauses] == [
+        f"gate-{'a' * 12}.material", f"gate-{'a' * 12}.git"
     ]
+    assert [clause["text"] for clause in clauses] == [
+        "Required material paths exist under the assigned workspace.",
+        "Exactly one local commit with the required complete message exists.",
+    ]
+    assert [claim["claim_id"] for claim in result_claims] == [
+        "zulu-owner-first", "mike-owner-second", "alpha-owner-third", "tango-owner-fourth"
+    ]
+    assert [claim["statement"] for claim in result_claims] == [claim["statement"] for claim in claims]
+    assert not ({clause["clause_id"] for clause in clauses} & {claim["claim_id"] for claim in result_claims})
+    assert all(claim not in clauses for claim in result_claims)
+    assert all(clause not in result_claims for clause in clauses)
 
 
 def test_absent_claims_preserve_v2_and_omit_claim_presentation(tmp_path):
@@ -104,9 +180,40 @@ def test_absent_claims_preserve_v2_and_omit_claim_presentation(tmp_path):
     profile = authored.profile
     assert profile.schema_version == "admissible_native_mission_profile_v2"
     assert profile.is_launchable_runtime_profile is True
+    assert set(authored.contract_summary) == V2_SUMMARY_KEYS
     assert "claim_authority" not in authored.contract_summary
     assert "claim_review_notices" not in authored.contract_summary
+    assert "runtime_launchable" not in authored.contract_summary
+    assert authored.profile_fingerprint == profile.profile_fingerprint
     assert canonical_bytes(profile.to_dict()) == Path(authored.document_path).read_bytes()
+
+
+def test_claim_free_v2_service_response_has_no_v3_placeholders_and_remains_preparable(tmp_path):
+    counter = iter(f"{value:032x}" for value in range(100, 140))
+    launcher = ProductLauncher(
+        _configuration(tmp_path), verify_head=False, id_generator=lambda: next(counter),
+        browser_opener=lambda _url: None,
+    )
+    launcher.proxy_g2 = lambda method, path, body=None: (
+        (200, {"contract_id": "canonical-v2-contract"})
+        if path.endswith("/validate") else (599, {})
+    )
+    try:
+        status, body = launcher.author_and_validate(_owner_input())
+        assert status == 200
+        assert body["contract_summary"]["schema_version"] == "admissible_native_mission_profile_v2"
+        assert set(body["contract_summary"]) == V2_SUMMARY_KEYS
+        assert "runtime_launchable" not in body
+        serialized = json.dumps(body, sort_keys=True, separators=(",", ":"))
+        assert "claim_authority" not in serialized
+        assert "claim_review_notices" not in serialized
+        assert "result_claim" not in serialized
+        assert body["profile_fingerprint"] == launcher._contracts[body["contract_id"]].profile_fingerprint
+        preparation_status, preparation = launcher.enqueue_preparation(body["contract_id"])
+        assert preparation_status == 202
+        assert preparation["state"] == "QUEUED"
+    finally:
+        launcher.close()
 
 
 @pytest.mark.parametrize("value", [None, []])
@@ -153,12 +260,20 @@ def test_v3_review_and_direct_launch_refusal_reach_no_runtime_path(tmp_path):
     launcher.proxy_g2 = lambda *args, **kwargs: proxy_calls.append((args, kwargs)) or (599, {})
     launcher._preflight_application = lambda **kwargs: preflight_calls.append((kwargs,)) or (1, b"")
     try:
-        status, body = launcher.author_and_validate(
-            _owner_input(result_claims=[_claim("delivery")])
-        )
+        status, body = launcher.author_and_validate(_owner_input(result_claims=_ordered_claims()))
         assert status == 200
         assert body["runtime_launchable"] is False
         assert body["contract_summary"]["schema_version"] == "admissible_native_mission_profile_v3"
+        service_claims = body["contract_summary"]["claim_authority"]["claims"]
+        assert [claim["claim_id"] for claim in service_claims] == [
+            "zulu-owner-first", "mike-owner-second", "alpha-owner-third", "tango-owner-fourth"
+        ]
+        assert service_claims[0]["depends_on"] == [
+            "mike-owner-second", "alpha-owner-third", "tango-owner-fourth"
+        ]
+        assert service_claims[0]["non_claims"] == [
+            "Zulu exclusion", "Mike exclusion", "Alpha exclusion"
+        ]
         assert proxy_calls == []
         contract_id = body["contract_id"]
         assert launcher.enqueue_preparation(contract_id) == (
