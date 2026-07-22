@@ -42,6 +42,7 @@ from admissible.delegated_gate.models import EvidenceKind, VerificationCommand
 
 MISSION_PROFILE_SCHEMA_VERSION = "admissible_native_mission_profile_v1"
 MISSION_PROFILE_SCHEMA_VERSION_V2 = "admissible_native_mission_profile_v2"
+MISSION_PROFILE_SCHEMA_VERSION_V3 = "admissible_native_mission_profile_v3"
 # The one authorized one-shot budget shape:
 # (provider invocations, native attempts, repair rounds, auditors, retries).
 ONE_SHOT_PROFILE_BUDGETS: tuple[int, int, int, int, int] = (1, 1, 0, 0, 0)
@@ -59,6 +60,155 @@ class WorkspaceSourceKind(str, Enum):
 class VerificationMode(str, Enum):
     OBSERVED_ONLY = "OBSERVED_ONLY"
     FROZEN_BEHAVIORAL = "FROZEN_BEHAVIORAL"
+
+
+class ClaimAuthorship(str, Enum):
+    OWNER_AUTHORED = "OWNER_AUTHORED"
+    TEMPLATE_AUTHORED = "TEMPLATE_AUTHORED"
+
+
+class ClaimObligationLevel(str, Enum):
+    MANDATORY = "MANDATORY"
+    OPTIONAL = "OPTIONAL"
+    ADVISORY = "ADVISORY"
+
+
+class ClaimSetCoverageStatus(str, Enum):
+    NOT_ASSESSED = "NOT_ASSESSED"
+
+
+@dataclass(frozen=True)
+class ResultClaim:
+    """One owner-ordered, inert result claim."""
+
+    claim_id: str
+    statement: str
+    obligation_level: ClaimObligationLevel
+    depends_on: tuple[str, ...]
+    non_claims: tuple[str, ...]
+
+    def validated(self) -> "ResultClaim":
+        require_identifier(self.claim_id, "claim_id")
+        require_nonempty_text(self.statement, "claim statement", max_bytes=4096)
+        if not isinstance(self.obligation_level, ClaimObligationLevel):
+            raise ValueError("claim obligation level is invalid")
+        if not isinstance(self.depends_on, tuple):
+            raise ValueError("claim dependencies must be an ordered tuple")
+        for dependency in self.depends_on:
+            require_identifier(dependency, "claim dependency")
+        if len(set(self.depends_on)) != len(self.depends_on):
+            raise ValueError("claim dependencies must be unique")
+        if self.claim_id in self.depends_on:
+            raise ValueError("claim cannot depend on itself")
+        if not isinstance(self.non_claims, tuple):
+            raise ValueError("non-claims must be an ordered tuple")
+        for statement in self.non_claims:
+            require_nonempty_text(statement, "non-claim statement", max_bytes=4096)
+        if len(set(self.non_claims)) != len(self.non_claims):
+            raise ValueError("non-claims must be unique")
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "claim_id": self.claim_id,
+            "statement": self.statement,
+            "obligation_level": self.obligation_level.value,
+            "depends_on": list(self.depends_on),
+            "non_claims": list(self.non_claims),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ResultClaim":
+        require_exact_keys(data, set(cls.__dataclass_fields__), "result claim")
+        try:
+            obligation_level = ClaimObligationLevel(data["obligation_level"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("claim obligation level is invalid") from exc
+        return cls(
+            claim_id=data["claim_id"],
+            statement=data["statement"],
+            obligation_level=obligation_level,
+            depends_on=require_string_list(data["depends_on"], "claim dependencies"),
+            non_claims=require_string_list(data["non_claims"], "non-claims"),
+        ).validated()
+
+
+@dataclass(frozen=True)
+class ClaimAuthority:
+    """Canonical, inert authority for an owner-ordered set of claims."""
+
+    authorship: ClaimAuthorship
+    coverage_status: ClaimSetCoverageStatus
+    claims: tuple[ResultClaim, ...]
+
+    def validated(self) -> "ClaimAuthority":
+        if not isinstance(self.authorship, ClaimAuthorship):
+            raise ValueError("claim authorship is invalid")
+        if self.coverage_status is not ClaimSetCoverageStatus.NOT_ASSESSED:
+            raise ValueError("claim coverage status must be NOT_ASSESSED")
+        if not isinstance(self.claims, tuple) or not self.claims:
+            raise ValueError("claims must be a non-empty ordered tuple")
+        claim_ids: list[str] = []
+        for claim in self.claims:
+            if not isinstance(claim, ResultClaim):
+                raise ValueError("claim has an invalid type")
+            claim.validated()
+            claim_ids.append(claim.claim_id)
+        if len(set(claim_ids)) != len(claim_ids):
+            raise ValueError("claim identities must be unique")
+        known_ids = set(claim_ids)
+        for claim in self.claims:
+            if not set(claim.depends_on) <= known_ids:
+                raise ValueError("claim dependency target is missing")
+        dependencies = {claim.claim_id: claim.depends_on for claim in self.claims}
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(claim_id: str) -> None:
+            if claim_id in visiting:
+                raise ValueError("claim dependency graph must be acyclic")
+            if claim_id in visited:
+                return
+            visiting.add(claim_id)
+            for dependency in dependencies[claim_id]:
+                visit(dependency)
+            visiting.remove(claim_id)
+            visited.add(claim_id)
+
+        for claim_id in claim_ids:
+            visit(claim_id)
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "authorship": self.authorship.value,
+            "coverage_status": self.coverage_status.value,
+            "claims": [claim.to_dict() for claim in self.claims],
+        }
+
+    @property
+    def identity_fingerprint(self) -> str:
+        return fingerprint(self.to_dict())
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ClaimAuthority":
+        require_exact_keys(data, set(cls.__dataclass_fields__), "claim authority")
+        try:
+            authorship = ClaimAuthorship(data["authorship"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("claim authorship is invalid") from exc
+        try:
+            coverage_status = ClaimSetCoverageStatus(data["coverage_status"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("claim coverage status must be NOT_ASSESSED") from exc
+        raw_claims = data["claims"]
+        if not isinstance(raw_claims, list):
+            raise ValueError("claims must be an ordered array")
+        return cls(
+            authorship=authorship,
+            coverage_status=coverage_status,
+            claims=tuple(ResultClaim.from_dict(claim) for claim in raw_claims),
+        ).validated()
 
 
 @dataclass(frozen=True)
@@ -381,12 +531,13 @@ class NativeMissionProfile:
     git_end_state_policy: GitEndStatePolicy | None = None
     verification: VerificationAuthority | None = None
     runtime_prompt: RuntimePromptAuthority | None = None
+    claim_authority: ClaimAuthority | None = None
 
     def _body(self) -> dict[str, Any]:
         """The complete canonical profile body, fingerprint field excluded."""
 
         data = dict(self.__dict__)
-        if self.schema_version == MISSION_PROFILE_SCHEMA_VERSION_V2:
+        if self.schema_version in {MISSION_PROFILE_SCHEMA_VERSION_V2, MISSION_PROFILE_SCHEMA_VERSION_V3}:
             for key in (
                 "fixture_id",
                 "fixture_version",
@@ -403,12 +554,17 @@ class NativeMissionProfile:
             data["git_end_state_policy"] = self.git_end_state_policy.to_dict()
             data["verification"] = self.verification.to_dict()
             data["runtime_prompt"] = self.runtime_prompt.to_dict()
+            if self.schema_version == MISSION_PROFILE_SCHEMA_VERSION_V3:
+                data["claim_authority"] = self.claim_authority.to_dict()
+            else:
+                data.pop("claim_authority")
         else:
             for key in (
                 "workspace_source",
                 "git_end_state_policy",
                 "verification",
                 "runtime_prompt",
+                "claim_authority",
             ):
                 data.pop(key)
         data["gate_clauses"] = [list(clause) for clause in self.gate_clauses]
@@ -455,6 +611,7 @@ class NativeMissionProfile:
         if self.schema_version not in {
             MISSION_PROFILE_SCHEMA_VERSION,
             MISSION_PROFILE_SCHEMA_VERSION_V2,
+            MISSION_PROFILE_SCHEMA_VERSION_V3,
         }:
             raise ValueError("unsupported native mission profile schema")
         require_identifier(self.profile_id, "profile_id")
@@ -470,9 +627,10 @@ class NativeMissionProfile:
                     self.git_end_state_policy,
                     self.verification,
                     self.runtime_prompt,
+                    self.claim_authority,
                 )
             ):
-                raise ValueError("v1 profile cannot carry v2 runtime authority")
+                raise ValueError("v1 profile cannot carry nested runtime or claim authority")
         else:
             if not isinstance(self.workspace_source, WorkspaceSourceAuthority):
                 raise ValueError("v2 profile must carry workspace source authority")
@@ -481,11 +639,18 @@ class NativeMissionProfile:
             if not isinstance(self.verification, VerificationAuthority):
                 raise ValueError("v2 profile must carry verification authority")
             if not isinstance(self.runtime_prompt, RuntimePromptAuthority):
-                raise ValueError("v2 profile must carry runtime prompt authority")
+                raise ValueError("runtime profile must carry runtime prompt authority")
+            if self.schema_version == MISSION_PROFILE_SCHEMA_VERSION_V2:
+                if self.claim_authority is not None:
+                    raise ValueError("v2 profile cannot carry claim authority")
+            elif not isinstance(self.claim_authority, ClaimAuthority):
+                raise ValueError("v3 profile must carry claim authority")
             source = self.workspace_source.validated()
             policy = self.git_end_state_policy.validated()
             verification = self.verification.validated()
             self.runtime_prompt.validated()
+            if self.claim_authority is not None:
+                self.claim_authority.validated()
             if self.fixture_id != source.fixture_id or self.fixture_version != source.fixture_version:
                 raise ValueError("internal v2 fixture mirrors contradict workspace source authority")
             if self.required_commit_message != policy.required_complete_commit_message:
@@ -639,11 +804,14 @@ class NativeMissionProfile:
             "git_end_state_policy",
             "verification",
             "runtime_prompt",
+            "claim_authority",
         }
         if schema == MISSION_PROFILE_SCHEMA_VERSION:
             require_exact_keys(data, v1_fields, "native mission profile v1")
         elif schema == MISSION_PROFILE_SCHEMA_VERSION_V2:
             require_exact_keys(data, v2_fields, "native mission profile v2")
+        elif schema == MISSION_PROFILE_SCHEMA_VERSION_V3:
+            require_exact_keys(data, v2_fields | {"claim_authority"}, "native mission profile v3")
         else:
             raise ValueError("unsupported native mission profile schema")
         values = dict(data)
@@ -678,6 +846,7 @@ class NativeMissionProfile:
                 git_end_state_policy=None,
                 verification=None,
                 runtime_prompt=None,
+                claim_authority=None,
             )
         else:
             for key in (
@@ -692,11 +861,17 @@ class NativeMissionProfile:
             policy = GitEndStatePolicy.from_dict(data["git_end_state_policy"])
             verification = VerificationAuthority.from_dict(data["verification"])
             runtime_prompt = RuntimePromptAuthority.from_dict(data["runtime_prompt"])
+            claim_authority = (
+                ClaimAuthority.from_dict(data["claim_authority"])
+                if schema == MISSION_PROFILE_SCHEMA_VERSION_V3
+                else None
+            )
             values.update(
                 workspace_source=source,
                 git_end_state_policy=policy,
                 verification=verification,
                 runtime_prompt=runtime_prompt,
+                claim_authority=claim_authority,
                 fixture_id=source.fixture_id,
                 fixture_version=source.fixture_version,
                 required_commit_message=policy.required_complete_commit_message,
@@ -718,11 +893,12 @@ def create_native_mission_profile(**values: Any) -> NativeMissionProfile:
     """
 
     schema_version = values.pop("schema_version", MISSION_PROFILE_SCHEMA_VERSION)
-    if schema_version == MISSION_PROFILE_SCHEMA_VERSION_V2:
+    if schema_version in {MISSION_PROFILE_SCHEMA_VERSION_V2, MISSION_PROFILE_SCHEMA_VERSION_V3}:
         source = values.get("workspace_source")
         policy = values.get("git_end_state_policy")
         verification = values.get("verification")
         runtime_prompt = values.get("runtime_prompt")
+        claim_authority = values.get("claim_authority")
         if isinstance(source, Mapping):
             source = WorkspaceSourceAuthority.from_dict(source)
         if isinstance(policy, Mapping):
@@ -731,6 +907,8 @@ def create_native_mission_profile(**values: Any) -> NativeMissionProfile:
             verification = VerificationAuthority.from_dict(verification)
         if isinstance(runtime_prompt, Mapping):
             runtime_prompt = RuntimePromptAuthority.from_dict(runtime_prompt)
+        if isinstance(claim_authority, Mapping):
+            claim_authority = ClaimAuthority.from_dict(claim_authority)
         if not all(
             (
                 isinstance(source, WorkspaceSourceAuthority),
@@ -740,11 +918,18 @@ def create_native_mission_profile(**values: Any) -> NativeMissionProfile:
             )
         ):
             raise ValueError("v2 profile requires complete nested runtime authority")
+        if schema_version == MISSION_PROFILE_SCHEMA_VERSION_V2 and claim_authority is not None:
+            raise ValueError("v2 profile cannot carry claim authority")
+        if schema_version == MISSION_PROFILE_SCHEMA_VERSION_V3 and not isinstance(
+            claim_authority, ClaimAuthority
+        ):
+            raise ValueError("v3 profile requires claim authority")
         values.update(
             workspace_source=source,
             git_end_state_policy=policy,
             verification=verification,
             runtime_prompt=runtime_prompt,
+            claim_authority=claim_authority,
             fixture_id=source.fixture_id,
             fixture_version=source.fixture_version,
             required_commit_message=policy.required_complete_commit_message,
@@ -1718,6 +1903,7 @@ __all__ = [
     "FLAGSHIP_VERIFIER_SOURCE",
     "MISSION_PROFILE_SCHEMA_VERSION",
     "MISSION_PROFILE_SCHEMA_VERSION_V2",
+    "MISSION_PROFILE_SCHEMA_VERSION_V3",
     "NEON_SIEGE_PROFILE",
     "ONE_SHOT_PROFILE_BUDGETS",
     "WORKFLOW_RECOVERY_COMPLETION_CONDITIONS_TEXT",
@@ -1729,9 +1915,14 @@ __all__ = [
     "WORKFLOW_RECOVERY_V2_PROFILE",
     "WORKFLOW_RECOVERY_VERIFIER_SOURCE",
     "NativeMissionProfile",
+    "ClaimAuthority",
+    "ClaimAuthorship",
+    "ClaimObligationLevel",
+    "ClaimSetCoverageStatus",
     "GitEndStatePolicy",
     "ProfileCheckpointCommand",
     "RuntimePromptAuthority",
+    "ResultClaim",
     "VerificationAuthority",
     "VerificationMode",
     "WorkspaceSourceAuthority",
