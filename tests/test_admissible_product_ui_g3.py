@@ -1323,22 +1323,19 @@ def test_client_security_and_exact_request_contract():
     assert "localStorage" not in HTML + CSS and "https://" not in HTML + CSS + JS
 
 
-def test_gate_clause_surfaces_use_safe_bounded_dom_rendering():
-    for element_id in (
-        "contract-gate-clauses",
-        "authorization-gate-clauses",
-        "result-gate-clauses",
-    ):
+def test_gate_clause_surfaces_declare_no_unsafe_markup_sink():
+    """Narrow static invariant only: absence of an HTML sink cannot be observed.
+
+    Behavioural proof that clauses render as inert, ordered text lives in
+    ``test_gate_clause_rendering_is_safe_ordered_and_bounded_in_real_browser``.
+    A "no such code path exists anywhere in the bundle" property has no runtime
+    witness, so it stays a source assertion.
+    """
+
+    for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval("):
+        assert sink not in JS, f"unsafe markup sink {sink!r} present in client bundle"
+    for element_id in ("contract-gate-clauses", "authorization-gate-clauses", "result-gate-clauses"):
         assert f'id="{element_id}"' in HTML
-        assert f'renderGateClauses("{element_id}"' in JS
-    assert (
-        "These clauses are part of the authorized contract. They are not independently "
-        "adjudicated unless linked to explicit verification evidence."
-    ) in JS
-    assert 'id.textContent=clause.clause_id' in JS
-    assert 'text.textContent=": "+clause.text' in JS
-    assert ".gate-clause-list li" in CSS
-    assert "overflow-wrap:anywhere" in CSS
 
 
 def test_explicit_state_machine_polling_and_secret_clearing_contract():
@@ -2164,3 +2161,247 @@ def test_import_side_effect_free_for_product_ui():
     )
     assert completed.returncode == 0, completed.stderr
     assert "g2.5" in completed.stdout
+
+
+GATE_CLAUSE_NOTICE = (
+    "These clauses are part of the authorized contract. They are not independently "
+    "adjudicated unless linked to explicit verification evidence."
+)
+CLAUSE_HOSTILE = '<script>window.__g3_clause_marker++</script><img src=x onerror="window.__g3_clause_marker++">'
+CLAUSE_LONG_TOKEN = ("CLAUSEOVERFLOW" * 160)[:1900]
+
+# Deliberately not alphabetical: canonical persisted order must survive rendering.
+CLAUSE_ORDERED = [
+    {"clause_id": "gate.zeta", "text": "Zeta clause authored first."},
+    {"clause_id": "gate.alpha", "text": CLAUSE_HOSTILE + " alpha clause text"},
+    {"clause_id": CLAUSE_HOSTILE + "gate.mu", "text": "Clause carrying a hostile identifier."},
+    {"clause_id": "gate.long", "text": CLAUSE_LONG_TOKEN},
+]
+
+CLAUSE_MEASURE_TEMPLATE = r"""
+(function(){
+  const root=document.getElementById("__ROOT_ID__");
+  if(!root)return JSON.stringify({missing:true});
+  const items=Array.from(root.querySelectorAll(".gate-clause-list li"));
+  const notice=root.querySelector(".gate-clause-notice");
+  const unavailable=root.querySelector(".gate-clause-unavailable");
+  const rect=root.getBoundingClientRect();
+  const range=document.createRange();range.selectNodeContents(root);
+  const paint=range.getBoundingClientRect();
+  return JSON.stringify({
+    missing:false,
+    marker:window.__g3_clause_marker===undefined?-1:window.__g3_clause_marker,
+    injectedNodes:root.querySelectorAll("script,img,iframe,svg,object,embed").length,
+    itemCount:items.length,
+    ids:Array.from(root.querySelectorAll(".gate-clause-id")).map(n=>n.textContent),
+    itemTexts:items.map(n=>n.textContent),
+    listCount:root.querySelectorAll(".gate-clause-list").length,
+    noticeText:notice?notice.textContent:null,
+    unavailableText:unavailable?unavailable.textContent:null,
+    rootText:root.textContent,
+    scrollWidth:root.scrollWidth,
+    clientWidth:root.clientWidth,
+    right:rect.right,
+    paintRight:paint.right,
+    width:rect.width,
+    docScrollWidth:document.documentElement.scrollWidth,
+    docClientWidth:document.documentElement.clientWidth,
+    bodyScrollWidth:document.body.scrollWidth
+  });
+})()
+"""
+
+
+def _clause_measure_js(root_id: str) -> str:
+    """Measurement expression scoped to one clause surface."""
+
+    return CLAUSE_MEASURE_TEMPLATE.replace("__ROOT_ID__", root_id)
+
+
+class ClauseLauncher(FakeLauncher):
+    """Serves a caller-chosen ``gate_clauses`` value in the authored contract summary."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.clauses = None
+        self.include_key = True
+
+    def author_and_validate(self, body):
+        status, response = super().author_and_validate(body)
+        if self.include_key:
+            response["contract_summary"]["gate_clauses"] = self.clauses
+        return status, response
+
+
+def test_gate_clause_rendering_is_safe_ordered_and_bounded_in_real_browser(tmp_path):
+    """Observable behaviour of the clause surface in a real browser.
+
+    Replaces the former source-substring assertions: every property below is read
+    back out of live DOM state after the real client rendered a real contract
+    response.
+    """
+
+    if not CHROME.is_file():
+        pytest.skip("Chrome not installed")
+    launcher = ClauseLauncher()
+    launcher.clauses = CLAUSE_ORDERED
+    server = create_ui_loopback_server(launcher, csrf_generator=lambda _n: "c" * 64).start()
+    profile = tmp_path / "chrome-profile-clauses"
+    profile.mkdir()
+    debug_port = 9222 + ((os.getpid() + 517) % 1000)
+    url = f"http://{server.host}:{server.port}/"
+    proc = subprocess.Popen(
+        [
+            str(CHROME), f"--user-data-dir={profile}", f"--remote-debugging-port={debug_port}",
+            "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+            "--disable-extensions", "--disable-background-networking", url,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    close_cdp = None
+    try:
+        deadline = time.time() + 20
+        page = None
+        while time.time() < deadline:
+            try:
+                with urlopen(f"http://127.0.0.1:{debug_port}/json", timeout=1) as resp:
+                    targets = json.loads(resp.read().decode())
+                page = next(
+                    (t for t in targets if t.get("type") == "page" and url.rstrip("/") in t.get("url", "")),
+                    None,
+                )
+            except Exception:
+                page = None
+            if page:
+                break
+            time.sleep(0.2)
+        assert page is not None, "Chrome debug target did not appear"
+        send, close_cdp = _cdp_connect(page["webSocketDebuggerUrl"])
+        send("Runtime.enable")
+
+        def evaluate(expression: str):
+            got = send("Runtime.evaluate", {"expression": expression, "returnByValue": True})
+            return ((got.get("result") or {}).get("result") or {}).get("value")
+
+        def wait_for(expression: str, wanted, timeout_s: float = 20.0):
+            end = time.time() + timeout_s
+            last = None
+            while time.time() < end:
+                last = evaluate(expression)
+                if last == wanted:
+                    return last
+                time.sleep(0.15)
+            raise AssertionError(f"CDP wait for {wanted!r} timed out; last={last!r}")
+
+        def drive_to_contract():
+            wait_for("window.AdmissibleG3Test && window.AdmissibleG3Test.getState()", "COMPOSE")
+            evaluate(
+                "window.AdmissibleG3Test.setField('mission-text','clause mission');"
+                "window.AdmissibleG3Test.setField('gate-objective','clause objective');"
+                "window.AdmissibleG3Test.setField('completion-conditions','clause conditions');"
+                "window.AdmissibleG3Test.setField('commit-message','feat: clause');"
+                "window.AdmissibleG3Test.submit('compose-form'); 'submitted'"
+            )
+            wait_for("window.AdmissibleG3Test.getState()", "CONTRACT_READY")
+
+        def measure(width: int, height: int, mobile: bool, root_id: str = "contract-gate-clauses"):
+            send("Emulation.setDeviceMetricsOverride", {
+                "width": width, "height": height, "deviceScaleFactor": 1, "mobile": mobile,
+            })
+            time.sleep(0.3)
+            evaluate("document.documentElement.offsetWidth")
+            raw = evaluate(_clause_measure_js(root_id))
+            assert isinstance(raw, str), f"clause measurement failed for {root_id}"
+            measured = json.loads(raw)
+            assert not measured["missing"], f"{root_id} surface absent from the document"
+            return measured
+
+        evaluate("window.__g3_clause_marker=0")
+        drive_to_contract()
+
+        for width, height, mobile in ((1280, 800, False), (390, 844, True)):
+            m = measure(width, height, mobile)
+            where = f"present @{width}x{height}"
+
+            # Hostile clause id and text are inert text, not markup.
+            assert m["marker"] == 0, f"{where}: hostile clause handler executed"
+            assert m["injectedNodes"] == 0, f"{where}: hostile clause created a DOM node"
+
+            # Canonical order, exact ids and exact text.
+            assert m["itemCount"] == len(CLAUSE_ORDERED), f"{where}: wrong clause count"
+            assert m["ids"] == [c["clause_id"] for c in CLAUSE_ORDERED], f"{where}: clause order or ids changed"
+            assert m["itemTexts"] == [
+                f'{c["clause_id"]}: {c["text"]}' for c in CLAUSE_ORDERED
+            ], f"{where}: clause text changed"
+            assert CLAUSE_HOSTILE in m["rootText"], f"{where}: hostile markup not rendered literally"
+
+            # The non-adjudication notice is visible on the surface.
+            assert m["noticeText"] == GATE_CLAUSE_NOTICE, f"{where}: notice missing or reworded"
+            assert m["unavailableText"] is None, f"{where}: unavailable copy shown alongside clauses"
+
+            # Long unbroken id and text stay bounded.
+            assert m["scrollWidth"] <= m["clientWidth"] + 1, (
+                f"{where}: clause surface scrollWidth {m['scrollWidth']} > clientWidth {m['clientWidth']}"
+            )
+            assert m["paintRight"] <= m["right"] + 1, f"{where}: clause text paints past its box"
+            assert m["docScrollWidth"] <= m["docClientWidth"] + 1, f"{where}: document overflow"
+            assert m["bodyScrollWidth"] <= m["docClientWidth"] + 1, f"{where}: body overflow"
+            assert m["width"] > 0, f"{where}: clause surface collapsed"
+
+        # The same clauses must also be visible on the second pre-authorization
+        # surface, immediately before the owner authorizes.
+        evaluate("window.AdmissibleG3Test.click('prepare-button'); 'clicked'")
+        wait_for("window.AdmissibleG3Test.getState()", "PREPARATION_READY")
+        for width, height, mobile in ((1280, 800, False), (390, 844, True)):
+            a = measure(width, height, mobile, root_id="authorization-gate-clauses")
+            where = f"pre-authorization @{width}x{height}"
+            assert a["marker"] == 0, f"{where}: hostile clause handler executed"
+            assert a["injectedNodes"] == 0, f"{where}: hostile clause created a DOM node"
+            assert a["ids"] == [c["clause_id"] for c in CLAUSE_ORDERED], f"{where}: clause order or ids changed"
+            assert a["itemTexts"] == [
+                f'{c["clause_id"]}: {c["text"]}' for c in CLAUSE_ORDERED
+            ], f"{where}: clause text changed"
+            assert a["noticeText"] == GATE_CLAUSE_NOTICE, f"{where}: notice missing or reworded"
+            assert a["unavailableText"] is None, f"{where}: unavailable copy shown alongside clauses"
+            assert a["scrollWidth"] <= a["clientWidth"] + 1, f"{where}: clause surface overflows"
+            assert a["paintRight"] <= a["right"] + 1, f"{where}: clause text paints past its box"
+            assert a["docScrollWidth"] <= a["docClientWidth"] + 1, f"{where}: document overflow"
+
+        # Absent clause authority renders the bounded unavailable state.
+        launcher.include_key = False
+        evaluate("window.AdmissibleG3Test.reset(); 'reset'")
+        drive_to_contract()
+        absent = measure(1280, 800, False)
+        assert absent["itemCount"] == 0 and absent["listCount"] == 0, "absent authority rendered a clause list"
+        assert absent["noticeText"] == GATE_CLAUSE_NOTICE, "absent authority dropped the notice"
+        assert absent["unavailableText"], "absent authority rendered no bounded unavailable copy"
+        assert absent["marker"] == 0 and absent["injectedNodes"] == 0
+
+        # A malformed clause set must not produce a partial, success-looking list.
+        launcher.include_key = True
+        launcher.clauses = [
+            {"clause_id": "gate.valid", "text": "This clause is well formed."},
+            {"clause_id": "gate.broken"},
+        ]
+        evaluate("window.AdmissibleG3Test.reset(); 'reset'")
+        drive_to_contract()
+        malformed = measure(1280, 800, False)
+        assert malformed["itemCount"] == 0, "malformed authority rendered a partial clause list"
+        assert malformed["listCount"] == 0, "malformed authority rendered an empty ordered list element"
+        assert "gate.valid" not in malformed["rootText"], "malformed authority leaked its well-formed subset"
+        assert malformed["unavailableText"], "malformed authority rendered no bounded copy"
+        assert malformed["noticeText"] == GATE_CLAUSE_NOTICE, "malformed authority dropped the notice"
+        assert malformed["marker"] == 0 and malformed["injectedNodes"] == 0
+
+        send("Emulation.clearDeviceMetricsOverride")
+    finally:
+        if close_cdp:
+            close_cdp()
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        server.stop()

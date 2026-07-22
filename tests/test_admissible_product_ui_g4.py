@@ -1217,9 +1217,16 @@ MEASURE_JS = r"""
     classificationItems:document.querySelectorAll("#result-classification .classification-item").length,
     evidenceCards:document.querySelectorAll("#evidence-glance .evidence-card").length,
     evidenceSections:document.querySelectorAll("#essential-evidence details,#supplemental-evidence details").length,
+    clauseItems:document.querySelectorAll("#result-gate-clauses .gate-clause-list li").length,
+    clauseLists:document.querySelectorAll("#result-gate-clauses .gate-clause-list").length,
+    clauseIds:Array.from(document.querySelectorAll("#result-gate-clauses .gate-clause-id")).map(n=>n.textContent),
+    clauseTexts:Array.from(document.querySelectorAll("#result-gate-clauses .gate-clause-list li")).map(n=>n.textContent),
+    clauseNotice:(document.querySelector("#result-gate-clauses .gate-clause-notice")||{}).textContent||null,
+    clauseUnavailable:(document.querySelector("#result-gate-clauses .gate-clause-unavailable")||{}).textContent||null,
+    clauseInjectedNodes:document.querySelectorAll("#result-gate-clauses script,#result-gate-clauses img,#result-gate-clauses iframe,#result-gate-clauses svg,#result-gate-clauses object,#result-gate-clauses embed").length,
     elements:{}
   };
-  ["result-summary","non-authority-notice"].forEach(function(id){
+  ["result-summary","non-authority-notice","result-gate-clauses"].forEach(function(id){
     const node=document.getElementById(id);
     if(!node){out.elements[id]=null;return;}
     const rect=node.getBoundingClientRect();
@@ -1284,10 +1291,37 @@ def _hostile_overflow_payload() -> dict:
     return payload
 
 
+GATE_CLAUSE_NOTICE = (
+    "These clauses are part of the authorized contract. They are not independently "
+    "adjudicated unless linked to explicit verification evidence."
+)
+
+# Deliberately not alphabetical: canonical persisted order must survive rendering.
+GATE_CLAUSES_FIXTURE = [
+    {"clause_id": "gate.zeta", "text": "Zeta clause persisted first."},
+    {"clause_id": "gate.hostile", "text": HOSTILE_PREFIX + " hostile clause text"},
+    {"clause_id": HOSTILE_PREFIX + "gate.mu", "text": "Clause carrying a hostile identifier."},
+    {"clause_id": UNBROKEN_TOKEN, "text": "Clause carrying a long unbroken identifier."},
+    {"clause_id": "gate.long", "text": UNBROKEN_TOKEN},
+]
+
+
+def _gate_clause_overflow_payload() -> dict:
+    payload = _result_payload()
+    payload["authorized_gate_clauses"] = {
+        "present": "PRESENT",
+        "clauses": GATE_CLAUSES_FIXTURE,
+        "notice": GATE_CLAUSE_NOTICE,
+        "note": None,
+    }
+    return payload
+
+
 OVERFLOW_SCENARIOS = (
     ("notice_long_token", _notice_overflow_payload, True),
     ("summary_long_token", _summary_overflow_payload, True),
     ("refused_hostile_long_token", _hostile_overflow_payload, True),
+    ("gate_clauses_hostile_long_token", _gate_clause_overflow_payload, False),
     ("normal_admitted_verified", _result_payload, False),
 )
 
@@ -1381,7 +1415,27 @@ def test_long_result_text_is_contained_in_summary_and_notice_surfaces(tmp_path):
                 assert m["marker"] == 0, f"{where}: hostile handler executed"
                 assert m["injectedNodes"] == 0, f"{where}: hostile DOM node created"
 
-                for element_id in ("result-summary", "non-authority-notice"):
+                assert m["clauseInjectedNodes"] == 0, f"{where}: clause surface created a DOM node"
+                assert m["clauseNotice"] == GATE_CLAUSE_NOTICE, f"{where}: clause notice missing or reworded"
+
+                if name == "gate_clauses_hostile_long_token":
+                    # Authorized clauses are rendered as inert, exactly ordered text.
+                    assert m["clauseItems"] == len(GATE_CLAUSES_FIXTURE), f"{where}: wrong clause count"
+                    assert m["clauseIds"] == [c["clause_id"] for c in GATE_CLAUSES_FIXTURE], (
+                        f"{where}: clause order or ids changed"
+                    )
+                    assert m["clauseTexts"] == [
+                        f'{c["clause_id"]}: {c["text"]}' for c in GATE_CLAUSES_FIXTURE
+                    ], f"{where}: clause text changed"
+                    assert m["clauseUnavailable"] is None, f"{where}: unavailable copy shown alongside clauses"
+                    assert max(len(t) for t in m["clauseTexts"]) >= 1800, f"{where}: long clause not delivered"
+                else:
+                    # Every other fixture omits the key: bounded unavailable state only.
+                    assert m["clauseItems"] == 0, f"{where}: clauses rendered without persisted authority"
+                    assert m["clauseLists"] == 0, f"{where}: empty clause list element rendered"
+                    assert m["clauseUnavailable"], f"{where}: no bounded unavailable clause copy"
+
+                for element_id in ("result-summary", "non-authority-notice", "result-gate-clauses"):
                     e = m["elements"][element_id]
                     assert e is not None, f"{where}/{element_id}: element missing"
                     assert e["scrollWidth"] <= e["clientWidth"] + 1, (

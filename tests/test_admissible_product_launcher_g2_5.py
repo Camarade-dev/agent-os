@@ -826,38 +826,74 @@ def test_lifecycle_browser_flag_and_shutdown(tmp_path):
     assert not any(name.startswith("admissible-g2") for name in leftover)
 
 
-def test_child_runner_unchanged_and_protected_paths_unmodified():
-    root = Path(__file__).resolve().parents[1]
-    changed = subprocess.check_output(
+# The trees that stay frozen against launcher-slice drift. A trailing slash
+# matches a whole subtree; a bare filename matches only that exact file.
+PROTECTED_PATH_PREFIXES = (
+    "admissible/delegated_gate/",
+    "admissible/product_service/",
+    "admissible/product_read_model/",
+    "admissible/checkpoint.py",
+)
+
+# Accepted history since the G2.4 base, enumerated file by file. Authorizing a
+# whole protected directory would make the guard vacuous, so every entry names
+# one reviewed file:
+#   - the golden result-presentation repair re-opened the run reconstruction;
+#   - the governed backend-drift rerun authorized the renderer (secret-safe
+#     authorization exposure in result JSON);
+#   - the behavioral backend-authority consistency repair authorized the native
+#     canary (behavioral-entry policy) and the native executor (behavioral-lane
+#     store binding);
+#   - neon-siege-v1 governed native canary preflight (eee9620) introduced the
+#     fixture registry, mission profile and neon siege mission;
+#   - V0.3 Step 1 authorized gate-clause visibility (4da0b39) surfaced the
+#     existing clauses through the read-model view type and the control plane.
+AUTHORIZED_REPAIR_PATHS = frozenset({
+    "admissible/product_read_model/read_model.py",
+    "admissible/product_read_model/renderer.py",
+    "admissible/delegated_gate/native_canary.py",
+    "admissible/delegated_gate/native_executor.py",
+    "admissible/delegated_gate/fixture_registry.py",
+    "admissible/delegated_gate/mission_profile.py",
+    "admissible/delegated_gate/neon_siege_mission.py",
+    "admissible/product_read_model/presentation_types.py",
+    "admissible/product_service/control.py",
+})
+
+
+def _unauthorized_protected_paths(changed_paths, authorized=AUTHORIZED_REPAIR_PATHS):
+    """Return every changed protected path that is not explicitly authorized.
+
+    The complete protected set is evaluated for every candidate path, so a single
+    stale authorization can no longer terminate the guard early and hide later
+    protected-path violations behind it.
+    """
+
+    violations = []
+    for raw in changed_paths:
+        path = raw.strip()
+        if not path or path in authorized:
+            continue
+        if any(
+            path.startswith(prefix) if prefix.endswith("/") else path == prefix
+            for prefix in PROTECTED_PATH_PREFIXES
+        ):
+            violations.append(path)
+    return sorted(violations)
+
+
+def _changed_since_g2_4_base(root):
+    return subprocess.check_output(
         ["git", "diff", "--name-only", "1f2949d42fb79e9407035822c65b6f889650d689"],
         cwd=root,
         text=True,
-    )
-    # The golden result-presentation repair re-opened exactly one read-model
-    # file (the run reconstruction); the governed backend-drift rerun slice
-    # additionally authorizes exactly the renderer (secret-safe authorization
-    # exposure in result JSON); the behavioral backend-authority consistency
-    # repair authorizes exactly the native canary (behavioral-entry policy)
-    # and the native executor (behavioral-lane store binding). Every other
-    # path in those trees - and the product service and checkpoint executor
-    # in full - stays frozen against launcher-slice drift.
-    AUTHORIZED_REPAIR_PATHS = {
-        "admissible/product_read_model/read_model.py",
-        "admissible/product_read_model/renderer.py",
-        "admissible/delegated_gate/native_canary.py",
-        "admissible/delegated_gate/native_executor.py",
-    }
-    residual = "\n".join(
-        line for line in (raw.strip() for raw in changed.splitlines())
-        if line and line not in AUTHORIZED_REPAIR_PATHS
-    )
-    for forbidden in (
-        "admissible/delegated_gate/",
-        "admissible/product_service/",
-        "admissible/product_read_model/",
-        "admissible/checkpoint.py",
-    ):
-        assert forbidden not in residual
+    ).splitlines()
+
+
+def test_child_runner_unchanged_and_protected_paths_unmodified():
+    root = Path(__file__).resolve().parents[1]
+    violations = _unauthorized_protected_paths(_changed_since_g2_4_base(root))
+    assert violations == [], f"unauthorized protected-path changes: {violations}"
     # child_runner substantive body unchanged vs base unless import-only
     base = subprocess.check_output(
         ["git", "show", "1f2949d42fb79e9407035822c65b6f889650d689:admissible/product_launcher/child_runner.py"],
@@ -866,6 +902,61 @@ def test_child_runner_unchanged_and_protected_paths_unmodified():
     current = (root / "admissible/product_launcher/child_runner.py").read_bytes()
     assert current.replace(b"\r\n", b"\n") == base.replace(b"\r\n", b"\n")
     assert child_runner_module.ProductionChildApplication is not None
+
+
+def test_protected_path_guard_still_rejects_unauthorized_changes():
+    """The guard must fail on a genuinely unauthorized protected path.
+
+    A guard that passes only because its authorization set swallowed a whole
+    directory - or because it stopped at the first stale entry - would be
+    vacuous, so each protected tree is probed independently and the real
+    repository state is required to stay clean at the same time.
+    """
+
+    root = Path(__file__).resolve().parents[1]
+    real = _changed_since_g2_4_base(root)
+    assert _unauthorized_protected_paths(real) == []
+
+    # One intruder per protected tree, each alongside the real accepted history,
+    # proves no protected tree lost its coverage and that later entries are still
+    # evaluated after earlier ones match an authorized path.
+    for intruder in (
+        "admissible/delegated_gate/native_canary_patch.py",
+        "admissible/product_service/control_plane_v2.py",
+        "admissible/product_read_model/read_model_v2.py",
+        "admissible/checkpoint.py",
+    ):
+        assert _unauthorized_protected_paths(list(real) + [intruder]) == [intruder]
+
+    # Several unauthorized paths at once are all reported, not just the first.
+    intruders = [
+        "admissible/checkpoint.py",
+        "admissible/product_read_model/read_model_v2.py",
+        "admissible/product_service/control_plane_v2.py",
+    ]
+    assert _unauthorized_protected_paths(list(real) + intruders) == sorted(intruders)
+
+    # Authorization is per file, never per directory.
+    assert _unauthorized_protected_paths(["admissible/product_service/control.py"]) == []
+    assert _unauthorized_protected_paths(["admissible/product_service/other.py"]) == [
+        "admissible/product_service/other.py"
+    ]
+    assert _unauthorized_protected_paths(["admissible/product_read_model/renderer.py"]) == []
+    assert _unauthorized_protected_paths(["admissible/product_read_model/renderer_v2.py"]) == [
+        "admissible/product_read_model/renderer_v2.py"
+    ]
+
+    # A bare protected filename must not match by prefix.
+    assert _unauthorized_protected_paths(["admissible/checkpoint_helpers.py"]) == []
+
+    # Unprotected trees stay out of scope.
+    assert _unauthorized_protected_paths(["tests/test_admissible_product_launcher_g2_5.py"]) == []
+    assert _unauthorized_protected_paths(["admissible/product_ui/app.js"]) == []
+
+    # Every authorized entry must actually live in a protected tree, otherwise the
+    # authorization list is silently accumulating dead entries.
+    for authorized in AUTHORIZED_REPAIR_PATHS:
+        assert _unauthorized_protected_paths([authorized], authorized=frozenset()) == [authorized]
 
 
 def test_live_rehearsal_end_to_end(tmp_path, monkeypatch):
