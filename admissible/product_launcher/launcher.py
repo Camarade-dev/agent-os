@@ -91,7 +91,10 @@ class ProductLauncher:
 
     @staticmethod
     def _non_launchable_error(record: AuthoredContractRecord) -> str:
-        if record.contract_summary.get("schema_version") == "admissible_native_mission_profile_v4":
+        schema_version = record.contract_summary.get("schema_version")
+        if schema_version == "admissible_native_mission_profile_v5":
+            return "VERIFICATION_EVIDENCE_BINDING_V5_NOT_LAUNCHABLE"
+        if schema_version == "admissible_native_mission_profile_v4":
             return "CLAIM_VERIFICATION_PLAN_V4_NOT_LAUNCHABLE"
         return "CLAIM_AWARE_V3_NOT_LAUNCHABLE"
 
@@ -286,8 +289,8 @@ class ProductLauncher:
             if not isinstance(contract_id, str):
                 return 502, {"error": "G2_VALIDATE_INVALID"}
         else:
-            # V3 is reviewable here only. It never crosses the runtime document
-            # loader, which intentionally remains V2-only.
+            # Inert V3/V4/V5 drafts are reviewable here only. They never cross
+            # the runtime document loader, which intentionally remains V2-only.
             contract_id = f"draft-{self._id_generator()}"
         record = AuthoredContractRecord(
             contract_id=contract_id,
@@ -416,6 +419,16 @@ class ProductLauncher:
             with self._lock:
                 if self._closed:
                     return 409, {"error": "LAUNCHER_CLOSED"}
+                for contract in self._contracts.values():
+                    if (
+                        contract.contract_summary.get("schema_version")
+                        == "admissible_native_mission_profile_v5"
+                        and parent_control_run_id
+                        in {contract.contract_id, *contract.generated_ids.values()}
+                    ):
+                        return 409, {
+                            "error": "VERIFICATION_EVIDENCE_BINDING_V5_NOT_LAUNCHABLE"
+                        }
             existing = self._recoveries.get_by_parent(parent_control_run_id)
             if existing is not None:
                 return 200, self._recovery_view(existing)

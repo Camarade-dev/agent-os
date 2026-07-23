@@ -11,6 +11,7 @@ from admissible.delegated_gate.canonical import canonical_bytes, require_safe_re
 from admissible.delegated_gate.mission_profile import (
     MISSION_PROFILE_SCHEMA_VERSION_V3,
     MISSION_PROFILE_SCHEMA_VERSION_V4,
+    MISSION_PROFILE_SCHEMA_VERSION_V5,
     MISSION_PROFILE_SCHEMA_VERSION_V2,
     ONE_SHOT_PROFILE_BUDGETS,
     WORKFLOW_RECOVERY_COMPLETION_CONDITIONS_TEXT,
@@ -24,6 +25,9 @@ from admissible.delegated_gate.mission_profile import (
     ClaimSetCoverageStatus,
     VerificationPlanAuthorship,
     VerificationPlanCoverageStatus,
+    VerificationEvidenceBindingAuthority,
+    VerificationEvidenceBindingAuthorship,
+    VerificationEvidenceBindingCoverageStatus,
     GitEndStatePolicy,
     ProfileCheckpointCommand,
     RuntimePromptAuthority,
@@ -53,6 +57,7 @@ OWNER_AUTHORING_FIELDS = frozenset(
         "template_id",
         "result_claims",
         "claim_verification_plan",
+        "verification_evidence_bindings",
     }
 )
 REQUIRED_OWNER_FIELDS = frozenset(
@@ -194,6 +199,7 @@ CLAIM_ADJUDICATION_NOTICE = (
 )
 CLAIM_RUNTIME_NOTICE = "Claim-aware V3 contracts are not launchable in the current runtime."
 CLAIM_V4_RUNTIME_NOTICE = "Claim-verification-plan V4 contracts are not launchable in the current runtime."
+CLAIM_V5_RUNTIME_NOTICE = "Evidence-binding V5 contracts are not launchable in the current runtime."
 PLAN_AUTHORSHIP_NOTICE = "These verification obligations were explicitly authored by the owner."
 PLAN_COVERAGE_NOTICE = (
     "Verification-plan coverage has not been assessed. Claims or requirements may "
@@ -215,6 +221,37 @@ PLAN_PROCEDURE_BINDING_NOTICE = (
     "Procedure references have not been validated against current runtime capabilities."
 )
 PLAN_RUNTIME_NOTICE = CLAIM_V4_RUNTIME_NOTICE
+BINDING_AUTHORSHIP_NOTICE = "These evidence bindings were explicitly authored by the owner."
+BINDING_COVERAGE_NOTICE = (
+    "Evidence-binding coverage has not been assessed. Verification obligations may "
+    "remain unbound."
+)
+BINDING_AUTHORITY_RELATIONSHIP_NOTICE = (
+    "Each binding authorizes a relationship between a verification obligation and "
+    "an in-profile evidence-source authority."
+)
+BINDING_NO_EVIDENCE_EXISTENCE_NOTICE = (
+    "A binding does not assert that an evidence record exists or will be produced."
+)
+BINDING_NO_RESOLUTION_OR_ELIGIBILITY_NOTICE = (
+    "A binding does not assert that a source has been resolved or that any produced "
+    "evidence is eligible."
+)
+BINDING_NO_OBLIGATION_OR_CLAIM_RESULT_NOTICE = (
+    "A binding does not mean that an obligation is satisfied or that a claim is "
+    "supported or adjudicated."
+)
+BINDING_SOURCE_IDENTITY_NOTICE = (
+    "Source references identify pre-authorized profile authorities, not post-run "
+    "evidence records."
+)
+BINDING_PROCEDURE_REFERENCE_SEPARATION_NOTICE = (
+    "An obligation's procedure reference is not its evidence-source identity."
+)
+BINDING_HUMAN_RUBRIC_LIMITATION_NOTICE = (
+    "Human-rubric obligations currently have no bindable evidence-source authority."
+)
+BINDING_RUNTIME_NOTICE = CLAIM_V5_RUNTIME_NOTICE
 
 
 def _require_text(value: object, field: str, *, max_bytes: int) -> str:
@@ -319,8 +356,23 @@ def _validate_owner_inputs(inputs: Mapping[str, Any]) -> dict[str, Any]:
         )
     model = inputs.get("model")
     timeout_seconds = inputs.get("timeout_seconds")
+    claims_present = "result_claims" in inputs
+    plan_present = "claim_verification_plan" in inputs
+    bindings_present = "verification_evidence_bindings" in inputs
+    if bindings_present and not claims_present:
+        raise AuthoringError(
+            "EVIDENCE_BINDINGS_REQUIRE_RESULT_CLAIMS",
+            field="verification_evidence_bindings",
+            safe_message_key="authoring.evidence_bindings_require_result_claims",
+        )
+    if bindings_present and not plan_present:
+        raise AuthoringError(
+            "EVIDENCE_BINDINGS_REQUIRE_VERIFICATION_PLAN",
+            field="verification_evidence_bindings",
+            safe_message_key="authoring.evidence_bindings_require_verification_plan",
+        )
     claim_authority = None
-    if "result_claims" in inputs:
+    if claims_present:
         raw_claims = inputs["result_claims"]
         if not isinstance(raw_claims, list) or not raw_claims:
             raise AuthoringError(
@@ -343,7 +395,7 @@ def _validate_owner_inputs(inputs: Mapping[str, Any]) -> dict[str, Any]:
                 safe_message_key="authoring.invalid_result_claims",
             ) from None
     plan_authority = None
-    if "claim_verification_plan" in inputs:
+    if plan_present:
         raw_plan = inputs["claim_verification_plan"]
         if claim_authority is None:
             raise AuthoringError(
@@ -378,6 +430,29 @@ def _validate_owner_inputs(inputs: Mapping[str, Any]) -> dict[str, Any]:
                 field="claim_verification_plan",
                 safe_message_key="authoring.invalid_claim_verification_plan",
             ) from None
+    binding_authority = None
+    if bindings_present:
+        raw_bindings = inputs["verification_evidence_bindings"]
+        if not isinstance(raw_bindings, list) or not raw_bindings:
+            raise AuthoringError(
+                "INVALID_VERIFICATION_EVIDENCE_BINDINGS",
+                field="verification_evidence_bindings",
+                safe_message_key="authoring.evidence_bindings_nonempty_array_required",
+            )
+        try:
+            binding_authority = VerificationEvidenceBindingAuthority.from_dict(
+                {
+                    "authorship": VerificationEvidenceBindingAuthorship.OWNER_AUTHORED.value,
+                    "coverage_status": VerificationEvidenceBindingCoverageStatus.NOT_ASSESSED.value,
+                    "bindings": raw_bindings,
+                }
+            )
+        except (TypeError, ValueError):
+            raise AuthoringError(
+                "INVALID_VERIFICATION_EVIDENCE_BINDINGS",
+                field="verification_evidence_bindings",
+                safe_message_key="authoring.invalid_verification_evidence_bindings",
+            ) from None
     return {
         "mission_text": mission_text,
         "gate_objective": gate_objective,
@@ -389,6 +464,7 @@ def _validate_owner_inputs(inputs: Mapping[str, Any]) -> dict[str, Any]:
         "timeout_seconds": timeout_seconds,
         "claim_authority": claim_authority,
         "claim_verification_plan_authority": plan_authority,
+        "verification_evidence_binding_authority": binding_authority,
     }
 
 
@@ -745,7 +821,13 @@ def author_runtime_contract(
     )
     claim_authority = validated["claim_authority"]
     plan_authority = validated["claim_verification_plan_authority"]
-    if plan_authority is not None:
+    binding_authority = validated["verification_evidence_binding_authority"]
+    if binding_authority is not None:
+        builder_kwargs["schema_version"] = MISSION_PROFILE_SCHEMA_VERSION_V5
+        builder_kwargs["claim_authority"] = claim_authority
+        builder_kwargs["claim_verification_plan_authority"] = plan_authority
+        builder_kwargs["verification_evidence_binding_authority"] = binding_authority
+    elif plan_authority is not None:
         builder_kwargs["schema_version"] = MISSION_PROFILE_SCHEMA_VERSION_V4
         builder_kwargs["claim_authority"] = claim_authority
         builder_kwargs["claim_verification_plan_authority"] = plan_authority
@@ -755,6 +837,12 @@ def author_runtime_contract(
     try:
         profile = profile_builder(**builder_kwargs)
     except Exception:
+        if binding_authority is not None:
+            raise AuthoringError(
+                "INVALID_VERIFICATION_EVIDENCE_BINDINGS",
+                field="verification_evidence_bindings",
+                safe_message_key="authoring.invalid_verification_evidence_bindings",
+            ) from None
         raise AuthoringError(
             "BUILDER_REJECTED",
             safe_message_key="authoring.builder_rejected",
@@ -802,7 +890,11 @@ def author_runtime_contract(
         ],
         "template_id": validated["template_id"],
     }
-    if profile.schema_version in {MISSION_PROFILE_SCHEMA_VERSION_V3, MISSION_PROFILE_SCHEMA_VERSION_V4}:
+    if profile.schema_version in {
+        MISSION_PROFILE_SCHEMA_VERSION_V3,
+        MISSION_PROFILE_SCHEMA_VERSION_V4,
+        MISSION_PROFILE_SCHEMA_VERSION_V5,
+    }:
         summary["profile_fingerprint"] = fingerprint
         summary["claim_authority"] = profile.claim_authority.to_dict()
         summary["claim_review_notices"] = {
@@ -812,10 +904,17 @@ def author_runtime_contract(
             "runtime": (
                 CLAIM_RUNTIME_NOTICE
                 if profile.schema_version == MISSION_PROFILE_SCHEMA_VERSION_V3
-                else CLAIM_V4_RUNTIME_NOTICE
+                else (
+                    CLAIM_V4_RUNTIME_NOTICE
+                    if profile.schema_version == MISSION_PROFILE_SCHEMA_VERSION_V4
+                    else CLAIM_V5_RUNTIME_NOTICE
+                )
             ),
         }
-    if profile.schema_version == MISSION_PROFILE_SCHEMA_VERSION_V4:
+    if profile.schema_version in {
+        MISSION_PROFILE_SCHEMA_VERSION_V4,
+        MISSION_PROFILE_SCHEMA_VERSION_V5,
+    }:
         summary["claim_verification_plan_authority"] = (
             profile.claim_verification_plan_authority.to_dict()
         )
@@ -826,7 +925,27 @@ def author_runtime_contract(
             "no_adjudication": PLAN_NO_ADJUDICATION_NOTICE,
             "independence": PLAN_INDEPENDENCE_NOTICE,
             "procedure_binding": PLAN_PROCEDURE_BINDING_NOTICE,
-            "runtime": PLAN_RUNTIME_NOTICE,
+            "runtime": (
+                PLAN_RUNTIME_NOTICE
+                if profile.schema_version == MISSION_PROFILE_SCHEMA_VERSION_V4
+                else CLAIM_V5_RUNTIME_NOTICE
+            ),
+        }
+    if profile.schema_version == MISSION_PROFILE_SCHEMA_VERSION_V5:
+        summary["verification_evidence_binding_authority"] = (
+            profile.verification_evidence_binding_authority.to_dict()
+        )
+        summary["verification_evidence_binding_review_notices"] = {
+            "authorship": BINDING_AUTHORSHIP_NOTICE,
+            "coverage": BINDING_COVERAGE_NOTICE,
+            "authority_relationship": BINDING_AUTHORITY_RELATIONSHIP_NOTICE,
+            "no_evidence_existence": BINDING_NO_EVIDENCE_EXISTENCE_NOTICE,
+            "no_resolution_or_eligibility": BINDING_NO_RESOLUTION_OR_ELIGIBILITY_NOTICE,
+            "no_obligation_or_claim_result": BINDING_NO_OBLIGATION_OR_CLAIM_RESULT_NOTICE,
+            "source_identity": BINDING_SOURCE_IDENTITY_NOTICE,
+            "procedure_reference_separation": BINDING_PROCEDURE_REFERENCE_SEPARATION_NOTICE,
+            "human_rubric_limitation": BINDING_HUMAN_RUBRIC_LIMITATION_NOTICE,
+            "runtime": BINDING_RUNTIME_NOTICE,
         }
     return AuthoredContractDocument(
         document_path=str(path.resolve()),
@@ -847,10 +966,21 @@ def author_runtime_contract(
 __all__ = [
     "AuthoringError",
     "AuthoredContractDocument",
+    "BINDING_AUTHORSHIP_NOTICE",
+    "BINDING_AUTHORITY_RELATIONSHIP_NOTICE",
+    "BINDING_COVERAGE_NOTICE",
+    "BINDING_HUMAN_RUBRIC_LIMITATION_NOTICE",
+    "BINDING_NO_EVIDENCE_EXISTENCE_NOTICE",
+    "BINDING_NO_OBLIGATION_OR_CLAIM_RESULT_NOTICE",
+    "BINDING_NO_RESOLUTION_OR_ELIGIBILITY_NOTICE",
+    "BINDING_PROCEDURE_REFERENCE_SEPARATION_NOTICE",
+    "BINDING_RUNTIME_NOTICE",
+    "BINDING_SOURCE_IDENTITY_NOTICE",
     "CLAIM_ADJUDICATION_NOTICE",
     "CLAIM_AUTHORSHIP_NOTICE",
     "CLAIM_COVERAGE_NOTICE",
     "CLAIM_RUNTIME_NOTICE",
+    "CLAIM_V5_RUNTIME_NOTICE",
     "GOLDEN_EXACT_CONTRACT_FIELDS",
     "GOLDEN_TEMPLATE_RECOMMENDED_TIMEOUT_SECONDS",
     "GOLDEN_WORKFLOW_COMMIT_MESSAGE",

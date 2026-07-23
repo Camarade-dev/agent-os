@@ -2460,6 +2460,42 @@ OWNER_EXPECTED_INDEPENDENCE_LABELS = [
     "Required independence: model",
     "Required independence: organizational",
 ]
+OWNER_ORDERED_BROWSER_V5_PLAN = [
+    OWNER_ORDERED_BROWSER_PLAN[0],
+    {
+        **OWNER_ORDERED_BROWSER_PLAN[1],
+        "strategy": "CHECKPOINT_COMMAND",
+        "procedure_reference": "alpha_descriptive_procedure",
+        "acceptance_predicate": "EXIT_CODE_ZERO",
+        "oracle_disclosed_to_subject": False,
+    },
+]
+OWNER_ORDERED_BROWSER_BINDINGS = [
+    {
+        "binding_id": "zulu-binding-first",
+        "obligation_id": "zulu-obligation",
+        "source_authority_type": "CHECKPOINT_COMMAND_AUTHORITY",
+        "source_authority_reference": "workspace-marker-check",
+    },
+    {
+        "binding_id": "alpha-binding-second-" + "x" * 40,
+        "obligation_id": "alpha-obligation",
+        "source_authority_type": "CHECKPOINT_COMMAND_AUTHORITY",
+        "source_authority_reference": "workspace-marker-check",
+    },
+]
+OWNER_BINDING_NOTICE_LITERALS = [
+    "These evidence bindings were explicitly authored by the owner.",
+    "Evidence-binding coverage has not been assessed. Verification obligations may remain unbound.",
+    "Each binding authorizes a relationship between a verification obligation and an in-profile evidence-source authority.",
+    "A binding does not assert that an evidence record exists or will be produced.",
+    "A binding does not assert that a source has been resolved or that any produced evidence is eligible.",
+    "A binding does not mean that an obligation is satisfied or that a claim is supported or adjudicated.",
+    "Source references identify pre-authorized profile authorities, not post-run evidence records.",
+    "An obligation's procedure reference is not its evidence-source identity.",
+    "Human-rubric obligations currently have no bindable evidence-source authority.",
+    "Evidence-binding V5 contracts are not launchable in the current runtime.",
+]
 
 
 def _claim_browser_configuration(tmp_path: Path) -> LauncherConfiguration:
@@ -2484,7 +2520,11 @@ class OwnerClaimBrowserLauncher(ProductLauncher):
         super().__init__(configuration, verify_head=False, id_generator=lambda: next(counter), browser_opener=lambda _url: None)
         self.malformed_claim_response = False
         self.malformed_plan_response = False
+        self.malformed_binding_response = False
+        self.missing_binding_response = False
+        self.hostile_binding_response = False
         self.preparation_attempts = 0
+        self.preparation_results = []
         self.proxy_g2 = lambda method, path, body=None: (200, {"contract_id": "v2-browser-contract"})
 
     def author_and_validate(self, body):
@@ -2495,11 +2535,26 @@ class OwnerClaimBrowserLauncher(ProductLauncher):
             ]
         if status == 200 and self.malformed_plan_response and "claim_verification_plan_authority" in response["contract_summary"]:
             response["contract_summary"]["claim_verification_plan_authority"]["verification_obligations"] = [OWNER_ORDERED_BROWSER_PLAN[0], {"obligation_id": "broken"}]
+        if status == 200 and self.malformed_binding_response and "verification_evidence_binding_authority" in response["contract_summary"]:
+            response["contract_summary"]["verification_evidence_binding_authority"]["bindings"] = [
+                OWNER_ORDERED_BROWSER_BINDINGS[0], {"binding_id": "broken"}
+            ]
+        if status == 200 and self.missing_binding_response and response["contract_summary"].get("schema_version") == "admissible_native_mission_profile_v5":
+            response["contract_summary"].pop("verification_evidence_binding_authority")
+            response["contract_summary"].pop("verification_evidence_binding_review_notices")
+        if status == 200 and self.hostile_binding_response and "verification_evidence_binding_authority" in response["contract_summary"]:
+            response["contract_summary"]["verification_evidence_binding_authority"]["bindings"][0] = {
+                **OWNER_ORDERED_BROWSER_BINDINGS[0],
+                "binding_id": "<img src=x onerror=window.__binding_attack=1>",
+                "source_authority_reference": "<script>window.__binding_attack=2</script>",
+            }
         return status, response
 
     def enqueue_preparation(self, contract_id):
         self.preparation_attempts += 1
-        return super().enqueue_preparation(contract_id)
+        result = super().enqueue_preparation(contract_id)
+        self.preparation_results.append(result)
+        return result
 
 
 def test_owner_claim_review_real_dom_preserves_authority_order_and_v3_boundary(tmp_path):
@@ -2542,6 +2597,17 @@ def test_owner_claim_review_real_dom_preserves_authority_order_and_v3_boundary(t
             result = send("Runtime.evaluate", {"expression": expression, "returnByValue": True})
             return ((result.get("result") or {}).get("result") or {}).get("value")
 
+        def evaluate_async(expression):
+            result = send(
+                "Runtime.evaluate",
+                {
+                    "expression": expression,
+                    "returnByValue": True,
+                    "awaitPromise": True,
+                },
+            )
+            return ((result.get("result") or {}).get("result") or {}).get("value")
+
         def wait_for(expression, wanted):
             end = time.time() + 20
             last = None
@@ -2552,7 +2618,7 @@ def test_owner_claim_review_real_dom_preserves_authority_order_and_v3_boundary(t
                 time.sleep(0.15)
             raise AssertionError(f"timed out waiting for {wanted!r}; last={last!r}")
 
-        def compose(claims, plan=None):
+        def compose(claims, plan=None, bindings=None):
             evaluate("window.AdmissibleG3Test.reset()")
             wait_for("window.AdmissibleG3Test.getState()", "COMPOSE")
             fields = {
@@ -2560,6 +2626,7 @@ def test_owner_claim_review_real_dom_preserves_authority_order_and_v3_boundary(t
                 "completion-conditions": "claim conditions", "commit-message": "feat: claim",
                 "result-claims": "" if claims is None else json.dumps(claims, separators=(",", ":")),
                 "claim-verification-plan": "" if plan is None else json.dumps(plan, separators=(",", ":")),
+                "verification-evidence-bindings": "" if bindings is None else json.dumps(bindings, separators=(",", ":")),
             }
             for field, value in fields.items():
                 evaluate(f"window.AdmissibleG3Test.setField({json.dumps(field)},{json.dumps(value)})")
@@ -2626,6 +2693,113 @@ def test_owner_claim_review_real_dom_preserves_authority_order_and_v3_boundary(t
         wait_for("window.AdmissibleG3Test.getState()", "CONTRACT_READY")
         assert launcher._preparations._items == {}
 
+        compose(
+            OWNER_ORDERED_BROWSER_CLAIMS,
+            OWNER_ORDERED_BROWSER_V5_PLAN,
+            OWNER_ORDERED_BROWSER_BINDINGS,
+        )
+        for width, height, mobile in ((1280, 800, False), (390, 844, True)):
+            send("Emulation.setDeviceMetricsOverride", {"width": width, "height": height, "deviceScaleFactor": 1, "mobile": mobile})
+            raw = evaluate("JSON.stringify((()=>{const b=document.getElementById('contract-evidence-binding-review'),p=document.getElementById('contract-verification-plan-review'),c=document.getElementById('contract-claim-review'),g=document.getElementById('contract-gate-clauses'),button=document.getElementById('prepare-button'),d=document.documentElement;const rows=item=>Array.from(item.querySelectorAll(':scope>dl>div'));const fact=(item,label)=>{const row=rows(item).find(x=>x.querySelector(':scope>dt').textContent===label);return row?row.querySelector(':scope>dd').textContent:null};const bindings=Array.from(b.querySelectorAll('.evidence-binding-list>li')).map(item=>({binding_id:item.querySelector(':scope>.binding-id').textContent,obligation_id:fact(item,'Obligation ID'),source_authority_type:fact(item,'Source authority type'),source_authority_reference:fact(item,'Source authority reference')}));return {bindings,notices:Array.from(b.querySelectorAll('.binding-notice')).map(x=>x.textContent),bindingItems:b.querySelectorAll('.evidence-binding-list>li').length,planItems:p.querySelectorAll('.verification-obligation-list>li').length,claimItems:c.querySelectorAll('.claim-list>li').length,gateItems:g.querySelectorAll('.gate-clause-list>li').length,procedureReferences:Array.from(p.querySelectorAll('.verification-obligation-list>li')).map(item=>fact(item,'Procedure reference')),sourceReferences:bindings.map(item=>item.source_authority_reference),injected:b.querySelectorAll('script,img,svg,iframe,object,embed').length,text:b.textContent,hidden:button.hidden,disabled:button.disabled,doc:[d.scrollWidth,d.clientWidth],binding:[b.scrollWidth,b.clientWidth],plan:[p.scrollWidth,p.clientWidth],claim:[c.scrollWidth,c.clientWidth]}})())")
+            measured = json.loads(raw)
+            assert measured["bindings"] == OWNER_ORDERED_BROWSER_BINDINGS
+            assert measured["notices"] == OWNER_BINDING_NOTICE_LITERALS
+            assert measured["bindingItems"] == 2
+            assert measured["planItems"] == 2
+            assert measured["claimItems"] == 4
+            assert measured["gateItems"] == 2
+            assert measured["procedureReferences"] == [
+                item["procedure_reference"] for item in OWNER_ORDERED_BROWSER_V5_PLAN
+            ]
+            assert measured["sourceReferences"] == [
+                item["source_authority_reference"] for item in OWNER_ORDERED_BROWSER_BINDINGS
+            ]
+            assert not (
+                set(measured["procedureReferences"]) & set(measured["sourceReferences"])
+            )
+            assert measured["injected"] == 0
+            assert measured["hidden"] is True and measured["disabled"] is True
+            assert measured["doc"][0] <= measured["doc"][1] + 1
+            assert measured["binding"][0] <= measured["binding"][1] + 1
+            assert measured["plan"][0] <= measured["plan"][1] + 1
+            assert measured["claim"][0] <= measured["claim"][1] + 1
+
+        attempts_before_v5_bypass = launcher.preparation_attempts
+        evaluate("const v5b=document.getElementById('prepare-button');v5b.hidden=false;v5b.disabled=false;v5b.click()")
+        refusal_deadline = time.time() + 5
+        while launcher.preparation_attempts == attempts_before_v5_bypass and time.time() < refusal_deadline:
+            time.sleep(0.05)
+        assert launcher.preparation_attempts == attempts_before_v5_bypass + 1
+        assert launcher.preparation_results[-1] == (
+            409,
+            {"error": "VERIFICATION_EVIDENCE_BINDING_V5_NOT_LAUNCHABLE"},
+        )
+        wait_for("window.AdmissibleG3Test.getState()", "CONTRACT_READY")
+        assert launcher._preparations._items == {}
+        forced_launch = json.loads(
+            evaluate_async(
+                "(async()=>{const contract_id=window.AdmissibleG3Test.snapshot().contractId;"
+                "const response=await fetch('/ui/api/v1/runs',{method:'POST',credentials:'omit',"
+                "headers:{'Content-Type':'application/json','X-Admissible-UI-CSRF':'"
+                + "f" * 64
+                + "','X-Admissible-Owner-Authorization':'owner',"
+                "'X-Admissible-Owner-Authorization-Digest':'"
+                + "f" * 64
+                + "'},body:JSON.stringify({contract_id,preparation_id:'fabricated'})});"
+                "return JSON.stringify({status:response.status,body:await response.json()});})()"
+            )
+        )
+        assert forced_launch == {
+            "status": 409,
+            "body": {
+                "error": "VERIFICATION_EVIDENCE_BINDING_V5_NOT_LAUNCHABLE"
+            },
+        }
+
+        launcher.hostile_binding_response = True
+        compose(
+            OWNER_ORDERED_BROWSER_CLAIMS,
+            OWNER_ORDERED_BROWSER_V5_PLAN,
+            OWNER_ORDERED_BROWSER_BINDINGS,
+        )
+        hostile = json.loads(evaluate("JSON.stringify((()=>{const b=document.getElementById('contract-evidence-binding-review');return {ids:Array.from(b.querySelectorAll('.binding-id')).map(x=>x.textContent),references:Array.from(b.querySelectorAll('.evidence-binding-list dd')).map(x=>x.textContent),injected:b.querySelectorAll('script,img,svg,iframe,object,embed').length,marker:window.__binding_attack||0}})())"))
+        assert hostile["ids"][0] == "<img src=x onerror=window.__binding_attack=1>"
+        assert "<script>window.__binding_attack=2</script>" in hostile["references"]
+        assert hostile["injected"] == 0 and hostile["marker"] == 0
+        launcher.hostile_binding_response = False
+
+        launcher.malformed_binding_response = True
+        compose(
+            OWNER_ORDERED_BROWSER_CLAIMS,
+            OWNER_ORDERED_BROWSER_V5_PLAN,
+            OWNER_ORDERED_BROWSER_BINDINGS,
+        )
+        malformed_binding = json.loads(evaluate("JSON.stringify({items:document.querySelectorAll('#contract-evidence-binding-review .evidence-binding-list>li').length,error:document.querySelector('#contract-evidence-binding-review .binding-review-error').textContent,sectionHidden:document.getElementById('contract-evidence-bindings').hidden,hidden:document.getElementById('prepare-button').hidden,disabled:document.getElementById('prepare-button').disabled})"))
+        assert malformed_binding == {
+            "items": 0,
+            "error": "Evidence-binding review data is unavailable or inconsistent. No partial binding list is shown.",
+            "sectionHidden": False,
+            "hidden": True,
+            "disabled": True,
+        }
+        launcher.malformed_binding_response = False
+
+        launcher.missing_binding_response = True
+        compose(
+            OWNER_ORDERED_BROWSER_CLAIMS,
+            OWNER_ORDERED_BROWSER_V5_PLAN,
+            OWNER_ORDERED_BROWSER_BINDINGS,
+        )
+        missing_binding = json.loads(evaluate("JSON.stringify({items:document.querySelectorAll('#contract-evidence-binding-review .evidence-binding-list>li').length,error:document.querySelector('#contract-evidence-binding-review .binding-review-error').textContent,sectionHidden:document.getElementById('contract-evidence-bindings').hidden,hidden:document.getElementById('prepare-button').hidden,disabled:document.getElementById('prepare-button').disabled})"))
+        assert missing_binding == {
+            "items": 0,
+            "error": "Evidence-binding review data is unavailable or inconsistent. No partial binding list is shown.",
+            "sectionHidden": False,
+            "hidden": True,
+            "disabled": True,
+        }
+        launcher.missing_binding_response = False
+
         launcher.malformed_plan_response = True
         compose(OWNER_ORDERED_BROWSER_CLAIMS, OWNER_ORDERED_BROWSER_PLAN)
         malformed_plan = json.loads(evaluate("JSON.stringify({items:document.querySelectorAll('#contract-verification-plan-review .verification-obligation-list>li').length,error:document.querySelector('#contract-verification-plan-review .plan-review-error').textContent,hidden:document.getElementById('prepare-button').hidden,disabled:document.getElementById('prepare-button').disabled})"))
@@ -2639,8 +2813,8 @@ def test_owner_claim_review_real_dom_preserves_authority_order_and_v3_boundary(t
 
         launcher.malformed_claim_response = False
         compose(None)
-        v2 = json.loads(evaluate("JSON.stringify({claimsHidden:document.getElementById('contract-claims').hidden,prepareHidden:document.getElementById('prepare-button').hidden,prepareDisabled:document.getElementById('prepare-button').disabled})"))
-        assert v2 == {"claimsHidden": True, "prepareHidden": False, "prepareDisabled": False}
+        v2 = json.loads(evaluate("JSON.stringify({claimsHidden:document.getElementById('contract-claims').hidden,planHidden:document.getElementById('contract-verification-plan').hidden,bindingsHidden:document.getElementById('contract-evidence-bindings').hidden,prepareHidden:document.getElementById('prepare-button').hidden,prepareDisabled:document.getElementById('prepare-button').disabled})"))
+        assert v2 == {"claimsHidden": True, "planHidden": True, "bindingsHidden": True, "prepareHidden": False, "prepareDisabled": False}
     finally:
         if close_cdp:
             close_cdp()
