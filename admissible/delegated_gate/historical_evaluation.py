@@ -19,11 +19,17 @@ from admissible.delegated_gate.canonical import (
 )
 from admissible.delegated_gate.mission_profile import (
     ClaimAuthority,
+    ClaimAuthorship,
+    ClaimSetCoverageStatus,
     ClaimVerificationPlanAuthority,
     MISSION_PROFILE_SCHEMA_VERSION_V2,
     MISSION_PROFILE_SCHEMA_VERSION_V5,
     NativeMissionProfile,
     VerificationEvidenceBindingAuthority,
+    VerificationEvidenceBindingAuthorship,
+    VerificationEvidenceBindingCoverageStatus,
+    VerificationPlanAuthorship,
+    VerificationPlanCoverageStatus,
 )
 from admissible.delegated_gate.native_canary import (
     NativeCanaryAuthorizationPayloadV4,
@@ -128,6 +134,137 @@ def require_exact_v5_v2_runtime_authority_compatibility(
             "projected v5 runtime-authority fingerprint does not match the historical v2 profile"
         )
     return projected
+
+
+def _owner_ordered_member_array(value: Any, label: str) -> list[Any]:
+    """Require one explicit, non-null, non-empty, ordered owner member array.
+
+    Only the ordered member arrays are owner-authored.  Authority wrapper
+    objects are rejected so a caller can never supply authorship, coverage
+    status, or any other system-owned wrapper field.
+    """
+
+    if value is None:
+        raise ValueError(f"historical evaluation {label} must not be null")
+    if isinstance(value, Mapping):
+        raise ValueError(
+            f"historical evaluation {label} must be the ordered owner member "
+            "array, not an authority object"
+        )
+    if not isinstance(value, list):
+        raise ValueError(f"historical evaluation {label} must be an ordered array")
+    if not value:
+        raise ValueError(f"historical evaluation {label} must be non-empty")
+    return value
+
+
+def _owner_authored_claim_authority(result_claims: Any) -> ClaimAuthority:
+    members = _owner_ordered_member_array(result_claims, "result claims")
+    try:
+        return ClaimAuthority.from_dict(
+            {
+                "authorship": ClaimAuthorship.OWNER_AUTHORED.value,
+                "coverage_status": ClaimSetCoverageStatus.NOT_ASSESSED.value,
+                "claims": members,
+            }
+        )
+    except TypeError:
+        raise ValueError("historical evaluation result claims are invalid") from None
+
+
+def _owner_authored_plan_authority(
+    claim_verification_plan: Any,
+) -> ClaimVerificationPlanAuthority:
+    members = _owner_ordered_member_array(
+        claim_verification_plan, "claim verification plan"
+    )
+    try:
+        return ClaimVerificationPlanAuthority.from_dict(
+            {
+                "authorship": VerificationPlanAuthorship.OWNER_AUTHORED.value,
+                "coverage_status": VerificationPlanCoverageStatus.NOT_ASSESSED.value,
+                "verification_obligations": members,
+            }
+        )
+    except TypeError:
+        raise ValueError(
+            "historical evaluation claim verification plan is invalid"
+        ) from None
+
+
+def _owner_authored_binding_authority(
+    verification_evidence_bindings: Any,
+) -> VerificationEvidenceBindingAuthority:
+    members = _owner_ordered_member_array(
+        verification_evidence_bindings, "verification evidence bindings"
+    )
+    try:
+        return VerificationEvidenceBindingAuthority.from_dict(
+            {
+                "authorship": VerificationEvidenceBindingAuthorship.OWNER_AUTHORED.value,
+                "coverage_status": (
+                    VerificationEvidenceBindingCoverageStatus.NOT_ASSESSED.value
+                ),
+                "bindings": members,
+            }
+        )
+    except TypeError:
+        raise ValueError(
+            "historical evaluation verification evidence bindings are invalid"
+        ) from None
+
+
+def derive_historical_v5_evaluation_profile(
+    *,
+    target_authorization_payload: NativeCanaryAuthorizationPayloadV4,
+    result_claims: object,
+    claim_verification_plan: object,
+    verification_evidence_bindings: object,
+) -> NativeMissionProfile:
+    """Derive one inert canonical V5 evaluation contract from historical V4.
+
+    The complete embedded runtime-V2 authority is copied exactly; only the
+    schema version changes and the three owner-authored evaluation layers are
+    added.  The function is pure: it persists nothing, creates no pairing
+    authority, and never consults current filesystem, Git, store, or provider
+    state.  The returned V5 says nothing about any payload until Step 5C
+    pairing authorizes that relation explicitly.
+    """
+
+    if not isinstance(
+        target_authorization_payload,
+        NativeCanaryAuthorizationPayloadV4,
+    ):
+        raise ValueError(
+            "target execution authorization must be a canonical historical v4 payload"
+        )
+    target_authorization_payload.validated_historical_structure()
+    target_profile = target_authorization_payload.mission_profile
+    if (
+        target_profile.schema_version != MISSION_PROFILE_SCHEMA_VERSION_V2
+        or not target_profile.is_launchable_runtime_profile
+    ):
+        raise ValueError(
+            "historical v4 authorization must embed an exact launchable runtime-v2 profile"
+        )
+    claim_authority = _owner_authored_claim_authority(result_claims)
+    plan_authority = _owner_authored_plan_authority(claim_verification_plan)
+    binding_authority = _owner_authored_binding_authority(
+        verification_evidence_bindings
+    )
+    body = target_profile.to_dict()
+    body.pop("profile_fingerprint")
+    body["schema_version"] = MISSION_PROFILE_SCHEMA_VERSION_V5
+    body["claim_authority"] = claim_authority.to_dict()
+    body["claim_verification_plan_authority"] = plan_authority.to_dict()
+    body["verification_evidence_binding_authority"] = binding_authority.to_dict()
+    body["profile_fingerprint"] = fingerprint(body)
+    derived = _validated_v5_evaluation_profile(NativeMissionProfile.from_dict(body))
+    require_exact_v5_v2_runtime_authority_compatibility(
+        evaluation_profile=derived,
+        target_authorization_payload=target_authorization_payload,
+    )
+    return derived
 
 
 @dataclass(frozen=True)
@@ -285,6 +422,7 @@ __all__ = [
     "HISTORICAL_EVALUATION_PAIRING_AUTHORITY_SCHEMA_VERSION",
     "HistoricalEvaluationPairingAuthority",
     "create_historical_evaluation_pairing_authority",
+    "derive_historical_v5_evaluation_profile",
     "project_v5_runtime_authority_to_v2",
     "require_exact_v5_v2_runtime_authority_compatibility",
     "validate_historical_evaluation_pairing_relation",
