@@ -6,9 +6,10 @@ from unittest import mock
 
 import pytest
 
-from admissible.delegated_gate.canonical import canonical_bytes
+from admissible.delegated_gate.canonical import canonical_bytes, fingerprint
 from admissible.delegated_gate.mission_profile import (
     MAX_VERIFICATION_EVIDENCE_BINDINGS,
+    MISSION_PROFILE_SCHEMA_VERSION_V4,
     MISSION_PROFILE_SCHEMA_VERSION_V5,
     NativeMissionProfile,
     ProfileCheckpointCommand,
@@ -58,7 +59,7 @@ def _bindings(items=None, authorship=VerificationEvidenceBindingAuthorship.OWNER
     )
 
 
-def _profile(plan=None, bindings=None, *, frozen=False):
+def _profile(plan=None, bindings=None, *, frozen=False, checkpoint_commands=None):
     base = _v4_profile(plan=plan)
     values = dict(base.__dict__)
     for key in ("schema_version", "profile_fingerprint", "verification_evidence_binding_authority"):
@@ -77,7 +78,9 @@ def _profile(plan=None, bindings=None, *, frozen=False):
     else:
         values.update(
             required_evidence_kinds=values["required_evidence_kinds"] + (EvidenceKind.VERIFICATION_COMMAND.value,),
-            checkpoint_commands=(ProfileCheckpointCommand("checkpoint.tests", ("python", "-m", "pytest"), 30, 8192),),
+            checkpoint_commands=checkpoint_commands or (
+                ProfileCheckpointCommand("checkpoint.tests", ("python", "-m", "pytest"), 30, 8192),
+            ),
         )
     return create_native_mission_profile(
         **values,
@@ -153,6 +156,51 @@ def test_valid_checkpoint_binding_and_direct_source_resolution_only():
         _profile(plan, _bindings((_binding(source_authority_reference="absent.command"),)))
 
 
+def test_checkpoint_binding_resolves_exact_command_identity_not_ordinal_position():
+    commands = (
+        ProfileCheckpointCommand("zulu-command", ("python", "-m", "pytest", "zulu"), 30, 8192),
+        ProfileCheckpointCommand("alpha-command", ("python", "-m", "pytest", "alpha"), 30, 8192),
+        ProfileCheckpointCommand("mike-command", ("python", "-m", "pytest", "mike"), 30, 8192),
+    )
+    binding = _binding(source_authority_reference="mike-command")
+    bindings = _bindings((binding,))
+
+    profile = _profile(bindings=bindings, checkpoint_commands=commands)
+    assert profile.validated() == profile
+    assert profile.verification_evidence_binding_authority.bindings[0].source_authority_reference == "mike-command"
+    assert binding.source_authority_reference in {
+        command.command_id for command in profile.checkpoint_commands
+    }
+
+    reordered = _profile(
+        bindings=bindings,
+        checkpoint_commands=(commands[1], commands[2], commands[0]),
+    )
+    assert reordered.validated() == reordered
+    assert reordered.verification_evidence_binding_authority.bindings[0].source_authority_reference == "mike-command"
+    assert reordered.verification_evidence_binding_authority.bindings[0].source_authority_reference != reordered.checkpoint_commands[0].command_id
+
+    for reference in ("Mike-Command", "unknown-command"):
+        with pytest.raises(ValueError, match="missing from profile"):
+            _profile(
+                bindings=_bindings((_binding(source_authority_reference=reference),)),
+                checkpoint_commands=commands,
+            )
+
+    for procedure_reference in ("zulu-command", "absent-command"):
+        plan = _plan((_obligation(procedure_reference=procedure_reference),))
+        procedure_independent = _profile(
+            plan,
+            bindings,
+            checkpoint_commands=commands,
+        )
+        assert procedure_independent.validated() == procedure_independent
+        assert (
+            procedure_independent.verification_evidence_binding_authority.bindings[0].source_authority_reference
+            == "mike-command"
+        )
+
+
 def test_frozen_behavioral_binding_is_content_addressed_and_mode_bound():
     obligation = _obligation(strategy=VerificationStrategy.FROZEN_BEHAVIORAL_VERIFIER,
                              oracle_disclosed_to_subject=True)
@@ -197,6 +245,45 @@ def test_v5_shape_round_trip_predicates_and_v4_rejects_injection():
     data = _v4_profile().to_dict(); data["verification_evidence_binding_authority"] = _bindings().to_dict()
     with pytest.raises(ValueError, match="keys"):
         NativeMissionProfile.from_dict(data)
+
+
+def test_raw_v4_direct_validation_refuses_v5_only_binding_authority():
+    obligation = _obligation(
+        strategy=VerificationStrategy.FROZEN_BEHAVIORAL_VERIFIER,
+        oracle_disclosed_to_subject=True,
+    )
+    binding = _binding(
+        source_authority_type=VerificationEvidenceSourceAuthorityType.FROZEN_BEHAVIORAL_VERIFIER_AUTHORITY,
+        source_authority_reference=SOURCE_SHA,
+    )
+    canonical_v5 = _profile(
+        _plan((obligation,)),
+        _bindings((binding,)),
+        frozen=True,
+    )
+    provisional_v4 = replace(
+        canonical_v5,
+        schema_version=MISSION_PROFILE_SCHEMA_VERSION_V4,
+        profile_fingerprint="0" * 64,
+        verification_evidence_binding_authority=None,
+    )
+    canonical_v4 = replace(
+        provisional_v4,
+        profile_fingerprint=fingerprint(provisional_v4._body()),
+    ).validated()
+    malformed_v4 = replace(
+        canonical_v4,
+        verification_evidence_binding_authority=_bindings((binding,)),
+    )
+
+    assert malformed_v4.schema_version == canonical_v4.schema_version
+    assert malformed_v4.schema_version != MISSION_PROFILE_SCHEMA_VERSION_V5
+    assert malformed_v4.profile_fingerprint == canonical_v4.profile_fingerprint
+    with pytest.raises(
+        ValueError,
+        match="v4 profile cannot carry verification evidence binding authority",
+    ):
+        malformed_v4.validated()
 
 
 def test_missing_null_malformed_and_unknown_v5_fields_fail_closed():
