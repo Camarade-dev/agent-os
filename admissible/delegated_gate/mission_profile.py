@@ -45,6 +45,7 @@ MISSION_PROFILE_SCHEMA_VERSION = "admissible_native_mission_profile_v1"
 MISSION_PROFILE_SCHEMA_VERSION_V2 = "admissible_native_mission_profile_v2"
 MISSION_PROFILE_SCHEMA_VERSION_V3 = "admissible_native_mission_profile_v3"
 MISSION_PROFILE_SCHEMA_VERSION_V4 = "admissible_native_mission_profile_v4"
+MISSION_PROFILE_SCHEMA_VERSION_V5 = "admissible_native_mission_profile_v5"
 MAX_CLAIMS_PER_AUTHORITY = 256
 MAX_DEPENDENCIES_PER_CLAIM = 64
 MAX_NON_CLAIMS_PER_CLAIM = 64
@@ -53,6 +54,7 @@ MAX_CLAIM_REFERENCES_PER_OBLIGATION = 64
 MAX_NON_CLAIMS_PER_VERIFICATION_OBLIGATION = 64
 MAX_NEGATIVE_CONTROLS_PER_OBLIGATION = 64
 MAX_REFERENCE_CASES_PER_OBLIGATION = 64
+MAX_VERIFICATION_EVIDENCE_BINDINGS = 256
 # The one authorized one-shot budget shape:
 # (provider invocations, native attempts, repair rounds, auditors, retries).
 ONE_SHOT_PROFILE_BUDGETS: tuple[int, int, int, int, int] = (1, 1, 0, 0, 0)
@@ -105,6 +107,20 @@ class VerificationStrategy(str, Enum):
 class VerificationAcceptancePredicate(str, Enum):
     EXIT_CODE_ZERO = "EXIT_CODE_ZERO"
     HUMAN_RUBRIC_PASS = "HUMAN_RUBRIC_PASS"
+
+
+class VerificationEvidenceBindingAuthorship(str, Enum):
+    OWNER_AUTHORED = "OWNER_AUTHORED"
+    TEMPLATE_AUTHORED = "TEMPLATE_AUTHORED"
+
+
+class VerificationEvidenceBindingCoverageStatus(str, Enum):
+    NOT_ASSESSED = "NOT_ASSESSED"
+
+
+class VerificationEvidenceSourceAuthorityType(str, Enum):
+    CHECKPOINT_COMMAND_AUTHORITY = "CHECKPOINT_COMMAND_AUTHORITY"
+    FROZEN_BEHAVIORAL_VERIFIER_AUTHORITY = "FROZEN_BEHAVIORAL_VERIFIER_AUTHORITY"
 
 
 @dataclass(frozen=True)
@@ -500,6 +516,110 @@ class ClaimVerificationPlanAuthority:
 
 
 @dataclass(frozen=True)
+class VerificationEvidenceBinding:
+    """One inert authorization to present an in-profile source against one obligation."""
+
+    binding_id: str
+    obligation_id: str
+    source_authority_type: VerificationEvidenceSourceAuthorityType
+    source_authority_reference: str
+
+    def validated(self) -> "VerificationEvidenceBinding":
+        require_identifier(self.binding_id, "verification evidence binding id")
+        require_identifier(self.obligation_id, "verification evidence binding obligation id")
+        if not isinstance(self.source_authority_type, VerificationEvidenceSourceAuthorityType):
+            raise ValueError("verification evidence source authority type is invalid")
+        if self.source_authority_type is VerificationEvidenceSourceAuthorityType.CHECKPOINT_COMMAND_AUTHORITY:
+            require_identifier(self.source_authority_reference, "checkpoint command authority reference")
+        else:
+            require_sha256(self.source_authority_reference, "frozen behavioral verifier authority reference")
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "binding_id": self.binding_id,
+            "obligation_id": self.obligation_id,
+            "source_authority_type": self.source_authority_type.value,
+            "source_authority_reference": self.source_authority_reference,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "VerificationEvidenceBinding":
+        require_exact_keys(data, set(cls.__dataclass_fields__), "verification evidence binding")
+        try:
+            source_type = VerificationEvidenceSourceAuthorityType(data["source_authority_type"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("verification evidence source authority type is invalid") from exc
+        return cls(
+            binding_id=data["binding_id"],
+            obligation_id=data["obligation_id"],
+            source_authority_type=source_type,
+            source_authority_reference=data["source_authority_reference"],
+        ).validated()
+
+
+@dataclass(frozen=True)
+class VerificationEvidenceBindingAuthority:
+    """Canonical inert authority for ordered verification-evidence bindings."""
+
+    authorship: VerificationEvidenceBindingAuthorship
+    coverage_status: VerificationEvidenceBindingCoverageStatus
+    bindings: tuple[VerificationEvidenceBinding, ...]
+
+    def validated(self) -> "VerificationEvidenceBindingAuthority":
+        if not isinstance(self.authorship, VerificationEvidenceBindingAuthorship):
+            raise ValueError("verification evidence binding authorship is invalid")
+        if self.coverage_status is not VerificationEvidenceBindingCoverageStatus.NOT_ASSESSED:
+            raise ValueError("verification evidence binding coverage status must be NOT_ASSESSED")
+        if not isinstance(self.bindings, tuple) or not self.bindings:
+            raise ValueError("verification evidence bindings must be a non-empty ordered tuple")
+        if len(self.bindings) > MAX_VERIFICATION_EVIDENCE_BINDINGS:
+            raise ValueError(f"verification evidence bindings cannot exceed {MAX_VERIFICATION_EVIDENCE_BINDINGS}")
+        binding_ids: list[str] = []
+        obligation_ids: list[str] = []
+        for binding in self.bindings:
+            if not isinstance(binding, VerificationEvidenceBinding):
+                raise ValueError("verification evidence binding has an invalid type")
+            binding.validated()
+            binding_ids.append(binding.binding_id)
+            obligation_ids.append(binding.obligation_id)
+        if len(set(binding_ids)) != len(binding_ids):
+            raise ValueError("verification evidence binding identities must be unique")
+        if len(set(obligation_ids)) != len(obligation_ids):
+            raise ValueError("verification evidence binding obligation identities must be unique")
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "authorship": self.authorship.value,
+            "coverage_status": self.coverage_status.value,
+            "bindings": [binding.to_dict() for binding in self.bindings],
+        }
+
+    @property
+    def identity_fingerprint(self) -> str:
+        return fingerprint(self.to_dict())
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "VerificationEvidenceBindingAuthority":
+        require_exact_keys(data, set(cls.__dataclass_fields__), "verification evidence binding authority")
+        try:
+            authorship = VerificationEvidenceBindingAuthorship(data["authorship"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("verification evidence binding authorship is invalid") from exc
+        try:
+            coverage = VerificationEvidenceBindingCoverageStatus(data["coverage_status"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("verification evidence binding coverage status must be NOT_ASSESSED") from exc
+        raw = data["bindings"]
+        if not isinstance(raw, list):
+            raise ValueError("verification evidence bindings must be an ordered array")
+        if len(raw) > MAX_VERIFICATION_EVIDENCE_BINDINGS:
+            raise ValueError(f"verification evidence bindings cannot exceed {MAX_VERIFICATION_EVIDENCE_BINDINGS}")
+        return cls(authorship, coverage, tuple(VerificationEvidenceBinding.from_dict(item) for item in raw)).validated()
+
+
+@dataclass(frozen=True)
 class WorkspaceSourceAuthority:
     """Immutable authority for the only two v0 workspace-source kinds."""
 
@@ -821,12 +941,13 @@ class NativeMissionProfile:
     runtime_prompt: RuntimePromptAuthority | None = None
     claim_authority: ClaimAuthority | None = None
     claim_verification_plan_authority: ClaimVerificationPlanAuthority | None = None
+    verification_evidence_binding_authority: VerificationEvidenceBindingAuthority | None = None
 
     def _body(self) -> dict[str, Any]:
         """The complete canonical profile body, fingerprint field excluded."""
 
         data = dict(self.__dict__)
-        if self.schema_version in {MISSION_PROFILE_SCHEMA_VERSION_V2, MISSION_PROFILE_SCHEMA_VERSION_V3, MISSION_PROFILE_SCHEMA_VERSION_V4}:
+        if self.schema_version in {MISSION_PROFILE_SCHEMA_VERSION_V2, MISSION_PROFILE_SCHEMA_VERSION_V3, MISSION_PROFILE_SCHEMA_VERSION_V4, MISSION_PROFILE_SCHEMA_VERSION_V5}:
             for key in (
                 "fixture_id",
                 "fixture_version",
@@ -843,14 +964,18 @@ class NativeMissionProfile:
             data["git_end_state_policy"] = self.git_end_state_policy.to_dict()
             data["verification"] = self.verification.to_dict()
             data["runtime_prompt"] = self.runtime_prompt.to_dict()
-            if self.schema_version in {MISSION_PROFILE_SCHEMA_VERSION_V3, MISSION_PROFILE_SCHEMA_VERSION_V4}:
+            if self.schema_version in {MISSION_PROFILE_SCHEMA_VERSION_V3, MISSION_PROFILE_SCHEMA_VERSION_V4, MISSION_PROFILE_SCHEMA_VERSION_V5}:
                 data["claim_authority"] = self.claim_authority.to_dict()
             else:
                 data.pop("claim_authority")
-            if self.schema_version == MISSION_PROFILE_SCHEMA_VERSION_V4:
+            if self.schema_version in {MISSION_PROFILE_SCHEMA_VERSION_V4, MISSION_PROFILE_SCHEMA_VERSION_V5}:
                 data["claim_verification_plan_authority"] = self.claim_verification_plan_authority.to_dict()
             else:
                 data.pop("claim_verification_plan_authority")
+            if self.schema_version == MISSION_PROFILE_SCHEMA_VERSION_V5:
+                data["verification_evidence_binding_authority"] = self.verification_evidence_binding_authority.to_dict()
+            else:
+                data.pop("verification_evidence_binding_authority")
         else:
             for key in (
                 "workspace_source",
@@ -859,6 +984,7 @@ class NativeMissionProfile:
                 "runtime_prompt",
                 "claim_authority",
                 "claim_verification_plan_authority",
+                "verification_evidence_binding_authority",
             ):
                 data.pop(key)
         data["gate_clauses"] = [list(clause) for clause in self.gate_clauses]
@@ -876,6 +1002,7 @@ class NativeMissionProfile:
             MISSION_PROFILE_SCHEMA_VERSION_V2,
             MISSION_PROFILE_SCHEMA_VERSION_V3,
             MISSION_PROFILE_SCHEMA_VERSION_V4,
+            MISSION_PROFILE_SCHEMA_VERSION_V5,
         }
 
     @property
@@ -921,6 +1048,7 @@ class NativeMissionProfile:
             MISSION_PROFILE_SCHEMA_VERSION_V2,
             MISSION_PROFILE_SCHEMA_VERSION_V3,
             MISSION_PROFILE_SCHEMA_VERSION_V4,
+            MISSION_PROFILE_SCHEMA_VERSION_V5,
         }:
             raise ValueError("unsupported native mission profile schema")
         require_identifier(self.profile_id, "profile_id")
@@ -938,6 +1066,7 @@ class NativeMissionProfile:
                     self.runtime_prompt,
                     self.claim_authority,
                     self.claim_verification_plan_authority,
+                    self.verification_evidence_binding_authority,
                 )
             ):
                 raise ValueError("v1 profile cannot carry nested runtime or claim authority")
@@ -951,15 +1080,20 @@ class NativeMissionProfile:
             if not isinstance(self.runtime_prompt, RuntimePromptAuthority):
                 raise ValueError("runtime profile must carry runtime prompt authority")
             if self.schema_version == MISSION_PROFILE_SCHEMA_VERSION_V2:
-                if self.claim_authority is not None or self.claim_verification_plan_authority is not None:
+                if self.claim_authority is not None or self.claim_verification_plan_authority is not None or self.verification_evidence_binding_authority is not None:
                     raise ValueError("v2 profile cannot carry claim or claim verification plan authority")
             elif not isinstance(self.claim_authority, ClaimAuthority):
                 raise ValueError("v3/v4 profile must carry claim authority")
             elif self.schema_version == MISSION_PROFILE_SCHEMA_VERSION_V3:
-                if self.claim_verification_plan_authority is not None:
+                if self.claim_verification_plan_authority is not None or self.verification_evidence_binding_authority is not None:
                     raise ValueError("v3 profile cannot carry claim verification plan authority")
             elif not isinstance(self.claim_verification_plan_authority, ClaimVerificationPlanAuthority):
-                raise ValueError("v4 profile must carry claim verification plan authority")
+                raise ValueError("v4/v5 profile must carry claim verification plan authority")
+            elif self.schema_version == MISSION_PROFILE_SCHEMA_VERSION_V4:
+                if self.verification_evidence_binding_authority is not None:
+                    raise ValueError("v4 profile cannot carry verification evidence binding authority")
+            elif not isinstance(self.verification_evidence_binding_authority, VerificationEvidenceBindingAuthority):
+                raise ValueError("v5 profile must carry verification evidence binding authority")
             source = self.workspace_source.validated()
             policy = self.git_end_state_policy.validated()
             verification = self.verification.validated()
@@ -975,6 +1109,8 @@ class NativeMissionProfile:
                     for claim_id in obligation.claim_ids
                 ):
                     raise ValueError("verification obligation claim reference is missing from claim authority")
+            if self.verification_evidence_binding_authority is not None:
+                self.verification_evidence_binding_authority.validated()
             if self.fixture_id != source.fixture_id or self.fixture_version != source.fixture_version:
                 raise ValueError("internal v2 fixture mirrors contradict workspace source authority")
             if self.required_commit_message != policy.required_complete_commit_message:
@@ -1034,6 +1170,32 @@ class NativeMissionProfile:
             command_ids.append(command.command_id)
         if len(set(command_ids)) != len(command_ids):
             raise ValueError("profile checkpoint command identities must be unique")
+        if self.verification_evidence_binding_authority is not None:
+            obligations = {
+                obligation.obligation_id: obligation
+                for obligation in self.claim_verification_plan_authority.verification_obligations
+            }
+            for binding in self.verification_evidence_binding_authority.bindings:
+                obligation = obligations.get(binding.obligation_id)
+                if obligation is None:
+                    raise ValueError("verification evidence binding obligation reference is missing")
+                if obligation.strategy is VerificationStrategy.HUMAN_RUBRIC_OBSERVATION:
+                    raise ValueError("human-rubric verification obligations cannot be evidence-bound in v5")
+                expected_type = (
+                    VerificationEvidenceSourceAuthorityType.CHECKPOINT_COMMAND_AUTHORITY
+                    if obligation.strategy is VerificationStrategy.CHECKPOINT_COMMAND
+                    else VerificationEvidenceSourceAuthorityType.FROZEN_BEHAVIORAL_VERIFIER_AUTHORITY
+                )
+                if binding.source_authority_type is not expected_type:
+                    raise ValueError("verification evidence source authority type is incompatible with obligation strategy")
+                if expected_type is VerificationEvidenceSourceAuthorityType.CHECKPOINT_COMMAND_AUTHORITY:
+                    if binding.source_authority_reference not in command_ids:
+                        raise ValueError("checkpoint command authority reference is missing from profile")
+                else:
+                    if self.verification.mode is not VerificationMode.FROZEN_BEHAVIORAL:
+                        raise ValueError("frozen behavioral verifier binding requires frozen behavioral verification authority")
+                    if binding.source_authority_reference != self.verification.verifier_source_sha256:
+                        raise ValueError("frozen behavioral verifier authority reference contradicts profile verification authority")
         has_command_evidence = EvidenceKind.VERIFICATION_COMMAND.value in self.required_evidence_kinds
         if bool(self.checkpoint_commands) != has_command_evidence:
             raise ValueError(
@@ -1130,6 +1292,7 @@ class NativeMissionProfile:
             "runtime_prompt",
             "claim_authority",
             "claim_verification_plan_authority",
+            "verification_evidence_binding_authority",
         }
         if schema == MISSION_PROFILE_SCHEMA_VERSION:
             require_exact_keys(data, v1_fields, "native mission profile v1")
@@ -1139,6 +1302,8 @@ class NativeMissionProfile:
             require_exact_keys(data, v2_fields | {"claim_authority"}, "native mission profile v3")
         elif schema == MISSION_PROFILE_SCHEMA_VERSION_V4:
             require_exact_keys(data, v2_fields | {"claim_authority", "claim_verification_plan_authority"}, "native mission profile v4")
+        elif schema == MISSION_PROFILE_SCHEMA_VERSION_V5:
+            require_exact_keys(data, v2_fields | {"claim_authority", "claim_verification_plan_authority", "verification_evidence_binding_authority"}, "native mission profile v5")
         else:
             raise ValueError("unsupported native mission profile schema")
         values = dict(data)
@@ -1175,6 +1340,7 @@ class NativeMissionProfile:
                 runtime_prompt=None,
                 claim_authority=None,
                 claim_verification_plan_authority=None,
+                verification_evidence_binding_authority=None,
             )
         else:
             for key in (
@@ -1191,12 +1357,17 @@ class NativeMissionProfile:
             runtime_prompt = RuntimePromptAuthority.from_dict(data["runtime_prompt"])
             claim_authority = (
                 ClaimAuthority.from_dict(data["claim_authority"])
-                if schema in {MISSION_PROFILE_SCHEMA_VERSION_V3, MISSION_PROFILE_SCHEMA_VERSION_V4}
+                if schema in {MISSION_PROFILE_SCHEMA_VERSION_V3, MISSION_PROFILE_SCHEMA_VERSION_V4, MISSION_PROFILE_SCHEMA_VERSION_V5}
                 else None
             )
             claim_verification_plan_authority = (
                 ClaimVerificationPlanAuthority.from_dict(data["claim_verification_plan_authority"])
-                if schema == MISSION_PROFILE_SCHEMA_VERSION_V4
+                if schema in {MISSION_PROFILE_SCHEMA_VERSION_V4, MISSION_PROFILE_SCHEMA_VERSION_V5}
+                else None
+            )
+            verification_evidence_binding_authority = (
+                VerificationEvidenceBindingAuthority.from_dict(data["verification_evidence_binding_authority"])
+                if schema == MISSION_PROFILE_SCHEMA_VERSION_V5
                 else None
             )
             values.update(
@@ -1206,6 +1377,7 @@ class NativeMissionProfile:
                 runtime_prompt=runtime_prompt,
                 claim_authority=claim_authority,
                 claim_verification_plan_authority=claim_verification_plan_authority,
+                verification_evidence_binding_authority=verification_evidence_binding_authority,
                 fixture_id=source.fixture_id,
                 fixture_version=source.fixture_version,
                 required_commit_message=policy.required_complete_commit_message,
@@ -1227,13 +1399,14 @@ def create_native_mission_profile(**values: Any) -> NativeMissionProfile:
     """
 
     schema_version = values.pop("schema_version", MISSION_PROFILE_SCHEMA_VERSION)
-    if schema_version in {MISSION_PROFILE_SCHEMA_VERSION_V2, MISSION_PROFILE_SCHEMA_VERSION_V3, MISSION_PROFILE_SCHEMA_VERSION_V4}:
+    if schema_version in {MISSION_PROFILE_SCHEMA_VERSION_V2, MISSION_PROFILE_SCHEMA_VERSION_V3, MISSION_PROFILE_SCHEMA_VERSION_V4, MISSION_PROFILE_SCHEMA_VERSION_V5}:
         source = values.get("workspace_source")
         policy = values.get("git_end_state_policy")
         verification = values.get("verification")
         runtime_prompt = values.get("runtime_prompt")
         claim_authority = values.get("claim_authority")
         claim_verification_plan_authority = values.get("claim_verification_plan_authority")
+        verification_evidence_binding_authority = values.get("verification_evidence_binding_authority")
         if isinstance(source, Mapping):
             source = WorkspaceSourceAuthority.from_dict(source)
         if isinstance(policy, Mapping):
@@ -1246,6 +1419,8 @@ def create_native_mission_profile(**values: Any) -> NativeMissionProfile:
             claim_authority = ClaimAuthority.from_dict(claim_authority)
         if isinstance(claim_verification_plan_authority, Mapping):
             claim_verification_plan_authority = ClaimVerificationPlanAuthority.from_dict(claim_verification_plan_authority)
+        if isinstance(verification_evidence_binding_authority, Mapping):
+            verification_evidence_binding_authority = VerificationEvidenceBindingAuthority.from_dict(verification_evidence_binding_authority)
         if not all(
             (
                 isinstance(source, WorkspaceSourceAuthority),
@@ -1256,20 +1431,28 @@ def create_native_mission_profile(**values: Any) -> NativeMissionProfile:
         ):
             raise ValueError("v2 profile requires complete nested runtime authority")
         if schema_version == MISSION_PROFILE_SCHEMA_VERSION_V2 and (
-            claim_authority is not None or claim_verification_plan_authority is not None
+            claim_authority is not None or claim_verification_plan_authority is not None or verification_evidence_binding_authority is not None
         ):
             raise ValueError("v2 profile cannot carry claim or claim verification plan authority")
         if schema_version == MISSION_PROFILE_SCHEMA_VERSION_V3 and not isinstance(
             claim_authority, ClaimAuthority
         ):
             raise ValueError("v3 profile requires claim authority")
-        if schema_version == MISSION_PROFILE_SCHEMA_VERSION_V3 and claim_verification_plan_authority is not None:
+        if schema_version == MISSION_PROFILE_SCHEMA_VERSION_V3 and (claim_verification_plan_authority is not None or verification_evidence_binding_authority is not None):
             raise ValueError("v3 profile cannot carry claim verification plan authority")
         if schema_version == MISSION_PROFILE_SCHEMA_VERSION_V4 and not all((
             isinstance(claim_authority, ClaimAuthority),
             isinstance(claim_verification_plan_authority, ClaimVerificationPlanAuthority),
         )):
             raise ValueError("v4 profile requires claim and claim verification plan authority")
+        if schema_version == MISSION_PROFILE_SCHEMA_VERSION_V4 and verification_evidence_binding_authority is not None:
+            raise ValueError("v4 profile cannot carry verification evidence binding authority")
+        if schema_version == MISSION_PROFILE_SCHEMA_VERSION_V5 and not all((
+            isinstance(claim_authority, ClaimAuthority),
+            isinstance(claim_verification_plan_authority, ClaimVerificationPlanAuthority),
+            isinstance(verification_evidence_binding_authority, VerificationEvidenceBindingAuthority),
+        )):
+            raise ValueError("v5 profile requires claim, claim verification plan, and verification evidence binding authority")
         values.update(
             workspace_source=source,
             git_end_state_policy=policy,
@@ -1277,6 +1460,7 @@ def create_native_mission_profile(**values: Any) -> NativeMissionProfile:
             runtime_prompt=runtime_prompt,
             claim_authority=claim_authority,
             claim_verification_plan_authority=claim_verification_plan_authority,
+            verification_evidence_binding_authority=verification_evidence_binding_authority,
             fixture_id=source.fixture_id,
             fixture_version=source.fixture_version,
             required_commit_message=policy.required_complete_commit_message,
@@ -2252,6 +2436,7 @@ __all__ = [
     "MISSION_PROFILE_SCHEMA_VERSION_V2",
     "MISSION_PROFILE_SCHEMA_VERSION_V3",
     "MISSION_PROFILE_SCHEMA_VERSION_V4",
+    "MISSION_PROFILE_SCHEMA_VERSION_V5",
     "MAX_CLAIMS_PER_AUTHORITY",
     "MAX_DEPENDENCIES_PER_CLAIM",
     "MAX_NON_CLAIMS_PER_CLAIM",
@@ -2260,6 +2445,7 @@ __all__ = [
     "MAX_NON_CLAIMS_PER_VERIFICATION_OBLIGATION",
     "MAX_NEGATIVE_CONTROLS_PER_OBLIGATION",
     "MAX_REFERENCE_CASES_PER_OBLIGATION",
+    "MAX_VERIFICATION_EVIDENCE_BINDINGS",
     "NEON_SIEGE_PROFILE",
     "ONE_SHOT_PROFILE_BUDGETS",
     "WORKFLOW_RECOVERY_COMPLETION_CONDITIONS_TEXT",
@@ -2289,6 +2475,11 @@ __all__ = [
     "VerificationPlanAuthorship",
     "VerificationPlanCoverageStatus",
     "VerificationStrategy",
+    "VerificationEvidenceBinding",
+    "VerificationEvidenceBindingAuthority",
+    "VerificationEvidenceBindingAuthorship",
+    "VerificationEvidenceBindingCoverageStatus",
+    "VerificationEvidenceSourceAuthorityType",
     "WorkspaceSourceAuthority",
     "WorkspaceSourceKind",
     "create_native_mission_profile",
