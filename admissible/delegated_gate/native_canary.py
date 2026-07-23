@@ -2414,7 +2414,7 @@ class NativeCanaryAuthorizationPayloadV4:
         data.pop("payload_fingerprint")
         return data
 
-    def validated(self) -> "NativeCanaryAuthorizationPayloadV4":
+    def _validated_prefix(self) -> NativeMissionProfile:
         if self.schema_version != AUTHORIZATION_SCHEMA_VERSION_V4:
             raise ValueError("unsupported v4 authorization payload")
         if not isinstance(self.mission_profile, NativeMissionProfile):
@@ -2426,14 +2426,16 @@ class NativeCanaryAuthorizationPayloadV4:
             raise ValueError("v4 authorization payload must bind the initialized workspace identity")
         self.initialized_workspace.validated()
         require_nonempty_text(self.source_repository, "authorization source repository", max_bytes=4096)
-        source, source_identity = _safe_directory(self.source_repository, "authorization source repository")
-        if str(source) != self.source_repository:
-            raise ValueError("authorization source repository must be a canonical absolute path")
-        if not isinstance(self.source_repository_identity, NativeFilesystemIdentity):
-            raise ValueError("authorization source repository identity is invalid")
-        self.source_repository_identity.validated()
-        if not _same_directory_identity(source_identity, self.source_repository_identity):
-            raise ValueError("authorization source repository identity changed")
+        return profile
+
+    def _validated_structural_remainder(
+        self,
+        *,
+        profile: NativeMissionProfile,
+        source: Path,
+    ) -> "NativeCanaryAuthorizationPayloadV4":
+        """Validate the canonical payload relations after source-path parsing."""
+
         require_sha256(self.mission_fingerprint,"authorization mission fingerprint"); require_sha256(self.gate_plan_fingerprint,"authorization gate plan fingerprint"); require_sha256(self.gate_contract_fingerprint,"authorization gate contract fingerprint"); require_sha256(self.backend_attestation_fingerprint,"authorization backend fingerprint"); require_sha256(self.payload_fingerprint,"authorization payload fingerprint")
         require_identifier(self.run_id,"authorization run ID"); require_identifier(self.session_id,"authorization session ID"); require_nonempty_text(self.source_head,"authorization source HEAD",max_bytes=128); require_nonempty_text(self.selected_model,"authorization model",max_bytes=256); require_nonempty_text(self.fixture_version,"fixture version",max_bytes=128); require_nonempty_text(self.executable,"authorization executable",max_bytes=4096)
         if self.required_commit_message is not None:
@@ -2507,6 +2509,68 @@ class NativeCanaryAuthorizationPayloadV4:
         if fingerprint(self._body())!=self.payload_fingerprint: raise ValueError("authorization payload fingerprint mismatch")
         return self
 
+    def validated_historical_structure(self) -> "NativeCanaryAuthorizationPayloadV4":
+        """Validate historical payload bytes without consulting current resources.
+
+        This proves only canonical execution-authorization structure and
+        relations encoded in the payload.  It does not prove that a source,
+        run root, execution request, artifact, or evidence record currently
+        exists.
+        """
+
+        profile = self._validated_prefix()
+        if (
+            profile.schema_version != MISSION_PROFILE_SCHEMA_VERSION_V2
+            or not profile.is_launchable_runtime_profile
+        ):
+            raise ValueError(
+                "historical v4 authorization requires an exact launchable runtime-v2 profile"
+            )
+        if (
+            not isinstance(self.source_head, str)
+            or len(self.source_head) not in {40, 64}
+            or self.source_head != self.source_head.lower()
+            or any(char not in "0123456789abcdef" for char in self.source_head)
+        ):
+            raise ValueError(
+                "historical v4 authorization source HEAD must be a lowercase Git object ID"
+            )
+        source = _lexical_absolute(
+            self.source_repository,
+            "authorization source repository",
+        )
+        if str(source) != self.source_repository:
+            raise ValueError("authorization source repository must be a canonical absolute path")
+        if not isinstance(self.source_repository_identity, NativeFilesystemIdentity):
+            raise ValueError("authorization source repository identity is invalid")
+        self.source_repository_identity.validated()
+        if self.source_repository_identity.entry_kind != "DIRECTORY":
+            raise ValueError(
+                "historical authorization source repository identity must describe a directory"
+            )
+        for value, label in (
+            (self.executable, "historical authorization executable"),
+            *((item, "historical authorization launcher path") for item in self.launcher_prefix),
+        ):
+            path = _lexical_absolute(value, label)
+            if str(path) != value:
+                raise ValueError(f"{label} must be a canonical absolute path")
+        return self._validated_structural_remainder(profile=profile, source=source)
+
+    def validated(self) -> "NativeCanaryAuthorizationPayloadV4":
+        """Retain live authorization validation, including current source identity."""
+
+        profile = self._validated_prefix()
+        source, source_identity = _safe_directory(self.source_repository, "authorization source repository")
+        if str(source) != self.source_repository:
+            raise ValueError("authorization source repository must be a canonical absolute path")
+        if not isinstance(self.source_repository_identity, NativeFilesystemIdentity):
+            raise ValueError("authorization source repository identity is invalid")
+        self.source_repository_identity.validated()
+        if not _same_directory_identity(source_identity, self.source_repository_identity):
+            raise ValueError("authorization source repository identity changed")
+        return self._validated_structural_remainder(profile=profile, source=source)
+
     def validated_for_authorization(self, *, active_source_repository: str | Path) -> "NativeCanaryAuthorizationPayloadV4":
         self.validated()
         active, active_identity = _safe_directory(active_source_repository, "active authorization source repository")
@@ -2524,9 +2588,7 @@ class NativeCanaryAuthorizationPayloadV4:
         data=self._body(); data["payload_fingerprint"]=self.payload_fingerprint; return data
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "NativeCanaryAuthorizationPayloadV4":
-        """Parse a persisted v4 payload without granting executable authority."""
-
+    def _from_dict_values(cls, data: Mapping[str, Any]) -> dict[str, Any]:
         require_exact_keys(data, set(cls.__dataclass_fields__), "native canary authorization payload v4")
         values = dict(data)
         values["source_repository_identity"] = NativeFilesystemIdentity.from_dict(data["source_repository_identity"])
@@ -2545,7 +2607,38 @@ class NativeCanaryAuthorizationPayloadV4:
         if not isinstance(data["initialized_workspace"], Mapping):
             raise ValueError("authorization initialized workspace must be a canonical object")
         values["initialized_workspace"] = InitializedWorkspaceIdentity.from_dict(data["initialized_workspace"])
-        return cls(**values).validated()
+        return values
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "NativeCanaryAuthorizationPayloadV4":
+        """Parse a persisted v4 payload on the existing live validation path."""
+
+        return cls(**cls._from_dict_values(data)).validated()
+
+    @classmethod
+    def from_historical_dict(
+        cls,
+        data: Mapping[str, Any],
+    ) -> "NativeCanaryAuthorizationPayloadV4":
+        """Parse historical execution authorization without live resource checks."""
+
+        return cls(**cls._from_dict_values(data)).validated_historical_structure()
+
+
+def load_historical_native_canary_authorization_payload_v4(
+    document: Mapping[str, Any],
+) -> NativeCanaryAuthorizationPayloadV4:
+    """Load canonical historical V4 execution authorization from one mapping.
+
+    The function validates every fact derivable from the supplied payload
+    fields, including its embedded launchable V2 profile and all canonical
+    fingerprints.  It deliberately does not establish that an execution
+    request, run root, source repository, artifact, or evidence record exists.
+    """
+
+    if not isinstance(document, Mapping):
+        raise ValueError("historical v4 authorization document must be one JSON object")
+    return NativeCanaryAuthorizationPayloadV4.from_historical_dict(document)
 
 
 def build_profile_authorization_payload(*, source_repository: Path, source_head: str, attestation: BackendAttestation, run_root: str | Path, profile: NativeMissionProfile, initialized_workspace: InitializedWorkspaceIdentity, backend_readiness_reason: str | None = None) -> NativeCanaryAuthorizationPayloadV4:
@@ -2813,4 +2906,4 @@ def run_native_mission_application(
 if __name__ == "__main__": sys.exit(main())
 
 
-__all__=["AUTHORIZATION_SCHEMA_VERSION","AUTHORIZATION_SCHEMA_VERSION_LEGACY_V2","AUTHORIZATION_SCHEMA_VERSION_V4","LEGACY_CANARY_PROFILE_ID","LEGACY_CANARY_FIXTURE_ID","LEGACY_CANARY_FIXTURE_VERSION","RUN_PREFLIGHT_METADATA_FILE_NAME","InitializedWorkspaceIdentity","LocalRepositoryAuthorityObservation","NativeCanaryAuthorizationPayloadV4","build_profile_authorization_payload","fixture_builder_registry","legacy_canary_profile","observe_initialized_workspace_identity","registered_profiles","resolve_fixture_builder","resolve_registered_profile","CANARY_NON_CLAIMS","CLASS_READINESS_REASONS","EVIDENCE_DIRECTORY_NAME","NATIVE_SIDECAR_DIRECTORY_NAME","PACKAGE_BIN_READY_REASON","WORKSPACE_DIRECTORY_NAME","BEHAVIORAL_EVIDENCE_SCHEMA_VERSION","CANARY_CLASSIFICATION","CANARY_FIXTURE_VERSION","CANARY_GATE_ID","CANARY_MISSION","CANARY_MISSION_ID","DEFAULT_STDERR_BYTE_LIMIT","DEFAULT_STDOUT_BYTE_LIMIT","DEFAULT_TIMEOUT_SECONDS","EXPECTED_MATERIAL_PATHS","FixtureRepository","MAX_AUDITOR_INVOCATIONS","MAX_NATIVE_PHASE_ATTEMPTS","MAX_PROVIDER_INVOCATIONS","MAX_REPAIR_ROUNDS","MAX_RETRIES","NativeCanaryAuthorizationPayload","NativeCanaryCoordinator","NativeCanaryOutcome","NativeCanaryStatus","ProductVerdict","OWNER_AUTHORIZATION_DIGEST_ENV","REQUIRED_COMMIT_MESSAGE","BehavioralVerifierEvidence","EvidenceOnlyCanaryReconstruction","build_authorization_payload","build_canary_repository","build_workflow_console_repository","build_native_agent_prompt","build_parser","create_canary_session","load_behavioral_verifier","main","npm_test_argv","reconstruct_completed_canary_success","reconstruct_completed_native_mission","run_behavioral_verifier","run_native_mission_application","_materialize_local_repository_copy","_observe_local_repository_source","_validate_future_run_root"]
+__all__=["AUTHORIZATION_SCHEMA_VERSION","AUTHORIZATION_SCHEMA_VERSION_LEGACY_V2","AUTHORIZATION_SCHEMA_VERSION_V4","LEGACY_CANARY_PROFILE_ID","LEGACY_CANARY_FIXTURE_ID","LEGACY_CANARY_FIXTURE_VERSION","RUN_PREFLIGHT_METADATA_FILE_NAME","InitializedWorkspaceIdentity","LocalRepositoryAuthorityObservation","NativeCanaryAuthorizationPayloadV4","build_profile_authorization_payload","load_historical_native_canary_authorization_payload_v4","fixture_builder_registry","legacy_canary_profile","observe_initialized_workspace_identity","registered_profiles","resolve_fixture_builder","resolve_registered_profile","CANARY_NON_CLAIMS","CLASS_READINESS_REASONS","EVIDENCE_DIRECTORY_NAME","NATIVE_SIDECAR_DIRECTORY_NAME","PACKAGE_BIN_READY_REASON","WORKSPACE_DIRECTORY_NAME","BEHAVIORAL_EVIDENCE_SCHEMA_VERSION","CANARY_CLASSIFICATION","CANARY_FIXTURE_VERSION","CANARY_GATE_ID","CANARY_MISSION","CANARY_MISSION_ID","DEFAULT_STDERR_BYTE_LIMIT","DEFAULT_STDOUT_BYTE_LIMIT","DEFAULT_TIMEOUT_SECONDS","EXPECTED_MATERIAL_PATHS","FixtureRepository","MAX_AUDITOR_INVOCATIONS","MAX_NATIVE_PHASE_ATTEMPTS","MAX_PROVIDER_INVOCATIONS","MAX_REPAIR_ROUNDS","MAX_RETRIES","NativeCanaryAuthorizationPayload","NativeCanaryCoordinator","NativeCanaryOutcome","NativeCanaryStatus","ProductVerdict","OWNER_AUTHORIZATION_DIGEST_ENV","REQUIRED_COMMIT_MESSAGE","BehavioralVerifierEvidence","EvidenceOnlyCanaryReconstruction","build_authorization_payload","build_canary_repository","build_workflow_console_repository","build_native_agent_prompt","build_parser","create_canary_session","load_behavioral_verifier","main","npm_test_argv","reconstruct_completed_canary_success","reconstruct_completed_native_mission","run_behavioral_verifier","run_native_mission_application","_materialize_local_repository_copy","_observe_local_repository_source","_validate_future_run_root"]
