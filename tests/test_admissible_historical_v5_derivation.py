@@ -4,6 +4,8 @@ from contextlib import ExitStack
 from dataclasses import replace
 import hashlib
 import inspect
+import io
+import os
 from pathlib import Path
 import sys
 from unittest import mock
@@ -16,6 +18,7 @@ from admissible.delegated_gate.canonical import (
 )
 from admissible.delegated_gate.historical_evaluation import (
     HistoricalEvaluationPairingAuthority,
+    create_historical_evaluation_pairing_authority,
     derive_historical_v5_evaluation_profile,
     project_v5_runtime_authority_to_v2,
     require_exact_v5_v2_runtime_authority_compatibility,
@@ -65,8 +68,37 @@ from test_admissible_workflow_recovery_profile import _payload_harness
 # ---------------------------------------------------------------------------
 
 
+HOSTILE_MISSION_TEXT = "  MiXeD Mission\tText\nSecond  line with  spaces  "
+HOSTILE_GATE_OBJECTIVE = "\tPreserve  Exact CASE\nAnd spacing\t"
+HOSTILE_COMPLETION_CONDITIONS_TEXT = "  Complete only when:\n\tA  and  B\n  "
+HOSTILE_STOP_CLAUSE = "\nSTOP  exactly\twhen authorized.\nDo  not trim.  "
+
+HOSTILE_RUNTIME_TEXT = {
+    "mission_text": HOSTILE_MISSION_TEXT,
+    "gate_objective": HOSTILE_GATE_OBJECTIVE,
+    "completion_conditions_text": HOSTILE_COMPLETION_CONDITIONS_TEXT,
+}
+
+
+def _assert_hostile_runtime_text_mapping(data: dict) -> None:
+    encoded = canonical_bytes(data)
+    for field, expected in HOSTILE_RUNTIME_TEXT.items():
+        assert data[field] == expected
+        assert canonical_bytes({field: data[field]}) == canonical_bytes(
+            {field: expected}
+        )
+        assert canonical_bytes({field: expected})[1:-1] in encoded
+    assert data["runtime_prompt"]["stop_clause"] == HOSTILE_STOP_CLAUSE
+    assert canonical_bytes(
+        {"stop_clause": data["runtime_prompt"]["stop_clause"]}
+    ) == canonical_bytes({"stop_clause": HOSTILE_STOP_CLAUSE})
+    assert canonical_bytes({"stop_clause": HOSTILE_STOP_CLAUSE})[1:-1] in encoded
+
+
 def _runtime_v2_profile() -> NativeMissionProfile:
     base = project_v5_runtime_authority_to_v2(_evaluation_profile()).to_dict()
+    base.update(HOSTILE_RUNTIME_TEXT)
+    base["runtime_prompt"]["stop_clause"] = HOSTILE_STOP_CLAUSE
     base["gate_clauses"] = [
         ["clause.zulu", "The zulu clause is satisfied by the recorded material."],
         ["clause.alpha", "The alpha clause is satisfied by the recorded material."],
@@ -270,6 +302,45 @@ def derived_v5(
 # ---------------------------------------------------------------------------
 
 
+def test_hostile_runtime_text_is_byte_preserved_across_historical_derivation(
+    historical_payload_document: dict,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    derived_v5: NativeMissionProfile,
+):
+    for value in (*HOSTILE_RUNTIME_TEXT.values(), HOSTILE_STOP_CLAUSE):
+        assert value != value.strip()
+        assert value != " ".join(value.split())
+        assert value != value.casefold()
+        assert "  " in value
+        assert "\t" in value
+        assert "\n" in value
+
+    constructed_v2 = _runtime_v2_profile()
+    projected_v2 = project_v5_runtime_authority_to_v2(derived_v5)
+    stages = (
+        constructed_v2.to_dict(),
+        historical_payload_document["mission_profile"],
+        historical_payload.mission_profile.to_dict(),
+        derived_v5.to_dict(),
+        projected_v2.to_dict(),
+    )
+    for stage in stages:
+        _assert_hostile_runtime_text_mapping(stage)
+
+    for serialized in (
+        canonical_bytes(historical_payload_document),
+        canonical_bytes(historical_payload.to_dict()),
+        canonical_bytes(derived_v5.to_dict()),
+        canonical_bytes(projected_v2.to_dict()),
+    ):
+        for field, expected in HOSTILE_RUNTIME_TEXT.items():
+            assert canonical_bytes({field: expected})[1:-1] in serialized
+        assert (
+            canonical_bytes({"stop_clause": HOSTILE_STOP_CLAUSE})[1:-1]
+            in serialized
+        )
+
+
 def test_valid_derivation_produces_exact_canonical_v5(
     historical_payload: NativeCanaryAuthorizationPayloadV4,
     derived_v5: NativeMissionProfile,
@@ -355,6 +426,127 @@ def test_derived_v5_equals_the_accepted_canonical_v5_construction(
     )
     assert canonical_bytes(derived_v5.to_dict()) == canonical_bytes(expected.to_dict())
     assert derived_v5.profile_fingerprint == expected.profile_fingerprint
+
+
+def _ordered_evaluation_members(
+    profile: NativeMissionProfile,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    data = profile.to_dict()
+    return (
+        data["claim_authority"]["claims"],
+        data["claim_verification_plan_authority"]["verification_obligations"],
+        data["verification_evidence_binding_authority"]["bindings"],
+    )
+
+
+def test_owner_authored_v5_project_payload_rederive_is_an_exact_reverse_law(
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    derived_v5: NativeMissionProfile,
+):
+    original = derived_v5
+    assert original.claim_authority.authorship is ClaimAuthorship.OWNER_AUTHORED
+    assert (
+        original.claim_authority.coverage_status
+        is ClaimSetCoverageStatus.NOT_ASSESSED
+    )
+    assert (
+        original.claim_verification_plan_authority.authorship
+        is VerificationPlanAuthorship.OWNER_AUTHORED
+    )
+    assert (
+        original.claim_verification_plan_authority.coverage_status
+        is VerificationPlanCoverageStatus.NOT_ASSESSED
+    )
+    assert (
+        original.verification_evidence_binding_authority.authorship
+        is VerificationEvidenceBindingAuthorship.OWNER_AUTHORED
+    )
+    assert (
+        original.verification_evidence_binding_authority.coverage_status
+        is VerificationEvidenceBindingCoverageStatus.NOT_ASSESSED
+    )
+
+    projected = project_v5_runtime_authority_to_v2(original)
+    reverse_payload = _payload_for_runtime_profile(historical_payload, projected)
+    assert reverse_payload.validated_historical_structure() is reverse_payload
+    assert canonical_bytes(reverse_payload.mission_profile.to_dict()) == canonical_bytes(
+        projected.to_dict()
+    )
+
+    claims, plan, bindings = _ordered_evaluation_members(original)
+    rederived = derive_historical_v5_evaluation_profile(
+        target_authorization_payload=reverse_payload,
+        result_claims=claims,
+        claim_verification_plan=plan,
+        verification_evidence_bindings=bindings,
+    )
+    assert canonical_bytes(rederived.to_dict()) == canonical_bytes(original.to_dict())
+    assert rederived.profile_fingerprint == original.profile_fingerprint
+
+    original_members = _ordered_evaluation_members(original)
+    rederived_members = _ordered_evaluation_members(rederived)
+    assert rederived_members == original_members
+    assert tuple(item["claim_id"] for item in rederived_members[0]) == tuple(
+        item["claim_id"] for item in original_members[0]
+    )
+    assert tuple(item["obligation_id"] for item in rederived_members[1]) == tuple(
+        item["obligation_id"] for item in original_members[1]
+    )
+    assert tuple(item["binding_id"] for item in rederived_members[2]) == tuple(
+        item["binding_id"] for item in original_members[2]
+    )
+
+
+def test_template_authored_v5_is_reclassified_but_runtime_projection_is_identical(
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    derived_v5: NativeMissionProfile,
+):
+    template_data = derived_v5.to_dict()
+    template_data["claim_authority"]["authorship"] = (
+        ClaimAuthorship.TEMPLATE_AUTHORED.value
+    )
+    template_data["claim_verification_plan_authority"]["authorship"] = (
+        VerificationPlanAuthorship.TEMPLATE_AUTHORED.value
+    )
+    template_data["verification_evidence_binding_authority"]["authorship"] = (
+        VerificationEvidenceBindingAuthorship.TEMPLATE_AUTHORED.value
+    )
+    template = NativeMissionProfile.from_dict(
+        _refingerprint_profile(template_data)
+    )
+    assert template.claim_authority.authorship is ClaimAuthorship.TEMPLATE_AUTHORED
+    assert (
+        template.claim_verification_plan_authority.authorship
+        is VerificationPlanAuthorship.TEMPLATE_AUTHORED
+    )
+    assert (
+        template.verification_evidence_binding_authority.authorship
+        is VerificationEvidenceBindingAuthorship.TEMPLATE_AUTHORED
+    )
+
+    projected = project_v5_runtime_authority_to_v2(template)
+    reverse_payload = _payload_for_runtime_profile(historical_payload, projected)
+    claims, plan, bindings = _ordered_evaluation_members(template)
+    rederived = derive_historical_v5_evaluation_profile(
+        target_authorization_payload=reverse_payload,
+        result_claims=claims,
+        claim_verification_plan=plan,
+        verification_evidence_bindings=bindings,
+    )
+    assert rederived.claim_authority.authorship is ClaimAuthorship.OWNER_AUTHORED
+    assert (
+        rederived.claim_verification_plan_authority.authorship
+        is VerificationPlanAuthorship.OWNER_AUTHORED
+    )
+    assert (
+        rederived.verification_evidence_binding_authority.authorship
+        is VerificationEvidenceBindingAuthorship.OWNER_AUTHORED
+    )
+    assert canonical_bytes(rederived.to_dict()) != canonical_bytes(template.to_dict())
+    assert rederived.profile_fingerprint != template.profile_fingerprint
+    assert canonical_bytes(
+        project_v5_runtime_authority_to_v2(rederived).to_dict()
+    ) == canonical_bytes(projected.to_dict())
 
 
 def test_derivation_signature_is_exactly_the_four_keyword_only_inputs():
@@ -1032,28 +1224,135 @@ def test_projection_postcondition_is_load_bearing(
 # ---------------------------------------------------------------------------
 
 
-def test_distinct_payloads_with_equal_runtime_v2_derive_the_same_v5(
+def _nested_mapping_keys(value) -> set[str]:
+    if isinstance(value, dict):
+        return set(value).union(
+            *(_nested_mapping_keys(item) for item in value.values())
+        )
+    if isinstance(value, (list, tuple)):
+        return set().union(*(_nested_mapping_keys(item) for item in value))
+    return set()
+
+
+def _nested_scalar_values(value):
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from _nested_scalar_values(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _nested_scalar_values(item)
+    else:
+        yield value
+
+
+def test_distinct_payload_targets_are_separate_from_equal_derived_v5_identity(
     historical_payload: NativeCanaryAuthorizationPayloadV4,
     derived_v5: NativeMissionProfile,
 ):
     changed = historical_payload.to_dict()
-    changed["source_head"] = "f" * 40
+    changed["source_head"] = (
+        "f" * len(changed["source_head"])
+        if changed["source_head"] != "f" * len(changed["source_head"])
+        else "e" * len(changed["source_head"])
+    )
+    initialized = changed["initialized_workspace"]
+    initialized["initial_git_head"] = (
+        "d" * len(initialized["initial_git_head"])
+        if initialized["initial_git_head"]
+        != "d" * len(initialized["initial_git_head"])
+        else "c" * len(initialized["initial_git_head"])
+    )
+    initialized["initial_material_tree_hash"] = (
+        "b" * 64
+        if initialized["initial_material_tree_hash"] != "b" * 64
+        else "a" * 64
+    )
     other_payload = load_historical_native_canary_authorization_payload_v4(
         _refingerprint_payload(changed)
+    )
+    assert historical_payload.validated_historical_structure() is historical_payload
+    assert other_payload.validated_historical_structure() is other_payload
+    assert other_payload.source_head != historical_payload.source_head
+    assert (
+        other_payload.initialized_workspace.initial_git_head
+        != historical_payload.initialized_workspace.initial_git_head
+    )
+    assert (
+        other_payload.initialized_workspace.initial_material_tree_hash
+        != historical_payload.initialized_workspace.initial_material_tree_hash
     )
     assert (
         other_payload.mission_profile.profile_fingerprint
         == historical_payload.mission_profile.profile_fingerprint
     )
-    assert other_payload.payload_fingerprint != historical_payload.payload_fingerprint
-    other_derived = _derive(other_payload)
-    assert canonical_bytes(other_derived.to_dict()) == canonical_bytes(
-        derived_v5.to_dict()
+    assert canonical_bytes(other_payload.mission_profile.to_dict()) == canonical_bytes(
+        historical_payload.mission_profile.to_dict()
     )
-    assert other_derived.profile_fingerprint == derived_v5.profile_fingerprint
-    serialized = canonical_json(derived_v5.to_dict())
-    assert historical_payload.payload_fingerprint not in serialized
-    assert other_payload.payload_fingerprint not in serialized
+    assert other_payload.payload_fingerprint != historical_payload.payload_fingerprint
+
+    pairing_side_effect = AssertionError(
+        "derivation attempted to create a pairing authority"
+    )
+    with mock.patch(
+        "admissible.delegated_gate.historical_evaluation."
+        "create_historical_evaluation_pairing_authority",
+        side_effect=pairing_side_effect,
+    ) as pairing_factory:
+        derived_a = _derive(historical_payload)
+        derived_b = _derive(other_payload)
+    pairing_factory.assert_not_called()
+
+    assert canonical_bytes(derived_a.to_dict()) == canonical_bytes(derived_v5.to_dict())
+    assert canonical_bytes(derived_b.to_dict()) == canonical_bytes(derived_a.to_dict())
+    assert derived_b.profile_fingerprint == derived_a.profile_fingerprint
+
+    v5_mapping = derived_a.to_dict()
+    v5_bytes = canonical_bytes(v5_mapping)
+    v5_values = tuple(_nested_scalar_values(v5_mapping))
+    for payload_fingerprint in (
+        historical_payload.payload_fingerprint,
+        other_payload.payload_fingerprint,
+    ):
+        assert payload_fingerprint not in v5_values
+        assert payload_fingerprint.encode("ascii") not in v5_bytes
+
+    payload_mapping = historical_payload.to_dict()
+    runtime_mapping_keys = _nested_mapping_keys(
+        payload_mapping["mission_profile"]
+    )
+    outer_payload_only_fields = set(payload_mapping) - runtime_mapping_keys
+    outer_payload_only_fields.update(
+        set(payload_mapping["initialized_workspace"]) - runtime_mapping_keys
+    )
+    assert outer_payload_only_fields.isdisjoint(_nested_mapping_keys(v5_mapping))
+
+    pairing_a = create_historical_evaluation_pairing_authority(
+        actor_id="owner.primary",
+        evaluation_profile=derived_a,
+        target_authorization_payload=historical_payload,
+    )
+    pairing_b = create_historical_evaluation_pairing_authority(
+        actor_id="owner.primary",
+        evaluation_profile=derived_b,
+        target_authorization_payload=other_payload,
+    )
+    assert (
+        pairing_a.target_authorization_payload_fingerprint
+        == historical_payload.payload_fingerprint
+    )
+    assert (
+        pairing_b.target_authorization_payload_fingerprint
+        == other_payload.payload_fingerprint
+    )
+    assert (
+        pairing_a.evaluation_profile_fingerprint
+        == pairing_b.evaluation_profile_fingerprint
+        == derived_a.profile_fingerprint
+    )
+    assert pairing_a.authority_fingerprint != pairing_b.authority_fingerprint
+    for pairing in (pairing_a, pairing_b):
+        assert pairing.authority_fingerprint not in v5_values
+        assert pairing.authority_fingerprint.encode("ascii") not in v5_bytes
 
 
 def test_derived_v5_carries_no_pairing_or_execution_fields(
@@ -1163,6 +1462,12 @@ def test_derivation_never_accesses_filesystem_git_stores_or_product_surfaces(
         mock.patch.object(Path, "mkdir", side_effect=forbidden),
         mock.patch.object(Path, "stat", side_effect=forbidden),
         mock.patch.object(Path, "exists", side_effect=forbidden),
+        mock.patch("builtins.open", side_effect=forbidden),
+        mock.patch.object(io, "open", side_effect=forbidden),
+        mock.patch.object(os, "stat", side_effect=forbidden),
+        mock.patch.object(os, "lstat", side_effect=forbidden),
+        mock.patch.object(os, "listdir", side_effect=forbidden),
+        mock.patch.object(os, "scandir", side_effect=forbidden),
     )
     product_prefixes = (
         "admissible.product_service",
