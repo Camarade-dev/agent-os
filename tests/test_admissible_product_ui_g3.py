@@ -2429,8 +2429,36 @@ OWNER_ORDERED_BROWSER_CLAIMS = [
     {"claim_id": "tango-owner-fourth", "statement": "Fourth", "obligation_level": "MANDATORY", "depends_on": [], "non_claims": []},
 ]
 OWNER_ORDERED_BROWSER_PLAN = [
-    {"obligation_id":"zulu-obligation","claim_ids":["mike-owner-second","zulu-owner-first"],"strategy":"CHECKPOINT_COMMAND","procedure_reference":"procedure_" + "Z" * 48,"acceptance_predicate":"EXIT_CODE_ZERO","declared_coverage":"coverage " + "C" * 96,"non_claims":["Zulu plan exclusion","Alpha plan exclusion"],"oracle_disclosed_to_subject":False,"independence_requirements":{"temporal":True,"artifact":False,"process":True,"information":True,"model":False,"organizational":True},"negative_controls":[{"control_id":"zulu-control","description":"<img src=x onerror=window.__plan_attack=1> hostile text"},{"control_id":"alpha-control","description":"Alpha control"}],"reference_cases":["zulu-case","alpha-case"]},
+    {"obligation_id":"zulu-obligation","claim_ids":["zulu-owner-first","alpha-owner-third","mike-owner-second"],"strategy":"CHECKPOINT_COMMAND","procedure_reference":"procedure_" + "Z" * 48,"acceptance_predicate":"EXIT_CODE_ZERO","declared_coverage":"coverage " + "C" * 96,"non_claims":["Zulu plan exclusion","Alpha plan exclusion","Mike plan exclusion"],"oracle_disclosed_to_subject":False,"independence_requirements":{"temporal":True,"artifact":False,"process":True,"information":True,"model":False,"organizational":True},"negative_controls":[{"control_id":"zulu-control","description":"<img src=x onerror=window.__plan_attack=1> hostile text"},{"control_id":"alpha-control","description":"Alpha control"},{"control_id":"mike-control","description":"Mike control"}],"reference_cases":["zulu-case","alpha-case","mike-case"]},
     {"obligation_id":"alpha-obligation","claim_ids":["alpha-owner-third"],"strategy":"HUMAN_RUBRIC_OBSERVATION","procedure_reference":"owner_rubric","acceptance_predicate":"HUMAN_RUBRIC_PASS","declared_coverage":"Owner rubric scope","non_claims":[],"oracle_disclosed_to_subject":False,"independence_requirements":{"temporal":False,"artifact":False,"process":False,"information":False,"model":False,"organizational":False},"negative_controls":[],"reference_cases":[]},
+]
+OWNER_EXPECTED_PLAN_DOM_ORDER = [
+    {
+        "obligation_id": "zulu-obligation",
+        "claim_references": ["zulu-owner-first", "alpha-owner-third", "mike-owner-second"],
+        "non_claims": ["Zulu plan exclusion", "Alpha plan exclusion", "Mike plan exclusion"],
+        "negative_controls": [
+            "zulu-control: <img src=x onerror=window.__plan_attack=1> hostile text",
+            "alpha-control: Alpha control",
+            "mike-control: Mike control",
+        ],
+        "reference_cases": ["zulu-case", "alpha-case", "mike-case"],
+    },
+    {
+        "obligation_id": "alpha-obligation",
+        "claim_references": ["alpha-owner-third"],
+        "non_claims": [],
+        "negative_controls": [],
+        "reference_cases": [],
+    },
+]
+OWNER_EXPECTED_INDEPENDENCE_LABELS = [
+    "Required independence: temporal",
+    "Required independence: artifact",
+    "Required independence: process",
+    "Required independence: information",
+    "Required independence: model",
+    "Required independence: organizational",
 ]
 
 
@@ -2563,9 +2591,24 @@ def test_owner_claim_review_real_dom_preserves_authority_order_and_v3_boundary(t
         compose(OWNER_ORDERED_BROWSER_CLAIMS, OWNER_ORDERED_BROWSER_PLAN)
         for width, height, mobile in ((1280, 800, False), (390, 844, True)):
             send("Emulation.setDeviceMetricsOverride", {"width": width, "height": height, "deviceScaleFactor": 1, "mobile": mobile})
-            raw = evaluate("JSON.stringify((()=>{const p=document.getElementById('contract-verification-plan-review'),c=document.getElementById('contract-claim-review'),g=document.getElementById('contract-gate-clauses'),b=document.getElementById('prepare-button'),d=document.documentElement;return {ids:Array.from(p.querySelectorAll('.obligation-id')).map(x=>x.textContent),notices:Array.from(p.querySelectorAll('.plan-notice')).map(x=>x.textContent),items:p.querySelectorAll('.verification-obligation-list>li').length,claimItems:c.querySelectorAll('.claim-list>li').length,gateItems:g.querySelectorAll('.gate-clause-list>li').length,injected:p.querySelectorAll('script,img,svg,iframe,object,embed').length,text:p.textContent,hidden:b.hidden,disabled:b.disabled,doc:[d.scrollWidth,d.clientWidth],plan:[p.scrollWidth,p.clientWidth],claim:[c.scrollWidth,c.clientWidth]}})())")
+            raw = evaluate("JSON.stringify((()=>{const p=document.getElementById('contract-verification-plan-review'),c=document.getElementById('contract-claim-review'),g=document.getElementById('contract-gate-clauses'),b=document.getElementById('prepare-button'),d=document.documentElement;const rows=dl=>Array.from(dl.querySelectorAll(':scope>div'));const values=(dl,label)=>{const row=rows(dl).find(x=>x.querySelector(':scope>dt').textContent===label);return row?Array.from(row.querySelectorAll(':scope>dd>ol>li')).map(x=>x.textContent):[]};const obligations=Array.from(p.querySelectorAll('.verification-obligation-list>li')).map(item=>{const dl=item.querySelector(':scope>dl');return {obligation_id:item.querySelector(':scope>.obligation-id').textContent,claim_references:values(dl,'Referenced claim IDs'),non_claims:values(dl,'Non-claims'),negative_controls:values(dl,'Negative controls'),reference_cases:values(dl,'Reference cases'),independence_labels:rows(dl).map(x=>x.querySelector(':scope>dt').textContent).filter(x=>x.toLowerCase().includes('independence'))}});return {ids:Array.from(p.querySelectorAll('.obligation-id')).map(x=>x.textContent),obligations,notices:Array.from(p.querySelectorAll('.plan-notice')).map(x=>x.textContent),items:p.querySelectorAll('.verification-obligation-list>li').length,claimItems:c.querySelectorAll('.claim-list>li').length,gateItems:g.querySelectorAll('.gate-clause-list>li').length,injected:p.querySelectorAll('script,img,svg,iframe,object,embed').length,text:p.textContent,hidden:b.hidden,disabled:b.disabled,doc:[d.scrollWidth,d.clientWidth],plan:[p.scrollWidth,p.clientWidth],claim:[c.scrollWidth,c.clientWidth]}})())")
             measured = json.loads(raw)
             assert measured["ids"] == ["zulu-obligation", "alpha-obligation"]
+            assert [
+                {key: obligation[key] for key in ("obligation_id", "claim_references", "non_claims", "negative_controls", "reference_cases")}
+                for obligation in measured["obligations"]
+            ] == OWNER_EXPECTED_PLAN_DOM_ORDER
+            assert all(
+                sorted(obligation["independence_labels"]) == sorted(OWNER_EXPECTED_INDEPENDENCE_LABELS)
+                for obligation in measured["obligations"]
+            )
+            lowered_plan_text = measured["text"].lower()
+            assert "required independence" in lowered_plan_text
+            for rejected_independence in (
+                "achieved independence", "demonstrated independence",
+                "verified independence", "independence satisfied",
+            ):
+                assert rejected_independence not in lowered_plan_text
             assert measured["items"] == 2 and measured["claimItems"] == 4 and measured["gateItems"] == 2
             assert measured["injected"] == 0 and "<img src=x" in measured["text"]
             assert len(measured["notices"]) == 7 and measured["notices"][-1] == "Claim-verification-plan V4 contracts are not launchable in the current runtime."
