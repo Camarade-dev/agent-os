@@ -2428,6 +2428,10 @@ OWNER_ORDERED_BROWSER_CLAIMS = [
     {"claim_id": "alpha-owner-third", "statement": "Third", "obligation_level": "ADVISORY", "depends_on": [], "non_claims": []},
     {"claim_id": "tango-owner-fourth", "statement": "Fourth", "obligation_level": "MANDATORY", "depends_on": [], "non_claims": []},
 ]
+OWNER_ORDERED_BROWSER_PLAN = [
+    {"obligation_id":"zulu-obligation","claim_ids":["mike-owner-second","zulu-owner-first"],"strategy":"CHECKPOINT_COMMAND","procedure_reference":"procedure_" + "Z" * 48,"acceptance_predicate":"EXIT_CODE_ZERO","declared_coverage":"coverage " + "C" * 96,"non_claims":["Zulu plan exclusion","Alpha plan exclusion"],"oracle_disclosed_to_subject":False,"independence_requirements":{"temporal":True,"artifact":False,"process":True,"information":True,"model":False,"organizational":True},"negative_controls":[{"control_id":"zulu-control","description":"<img src=x onerror=window.__plan_attack=1> hostile text"},{"control_id":"alpha-control","description":"Alpha control"}],"reference_cases":["zulu-case","alpha-case"]},
+    {"obligation_id":"alpha-obligation","claim_ids":["alpha-owner-third"],"strategy":"HUMAN_RUBRIC_OBSERVATION","procedure_reference":"owner_rubric","acceptance_predicate":"HUMAN_RUBRIC_PASS","declared_coverage":"Owner rubric scope","non_claims":[],"oracle_disclosed_to_subject":False,"independence_requirements":{"temporal":False,"artifact":False,"process":False,"information":False,"model":False,"organizational":False},"negative_controls":[],"reference_cases":[]},
+]
 
 
 def _claim_browser_configuration(tmp_path: Path) -> LauncherConfiguration:
@@ -2451,6 +2455,7 @@ class OwnerClaimBrowserLauncher(ProductLauncher):
         counter = iter(f"{value:032x}" for value in range(500, 700))
         super().__init__(configuration, verify_head=False, id_generator=lambda: next(counter), browser_opener=lambda _url: None)
         self.malformed_claim_response = False
+        self.malformed_plan_response = False
         self.preparation_attempts = 0
         self.proxy_g2 = lambda method, path, body=None: (200, {"contract_id": "v2-browser-contract"})
 
@@ -2460,6 +2465,8 @@ class OwnerClaimBrowserLauncher(ProductLauncher):
             response["contract_summary"]["claim_authority"]["claims"] = [
                 OWNER_ORDERED_BROWSER_CLAIMS[0], {"claim_id": "broken"}
             ]
+        if status == 200 and self.malformed_plan_response and "claim_verification_plan_authority" in response["contract_summary"]:
+            response["contract_summary"]["claim_verification_plan_authority"]["verification_obligations"] = [OWNER_ORDERED_BROWSER_PLAN[0], {"obligation_id": "broken"}]
         return status, response
 
     def enqueue_preparation(self, contract_id):
@@ -2517,13 +2524,14 @@ def test_owner_claim_review_real_dom_preserves_authority_order_and_v3_boundary(t
                 time.sleep(0.15)
             raise AssertionError(f"timed out waiting for {wanted!r}; last={last!r}")
 
-        def compose(claims):
+        def compose(claims, plan=None):
             evaluate("window.AdmissibleG3Test.reset()")
             wait_for("window.AdmissibleG3Test.getState()", "COMPOSE")
             fields = {
                 "mission-text": "claim mission", "gate-objective": "claim objective",
                 "completion-conditions": "claim conditions", "commit-message": "feat: claim",
                 "result-claims": "" if claims is None else json.dumps(claims, separators=(",", ":")),
+                "claim-verification-plan": "" if plan is None else json.dumps(plan, separators=(",", ":")),
             }
             for field, value in fields.items():
                 evaluate(f"window.AdmissibleG3Test.setField({json.dumps(field)},{json.dumps(value)})")
@@ -2544,13 +2552,42 @@ def test_owner_claim_review_real_dom_preserves_authority_order_and_v3_boundary(t
             assert measured["injected"] == 0
             assert measured["hidden"] is True and measured["disabled"] is True
 
-        evaluate("const b=document.getElementById('prepare-button');b.hidden=false;b.disabled=false;b.click()")
+        evaluate("{const v4b=document.getElementById('prepare-button');v4b.hidden=false;v4b.disabled=false;v4b.click()}")
         refusal_deadline = time.time() + 5
         while launcher.preparation_attempts != 1 and time.time() < refusal_deadline:
             time.sleep(0.05)
         assert launcher.preparation_attempts == 1
         wait_for("window.AdmissibleG3Test.getState()", "CONTRACT_READY")
         assert launcher._preparations._items == {}
+
+        compose(OWNER_ORDERED_BROWSER_CLAIMS, OWNER_ORDERED_BROWSER_PLAN)
+        for width, height, mobile in ((1280, 800, False), (390, 844, True)):
+            send("Emulation.setDeviceMetricsOverride", {"width": width, "height": height, "deviceScaleFactor": 1, "mobile": mobile})
+            raw = evaluate("JSON.stringify((()=>{const p=document.getElementById('contract-verification-plan-review'),c=document.getElementById('contract-claim-review'),g=document.getElementById('contract-gate-clauses'),b=document.getElementById('prepare-button'),d=document.documentElement;return {ids:Array.from(p.querySelectorAll('.obligation-id')).map(x=>x.textContent),notices:Array.from(p.querySelectorAll('.plan-notice')).map(x=>x.textContent),items:p.querySelectorAll('.verification-obligation-list>li').length,claimItems:c.querySelectorAll('.claim-list>li').length,gateItems:g.querySelectorAll('.gate-clause-list>li').length,injected:p.querySelectorAll('script,img,svg,iframe,object,embed').length,text:p.textContent,hidden:b.hidden,disabled:b.disabled,doc:[d.scrollWidth,d.clientWidth],plan:[p.scrollWidth,p.clientWidth],claim:[c.scrollWidth,c.clientWidth]}})())")
+            measured = json.loads(raw)
+            assert measured["ids"] == ["zulu-obligation", "alpha-obligation"]
+            assert measured["items"] == 2 and measured["claimItems"] == 4 and measured["gateItems"] == 2
+            assert measured["injected"] == 0 and "<img src=x" in measured["text"]
+            assert len(measured["notices"]) == 7 and measured["notices"][-1] == "Claim-verification-plan V4 contracts are not launchable in the current runtime."
+            assert measured["hidden"] is True and measured["disabled"] is True
+            assert measured["doc"][0] <= measured["doc"][1] + 1
+            assert measured["plan"][0] <= measured["plan"][1] + 1
+            assert measured["claim"][0] <= measured["claim"][1] + 1
+
+        attempts_before_v4_bypass = launcher.preparation_attempts
+        evaluate("const b=document.getElementById('prepare-button');b.hidden=false;b.disabled=false;b.click()")
+        refusal_deadline = time.time() + 5
+        while launcher.preparation_attempts == attempts_before_v4_bypass and time.time() < refusal_deadline:
+            time.sleep(0.05)
+        assert launcher.preparation_attempts == attempts_before_v4_bypass + 1
+        wait_for("window.AdmissibleG3Test.getState()", "CONTRACT_READY")
+        assert launcher._preparations._items == {}
+
+        launcher.malformed_plan_response = True
+        compose(OWNER_ORDERED_BROWSER_CLAIMS, OWNER_ORDERED_BROWSER_PLAN)
+        malformed_plan = json.loads(evaluate("JSON.stringify({items:document.querySelectorAll('#contract-verification-plan-review .verification-obligation-list>li').length,error:document.querySelector('#contract-verification-plan-review .plan-review-error').textContent,hidden:document.getElementById('prepare-button').hidden,disabled:document.getElementById('prepare-button').disabled})"))
+        assert malformed_plan == {"items": 0, "error": "Verification-plan review data is unavailable or inconsistent. No partial obligation list is shown.", "hidden": True, "disabled": True}
+        launcher.malformed_plan_response = False
 
         launcher.malformed_claim_response = True
         compose(OWNER_ORDERED_BROWSER_CLAIMS)

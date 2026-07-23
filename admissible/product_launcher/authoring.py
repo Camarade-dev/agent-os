@@ -10,6 +10,7 @@ from typing import Any, Callable, Mapping
 from admissible.delegated_gate.canonical import canonical_bytes, require_safe_relative_path
 from admissible.delegated_gate.mission_profile import (
     MISSION_PROFILE_SCHEMA_VERSION_V3,
+    MISSION_PROFILE_SCHEMA_VERSION_V4,
     MISSION_PROFILE_SCHEMA_VERSION_V2,
     ONE_SHOT_PROFILE_BUDGETS,
     WORKFLOW_RECOVERY_COMPLETION_CONDITIONS_TEXT,
@@ -18,8 +19,11 @@ from admissible.delegated_gate.mission_profile import (
     WORKFLOW_RECOVERY_V2_PROFILE,
     WORKFLOW_RECOVERY_VERIFIER_SOURCE,
     ClaimAuthority,
+    ClaimVerificationPlanAuthority,
     ClaimAuthorship,
     ClaimSetCoverageStatus,
+    VerificationPlanAuthorship,
+    VerificationPlanCoverageStatus,
     GitEndStatePolicy,
     ProfileCheckpointCommand,
     RuntimePromptAuthority,
@@ -48,6 +52,7 @@ OWNER_AUTHORING_FIELDS = frozenset(
         "timeout_seconds",
         "template_id",
         "result_claims",
+        "claim_verification_plan",
     }
 )
 REQUIRED_OWNER_FIELDS = frozenset(
@@ -188,6 +193,28 @@ CLAIM_ADJUDICATION_NOTICE = (
     "These claims are part of the draft contract but have not been adjudicated."
 )
 CLAIM_RUNTIME_NOTICE = "Claim-aware V3 contracts are not launchable in the current runtime."
+CLAIM_V4_RUNTIME_NOTICE = "Claim-verification-plan V4 contracts are not launchable in the current runtime."
+PLAN_AUTHORSHIP_NOTICE = "These verification obligations were explicitly authored by the owner."
+PLAN_COVERAGE_NOTICE = (
+    "Verification-plan coverage has not been assessed. Claims or requirements may "
+    "lack an authorized verification obligation."
+)
+PLAN_NON_EXECUTION_NOTICE = (
+    "These verification obligations describe intended evidence-acquisition procedures. "
+    "They have not been executed and have produced no evidence."
+)
+PLAN_NO_ADJUDICATION_NOTICE = (
+    "The presence of a verification obligation does not mean that its referenced "
+    "claims are supported or adjudicated."
+)
+PLAN_INDEPENDENCE_NOTICE = (
+    "Independence values are requirements of the plan, not evidence that those "
+    "properties were achieved."
+)
+PLAN_PROCEDURE_BINDING_NOTICE = (
+    "Procedure references have not been validated against current runtime capabilities."
+)
+PLAN_RUNTIME_NOTICE = CLAIM_V4_RUNTIME_NOTICE
 
 
 def _require_text(value: object, field: str, *, max_bytes: int) -> str:
@@ -315,6 +342,42 @@ def _validate_owner_inputs(inputs: Mapping[str, Any]) -> dict[str, Any]:
                 field="result_claims",
                 safe_message_key="authoring.invalid_result_claims",
             ) from None
+    plan_authority = None
+    if "claim_verification_plan" in inputs:
+        raw_plan = inputs["claim_verification_plan"]
+        if claim_authority is None:
+            raise AuthoringError(
+                "VERIFICATION_PLAN_REQUIRES_RESULT_CLAIMS",
+                field="claim_verification_plan",
+                safe_message_key="authoring.verification_plan_requires_result_claims",
+            )
+        if not isinstance(raw_plan, list) or not raw_plan:
+            raise AuthoringError(
+                "INVALID_CLAIM_VERIFICATION_PLAN",
+                field="claim_verification_plan",
+                safe_message_key="authoring.verification_plan_nonempty_array_required",
+            )
+        claim_ids = [claim.claim_id for claim in claim_authority.claims]
+        if len({claim_id.casefold() for claim_id in claim_ids}) != len(claim_ids):
+            raise AuthoringError(
+                "INVALID_CLAIM_VERIFICATION_PLAN",
+                field="claim_verification_plan",
+                safe_message_key="authoring.invalid_claim_verification_plan",
+            )
+        try:
+            plan_authority = ClaimVerificationPlanAuthority.from_dict(
+                {
+                    "authorship": VerificationPlanAuthorship.OWNER_AUTHORED.value,
+                    "coverage_status": VerificationPlanCoverageStatus.NOT_ASSESSED.value,
+                    "verification_obligations": raw_plan,
+                }
+            )
+        except (TypeError, ValueError):
+            raise AuthoringError(
+                "INVALID_CLAIM_VERIFICATION_PLAN",
+                field="claim_verification_plan",
+                safe_message_key="authoring.invalid_claim_verification_plan",
+            ) from None
     return {
         "mission_text": mission_text,
         "gate_objective": gate_objective,
@@ -325,6 +388,7 @@ def _validate_owner_inputs(inputs: Mapping[str, Any]) -> dict[str, Any]:
         "model": model,
         "timeout_seconds": timeout_seconds,
         "claim_authority": claim_authority,
+        "claim_verification_plan_authority": plan_authority,
     }
 
 
@@ -680,7 +744,12 @@ def author_runtime_contract(
         generated=generated,
     )
     claim_authority = validated["claim_authority"]
-    if claim_authority is not None:
+    plan_authority = validated["claim_verification_plan_authority"]
+    if plan_authority is not None:
+        builder_kwargs["schema_version"] = MISSION_PROFILE_SCHEMA_VERSION_V4
+        builder_kwargs["claim_authority"] = claim_authority
+        builder_kwargs["claim_verification_plan_authority"] = plan_authority
+    elif claim_authority is not None:
         builder_kwargs["schema_version"] = MISSION_PROFILE_SCHEMA_VERSION_V3
         builder_kwargs["claim_authority"] = claim_authority
     try:
@@ -733,14 +802,31 @@ def author_runtime_contract(
         ],
         "template_id": validated["template_id"],
     }
-    if profile.schema_version == MISSION_PROFILE_SCHEMA_VERSION_V3:
+    if profile.schema_version in {MISSION_PROFILE_SCHEMA_VERSION_V3, MISSION_PROFILE_SCHEMA_VERSION_V4}:
         summary["profile_fingerprint"] = fingerprint
         summary["claim_authority"] = profile.claim_authority.to_dict()
         summary["claim_review_notices"] = {
             "authorship": CLAIM_AUTHORSHIP_NOTICE,
             "coverage": CLAIM_COVERAGE_NOTICE,
             "adjudication": CLAIM_ADJUDICATION_NOTICE,
-            "runtime": CLAIM_RUNTIME_NOTICE,
+            "runtime": (
+                CLAIM_RUNTIME_NOTICE
+                if profile.schema_version == MISSION_PROFILE_SCHEMA_VERSION_V3
+                else CLAIM_V4_RUNTIME_NOTICE
+            ),
+        }
+    if profile.schema_version == MISSION_PROFILE_SCHEMA_VERSION_V4:
+        summary["claim_verification_plan_authority"] = (
+            profile.claim_verification_plan_authority.to_dict()
+        )
+        summary["verification_plan_review_notices"] = {
+            "authorship": PLAN_AUTHORSHIP_NOTICE,
+            "coverage": PLAN_COVERAGE_NOTICE,
+            "non_execution": PLAN_NON_EXECUTION_NOTICE,
+            "no_adjudication": PLAN_NO_ADJUDICATION_NOTICE,
+            "independence": PLAN_INDEPENDENCE_NOTICE,
+            "procedure_binding": PLAN_PROCEDURE_BINDING_NOTICE,
+            "runtime": PLAN_RUNTIME_NOTICE,
         }
     return AuthoredContractDocument(
         document_path=str(path.resolve()),

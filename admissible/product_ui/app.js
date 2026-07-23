@@ -154,6 +154,7 @@
   function appendReturnedFact(root,body,key,label){if(hasOwn(body,key))appendFact(root,label,body[key]);}
   const GATE_CLAUSE_NOTICE="These clauses are part of the authorized contract. They are not independently adjudicated unless linked to explicit verification evidence.";
   const CLAIM_NOTICE_KEYS=["authorship","coverage","adjudication","runtime"];
+  const PLAN_NOTICE_KEYS=["authorship","coverage","non_execution","no_adjudication","independence","procedure_binding","runtime"];
   function normalizedGateClauses(value){
     if(!Array.isArray(value)||!value.length)return null;
     const seen=new Set(),clauses=[];
@@ -190,6 +191,30 @@
     const meta=document.createElement("dl");meta.className="detail-list";appendFact(meta,"Authorship",summary.claim_authority.authorship);appendFact(meta,"Coverage status",summary.claim_authority.coverage_status);root.append(meta);
     const list=document.createElement("ol");list.className="claim-list";review.claims.forEach(claim=>{const item=document.createElement("li"),title=document.createElement("p"),statement=document.createElement("p"),details=document.createElement("dl");title.className="claim-id";title.textContent=claim.claim_id;statement.className="claim-statement";statement.textContent=claim.statement;appendFact(details,"Obligation level",claim.obligation_level);appendFact(details,"Dependencies",claim.depends_on.join(", ")||"None");appendFact(details,"Non-claims",claim.non_claims.join("; ")||"None");item.append(title,statement,details);list.append(item);});root.append(list);return true;
   }
+  function normalizedVerificationPlan(authority,notices){
+    if(!isObject(authority)||authority.authorship!=="OWNER_AUTHORED"||authority.coverage_status!=="NOT_ASSESSED"||!Array.isArray(authority.verification_obligations)||!authority.verification_obligations.length||!isObject(notices))return null;
+    if(!PLAN_NOTICE_KEYS.every(key=>typeof notices[key]==="string"&&notices[key]))return null;
+    const obligations=[],seen=new Set(),exact="acceptance_predicate,claim_ids,declared_coverage,independence_requirements,negative_controls,non_claims,obligation_id,oracle_disclosed_to_subject,procedure_reference,reference_cases,strategy";
+    for(const item of authority.verification_obligations){
+      if(!isObject(item)||Object.keys(item).sort().join(",")!==exact||typeof item.obligation_id!=="string"||!item.obligation_id||seen.has(item.obligation_id)||!Array.isArray(item.claim_ids)||!item.claim_ids.length||!item.claim_ids.every(x=>typeof x==="string")||typeof item.strategy!=="string"||typeof item.procedure_reference!=="string"||typeof item.acceptance_predicate!=="string"||typeof item.declared_coverage!=="string"||!Array.isArray(item.non_claims)||!item.non_claims.every(x=>typeof x==="string")||typeof item.oracle_disclosed_to_subject!=="boolean"||!isObject(item.independence_requirements)||Object.keys(item.independence_requirements).sort().join(",")!=="artifact,information,model,organizational,process,temporal"||!Object.values(item.independence_requirements).every(x=>typeof x==="boolean")||!Array.isArray(item.negative_controls)||!item.negative_controls.every(x=>isObject(x)&&Object.keys(x).sort().join(",")==="control_id,description"&&typeof x.control_id==="string"&&typeof x.description==="string")||!Array.isArray(item.reference_cases)||!item.reference_cases.every(x=>typeof x==="string"))return null;
+      seen.add(item.obligation_id);obligations.push(item);
+    }
+    return {obligations,notices};
+  }
+  function appendOrderedValues(root,label,values){
+    const row=document.createElement("div"),dt=document.createElement("dt"),dd=document.createElement("dd"),list=document.createElement("ol");dt.textContent=label;
+    if(values.length){values.forEach(value=>{const item=document.createElement("li");item.textContent=value;list.append(item);});dd.append(list);}else dd.textContent="None";
+    row.append(dt,dd);root.append(row);
+  }
+  function renderVerificationPlanReview(summary){
+    const section=byId("contract-verification-plan"),root=byId("contract-verification-plan-review");if(!section||!root)return !hasOwn(summary,"claim_verification_plan_authority")&&!hasOwn(summary,"verification_plan_review_notices");root.replaceChildren();
+    if(!hasOwn(summary,"claim_verification_plan_authority")&&!hasOwn(summary,"verification_plan_review_notices")){section.hidden=true;return true;}
+    section.hidden=false;const review=normalizedVerificationPlan(summary.claim_verification_plan_authority,summary.verification_plan_review_notices);
+    if(!review){const failure=document.createElement("p");failure.className="plan-review-error";failure.textContent="Verification-plan review data is unavailable or inconsistent. No partial obligation list is shown.";root.append(failure);return false;}
+    PLAN_NOTICE_KEYS.forEach(key=>{const notice=document.createElement("p");notice.className="plan-notice";notice.textContent=review.notices[key];root.append(notice);});
+    const meta=document.createElement("dl");meta.className="detail-list";appendFact(meta,"Authorship",summary.claim_verification_plan_authority.authorship);appendFact(meta,"Coverage status",summary.claim_verification_plan_authority.coverage_status);root.append(meta);
+    const list=document.createElement("ol");list.className="verification-obligation-list";review.obligations.forEach(obligation=>{const item=document.createElement("li"),title=document.createElement("p"),details=document.createElement("dl");title.className="obligation-id";title.textContent=obligation.obligation_id;appendOrderedValues(details,"Referenced claim IDs",obligation.claim_ids);appendFact(details,"Strategy",obligation.strategy);appendFact(details,"Procedure reference",obligation.procedure_reference);appendFact(details,"Acceptance predicate",obligation.acceptance_predicate);appendFact(details,"Declared coverage",obligation.declared_coverage);appendOrderedValues(details,"Non-claims",obligation.non_claims);appendFact(details,"Oracle disclosed to subject",String(obligation.oracle_disclosed_to_subject));Object.entries(obligation.independence_requirements).forEach(([key,value])=>appendFact(details,`Required independence: ${key}`,String(value)));appendOrderedValues(details,"Negative controls",obligation.negative_controls.map(control=>`${control.control_id}: ${control.description}`));appendOrderedValues(details,"Reference cases",obligation.reference_cases);item.append(title,details);list.append(item);});root.append(list);return true;
+  }
   function renderBootstrap(boot){
     const root=byId("bootstrap-facts");root.replaceChildren();
     [["Service",boot.service],["Repository",boot.repository_display_path],["Required source HEAD",boot.required_source_head],["Authorization mode",boot.authorization_mode],["Owner phrase encoding",boot.owner_authorization_encoding],["Visual UI wire value",String(boot.visual_ui_available)],["Local state",boot.g2_ready?"Ready":"Unavailable"]].forEach(x=>appendFact(root,x[0],x[1]));
@@ -207,17 +232,18 @@
     const remove=document.createElement("button");remove.type="button";remove.className="button quiet";remove.textContent="Remove";remove.addEventListener("click",()=>row.remove());row.append(input,remove);byId("material-list").append(row);
   }
   function parsedClaims(){const field=byId("result-claims");if(!field)return undefined;const raw=field.value;if(!raw.trim())return undefined;try{return JSON.parse(raw);}catch(_error){return null;}}
+  function parsedVerificationPlan(){const field=byId("claim-verification-plan");if(!field)return undefined;const raw=field.value;if(!raw.trim())return undefined;try{return JSON.parse(raw);}catch(_error){return null;}}
   function validateCompose(){
     let valid=true;[["mission-text","mission-error","Enter the mission."],["gate-objective","objective-error","Enter the gate objective."],["completion-conditions","conditions-error","Enter completion conditions."],["commit-message","commit-error","Enter the intended commit message."]].forEach(([field,error,message])=>{const empty=!byId(field).value.trim();byId(error).textContent=empty?message:"";byId(field).setAttribute("aria-invalid",String(empty));if(empty)valid=false;});
-    if(/[\r\n]/.test(byId("commit-message").value)){byId("commit-error").textContent="Use one commit-message line.";valid=false;}const claims=parsedClaims(),claimsError=byId("claims-error");if(claimsError)claimsError.textContent=claims===null?"Enter a valid JSON array.":"";if(claims===null)valid=false;return valid;
+    if(/[\r\n]/.test(byId("commit-message").value)){byId("commit-error").textContent="Use one commit-message line.";valid=false;}const claims=parsedClaims(),claimsError=byId("claims-error");if(claimsError)claimsError.textContent=claims===null?"Enter valid JSON.":"";const plan=parsedVerificationPlan(),planError=byId("verification-plan-error");if(planError)planError.textContent=plan===null?"Enter valid JSON.":"";if(claims===null||plan===null)valid=false;return valid;
   }
-  function composeBody(){const body={mission_text:byId("mission-text").value,gate_objective:byId("gate-objective").value,completion_conditions_text:byId("completion-conditions").value,required_material_paths:Array.from(byId("material-list").querySelectorAll("input")).map(x=>x.value).filter(Boolean),commit_message:byId("commit-message").value,model:byId("model").value,timeout_seconds:Number(byId("timeout-seconds").value),template_id:byId("template-id").value},claims=parsedClaims();if(claims!==undefined)body.result_claims=claims;return body;}
+  function composeBody(){const body={mission_text:byId("mission-text").value,gate_objective:byId("gate-objective").value,completion_conditions_text:byId("completion-conditions").value,required_material_paths:Array.from(byId("material-list").querySelectorAll("input")).map(x=>x.value).filter(Boolean),commit_message:byId("commit-message").value,model:byId("model").value,timeout_seconds:Number(byId("timeout-seconds").value),template_id:byId("template-id").value},claims=parsedClaims(),plan=parsedVerificationPlan();if(claims!==undefined)body.result_claims=claims;if(plan!==undefined)body.claim_verification_plan=plan;return body;}
   function renderContract(){
     const body=ui.contract.response,summary=body.contract_summary||{},ids=body.generated_ids||{},root=byId("contract-facts");root.replaceChildren();
     [["Contract ID",body.contract_id],["Canonical fingerprint",body.profile_fingerprint],["Profile ID",ids.profile_id||summary.profile_id],["Run ID",ids.run_id||summary.run_id],["Session ID",ids.session_id||summary.session_id],["Gate ID",ids.gate_id||summary.gate_id],["Mission ID",ids.mission_id||summary.mission_id],["Workspace source kind",summary.workspace_source_kind],["Verification mode",summary.verification_mode],["Authorization mode",body.authorization_mode],["Execution started",String(body.execution_started)]].forEach(x=>appendFact(root,x[0],x[1]));
     const intent=byId("intent-facts");intent.replaceChildren();[["Mission",ui.contract.input.mission_text],["Gate objective",ui.contract.input.gate_objective],["Completion conditions",ui.contract.input.completion_conditions_text],["Required materials",ui.contract.input.required_material_paths.join(", ")||"None"],["Intended commit",ui.contract.input.commit_message]].forEach(x=>appendFact(intent,x[0],x[1]));
     renderGateClauses("contract-gate-clauses",summary.gate_clauses,"INCONSISTENT");
-    const claimsValid=renderClaimReview(summary),launchable=body.runtime_launchable!==false;byId("prepare-button").hidden=!launchable;byId("prepare-button").disabled=!launchable||!claimsValid;
+    const claimsValid=renderClaimReview(summary),planValid=renderVerificationPlanReview(summary),launchable=body.runtime_launchable!==false;byId("prepare-button").hidden=!launchable;byId("prepare-button").disabled=!launchable||!claimsValid||!planValid;
   }
   async function author(event){
     event.preventDefault();clearError();if(!validateCompose())return;const input=composeBody();setState(STATES.AUTHORING);

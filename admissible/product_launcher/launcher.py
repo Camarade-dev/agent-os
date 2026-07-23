@@ -89,6 +89,12 @@ class AuthoredContractRecord:
 class ProductLauncher:
     """Owns control plane, G2 loopback, UI loopback, and ephemeral state."""
 
+    @staticmethod
+    def _non_launchable_error(record: AuthoredContractRecord) -> str:
+        if record.contract_summary.get("schema_version") == "admissible_native_mission_profile_v4":
+            return "CLAIM_VERIFICATION_PLAN_V4_NOT_LAUNCHABLE"
+        return "CLAIM_AWARE_V3_NOT_LAUNCHABLE"
+
     def __init__(
         self,
         configuration: LauncherConfiguration,
@@ -319,7 +325,7 @@ class ProductLauncher:
             if record is None:
                 return 404, {"error": "CONTRACT_NOT_FOUND"}
             if not record.is_launchable_runtime_profile:
-                return 409, {"error": "CLAIM_AWARE_V3_NOT_LAUNCHABLE"}
+                return 409, {"error": self._non_launchable_error(record)}
             if self._active_preflight is not None:
                 return 409, {"error": "PREFLIGHT_BUSY"}
             preparation_id = self._id_generator()
@@ -612,7 +618,7 @@ class ProductLauncher:
                 if record is None:
                     return 404, {"error": "CONTRACT_NOT_FOUND"}
                 if not record.is_launchable_runtime_profile:
-                    return 409, {"error": "CLAIM_AWARE_V3_NOT_LAUNCHABLE"}
+                    return 409, {"error": self._non_launchable_error(record)}
                 if preparation is None:
                     return 404, {"error": "PREPARATION_NOT_FOUND"}
                 if preparation.contract_id != contract_id:
