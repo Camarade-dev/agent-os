@@ -851,8 +851,10 @@ PROTECTED_PATH_PREFIXES = (
 #   - V0.3 Step 2A/2A.1 authorized the inert ClaimAuthority schema and its
 #     pre-integration hardening in mission_profile.py and native_canary.py.
 #   - V0.3 Step 5A authorized the inert historical evaluation pairing module.
+#   - V0.3 Step 5C1 authorized the write-once historical evaluation store.
 AUTHORIZED_REPAIR_PATHS = frozenset({
     "admissible/delegated_gate/historical_evaluation.py",
+    "admissible/delegated_gate/historical_evaluation_store.py",
     "admissible/product_read_model/read_model.py",
     "admissible/product_read_model/renderer.py",
     "admissible/delegated_gate/native_canary.py",
