@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import ast
 import builtins
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 import hashlib
 import hmac
@@ -22,8 +22,10 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tokenize
 from types import ModuleType
 from unittest import mock
+import warnings
 
 import pytest
 
@@ -1063,46 +1065,263 @@ def test_limitation_seven_names_every_excluded_authority_surface():
         assert surface in clause
 
 
-_POSITIVE_CLAIM_TOKENS = (
-    "authenticated",
-    "verified owner",
-    "verified actor",
-    "cryptographically signed",
-    "digital signature",
-    "fresh secret possession",
-    "signer identity",
-    "proves possession",
+# The scanner is a list of explicit positive-claim regular expressions.  Each
+# pattern carries its own narrow negation slot -- either a fixed-width
+# lookbehind covering the position directly in front of the claim verb, or a
+# lookahead covering the single position after a copula that would negate it.
+# No rule exempts a sentence or a clause, so a negation about some unrelated
+# subject standing beside a positive claim can never mask that claim.
+_IDENTITY_NOUN = (
+    r"(?:owner|actor|actor_id|operator|user|person|individual|human|caller|"
+    r"signer|principal|identity)"
 )
-_NEGATION_TOKENS = ("not", "never", "no", "nothing", "cannot", "without", "only")
+# A negation in the one slot directly after the copula negates the claim.
+_NOT_AFTER_COPULA = r"(?!\s+(?:not|never|no)\b)"
+# A negation directly in front of the claim verb negates that verb.
+_NOT_BEFORE_VERB = r"(?<!not )(?<!never )(?<!nor )"
+_COPULA = (
+    r"(?:is|are|was|were|has\s+been|have\s+been|had\s+been|remains?|becomes?|"
+    r"gets?)"
+)
+_HEDGE = (
+    r"(?:\s+(?:already|hereby|therefore|thus|then|now|fully|properly|correctly|"
+    r"independently|locally|actually|indeed|cryptographically|strongly|"
+    r"successfully|reliably))*"
+)
+_PROVEN = r"(?:proven|proved|establishes|established|demonstrated|guaranteed|assured)"
+
+_POSITIVE_CLAIM_PATTERNS: tuple[tuple[str, str], ...] = (
+    # "authenticated owner", "authenticated actor", "authenticated local actor"
+    (
+        "authenticated-identity",
+        _NOT_BEFORE_VERB + r"\bauthenticated(?:\s+\w+){0,1}\s+" + _IDENTITY_NOUN + r"\b",
+    ),
+    # "verified owner", "verified actor identity"
+    (
+        "verified-identity",
+        _NOT_BEFORE_VERB + r"\bverified(?:\s+\w+){0,1}\s+" + _IDENTITY_NOUN + r"\b",
+    ),
+    # "the operator is authenticated", "the actor was authenticated"
+    (
+        "copula-authenticated",
+        r"\b" + _COPULA + _NOT_AFTER_COPULA + _HEDGE + r"\s+authenticated\b",
+    ),
+    # "authenticates the actor" -- but not "does not authenticate the actor"
+    (
+        "authenticates-identity",
+        _NOT_BEFORE_VERB
+        + r"\bauthenticat(?:es|e|ed|ing)\s+(?:the\s+|an?\s+)?"
+        + _IDENTITY_NOUN
+        + r"\b",
+    ),
+    # "cryptographically signed"
+    (
+        "cryptographically-signed",
+        _NOT_BEFORE_VERB + r"\bcryptographically(?:\s+\w+){0,1}\s+signed\b",
+    ),
+    # "signed by the owner"
+    (
+        "signed-by-identity",
+        _NOT_BEFORE_VERB + r"\bsigned\s+by\s+(?:the\s+|an?\s+)?" + _IDENTITY_NOUN + r"\b",
+    ),
+    # "this is a digital signature" -- but not "this is not a digital signature"
+    (
+        "copula-digital-signature",
+        r"\b"
+        + _COPULA
+        + _NOT_AFTER_COPULA
+        + _HEDGE
+        + r"\s+(?:an?\s+)?(?:digital|cryptographic)\s+signature\b",
+    ),
+    # "digital signature proving actor identity"
+    (
+        "signature-proving",
+        r"\b(?:digital|cryptographic)\s+signature\s+(?:that\s+)?"
+        r"(?:prov(?:es|ing|ed)|establish(?:es|ing|ed)|confirm(?:s|ing|ed)|"
+        r"bind(?:s|ing)|identif(?:ies|ying))\b",
+    ),
+    # "proves possession", "proves possession of the secret"
+    (
+        "proves-possession",
+        _NOT_BEFORE_VERB + r"\bprov(?:es|e|ed|ing)(?:\s+\w+){0,3}?\s+possession\b",
+    ),
+    # "fresh secret possession is proven", "possession of the secret is proven"
+    (
+        "possession-is-proven",
+        r"\bpossession(?:\s+of(?:\s+\w+){0,3}?)?\s+"
+        + _COPULA
+        + _NOT_AFTER_COPULA
+        + _HEDGE
+        + r"\s+"
+        + _PROVEN
+        + r"\b",
+    ),
+    # "proven fresh secret possession"
+    (
+        "proven-possession",
+        _NOT_BEFORE_VERB
+        + r"\b(?:proven|proved|established)\s+(?:fresh\s+)?(?:secret\s+)?possession\b",
+    ),
+    # "confirms the identity of actor_id"
+    (
+        "confirms-identity",
+        _NOT_BEFORE_VERB + r"\bconfirm(?:s|ed|ing)?\s+(?:the\s+)?identity\s+of\b",
+    ),
+    # "identifies the person who confirmed"
+    (
+        "identifies-identity",
+        _NOT_BEFORE_VERB
+        + r"\bidentif(?:ies|y|ied|ying)\s+(?:the\s+|an?\s+)?"
+        + _IDENTITY_NOUN
+        + r"\b",
+    ),
+    # "verifies the owner identity"
+    (
+        "verifies-identity",
+        _NOT_BEFORE_VERB
+        + r"\bverif(?:ies|y|ied|ying)\s+(?:the\s+|an?\s+)?"
+        + _IDENTITY_NOUN
+        + r"\b",
+    ),
+)
 
 
-def _clauses(text: str) -> list[str]:
-    """Split prose into clauses so a negation is checked where it applies.
+def _normalized_prose(text: str) -> str:
+    """Lowercase and collapse whitespace, keeping punctuation as a boundary.
 
-    This is deliberately not a lexical ban: a token may appear as long as its
-    own clause carries an explicit negation, so "actor_id ... is not
-    authenticated" passes while "an authenticated actor" does not.
+    Punctuation is deliberately preserved: every pattern joins its words with
+    ``\\s+``, so no claim can be assembled across a sentence or clause break
+    that only whitespace normalization would have erased.
     """
 
-    normalized = " ".join(text.lower().split())
-    clauses: list[str] = []
-    for sentence in re.split(r"[.;:]", normalized):
-        clauses.extend(
-            re.split(r",|\band\b|\bso\b|\btherefore\b|\bbecause\b|\bthat\b", sentence)
-        )
-    return clauses
+    return re.sub(r"\s+", " ", text.lower())
 
 
 def _positive_claim_violations(text: str) -> list[str]:
-    violations = []
-    for clause in _clauses(text):
-        words = set(re.findall(r"[a-z_]+", clause))
-        if words & set(_NEGATION_TOKENS):
-            continue
-        for token in _POSITIVE_CLAIM_TOKENS:
-            if token in clause:
-                violations.append(f"{token!r} in {clause.strip()!r}")
+    """Every positive authentication, signature or freshness claim in ``text``."""
+
+    normalized = _normalized_prose(text)
+    violations: list[str] = []
+    for name, pattern in _POSITIVE_CLAIM_PATTERNS:
+        for match in re.finditer(pattern, normalized):
+            violations.append(f"{name}: {match.group(0).strip()!r}")
     return violations
+
+
+# ---------------------------------------------------------------------------
+# Adversarial wording fixtures.
+#
+# Every string below is quoted mutation payload, never a statement this suite
+# makes about the mechanism.  The focused-module prose audit further down
+# excludes exactly these declared values, which is what keeps a payload from
+# being mistaken for an accepted semantic claim of this file.
+# ---------------------------------------------------------------------------
+
+ACCEPTED_NEGATIVE_WORDING = (
+    "actor_id is not authenticated",
+    "actor_id is not authenticated.",
+    "this is not a digital signature",
+    "the tag is not a digital signature.",
+    "fresh secret possession is not proven",
+    "the mechanism does not authenticate the actor",
+    "acceptance does not prove fresh secret possession by the operator.",
+    "the configured shared secret is not bound to any named actor",
+    "no secret, tag, hash of a tag, or other secret-derived material may be "
+    "persisted",
+)
+
+REJECTED_POSITIVE_WORDING = (
+    "authenticated owner",
+    "authenticated actor",
+    "verified owner",
+    "verified actor identity",
+    "cryptographically signed",
+    "digital signature proving actor identity",
+    "fresh secret possession is proven",
+    "proves possession of the secret",
+    "confirms the identity of actor_id",
+    "identifies the person who confirmed",
+    "the actor was authenticated",
+    "the authenticated owner approved this.",
+    "this record is cryptographically signed.",
+    "fresh secret possession is established here",
+)
+
+# The same positive claims, each standing beside an unrelated negation.  A
+# scanner that exempted a whole sentence or clause on seeing "not", "no",
+# "never" or "does not" would pass every one of these.
+MASKED_NEGATION_WORDING = (
+    "the authenticated owner approved this, but no receipt is persisted",
+    "authenticated actor: never persisted, never logged",
+    "verified owner identity; this does not touch the archive",
+    "verified actor identity is recorded, no nonce is used",
+    "the record is cryptographically signed and no secret is stored",
+    "a digital signature proving actor identity, not a bare tag",
+    "fresh secret possession is proven, although no timestamp is bound",
+    "this proves possession of the secret and nothing else",
+    "it confirms the identity of actor_id but never stores it",
+    "it identifies the person who confirmed and no one else",
+    "the actor was authenticated, so no further check is needed",
+)
+
+# A negation only clears the claim whose own slot it occupies.
+NARROW_NEGATION_ACCEPTED = (
+    "the operator is not authenticated",
+    "this does not authenticate the actor",
+)
+NARROW_NEGATION_REJECTED = (
+    "the operator is authenticated and the tag is not persisted",
+    "this does not persist anything and authenticates the actor",
+)
+
+_LEGACY_BANNED_SUBSTRINGS = (
+    "authenticated owner",
+    "authenticated actor",
+    "verified owner",
+    "cryptographically signed",
+    "fresh secret possession proven",
+    "proves fresh secret possession",
+)
+
+# Comment-shaped payloads used to pin the quoted-span rule itself.
+_QUOTE_STRIPPING_SAMPLES = (
+    "# an authenticated owner approved this",
+    '# rejects "authenticated owner" as a quoted payload',
+)
+
+_WORDING_FIXTURE_TEXTS = frozenset(
+    ACCEPTED_NEGATIVE_WORDING
+    + REJECTED_POSITIVE_WORDING
+    + MASKED_NEGATION_WORDING
+    + NARROW_NEGATION_ACCEPTED
+    + NARROW_NEGATION_REJECTED
+    + _LEGACY_BANNED_SUBSTRINGS
+    + _QUOTE_STRIPPING_SAMPLES
+)
+
+
+@pytest.mark.parametrize("sample", ACCEPTED_NEGATIVE_WORDING)
+def test_proof_strength_scanner_accepts_every_explicit_negative(sample: str):
+    assert _positive_claim_violations(sample) == []
+
+
+@pytest.mark.parametrize("sample", REJECTED_POSITIVE_WORDING)
+def test_proof_strength_scanner_rejects_every_positive_claim(sample: str):
+    assert _positive_claim_violations(sample) != []
+
+
+@pytest.mark.parametrize("sample", MASKED_NEGATION_WORDING)
+def test_proof_strength_scanner_is_not_masked_by_an_unrelated_negation(sample: str):
+    # The unrelated negation is really present in the sample, and the positive
+    # claim is still reported.
+    assert re.search(r"\b(?:not|no|never|nothing|cannot)\b", sample)
+    assert _positive_claim_violations(sample) != []
+
+
+def test_masked_negation_samples_cover_every_required_masking_form():
+    joined = " ".join(MASKED_NEGATION_WORDING)
+    for masking in ("not", "no", "never", "does not", "nothing"):
+        assert re.search(rf"\b{masking}\b", joined), masking
 
 
 def test_negation_aware_scanner_accepts_negations_and_rejects_positive_claims():
@@ -1119,6 +1338,123 @@ def test_negation_aware_scanner_accepts_negations_and_rejects_positive_claims():
     assert _positive_claim_violations("fresh secret possession is established here")
 
 
+def test_scanner_negation_handling_is_narrow_rather_than_clause_wide():
+    """A negation clears only the claim whose own slot it occupies."""
+
+    for sample in NARROW_NEGATION_ACCEPTED:
+        assert _positive_claim_violations(sample) == [], sample
+    for sample in NARROW_NEGATION_REJECTED:
+        assert _positive_claim_violations(sample) != [], sample
+    # Each rejected sample really does carry a negation somewhere in the very
+    # same clause, and is reported anyway.
+    for sample in NARROW_NEGATION_REJECTED:
+        assert re.search(r"\bnot\b", sample)
+
+
+# ---------------------------------------------------------------------------
+# Prose surfaces.
+# ---------------------------------------------------------------------------
+
+
+def _docstring_fragments(tree: ast.AST, label: str) -> list[tuple[str, str]]:
+    fragments = [(f"{label} module docstring", ast.get_docstring(tree) or "")]
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            fragments.append(
+                (f"{label} {node.name} docstring", ast.get_docstring(node) or "")
+            )
+    return fragments
+
+
+def _prose_surfaces(path: Path, label: str) -> list[tuple[str, str]]:
+    """Every prose surface of one module: docstrings, comments and strings.
+
+    Exception messages and exported constant values are ordinary string
+    constants of the module and are therefore covered by the literal sweep.
+    """
+
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=path.name)
+    surfaces = _docstring_fragments(tree, label)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            surfaces.append((f"{label} string line {node.lineno}", node.value))
+        elif isinstance(node, ast.Raise):
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Constant) and isinstance(inner.value, str):
+                    surfaces.append(
+                        (f"{label} exception message line {inner.lineno}", inner.value)
+                    )
+    with tokenize.open(path) as handle:
+        for token in tokenize.generate_tokens(handle.readline):
+            if token.type == tokenize.COMMENT:
+                surfaces.append(
+                    (f"{label} comment line {token.start[0]}", token.string)
+                )
+    return surfaces
+
+
+def _exported_constant_surfaces(module: ModuleType) -> list[tuple[str, str]]:
+    surfaces: list[tuple[str, str]] = []
+    for name in module.__all__:
+        value = getattr(module, name)
+        if isinstance(value, str):
+            surfaces.append((name, value))
+        elif isinstance(value, tuple):
+            for index, item in enumerate(value):
+                if isinstance(item, str):
+                    surfaces.append((f"{name}[{index}]", item))
+    return surfaces
+
+
+def _raised_message_surfaces(
+    vector_authority: HistoricalEvaluationPairingAuthority,
+) -> list[tuple[str, str]]:
+    """Every bounded ``ValueError`` message the module can actually produce."""
+
+    surfaces: list[tuple[str, str]] = []
+    cases = (
+        (
+            "wrong authority type",
+            lambda: build_historical_pairing_confirmation_message(
+                pairing_authority=VECTOR_AUTHORITY_DOCUMENT  # type: ignore[arg-type]
+            ),
+        ),
+        (
+            "non-bytes secret",
+            lambda: compute_historical_pairing_confirmation_tag(
+                secret="text", pairing_authority=vector_authority  # type: ignore[arg-type]
+            ),
+        ),
+        (
+            "empty secret",
+            lambda: compute_historical_pairing_confirmation_tag(
+                secret=b"", pairing_authority=vector_authority
+            ),
+        ),
+        (
+            "out-of-bounds secret",
+            lambda: compute_historical_pairing_confirmation_tag(
+                secret=b"s" * 15, pairing_authority=vector_authority
+            ),
+        ),
+        (
+            "malformed tag",
+            lambda: verify_historical_pairing_confirmation_tag(
+                configured_secret=VECTOR_SECRET,
+                pairing_authority=vector_authority,
+                presented_tag="nope",
+            ),
+        ),
+    )
+    for label, call in cases:
+        with pytest.raises(ValueError) as raised:
+            call()
+        surfaces.append((f"raised {label}", str(raised.value)))
+    assert len(surfaces) == len(cases)
+    return surfaces
+
+
 def test_module_prose_makes_no_positive_authentication_claim():
     source = Path(inspect.getfile(confirmation)).read_text(encoding="utf-8")
     assert _positive_claim_violations(source) == []
@@ -1128,15 +1464,94 @@ def test_module_prose_makes_no_positive_authentication_claim():
         )
         == []
     )
-    for banned in (
-        "authenticated owner",
-        "authenticated actor",
-        "verified owner",
-        "cryptographically signed",
-        "fresh secret possession proven",
-        "proves fresh secret possession",
-    ):
+    for banned in _LEGACY_BANNED_SUBSTRINGS:
         assert banned not in source.lower()
+
+
+def test_every_production_prose_surface_makes_no_positive_claim(
+    vector_authority: HistoricalEvaluationPairingAuthority,
+):
+    module_path = Path(inspect.getfile(confirmation))
+    surfaces = (
+        _prose_surfaces(module_path, "production")
+        + _exported_constant_surfaces(confirmation)
+        + _raised_message_surfaces(vector_authority)
+    )
+    violations = [
+        f"{label}: {claim}"
+        for label, text in surfaces
+        for claim in _positive_claim_violations(text)
+    ]
+    assert violations == []
+    # The sweep really reached each required surface class.
+    labels = [label for label, _text in surfaces]
+    assert any(label.endswith("module docstring") for label in labels)
+    assert any("docstring" in label and "module" not in label for label in labels)
+    assert any("comment line" in label for label in labels)
+    assert any("exception message line" in label for label in labels)
+    assert any(label.startswith("raised ") for label in labels)
+    assert any(
+        label.startswith("HISTORICAL_PAIRING_CONFIRMATION_LIMITATIONS[")
+        for label in labels
+    )
+    for public_name in confirmation.__all__:
+        if callable(getattr(confirmation, public_name)):
+            assert f"production {public_name} docstring" in labels
+
+
+_QUOTED_SPAN = re.compile(r'"[^"\n]*"')
+
+
+def _without_quoted_payloads(text: str) -> str:
+    """Drop double-quoted spans so quoted material is not read as a claim.
+
+    Used only for this module's own comments and docstrings, where a prohibited
+    phrase legitimately appears as quoted mutation material.  The production
+    sweep never applies it, and an unquoted claim is still reported here.
+    """
+
+    return _QUOTED_SPAN.sub(" ", text)
+
+
+def test_quoted_payload_rule_is_narrow_and_leaves_the_scanner_armed():
+    unquoted, quoted = _QUOTE_STRIPPING_SAMPLES
+    assert _positive_claim_violations(_without_quoted_payloads(unquoted)) != []
+    assert _positive_claim_violations(_without_quoted_payloads(quoted)) == []
+    # It is a span rule, not a phrase allowlist: the phrase alone is still a
+    # violation once it is not quoted.
+    assert _positive_claim_violations(_without_quoted_payloads("authenticated owner"))
+    # The production sweep is scanned raw, with no quoted-span exemption at all.
+    production_audit = inspect.getsource(
+        test_every_production_prose_surface_makes_no_positive_claim
+    )
+    assert "_without_quoted_payloads" not in production_audit
+
+
+def test_focused_test_module_prose_makes_no_positive_claim():
+    """This suite's own accepted semantics carry no positive claim either.
+
+    Declared adversarial payloads are excluded by exact value; quoted spans in
+    this module's comments and docstrings are quoted mutation material rather
+    than statements this module makes.
+    """
+
+    violations: list[str] = []
+    for label, text in _prose_surfaces(Path(__file__), "focused"):
+        if text in _WORDING_FIXTURE_TEXTS:
+            continue
+        if "comment line" in label or "docstring" in label:
+            text = _without_quoted_payloads(text)
+        violations.extend(
+            f"{label}: {claim}" for claim in _positive_claim_violations(text)
+        )
+    assert violations == []
+    # Neither exclusion disarms the scanner itself.
+    assert all(
+        _positive_claim_violations(payload)
+        for payload in REJECTED_POSITIVE_WORDING
+        + MASKED_NEGATION_WORDING
+        + NARROW_NEGATION_REJECTED
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1501,6 +1916,447 @@ def test_importing_and_invoking_pulls_in_no_product_or_store_module(
     )
     after = {name for name in sys.modules if name.startswith(tracked)}
     assert after == before
+
+
+# ---------------------------------------------------------------------------
+# Confidentiality of the configured secret and the computed tag.
+#
+# A disclosure is not only the complete value: any meaningful contiguous
+# fragment of either is one.  The fixture secret is deliberately printable
+# ASCII and deliberately short, so the derived fragment set stays small and
+# fully deterministic.  It is fixture material and no real secret.
+# ---------------------------------------------------------------------------
+
+CONFIDENTIALITY_SECRET = b"CONFIDENTIALITY-PROBE-SECRET-0123456789-ABCDEFGH"
+CONFIDENTIALITY_TAG = (
+    "71a5b0f836a0f8786d5b10f181d8b591dcd19aeb580aecec7af55a048c74aa78"
+)
+_FRAGMENT_BYTES = 8
+_LONG_FRAGMENT_CHARACTERS = 16
+
+
+def _fragments_of(secret: bytes, tag: str) -> frozenset[str]:
+    """Bounded forbidden-fragment set for one printable secret and its tag."""
+
+    text = secret.decode("ascii")
+    fragments: set[str] = {tag, text, secret.hex(), repr(secret)}
+    for size in (_FRAGMENT_BYTES, _LONG_FRAGMENT_CHARACTERS):
+        for start in range(len(tag) - size + 1):
+            fragments.add(tag[start : start + size])
+    fragments.update({tag[:8], tag[-8:], tag[:32], tag[-32:]})
+    for start in range(len(secret) - _FRAGMENT_BYTES + 1):
+        chunk = secret[start : start + _FRAGMENT_BYTES]
+        fragments.add(chunk.decode("ascii"))
+        fragments.add(chunk.hex())
+        fragments.add(repr(chunk))
+    fragments.update(
+        {
+            text[:8],
+            text[-8:],
+            secret[:8].hex(),
+            secret[-8:].hex(),
+            repr(secret[:8]),
+            repr(secret[-8:]),
+        }
+    )
+    return frozenset(fragments)
+
+
+FORBIDDEN_FRAGMENTS = _fragments_of(CONFIDENTIALITY_SECRET, CONFIDENTIALITY_TAG)
+
+
+class _GuardStream(io.TextIOBase):
+    """Bounded stand-in capturing every write made inside one window."""
+
+    def __init__(self, sink: list[str]) -> None:
+        super().__init__()
+        self._sink = sink
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, text) -> int:
+        rendered = str(text)
+        self._sink.append(rendered)
+        return len(rendered)
+
+    def writelines(self, lines) -> None:
+        for line in lines:
+            self.write(line)
+
+    def flush(self) -> None:
+        return None
+
+    def isatty(self) -> bool:
+        return False
+
+
+class _RecordingHandler(logging.Handler):
+    def __init__(self, sink: list[logging.LogRecord]) -> None:
+        super().__init__(level=logging.NOTSET)
+        self._sink = sink
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self._sink.append(record)
+
+
+class _SinkObservation:
+    """Everything one bounded invocation window emitted on any observed sink."""
+
+    def __init__(self) -> None:
+        self.stdout: list[str] = []
+        self.stderr: list[str] = []
+        self.prints: list[str] = []
+        self.records: list[logging.LogRecord] = []
+        self.warnings: list[warnings.WarningMessage] = []
+
+    def texts(self) -> list[tuple[str, str]]:
+        observed = [
+            ("sys.stdout.write", "".join(self.stdout)),
+            ("sys.stderr.write", "".join(self.stderr)),
+            ("builtins.print", "".join(self.prints)),
+        ]
+        for index, record in enumerate(self.records):
+            observed.extend(
+                [
+                    (f"logging[{index}].getMessage", record.getMessage()),
+                    (f"logging[{index}].msg", str(record.msg)),
+                    (f"logging[{index}].args", repr(record.args)),
+                    (f"logging[{index}].name", record.name),
+                ]
+            )
+        for index, caught in enumerate(self.warnings):
+            observed.extend(
+                [
+                    (f"warning[{index}].message", str(caught.message)),
+                    (f"warning[{index}].category", caught.category.__name__),
+                    (
+                        f"warning[{index}].rendered",
+                        # A fixed filename keeps the rendered text independent
+                        # of where the warning was raised.
+                        warnings.formatwarning(
+                            caught.message,
+                            caught.category,
+                            "<confirmation-invocation>",
+                            0,
+                        ),
+                    ),
+                ]
+            )
+        return observed
+
+    def is_silent(self) -> bool:
+        return not (
+            self.stdout
+            or self.stderr
+            or self.prints
+            or self.records
+            or self.warnings
+        )
+
+
+@contextmanager
+def _observed_sinks():
+    """Observe every output sink for exactly one bounded invocation window.
+
+    Every patched sink is restored on the way out, so nothing here can reach
+    pytest's own reporting outside the window.
+    """
+
+    observation = _SinkObservation()
+    real_print = builtins.print
+    real_stdout, real_stderr = sys.stdout, sys.stderr
+    root = logging.getLogger()
+    previous_level = root.level
+    previous_disable = root.manager.disable
+    handler = _RecordingHandler(observation.records)
+
+    def guarded_print(*values, sep=" ", end="\n", file=None, flush=False):
+        rendered = (" " if sep is None else sep).join(str(value) for value in values)
+        observation.prints.append(rendered + ("\n" if end is None else end))
+        return None
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        root.addHandler(handler)
+        root.setLevel(logging.DEBUG)
+        logging.disable(logging.NOTSET)
+        sys.stdout = _GuardStream(observation.stdout)
+        sys.stderr = _GuardStream(observation.stderr)
+        builtins.print = guarded_print
+        try:
+            yield observation
+        finally:
+            builtins.print = real_print
+            sys.stdout = real_stdout
+            sys.stderr = real_stderr
+            logging.disable(previous_disable)
+            root.setLevel(previous_level)
+            root.removeHandler(handler)
+        observation.warnings.extend(caught)
+
+
+def _disclosures_in_text(
+    text: str,
+    fragments: frozenset[str] = FORBIDDEN_FRAGMENTS,
+) -> list[str]:
+    """Every forbidden fragment carried by one string, longest match first."""
+
+    ordered = sorted(fragments, key=lambda item: (-len(item), item))
+    return [fragment for fragment in ordered if fragment in text]
+
+
+def _disclosures(
+    observation: _SinkObservation,
+    fragments: frozenset[str] = FORBIDDEN_FRAGMENTS,
+) -> list[str]:
+    """Every observed sink text carrying a forbidden fragment, longest first."""
+
+    found: list[str] = []
+    for sink, text in observation.texts():
+        if not text:
+            continue
+        found.extend(
+            f"{sink} disclosed {fragment!r}"
+            for fragment in _disclosures_in_text(text, fragments)
+        )
+    return found
+
+
+def _invoke_every_public_api(
+    authority: HistoricalEvaluationPairingAuthority,
+    secret: bytes,
+) -> str:
+    message = build_historical_pairing_confirmation_message(pairing_authority=authority)
+    assert message.startswith(HISTORICAL_PAIRING_CONFIRMATION_DOMAIN)
+    tag = compute_historical_pairing_confirmation_tag(
+        secret=secret, pairing_authority=authority
+    )
+    assert (
+        verify_historical_pairing_confirmation_tag(
+            configured_secret=secret,
+            pairing_authority=authority,
+            presented_tag=tag,
+        )
+        is True
+    )
+    assert (
+        verify_historical_pairing_confirmation_tag(
+            configured_secret=secret,
+            pairing_authority=authority,
+            presented_tag="0" * 64,
+        )
+        is False
+    )
+    return tag
+
+
+def test_confidentiality_fixture_is_printable_ascii_and_independently_pinned(
+    vector_authority: HistoricalEvaluationPairingAuthority,
+):
+    assert CONFIDENTIALITY_SECRET.isascii()
+    assert CONFIDENTIALITY_SECRET.decode("ascii").isprintable()
+    assert (
+        MIN_CONFIRMATION_SECRET_BYTES
+        <= len(CONFIDENTIALITY_SECRET)
+        <= MAX_CONFIRMATION_SECRET_BYTES
+    )
+    assert CONFIDENTIALITY_TAG == _independent_tag(
+        CONFIDENTIALITY_SECRET, VECTOR_AUTHORITY_DOCUMENT
+    )
+    assert (
+        compute_historical_pairing_confirmation_tag(
+            secret=CONFIDENTIALITY_SECRET, pairing_authority=vector_authority
+        )
+        == CONFIDENTIALITY_TAG
+    )
+
+
+def test_forbidden_fragment_set_is_bounded_deterministic_and_complete():
+    assert _fragments_of(CONFIDENTIALITY_SECRET, CONFIDENTIALITY_TAG) == (
+        FORBIDDEN_FRAGMENTS
+    )
+    assert 0 < len(FORBIDDEN_FRAGMENTS) < 400
+    assert min(len(fragment) for fragment in FORBIDDEN_FRAGMENTS) == 8
+    tag = CONFIDENTIALITY_TAG
+    secret = CONFIDENTIALITY_SECRET
+    text = secret.decode("ascii")
+    # Every contiguous tag substring of length 8 and of length 16.
+    for size in (8, 16):
+        windows = [tag[start : start + size] for start in range(len(tag) - size + 1)]
+        assert len(windows) == len(tag) - size + 1
+        assert set(windows) <= FORBIDDEN_FRAGMENTS
+    assert {tag[:8], tag[-8:], tag[:32], tag[-32:]} <= FORBIDDEN_FRAGMENTS
+    # Every contiguous 8-byte secret fragment, as ASCII, as hex and as a bytes
+    # repr.
+    for start in range(len(secret) - 7):
+        chunk = secret[start : start + 8]
+        assert chunk.decode("ascii") in FORBIDDEN_FRAGMENTS
+        assert chunk.hex() in FORBIDDEN_FRAGMENTS
+        assert repr(chunk) in FORBIDDEN_FRAGMENTS
+    assert {text[:8], text[-8:]} <= FORBIDDEN_FRAGMENTS
+    assert {secret[:8].hex(), secret[-8:].hex()} <= FORBIDDEN_FRAGMENTS
+    assert {repr(secret[:8]), repr(secret[-8:])} <= FORBIDDEN_FRAGMENTS
+    # The complete values remain forbidden too.
+    assert {tag, text, secret.hex(), repr(secret)} <= FORBIDDEN_FRAGMENTS
+
+
+_SIMULATED_SINK_LEAKS = (
+    ("print-tag-8", lambda secret, tag: print(tag[:8]), lambda secret, tag: tag[:8]),
+    ("print-tag-32", lambda secret, tag: print(tag[:32]), lambda secret, tag: tag[:8]),
+    (
+        "print-secret-8",
+        lambda secret, tag: print(secret[:8]),
+        lambda secret, tag: secret[:8].decode("ascii"),
+    ),
+    (
+        "stdout-write-tag-8",
+        lambda secret, tag: sys.stdout.write(tag[:8]),
+        lambda secret, tag: tag[:8],
+    ),
+    (
+        "stderr-write-secret-8",
+        lambda secret, tag: sys.stderr.write(secret[:8].decode("ascii")),
+        lambda secret, tag: secret[:8].decode("ascii"),
+    ),
+    (
+        "logging-warning-tag-8",
+        lambda secret, tag: logging.warning("confirmation=%s", tag[:8]),
+        lambda secret, tag: tag[:8],
+    ),
+    (
+        "logging-error-secret-hex",
+        lambda secret, tag: logging.error("secret=%s", secret[:8].hex()),
+        lambda secret, tag: secret[:8].hex(),
+    ),
+    (
+        "warn-tag-8",
+        lambda secret, tag: warnings.warn(tag[:8]),
+        lambda secret, tag: tag[:8],
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("leak", "expected"),
+    [(leak, expected) for _label, leak, expected in _SIMULATED_SINK_LEAKS],
+    ids=[label for label, _leak, _expected in _SIMULATED_SINK_LEAKS],
+)
+def test_confidentiality_guard_detects_every_simulated_sink_leak(leak, expected):
+    """The guard is armed on each sink before it is used to prove silence."""
+
+    with _observed_sinks() as observation:
+        leak(CONFIDENTIALITY_SECRET, CONFIDENTIALITY_TAG)
+    assert not observation.is_silent()
+    disclosed = _disclosures(observation)
+    assert disclosed != []
+    fragment = expected(CONFIDENTIALITY_SECRET, CONFIDENTIALITY_TAG)
+    assert fragment in FORBIDDEN_FRAGMENTS
+    assert any(repr(fragment) in entry for entry in disclosed)
+
+
+def test_clean_invocation_discloses_no_confidentiality_fragment_on_any_sink(
+    vector_authority: HistoricalEvaluationPairingAuthority,
+):
+    with _observed_sinks() as observation:
+        tag = _invoke_every_public_api(vector_authority, CONFIDENTIALITY_SECRET)
+    # Disclosure is asserted first so a leak is reported as the exact fragment.
+    assert _disclosures(observation) == []
+    assert observation.prints == [], f"builtins.print was called: {observation.prints!r}"
+    assert "".join(observation.stdout) == "", "sys.stdout.write was called"
+    assert "".join(observation.stderr) == "", "sys.stderr.write was called"
+    assert [record.getMessage() for record in observation.records] == [], (
+        "a log record was emitted"
+    )
+    assert [str(caught.message) for caught in observation.warnings] == [], (
+        "a warning was raised"
+    )
+    assert observation.is_silent()
+    assert tag == CONFIDENTIALITY_TAG
+
+
+def test_clean_invocation_stays_silent_for_the_real_historical_authority(
+    real_authority: HistoricalEvaluationPairingAuthority,
+):
+    real_tag = compute_historical_pairing_confirmation_tag(
+        secret=CONFIDENTIALITY_SECRET, pairing_authority=real_authority
+    )
+    fragments = FORBIDDEN_FRAGMENTS | _fragments_of(CONFIDENTIALITY_SECRET, real_tag)
+    with _observed_sinks() as observation:
+        assert _invoke_every_public_api(real_authority, CONFIDENTIALITY_SECRET) == (
+            real_tag
+        )
+    assert _disclosures(observation, fragments) == []
+    assert observation.is_silent()
+
+
+def test_rejected_invocations_disclose_no_confidentiality_fragment(
+    vector_authority: HistoricalEvaluationPairingAuthority,
+):
+    """Every bounded rejection path is silent about the secret and the tag."""
+
+    with _observed_sinks() as observation:
+        for presented in (
+            CONFIDENTIALITY_TAG.upper(),
+            CONFIDENTIALITY_TAG[:63],
+            CONFIDENTIALITY_TAG + "0",
+            "z" * 64,
+        ):
+            with pytest.raises(ValueError) as raised:
+                verify_historical_pairing_confirmation_tag(
+                    configured_secret=CONFIDENTIALITY_SECRET,
+                    pairing_authority=vector_authority,
+                    presented_tag=presented,
+                )
+            # The bounded message never quotes the rejected material back.
+            assert _disclosures_in_text(str(raised.value)) == []
+        with pytest.raises(ValueError) as raised:
+            compute_historical_pairing_confirmation_tag(
+                secret=CONFIDENTIALITY_SECRET[:8], pairing_authority=vector_authority
+            )
+        assert _disclosures_in_text(str(raised.value)) == []
+        # A well-formed but wrong tag is a plain False, still silent.
+        assert (
+            verify_historical_pairing_confirmation_tag(
+                configured_secret=CONFIDENTIALITY_SECRET,
+                pairing_authority=vector_authority,
+                presented_tag="0" * 64,
+            )
+            is False
+        )
+    assert _disclosures(observation) == []
+    assert observation.is_silent()
+
+
+def test_confidentiality_guard_restores_every_sink_on_the_way_out():
+    real_print = builtins.print
+    real_stdout, real_stderr = sys.stdout, sys.stderr
+    root = logging.getLogger()
+    handlers_before = list(root.handlers)
+    level_before = root.level
+    disable_before = root.manager.disable
+
+    with _observed_sinks() as observation:
+        assert sys.stdout is not real_stdout
+        assert builtins.print is not real_print
+        print("guarded")
+    assert observation.prints == ["guarded\n"]
+
+    assert builtins.print is real_print
+    assert sys.stdout is real_stdout
+    assert sys.stderr is real_stderr
+    assert list(root.handlers) == handlers_before
+    assert root.level == level_before
+    assert root.manager.disable == disable_before
+
+    # The same window survives an exception raised inside it.
+    with pytest.raises(RuntimeError):
+        with _observed_sinks():
+            raise RuntimeError("bounded")
+    assert builtins.print is real_print
+    assert sys.stdout is real_stdout
+    assert sys.stderr is real_stderr
+    assert list(root.handlers) == handlers_before
 
 
 # ---------------------------------------------------------------------------
