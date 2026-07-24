@@ -2134,6 +2134,10 @@ def test_no_execution_evidence_product_or_acceptance_module_is_reached(
         "admissible.delegated_gate.historical_evaluation",
         "admissible.delegated_gate.historical_evaluation_store",
         "admissible.delegated_gate.historical_pairing_confirmation",
+        # V0.3 Step 5C2C1: the read-only owner-review presentation module.  It
+        # is itself evidence-blind and adds no execution, evidence, acceptance,
+        # product, or provider dependency to this coordinator.
+        "admissible.delegated_gate.historical_pairing_review",
         "admissible.delegated_gate.mission_profile",
         "admissible.delegated_gate.native_canary",
     }

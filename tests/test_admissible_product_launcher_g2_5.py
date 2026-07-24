@@ -858,10 +858,17 @@ PROTECTED_PATH_PREFIXES = (
 #     workflow: an in-memory coordinator composing the accepted 5A/5B/5C1/5C2A
 #     primitives.  It adds no route, no UI, no canonical document, and no
 #     fourth archive file, and it leaves the accepted store untouched.
+#   - V0.3 Step 5C2C1 authorized the read-only historical pairing owner review:
+#     one ephemeral, non-canonical, never-persisted presentation module plus the
+#     coordinator's read-only review API.  It adds no route, no UI, no canonical
+#     document, and no archive file, and it changes neither preparation nor
+#     confirmation semantics.  The companion payload registry lives outside the
+#     protected trees in admissible/product_launcher/ and needs no entry here.
 AUTHORIZED_REPAIR_PATHS = frozenset({
     "admissible/delegated_gate/historical_evaluation.py",
     "admissible/delegated_gate/historical_evaluation_store.py",
     "admissible/delegated_gate/historical_pairing_confirmation.py",
+    "admissible/delegated_gate/historical_pairing_review.py",
     "admissible/delegated_gate/historical_pairing_workflow.py",
     "admissible/product_read_model/read_model.py",
     "admissible/product_read_model/renderer.py",

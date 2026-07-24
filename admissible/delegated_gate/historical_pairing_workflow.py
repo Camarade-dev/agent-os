@@ -20,6 +20,13 @@ accepted Step 5C2A verifier.  The archive is then reloaded through the accepted
 public Step 5C1 load API and the reloaded canonical bytes are required to equal
 the pinned objects exactly before the preparation is marked consumed.
 
+Review is a third, strictly read-only call.  It resolves one live preparation by
+its exact identifier and complete authority fingerprint, snapshots the pinned
+objects under the registry lock, and then builds the complete owner review
+outside that lock.  Review reserves nothing, confirms nothing, reads no secret,
+extends no TTL, persists nothing, and touches no filesystem.  It leaves
+preparation and confirmation semantics completely unchanged.
+
 Deliberate, load-bearing limitations
 ------------------------------------
 
@@ -84,6 +91,16 @@ from admissible.delegated_gate.historical_pairing_confirmation import (
     MIN_CONFIRMATION_SECRET_BYTES,
     build_historical_pairing_confirmation_message,
     verify_historical_pairing_confirmation_tag,
+)
+from admissible.delegated_gate.historical_pairing_review import (
+    # The three preparation-state labels are owned and published by the review
+    # module.  They are bound to private aliases here so this coordinator's own
+    # public constant surface keeps carrying exactly one outcome meaning.
+    PREPARATION_STATE_CONFIRMATION_IN_PROGRESS as _STATE_CONFIRMATION_IN_PROGRESS,
+    PREPARATION_STATE_CONSUMED as _STATE_CONSUMED,
+    PREPARATION_STATE_READY_FOR_CONFIRMATION as _STATE_READY_FOR_CONFIRMATION,
+    HistoricalEvaluationPairingOwnerReview,
+    build_historical_evaluation_pairing_owner_review,
 )
 from admissible.delegated_gate.mission_profile import (
     MISSION_PROFILE_SCHEMA_VERSION_V5,
@@ -956,6 +973,90 @@ class HistoricalEvaluationPairingCoordinator:
             limitations=HISTORICAL_PAIRING_WORKFLOW_LIMITATIONS,
         )
 
+    # -- review -----------------------------------------------------------
+
+    @staticmethod
+    def _preparation_state(preparation: _PinnedPreparation) -> str:
+        """Report the in-memory snapshot state of one live preparation.
+
+        A consumed preparation can never be confirmed again, so ``consumed``
+        outranks the transient reservation flag.  This is process state only: it
+        vanishes on restart and is never reconstructed from archive existence.
+        """
+
+        if preparation.consumed:
+            return _STATE_CONSUMED
+        if preparation.confirmation_reserved:
+            return _STATE_CONFIRMATION_IN_PROGRESS
+        return _STATE_READY_FOR_CONFIRMATION
+
+    def get_historical_evaluation_pairing_review(
+        self,
+        *,
+        preparation_id: str,
+        expected_authority_fingerprint: str,
+    ) -> HistoricalEvaluationPairingOwnerReview:
+        """Return one complete, read-only owner review of a live preparation.
+
+        The method reserves nothing, confirms nothing, reads no secret, extends
+        no TTL, persists nothing, accesses no filesystem, and returns no mutable
+        canonical object.  Consumed and in-progress preparations stay reviewable
+        while they are still present; expired ones do not, and the expired
+        answer is never degraded into a not-found answer.
+
+        Only the snapshot is taken under the registry lock.  The complete review
+        -- including the fresh exact compatibility revalidation -- is built after
+        the lock is released, so no review work can block a concurrent
+        preparation or confirmation.
+        """
+
+        identifier = _validated_preparation_id(
+            preparation_id, label="preparation identifier"
+        )
+        expected = _validated_expected_authority_fingerprint(
+            expected_authority_fingerprint
+        )
+
+        # The configured clock is a public constructor parameter and may block,
+        # raise, or re-enter this coordinator, so it is called before the lock.
+        now = self._now()
+        with self._lock:
+            self._sweep_locked(now, keep=identifier)
+            preparation = self._preparations.get(identifier)
+            if preparation is None:
+                raise PairingPreparationNotFound(
+                    "historical pairing preparation was not found"
+                )
+            if self._is_expired(preparation, now):
+                if not preparation.confirmation_reserved:
+                    del self._preparations[identifier]
+                raise PairingPreparationExpired(
+                    "historical pairing preparation has expired"
+                )
+            # The complete fingerprint is compared, never a prefix.
+            if preparation.pairing_authority.authority_fingerprint != expected:
+                raise StalePairingAuthorityFingerprint(
+                    "expected historical pairing authority fingerprint does not "
+                    "match the pinned preparation"
+                )
+            evaluation_profile = preparation.evaluation_profile
+            target_authorization_payload = (
+                preparation.target_authorization_payload
+            )
+            pairing_authority = preparation.pairing_authority
+            confirmation_message = preparation.confirmation_message
+            preparation_state = self._preparation_state(preparation)
+            # ``created_at`` is deliberately untouched: reviewing never renews.
+
+        return build_historical_evaluation_pairing_owner_review(
+            preparation_id=identifier,
+            preparation_state=preparation_state,
+            evaluation_profile=evaluation_profile,
+            target_authorization_payload=target_authorization_payload,
+            pairing_authority=pairing_authority,
+            confirmation_message=confirmation_message,
+        )
+
 
 __all__ = [
     "CONFIRMATION_ACCEPTED_ARCHIVE_AVAILABLE",
@@ -964,6 +1065,7 @@ __all__ = [
     "DEFAULT_PREPARATION_TTL_SECONDS",
     "HISTORICAL_PAIRING_WORKFLOW_LIMITATIONS",
     "HistoricalEvaluationPairingCoordinator",
+    "HistoricalEvaluationPairingOwnerReview",
     "HistoricalEvaluationPairingPreparationView",
     "HistoricalEvaluationPairingReviewProjection",
     "HistoricalEvaluationPairingWorkflowResult",
