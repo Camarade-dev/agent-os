@@ -854,10 +854,15 @@ PROTECTED_PATH_PREFIXES = (
 #   - V0.3 Step 5C1 authorized the write-once historical evaluation store.
 #   - V0.3 Step 5C2A authorized the pure historical pairing confirmation
 #     primitive (domain-separated HMAC material only; no store, no receipt).
+#   - V0.3 Step 5C2B authorized the headless historical pairing confirmation
+#     workflow: an in-memory coordinator composing the accepted 5A/5B/5C1/5C2A
+#     primitives.  It adds no route, no UI, no canonical document, and no
+#     fourth archive file, and it leaves the accepted store untouched.
 AUTHORIZED_REPAIR_PATHS = frozenset({
     "admissible/delegated_gate/historical_evaluation.py",
     "admissible/delegated_gate/historical_evaluation_store.py",
     "admissible/delegated_gate/historical_pairing_confirmation.py",
+    "admissible/delegated_gate/historical_pairing_workflow.py",
     "admissible/product_read_model/read_model.py",
     "admissible/product_read_model/renderer.py",
     "admissible/delegated_gate/native_canary.py",
