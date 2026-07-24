@@ -471,6 +471,13 @@ class HistoricalEvaluationPairingCoordinator:
     configuration.  Neither is ever supplied by a preparation request or by a
     confirmation request, neither is returned by any public method, and the
     secret is never logged, serialized, or persisted.
+
+    The registry lock guards only the in-memory preparation registry.  No
+    configurable callback -- neither the injected clock nor the injected
+    identifier factory -- and no canonical derivation, validation, message
+    construction, tag verification, archive publication, archive reload, or
+    filesystem operation ever runs while that lock is held, so an injected
+    callback cannot deadlock this coordinator merely by being invoked.
     """
 
     def __init__(
@@ -544,17 +551,76 @@ class HistoricalEvaluationPairingCoordinator:
         ]:
             del self._preparations[key]
 
-    def _allocate_identifier_locked(self) -> str:
-        """Allocate one unique live identifier with a bounded retry count."""
+    def _candidate_identifier(self) -> str:
+        """Obtain and validate one candidate identifier outside the lock.
+
+        The identifier factory is a public constructor parameter, so an injected
+        callback may block, raise, inspect external state, acquire another lock,
+        or re-enter this coordinator.  It is therefore never invoked while the
+        registry lock is held, and neither is the configured clock.
+        """
+
+        candidate = self._preparation_id_factory()
+        if type(candidate) is not str or not _PREPARATION_ID.fullmatch(candidate):
+            raise InvalidPairingCoordinatorConfiguration(
+                "configured historical pairing preparation identifier factory "
+                "must return a bounded opaque identifier"
+            )
+        return candidate
+
+    def _register_preparation(
+        self,
+        *,
+        now: float,
+        evaluation_profile: NativeMissionProfile,
+        target_authorization_payload: NativeCanaryAuthorizationPayloadV4,
+        pairing_authority: HistoricalEvaluationPairingAuthority,
+        confirmation_message: bytes,
+    ) -> str:
+        """Insert one complete preparation under a bounded candidate sequence.
+
+        Every candidate is produced and validated outside the lock; the lock is
+        then taken only to reclaim, to refuse on capacity, and to decide
+        uniqueness atomically.  A colliding candidate releases the lock before
+        the next candidate is requested, so no configurable callback ever runs
+        under it.  The uniqueness decision itself stays inside the lock, so two
+        simultaneous preparations offered the same candidate sequence can never
+        both insert the same identifier, and a candidate is never reserved with
+        a placeholder document.
+        """
 
         for _attempt in range(MAX_PREPARATION_ID_ATTEMPTS):
-            candidate = self._preparation_id_factory()
-            if type(candidate) is not str or not _PREPARATION_ID.fullmatch(candidate):
-                raise InvalidPairingCoordinatorConfiguration(
-                    "configured historical pairing preparation identifier factory "
-                    "must return a bounded opaque identifier"
+            candidate = self._candidate_identifier()
+            with self._lock:
+                self._sweep_locked(now)
+                if len(self._preparations) >= self._max_preparations:
+                    # Consumed preparations can never be confirmed again, so they
+                    # are reclaimed in insertion order before any refusal.
+                    for key in [
+                        key
+                        for key, preparation in self._preparations.items()
+                        if preparation.consumed
+                        and not preparation.confirmation_reserved
+                    ]:
+                        del self._preparations[key]
+                        if len(self._preparations) < self._max_preparations:
+                            break
+                if len(self._preparations) >= self._max_preparations:
+                    raise PairingPreparationCapacityExhausted(
+                        "historical pairing preparation capacity of "
+                        f"{self._max_preparations} live preparations is exhausted"
+                    )
+                if candidate in self._preparations:
+                    continue
+                self._preparations[candidate] = _PinnedPreparation(
+                    preparation_id=candidate,
+                    evaluation_profile=evaluation_profile,
+                    target_authorization_payload=target_authorization_payload,
+                    pairing_authority=pairing_authority,
+                    confirmation_message=confirmation_message,
+                    archive_root=self._archive_root,
+                    created_at=now,
                 )
-            if candidate not in self._preparations:
                 return candidate
         raise PairingPreparationIdentifierUnavailable(
             "historical pairing preparation identifier could not be allocated "
@@ -658,34 +724,13 @@ class HistoricalEvaluationPairingCoordinator:
         )
 
         now = self._now()
-        with self._lock:
-            self._sweep_locked(now)
-            if len(self._preparations) >= self._max_preparations:
-                # Consumed preparations can never be confirmed again, so they
-                # are reclaimed in insertion order before any refusal.
-                for key in [
-                    key
-                    for key, preparation in self._preparations.items()
-                    if preparation.consumed and not preparation.confirmation_reserved
-                ]:
-                    del self._preparations[key]
-                    if len(self._preparations) < self._max_preparations:
-                        break
-            if len(self._preparations) >= self._max_preparations:
-                raise PairingPreparationCapacityExhausted(
-                    "historical pairing preparation capacity of "
-                    f"{self._max_preparations} live preparations is exhausted"
-                )
-            preparation_id = self._allocate_identifier_locked()
-            self._preparations[preparation_id] = _PinnedPreparation(
-                preparation_id=preparation_id,
-                evaluation_profile=evaluation_profile,
-                target_authorization_payload=target_authorization_payload,
-                pairing_authority=pairing_authority,
-                confirmation_message=confirmation_message,
-                archive_root=self._archive_root,
-                created_at=now,
-            )
+        preparation_id = self._register_preparation(
+            now=now,
+            evaluation_profile=evaluation_profile,
+            target_authorization_payload=target_authorization_payload,
+            pairing_authority=pairing_authority,
+            confirmation_message=confirmation_message,
+        )
 
         return HistoricalEvaluationPairingPreparationView(
             preparation_id=preparation_id,

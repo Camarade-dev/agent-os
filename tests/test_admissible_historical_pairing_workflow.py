@@ -13,7 +13,7 @@ import builtins
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from copy import deepcopy
-from dataclasses import FrozenInstanceError, fields
+from dataclasses import FrozenInstanceError, fields, replace
 import hashlib
 import hmac
 import inspect
@@ -2640,3 +2640,1717 @@ def test_no_internal_preparation_pretends_to_be_a_canonical_document(
     for name in vars(pinned):
         assert "secret" not in name
         assert "tag" not in name
+
+
+# ===========================================================================
+# K. Callback and registry-lock discipline.
+#
+# Every callback reachable from the public constructor may block, raise,
+# inspect external state, acquire another lock, or re-enter this coordinator.
+# None of them may therefore run while the registry lock is held.  Each probe
+# below decides that dynamically with a non-blocking acquisition rather than by
+# reading the source, so a future implementation that reintroduces the defect
+# fails here even if it is spelled differently.
+# ===========================================================================
+
+
+class _RegistryLockProbe:
+    """Record, per labelled call, whether the registry lock was already held."""
+
+    def __init__(self) -> None:
+        self.coordinator = None
+        self.observations: list[tuple[str, bool]] = []
+
+    def observe(self, label: str) -> None:
+        lock = self.coordinator._lock
+        acquired = lock.acquire(blocking=False)
+        if acquired:
+            lock.release()
+        self.observations.append((label, acquired))
+
+    @property
+    def labels(self) -> list[str]:
+        return [label for label, _free in self.observations]
+
+    @property
+    def under_lock(self) -> list[str]:
+        return [label for label, free in self.observations if not free]
+
+
+class _ProbingClock:
+    """A configured clock that reports whether it ran under the registry lock."""
+
+    def __init__(self, probe: _RegistryLockProbe, start: float = 10_000.0) -> None:
+        self._probe = probe
+        self.value = float(start)
+
+    def __call__(self) -> float:
+        self._probe.observe("clock")
+        return self.value
+
+    def advance(self, delta: float) -> None:
+        self.value += float(delta)
+
+
+def test_the_configured_clock_is_never_called_while_the_registry_lock_is_held(
+    tmp_path: Path,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    expected_tag: str,
+):
+    probe = _RegistryLockProbe()
+    clock = _ProbingClock(probe)
+    coordinator = _coordinator(tmp_path / "archive", clock=clock)
+    probe.coordinator = coordinator
+
+    view = _prepare(coordinator, historical_payload)
+    with pytest.raises(PairingConfirmationRejected):
+        _confirm(coordinator, view, WRONG_TAG)
+    assert _confirm(coordinator, view, expected_tag).outcome == (
+        CONFIRMATION_ACCEPTED_ARCHIVE_AVAILABLE
+    )
+
+    # The clock really was exercised on every path that consults it.
+    assert probe.labels == ["clock", "clock", "clock"]
+    assert probe.under_lock == []
+
+
+def test_the_preparation_identifier_factory_runs_outside_the_registry_lock(
+    tmp_path: Path,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    expected_tag: str,
+):
+    """An injected factory may take the registry lock while it is being called.
+
+    The callback below does exactly what a hostile or merely careless injected
+    factory may do: it tries to acquire the coordinator's own registry lock
+    without blocking.  That acquisition must succeed, which is only possible if
+    the coordinator invoked the factory with the lock released.
+    """
+
+    archive_root = tmp_path / "archive"
+    holder: dict = {}
+    acquisitions: list[bool] = []
+    identifiers = _sequential_identifiers()
+
+    def probing_factory() -> str:
+        lock = holder["coordinator"]._lock
+        acquired = lock.acquire(blocking=False)
+        acquisitions.append(acquired)
+        if acquired:
+            lock.release()
+        return identifiers()
+
+    coordinator = _coordinator(archive_root, preparation_id_factory=probing_factory)
+    holder["coordinator"] = coordinator
+    view = _prepare(coordinator, historical_payload)
+
+    assert acquisitions == [True]
+    assert view.preparation_id == "prep-000001"
+    assert _confirm(coordinator, view, expected_tag).outcome == (
+        CONFIRMATION_ACCEPTED_ARCHIVE_AVAILABLE
+    )
+    # A second preparation repeats the same discipline, including after the
+    # registry already holds an entry.
+    second = _prepare(coordinator, historical_payload)
+    assert acquisitions == [True, True]
+    assert second.preparation_id == "prep-000002"
+
+
+def test_a_colliding_identifier_factory_still_runs_outside_the_registry_lock(
+    tmp_path: Path,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+):
+    """Every bounded retry re-enters the factory with the lock released."""
+
+    holder: dict = {}
+    acquisitions: list[bool] = []
+
+    def colliding_factory() -> str:
+        lock = holder["coordinator"]._lock
+        acquired = lock.acquire(blocking=False)
+        acquisitions.append(acquired)
+        if acquired:
+            lock.release()
+        return "prep-collision"
+
+    coordinator = _coordinator(
+        tmp_path / "archive", preparation_id_factory=colliding_factory
+    )
+    holder["coordinator"] = coordinator
+    first = _prepare(coordinator, historical_payload)
+    assert first.preparation_id == "prep-collision"
+    with pytest.raises(PairingPreparationIdentifierUnavailable):
+        _prepare(coordinator, historical_payload)
+
+    assert acquisitions == [True] * (1 + MAX_PREPARATION_ID_ATTEMPTS)
+    # The refused preparation left exactly one live entry behind.
+    assert list(coordinator._preparations) == ["prep-collision"]
+
+
+def test_a_raising_identifier_factory_leaves_the_registry_unchanged(
+    tmp_path: Path,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    expected_tag: str,
+):
+    """A callback that raises must not corrupt or half-populate the registry."""
+
+    failures = itertools.count()
+    identifiers = _sequential_identifiers()
+
+    def hostile_factory() -> str:
+        index = next(failures)
+        if index == 0:
+            raise RuntimeError("injected identifier factory failure")
+        if index == 1:
+            return 17  # an invalid type
+        if index == 2:
+            return "no"  # malformed syntax
+        return identifiers()
+
+    coordinator = _coordinator(
+        tmp_path / "archive", preparation_id_factory=hostile_factory
+    )
+    with pytest.raises(RuntimeError) as caught:
+        _prepare(coordinator, historical_payload)
+    assert not isinstance(caught.value, HistoricalPairingWorkflowError)
+    assert coordinator._preparations == {}
+    for _invalid in range(2):
+        with pytest.raises(InvalidPairingCoordinatorConfiguration):
+            _prepare(coordinator, historical_payload)
+        assert coordinator._preparations == {}
+    # The lock was released on every failure path, so the coordinator is live.
+    view = _prepare(coordinator, historical_payload)
+    assert list(coordinator._preparations) == [view.preparation_id]
+    assert _confirm(coordinator, view, expected_tag).outcome == (
+        CONFIRMATION_ACCEPTED_ARCHIVE_AVAILABLE
+    )
+
+
+def test_canonical_preparation_callbacks_run_outside_the_registry_lock(
+    tmp_path: Path,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    probe = _RegistryLockProbe()
+    for name, label in (
+        ("derive_historical_v5_evaluation_profile", "derive"),
+        ("create_historical_evaluation_pairing_authority", "authority"),
+        ("validate_historical_evaluation_pairing_relation", "relation"),
+        ("build_historical_pairing_confirmation_message", "message"),
+    ):
+        original = getattr(workflow, name)
+
+        def probing(*args, _original=original, _label=label, **kwargs):
+            probe.observe(_label)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(workflow, name, probing)
+
+    coordinator = _coordinator(tmp_path / "archive")
+    probe.coordinator = coordinator
+    view = _prepare(coordinator, historical_payload)
+
+    assert probe.labels == ["derive", "authority", "relation", "message"]
+    assert probe.under_lock == []
+    assert view.preparation_id == "prep-000001"
+
+
+def test_verification_persistence_and_reload_run_outside_the_registry_lock(
+    tmp_path: Path,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    expected_tag: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    probe = _RegistryLockProbe()
+    for name, label in (
+        ("verify_historical_pairing_confirmation_tag", "verify"),
+        ("persist_historical_evaluation_pairing", "persist"),
+        ("load_historical_evaluation_pairing", "load"),
+    ):
+        original = getattr(workflow, name)
+
+        def probing(*args, _original=original, _label=label, **kwargs):
+            probe.observe(_label)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(workflow, name, probing)
+
+    coordinator = _coordinator(tmp_path / "archive")
+    probe.coordinator = coordinator
+    view = _prepare(coordinator, historical_payload)
+    assert _confirm(coordinator, view, expected_tag).outcome == (
+        CONFIRMATION_ACCEPTED_ARCHIVE_AVAILABLE
+    )
+
+    assert probe.labels == ["verify", "persist", "load"]
+    assert probe.under_lock == []
+
+
+def test_an_injected_identifier_factory_may_reenter_without_deadlocking(
+    tmp_path: Path,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    expected_tag: str,
+):
+    """A bounded re-entry probe: one nested preparation from inside the callback.
+
+    The nesting depth is bounded to exactly one, so the probe terminates by
+    construction rather than by timing.  The worker thread carries the outer
+    preparation only so that a coordinator which invoked the callback under its
+    own non-reentrant lock fails this test instead of hanging the session.
+    """
+
+    holder: dict = {}
+    nested: list = []
+    identifiers = _sequential_identifiers()
+    depth = itertools.count()
+
+    def reentrant_factory() -> str:
+        if next(depth) == 0:
+            nested.append(_prepare(holder["coordinator"], historical_payload))
+        return identifiers()
+
+    coordinator = _coordinator(
+        tmp_path / "archive", preparation_id_factory=reentrant_factory
+    )
+    holder["coordinator"] = coordinator
+
+    outer: list = []
+    worker = threading.Thread(
+        target=lambda: outer.append(_prepare(coordinator, historical_payload)),
+        daemon=True,
+    )
+    worker.start()
+    worker.join(timeout=30)
+    assert not worker.is_alive(), (
+        "an injected preparation identifier factory deadlocked the coordinator"
+    )
+
+    assert len(nested) == 1 and len(outer) == 1
+    assert nested[0].preparation_id == "prep-000001"
+    assert outer[0].preparation_id == "prep-000002"
+    assert set(coordinator._preparations) == {"prep-000001", "prep-000002"}
+    # Both re-entered preparations are complete and independently confirmable.
+    for view in (nested[0], outer[0]):
+        assert coordinator._preparations[view.preparation_id].consumed is False
+    assert _confirm(coordinator, nested[0], expected_tag).outcome == (
+        CONFIRMATION_ACCEPTED_ARCHIVE_AVAILABLE
+    )
+    assert _confirm(coordinator, outer[0], expected_tag).outcome == (
+        CONFIRMATION_ACCEPTED_ARCHIVE_AVAILABLE
+    )
+
+
+class _LockObservingRegistry(dict):
+    """A registry that records whether each membership probe held the lock.
+
+    ``__contains__`` is reached only by the identifier-uniqueness decision, so a
+    probe that finds the lock free was taken outside it.  A non-blocking
+    acquisition decides that without any timing assumption.
+    """
+
+    def __init__(self, lock: threading.Lock) -> None:
+        super().__init__()
+        self._lock = lock
+        self.probes: list[bool] = []
+
+    def __contains__(self, key) -> bool:
+        acquired = self._lock.acquire(blocking=False)
+        if acquired:
+            self._lock.release()
+        self.probes.append(acquired)
+        return super().__contains__(key)
+
+
+def test_the_identifier_uniqueness_decision_is_made_under_the_registry_lock(
+    tmp_path: Path,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    expected_tag: str,
+):
+    """Candidate generation left the lock; the uniqueness decision did not.
+
+    A membership probe taken before the lock is acquired would let two
+    simultaneous preparations both conclude that the same candidate is free.
+    """
+
+    coordinator = _coordinator(tmp_path / "archive", max_preparations=4)
+    registry = _LockObservingRegistry(coordinator._lock)
+    coordinator._preparations = registry
+
+    first = _prepare(coordinator, historical_payload)
+    second = _prepare(coordinator, historical_payload)
+    assert first.preparation_id != second.preparation_id
+    coordinator._preparation_id_factory = lambda: first.preparation_id
+    with pytest.raises(PairingPreparationIdentifierUnavailable):
+        _prepare(coordinator, historical_payload)
+
+    # One probe for each accepted candidate plus one for each bounded collision.
+    assert len(registry.probes) == 2 + MAX_PREPARATION_ID_ATTEMPTS
+    assert registry.probes == [False] * len(registry.probes), registry.probes
+    assert _confirm(coordinator, first, expected_tag).outcome == (
+        CONFIRMATION_ACCEPTED_ARCHIVE_AVAILABLE
+    )
+
+
+def test_two_simultaneous_preparations_never_share_one_identifier(
+    tmp_path: Path,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+):
+    """Candidate generation moved out of the lock; uniqueness did not.
+
+    Both threads are handed exactly the same candidate sequence, so only an
+    atomic in-lock uniqueness decision can keep them apart.
+    """
+
+    previous_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        for index in range(8):
+            coordinator = _coordinator(
+                tmp_path / f"archive-{index}", max_preparations=8
+            )
+            calls = itertools.count()
+            sequence_lock = threading.Lock()
+
+            def shared_factory() -> str:
+                # Both threads are handed the very same first candidate; only
+                # the loser of the atomic in-lock decision ever sees another.
+                with sequence_lock:
+                    position = next(calls)
+                if position < 2:
+                    return "prep-shared-0000"
+                return f"prep-shared-{position:04d}"
+
+            coordinator._preparation_id_factory = shared_factory
+            barrier = threading.Barrier(2)
+
+            def attempt():
+                barrier.wait(timeout=60)
+                return _prepare(coordinator, historical_payload).preparation_id
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                identifiers = [
+                    future.result(timeout=60)
+                    for future in [pool.submit(attempt), pool.submit(attempt)]
+                ]
+            assert len(set(identifiers)) == 2, identifiers
+            assert "prep-shared-0000" in identifiers, identifiers
+            assert set(coordinator._preparations) == set(identifiers)
+            assert len(coordinator._preparations) == 2
+    finally:
+        sys.setswitchinterval(previous_interval)
+
+
+# ===========================================================================
+# L. Public identities are never credentials.
+#
+# The public preparation view deliberately exposes several lowercase SHA-256
+# identities.  Each is syntactically indistinguishable from a confirmation tag
+# and none is a credential, so every one of them must be refused exactly like
+# any other wrong tag.
+# ===========================================================================
+
+
+def _public_identity_candidate_tags(
+    view: HistoricalEvaluationPairingPreparationView,
+    expected_authority: HistoricalEvaluationPairingAuthority,
+    other_authority: HistoricalEvaluationPairingAuthority,
+) -> tuple[tuple[str, str], ...]:
+    """Syntactically valid, semantically worthless confirmation-tag candidates."""
+
+    authority_bytes = canonical_bytes(expected_authority.to_dict())
+    return (
+        ("authority-fingerprint", view.authority_fingerprint),
+        ("evaluation-profile-fingerprint", view.evaluation_profile_fingerprint),
+        (
+            "target-payload-fingerprint",
+            view.target_authorization_payload_fingerprint,
+        ),
+        (
+            "preparation-id-digest",
+            hashlib.sha256(view.preparation_id.encode("utf-8")).hexdigest(),
+        ),
+        (
+            "confirmation-message-digest",
+            hashlib.sha256(view.confirmation_message).hexdigest(),
+        ),
+        (
+            "runtime-owner-authorization-digest",
+            hashlib.sha256(WORKFLOW_SECRET + b"\0" + authority_bytes).hexdigest(),
+        ),
+        ("all-zero", "0" * 64),
+        ("all-f", "f" * 64),
+        (
+            "other-authority-valid-tag",
+            _independent_tag(WORKFLOW_SECRET, other_authority.to_dict()),
+        ),
+        (
+            "other-secret-valid-tag",
+            _independent_tag(OTHER_SECRET, expected_authority.to_dict()),
+        ),
+    )
+
+
+def test_no_public_identity_is_accepted_as_a_confirmation_tag(
+    tmp_path: Path,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    expected_profile: NativeMissionProfile,
+    expected_authority: HistoricalEvaluationPairingAuthority,
+    other_authority: HistoricalEvaluationPairingAuthority,
+    expected_tag: str,
+    forbidden_fragments: frozenset[str],
+):
+    archive_root = tmp_path / "archive"
+    coordinator = _coordinator(archive_root)
+    view = _prepare(coordinator, historical_payload)
+    pinned = coordinator._preparations[view.preparation_id]
+    candidates = _public_identity_candidate_tags(
+        view, expected_authority, other_authority
+    )
+    assert len(candidates) == 10
+    assert len({candidate for _label, candidate in candidates}) == 10
+
+    for label, candidate in candidates:
+        # Every candidate really is syntactically a well-formed tag, so nothing
+        # below can be refused merely as malformed input.
+        assert re.fullmatch(r"[0-9a-f]{64}", candidate), label
+        assert candidate != expected_tag, label
+
+        accepted = None
+        try:
+            accepted = _confirm(coordinator, view, candidate)
+        except PairingConfirmationRejected as exc:
+            rejection = exc
+        else:
+            rejection = None
+
+        # The load-bearing failure: an archive published without a valid tag.
+        assert _archive_documents(archive_root) == [], (
+            f"{label} caused an archive to be published without a valid tag"
+        )
+        assert not archive_root.exists(), label
+        assert accepted is None, f"{label} was accepted as a confirmation tag"
+        # One generic refusal for every wrong-but-well-formed candidate.
+        assert type(rejection) is PairingConfirmationRejected, label
+        assert str(rejection) == CONFIRMATION_REJECTED_MESSAGE, label
+        # No expected tag is read back, returned, or hinted at.
+        for rendered in (str(rejection), repr(rejection)):
+            assert expected_tag not in rendered, label
+            assert candidate not in rendered, label
+            assert _disclosures_in_text(rendered, forbidden_fragments) == [], label
+        # The preparation stays retryable and the reservation was released.
+        assert pinned.confirmation_reserved is False, label
+        assert pinned.consumed is False, label
+        assert coordinator._preparations[view.preparation_id] is pinned, label
+
+    # An independently computed Step 5C2A tag still confirms the same pairing.
+    result = _confirm(coordinator, view, expected_tag)
+    assert result.outcome == CONFIRMATION_ACCEPTED_ARCHIVE_AVAILABLE
+    assert _archive_documents(archive_root) == _expected_document_names(
+        expected_profile, historical_payload, expected_authority
+    )
+
+
+def test_public_identities_reach_the_accepted_verifier_as_ordinary_tags(
+    tmp_path: Path,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    expected_authority: HistoricalEvaluationPairingAuthority,
+    other_authority: HistoricalEvaluationPairingAuthority,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """No candidate is short-circuited into acceptance before verification."""
+
+    coordinator = _coordinator(tmp_path / "archive")
+    view = _prepare(coordinator, historical_payload)
+    presented: list[str] = []
+    real = workflow.verify_historical_pairing_confirmation_tag
+
+    def spy(*, configured_secret, pairing_authority, presented_tag):
+        presented.append(presented_tag)
+        return real(
+            configured_secret=configured_secret,
+            pairing_authority=pairing_authority,
+            presented_tag=presented_tag,
+        )
+
+    monkeypatch.setattr(workflow, "verify_historical_pairing_confirmation_tag", spy)
+    candidates = _public_identity_candidate_tags(
+        view, expected_authority, other_authority
+    )
+    for _label, candidate in candidates:
+        with pytest.raises(PairingConfirmationRejected):
+            _confirm(coordinator, view, candidate)
+    assert presented == [candidate for _label, candidate in candidates]
+
+
+# ===========================================================================
+# M. Confidentiality of the complete exception chain.
+#
+# A bounded top-level message proves nothing on its own: Python keeps the whole
+# ``__cause__``/``__context__`` chain reachable and a trusted caller renders it.
+# The dedicated fixture below therefore uses a deliberately short six-character
+# fragment threshold, and every chained exception is inspected.
+# ===========================================================================
+
+
+# Fixture material only.  Structureless printable ASCII, so no six-character
+# window of it can occur accidentally in ordinary text.
+CHAIN_SECRET = b"Wg4Yn7Bq2Kd9Fs5Tj1Vc8Lm3Zx6Ph0Ru4Aw7Eo2"
+CHAIN_OTHER_SECRET = b"Nz5Jr9Cw3Hf7Qb1Mk8Sv4Dp0Xt6Ly2Ug9Ia5Te3"
+_CHAIN_FRAGMENT_LENGTH = 6
+_CHAIN_MAX_DEPTH = 32
+
+
+def _chain_fragments(secret: bytes, *tags: str) -> frozenset[str]:
+    """Meaningful contiguous fragments of one secret and its related tags."""
+
+    text = secret.decode("ascii")
+    fragments: set[str] = {text, secret.hex(), repr(secret), *tags}
+    for rendered in (text, secret.hex(), *tags):
+        for start in range(len(rendered) - _CHAIN_FRAGMENT_LENGTH + 1):
+            fragments.add(rendered[start : start + _CHAIN_FRAGMENT_LENGTH])
+    return frozenset(fragments)
+
+
+def _rendered_exception_chain(
+    error: BaseException,
+    *,
+    max_depth: int = _CHAIN_MAX_DEPTH,
+) -> list[str]:
+    """Every renderable text of one exception and of its complete chain.
+
+    ``__cause__`` and ``__context__`` are both followed, including through a
+    ``raise ... from None`` that only suppresses traceback display.  Traversal
+    is bounded by ``max_depth`` and by identity, so a self-referential or cyclic
+    chain terminates.
+    """
+
+    rendered: list[str] = []
+    seen: set[int] = set()
+    pending: list[tuple[BaseException | None, int]] = [(error, 0)]
+    while pending:
+        current, depth = pending.pop()
+        if current is None or depth > max_depth or id(current) in seen:
+            continue
+        seen.add(id(current))
+        rendered.append(str(current))
+        rendered.append(repr(current))
+        rendered.extend(repr(argument) for argument in getattr(current, "args", ()))
+        rendered.extend(f"{name}={value!r}" for name, value in vars(current).items())
+        for attribute in ("filename", "filename2", "strerror", "msg", "reason"):
+            value = getattr(current, attribute, None)
+            if value is not None:
+                rendered.append(repr(value))
+        pending.append((current.__cause__, depth + 1))
+        pending.append((current.__context__, depth + 1))
+    return rendered
+
+
+def _chain_disclosures(
+    error: BaseException,
+    fragments: frozenset[str],
+) -> list[str]:
+    """Every forbidden fragment carried anywhere in one exception chain."""
+
+    found: list[str] = []
+    for rendered in _rendered_exception_chain(error):
+        found.extend(
+            f"{fragment!r} disclosed by {rendered[:120]!r}"
+            for fragment in _disclosures_in_text(rendered, fragments)
+        )
+    return found
+
+
+@pytest.fixture(scope="module")
+def chain_authority(
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    expected_profile: NativeMissionProfile,
+) -> HistoricalEvaluationPairingAuthority:
+    return create_historical_evaluation_pairing_authority(
+        actor_id=ACTOR_ID,
+        evaluation_profile=expected_profile,
+        target_authorization_payload=historical_payload,
+    )
+
+
+@pytest.fixture(scope="module")
+def chain_expected_tag(chain_authority: HistoricalEvaluationPairingAuthority) -> str:
+    return _independent_tag(CHAIN_SECRET, chain_authority.to_dict())
+
+
+@pytest.fixture(scope="module")
+def chain_presented_tag(chain_authority: HistoricalEvaluationPairingAuthority) -> str:
+    return _independent_tag(CHAIN_OTHER_SECRET, chain_authority.to_dict())
+
+
+@pytest.fixture(scope="module")
+def chain_fragments(
+    chain_expected_tag: str,
+    chain_presented_tag: str,
+) -> frozenset[str]:
+    return _chain_fragments(CHAIN_SECRET, chain_expected_tag, chain_presented_tag)
+
+
+def test_the_exception_chain_scanner_is_armed_and_bounded(
+    chain_fragments: frozenset[str],
+    chain_expected_tag: str,
+):
+    assert CHAIN_SECRET.isascii() and CHAIN_SECRET.decode("ascii").isprintable()
+    assert MIN_CONFIRMATION_SECRET_BYTES <= len(CHAIN_SECRET)
+    assert _CHAIN_FRAGMENT_LENGTH <= 6
+    assert min(len(fragment) for fragment in chain_fragments) == (
+        _CHAIN_FRAGMENT_LENGTH
+    )
+
+    secret_fragment = CHAIN_SECRET.decode("ascii")[7 : 7 + _CHAIN_FRAGMENT_LENGTH]
+    tag_fragment = chain_expected_tag[9 : 9 + _CHAIN_FRAGMENT_LENGTH]
+    assert {secret_fragment, tag_fragment} <= chain_fragments
+
+    # A leak through __cause__ is caught.
+    try:
+        raise PairingConfirmationRejected(
+            CONFIRMATION_REJECTED_MESSAGE
+        ) from ValueError(f"key={secret_fragment}")
+    except PairingConfirmationRejected as exc:
+        assert _chain_disclosures(exc, chain_fragments) != []
+
+    # A leak through __context__ is caught even when it is suppressed for
+    # traceback display by a bare "from None".
+    try:
+        try:
+            raise ValueError(f"expected={tag_fragment}")
+        except ValueError:
+            raise PairingConfirmationRejected(CONFIRMATION_REJECTED_MESSAGE) from None
+    except PairingConfirmationRejected as exc:
+        assert exc.__cause__ is None
+        assert exc.__suppress_context__ is True
+        assert _chain_disclosures(exc, chain_fragments) != []
+
+    # A leak two links deep, through a mixed cause and context chain, is caught.
+    try:
+        try:
+            raise OSError(f"deep={secret_fragment}")
+        except OSError as inner:
+            raise ValueError("middle") from inner
+    except ValueError as middle:
+        outer = PairingArchiveWriteFailed("bounded")
+        outer.__cause__ = middle
+        assert _chain_disclosures(outer, chain_fragments) != []
+
+    # A structured attribute is caught.
+    structured = PairingArchiveWriteFailed("bounded")
+    structured.detail = f"secret={secret_fragment}"
+    assert _chain_disclosures(structured, chain_fragments) != []
+
+    # A cyclic chain terminates instead of exhausting the interpreter.
+    first = RuntimeError("first")
+    second = RuntimeError("second")
+    first.__cause__ = second
+    second.__cause__ = first
+    assert len(_rendered_exception_chain(first)) < 100
+    assert _chain_disclosures(first, chain_fragments) == []
+
+    # The depth limit really is a bound.
+    deepest = RuntimeError(f"deepest={secret_fragment}")
+    current: BaseException = deepest
+    for _link in range(_CHAIN_MAX_DEPTH + 5):
+        wrapper = RuntimeError("link")
+        wrapper.__cause__ = current
+        current = wrapper
+    assert _chain_disclosures(current, chain_fragments) == []
+    assert _chain_disclosures(deepest, chain_fragments) != []
+
+
+def test_no_exception_chain_carries_secret_or_tag_derived_material(
+    tmp_path: Path,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    expected_profile: NativeMissionProfile,
+    chain_authority: HistoricalEvaluationPairingAuthority,
+    chain_expected_tag: str,
+    chain_presented_tag: str,
+    chain_fragments: frozenset[str],
+    monkeypatch: pytest.MonkeyPatch,
+):
+    archive_root = tmp_path / "chain-archive"
+    coordinator = _coordinator(
+        archive_root, configured_secret=CHAIN_SECRET, max_preparations=2
+    )
+    view = _prepare(coordinator, historical_payload)
+    assert view.authority_fingerprint == chain_authority.authority_fingerprint
+
+    collected: list[tuple[str, BaseException]] = []
+
+    def capture(label: str, callable_) -> None:
+        try:
+            callable_()
+        except HistoricalPairingWorkflowError as exc:
+            collected.append((label, exc))
+            return
+        raise AssertionError(f"{label}: a bounded coordinator error was expected")
+
+    capture(
+        "invalid-configuration",
+        lambda: _coordinator(archive_root, configured_secret=b"short"),
+    )
+    capture(
+        "invalid-preparation",
+        lambda: _prepare(coordinator, historical_payload, result_claims=[]),
+    )
+    capture("wrong-tag", lambda: _confirm(coordinator, view, chain_presented_tag))
+    capture("malformed-tag", lambda: _confirm(coordinator, view, "Z" * 64))
+    capture(
+        "stale-fingerprint",
+        lambda: _confirm(
+            coordinator,
+            view,
+            chain_expected_tag,
+            expected_authority_fingerprint="a" * 64,
+        ),
+    )
+    capture(
+        "unknown-preparation",
+        lambda: _confirm(
+            coordinator, view, chain_expected_tag, preparation_id="absent-000001"
+        ),
+    )
+    capture(
+        "malformed-preparation-identifier",
+        lambda: _confirm(coordinator, view, chain_expected_tag, preparation_id="x"),
+    )
+
+    with monkeypatch.context() as patched:
+        patched.setattr(
+            workflow,
+            "verify_historical_pairing_confirmation_tag",
+            mock.Mock(side_effect=ValueError("simulated verifier refusal")),
+        )
+        capture("verifier-raised", lambda: _confirm(coordinator, view, chain_expected_tag))
+
+    # A real internal cause: its message names the archive path, which is the
+    # one kind of detail the trusted chain is allowed to carry.
+    with monkeypatch.context() as patched:
+        patched.setattr(
+            workflow,
+            "persist_historical_evaluation_pairing",
+            mock.Mock(side_effect=OSError(f"simulated write failure at {archive_root}")),
+        )
+        capture(
+            "persistence-failed",
+            lambda: _confirm(coordinator, view, chain_expected_tag),
+        )
+    with monkeypatch.context() as patched:
+        patched.setattr(
+            workflow,
+            "load_historical_evaluation_pairing",
+            mock.Mock(side_effect=OSError(f"simulated reload failure at {archive_root}")),
+        )
+        capture("reload-failed", lambda: _confirm(coordinator, view, chain_expected_tag))
+    with monkeypatch.context() as patched:
+        foreign = HistoricalEvaluationPairingBundle(
+            evaluation_profile=expected_profile,
+            target_authorization_payload=historical_payload,
+            pairing_authority=replace(chain_authority, actor_id=OTHER_ACTOR_ID),
+        )
+        patched.setattr(
+            workflow, "load_historical_evaluation_pairing", lambda **kwargs: foreign
+        )
+        capture("content-mismatch", lambda: _confirm(coordinator, view, chain_expected_tag))
+
+    conflicting = (
+        archive_root
+        / AUTHORITY_DIRECTORY_NAME
+        / f"{chain_authority.authority_fingerprint}{AUTHORITY_FILE_SUFFIX}"
+    )
+    conflicting.parent.mkdir(parents=True, exist_ok=True)
+    conflicting.write_bytes(b'{"conflicting":"bytes"}')
+    capture("archive-conflict", lambda: _confirm(coordinator, view, chain_expected_tag))
+    conflicting.unlink()
+
+    _prepare(coordinator, historical_payload)
+    capture("capacity", lambda: _prepare(coordinator, historical_payload))
+
+    # Capacity is checked before uniqueness, so an exhausted identifier needs a
+    # coordinator that still has room.
+    roomy = _coordinator(
+        archive_root, configured_secret=CHAIN_SECRET, max_preparations=4
+    )
+    taken = _prepare(roomy, historical_payload).preparation_id
+    roomy._preparation_id_factory = lambda: taken
+    capture("identifier-unavailable", lambda: _prepare(roomy, historical_payload))
+
+    assert len(collected) == 14
+    # Every distinct bounded failure class really was exercised, so the scan
+    # below covers the complete refusal surface rather than one repeated path.
+    assert {label: type(error) for label, error in collected} == {
+        "invalid-configuration": InvalidPairingCoordinatorConfiguration,
+        "invalid-preparation": InvalidPairingPreparationRequest,
+        "wrong-tag": PairingConfirmationRejected,
+        "malformed-tag": MalformedPairingConfirmationTag,
+        "stale-fingerprint": StalePairingAuthorityFingerprint,
+        "unknown-preparation": PairingPreparationNotFound,
+        "malformed-preparation-identifier": InvalidPairingPreparationRequest,
+        "verifier-raised": PairingConfirmationRejected,
+        "persistence-failed": PairingArchiveWriteFailed,
+        "reload-failed": PairingArchiveReloadFailed,
+        "content-mismatch": PairingArchiveContentMismatch,
+        "archive-conflict": PairingArchiveConflict,
+        "capacity": PairingPreparationCapacityExhausted,
+        "identifier-unavailable": PairingPreparationIdentifierUnavailable,
+    }
+    for label, error in collected:
+        assert _chain_disclosures(error, chain_fragments) == [], label
+        for rendered in _rendered_exception_chain(error):
+            assert chain_expected_tag not in rendered, label
+            assert chain_presented_tag not in rendered, label
+            assert CHAIN_SECRET.decode("ascii") not in rendered, label
+            assert CHAIN_SECRET.hex() not in rendered, label
+
+    # The scan really did reach chained causes: the tolerated archive path is
+    # present inside one internal cause and absent from every bounded message.
+    by_label = dict(collected)
+    persistence_chain = "\n".join(
+        _rendered_exception_chain(by_label["persistence-failed"])
+    )
+    assert str(archive_root) in persistence_chain
+    assert by_label["persistence-failed"].__cause__ is not None
+    for _label, error in collected:
+        assert str(archive_root) not in str(error)
+
+
+# ===========================================================================
+# N. A reserved preparation is never reclaimed.
+#
+# Expiry and capacity cleanup both run while another thread may be inside
+# verification or persistence holding exactly one pinned preparation.  Evicting
+# that record would let a second confirmation republish under a reused
+# identifier, so a reservation is an absolute cleanup barrier.
+# ===========================================================================
+
+
+class _BlockedConfirmation:
+    """Hold one confirmation inside a chosen accepted call until released.
+
+    The confirmation runs on a worker thread and parks inside the patched call,
+    so the preparation stays reserved for the whole ``with`` body while the main
+    thread exercises cleanup.
+    """
+
+    def __init__(self, coordinator, view, tag: str, *, name: str) -> None:
+        self._coordinator = coordinator
+        self._view = view
+        self._tag = tag
+        self._name = name
+        self.entered = threading.Event()
+        self._proceed = threading.Event()
+        self._patch = None
+        self._pool = None
+        self._pending = None
+
+    def __enter__(self) -> "_BlockedConfirmation":
+        original = getattr(workflow, self._name)
+        proceed = self._proceed
+        entered = self.entered
+
+        def blocking(*args, **kwargs):
+            entered.set()
+            assert proceed.wait(timeout=60)
+            return original(*args, **kwargs)
+
+        self._patch = mock.patch.object(workflow, self._name, blocking)
+        self._patch.start()
+        self._pool = ThreadPoolExecutor(max_workers=1)
+        self._pending = self._pool.submit(
+            _confirm, self._coordinator, self._view, self._tag
+        )
+        assert self.entered.wait(timeout=60)
+        return self
+
+    def release(self):
+        self._proceed.set()
+        return self._pending.result(timeout=60)
+
+    def __exit__(self, *exception) -> bool:
+        self._proceed.set()
+        try:
+            self._pending.exception(timeout=60)
+        finally:
+            self._pool.shutdown(wait=True)
+            self._patch.stop()
+        return False
+
+
+_RESERVATION_STAGES = (
+    ("verification", "verify_historical_pairing_confirmation_tag"),
+    ("persistence", "persist_historical_evaluation_pairing"),
+)
+
+
+@pytest.mark.parametrize(
+    "blocked_call",
+    [name for _label, name in _RESERVATION_STAGES],
+    ids=[label for label, _name in _RESERVATION_STAGES],
+)
+def test_cleanup_never_reclaims_a_reserved_preparation(
+    tmp_path: Path,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    expected_profile: NativeMissionProfile,
+    expected_authority: HistoricalEvaluationPairingAuthority,
+    expected_tag: str,
+    blocked_call: str,
+):
+    archive_root = tmp_path / "archive"
+    clock = _FakeClock()
+    coordinator = _coordinator(
+        archive_root,
+        max_preparations=1,
+        preparation_ttl_seconds=30,
+        clock=clock,
+    )
+    view = _prepare(coordinator, historical_payload)
+    pinned = coordinator._preparations[view.preparation_id]
+
+    with _BlockedConfirmation(
+        coordinator, view, expected_tag, name=blocked_call
+    ) as blocked:
+        assert pinned.confirmation_reserved is True
+        assert pinned.consumed is False
+
+        # Reserved and otherwise active: cleanup keeps it and capacity refuses.
+        with pytest.raises(PairingPreparationCapacityExhausted):
+            _prepare(coordinator, historical_payload)
+        assert coordinator._preparations[view.preparation_id] is pinned
+
+        # A concurrent locator resolution cannot reclaim it either.
+        with pytest.raises(PairingPreparationInUse):
+            _confirm(coordinator, view, expected_tag)
+        assert coordinator._preparations[view.preparation_id] is pinned
+
+        # Reserved after crossing the TTL: still not reclaimed, still refusing.
+        clock.advance(31)
+        assert clock.value - pinned.created_at >= 30
+        for _round in range(3):
+            with pytest.raises(PairingPreparationCapacityExhausted):
+                _prepare(coordinator, historical_payload)
+        assert coordinator._preparations[view.preparation_id] is pinned
+
+        # An expired but reserved record is refused as expired and, unlike an
+        # unreserved one, is deliberately not dropped by that refusal.
+        with pytest.raises(PairingPreparationExpired):
+            _confirm(coordinator, view, expected_tag)
+        assert coordinator._preparations[view.preparation_id] is pinned
+
+        # The active confirmation still holds exactly its pinned objects.
+        assert pinned.evaluation_profile is not None
+        assert pinned.target_authorization_payload is historical_payload
+        assert pinned.pairing_authority == expected_authority
+        assert pinned.confirmation_reserved is True
+
+        result = blocked.release()
+
+    assert result.outcome == CONFIRMATION_ACCEPTED_ARCHIVE_AVAILABLE
+    assert result.asserted_actor_id == ACTOR_ID
+    assert result.authority_fingerprint == expected_authority.authority_fingerprint
+    assert _archive_documents(archive_root) == _expected_document_names(
+        expected_profile, historical_payload, expected_authority
+    )
+    # Released and consumed, the record becomes ordinarily reclaimable again.
+    assert pinned.confirmation_reserved is False
+    assert pinned.consumed is True
+    replacement = _prepare(coordinator, historical_payload)
+    assert replacement.preparation_id != view.preparation_id
+
+
+def test_a_reserved_identifier_is_never_reissued(
+    tmp_path: Path,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    expected_tag: str,
+):
+    """The reserved locator stays taken until its record is truly reclaimable."""
+
+    clock = _FakeClock()
+    coordinator = _coordinator(
+        tmp_path / "archive",
+        max_preparations=4,
+        preparation_ttl_seconds=30,
+        clock=clock,
+        preparation_id_factory=lambda: "prep-reserved-0001",
+    )
+    view = _prepare(coordinator, historical_payload)
+    assert view.preparation_id == "prep-reserved-0001"
+
+    with _BlockedConfirmation(
+        coordinator,
+        view,
+        expected_tag,
+        name="persist_historical_evaluation_pairing",
+    ) as blocked:
+        # Reserved: the identifier cannot be handed out again even though the
+        # coordinator has capacity left.
+        with pytest.raises(PairingPreparationIdentifierUnavailable):
+            _prepare(coordinator, historical_payload)
+        # Still reserved after the TTL has passed: still not reissued.
+        clock.advance(31)
+        with pytest.raises(PairingPreparationIdentifierUnavailable):
+            _prepare(coordinator, historical_payload)
+        assert "prep-reserved-0001" in coordinator._preparations
+        blocked.release()
+
+    # Released and now ordinarily reclaimable, the locator frees up.
+    reissued = _prepare(coordinator, historical_payload)
+    assert reissued.preparation_id == "prep-reserved-0001"
+    assert coordinator._preparations["prep-reserved-0001"].consumed is False
+    # A consumed but still live record keeps its locator: only reclamation
+    # releases it, and capacity is deliberately not exhausted here.
+    assert _confirm(coordinator, reissued, expected_tag).outcome == (
+        CONFIRMATION_ACCEPTED_ARCHIVE_AVAILABLE
+    )
+    assert coordinator._preparations["prep-reserved-0001"].consumed is True
+    with pytest.raises(PairingPreparationIdentifierUnavailable):
+        _prepare(coordinator, historical_payload)
+
+
+# ===========================================================================
+# O. Interleaved preparations stay attributed and persisted separately.
+# ===========================================================================
+
+
+def _other_owner_material(payload: NativeCanaryAuthorizationPayloadV4) -> dict:
+    """Owner material whose claim prose differs from the module fixture."""
+
+    material = _owner_material(payload)
+    material["result_claims"][0]["statement"] = (
+        "The zulu behavior exists in the second recorded material."
+    )
+    return material
+
+
+@pytest.fixture(scope="module")
+def other_historical_payload(
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+) -> NativeCanaryAuthorizationPayloadV4:
+    """A second exact historical payload with its own canonical identity."""
+
+    document = historical_payload.to_dict()
+    document["source_head"] = "b" * 40
+    assert document["source_head"] != historical_payload.source_head
+    payload = load_historical_native_canary_authorization_payload_v4(
+        _refingerprint_payload(document)
+    )
+    assert payload.payload_fingerprint != historical_payload.payload_fingerprint
+    return payload
+
+
+@pytest.fixture(scope="module")
+def other_expected_profile(
+    other_historical_payload: NativeCanaryAuthorizationPayloadV4,
+) -> NativeMissionProfile:
+    return derive_historical_v5_evaluation_profile(
+        target_authorization_payload=other_historical_payload,
+        **_other_owner_material(other_historical_payload),
+    )
+
+
+@pytest.fixture(scope="module")
+def other_pairing_authority(
+    other_historical_payload: NativeCanaryAuthorizationPayloadV4,
+    other_expected_profile: NativeMissionProfile,
+) -> HistoricalEvaluationPairingAuthority:
+    return create_historical_evaluation_pairing_authority(
+        actor_id=OTHER_ACTOR_ID,
+        evaluation_profile=other_expected_profile,
+        target_authorization_payload=other_historical_payload,
+    )
+
+
+@pytest.fixture(scope="module")
+def other_pairing_tag(
+    other_pairing_authority: HistoricalEvaluationPairingAuthority,
+) -> str:
+    return _independent_tag(WORKFLOW_SECRET, other_pairing_authority.to_dict())
+
+
+def _prepare_other(coordinator, payload: NativeCanaryAuthorizationPayloadV4):
+    return coordinator.prepare_historical_evaluation_pairing(
+        target_authorization_payload=payload,
+        actor_id=OTHER_ACTOR_ID,
+        **_other_owner_material(payload),
+    )
+
+
+def test_the_two_interleaved_fixtures_really_are_distinct(
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    other_historical_payload: NativeCanaryAuthorizationPayloadV4,
+    expected_profile: NativeMissionProfile,
+    other_expected_profile: NativeMissionProfile,
+    expected_authority: HistoricalEvaluationPairingAuthority,
+    other_pairing_authority: HistoricalEvaluationPairingAuthority,
+):
+    assert expected_authority.actor_id != other_pairing_authority.actor_id
+    assert historical_payload.payload_fingerprint != (
+        other_historical_payload.payload_fingerprint
+    )
+    assert expected_profile.profile_fingerprint != (
+        other_expected_profile.profile_fingerprint
+    )
+    assert expected_authority.authority_fingerprint != (
+        other_pairing_authority.authority_fingerprint
+    )
+    assert other_expected_profile.schema_version == MISSION_PROFILE_SCHEMA_VERSION_V5
+    assert other_expected_profile.is_launchable_runtime_profile is False
+
+
+def test_interleaved_confirmations_keep_their_own_result_attribution(
+    tmp_path: Path,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    other_historical_payload: NativeCanaryAuthorizationPayloadV4,
+    expected_profile: NativeMissionProfile,
+    other_expected_profile: NativeMissionProfile,
+    expected_authority: HistoricalEvaluationPairingAuthority,
+    other_pairing_authority: HistoricalEvaluationPairingAuthority,
+    expected_tag: str,
+    other_pairing_tag: str,
+):
+    coordinator = _coordinator(tmp_path / "archive")
+    first = _prepare(coordinator, historical_payload)
+    second = _prepare_other(coordinator, other_historical_payload)
+    assert first.preparation_id != second.preparation_id
+
+    # A is confirmed only after B already exists in the registry.
+    first_result = _confirm(coordinator, first, expected_tag)
+    second_result = _confirm(coordinator, second, other_pairing_tag)
+
+    for result, actor, profile, payload, authority in (
+        (
+            first_result,
+            ACTOR_ID,
+            expected_profile,
+            historical_payload,
+            expected_authority,
+        ),
+        (
+            second_result,
+            OTHER_ACTOR_ID,
+            other_expected_profile,
+            other_historical_payload,
+            other_pairing_authority,
+        ),
+    ):
+        assert result.asserted_actor_id == actor
+        assert result.authority_fingerprint == authority.authority_fingerprint
+        assert result.evaluation_profile_fingerprint == profile.profile_fingerprint
+        assert result.target_authorization_payload_fingerprint == (
+            payload.payload_fingerprint
+        )
+        # Every value is also the one carried by this result's own reloaded
+        # bundle, so no coordinator-level "latest" value could have supplied it.
+        bundle = result.archived_pairing
+        assert bundle.pairing_authority.actor_id == actor
+        assert bundle.pairing_authority.authority_fingerprint == (
+            result.authority_fingerprint
+        )
+        assert bundle.evaluation_profile.profile_fingerprint == (
+            result.evaluation_profile_fingerprint
+        )
+        assert bundle.target_authorization_payload.payload_fingerprint == (
+            result.target_authorization_payload_fingerprint
+        )
+        assert canonical_bytes(bundle.evaluation_profile.to_dict()) == (
+            canonical_bytes(profile.to_dict())
+        )
+        assert canonical_bytes(bundle.target_authorization_payload.to_dict()) == (
+            canonical_bytes(payload.to_dict())
+        )
+        assert canonical_bytes(bundle.pairing_authority.to_dict()) == (
+            canonical_bytes(authority.to_dict())
+        )
+
+    assert first_result.preparation_id == first.preparation_id
+    assert second_result.preparation_id == second.preparation_id
+    assert first_result.asserted_actor_id != second_result.asserted_actor_id
+
+
+def test_an_earlier_confirmation_persists_exactly_its_own_documents(
+    tmp_path: Path,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    other_historical_payload: NativeCanaryAuthorizationPayloadV4,
+    expected_profile: NativeMissionProfile,
+    other_expected_profile: NativeMissionProfile,
+    expected_authority: HistoricalEvaluationPairingAuthority,
+    other_pairing_authority: HistoricalEvaluationPairingAuthority,
+    expected_tag: str,
+    other_pairing_tag: str,
+):
+    """Distinct from result attribution: this pins the published bytes."""
+
+    archive_root = tmp_path / "archive"
+    coordinator = _coordinator(archive_root)
+    first = _prepare(coordinator, historical_payload)
+    second = _prepare_other(coordinator, other_historical_payload)
+
+    # Confirming A must publish exactly A's three documents.  Reporting the
+    # archive state on failure keeps the diagnosis semantic: a coordinator that
+    # published a later preparation's documents cannot then reload its own.
+    try:
+        _confirm(coordinator, first, expected_tag)
+    except HistoricalPairingWorkflowError as exc:
+        raise AssertionError(
+            "confirming the earlier preparation did not publish its own "
+            f"documents: archive={_archive_documents(archive_root)} "
+            f"error={type(exc).__name__}"
+        ) from None
+    first_names = _expected_document_names(
+        expected_profile, historical_payload, expected_authority
+    )
+    second_names = _expected_document_names(
+        other_expected_profile, other_historical_payload, other_pairing_authority
+    )
+    assert set(first_names).isdisjoint(second_names)
+    # Only A's three documents exist while B is still merely prepared.
+    assert _archive_documents(archive_root) == first_names
+
+    _confirm(coordinator, second, other_pairing_tag)
+    assert _archive_documents(archive_root) == sorted(first_names + second_names)
+
+    for profile, payload, authority in (
+        (expected_profile, historical_payload, expected_authority),
+        (other_expected_profile, other_historical_payload, other_pairing_authority),
+    ):
+        bundle = load_historical_evaluation_pairing(
+            archive_root=archive_root,
+            authority_fingerprint=authority.authority_fingerprint,
+        )
+        assert canonical_bytes(bundle.evaluation_profile.to_dict()) == (
+            canonical_bytes(profile.to_dict())
+        )
+        assert canonical_bytes(bundle.target_authorization_payload.to_dict()) == (
+            canonical_bytes(payload.to_dict())
+        )
+        assert canonical_bytes(bundle.pairing_authority.to_dict()) == (
+            canonical_bytes(authority.to_dict())
+        )
+
+
+# ===========================================================================
+# P. All three reloaded documents are compared as exact canonical bytes.
+#
+# Each case below replaces exactly one referenced object in an otherwise exact
+# reloaded bundle.  Every forgery keeps the expected fingerprint field and
+# differs only in canonical body bytes, so neither a fingerprint-only
+# comparison nor an authority-only comparison can notice it.
+# ===========================================================================
+
+
+def _forged_documents(
+    expected_profile: NativeMissionProfile,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    expected_authority: HistoricalEvaluationPairingAuthority,
+) -> dict:
+    """One bypass-loaded variant per document, each fingerprint-preserving."""
+
+    return {
+        "profile": replace(
+            expected_profile,
+            mission_text=expected_profile.mission_text + "\nforged historical body",
+        ),
+        "payload": replace(historical_payload, source_head="c" * 40),
+        "authority": replace(expected_authority, actor_id=OTHER_ACTOR_ID),
+    }
+
+
+def test_the_forged_reload_documents_are_fingerprint_preserving(
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    expected_profile: NativeMissionProfile,
+    expected_authority: HistoricalEvaluationPairingAuthority,
+):
+    forged = _forged_documents(
+        expected_profile, historical_payload, expected_authority
+    )
+    expected = {
+        "profile": expected_profile,
+        "payload": historical_payload,
+        "authority": expected_authority,
+    }
+    fingerprint_fields = {
+        "profile": "profile_fingerprint",
+        "payload": "payload_fingerprint",
+        "authority": "authority_fingerprint",
+    }
+    for document, candidate in forged.items():
+        original = expected[document]
+        assert type(candidate) is type(original), document
+        assert getattr(candidate, fingerprint_fields[document]) == getattr(
+            original, fingerprint_fields[document]
+        ), document
+        assert canonical_bytes(candidate.to_dict()) != canonical_bytes(
+            original.to_dict()
+        ), document
+    # The forgeries are deliberately unreachable through the canonical
+    # constructors: only a bypass-loaded object can carry a fingerprint field
+    # that does not match its own body, which is exactly why the coordinator
+    # must compare bytes rather than trust the field.
+    with pytest.raises((TypeError, ValueError)):
+        NativeMissionProfile.from_dict(forged["profile"].to_dict())
+    with pytest.raises((TypeError, ValueError)):
+        load_historical_native_canary_authorization_payload_v4(
+            forged["payload"].to_dict()
+        )
+    with pytest.raises((TypeError, ValueError)):
+        HistoricalEvaluationPairingAuthority.from_dict(forged["authority"].to_dict())
+    # The forged profile is still non-launchable, so a launchability guard can
+    # never be what refuses it.
+    assert forged["profile"].is_launchable_runtime_profile is False
+    assert forged["profile"].schema_version == MISSION_PROFILE_SCHEMA_VERSION_V5
+
+
+@pytest.mark.parametrize("document", ["profile", "payload", "authority"])
+def test_one_differing_reloaded_document_is_refused_by_byte_comparison(
+    tmp_path: Path,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    expected_profile: NativeMissionProfile,
+    expected_authority: HistoricalEvaluationPairingAuthority,
+    expected_tag: str,
+    monkeypatch: pytest.MonkeyPatch,
+    document: str,
+):
+    archive_root = tmp_path / "archive"
+    coordinator = _coordinator(archive_root)
+    view = _prepare(coordinator, historical_payload)
+    forged = _forged_documents(
+        expected_profile, historical_payload, expected_authority
+    )[document]
+
+    members = {
+        "evaluation_profile": expected_profile,
+        "target_authorization_payload": historical_payload,
+        "pairing_authority": expected_authority,
+    }
+    members[
+        {
+            "profile": "evaluation_profile",
+            "payload": "target_authorization_payload",
+            "authority": "pairing_authority",
+        }[document]
+    ] = forged
+    bundle = HistoricalEvaluationPairingBundle(**members)
+    assert isinstance(bundle, HistoricalEvaluationPairingBundle)
+    # Exactly one referenced object differs; the other two are the exact
+    # expected objects, by identity.
+    differing = [
+        name
+        for name, member in (
+            ("evaluation_profile", bundle.evaluation_profile),
+            ("target_authorization_payload", bundle.target_authorization_payload),
+            ("pairing_authority", bundle.pairing_authority),
+        )
+        if member is not {
+            "evaluation_profile": expected_profile,
+            "target_authorization_payload": historical_payload,
+            "pairing_authority": expected_authority,
+        }[name]
+    ]
+    assert len(differing) == 1
+
+    monkeypatch.setattr(
+        workflow, "load_historical_evaluation_pairing", lambda **kwargs: bundle
+    )
+    with pytest.raises(PairingArchiveContentMismatch) as caught:
+        _confirm(coordinator, view, expected_tag)
+    # The byte-comparison layer refused it, not the reload type gate.
+    assert type(caught.value) is PairingArchiveContentMismatch
+    assert str(caught.value) == (
+        "reloaded historical pairing documents are not the exact pinned "
+        "canonical bytes"
+    )
+
+    # The preparation was not consumed, so the exact retry still succeeds.
+    monkeypatch.undo()
+    result = _confirm(coordinator, view, expected_tag)
+    assert result.outcome == CONFIRMATION_ACCEPTED_ARCHIVE_AVAILABLE
+    assert _archive_documents(archive_root) == _expected_document_names(
+        expected_profile, historical_payload, expected_authority
+    )
+    assert canonical_bytes(
+        result.archived_pairing.pairing_authority.to_dict()
+    ) == canonical_bytes(expected_authority.to_dict())
+
+
+# ===========================================================================
+# Q. Staleness compares the complete fingerprint, never a prefix.
+# ===========================================================================
+
+
+def _prefix_sharing_fingerprint(expected: str, shared: int) -> str:
+    """A different valid lowercase SHA-256 sharing ``shared`` leading characters."""
+
+    for counter in itertools.count():
+        digest = hashlib.sha256(f"stale-{shared}-{counter}".encode("utf-8")).hexdigest()
+        candidate = expected[:shared] + digest[shared:]
+        if candidate != expected:
+            return candidate
+    raise AssertionError("unreachable")
+
+
+@pytest.mark.parametrize("shared", [8, 16, 32, 63])
+def test_a_prefix_sharing_authority_fingerprint_is_still_stale(
+    tmp_path: Path,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    expected_authority: HistoricalEvaluationPairingAuthority,
+    expected_tag: str,
+    monkeypatch: pytest.MonkeyPatch,
+    shared: int,
+):
+    archive_root = tmp_path / "archive"
+    coordinator = _SecretAccessRecordingCoordinator(
+        configured_secret=WORKFLOW_SECRET,
+        archive_root=archive_root,
+        preparation_ttl_seconds=600,
+        max_preparations=8,
+        clock=_FakeClock(),
+        preparation_id_factory=_sequential_identifiers(),
+    )
+    view = _prepare(coordinator, historical_payload)
+    expected_fingerprint = expected_authority.authority_fingerprint
+    candidate = _prefix_sharing_fingerprint(expected_fingerprint, shared)
+
+    assert re.fullmatch(r"[0-9a-f]{64}", candidate)
+    assert candidate != expected_fingerprint
+    assert candidate[:shared] == expected_fingerprint[:shared]
+    assert candidate[shared:] != expected_fingerprint[shared:]
+
+    verifications: list[str] = []
+    monkeypatch.setattr(
+        workflow,
+        "verify_historical_pairing_confirmation_tag",
+        lambda **kwargs: verifications.append("verify") or True,
+    )
+    # The presented tag is the genuinely valid one, so only a complete
+    # fingerprint comparison can refuse this call.
+    with pytest.raises(StalePairingAuthorityFingerprint):
+        _confirm(
+            coordinator,
+            view,
+            expected_tag,
+            expected_authority_fingerprint=candidate,
+        )
+    assert verifications == []
+    assert coordinator.secret_reads == []
+    assert not archive_root.exists()
+    assert _archive_documents(archive_root) == []
+
+    # The exact fingerprint still confirms the same preparation.
+    monkeypatch.undo()
+    assert _confirm(coordinator, view, expected_tag).outcome == (
+        CONFIRMATION_ACCEPTED_ARCHIVE_AVAILABLE
+    )
+    assert coordinator.secret_reads == ["read"]
+
+
+# ===========================================================================
+# R. The review projection is a bounded headless identity summary.
+#
+# Step 5C2C must build a complete owner-review representation from the pinned
+# V5, V4 and authority objects.  This section pins what today's projection
+# deliberately is not, so that boundary cannot be crossed silently.
+# ===========================================================================
+
+
+_OMITTED_CANONICAL_KEYS = (
+    "statement",
+    "non_claims",
+    "obligation_level",
+    "depends_on",
+    "strategy",
+    "procedure_reference",
+    "acceptance_predicate",
+    "declared_coverage",
+    "oracle_disclosed_to_subject",
+    "independence_requirements",
+    "negative_controls",
+    "reference_cases",
+    "source_authority_type",
+    "source_authority_reference",
+    "mission_text",
+    "gate_objective",
+    "gate_clauses",
+    "completion_conditions_text",
+    "runtime_prompt",
+    "attestation_non_claims",
+    "canary_non_claims",
+)
+
+
+def _projection_rendering(
+    projection: HistoricalEvaluationPairingReviewProjection,
+) -> str:
+    return "\n".join(
+        [repr(projection)]
+        + [f"{field.name}={getattr(projection, field.name)!r}" for field in fields(projection)]
+    )
+
+
+def test_the_review_projection_is_a_bounded_identity_summary_only(
+    tmp_path: Path,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    expected_profile: NativeMissionProfile,
+):
+    coordinator = _coordinator(tmp_path / "archive")
+    view = _prepare(coordinator, historical_payload)
+    projection = view.review_projection
+    rendering = _projection_rendering(projection)
+    profile_bytes = canonical_bytes(expected_profile.to_dict()).decode("utf-8")
+    payload_bytes = canonical_bytes(historical_payload.to_dict()).decode("utf-8")
+
+    # Every omitted concept really exists in the pinned canonical material, so
+    # the omission below is a real boundary rather than a vacuous one.
+    for key in _OMITTED_CANONICAL_KEYS:
+        assert key in profile_bytes or key in payload_bytes, key
+        assert key not in rendering, key
+        assert not hasattr(projection, key), key
+    assert [field.name for field in fields(projection)] == [
+        "evaluation_profile_schema_version",
+        "evaluation_profile_is_launchable",
+        "target_authorization_payload_schema_version",
+        "pairing_authority_schema_version",
+        "profile_id",
+        "run_id",
+        "session_id",
+        "gate_id",
+        "mission_id",
+        "result_claim_ids",
+        "verification_obligation_ids",
+        "verification_evidence_binding_ids",
+    ]
+
+    # The owner prose itself never appears.
+    claims = expected_profile.claim_authority.claims
+    obligations = (
+        expected_profile.claim_verification_plan_authority.verification_obligations
+    )
+    bindings = expected_profile.verification_evidence_binding_authority.bindings
+    omitted_prose = [
+        *(claim.statement for claim in claims),
+        *(text for claim in claims for text in claim.non_claims),
+        *(obligation.procedure_reference for obligation in obligations),
+        *(obligation.strategy.value for obligation in obligations),
+        *(obligation.acceptance_predicate.value for obligation in obligations),
+        *(obligation.declared_coverage for obligation in obligations),
+        *(text for obligation in obligations for text in obligation.non_claims),
+        *(
+            control.description
+            for obligation in obligations
+            for control in obligation.negative_controls
+        ),
+        *(
+            control.control_id
+            for obligation in obligations
+            for control in obligation.negative_controls
+        ),
+        *(binding.source_authority_reference for binding in bindings),
+        *(binding.source_authority_type.value for binding in bindings),
+        *historical_payload.attestation_non_claims,
+        *historical_payload.canary_non_claims,
+        expected_profile.mission_text,
+        expected_profile.gate_objective,
+    ]
+    assert len(omitted_prose) > 20
+    for text in omitted_prose:
+        assert text, "an omitted-content probe must not be empty"
+        assert text not in rendering, text[:60]
+    # Independence requirements are a canonical mapping in the pinned profile
+    # and are projected neither as a value nor as a field.
+    independence = obligations[0].independence_requirements.to_dict()
+    assert json.dumps(independence, sort_keys=True) not in rendering
+    for name, value in independence.items():
+        assert not hasattr(projection, name), name
+        assert f"{name}={value!r}" not in rendering, name
+
+    # Only owner-ordered member identities are projected.
+    assert projection.result_claim_ids == tuple(claim.claim_id for claim in claims)
+    assert projection.verification_obligation_ids == tuple(
+        obligation.obligation_id for obligation in obligations
+    )
+    assert projection.verification_evidence_binding_ids == tuple(
+        binding.binding_id for binding in bindings
+    )
+    # No coordinator limitation notice is smuggled into the projection either.
+    for limitation in HISTORICAL_PAIRING_WORKFLOW_LIMITATIONS:
+        assert limitation not in rendering
+
+
+def test_the_review_projection_is_derived_pinned_and_non_canonical(
+    tmp_path: Path,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    expected_profile: NativeMissionProfile,
+    expected_authority: HistoricalEvaluationPairingAuthority,
+    expected_tag: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    archive_root = tmp_path / "archive"
+    coordinator = _coordinator(archive_root)
+    view = _prepare(coordinator, historical_payload)
+    projection = view.review_projection
+    pinned = coordinator._preparations[view.preparation_id]
+
+    # Derived from the pinned canonical objects, value by value.
+    assert projection.evaluation_profile_schema_version == (
+        pinned.evaluation_profile.schema_version
+    )
+    assert projection.evaluation_profile_is_launchable == (
+        pinned.evaluation_profile.is_launchable_runtime_profile
+    )
+    assert projection.target_authorization_payload_schema_version == (
+        pinned.target_authorization_payload.schema_version
+    )
+    assert projection.pairing_authority_schema_version == (
+        pinned.pairing_authority.schema_version
+    )
+    for name in ("profile_id", "run_id", "session_id", "gate_id", "mission_id"):
+        assert getattr(projection, name) == getattr(pinned.evaluation_profile, name)
+
+    # Non-canonical: no document interface, no fingerprint, no persistence.
+    assert not hasattr(projection, "to_dict")
+    assert not hasattr(projection, "identity_fingerprint")
+    assert not hasattr(projection, "validated")
+    assert not any("fingerprint" in field.name for field in fields(projection))
+    with pytest.raises((AttributeError, TypeError, ValueError)):
+        canonical_bytes(projection)
+
+    published: list[dict] = []
+    real_persist = workflow.persist_historical_evaluation_pairing
+
+    def recording_persist(**kwargs):
+        published.append(kwargs)
+        return real_persist(**kwargs)
+
+    monkeypatch.setattr(
+        workflow, "persist_historical_evaluation_pairing", recording_persist
+    )
+    authority_bytes = canonical_bytes(expected_authority.to_dict())
+    result = _confirm(coordinator, view, expected_tag)
+    monkeypatch.undo()
+
+    assert len(published) == 1
+    assert set(published[0]) == {
+        "archive_root",
+        "evaluation_profile",
+        "target_authorization_payload",
+        "pairing_authority",
+    }
+    assert projection not in published[0].values()
+    # Extending or changing the projection cannot move one authority byte.
+    extended = replace(projection, profile_id="mutated-review-identity")
+    assert extended != projection
+    assert canonical_bytes(expected_authority.to_dict()) == authority_bytes
+    assert canonical_bytes(
+        result.archived_pairing.pairing_authority.to_dict()
+    ) == authority_bytes
+    assert (
+        archive_root
+        / AUTHORITY_DIRECTORY_NAME
+        / f"{expected_authority.authority_fingerprint}{AUTHORITY_FILE_SUFFIX}"
+    ).read_bytes() == authority_bytes
+    assert _independent_tag(WORKFLOW_SECRET, expected_authority.to_dict()) == (
+        expected_tag
+    )
+    # The result carries no projection at all: review presentation is not a
+    # confirmation outcome.
+    assert not hasattr(result, "review_projection")
