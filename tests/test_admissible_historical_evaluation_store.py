@@ -35,6 +35,7 @@ from admissible.delegated_gate.historical_evaluation_store import (
     HistoricalEvaluationArchiveConflict,
     HistoricalEvaluationArchiveFingerprintMismatch,
     HistoricalEvaluationPairingBundle,
+    HistoricalEvaluationStoreError,
     MalformedHistoricalAuthorizationPayload,
     MalformedHistoricalEvaluationAuthority,
     MalformedHistoricalEvaluationProfile,
@@ -957,3 +958,297 @@ def test_actor_id_is_only_an_asserted_identifier_and_no_fourth_authority_exists(
     ):
         assert forbidden_fields.isdisjoint(document)
     assert len(tuple(archive_root.rglob("*.json"))) == 3
+
+
+# ---------------------------------------------------------------------------
+# Reload integrity: every archived document must reload as its exact canonical
+# bytes, and a canonical-looking document must never outrank its own body.
+# ---------------------------------------------------------------------------
+
+
+_DOCUMENT_KINDS = ("profile", "payload", "authority")
+
+_MALFORMED_ERRORS = {
+    "profile": MalformedHistoricalEvaluationProfile,
+    "payload": MalformedHistoricalAuthorizationPayload,
+    "authority": MalformedHistoricalEvaluationAuthority,
+}
+
+_ABSENT_ERRORS = {
+    "profile": ReferencedHistoricalEvaluationProfileNotFound,
+    "payload": ReferencedHistoricalAuthorizationPayloadNotFound,
+    "authority": CommittedHistoricalEvaluationAuthorityNotFound,
+}
+
+_FINGERPRINT_FIELDS = {
+    "profile": "profile_fingerprint",
+    "payload": "payload_fingerprint",
+    "authority": "authority_fingerprint",
+}
+
+_NEVER_LOADED = "no bundle was produced"
+
+
+def _canonical_documents(
+    documents: tuple[
+        NativeMissionProfile,
+        NativeCanaryAuthorizationPayloadV4,
+        HistoricalEvaluationPairingAuthority,
+    ],
+) -> dict[str, dict]:
+    profile, payload, authority = documents
+    return {
+        "profile": profile.to_dict(),
+        "payload": payload.to_dict(),
+        "authority": authority.to_dict(),
+    }
+
+
+def _selected(paths: tuple[Path, Path, Path], document_kind: str) -> Path:
+    return dict(zip(_DOCUMENT_KINDS, paths))[document_kind]
+
+
+def _other_bytes(
+    paths: tuple[Path, Path, Path],
+    selected: Path,
+) -> dict[Path, bytes]:
+    return {path: path.read_bytes() for path in paths if path != selected}
+
+
+def _rejected_load(
+    archive_root: Path,
+    authority_fingerprint: str,
+    error: type[HistoricalEvaluationStoreError],
+) -> HistoricalEvaluationStoreError:
+    """Require one bounded rejection and prove no bundle object is produced."""
+
+    outcome: object = _NEVER_LOADED
+    with pytest.raises(error) as raised:
+        outcome = load_historical_evaluation_pairing(
+            archive_root=archive_root,
+            authority_fingerprint=authority_fingerprint,
+        )
+    assert outcome == _NEVER_LOADED
+    assert not isinstance(outcome, HistoricalEvaluationPairingBundle)
+    assert isinstance(raised.value, HistoricalEvaluationStoreError)
+    return raised.value
+
+
+@pytest.mark.parametrize("document_kind", _DOCUMENT_KINDS)
+def test_non_canonical_bytes_of_each_archived_document_reject_on_reload(
+    tmp_path: Path,
+    historical_pairing_documents,
+    document_kind: str,
+):
+    profile, payload, authority = historical_pairing_documents
+    archive_root = tmp_path / f"canonical-{document_kind}"
+    _persist(archive_root, historical_pairing_documents)
+    paths = _document_paths(archive_root, profile, payload, authority)
+    selected = _selected(paths, document_kind)
+    canonical_mapping = _canonical_documents(historical_pairing_documents)[
+        document_kind
+    ]
+    committed = selected.read_bytes()
+    assert committed == canonical_bytes(canonical_mapping)
+
+    # Deterministic pretty-printed JSON: same parsed mapping, same embedded
+    # fingerprint text, same filename -- only the bytes stop being canonical.
+    non_canonical = json.dumps(
+        canonical_mapping, indent=2, sort_keys=True
+    ).encode("utf-8")
+    assert non_canonical != committed
+    assert json.loads(non_canonical) == json.loads(committed)
+    field = _FINGERPRINT_FIELDS[document_kind]
+    assert json.loads(non_canonical)[field] == canonical_mapping[field]
+    assert selected.name.startswith(canonical_mapping[field])
+
+    untouched = _other_bytes(paths, selected)
+    selected.write_bytes(non_canonical)
+    error = _rejected_load(
+        archive_root,
+        authority.authority_fingerprint,
+        _MALFORMED_ERRORS[document_kind],
+    )
+    assert "canonical" in str(error)
+    # The non-canonical document is never normalized, repaired, or rewritten.
+    assert selected.read_bytes() == non_canonical
+    assert _other_bytes(paths, selected) == untouched
+    assert len(tuple(archive_root.rglob("*.json"))) == 3
+
+
+def _tampered_document(
+    documents: tuple[
+        NativeMissionProfile,
+        NativeCanaryAuthorizationPayloadV4,
+        HistoricalEvaluationPairingAuthority,
+    ],
+    document_kind: str,
+    mutation: str,
+) -> dict:
+    data = deepcopy(_canonical_documents(documents)[document_kind])
+    if mutation == "claim_statement":
+        data["claim_authority"]["claims"][0]["statement"] += " Tampered."
+    elif mutation == "profile_id":
+        data["profile_id"] = "tampered-profile"
+    elif mutation == "source_head":
+        head = data["source_head"]
+        data["source_head"] = ("e" if head == "f" * len(head) else "f") * len(head)
+    elif mutation == "embedded_runtime_mission_text":
+        data["mission_profile"]["mission_text"] += " Tampered."
+    elif mutation == "actor_id":
+        data["actor_id"] = "owner.tampered-actor"
+    elif mutation == "evaluation_profile_fingerprint":
+        data["evaluation_profile_fingerprint"] = "0" * 64
+    else:
+        raise AssertionError(mutation)
+    return data
+
+
+@pytest.mark.parametrize(
+    ("document_kind", "mutation"),
+    [
+        ("profile", "claim_statement"),
+        ("profile", "profile_id"),
+        ("payload", "source_head"),
+        ("payload", "embedded_runtime_mission_text"),
+        ("authority", "actor_id"),
+        ("authority", "evaluation_profile_fingerprint"),
+    ],
+)
+def test_canonical_bytes_hiding_a_tampered_body_reject_on_reload(
+    tmp_path: Path,
+    historical_pairing_documents,
+    document_kind: str,
+    mutation: str,
+):
+    profile, payload, authority = historical_pairing_documents
+    archive_root = tmp_path / f"tampered-{document_kind}-{mutation}"
+    _persist(archive_root, historical_pairing_documents)
+    paths = _document_paths(archive_root, profile, payload, authority)
+    selected = _selected(paths, document_kind)
+    committed = selected.read_bytes()
+    tampered = _tampered_document(
+        historical_pairing_documents, document_kind, mutation
+    )
+    field = _FINGERPRINT_FIELDS[document_kind]
+    retained = json.loads(committed)[field]
+
+    # The identity text stays exactly what the archive already committed: only
+    # the body beneath it changed, and the bytes stay canonical.
+    assert tampered[field] == retained
+    assert selected.name.startswith(retained)
+    tampered_bytes = canonical_bytes(tampered)
+    assert tampered_bytes != committed
+    assert tampered_bytes == canonical_bytes(json.loads(tampered_bytes))
+    assert (
+        fingerprint({key: value for key, value in tampered.items() if key != field})
+        != retained
+    )
+
+    untouched = _other_bytes(paths, selected)
+    selected.write_bytes(tampered_bytes)
+    _rejected_load(
+        archive_root,
+        authority.authority_fingerprint,
+        HistoricalEvaluationArchiveFingerprintMismatch,
+    )
+    assert selected.read_bytes() == tampered_bytes
+    assert _other_bytes(paths, selected) == untouched
+    assert len(tuple(archive_root.rglob("*.json"))) == 3
+
+
+def test_truncated_authority_marker_never_commits_profile_and_payload(
+    tmp_path: Path,
+    historical_pairing_documents,
+):
+    profile, payload, authority = historical_pairing_documents
+    archive_root = tmp_path / "truncated-authority"
+    _persist(archive_root, historical_pairing_documents)
+    profile_path, payload_path, authority_path = _document_paths(
+        archive_root, profile, payload, authority
+    )
+    committed = authority_path.read_bytes()
+    truncated = committed[: len(committed) // 2]
+    assert truncated and truncated != committed
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(truncated)
+    untouched = {
+        profile_path: profile_path.read_bytes(),
+        payload_path: payload_path.read_bytes(),
+    }
+    authority_path.write_bytes(truncated)
+
+    _rejected_load(
+        archive_root,
+        authority.authority_fingerprint,
+        MalformedHistoricalEvaluationAuthority,
+    )
+    assert authority_path.is_file()
+    assert authority_path.read_bytes() == truncated
+    assert {path: path.read_bytes() for path in untouched} == untouched
+    assert len(tuple(archive_root.rglob("*.json"))) == 3
+
+
+def test_misfiled_self_consistent_authority_rejects_identity_mismatch(
+    tmp_path: Path,
+    historical_pairing_documents,
+):
+    profile, payload, authority = historical_pairing_documents
+    archive_root = tmp_path / "misfiled-authority"
+    _persist(archive_root, historical_pairing_documents)
+    _profile_path, _payload_path, authority_path = _document_paths(
+        archive_root, profile, payload, authority
+    )
+    committed = authority_path.read_bytes()
+    misfiled_fingerprint = fingerprint({"misfiled": "pairing authority"})
+    assert misfiled_fingerprint != authority.authority_fingerprint
+    misfiled_path = (
+        archive_root
+        / AUTHORITY_DIRECTORY_NAME
+        / f"{misfiled_fingerprint}{AUTHORITY_FILE_SUFFIX}"
+    )
+    misfiled_path.write_bytes(committed)
+
+    # The document is self-consistent; only its filename identity disagrees.
+    assert HistoricalEvaluationPairingAuthority.from_dict(
+        json.loads(committed)
+    ) == authority
+    _rejected_load(
+        archive_root,
+        misfiled_fingerprint,
+        HistoricalEvaluationArchiveFingerprintMismatch,
+    )
+    assert misfiled_path.read_bytes() == committed
+    assert authority_path.read_bytes() == committed
+    assert _load(archive_root, authority).pairing_authority == authority
+
+
+@pytest.mark.parametrize("document_kind", _DOCUMENT_KINDS)
+def test_directory_at_a_document_path_is_a_bounded_archive_rejection(
+    tmp_path: Path,
+    historical_pairing_documents,
+    document_kind: str,
+):
+    profile, payload, authority = historical_pairing_documents
+    archive_root = tmp_path / f"directory-{document_kind}"
+    _persist(archive_root, historical_pairing_documents)
+    paths = _document_paths(archive_root, profile, payload, authority)
+    selected = _selected(paths, document_kind)
+    untouched = _other_bytes(paths, selected)
+    selected.unlink()
+    selected.mkdir()
+    child = selected / "unrelated-child.json"
+    child.write_bytes(b'{"unrelated":"child"}')
+
+    _rejected_load(
+        archive_root,
+        authority.authority_fingerprint,
+        _ABSENT_ERRORS[document_kind],
+    )
+    # No recursive inspection, repair, or deletion of the replaced location.
+    assert selected.is_dir()
+    assert [entry.name for entry in sorted(selected.iterdir())] == [
+        "unrelated-child.json"
+    ]
+    assert child.read_bytes() == b'{"unrelated":"child"}'
+    assert _other_bytes(paths, selected) == untouched
