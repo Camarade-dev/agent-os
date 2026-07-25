@@ -51,10 +51,16 @@ Deliberate, load-bearing limitations
   non-authoritative, never fingerprinted, never persisted into a V4, V5,
   pairing authority, or archive document, and never enters a confirmation
   message.
-* Configured symbolic links and known reparse-point forms are rejected before
-  and after the document handle is opened.  That is a fail-closed check against
-  ordinary misconfiguration, not a claim of complete race-proof resistance to a
-  hostile local process that can swap the path between those observations.
+* A directly configured symbolic link or known reparse-point form is refused,
+  to the exact extent the platform's own metadata checks report it.  The
+  pre-open ``lstat`` decides the configured path itself and the post-open
+  ``fstat`` decides the handle that was actually opened, so the bytes that are
+  validated are always the bytes of that opened regular-file descriptor.  The
+  guarantee stops exactly there and is deliberately narrow.  A symlinked
+  ancestor directory of the configured path is not inspected and may therefore
+  go undetected, because no parent is ever constructed or scanned.  A hostile
+  local process that can replace the path between those two observations is
+  outside the stated trust model.  No complete race-proof guarantee is claimed.
 * Loading a payload proves only canonical execution-authorization structure.
   It never establishes that a source repository, run root, workspace, artifact,
   or evidence record currently exists.

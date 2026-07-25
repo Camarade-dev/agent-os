@@ -28,15 +28,30 @@ What the review is not
   or workspace existence is asserted, and no filesystem path carried inside the
   V4 payload is ever dereferenced.
 
-Path withholding
-----------------
+Structured locator withholding, and its exact limits
+----------------------------------------------------
 
-Every local locator carried by the historical authorization is deliberately
-withheld and named in ``HISTORICAL_PAIRING_OWNER_REVIEW_WITHHELD_FIELDS``.  The
-mission-relative required material paths are presented, because they are owner
-mission content rather than local locators, and so are the profile-authored
-checkpoint command definitions.  No absolute local path value from the payload
-ever appears in the review or in its presentation mapping.
+Every structured local locator field carried by the historical authorization is
+deliberately withheld and named in
+``HISTORICAL_PAIRING_OWNER_REVIEW_WITHHELD_FIELDS``.  That is a field-level
+guarantee about exactly those named fields and it is nothing wider.
+
+Exact owner-authored and mission-authored text is reproduced without rewriting,
+and such text may itself contain path-like or absolute-path-looking content: a
+mission statement, a gate objective, a completion condition, a stop clause, a
+gate clause, a claim statement, a claim non-claim, a declared coverage, and a
+negative-control description are each presented exactly as their author wrote
+them.  The exact profile-authored checkpoint command arguments are reproduced
+as well, and one of those arguments may be, or may contain, a program name or a
+path-like string.  The mission-relative required material paths are presented
+too, because they are owner mission content rather than local locators.
+
+No prose is scanned, redacted, rewritten, or otherwise sanitized here, and no
+claim is made that every string resembling a path has been removed.  Path-like
+text that reaches the review is inert text and nothing more: it is never
+evidence that a filesystem entry exists, and a displayed path has been neither
+resolved nor accessed.  The review continues to assert no path, source,
+artifact, or workspace existence.
 
 Authority derivation
 --------------------

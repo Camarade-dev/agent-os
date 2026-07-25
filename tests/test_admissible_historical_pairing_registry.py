@@ -600,6 +600,221 @@ def test_malformed_truncated_duplicate_key_and_non_object_documents_are_refused(
         assert expected_fragment in str(failure.value)
 
 
+# ---------------------------------------------------------------------------
+# Step 5C2C1.1 D. Duplicate JSON keys strictly inside nested objects.
+#
+# The committed fixture above duplicates a key at the document root only.  A
+# root-only detector hands that document straight to the loader, so everything
+# below builds documents whose one and only defect is a duplicated key inside a
+# nested authority object.
+# ---------------------------------------------------------------------------
+
+
+class _RootOnlyDuplicateDetector:
+    """A deliberately insufficient detector that judges the root object only.
+
+    ``object_pairs_hook`` fires as each object completes, so for a document
+    whose root is an object the final call is always that root.  Judging a
+    document by that call alone is exactly the root-only rule this slice must
+    prove insufficient.
+    """
+
+    def __init__(self) -> None:
+        self.completed_key_lists: list[list[str]] = []
+
+    def __call__(self, pairs):
+        self.completed_key_lists.append([key for key, _value in pairs])
+        return dict(pairs)
+
+    @property
+    def root_keys(self) -> list[str]:
+        return self.completed_key_lists[-1]
+
+    def root_has_duplicate(self) -> bool:
+        return len(self.root_keys) != len(set(self.root_keys))
+
+    def some_object_has_duplicate(self) -> bool:
+        return any(
+            len(keys) != len(set(keys)) for keys in self.completed_key_lists
+        )
+
+
+def _detected(text: str) -> _RootOnlyDuplicateDetector:
+    detector = _RootOnlyDuplicateDetector()
+    json.loads(text, object_pairs_hook=detector)
+    return detector
+
+
+def _nested_object(document, container_key: str):
+    """Find one nested object by key, without assuming its depth."""
+
+    if isinstance(document, dict):
+        found = document.get(container_key)
+        if isinstance(found, dict):
+            return found
+        for value in document.values():
+            deeper = _nested_object(value, container_key)
+            if deeper is not None:
+                return deeper
+    return None
+
+
+def _duplicate_nested_key(text: str, container_key: str, duplicate_key: str) -> str:
+    """Insert one exact extra copy of an existing pair inside a nested object.
+
+    The inserted pair is byte-identical to the pair the valid document already
+    carries, so a last-wins parser recovers exactly the valid document and the
+    only possible ground for refusal is the duplicated key itself.
+    """
+
+    anchor = f'"{container_key}":{{'
+    assert text.count(anchor) == 1, container_key
+    container = _nested_object(json.loads(text), container_key)
+    assert container is not None and duplicate_key in container, duplicate_key
+    pair = _oracle_canonical_bytes(
+        {duplicate_key: container[duplicate_key]}
+    ).decode("utf-8")[1:-1]
+    return text.replace(anchor, f"{anchor}{pair},", 1)
+
+
+# Three real V4 nesting sites: one accepted authority object at depth one and
+# two at depth two.
+NESTED_DUPLICATE_CASES = (
+    ("mission_profile", "gate_id"),
+    ("runtime_prompt", "stop_clause"),
+    ("workspace_source", "kind"),
+)
+
+
+@pytest.mark.parametrize("container_key,duplicate_key", NESTED_DUPLICATE_CASES)
+def test_nested_duplicate_json_key_is_refused_although_the_root_is_clean(
+    tmp_path: Path,
+    document_root: Path,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    container_key: str,
+    duplicate_key: str,
+):
+    valid = _document_bytes(historical_payload).decode("utf-8")
+    injected = _duplicate_nested_key(valid, container_key, duplicate_key)
+    assert injected != valid
+
+    # The document is otherwise the exact valid canonical document: a last-wins
+    # parser recovers it exactly, so nothing but the duplicate can be blamed.
+    assert json.loads(injected) == json.loads(valid)
+
+    detector = _detected(injected)
+    assert detector.root_has_duplicate() is False
+    assert detector.some_object_has_duplicate() is True
+    assert sorted(detector.root_keys) == sorted(json.loads(valid))
+    assert len(detector.root_keys) == len(set(detector.root_keys))
+
+    path = _write(
+        document_root / f"nested-{container_key}.json", injected.encode("utf-8")
+    )
+    with pytest.raises(MalformedHistoricalPayloadDocument) as failure:
+        _registry(tmp_path, (_entry("nested-duplicate", path),))
+    message = str(failure.value)
+    # The refusal is the bounded malformed-document refusal, decided while the
+    # document is parsed -- not the later canonical-bytes revalidation.
+    assert "JSON" in message
+    assert "canonical" not in message
+    cause = failure.value.__cause__
+    assert isinstance(cause, ValueError)
+    assert str(cause) == f"duplicate JSON field: {duplicate_key}"
+
+    # Control: the identical document without the duplicate is admitted.
+    control = _write(document_root / "nested-control.json", valid.encode("utf-8"))
+    registry = _registry(tmp_path, (_entry("control-payload", control),))
+    assert registry.payload_ids == ("control-payload",)
+    assert registry.get(payload_id="control-payload").payload_fingerprint == (
+        historical_payload.payload_fingerprint
+    )
+
+
+def test_a_root_only_duplicate_detector_is_insufficient_for_this_loader(
+    tmp_path: Path,
+    document_root: Path,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+):
+    """The committed top-level fixture is not nested coverage, and vice versa."""
+
+    valid = _document_bytes(historical_payload).decode("utf-8")
+    root_duplicated = valid.replace(
+        '{"attestation_non_claims"',
+        '{"schema_version":"x","schema_version":"y","attestation_non_claims"',
+        1,
+    )
+    assert root_duplicated != valid
+    # A root-only detector catches exactly the committed top-level fixture.
+    assert _detected(root_duplicated).root_has_duplicate() is True
+    assert _detected(valid).some_object_has_duplicate() is False
+
+    for container_key, duplicate_key in NESTED_DUPLICATE_CASES:
+        injected = _duplicate_nested_key(valid, container_key, duplicate_key)
+        detector = _detected(injected)
+        # ... and misses every nested one, which the real loader still refuses.
+        assert detector.root_has_duplicate() is False
+        assert detector.some_object_has_duplicate() is True
+        path = _write(
+            document_root / f"insufficient-{container_key}.json",
+            injected.encode("utf-8"),
+        )
+        with pytest.raises(MalformedHistoricalPayloadDocument):
+            _registry(tmp_path, (_entry("nested-payload", path),))
+
+
+def test_a_nested_duplicate_leaves_no_document_admitted_or_partly_registered(
+    tmp_path: Path,
+    document_root: Path,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    other_payload: NativeCanaryAuthorizationPayloadV4,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    valid = _document_bytes(historical_payload).decode("utf-8")
+    injected = _duplicate_nested_key(valid, "runtime_prompt", "stop_clause")
+    good = _write(document_root / "good.json", _document_bytes(other_payload))
+    bad = _write(document_root / "bad.json", injected.encode("utf-8"))
+
+    # Capture whatever instance construction begins on, so a partially built
+    # registry could not escape unnoticed.
+    instances: list[HistoricalPayloadRegistry] = []
+    real_init = HistoricalPayloadRegistry.__init__
+
+    def spy_init(self, **kwargs):
+        instances.append(self)
+        return real_init(self, **kwargs)
+
+    monkeypatch.setattr(HistoricalPayloadRegistry, "__init__", spy_init)
+
+    with _filesystem_observation(monkeypatch) as first:
+        with pytest.raises(MalformedHistoricalPayloadDocument):
+            _registry(
+                tmp_path, (_entry("bad-payload", bad), _entry("good-payload", good))
+            )
+    # Loading stops at the first refusal: the later document is never opened.
+    assert first.opened == [bad]
+
+    with _filesystem_observation(monkeypatch) as second:
+        with pytest.raises(MalformedHistoricalPayloadDocument):
+            _registry(
+                tmp_path, (_entry("good-payload", good), _entry("bad-payload", bad))
+            )
+    # Even with one valid document already loaded, construction is all or
+    # nothing: no identifier, record, or metadata view is ever published.
+    assert second.opened == [good, bad]
+    assert len(instances) == 2
+    for instance in instances:
+        for attribute in ("_payload_ids", "_records", "_metadata"):
+            assert not hasattr(instance, attribute), attribute
+
+    monkeypatch.undo()
+    survivor = _registry(tmp_path, (_entry("good-payload", good),))
+    assert survivor.payload_ids == ("good-payload",)
+    assert survivor.get(payload_id="good-payload").payload_fingerprint == (
+        other_payload.payload_fingerprint
+    )
+
+
 def test_bounded_read_requests_exactly_the_bound_plus_one_byte(
     tmp_path: Path,
     document_root: Path,
@@ -965,3 +1180,117 @@ def test_empty_configuration_is_a_valid_empty_registry(tmp_path: Path):
     assert registry.payload_ids == ()
     assert registry.metadata == ()
     assert repr(registry) == "<HistoricalPayloadRegistry payloads=0>"
+
+
+# ---------------------------------------------------------------------------
+# Step 5C2C1.1 B/F. The documented symlink guarantee is bounded, and says so.
+#
+# This audit deliberately distinguishes an explicit limitation from a positive
+# overclaim: a sentence may name a hazard as long as it also bounds it, and a
+# sentence that names the hazard while asserting immunity is refused.
+# ---------------------------------------------------------------------------
+
+_LIMITATION_CUES = frozenset(
+    {
+        "no",
+        "not",
+        "never",
+        "cannot",
+        "nothing",
+        "neither",
+        "nor",
+        "outside",
+        "may",
+        "without",
+        "undetected",
+        "deliberately",
+        "stops",
+    }
+)
+
+
+def _sentences(text: str) -> list[str]:
+    normalized = " ".join(text.split())
+    return [
+        sentence.strip()
+        for sentence in re.split(r"(?<=\.)\s+", normalized)
+        if sentence.strip()
+    ]
+
+
+def _bounds_its_own_claim(sentence: str) -> bool:
+    return bool(_LIMITATION_CUES & set(re.findall(r"[a-z]+", sentence.lower())))
+
+
+# The exact bounded guarantee the module is allowed to state.
+REGISTRY_REQUIRED_BOUNDED_CLAIMS = (
+    "a directly configured symbolic link or known reparse-point form is "
+    "refused, to the exact extent the platform's own metadata checks report it.",
+    "the bytes that are validated are always the bytes of that opened "
+    "regular-file descriptor.",
+    "a symlinked ancestor directory of the configured path is not inspected "
+    "and may therefore go undetected",
+    "is outside the stated trust model.",
+    "no complete race-proof guarantee is claimed.",
+)
+
+# Positive overclaims the module must never make.
+REGISTRY_FORBIDDEN_OVERCLAIMS = (
+    "all symlinked ancestor",
+    "every symlinked ancestor",
+    "all symlinked ancestors",
+    "every ancestor directory is detected",
+    "all ancestor directories are",
+    "is race-proof",
+    "are race-proof",
+    "race-proof loading",
+    "race-proof guarantee is provided",
+    "immune to",
+    "cannot be swapped",
+)
+
+# Hazards that may be named only inside a sentence that also bounds them.
+REGISTRY_BOUNDED_TOPICS = ("race-proof", "symlinked ancestor", "trust model")
+
+
+def _registry_documentation() -> str:
+    return " ".join(registry_module.__doc__.split()).lower()
+
+
+def test_registry_states_the_bounded_symlink_and_race_guarantee():
+    documentation = _registry_documentation()
+    for claim in REGISTRY_REQUIRED_BOUNDED_CLAIMS:
+        assert claim in documentation, claim
+
+
+def test_registry_makes_no_universal_symlink_or_race_claim():
+    documentation = _registry_documentation()
+    for overclaim in REGISTRY_FORBIDDEN_OVERCLAIMS:
+        assert overclaim not in documentation, overclaim
+
+
+def test_every_registry_hazard_sentence_bounds_the_hazard_it_names():
+    sentences = _sentences(registry_module.__doc__)
+    for topic in REGISTRY_BOUNDED_TOPICS:
+        carrying = [
+            sentence for sentence in sentences if topic in sentence.lower()
+        ]
+        assert carrying, topic
+        for sentence in carrying:
+            assert _bounds_its_own_claim(sentence), (topic, sentence)
+
+
+def test_the_bounded_guarantee_matches_the_loading_algorithm_that_exists():
+    """The documented bound is the algorithm's real shape, not an aspiration."""
+
+    source = Path(registry_module.__file__).read_text(encoding="utf-8")
+    # Exactly the two documented metadata observations, and no third one.
+    assert source.count("os.lstat(") == 1
+    assert source.count("os.fstat(") == 1
+    assert "_is_redirecting" in source
+    # No ancestor is inspected, exactly as the limitation states.
+    tree = ast.parse(source, filename=registry_module.__file__)
+    assert not (
+        {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+        & {"parent", "parents", "resolve", "readlink"}
+    )

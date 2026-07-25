@@ -18,6 +18,7 @@ import hashlib
 import itertools
 import json
 from pathlib import Path
+import re
 import threading
 from typing import Mapping
 from unittest import mock
@@ -26,7 +27,11 @@ import pytest
 
 from admissible.delegated_gate import historical_pairing_review as review_module
 from admissible.delegated_gate import historical_pairing_workflow as workflow
-from admissible.delegated_gate.canonical import canonical_bytes, canonical_json
+from admissible.delegated_gate.canonical import (
+    canonical_bytes,
+    canonical_json,
+    require_identifier,
+)
 from admissible.delegated_gate.historical_evaluation import (
     HistoricalEvaluationPairingAuthority,
 )
@@ -45,11 +50,14 @@ from admissible.delegated_gate.historical_pairing_review import (
     PREPARATION_STATE_READY_FOR_CONFIRMATION,
     HistoricalEvaluationPairingOwnerReview,
     HistoricalPairingOwnerReviewError,
+    ReviewedClaimAuthority,
     ReviewedEvidenceBinding,
+    ReviewedEvidenceBindingAuthority,
     ReviewedIndependenceRequirements,
     ReviewedNegativeControl,
     ReviewedResultClaim,
     ReviewedVerificationObligation,
+    ReviewedVerificationPlanAuthority,
     build_historical_evaluation_pairing_owner_review,
 )
 from admissible.delegated_gate.historical_pairing_workflow import (
@@ -61,8 +69,12 @@ from admissible.delegated_gate.historical_pairing_workflow import (
 )
 from admissible.delegated_gate.mission_profile import (
     MISSION_PROFILE_SCHEMA_VERSION_V5,
+    ClaimAuthority,
+    ClaimVerificationPlanAuthority,
+    NativeMissionProfile,
     ResultClaim,
     VerificationEvidenceBinding,
+    VerificationEvidenceBindingAuthority,
     VerificationIndependenceRequirements,
     VerificationNegativeControl,
     VerificationObligation,
@@ -76,7 +88,16 @@ from admissible.delegated_gate.native_canary import (
     NativeCanaryAuthorizationPayloadV4,
     load_historical_native_canary_authorization_payload_v4,
 )
-from test_admissible_historical_evaluation_pairing import _refingerprint_payload
+from admissible.product_launcher.historical_pairing_registry import (
+    HistoricalPairingConfiguration,
+    HistoricalPayloadEntry,
+    HistoricalPayloadRegistry,
+)
+from test_admissible_historical_evaluation_pairing import (
+    _payload_for_runtime_profile,
+    _refingerprint_payload,
+    _refingerprint_profile,
+)
 from test_admissible_historical_pairing_confirmation import (
     _disclosures_in_text,
     _fragments_of,
@@ -892,7 +913,11 @@ def test_review_exposes_no_source_repository_identity_or_drive_shaped_value(
     for _key, value in _keyed_values(presented):
         if not isinstance(value, str):
             continue
-        # No presented value is an absolute local path in either flavour.
+        # Fixture-scoped, and deliberately not a universal law: this fixture's
+        # authored prose carries no absolute-path-looking text, so nothing
+        # presented from it is path-shaped.  The general rule -- structured
+        # locators withheld, exact prose and argv reproduced even when they do
+        # look like paths -- is pinned by the Step 5C2C1.1 disclosure tests.
         assert not Path(value).is_absolute() or "/" not in value
         assert str(archive_root) not in value
 
@@ -1620,6 +1645,864 @@ def test_review_type_is_frozen_and_carries_the_documented_sections(review):
     }
     with pytest.raises(FrozenInstanceError):
         review.notices = ()
+
+
+# ---------------------------------------------------------------------------
+# Step 5C2C1.1 C. Structured locators versus exact free text.
+#
+# Two deliberately different marker classes are planted at once:
+#
+# * structured locator markers, planted into canonical locator FIELDS, none of
+#   which may ever reach the review; and
+# * exact free-text and command markers -- Windows-flavoured and
+#   POSIX-flavoured absolute-path-looking strings -- planted into owner-authored
+#   and mission-authored TEXT and into checkpoint argv, every one of which must
+#   be reproduced without rewriting.
+#
+# Every assertion below is exact marker membership or exact field equality.  No
+# platform-dependent path predicate is used, so the meaning is identical on
+# Windows and on POSIX.
+# ---------------------------------------------------------------------------
+
+# One token per independently settable canonical locator field.  The four
+# authorization roots are structurally derived from one another (the workspace,
+# evidence and sidecar roots are the committed deterministic children of the run
+# root), so they necessarily share one chain token; each complete root value is
+# additionally asserted absent on its own.
+LOCATOR_MARKERS = {
+    "source_repository": "zlocsrcrepo5c2c11",
+    "run_root_chain": "zlocrunchain5c2c11",
+    "program_path": "zlocprogram5c2c11",
+    "launcher_prefix": "zloclauncher5c2c11",
+    "local_repository_path": "zloclocalrepo5c2c11",
+    "configured_document_path": "zlocdocument5c2c11",
+    "archive_root": "zlocarchive5c2c11",
+}
+
+# Free-text slots whose exact planted text must survive verbatim.
+TEXT_MARKER_SLOTS = (
+    "mission_text",
+    "gate_objective",
+    "completion_conditions_text",
+    "stop_clause",
+    "gate_clause",
+    "claim_statement",
+    "claim_non_claim",
+    "declared_coverage",
+    "negative_control",
+    "checkpoint_argv",
+)
+
+# Slots the canonical identifier grammar constrains, so a complete absolute
+# path cannot be planted there at all.
+IDENTIFIER_MARKER_SLOTS = ("procedure_reference", "reference_case")
+
+
+def _windows_text_marker(slot: str) -> str:
+    return f"C:\\s5c2c11\\{slot}\\windows-absolute.txt"
+
+
+def _posix_text_marker(slot: str) -> str:
+    return f"/s5c2c11/{slot}/posix-absolute.txt"
+
+
+def _text_markers(slot: str) -> tuple[str, str]:
+    return _windows_text_marker(slot), _posix_text_marker(slot)
+
+
+def _decorated(base: str, slot: str) -> str:
+    """Append both absolute-path-looking flavours to one authored string."""
+
+    windows, posix = _text_markers(slot)
+    return f"{base}\n{windows}\n{posix}\n"
+
+
+def _identifier_marker(slot: str) -> str:
+    """The most path-looking value the canonical identifier grammar permits."""
+
+    return f"C:s5c2c11.{slot}.absolute-like"
+
+
+def _serialized(value: str) -> str:
+    """Return one string exactly as it appears inside serialized JSON.
+
+    A Windows-flavoured marker carries a separator that JSON escapes, so a raw
+    substring test against serialized output would be silently vacuous.
+    """
+
+    return json.dumps(value, ensure_ascii=False)[1:-1]
+
+
+def _disclosure_profile(
+    profile: NativeMissionProfile, local_repository: Path
+) -> NativeMissionProfile:
+    """One historical V2 profile whose authored prose carries both flavours."""
+
+    data = profile.to_dict()
+    data["mission_text"] = _decorated(data["mission_text"], "mission_text")
+    data["gate_objective"] = _decorated(data["gate_objective"], "gate_objective")
+    data["completion_conditions_text"] = _decorated(
+        data["completion_conditions_text"], "completion_conditions_text"
+    )
+    data["runtime_prompt"]["stop_clause"] = _decorated(
+        data["runtime_prompt"]["stop_clause"], "stop_clause"
+    )
+    clause_id, clause_text = data["gate_clauses"][0]
+    data["gate_clauses"][0] = [clause_id, _decorated(clause_text, "gate_clause")]
+    windows, posix = _text_markers("checkpoint_argv")
+    data["checkpoint_commands"][0]["argv"] = [
+        *data["checkpoint_commands"][0]["argv"],
+        windows,
+        posix,
+    ]
+    data["workspace_source"] = {
+        "kind": WorkspaceSourceKind.EXISTING_LOCAL_GIT_REPOSITORY.value,
+        "fixture_id": None,
+        "fixture_version": None,
+        "local_repository_path": str(local_repository),
+    }
+    return NativeMissionProfile.from_dict(_refingerprint_profile(data))
+
+
+def _disclosure_owner_material(
+    payload: NativeCanaryAuthorizationPayloadV4,
+) -> dict:
+    """Owner-authored material whose prose carries both flavours."""
+
+    claims = _hostile_claims()
+    claims[0]["statement"] = _decorated(claims[0]["statement"], "claim_statement")
+    claims[0]["non_claims"] = [
+        _decorated(claims[0]["non_claims"][0], "claim_non_claim")
+    ]
+    plan = _hostile_plan()
+    plan[0]["procedure_reference"] = _identifier_marker("procedure_reference")
+    plan[0]["declared_coverage"] = _decorated(
+        plan[0]["declared_coverage"], "declared_coverage"
+    )
+    plan[0]["negative_controls"][0]["description"] = _decorated(
+        plan[0]["negative_controls"][0]["description"], "negative_control"
+    )
+    plan[0]["reference_cases"] = [
+        _identifier_marker("reference_case"),
+        *plan[0]["reference_cases"],
+    ]
+    return {
+        "result_claims": claims,
+        "claim_verification_plan": plan,
+        "verification_evidence_bindings": _hostile_bindings(
+            payload.mission_profile.verification.verifier_source_sha256
+        ),
+    }
+
+
+@pytest.fixture(scope="module")
+def disclosure_payload(
+    tmp_path_factory: pytest.TempPathFactory,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+) -> NativeCanaryAuthorizationPayloadV4:
+    """One payload carrying both marker classes at once."""
+
+    fixture_root = tmp_path_factory.mktemp("s5c2c11")
+    local_repository = (
+        fixture_root / f"absent-{LOCATOR_MARKERS['local_repository_path']}" / "repo"
+    )
+    variant = _disclosure_profile(
+        historical_payload.mission_profile, local_repository
+    )
+    live = _payload_for_runtime_profile(historical_payload, variant).to_dict()
+    assert live["launcher_prefix"], "the fixture must exercise launcher_prefix"
+    chain = fixture_root / f"absent-{LOCATOR_MARKERS['run_root_chain']}"
+    run_root = chain / live["run_id"]
+    live["source_repository"] = str(
+        fixture_root / f"absent-{LOCATOR_MARKERS['source_repository']}" / "source"
+    )
+    live["executable"] = str(
+        fixture_root / f"absent-{LOCATOR_MARKERS['program_path']}" / "agent.exe"
+    )
+    live["launcher_prefix"] = [
+        str(
+            fixture_root
+            / f"absent-{LOCATOR_MARKERS['launcher_prefix']}-{index}"
+            / "launcher.exe"
+        )
+        for index, _value in enumerate(live["launcher_prefix"])
+    ]
+    live["run_root"] = str(run_root)
+    live["workspace_root"] = str(run_root / WORKSPACE_DIRECTORY_NAME)
+    live["evidence_root"] = str(run_root / EVIDENCE_DIRECTORY_NAME)
+    live["native_sidecar_root"] = str(
+        run_root / EVIDENCE_DIRECTORY_NAME / NATIVE_SIDECAR_DIRECTORY_NAME
+    )
+    payload = load_historical_native_canary_authorization_payload_v4(
+        _refingerprint_payload(live)
+    )
+    assert not chain.exists()
+    assert not local_repository.exists()
+    return payload
+
+
+@pytest.fixture(scope="module")
+def registered_disclosure_payload(
+    tmp_path_factory: pytest.TempPathFactory,
+    disclosure_payload: NativeCanaryAuthorizationPayloadV4,
+) -> NativeCanaryAuthorizationPayloadV4:
+    """The same payload, delivered through a marker-bearing configured path."""
+
+    root = tmp_path_factory.mktemp("s5c2c11-reg")
+    document = root / f"{LOCATOR_MARKERS['configured_document_path']}.json"
+    document.write_bytes(canonical_bytes(disclosure_payload.to_dict()))
+    registry = HistoricalPayloadRegistry(
+        configuration=HistoricalPairingConfiguration(
+            archive_root=root / "registry-archive",
+            payload_entries=(
+                HistoricalPayloadEntry(
+                    payload_id="disclosure-payload", document_path=document
+                ),
+            ),
+        )
+    )
+    loaded = registry.get(payload_id="disclosure-payload")
+    assert loaded.payload_fingerprint == disclosure_payload.payload_fingerprint
+    assert LOCATOR_MARKERS["configured_document_path"] in str(document)
+    return loaded
+
+
+@pytest.fixture()
+def disclosure_archive_root(tmp_path: Path) -> Path:
+    return tmp_path / f"{LOCATOR_MARKERS['archive_root']}-archive"
+
+
+@pytest.fixture()
+def disclosure_coordinator(
+    disclosure_archive_root: Path, clock: _FakeClock
+) -> HistoricalEvaluationPairingCoordinator:
+    return HistoricalEvaluationPairingCoordinator(
+        configured_secret=REVIEW_SECRET,
+        archive_root=disclosure_archive_root,
+        preparation_ttl_seconds=600,
+        max_preparations=8,
+        clock=clock,
+        preparation_id_factory=_sequential_identifiers("disclosure"),
+    )
+
+
+@pytest.fixture()
+def disclosure_review(
+    disclosure_coordinator: HistoricalEvaluationPairingCoordinator,
+    registered_disclosure_payload: NativeCanaryAuthorizationPayloadV4,
+) -> HistoricalEvaluationPairingOwnerReview:
+    prepared = disclosure_coordinator.prepare_historical_evaluation_pairing(
+        target_authorization_payload=registered_disclosure_payload,
+        actor_id=ACTOR_ID,
+        **_disclosure_owner_material(registered_disclosure_payload),
+    )
+    return disclosure_coordinator.get_historical_evaluation_pairing_review(
+        preparation_id=prepared.preparation_id,
+        expected_authority_fingerprint=prepared.authority_fingerprint,
+    )
+
+
+def test_every_structured_locator_marker_is_actually_planted(
+    registered_disclosure_payload: NativeCanaryAuthorizationPayloadV4,
+    disclosure_archive_root: Path,
+):
+    """A marker that was never planted would prove nothing about withholding."""
+
+    payload = registered_disclosure_payload
+    source = payload.mission_profile.effective_workspace_source
+    assert LOCATOR_MARKERS["source_repository"] in payload.source_repository
+    assert LOCATOR_MARKERS["program_path"] in payload.executable
+    assert payload.launcher_prefix
+    for value in payload.launcher_prefix:
+        assert LOCATOR_MARKERS["launcher_prefix"] in value
+    for value in (
+        payload.run_root,
+        payload.workspace_root,
+        payload.evidence_root,
+        payload.native_sidecar_root,
+    ):
+        assert LOCATOR_MARKERS["run_root_chain"] in value
+    assert source.kind is WorkspaceSourceKind.EXISTING_LOCAL_GIT_REPOSITORY
+    assert LOCATOR_MARKERS["local_repository_path"] in source.local_repository_path
+    assert LOCATOR_MARKERS["archive_root"] in str(disclosure_archive_root)
+    # The four roots really are structurally derived, which is why they share
+    # one chain token rather than carrying four independent ones.
+    assert payload.workspace_root == str(
+        Path(payload.run_root) / WORKSPACE_DIRECTORY_NAME
+    )
+    assert payload.evidence_root == str(
+        Path(payload.run_root) / EVIDENCE_DIRECTORY_NAME
+    )
+    assert payload.native_sidecar_root == str(
+        Path(payload.evidence_root) / NATIVE_SIDECAR_DIRECTORY_NAME
+    )
+
+
+def test_no_structured_locator_marker_or_value_reaches_the_review(
+    disclosure_review: HistoricalEvaluationPairingOwnerReview,
+    registered_disclosure_payload: NativeCanaryAuthorizationPayloadV4,
+    disclosure_archive_root: Path,
+):
+    review = disclosure_review
+    payload = registered_disclosure_payload
+    presented = review.to_presentation_dict()
+    rendered = json.dumps(presented, ensure_ascii=False)
+    rendered_repr = repr(review)
+    texts = _texts(review)
+    keyed = list(_keyed_values(presented))
+
+    for name, marker in LOCATOR_MARKERS.items():
+        assert marker not in rendered, name
+        assert marker not in rendered_repr, name
+        for text in texts:
+            assert marker not in text, name
+        for key, value in keyed:
+            assert marker not in key, name
+            if isinstance(value, str):
+                assert marker not in value, name
+
+    complete_values = (
+        payload.source_repository,
+        payload.run_root,
+        payload.workspace_root,
+        payload.evidence_root,
+        payload.native_sidecar_root,
+        payload.executable,
+        *payload.launcher_prefix,
+        payload.mission_profile.effective_workspace_source.local_repository_path,
+        str(disclosure_archive_root),
+    )
+    assert len(set(complete_values)) == len(complete_values)
+    for value in complete_values:
+        assert value
+        # Both the raw value and its serialized form, because JSON escapes the
+        # separator a Windows-flavoured locator carries.
+        assert value not in rendered
+        assert _serialized(value) not in rendered
+        assert value not in rendered_repr
+        for text in texts:
+            assert value not in text
+        for _key, presented_value in keyed:
+            if isinstance(presented_value, str):
+                assert value not in presented_value
+
+
+def test_the_source_repository_identity_is_not_path_bearing(
+    disclosure_review: HistoricalEvaluationPairingOwnerReview,
+    registered_disclosure_payload: NativeCanaryAuthorizationPayloadV4,
+):
+    """The withheld identity carries no path at all, and never appears.
+
+    ``source_repository_identity`` is a filesystem identity of pure integers,
+    so it is not path-bearing in the first place; what is proven here is that
+    the complete object is withheld anyway.
+    """
+
+    identity = registered_disclosure_payload.source_repository_identity.to_dict()
+    assert identity
+    assert all(isinstance(value, int) for value in identity.values())
+    for key in identity:
+        assert "path" not in key, key
+        assert LOCATOR_MARKERS["source_repository"] not in str(identity[key])
+    presented = disclosure_review.to_presentation_dict()
+    rendered = json.dumps(presented, ensure_ascii=False)
+    assert canonical_json(identity) not in rendered
+    for key, _value in _keyed_values(presented):
+        assert "source_repository_identity" not in key, key
+        # ``mode`` is deliberately not banned: the behavioral-verifier
+        # disclosure owns an unrelated field of that name.
+        assert key.rsplit(".", 1)[-1] not in {
+            "device",
+            "inode",
+            "size",
+            "mtime_ns",
+            "file_attributes",
+        }, key
+    assert (
+        "target_authorization_payload.source_repository_identity"
+        in HISTORICAL_PAIRING_OWNER_REVIEW_WITHHELD_FIELDS
+    )
+
+
+# The exact review field and the exact presentation key that must carry each
+# planted marker -- and nothing else may carry it.
+MARKER_CARRIERS = {
+    "mission_text": "historical_mission_context.mission_text",
+    "gate_objective": "historical_mission_context.gate_objective",
+    "completion_conditions_text": (
+        "historical_mission_context.completion_conditions_text"
+    ),
+    "stop_clause": "historical_mission_context.stop_clause",
+    "gate_clause": "historical_mission_context.gate_clauses[0].text",
+    "claim_statement": "claim_authority.claims[0].statement",
+    "claim_non_claim": "claim_authority.claims[0].non_claims[0]",
+    "declared_coverage": (
+        "verification_plan_authority.verification_obligations[0]"
+        ".declared_coverage"
+    ),
+    "negative_control": (
+        "verification_plan_authority.verification_obligations[0]"
+        ".negative_controls[0].description"
+    ),
+    "procedure_reference": (
+        "verification_plan_authority.verification_obligations[0]"
+        ".procedure_reference"
+    ),
+    "reference_case": (
+        "verification_plan_authority.verification_obligations[0]"
+        ".reference_cases[0]"
+    ),
+}
+
+
+def test_every_exact_prose_marker_is_reproduced_in_its_own_field_only(
+    disclosure_review: HistoricalEvaluationPairingOwnerReview,
+):
+    """Each planted string appears exactly once, at exactly the right key."""
+
+    presented = disclosure_review.to_presentation_dict()
+    keyed = list(_keyed_values(presented))
+    for slot in TEXT_MARKER_SLOTS:
+        if slot == "checkpoint_argv":
+            continue
+        for marker in _text_markers(slot):
+            carriers = sorted(
+                key
+                for key, value in keyed
+                if isinstance(value, str) and marker in value
+            )
+            assert carriers == [MARKER_CARRIERS[slot]], (slot, marker, carriers)
+    for slot in IDENTIFIER_MARKER_SLOTS:
+        marker = _identifier_marker(slot)
+        carriers = sorted(
+            key for key, value in keyed if isinstance(value, str) and marker in value
+        )
+        assert carriers == [MARKER_CARRIERS[slot]], (slot, carriers)
+
+
+def test_exact_authored_prose_is_reproduced_without_rewriting(
+    disclosure_review: HistoricalEvaluationPairingOwnerReview,
+    registered_disclosure_payload: NativeCanaryAuthorizationPayloadV4,
+):
+    """Field-by-field equality against the pinned canonical source values."""
+
+    review = disclosure_review
+    profile = registered_disclosure_payload.mission_profile
+    context = review.historical_mission_context
+    presented = review.to_presentation_dict()
+    mission = presented["historical_mission_context"]
+    owner = _disclosure_owner_material(registered_disclosure_payload)
+
+    for slot, stored, shown, authored in (
+        ("mission_text", context.mission_text, mission["mission_text"],
+         profile.mission_text),
+        ("gate_objective", context.gate_objective, mission["gate_objective"],
+         profile.gate_objective),
+        ("completion_conditions_text", context.completion_conditions_text,
+         mission["completion_conditions_text"],
+         profile.completion_conditions_text),
+        ("stop_clause", context.stop_clause, mission["stop_clause"],
+         profile.runtime_prompt.stop_clause),
+        ("gate_clause", context.gate_clauses[0].text,
+         mission["gate_clauses"][0]["text"], profile.gate_clauses[0][1]),
+        ("claim_statement", review.claim_authority.claims[0].statement,
+         presented["claim_authority"]["claims"][0]["statement"],
+         owner["result_claims"][0]["statement"]),
+        ("claim_non_claim", review.claim_authority.claims[0].non_claims[0],
+         presented["claim_authority"]["claims"][0]["non_claims"][0],
+         owner["result_claims"][0]["non_claims"][0]),
+        ("declared_coverage",
+         review.verification_plan_authority.verification_obligations[0]
+         .declared_coverage,
+         presented["verification_plan_authority"]["verification_obligations"][0]
+         ["declared_coverage"],
+         owner["claim_verification_plan"][0]["declared_coverage"]),
+        ("negative_control",
+         review.verification_plan_authority.verification_obligations[0]
+         .negative_controls[0].description,
+         presented["verification_plan_authority"]["verification_obligations"][0]
+         ["negative_controls"][0]["description"],
+         owner["claim_verification_plan"][0]["negative_controls"][0]
+         ["description"]),
+    ):
+        windows, posix = _text_markers(slot)
+        assert windows in authored and posix in authored, slot
+        # Exact reproduction: no strip, collapse, escape, or rewrite.
+        assert stored == authored, slot
+        assert shown == authored, slot
+        assert windows in stored and posix in stored, slot
+        assert stored != stored.strip(), slot
+        assert stored != " ".join(stored.split()), slot
+
+
+def test_exact_checkpoint_command_arguments_are_reproduced_without_rewriting(
+    disclosure_review: HistoricalEvaluationPairingOwnerReview,
+    registered_disclosure_payload: NativeCanaryAuthorizationPayloadV4,
+):
+    profile = registered_disclosure_payload.mission_profile
+    command = disclosure_review.historical_mission_context.checkpoint_commands[0]
+    presented = disclosure_review.to_presentation_dict()
+    shown = presented["historical_mission_context"]["checkpoint_commands"][0]
+    windows, posix = _text_markers("checkpoint_argv")
+
+    assert command.argv == profile.checkpoint_commands[0].argv
+    assert shown["argv"] == list(profile.checkpoint_commands[0].argv)
+    assert command.argv[-2:] == (windows, posix)
+    assert shown["argv"][-2:] == [windows, posix]
+
+    keyed = list(_keyed_values(presented))
+    for offset, marker in ((2, windows), (1, posix)):
+        index = len(command.argv) - offset
+        carriers = sorted(
+            key for key, value in keyed if isinstance(value, str) and marker in value
+        )
+        assert carriers == [
+            f"historical_mission_context.checkpoint_commands[0].argv[{index}]"
+        ], (marker, carriers)
+
+
+def test_identifier_fields_cannot_carry_a_complete_absolute_path(
+    disclosure_review: HistoricalEvaluationPairingOwnerReview,
+):
+    """The limitation on identifier-typed fields is pinned, not glossed over.
+
+    ``procedure_reference`` and every reference case are canonical identifiers.
+    The grammar admits ``:`` but neither separator flavour, so the most
+    path-looking value the schema permits is planted there instead -- and the
+    review still reproduces that value exactly.
+    """
+
+    obligation = (
+        disclosure_review.verification_plan_authority.verification_obligations[0]
+    )
+    for slot, value in (
+        ("procedure_reference", obligation.procedure_reference),
+        ("reference_case", obligation.reference_cases[0]),
+    ):
+        assert value == _identifier_marker(slot)
+        assert require_identifier(value, slot) == value
+        assert ":" in value
+        for refused in _text_markers(slot):
+            with pytest.raises(ValueError):
+                require_identifier(refused, slot)
+
+
+def test_the_documented_distinction_is_stated_exactly(
+    disclosure_review: HistoricalEvaluationPairingOwnerReview,
+):
+    """Structured locator fields withheld versus exact text reproduced."""
+
+    documentation = " ".join(review_module.__doc__.split()).lower()
+    assert (
+        "every structured local locator field carried by the historical "
+        "authorization is deliberately withheld" in documentation
+    )
+    assert (
+        "exact owner-authored and mission-authored text is reproduced without "
+        "rewriting, and such text may itself contain path-like or "
+        "absolute-path-looking content" in documentation
+    )
+    assert (
+        "the exact profile-authored checkpoint command arguments are reproduced"
+        in documentation
+    )
+    # The two halves describe different material: no withheld field name is a
+    # presented mission-context field, and vice versa.
+    presented_mission_keys = set(
+        disclosure_review.historical_mission_context.to_presentation_dict()
+    )
+    withheld_leaves = {
+        field.rsplit(".", 1)[-1]
+        for field in HISTORICAL_PAIRING_OWNER_REVIEW_WITHHELD_FIELDS
+    }
+    assert not (presented_mission_keys & withheld_leaves)
+    assert {"mission_text", "checkpoint_commands"} <= presented_mission_keys
+
+
+# ---------------------------------------------------------------------------
+# Step 5C2C1.1 E. Authority-wrapper schema fidelity.
+#
+# The source field inventory is read from the real canonical types, so adding a
+# wrapper field upstream without an explicit reviewed representation fails here.
+# ---------------------------------------------------------------------------
+
+AUTHORITY_WRAPPER_SCHEMAS = (
+    (
+        ClaimAuthority,
+        ReviewedClaimAuthority,
+        {
+            "authorship": "authorship",
+            "coverage_status": "coverage_status",
+            "claims": "claims",
+        },
+        "claims",
+        "claim_id",
+        ResultClaim,
+        ReviewedResultClaim,
+    ),
+    (
+        ClaimVerificationPlanAuthority,
+        ReviewedVerificationPlanAuthority,
+        {
+            "authorship": "authorship",
+            "coverage_status": "coverage_status",
+            "verification_obligations": "verification_obligations",
+        },
+        "verification_obligations",
+        "obligation_id",
+        VerificationObligation,
+        ReviewedVerificationObligation,
+    ),
+    (
+        VerificationEvidenceBindingAuthority,
+        ReviewedEvidenceBindingAuthority,
+        {
+            "authorship": "authorship",
+            "coverage_status": "coverage_status",
+            "bindings": "bindings",
+        },
+        "bindings",
+        "binding_id",
+        VerificationEvidenceBinding,
+        ReviewedEvidenceBinding,
+    ),
+)
+
+# A reviewed wrapper may never invent an authority result or assessment.
+INVENTED_AUTHORITY_RESULT_NAMES = frozenset(
+    {
+        "result",
+        "results",
+        "assessment",
+        "assessed",
+        "satisfaction",
+        "satisfied",
+        "verdict",
+        "product_verdict",
+        "admitted",
+        "admission",
+        "eligibility",
+        "support",
+        "claim_support",
+        "coverage_rollup",
+        "outcome",
+        "score",
+        "conclusion",
+        "obligation_result",
+    }
+)
+
+
+@pytest.mark.parametrize(
+    "source_type,reviewed_type,mapping,member_field,id_field,"
+    "source_member_type,reviewed_member_type",
+    AUTHORITY_WRAPPER_SCHEMAS,
+    ids=[schema[0].__name__ for schema in AUTHORITY_WRAPPER_SCHEMAS],
+)
+def test_every_authority_wrapper_field_has_an_explicit_reviewed_mapping(
+    source_type,
+    reviewed_type,
+    mapping,
+    member_field,
+    id_field,
+    source_member_type,
+    reviewed_member_type,
+):
+    source_fields = {field.name for field in fields(source_type)}
+    reviewed_fields = {field.name for field in fields(reviewed_type)}
+    # Inventoried from the real source type: a new wrapper field upstream
+    # without an explicit reviewed mapping fails right here.
+    assert source_fields == set(mapping), source_type
+    # No source field is silently omitted and no reviewed field is invented.
+    assert reviewed_fields == set(mapping.values()), reviewed_type
+    assert not (reviewed_fields & INVENTED_AUTHORITY_RESULT_NAMES), reviewed_type
+    assert member_field in mapping.values()
+    # The ordered member collection keeps its field-for-field member schema.
+    assert {field.name for field in fields(reviewed_member_type)} == {
+        field.name for field in fields(source_member_type)
+    }
+    assert id_field in {field.name for field in fields(reviewed_member_type)}
+    # The wrappers carry no schema version of their own: the accepted design
+    # states it exactly once, on the pairing identity.
+    assert "schema_version" not in reviewed_fields
+    assert "schema_version" not in source_fields
+
+
+def test_reviewed_wrappers_preserve_authorship_coverage_and_owner_order(
+    review: HistoricalEvaluationPairingOwnerReview,
+    coordinator: HistoricalEvaluationPairingCoordinator,
+    prepared,
+):
+    profile = coordinator._preparations[prepared.preparation_id].evaluation_profile
+    pairs = (
+        ("claim_authority", "claim_authority"),
+        ("claim_verification_plan_authority", "verification_plan_authority"),
+        (
+            "verification_evidence_binding_authority",
+            "verification_evidence_binding_authority",
+        ),
+    )
+    for (source_attribute, reviewed_attribute), schema in zip(
+        pairs, AUTHORITY_WRAPPER_SCHEMAS, strict=True
+    ):
+        _source_type, _reviewed_type, mapping, member_field, id_field = schema[:5]
+        source = getattr(profile, source_attribute)
+        reviewed = getattr(review, reviewed_attribute)
+        assert reviewed.authorship == source.authorship.value
+        assert reviewed.coverage_status == source.coverage_status.value
+        # Coverage remains exactly what the authority carries.
+        assert reviewed.coverage_status == "NOT_ASSESSED"
+        members = getattr(reviewed, member_field)
+        source_members = getattr(source, member_field)
+        assert isinstance(members, tuple)
+        # Owner ordering is preserved: nothing sorts, dedupes, or regroups.
+        assert [getattr(member, id_field) for member in members] == [
+            getattr(member, id_field) for member in source_members
+        ]
+        presented = reviewed.to_presentation_dict()
+        assert set(presented) == set(mapping.values())
+        assert len(presented[member_field]) == len(source_members)
+    assert review.pairing_identity.evaluation_profile_schema_version == (
+        profile.schema_version
+    )
+    assert profile.schema_version == MISSION_PROFILE_SCHEMA_VERSION_V5
+
+
+# ---------------------------------------------------------------------------
+# Step 5C2C1.1 F. Documentation wording.
+#
+# The audit distinguishes an explicit limitation from a positive overclaim: a
+# sentence may name a hazard as long as it also bounds it, and a sentence that
+# names the hazard while asserting immunity is refused.
+# ---------------------------------------------------------------------------
+
+_REVIEW_LIMITATION_CUES = frozenset(
+    {
+        "no",
+        "not",
+        "never",
+        "cannot",
+        "nothing",
+        "neither",
+        "nor",
+        "may",
+        "without",
+        "inert",
+        "deliberately",
+    }
+)
+
+# The exact bounded claims the module is allowed to state.
+REVIEW_REQUIRED_BOUNDED_CLAIMS = (
+    "every structured local locator field carried by the historical "
+    "authorization is deliberately withheld",
+    "that is a field-level guarantee about exactly those named fields and it "
+    "is nothing wider.",
+    "exact owner-authored and mission-authored text is reproduced without "
+    "rewriting, and such text may itself contain path-like or "
+    "absolute-path-looking content",
+    "the exact profile-authored checkpoint command arguments are reproduced "
+    "as well, and one of those arguments may be, or may contain, a program "
+    "name or a path-like string.",
+    "no claim is made that every string resembling a path has been removed.",
+    "it is never evidence that a filesystem entry exists, and a displayed "
+    "path has been neither resolved nor accessed.",
+    "the review continues to assert no path, source, artifact, or workspace "
+    "existence.",
+)
+
+# Positive overclaims the module must never make.
+REVIEW_FORBIDDEN_OVERCLAIMS = (
+    "no absolute local path",
+    "absolute local path value",
+    "ever appears in the review",
+    "never appears in the review",
+    "no path-looking text",
+    "no path-like text",
+    "contains no path",
+    "cannot contain a path",
+    "cannot contain paths",
+    "argv cannot contain",
+    "arguments cannot contain a path",
+    "every string resembling a path is removed",
+    "all path-like text is removed",
+    "prose is sanitized",
+    "arbitrary prose is sanitized",
+)
+
+# Hazards that may be named only inside a sentence that also bounds them.
+REVIEW_BOUNDED_TOPICS = (
+    "path-like",
+    "absolute-path-looking",
+    "resembling a path",
+)
+
+# The exact false universal sentence this slice removed.
+REMOVED_FALSE_UNIVERSAL_SENTENCE = (
+    "No absolute local path value from the payload ever appears in the review "
+    "or in its presentation mapping."
+)
+
+
+def _review_documentation() -> str:
+    return " ".join(review_module.__doc__.split()).lower()
+
+
+def test_review_states_the_bounded_disclosure_claim():
+    documentation = _review_documentation()
+    for claim in REVIEW_REQUIRED_BOUNDED_CLAIMS:
+        assert claim in documentation, claim
+
+
+def test_review_makes_no_universal_path_disclosure_claim():
+    documentation = _review_documentation()
+    for overclaim in REVIEW_FORBIDDEN_OVERCLAIMS:
+        assert overclaim not in documentation, overclaim
+    source = " ".join(
+        Path(review_module.__file__).read_text(encoding="utf-8").split()
+    ).lower()
+    assert " ".join(REMOVED_FALSE_UNIVERSAL_SENTENCE.split()).lower() not in source
+
+
+def test_every_review_hazard_sentence_bounds_the_hazard_it_names():
+    normalized = " ".join(review_module.__doc__.split())
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=\.)\s+", normalized)
+        if sentence.strip()
+    ]
+    for topic in REVIEW_BOUNDED_TOPICS:
+        carrying = [
+            sentence for sentence in sentences if topic in sentence.lower()
+        ]
+        assert carrying, topic
+        for sentence in carrying:
+            words = set(re.findall(r"[a-z]+", sentence.lower()))
+            assert _REVIEW_LIMITATION_CUES & words, (topic, sentence)
+
+
+def test_the_bounded_wording_matches_the_behavior_that_exists(
+    disclosure_review: HistoricalEvaluationPairingOwnerReview,
+    registered_disclosure_payload: NativeCanaryAuthorizationPayloadV4,
+):
+    """Documentation and behavior are checked against each other, both ways."""
+
+    rendered = json.dumps(
+        disclosure_review.to_presentation_dict(), ensure_ascii=False
+    )
+    # The withholding half is true.
+    for marker in LOCATOR_MARKERS.values():
+        assert marker not in rendered
+    # The reproduction half is true, and is exactly why the universal claim
+    # would have been false.  A Windows-flavoured marker is compared in its
+    # serialized form, because JSON escapes the separator it contains.
+    for slot in TEXT_MARKER_SLOTS:
+        for marker in _text_markers(slot):
+            assert _serialized(marker) in rendered, slot
+    assert (
+        "no source, path, artifact, or workspace existence"
+        in "\n".join(HISTORICAL_PAIRING_OWNER_REVIEW_NOTICES)
+    )
 
 
 def test_existing_preparation_view_and_projection_are_unchanged(prepared):
