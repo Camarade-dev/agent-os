@@ -29,6 +29,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import stat
 import sys
 import threading
@@ -217,6 +218,86 @@ def _filesystem_observation(module, monkeypatch: pytest.MonkeyPatch):
     for name in ("glob", "rglob", "iterdir", "mkdir", "resolve", "readlink"):
         monkeypatch.setattr(Path, name, forbidden(f"Path.{name}"))
     yield observation
+
+
+class _PathAccess:
+    """Every path handed to an open, stat, existence or directory entry point.
+
+    Nothing is forbidden here and nothing is faked: each entry point delegates
+    to the real implementation and records the exact path it was given, so a
+    test can afterwards distinguish the one document the loader is allowed to
+    touch from every configured path it must never touch.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str]] = []
+
+    def record(self, operation: str, value: object) -> None:
+        try:
+            recorded = os.fspath(value)
+        except TypeError:
+            # An integer file descriptor names no path and cannot be a
+            # configured V4 document; record it verbatim rather than dropping it.
+            recorded = f"<non-path {value!r}>"
+        self.events.append((operation, recorded))
+
+    def paths_for(self, operation: str) -> list[str]:
+        return [path for name, path in self.events if name == operation]
+
+    @property
+    def paths(self) -> list[str]:
+        return [path for _, path in self.events]
+
+
+# Every entry point through which a configured V4 document could be opened,
+# stat-ed, probed for existence, or reached through its directory.
+OBSERVED_OS_ENTRY_POINTS = ("stat", "lstat", "access", "scandir", "listdir")
+OBSERVED_PATH_ENTRY_POINTS = ("open", "stat", "lstat", "exists", "is_file", "is_dir")
+OBSERVED_METADATA_OPERATIONS = (
+    ("builtins.open",)
+    + tuple(f"os.{name}" for name in OBSERVED_OS_ENTRY_POINTS)
+    + tuple(f"Path.{name}" for name in OBSERVED_PATH_ENTRY_POINTS)
+)
+
+
+@contextmanager
+def _path_access_observation(monkeypatch: pytest.MonkeyPatch):
+    """Record the exact path of every open, stat, existence or directory call.
+
+    ``builtins.open`` is wrapped rather than the module global, so a call that
+    bypassed the module namespace would still be seen, and ``Path`` is wrapped
+    on the class, so a bound-method call on any concrete flavour is seen too.
+    """
+
+    access = _PathAccess()
+    real_open = builtins.open
+    real_os = {name: getattr(os, name) for name in OBSERVED_OS_ENTRY_POINTS}
+    real_path = {name: getattr(Path, name) for name in OBSERVED_PATH_ENTRY_POINTS}
+
+    def spy_open(file, *args, **kwargs):
+        access.record("builtins.open", file)
+        return real_open(file, *args, **kwargs)
+
+    def make_os_spy(name, real):
+        def spy(path, *args, **kwargs):
+            access.record(f"os.{name}", path)
+            return real(path, *args, **kwargs)
+
+        return spy
+
+    def make_path_spy(name, real):
+        def spy(self, *args, **kwargs):
+            access.record(f"Path.{name}", self)
+            return real(self, *args, **kwargs)
+
+        return spy
+
+    monkeypatch.setattr(builtins, "open", spy_open)
+    for name, real in real_os.items():
+        monkeypatch.setattr(os, name, make_os_spy(name, real))
+    for name, real in real_path.items():
+        monkeypatch.setattr(Path, name, make_path_spy(name, real))
+    yield access
 
 
 class _Quiet:
@@ -548,11 +629,113 @@ def test_trailing_nul_hmac_equivalence_is_an_hmac_property_not_a_reader_defect(
     block_nul = read_historical_pairing_secret_file(
         path=_write(secret_root / "block-nul.bin", block + b"\x00")
     )
+    # Stated for exactly these two fixture values at exactly this length, and
+    # deliberately not generalized into a universal cryptographic law: a key at
+    # or above the block size is hashed rather than zero-padded, so these two
+    # particular secrets are two particular different HMAC keys here.
     assert compute_historical_pairing_confirmation_tag(
         secret=block_bare, pairing_authority=authority
     ) != compute_historical_pairing_confirmation_tag(
         secret=block_nul, pairing_authority=authority
     )
+
+
+# --- The documented HMAC semantics must stay honest -------------------------
+#
+# The behavioural proofs above establish what is true.  These tests pin the
+# module documentation to the same truth, because a docstring is the only part
+# of this reader an operator reads before configuring a secret, and the false
+# claim these tests forbid is exactly the one an independent review removed.
+
+
+def _normalized_documentation(module) -> str:
+    """Collapse the module docstring to one lowercase whitespace-normal line."""
+
+    return " ".join((module.__doc__ or "").split()).lower()
+
+
+# Sentences the corrected documentation must state.  Each is an independent
+# literal here: the module is never asked to supply the wording it is then
+# compared against.
+REQUIRED_SECRET_DOC_STATEMENTS = (
+    # 1. The exact secret bytes are preserved.
+    "every byte in the file is preserved as part of the configured secret",
+    # 2. The reader performs no transformation.
+    "the reader performs no transformation",
+    # 3a. No claim of a distinct key or tag per distinct byte string.
+    "the reader does not claim that every distinct byte string maps to a "
+    "distinct hmac key or tag",
+    # 3b. HMAC's own key normalization may make distinct byte strings equivalent.
+    "hmac performs its own standard key normalization, including zero-padding "
+    "of short keys, so some distinct byte strings may be hmac-equivalent",
+)
+
+# Distinctness language is permitted *only* inside the disclaiming statements
+# above.  Everything else in the docstring is scanned for the false claims.
+FORBIDDEN_SECRET_DOC_CLAIMS = (
+    (r"different confirmation tags?", "distinct secret bytes always produce distinct tags"),
+    (r"distinct confirmation tags?", "distinct secret bytes always produce distinct tags"),
+    (r"different tags?\b", "a trailing NUL produces a different tag"),
+    (r"distinct tags?\b", "a trailing NUL produces a different tag"),
+    (r"distinct hmac keys?", "a one-to-one byte-string to HMAC-key mapping"),
+    (r"one[- ]to[- ]one", "a one-to-one byte-string to HMAC-key mapping"),
+    (r"biject\w*", "a one-to-one byte-string to HMAC-key mapping"),
+    (
+        r"every (?:trailing )?byte (?:therefore )?changes",
+        "every trailing byte changes the confirmation tag",
+    ),
+    (
+        r"always (?:produces?|yields?|changes|maps)",
+        "an unconditional byte-difference-implies-tag-difference guarantee",
+    ),
+    (
+        r"reader (?:canonicali[sz]es|normali[sz]es)",
+        "the reader canonicalizes or normalizes the secret",
+    ),
+)
+
+
+def test_secret_documentation_states_the_three_required_hmac_concepts():
+    """Preserved bytes, no transformation, and HMAC's own key normalization."""
+
+    documentation = _normalized_documentation(secret_module)
+    for statement in REQUIRED_SECRET_DOC_STATEMENTS:
+        assert statement in documentation, statement
+
+
+def test_secret_documentation_claims_no_distinct_byte_to_distinct_tag_mapping():
+    """The removed false claim may not return in any equivalent wording.
+
+    The four disclaiming statements are excised first, so distinctness wording
+    is legal exactly where it is disclaimed and nowhere else.  A restored
+    sentence asserting that a trailing byte necessarily changes the confirmation
+    tag therefore has nowhere to hide.
+    """
+
+    documentation = _normalized_documentation(secret_module)
+    scanned = documentation
+    for statement in REQUIRED_SECRET_DOC_STATEMENTS:
+        scanned = scanned.replace(statement, " ")
+    for pattern, claim in FORBIDDEN_SECRET_DOC_CLAIMS:
+        found = re.search(pattern, scanned)
+        assert found is None, f"documentation claims {claim}: {found.group(0)!r}"
+
+
+def test_secret_documentation_disclaimer_survives_removal_of_the_false_claim():
+    """The excision above cannot be what makes the previous test pass.
+
+    If the disclaiming statements were absent, the excision would remove
+    nothing; this pins that they are present *and* that the corrected paragraph
+    is shorter than the whole docstring, so the scan really does examine text.
+    """
+
+    documentation = _normalized_documentation(secret_module)
+    scanned = documentation
+    for statement in REQUIRED_SECRET_DOC_STATEMENTS:
+        scanned = scanned.replace(statement, " ")
+    assert len(scanned) < len(documentation)
+    assert "hmac" in documentation
+    assert "confirmation tag" not in scanned
 
 
 BINARY_SECRETS = {
@@ -813,10 +996,49 @@ def test_ttl_and_capacity_are_transferred_unchanged(enablement_root: Path):
 # --- Schema and field laws --------------------------------------------------
 
 
+def test_schema_version_constant_is_exactly_the_accepted_literal():
+    """The wire contract is pinned to a literal, not to itself.
+
+    Every other schema test compares a document against the production
+    constant, so a silent drift of that constant to any other value -- ``_v2``,
+    ``_v3``, or an arbitrary same-shape string -- would leave them all green
+    while every already-deployed enablement document became unloadable.  This
+    is the only assertion that fails on that drift, and it inspects the real
+    production constant rather than a copy.
+    """
+
+    assert (
+        enablement_module.HISTORICAL_PAIRING_ENABLEMENT_SCHEMA_VERSION
+        == "admissible_historical_pairing_enablement_v1"
+    )
+    assert (
+        HISTORICAL_PAIRING_ENABLEMENT_SCHEMA_VERSION
+        == "admissible_historical_pairing_enablement_v1"
+    )
+    assert type(HISTORICAL_PAIRING_ENABLEMENT_SCHEMA_VERSION) is str
+
+
+def test_document_declaring_the_accepted_literal_loads(enablement_root: Path):
+    """The positive path, driven by the literal instead of by the constant."""
+
+    document = _enablement_document(
+        archive_root=str(enablement_root / "archive"),
+        payloads=(("only-payload", str(enablement_root / "one.json")),),
+        schema_version="admissible_historical_pairing_enablement_v1",
+    )
+    path = _write(enablement_root / "c.json", _document_bytes(document))
+    configuration = load_historical_pairing_configuration(path=path)
+    assert type(configuration) is HistoricalPairingConfiguration
+    assert [entry.payload_id for entry in configuration.payload_entries] == [
+        "only-payload"
+    ]
+
+
 @pytest.mark.parametrize(
     "schema_version",
     [
         "admissible_historical_pairing_enablement_v2",
+        "admissible_historical_pairing_enablement_v3",
         "admissible_historical_pairing_enablement_v1 ",
         " admissible_historical_pairing_enablement_v1",
         "Admissible_Historical_Pairing_Enablement_V1",
@@ -1395,6 +1617,85 @@ def test_loader_opens_only_the_configuration_document_and_creates_nothing(
     assert payload_document.read_bytes() == b"{}"
     assert not (enablement_root / "two.json").exists()
     assert not (enablement_root / "three.json").exists()
+
+
+def test_no_configured_v4_document_receives_open_stat_or_existence_access(
+    enablement_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Real decoys on disk, and not one metadata call reaches any of them.
+
+    Every configured V4 document exists here, so an accidental ``stat`` would
+    succeed instead of failing loudly: the only thing that can catch it is
+    recording the exact path of every entry point and comparing it against the
+    configured set.  The enablement document itself is allowed to be opened and
+    metadata-checked; the archive root and the three payload documents are not.
+    """
+
+    decoys = tuple(
+        _write(enablement_root / name, b'{"decoy": true}')
+        for name in ("one.json", "two.json", "three.json")
+    )
+    archive_root = enablement_root / "archive"
+    document = _enablement_document(
+        archive_root=str(archive_root),
+        payloads=(
+            ("first-payload", str(decoys[0])),
+            ("second-payload", str(decoys[1])),
+            ("third-payload", str(decoys[2])),
+        ),
+    )
+    path = _write(enablement_root / "c.json", _document_bytes(document))
+    forbidden = {os.fspath(decoy) for decoy in decoys} | {os.fspath(archive_root)}
+
+    with _path_access_observation(monkeypatch) as access:
+        configuration = load_historical_pairing_configuration(path=path)
+
+    # 1. Not one of the twelve observed entry points ever saw a forbidden path.
+    for operation in OBSERVED_METADATA_OPERATIONS:
+        for observed in access.paths_for(operation):
+            assert observed not in forbidden, (operation, observed)
+
+    # 2. Exact path law: the enablement document is the only path touched at
+    #    all, so no directory-derived or parent-derived access reached them
+    #    either.
+    assert access.paths_for("builtins.open") == [os.fspath(path)]
+    assert set(access.paths) == {os.fspath(path)}
+    assert access.paths_for("os.scandir") == []
+    assert access.paths_for("os.listdir") == []
+
+    # 3. The archive root was not created, and the decoy bytes were not read.
+    assert not archive_root.exists()
+    assert configuration.archive_root == archive_root
+    for decoy in decoys:
+        assert decoy.read_bytes() == b'{"decoy": true}'
+    assert [entry.document_path for entry in configuration.payload_entries] == list(
+        decoys
+    )
+
+
+def test_accepted_configuration_validation_is_filesystem_free(
+    enablement_root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """``validated()`` decides every configuration law without touching disk."""
+
+    decoys = tuple(
+        _write(enablement_root / name, b"{}") for name in ("a.json", "b.json")
+    )
+    configuration = HistoricalPairingConfiguration(
+        archive_root=enablement_root / "archive",
+        payload_entries=tuple(
+            HistoricalPayloadEntry(payload_id=payload_id, document_path=decoy)
+            for payload_id, decoy in zip(("first-payload", "second-payload"), decoys)
+        ),
+        preparation_ttl_seconds=900,
+        max_preparations=64,
+    )
+
+    with _path_access_observation(monkeypatch) as access:
+        assert configuration.validated() is configuration
+
+    assert access.events == []
+    assert not (enablement_root / "archive").exists()
 
 
 def test_returned_configuration_retains_no_bytes_mapping_or_source_path(

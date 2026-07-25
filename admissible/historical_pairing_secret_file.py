@@ -17,8 +17,23 @@ Base64-decodes or hex-decodes, never trims, strips, or normalizes, never
 removes a carriage return or line feed, never changes case, and never
 truncates.  A trailing ``\\n``, ``\\r\\n``, NUL byte, space, or tab is therefore
 part of the secret whenever the total length remains inside the accepted
-bounds, and two files that differ only in such a trailing byte are two
-different secrets that produce two different confirmation tags.
+bounds.  Every byte in the file is preserved as part of the configured secret.
+The reader performs no transformation, so two independent consumers of one
+file -- the launcher today and an independent helper later -- receive the same
+exact bytes.
+
+What the reader does not claim
+------------------------------
+
+The reader does not claim that every distinct byte string maps to a distinct
+HMAC key or tag.  HMAC performs its own standard key normalization, including
+zero-padding of short keys, so some distinct byte strings may be
+HMAC-equivalent.  A secret shorter than the HMAC block size and that same
+secret followed by a NUL byte are returned here as two byte strings that are
+not equal, yet they can be one effective HMAC key and produce the same tag for
+the same message.  That equivalence belongs to HMAC's own key-normalization
+semantics and to the accepted confirmation primitive; this reader is not
+responsible for it and applies no key normalization of its own.
 
 Bounds
 ------
