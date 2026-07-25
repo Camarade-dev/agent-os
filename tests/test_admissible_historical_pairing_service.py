@@ -67,11 +67,16 @@ from admissible.product_launcher import historical_pairing_service as service_mo
 from admissible.product_launcher.historical_pairing_registry import (
     HistoricalPairingConfiguration,
     HistoricalPayloadEntry,
+    HistoricalPayloadNotFound,
     HistoricalPayloadRegistry,
+    HistoricalPayloadRegistryError,
+    InvalidHistoricalPairingConfiguration,
     MalformedHistoricalPayloadDocument,
 )
 from admissible.product_launcher.historical_pairing_service import (
     CONFIRMATION_ERROR_MAPPING,
+    ERROR_HISTORICAL_PAIRING_UNAVAILABLE,
+    ERROR_PAYLOAD_NOT_ALLOWLISTED,
     PREPARATION_ERROR_MAPPING,
     REVIEW_ERROR_MAPPING,
     HistoricalPairingFeatureConfigurationError,
@@ -1251,6 +1256,248 @@ def test_error_mappings_are_read_only_and_complete():
             assert 400 <= status <= 599
             assert code == code.upper()
             assert set(code) <= set("ABCDEFGHIJKLMNOPQRSTUVWXYZ_")
+
+
+# ---------------------------------------------------------------------------
+# G2. The exact-type mapping policy, stated as a policy.
+#
+# ``_mapped_refusal`` keys on ``type(exc)`` and on nothing else.  A subclass of
+# a mapped class is therefore a different key, and it must reach the one fixed
+# unavailable code rather than quietly inheriting the narrower code its base
+# class was granted.  That is deliberate: a narrow code is a documented promise
+# about one exactly known failure, and an unforeseen refinement of that failure
+# is not the same fact.  ``isinstance`` would silently widen every promise the
+# moment anyone subclassed a mapped class.
+#
+# The registry path below is the deliberate opposite policy and is pinned here
+# so this section can never be "made consistent" by accident.
+# ---------------------------------------------------------------------------
+
+
+HOSTILE_SENTINEL = "HOSTILE-SUBCLASS-MATERIAL"
+
+# Read from the product itself rather than restated, so a class added to any
+# mapping is covered here the moment it is added.
+MAPPED_WORKFLOW_ERRORS = tuple(
+    sorted(
+        set(PREPARATION_ERROR_MAPPING)
+        | set(REVIEW_ERROR_MAPPING)
+        | set(CONFIRMATION_ERROR_MAPPING),
+        key=lambda kind: kind.__name__,
+    )
+)
+MAPPED_WORKFLOW_ERROR_IDS = [kind.__name__ for kind in MAPPED_WORKFLOW_ERRORS]
+
+_OPERATION_MAPPINGS: dict[str, AbstractMapping] = {
+    "prepare": PREPARATION_ERROR_MAPPING,
+    "review": REVIEW_ERROR_MAPPING,
+    "confirm": CONFIRMATION_ERROR_MAPPING,
+}
+
+
+def _hostile_subclass(mapped: type) -> type:
+    """One fresh subclass of a mapped class, hostile in every readable slot."""
+
+    return type(
+        f"Hostile{mapped.__name__}",
+        (mapped,),
+        {
+            "__doc__": f"{HOSTILE_SENTINEL}-DOC",
+            "code": f"{HOSTILE_SENTINEL}-CLASS-CODE",
+            "status": 200,
+        },
+    )
+
+
+def _hostile_instance(mapped: type) -> BaseException:
+    """One subclass instance carrying the sentinel everywhere it could leak."""
+
+    error = _hostile_subclass(mapped)(
+        f"{HOSTILE_SENTINEL}-MESSAGE",
+        f"{HOSTILE_SENTINEL}-SECOND-ARG",
+        {"nested": f"{HOSTILE_SENTINEL}-NESTED-ARG"},
+    )
+    error.status = 200
+    error.error = f"{HOSTILE_SENTINEL}-INSTANCE-ERROR"
+    error.detail = f"{HOSTILE_SENTINEL}-INSTANCE-DETAIL"
+    error.__cause__ = RuntimeError(f"{HOSTILE_SENTINEL}-CAUSE")
+    error.__context__ = RuntimeError(f"{HOSTILE_SENTINEL}-CONTEXT")
+    # ``add_note`` exists from 3.11; assigning ``__notes__`` is exactly what it
+    # does, so the hostile note is present on every supported interpreter.
+    error.__notes__ = [f"{HOSTILE_SENTINEL}-NOTE"]
+    return error
+
+
+def _invoke_operation(
+    service: HistoricalPairingService,
+    operation: str,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+) -> tuple[int, dict]:
+    """Drive exactly one bounded service operation with fixed neutral inputs."""
+
+    if operation == "prepare":
+        return prepared(service, historical_payload)
+    if operation == "review":
+        return service.review(
+            preparation_id="preparation-identifier",
+            expected_authority_fingerprint="a" * 64,
+        )
+    assert operation == "confirm"
+    return service.confirm(
+        preparation_id="preparation-identifier",
+        expected_authority_fingerprint="a" * 64,
+        presented_confirmation_tag="b" * 64,
+    )
+
+
+def _hostile_material(mapped: type) -> tuple[str, ...]:
+    """Every string a leaking implementation could plausibly have echoed."""
+
+    return (
+        HOSTILE_SENTINEL,
+        f"Hostile{mapped.__name__}",
+        mapped.__name__,
+        "message",
+        "detail",
+        "cause",
+        "context",
+        "note",
+        "args",
+        "Traceback",
+    )
+
+
+def test_the_mapped_workflow_error_inventory_is_the_products_own():
+    """The subclass sweep below can never silently become an empty sweep."""
+
+    assert set(MAPPED_WORKFLOW_ERRORS) == set(PREPARATION_ERROR_MAPPING) | set(
+        CONFIRMATION_ERROR_MAPPING
+    )
+    assert set(REVIEW_ERROR_MAPPING) <= set(CONFIRMATION_ERROR_MAPPING)
+    assert len(MAPPED_WORKFLOW_ERRORS) >= 15
+    for mapped in MAPPED_WORKFLOW_ERRORS:
+        assert issubclass(mapped, HistoricalPairingWorkflowError)
+    # No mapped class was granted the unavailable code, so inheriting a narrow
+    # code is always observably different from reaching the fallback.
+    for mapping in _OPERATION_MAPPINGS.values():
+        for _status, code in mapping.values():
+            assert code != ERROR_HISTORICAL_PAIRING_UNAVAILABLE
+
+
+@pytest.mark.parametrize(
+    "mapped", MAPPED_WORKFLOW_ERRORS, ids=MAPPED_WORKFLOW_ERROR_IDS
+)
+def test_a_subclass_of_a_mapped_error_never_inherits_its_narrow_code(
+    service: HistoricalPairingService,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    mapped: type,
+):
+    """``type(exc)`` is the whole key: a subclass is simply a different type."""
+
+    hostile = _hostile_instance(mapped)
+    assert isinstance(hostile, mapped)
+    assert type(hostile) is not mapped
+    for operation, mapping in sorted(_OPERATION_MAPPINGS.items()):
+        service._coordinator = _RaisingCoordinator(hostile)
+        status, body = _invoke_operation(service, operation, historical_payload)
+        assert (status, body) == (
+            500,
+            {"error": ERROR_HISTORICAL_PAIRING_UNAVAILABLE},
+        ), operation
+        assert body == {"error": "HISTORICAL_PAIRING_UNAVAILABLE"}
+        assert set(body) == {"error"}
+        narrow = mapping.get(mapped)
+        if narrow is not None:
+            # The base class really does own a narrower answer on this
+            # operation, so the subclass demonstrably did not inherit it.
+            assert narrow != (status, body["error"])
+            assert narrow[1] != body["error"]
+            assert narrow[0] != status or narrow[1] != body["error"]
+        rendered = json.dumps(body, sort_keys=True)
+        for forbidden in _hostile_material(mapped):
+            assert forbidden not in rendered, (operation, forbidden)
+
+
+@pytest.mark.parametrize(
+    "mapped", MAPPED_WORKFLOW_ERRORS, ids=MAPPED_WORKFLOW_ERROR_IDS
+)
+def test_the_exact_mapped_class_keeps_its_documented_narrow_mapping(
+    service: HistoricalPairingService,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    mapped: type,
+):
+    """The narrow codes are still granted -- to the exact class and no other."""
+
+    for operation, mapping in sorted(_OPERATION_MAPPINGS.items()):
+        service._coordinator = _RaisingCoordinator(_leaky(mapped))
+        status, body = _invoke_operation(service, operation, historical_payload)
+        narrow = mapping.get(mapped)
+        if narrow is None:
+            # Not mapped on this operation: the fallback is the whole answer.
+            assert (status, body) == (
+                500,
+                {"error": ERROR_HISTORICAL_PAIRING_UNAVAILABLE},
+            ), operation
+        else:
+            assert (status, body) == (narrow[0], {"error": narrow[1]}), operation
+        assert set(body) == {"error"}
+        assert LEAK_SENTINEL not in json.dumps(body, sort_keys=True)
+
+
+class _RaisingRegistry:
+    """Stand-in registry raising one chosen bounded registry failure."""
+
+    def __init__(self, error: BaseException) -> None:
+        self._error = error
+        self.metadata: tuple = ()
+        self.calls: list[str] = []
+
+    def get(self, **_kwargs):
+        self.calls.append("get")
+        raise self._error
+
+
+REGISTRY_ERRORS = (
+    HistoricalPayloadNotFound,
+    MalformedHistoricalPayloadDocument,
+    InvalidHistoricalPairingConfiguration,
+    HistoricalPayloadRegistryError,
+)
+REGISTRY_ERROR_IDS = [kind.__name__ for kind in REGISTRY_ERRORS]
+
+
+@pytest.mark.parametrize("exact", [True, False], ids=["exact", "subclass"])
+@pytest.mark.parametrize("mapped", REGISTRY_ERRORS, ids=REGISTRY_ERROR_IDS)
+def test_registry_failures_deliberately_collapse_through_isinstance(
+    service: HistoricalPairingService,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    mapped: type,
+    exact: bool,
+):
+    """The locator policy is the opposite policy, on purpose, and stays so.
+
+    A malformed identifier and an unregistered identifier must be one single
+    indistinguishable answer, so this path catches the registry base class and
+    every refinement of it.  Converting it to exact-type matching would turn an
+    unforeseen registry failure into a different, distinguishable answer and
+    would leak the difference between "no such payload" and "that payload is
+    broken".  This test exists so that conversion cannot happen quietly.
+    """
+
+    kind = mapped if exact else _hostile_subclass(mapped)
+    service._registry = _RaisingRegistry(kind(f"{HOSTILE_SENTINEL}-REGISTRY"))
+    status, body = prepared(service, historical_payload)
+    assert (status, body) == (404, {"error": ERROR_PAYLOAD_NOT_ALLOWLISTED})
+    assert body == {"error": "PAYLOAD_NOT_ALLOWLISTED"}
+    assert service._registry.calls == ["get"]
+    rendered = json.dumps(body, sort_keys=True)
+    for forbidden in _hostile_material(mapped):
+        assert forbidden not in rendered
+    # The registry classes are deliberately not workflow classes, so they were
+    # never candidates for the exact-type mapping in the first place.
+    assert not issubclass(mapped, HistoricalPairingWorkflowError)
+    for mapping in _OPERATION_MAPPINGS.values():
+        assert mapped not in mapping
 
 
 # ---------------------------------------------------------------------------

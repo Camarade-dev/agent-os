@@ -9,6 +9,7 @@ to produce a credential it is then verified against.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import io
 import json
@@ -55,8 +56,11 @@ from admissible.product_launcher.historical_pairing_service import (
 from admissible.product_launcher.launcher import ProductLauncher
 from admissible.product_launcher.ui_transport import (
     CSRF_HEADER,
+    DIGEST_HEADER,
+    G2_TOKEN_HEADER,
     HISTORICAL_PAIRINGS_SEGMENT,
     HISTORICAL_PAIRING_CONFIRMATION_HEADER,
+    OWNER_HEADER,
     UI_API_PREFIX,
     _UIHandler,
     _UIServer,
@@ -2373,3 +2377,1003 @@ def test_the_four_route_shapes_are_exactly_the_documented_ones():
         parts = path.split("/")
         assert len(parts) == expected_length
         assert parts[4] == HISTORICAL_PAIRINGS_SEGMENT
+
+
+# ---------------------------------------------------------------------------
+# K. The dedicated header is the sole confirmation credential source.
+#
+# Every channel below is a real credential channel somewhere: two are standard
+# HTTP authentication headers, one is the standard cookie channel, and three
+# are headers this very transport already reads for other, unrelated purposes.
+# A transport that consulted any of them for a confirmation tag would hold two
+# credential sources instead of one, and the owner's independently generated
+# tag would stop being the only thing that can confirm a pairing.
+#
+# The foreign value is a *genuinely valid* historical-pairing tag wherever the
+# channel could plausibly be believed.  A syntactically invalid placeholder
+# would be refused by the accepted coordinator no matter which header carried
+# it, so it would prove nothing at all about where the transport looked.
+# ---------------------------------------------------------------------------
+
+
+AUTHORIZATION_HEADER = "Authorization"
+PROXY_AUTHORIZATION_HEADER = "Proxy-Authorization"
+COOKIE_HEADER = "Cookie"
+ALT_CONFIRMATION_HEADER = f"{HISTORICAL_PAIRING_CONFIRMATION_HEADER}-Alt"
+
+# One valid-format credential that is never the correct tag for any prepared
+# pairing: 64 lowercase hex characters, so it reaches the coordinator's
+# verification step rather than its syntax refusal.
+WRONG_CONFIRMATION_TAG = "0" * 64
+HOSTILE_FOREIGN_MARKER = "HOSTILE-FOREIGN-CREDENTIAL-MARKER"
+
+
+def _bearer(value: str) -> str:
+    return f"Bearer {value}"
+
+
+def _cookie(value: str) -> str:
+    return f"historical_pairing_confirmation={value}"
+
+
+def _verbatim(value: str) -> str:
+    return value
+
+
+def _runtime_digest(_value: str) -> str:
+    return RUNTIME_OWNER_DIGEST
+
+
+# (label, header name, value builder applied to the *correct* tag).
+FOREIGN_CREDENTIAL_CHANNELS = (
+    ("authorization_bearer_tag", AUTHORIZATION_HEADER, _bearer),
+    ("proxy_authorization_bearer_tag", PROXY_AUTHORIZATION_HEADER, _bearer),
+    ("cookie_tag", COOKIE_HEADER, _cookie),
+    ("owner_digest_header_tag", DIGEST_HEADER, _verbatim),
+    ("owner_digest_header_runtime_digest", DIGEST_HEADER, _runtime_digest),
+    ("owner_authorization_header_tag", OWNER_HEADER, _verbatim),
+    ("control_token_header_tag", G2_TOKEN_HEADER, _verbatim),
+    ("alt_confirmation_header_tag", ALT_CONFIRMATION_HEADER, _verbatim),
+)
+FOREIGN_CREDENTIAL_IDS = [label for label, _name, _build in FOREIGN_CREDENTIAL_CHANNELS]
+
+
+def test_the_probed_foreign_headers_are_the_products_own_real_headers():
+    """Three of the rejected channels are headers this transport really reads."""
+
+    assert OWNER_HEADER == "X-Admissible-Owner-Authorization"
+    assert DIGEST_HEADER == "X-Admissible-Owner-Authorization-Digest"
+    assert G2_TOKEN_HEADER == "X-Admissible-Control-Token"
+    assert HISTORICAL_PAIRING_CONFIRMATION_HEADER == (
+        "X-Admissible-Historical-Pairing-Confirmation"
+    )
+    assert ALT_CONFIRMATION_HEADER == (
+        "X-Admissible-Historical-Pairing-Confirmation-Alt"
+    )
+    # The alternate name is a strict extension of the accepted one, so a
+    # transport matching by prefix rather than by exact name would accept it.
+    assert ALT_CONFIRMATION_HEADER.startswith(HISTORICAL_PAIRING_CONFIRMATION_HEADER)
+    assert ALT_CONFIRMATION_HEADER != HISTORICAL_PAIRING_CONFIRMATION_HEADER
+    assert len(RUNTIME_OWNER_DIGEST) == 64
+    assert len(WRONG_CONFIRMATION_TAG) == 64
+    names = {name for _label, name, _build in FOREIGN_CREDENTIAL_CHANNELS}
+    assert HISTORICAL_PAIRING_CONFIRMATION_HEADER not in names
+
+
+class _ObservingService:
+    """Records every transport call and delegates to the accepted service.
+
+    This sits at the exact boundary the transport calls, so what it records is
+    literally what the transport decided to hand over -- not a reconstruction.
+    """
+
+    def __init__(self, inner: object) -> None:
+        self._inner = inner
+        self.calls: list[tuple[str, dict]] = []
+
+    def _record(self, name: str, kwargs: dict) -> None:
+        self.calls.append((name, dict(kwargs)))
+
+    def payloads(self):
+        self._record("payloads", {})
+        return self._inner.payloads()
+
+    def prepare(self, **kwargs):
+        self._record("prepare", kwargs)
+        return self._inner.prepare(**kwargs)
+
+    def review(self, **kwargs):
+        self._record("review", kwargs)
+        return self._inner.review(**kwargs)
+
+    def confirm(self, **kwargs):
+        self._record("confirm", kwargs)
+        return self._inner.confirm(**kwargs)
+
+    def named(self, name: str) -> list[dict]:
+        return [kwargs for called, kwargs in self.calls if called == name]
+
+
+@pytest.fixture()
+def observed_launcher(enabled_launcher: ProductLauncher):
+    """The accepted enabled launcher with a recorder at the real boundary."""
+
+    recorder = _ObservingService(enabled_launcher._historical_pairing)
+    enabled_launcher._historical_pairing = recorder
+    return enabled_launcher, recorder
+
+
+def archive_documents(tmp_path: Path) -> list[str]:
+    """Every file currently under the enabled launcher's configured archive."""
+
+    archive = tmp_path / "enabled" / "archive"
+    if not archive.exists():
+        return []
+    return sorted(
+        path.relative_to(archive).as_posix()
+        for path in archive.rglob("*")
+        if path.is_file()
+    )
+
+
+def archive_bytes(tmp_path: Path) -> bytes:
+    """Every archived document name and body, concatenated for one scan."""
+
+    archive = tmp_path / "enabled" / "archive"
+    if not archive.exists():
+        return b""
+    chunks: list[bytes] = []
+    for path in sorted(archive.rglob("*")):
+        if path.is_file():
+            chunks.append(path.name.encode("utf-8"))
+            chunks.append(path.read_bytes())
+    return b"".join(chunks)
+
+
+CONFIRMATION_RESULT_FIELDS = frozenset(
+    {
+        "outcome",
+        "preparation_id",
+        "asserted_actor_id",
+        "pairing_authority_fingerprint",
+        "evaluation_profile_fingerprint",
+        "target_authorization_payload_fingerprint",
+        "archived_pairing_document_count",
+        "limitations",
+    }
+)
+
+
+@pytest.mark.parametrize(
+    "label,name,build", FOREIGN_CREDENTIAL_CHANNELS, ids=FOREIGN_CREDENTIAL_IDS
+)
+def test_a_foreign_channel_alone_is_never_a_confirmation_credential(
+    tmp_path: Path,
+    observed_launcher,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    label: str,
+    name: str,
+    build,
+):
+    """A correct tag carried by the wrong header confirms exactly nothing."""
+
+    launcher, recorder = observed_launcher
+    _status, review = prepare_over_http(launcher, historical_payload)
+    preparation_id, fingerprint = locator_of(review)
+    tag = independent_confirmation_tag(PAIRING_SECRET, review)
+    value = build(tag)
+    assert archive_documents(tmp_path) == []
+    with _observed_sinks() as observation:
+        status, headers, body, raw = request(
+            launcher,
+            "POST",
+            confirmation_path(preparation_id),
+            body={"expected_authority_fingerprint": fingerprint},
+            headers={name: value},
+        )
+    # The dedicated header was absent, so the request never had a credential.
+    assert (status, body) == (400, {"error": "CONFIRMATION_TAG_REQUIRED"}), label
+    assert recorder.named("confirm") == []
+    assert archive_documents(tmp_path) == []
+    # Neither the foreign value nor the tag inside it is echoed or logged.
+    forbidden = frozenset({value, tag})
+    rendered = raw.decode("latin-1") + json.dumps(dict(headers), sort_keys=True)
+    for secret_text in forbidden:
+        assert secret_text not in rendered
+    assert _disclosures(observation, forbidden) == []
+    assert observation.warnings == []
+    assert HISTORICAL_PAIRING_CONFIRMATION_HEADER not in headers
+    assert name not in headers
+    # The refusal changed nothing: the preparation is still confirmable by the
+    # one credential source that exists.
+    status, _headers, body, _raw = confirm_over_http(
+        launcher, preparation_id, fingerprint, tag
+    )
+    assert status == 200
+    assert body["outcome"] == "CONFIRMATION_ACCEPTED_ARCHIVE_AVAILABLE"
+    assert len(archive_documents(tmp_path)) == 3
+    assert [
+        kwargs["presented_confirmation_tag"] for kwargs in recorder.named("confirm")
+    ] == [tag]
+
+
+def test_every_foreign_channel_at_once_is_still_not_a_credential(
+    tmp_path: Path,
+    observed_launcher,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+):
+    """Eight simultaneous correct-tag-bearing foreign headers change nothing."""
+
+    launcher, recorder = observed_launcher
+    _status, review = prepare_over_http(launcher, historical_payload)
+    preparation_id, fingerprint = locator_of(review)
+    tag = independent_confirmation_tag(PAIRING_SECRET, review)
+    every = {
+        name: build(tag) for _label, name, build in FOREIGN_CREDENTIAL_CHANNELS
+    }
+    assert len(every) == 7  # the two owner-digest variants share one header
+    status, _headers, body, raw = request(
+        launcher,
+        "POST",
+        confirmation_path(preparation_id),
+        body={"expected_authority_fingerprint": fingerprint},
+        headers=every,
+    )
+    assert (status, body) == (400, {"error": "CONFIRMATION_TAG_REQUIRED"})
+    assert recorder.named("confirm") == []
+    assert archive_documents(tmp_path) == []
+    assert tag not in raw.decode("latin-1")
+    assert confirm_over_http(launcher, preparation_id, fingerprint, tag)[0] == 200
+    assert len(archive_documents(tmp_path)) == 3
+
+
+# ---------------------------------------------------------------------------
+# L. A foreign credential never overrides the dedicated header.
+#
+# Sole-source is two claims, not one.  Section K proved a foreign channel
+# cannot supply a missing credential.  This section proves it cannot replace,
+# repair, or contaminate a credential that is present -- in either direction.
+# ---------------------------------------------------------------------------
+
+
+# The four channels a fallback would most plausibly be written against: the
+# standard authentication header and the three headers this transport already
+# reads for its own unrelated purposes.
+OVERRIDE_CHANNELS = (
+    ("authorization", AUTHORIZATION_HEADER, _bearer),
+    ("owner_digest", DIGEST_HEADER, _verbatim),
+    ("owner_authorization", OWNER_HEADER, _verbatim),
+    ("control_token", G2_TOKEN_HEADER, _verbatim),
+)
+OVERRIDE_IDS = [label for label, _name, _build in OVERRIDE_CHANNELS]
+
+HOSTILE_FOREIGN_VALUES = (
+    ("runtime_owner_digest", RUNTIME_OWNER_DIGEST),
+    ("wrong_tag", WRONG_CONFIRMATION_TAG),
+    ("hostile_marker", HOSTILE_FOREIGN_MARKER),
+)
+HOSTILE_IDS = [label for label, _value in HOSTILE_FOREIGN_VALUES]
+
+
+@pytest.mark.parametrize("label,name,build", OVERRIDE_CHANNELS, ids=OVERRIDE_IDS)
+def test_a_correct_foreign_credential_never_rescues_a_wrong_dedicated_tag(
+    tmp_path: Path,
+    observed_launcher,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    label: str,
+    name: str,
+    build,
+):
+    """The dedicated header is not merely preferred; it is the only source."""
+
+    launcher, recorder = observed_launcher
+    _status, review = prepare_over_http(launcher, historical_payload)
+    preparation_id, fingerprint = locator_of(review)
+    tag = independent_confirmation_tag(PAIRING_SECRET, review)
+    assert WRONG_CONFIRMATION_TAG != tag
+    status, _headers, body, raw = request(
+        launcher,
+        "POST",
+        confirmation_path(preparation_id),
+        body={"expected_authority_fingerprint": fingerprint},
+        headers={
+            HISTORICAL_PAIRING_CONFIRMATION_HEADER: WRONG_CONFIRMATION_TAG,
+            name: build(tag),
+        },
+    )
+    # The service saw exactly the wrong dedicated value, so the answer is the
+    # ordinary rejection of a syntactically valid incorrect credential.
+    assert [
+        kwargs["presented_confirmation_tag"] for kwargs in recorder.named("confirm")
+    ] == [WRONG_CONFIRMATION_TAG], label
+    assert (status, body) == (403, {"error": "CONFIRMATION_REJECTED"})
+    assert archive_documents(tmp_path) == []
+    assert tag not in raw.decode("latin-1")
+    # Nothing was consumed, so the correct credential still works.
+    status, _headers, body, _raw = confirm_over_http(
+        launcher, preparation_id, fingerprint, tag
+    )
+    assert status == 200
+    assert body["outcome"] == "CONFIRMATION_ACCEPTED_ARCHIVE_AVAILABLE"
+    assert len(archive_documents(tmp_path)) == 3
+    assert [
+        kwargs["presented_confirmation_tag"] for kwargs in recorder.named("confirm")
+    ] == [WRONG_CONFIRMATION_TAG, tag]
+
+
+@pytest.mark.parametrize(
+    "hostile_label,hostile", HOSTILE_FOREIGN_VALUES, ids=HOSTILE_IDS
+)
+@pytest.mark.parametrize("label,name,build", OVERRIDE_CHANNELS, ids=OVERRIDE_IDS)
+def test_a_hostile_foreign_credential_never_disturbs_a_correct_confirmation(
+    tmp_path: Path,
+    observed_launcher,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    label: str,
+    name: str,
+    build,
+    hostile_label: str,
+    hostile: str,
+):
+    """The foreign value is inert: it cannot deny, alter, or enter the result."""
+
+    launcher, recorder = observed_launcher
+    _status, review = prepare_over_http(launcher, historical_payload)
+    preparation_id, fingerprint = locator_of(review)
+    identity = review["pairing_identity"]
+    tag = independent_confirmation_tag(PAIRING_SECRET, review)
+    foreign = build(hostile)
+    assert hostile != tag
+    with _observed_sinks() as observation:
+        status, headers, body, raw = request(
+            launcher,
+            "POST",
+            confirmation_path(preparation_id),
+            body={"expected_authority_fingerprint": fingerprint},
+            headers={
+                HISTORICAL_PAIRING_CONFIRMATION_HEADER: tag,
+                name: foreign,
+            },
+        )
+    assert status == 200, (label, hostile_label)
+    recorded = recorder.named("confirm")
+    assert [kwargs["presented_confirmation_tag"] for kwargs in recorded] == [tag]
+    assert set(recorded[0]) == {
+        "preparation_id",
+        "expected_authority_fingerprint",
+        "presented_confirmation_tag",
+    }
+    assert recorded[0]["preparation_id"] == preparation_id
+    assert recorded[0]["expected_authority_fingerprint"] == fingerprint
+    # The result is exactly the accepted result: the foreign value had no
+    # semantic effect on any field of it.
+    assert set(body) == CONFIRMATION_RESULT_FIELDS
+    assert body["outcome"] == "CONFIRMATION_ACCEPTED_ARCHIVE_AVAILABLE"
+    assert body["preparation_id"] == preparation_id
+    assert body["asserted_actor_id"] == ACTOR_ID
+    assert body["archived_pairing_document_count"] == 3
+    assert body["pairing_authority_fingerprint"] == (
+        identity["pairing_authority_fingerprint"]
+    )
+    assert body["evaluation_profile_fingerprint"] == (
+        identity["evaluation_profile_fingerprint"]
+    )
+    assert body["target_authorization_payload_fingerprint"] == (
+        identity["target_authorization_payload_fingerprint"]
+    )
+    # The foreign value reached no result, archive, log, response header, or
+    # retained launcher state.
+    forbidden = frozenset({hostile, foreign})
+    rendered = (
+        raw.decode("latin-1")
+        + json.dumps(dict(headers), sort_keys=True)
+        + json.dumps(recorded, sort_keys=True)
+    )
+    for secret_text in forbidden:
+        assert secret_text not in rendered, (label, hostile_label)
+        assert secret_text.encode("utf-8") not in archive_bytes(tmp_path)
+    assert len(archive_documents(tmp_path)) == 3
+    assert _disclosures(observation, forbidden) == []
+    assert observation.warnings == []
+    assert graph_disclosures(launcher, forbidden) == []
+
+
+# ---------------------------------------------------------------------------
+# M. Direct observation of the service call itself.
+#
+# Sections K and L read the outcome; this section reads the call.  A double
+# stands where the accepted service stands, so "the transport never forwarded
+# a foreign header as a credential" is observed rather than inferred.
+# ---------------------------------------------------------------------------
+
+
+CONFIRM_KEYWORDS = frozenset(
+    {"preparation_id", "expected_authority_fingerprint", "presented_confirmation_tag"}
+)
+
+
+def test_without_the_dedicated_header_confirm_is_never_called(
+    enabled_launcher: ProductLauncher,
+):
+    """Observed at the boundary: no dedicated header, no service call at all."""
+
+    recorder = _RecordingService()
+    enabled_launcher._historical_pairing = recorder
+    marker = "e" * 64
+    for label, name, build in FOREIGN_CREDENTIAL_CHANNELS:
+        status, _headers, body, _raw = request(
+            enabled_launcher,
+            "POST",
+            confirmation_path("some-preparation"),
+            body={"expected_authority_fingerprint": "a" * 64},
+            headers={name: build(marker)},
+        )
+        assert (status, body) == (400, {"error": "CONFIRMATION_TAG_REQUIRED"}), label
+    status, _headers, body, _raw = request(
+        enabled_launcher,
+        "POST",
+        confirmation_path("some-preparation"),
+        body={"expected_authority_fingerprint": "a" * 64},
+        headers={
+            name: build(marker) for _label, name, build in FOREIGN_CREDENTIAL_CHANNELS
+        },
+    )
+    assert (status, body) == (400, {"error": "CONFIRMATION_TAG_REQUIRED"})
+    assert recorder.calls == []
+    assert recorder.tags == []
+
+
+def test_one_dedicated_header_calls_confirm_exactly_once_with_that_value(
+    enabled_launcher: ProductLauncher,
+):
+    """The forwarded credential is the dedicated header value and nothing else."""
+
+    recorder = _RecordingService()
+    enabled_launcher._historical_pairing = recorder
+    dedicated = "9" * 64
+    decoy = "f" * 64
+    status, _headers, _body, _raw = request(
+        enabled_launcher,
+        "POST",
+        confirmation_path("some-preparation"),
+        body={"expected_authority_fingerprint": "a" * 64},
+        headers={
+            HISTORICAL_PAIRING_CONFIRMATION_HEADER: dedicated,
+            **{
+                name: build(decoy)
+                for _label, name, build in FOREIGN_CREDENTIAL_CHANNELS
+            },
+        },
+    )
+    assert status == 200
+    assert len(recorder.calls) == 1
+    called, kwargs = recorder.calls[0]
+    assert called == "confirm"
+    assert set(kwargs) == CONFIRM_KEYWORDS
+    assert kwargs["presented_confirmation_tag"] == dedicated
+    assert recorder.tags == [dedicated]
+    # No other request header travelled with the call under any name.
+    rendered = json.dumps(kwargs, sort_keys=True)
+    assert decoy not in rendered
+    assert RUNTIME_OWNER_DIGEST not in rendered
+    assert enabled_launcher.csrf_nonce not in rendered
+    for _label, name, _build in FOREIGN_CREDENTIAL_CHANNELS:
+        assert name not in rendered
+        assert name.lower() not in rendered.lower()
+
+
+def test_the_body_can_never_replace_or_override_the_dedicated_tag(
+    enabled_launcher: ProductLauncher,
+):
+    """Body content is not a credential channel, present header or not."""
+
+    recorder = _RecordingService()
+    enabled_launcher._historical_pairing = recorder
+    dedicated = "9" * 64
+    smuggled = "7" * 64
+    for headers in ({}, {HISTORICAL_PAIRING_CONFIRMATION_HEADER: dedicated}):
+        status, _headers, body, _raw = request(
+            enabled_launcher,
+            "POST",
+            confirmation_path("some-preparation"),
+            body={
+                "expected_authority_fingerprint": "a" * 64,
+                "presented_confirmation_tag": smuggled,
+            },
+            headers=dict(headers),
+        )
+        assert (status, body) == (400, {"error": "INVALID_FIELDS"})
+    assert recorder.calls == []
+    # A tag-shaped body value and a tag-shaped path component are a fingerprint
+    # and a locator; neither can become the forwarded credential.
+    status, _headers, _body, _raw = request(
+        enabled_launcher,
+        "POST",
+        confirmation_path(smuggled),
+        body={"expected_authority_fingerprint": smuggled},
+        headers={HISTORICAL_PAIRING_CONFIRMATION_HEADER: dedicated},
+    )
+    assert status == 200
+    assert len(recorder.calls) == 1
+    _called, kwargs = recorder.calls[0]
+    assert kwargs == {
+        "preparation_id": smuggled,
+        "expected_authority_fingerprint": smuggled,
+        "presented_confirmation_tag": dedicated,
+    }
+    assert recorder.tags == [dedicated]
+
+
+def test_a_rejecting_double_still_sees_only_the_dedicated_header(
+    enabled_launcher: ProductLauncher,
+):
+    """A refusing service proves nothing is retried through another channel."""
+
+    class _RejectingService(_RecordingService):
+        def confirm(self, **kwargs):
+            super().confirm(**kwargs)
+            return 403, {"error": "CONFIRMATION_REJECTED"}
+
+    recorder = _RejectingService()
+    enabled_launcher._historical_pairing = recorder
+    dedicated = "3" * 64
+    correct_looking = "4" * 64
+    status, _headers, body, _raw = request(
+        enabled_launcher,
+        "POST",
+        confirmation_path("some-preparation"),
+        body={"expected_authority_fingerprint": "a" * 64},
+        headers={
+            HISTORICAL_PAIRING_CONFIRMATION_HEADER: dedicated,
+            **{
+                name: build(correct_looking)
+                for _label, name, build in FOREIGN_CREDENTIAL_CHANNELS
+            },
+        },
+    )
+    assert (status, body) == (403, {"error": "CONFIRMATION_REJECTED"})
+    # Exactly one attempt: a refusal is never re-driven with a foreign value.
+    assert recorder.tags == [dedicated]
+    assert len(recorder.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# N. A disabled route is byte-indistinguishable from an unknown route.
+#
+# Only the answer is compared.  Timing is deliberately not asserted: a loopback
+# timing comparison is not a security guarantee and a flaky one would be worse
+# than none.
+# ---------------------------------------------------------------------------
+
+
+# ``Date`` is the only genuinely time-dependent standard field the accepted
+# handler emits.  ``Server`` is a fixed interpreter-derived string and is
+# therefore compared like any other header.
+TIME_DEPENDENT_RESPONSE_HEADERS = frozenset({"Date"})
+
+COMPARED_RESPONSE_FIELDS = (
+    "Content-Length",
+    "Content-Type",
+    "Cache-Control",
+    "Connection",
+    "Content-Security-Policy",
+    "Referrer-Policy",
+    "X-Content-Type-Options",
+)
+
+DISABLED_PROBE_TARGETS = tuple(
+    ("GET", path) for path in DISABLED_GET_PATHS
+) + tuple(("POST", path) for path in DISABLED_POST_PATHS)
+DISABLED_PROBE_IDS = [
+    f"{method}-{path.rsplit('/', 1)[-1]}" for method, path in DISABLED_PROBE_TARGETS
+]
+UNKNOWN_ROUTE_PATH = f"{UI_API_PREFIX}/no-such-route"
+
+
+def raw_response_parts(raw: bytes) -> tuple[int, tuple[tuple[str, str], ...], bytes]:
+    """Split one raw response into status, ordered headers, and body bytes."""
+
+    head, separator, payload = raw.partition(b"\r\n\r\n")
+    assert separator, raw
+    lines = head.split(b"\r\n")
+    status = int(lines[0].split(b" ", 2)[1])
+    headers: list[tuple[str, str]] = []
+    for line in lines[1:]:
+        name, colon, value = line.decode("latin-1").partition(":")
+        assert colon, line
+        headers.append((name.strip(), value.strip()))
+    return status, tuple(headers), payload
+
+
+def _values_of(headers: tuple[tuple[str, str], ...], field: str) -> tuple[str, ...]:
+    lowered = field.lower()
+    return tuple(value for name, value in headers if name.lower() == lowered)
+
+
+def _stable(headers: tuple[tuple[str, str], ...]) -> list[tuple[str, str]]:
+    return sorted(
+        (name, value)
+        for name, value in headers
+        if name not in TIME_DEPENDENT_RESPONSE_HEADERS
+    )
+
+
+def _pairing_specific(headers: tuple[tuple[str, str], ...]) -> list[str]:
+    found = []
+    for name, _value in headers:
+        lowered = name.lower()
+        if lowered.startswith("x-") and (
+            "historical" in lowered or "pairing" in lowered
+        ):
+            found.append(name)
+    return found
+
+
+def parity_violations(observed: bytes, control: bytes) -> list[str]:
+    """Every way a disabled-route answer differs from an unknown-route answer."""
+
+    observed_status, observed_headers, observed_body = raw_response_parts(observed)
+    control_status, control_headers, control_body = raw_response_parts(control)
+    violations: list[str] = []
+    if observed_status != control_status:
+        violations.append(f"status {observed_status} != {control_status}")
+    if observed_body != control_body:
+        violations.append(f"raw body {observed_body!r} != {control_body!r}")
+    if json.loads(observed_body or b"null") != json.loads(control_body or b"null"):
+        violations.append("parsed body differs")
+    if _stable(observed_headers) != _stable(control_headers):
+        violations.append(
+            f"header multiset {_stable(observed_headers)!r} != "
+            f"{_stable(control_headers)!r}"
+        )
+    observed_names = sorted(name for name, _value in observed_headers)
+    control_names = sorted(name for name, _value in control_headers)
+    if observed_names != control_names:
+        violations.append(
+            f"header multiplicity {observed_names!r} != {control_names!r}"
+        )
+    for field in COMPARED_RESPONSE_FIELDS:
+        if _values_of(observed_headers, field) != _values_of(control_headers, field):
+            violations.append(f"{field} differs")
+    for name in _pairing_specific(observed_headers) + _pairing_specific(control_headers):
+        violations.append(f"historical-pairing specific header {name!r}")
+    return violations
+
+
+def disabled_probe(launcher: ProductLauncher, method: str, path: str) -> bytes:
+    """One raw exchange with exactly the same guard headers for every path."""
+
+    port = launcher.ui_port
+    payload = b"{}" if method == "POST" else b""
+    return raw_exchange(
+        port,
+        raw_request_bytes(
+            port,
+            method,
+            path,
+            headers=[
+                ("Host", f"127.0.0.1:{port}"),
+                ("Content-Type", "application/json"),
+                (CSRF_HEADER, launcher.csrf_nonce),
+                ("Content-Length", str(len(payload))),
+                ("Connection", "close"),
+            ],
+            body=payload,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "method,path", DISABLED_PROBE_TARGETS, ids=DISABLED_PROBE_IDS
+)
+def test_a_disabled_route_answer_is_header_for_header_an_unknown_route_answer(
+    disabled_launcher: ProductLauncher,
+    method: str,
+    path: str,
+):
+    control = disabled_probe(disabled_launcher, method, UNKNOWN_ROUTE_PATH)
+    observed = disabled_probe(disabled_launcher, method, path)
+    assert parity_violations(observed, control) == []
+    status, headers, payload = raw_response_parts(observed)
+    assert status == 404
+    assert json.loads(payload) == {"error": "NOT_FOUND"}
+    # The comparison is not vacuous: the accepted answer really does carry the
+    # complete bounded response-header block, so equality means something.
+    names = {name for name, _value in headers}
+    assert set(COMPARED_RESPONSE_FIELDS) <= names
+    assert _pairing_specific(headers) == []
+
+
+def test_a_distinguishing_disabled_route_header_would_be_detected(
+    monkeypatch: pytest.MonkeyPatch,
+    disabled_launcher: ProductLauncher,
+):
+    """The parity comparison is proven able to see one extra response header."""
+
+    original_end_headers = _UIHandler.end_headers
+
+    def leaking_end_headers(self) -> None:
+        if HISTORICAL_PAIRINGS_SEGMENT in self.path:
+            self.send_header("X-Admissible-Historical-Pairing", "disabled")
+        original_end_headers(self)
+
+    monkeypatch.setattr(_UIHandler, "end_headers", leaking_end_headers)
+    for method, path in DISABLED_PROBE_TARGETS:
+        control = disabled_probe(disabled_launcher, method, UNKNOWN_ROUTE_PATH)
+        observed = disabled_probe(disabled_launcher, method, path)
+        violations = parity_violations(observed, control)
+        assert violations, (method, path)
+        assert any(
+            "X-Admissible-Historical-Pairing" in item for item in violations
+        ), (method, path, violations)
+        # The unknown-route control stayed clean, so the difference really is
+        # the disabled route revealing itself.
+        assert parity_violations(control, control) == []
+
+
+# ---------------------------------------------------------------------------
+# O. Bounded static complement: no hidden credential-selection helper.
+#
+# Secondary evidence only.  Sections K, L and M carry the authority; this
+# section merely states that the shapes those sections forbid are also absent
+# from the source, so a future edit reintroducing one is refused twice.
+# ---------------------------------------------------------------------------
+
+
+HEADER_READ_ATTRIBUTES = frozenset(
+    {"_all_headers", "get_all", "getheader", "getallmatchingheaders"}
+)
+
+# Exactly the fixed header names the accepted transport reads, and nothing
+# else.  Eight are exact literals or module constants; the ninth is the sole
+# parameter of the one accessor, checked separately below.
+ALLOWED_HEADER_READS = frozenset(
+    {
+        "Host",
+        "Origin",
+        "Transfer-Encoding",
+        "Content-Length",
+        "Content-Type",
+        "CSRF_HEADER",
+        "OWNER_HEADER",
+        "DIGEST_HEADER",
+        "HISTORICAL_PAIRING_CONFIRMATION_HEADER",
+    }
+)
+
+CREDENTIAL_HEADER_CONSTANTS = frozenset(
+    {
+        "HISTORICAL_PAIRING_CONFIRMATION_HEADER",
+        "OWNER_HEADER",
+        "DIGEST_HEADER",
+        "G2_TOKEN_HEADER",
+        "CSRF_HEADER",
+    }
+)
+
+
+def transport_source() -> str:
+    return Path(ui_transport_module.__file__).read_text(encoding="utf-8")
+
+
+def transport_tree() -> ast.Module:
+    return ast.parse(transport_source(), filename=ui_transport_module.__file__)
+
+
+def _definition(tree: ast.AST, name: str) -> ast.FunctionDef:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"no function named {name!r}")
+
+
+def _is_headers_attribute(node: ast.AST) -> bool:
+    return isinstance(node, ast.Attribute) and node.attr == "headers"
+
+
+def _header_read_calls(tree: ast.AST, *, exclude: ast.AST | None = None):
+    excluded = {id(node) for node in ast.walk(exclude)} if exclude is not None else set()
+    found = []
+    for node in ast.walk(tree):
+        if id(node) in excluded:
+            continue
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        attribute = node.func.attr
+        if attribute in HEADER_READ_ATTRIBUTES or (
+            attribute == "get" and _is_headers_attribute(node.func.value)
+        ):
+            found.append(node)
+    return found
+
+
+def _read_header_name(call: ast.Call) -> str:
+    first = call.args[0]
+    if isinstance(first, ast.Constant):
+        assert isinstance(first.value, str), ast.dump(call)
+        return first.value
+    assert isinstance(first, ast.Name), ast.dump(call)
+    return first.id
+
+
+def test_the_only_header_accessor_is_one_fixed_named_lookup():
+    """``_all_headers`` reads exactly its argument, with no default and no scan."""
+
+    accessor = _definition(transport_tree(), "_all_headers")
+    assert [argument.arg for argument in accessor.args.args] == ["self", "name"]
+    assert accessor.args.defaults == []
+    assert accessor.args.kwonlyargs == []
+    assert accessor.args.vararg is None and accessor.args.kwarg is None
+    assert len(accessor.body) == 2
+    assignment = accessor.body[0]
+    assert isinstance(assignment, ast.Assign)
+    call = assignment.value
+    assert isinstance(call, ast.Call)
+    assert isinstance(call.func, ast.Attribute)
+    assert call.func.attr == "get_all"
+    assert _is_headers_attribute(call.func.value)
+    assert len(call.args) == 1
+    assert isinstance(call.args[0], ast.Name)
+    assert call.args[0].id == "name"
+    assert not call.keywords
+
+
+def test_the_transport_reads_only_fixed_named_headers_with_no_fallback_default():
+    tree = transport_tree()
+    accessor = _definition(tree, "_all_headers")
+    calls = _header_read_calls(tree, exclude=accessor)
+    assert calls
+    names = set()
+    for call in calls:
+        # A second positional argument would be a fallback default; a keyword
+        # argument would be a dynamic lookup.
+        assert len(call.args) == 1, ast.dump(call)
+        assert not call.keywords, ast.dump(call)
+        names.add(_read_header_name(call))
+    assert names == ALLOWED_HEADER_READS
+
+
+def test_every_dedicated_header_reference_is_one_plain_occurrence_lookup():
+    tree = transport_tree()
+    parents: dict[int, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[id(child)] = node
+    loads = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name)
+        and node.id == "HISTORICAL_PAIRING_CONFIRMATION_HEADER"
+        and isinstance(node.ctx, ast.Load)
+    ]
+    assert loads
+    for load in loads:
+        call = parents[id(load)]
+        assert isinstance(call, ast.Call), ast.dump(call)
+        assert isinstance(call.func, ast.Attribute)
+        assert call.func.attr == "_all_headers"
+        assert len(call.args) == 1 and call.args[0] is load
+        assert not call.keywords
+
+
+def test_no_boolean_or_conditional_fallback_selects_a_credential_source():
+    """``dedicated or Authorization`` and its ternary twin are both absent."""
+
+    tree = transport_tree()
+    accessor = _definition(tree, "_all_headers")
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.BoolOp, ast.IfExp)):
+            continue
+        assert _header_read_calls(node, exclude=accessor) == [], ast.dump(node)
+        referenced = {
+            child.id for child in ast.walk(node) if isinstance(child, ast.Name)
+        }
+        assert not (referenced & CREDENTIAL_HEADER_CONSTANTS), ast.dump(node)
+
+
+def test_the_transport_never_scans_headers_for_a_tag_shaped_value():
+    tree = transport_tree()
+    accessor = _definition(tree, "_all_headers")
+    # No comprehension or generator ever iterates a header collection.
+    for node in ast.walk(tree):
+        if isinstance(
+            node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+        ):
+            for generator in node.generators:
+                assert _header_read_calls(generator.iter, exclude=accessor) == []
+                assert not _is_headers_attribute(generator.iter), ast.dump(node)
+        if isinstance(node, ast.For):
+            assert not _is_headers_attribute(node.iter), ast.dump(node)
+            assert _header_read_calls(node.iter, exclude=accessor) == []
+        if isinstance(node, ast.Subscript):
+            assert not _is_headers_attribute(node.value), ast.dump(node)
+    # The only regular expression in the module is the Content-Length grammar,
+    # so no 64-hex or tag-shaped pattern can be matched against a header.
+    compiled = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "compile"
+    ]
+    assert len(compiled) == 1
+    assert compiled[0].args[0].value == r"[0-9]+"
+    applications = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"fullmatch", "match", "search", "findall", "finditer"}
+    ]
+    assert len(applications) == 1
+    assert isinstance(applications[0].func.value, ast.Name)
+    assert applications[0].func.value.id == "_DECIMAL_LENGTH"
+
+
+def test_the_transport_names_no_foreign_credential_channel_at_all():
+    tree = transport_tree()
+    literals = {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    for forbidden in (
+        AUTHORIZATION_HEADER,
+        PROXY_AUTHORIZATION_HEADER,
+        COOKIE_HEADER,
+        "Set-Cookie",
+        ALT_CONFIRMATION_HEADER,
+        "WWW-Authenticate",
+    ):
+        assert forbidden not in literals
+    source = transport_source()
+    for forbidden in (
+        "cookie",
+        "Cookie",
+        "SimpleCookie",
+        "Proxy-Authorization",
+        "self.headers.items",
+        "self.headers.keys",
+        "self.headers.values",
+        "self.headers.raw_items",
+    ):
+        assert forbidden not in source
+
+
+def test_the_confirmation_route_derives_its_tag_from_exactly_one_source():
+    """One assignment from the counted occurrence list, one route-local drop."""
+
+    post = _definition(transport_tree(), "do_POST")
+
+    def assignments_to(name: str) -> list[ast.Assign]:
+        found = [
+            node
+            for node in ast.walk(post)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == name
+                for target in node.targets
+            )
+        ]
+        return sorted(found, key=lambda node: node.lineno)
+
+    occurrences = assignments_to("tags")
+    assert len(occurrences) == 1
+    call = occurrences[0].value
+    assert isinstance(call, ast.Call)
+    assert isinstance(call.func, ast.Attribute)
+    assert call.func.attr == "_all_headers"
+    assert len(call.args) == 1
+    assert isinstance(call.args[0], ast.Name)
+    assert call.args[0].id == "HISTORICAL_PAIRING_CONFIRMATION_HEADER"
+
+    presented = assignments_to("presented_tag")
+    assert len(presented) == 2
+    derivation, dropped = presented
+    assert isinstance(derivation.value, ast.Subscript)
+    assert isinstance(derivation.value.value, ast.Name)
+    assert derivation.value.value.id == "tags"
+    assert isinstance(derivation.value.slice, ast.Constant)
+    assert derivation.value.slice.value == 0
+    assert isinstance(dropped.value, ast.Constant)
+    assert dropped.value.value == ""
