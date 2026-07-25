@@ -136,6 +136,67 @@
         <p class="rail-note">The browser proposes fields. The launcher constructs and validates authority.</p>
       </aside>
     </div>
+    <section id="historical-pairing-view" class="historical-pairing" aria-labelledby="historical-pairing-title" hidden>
+      <p class="section-index">Optional / Historical evaluation pairing</p>
+      <h2 id="historical-pairing-title">Pair a historical run with owner evaluation authority</h2>
+      <p class="truth-line neutral">This pairing authorizes post-run evaluation only. It authorizes no execution, starts nothing, and reads no runtime evidence. The launcher derives every field shown below; this page only presents them.</p>
+      <p id="historical-unavailable" class="pending-verdict" hidden>The historical evaluation pairing feature is unavailable in this launcher session. Nothing else on this page is affected.</p>
+
+      <div id="historical-feature-body">
+        <form id="historical-authoring-form" novalidate>
+          <fieldset id="historical-authoring-fields">
+            <legend>Owner-authored pairing inputs</legend>
+            <p class="hint">Each authority editor below must contain one exact JSON array. This page checks only that the text parses as JSON and that its root is an array. The launcher remains the only validator of members, identifiers, counts, dependencies, obligations, bindings, predicates, and fingerprints.</p>
+            <div class="split-fields">
+              <div class="field"><label for="historical-payload-id">Configured historical payload</label><select id="historical-payload-id" required aria-describedby="historical-payload-help"></select><p id="historical-payload-help" class="hint">Only launcher-configured payloads are listed, in the launcher's declaration order.</p></div>
+              <div class="field"><label for="historical-actor-id">Asserted actor identifier</label><input id="historical-actor-id" type="text" maxlength="512" required aria-describedby="historical-actor-help"><p id="historical-actor-help" class="hint">Asserted only. This identifier is never authenticated.</p></div>
+            </div>
+            <div class="field"><label for="historical-result-claims">Result Claims (exact JSON array)</label><textarea id="historical-result-claims" rows="6" spellcheck="false" aria-describedby="historical-result-claims-help historical-result-claims-error"></textarea><p id="historical-result-claims-help" class="hint">A JSON array. No default claim, obligation, binding, predicate, or control is supplied by this page.</p><p id="historical-result-claims-error" class="field-error"></p></div>
+            <div class="field"><label for="historical-verification-plan">Claim Verification Plan (exact JSON array)</label><textarea id="historical-verification-plan" rows="6" spellcheck="false" aria-describedby="historical-verification-plan-help historical-verification-plan-error"></textarea><p id="historical-verification-plan-help" class="hint">A JSON array. Members are sent exactly as written, in the order written.</p><p id="historical-verification-plan-error" class="field-error"></p></div>
+            <div class="field"><label for="historical-evidence-bindings">Verification Evidence Bindings (exact JSON array)</label><textarea id="historical-evidence-bindings" rows="6" spellcheck="false" aria-describedby="historical-evidence-bindings-help historical-evidence-bindings-error"></textarea><p id="historical-evidence-bindings-help" class="hint">A JSON array. Nothing here is sorted, trimmed, deduplicated, or completed.</p><p id="historical-evidence-bindings-error" class="field-error"></p></div>
+          </fieldset>
+          <p id="historical-frozen-notice" class="pending-verdict" hidden>Authoring content is frozen for the active preparation. Changing any authoring content requires creating a new preparation.</p>
+          <div class="actions"><button id="historical-new-preparation" class="button quiet" type="button" hidden>Start new preparation</button><button id="historical-prepare" class="button primary" type="submit">Prepare pairing</button></div>
+        </form>
+
+        <section id="historical-review" class="historical-review" aria-labelledby="historical-review-title" hidden>
+          <h3 id="historical-review-title">Server-derived owner review</h3>
+          <p id="historical-review-stale" class="pending-verdict" hidden>This review is the last successful server response. It is shown as stale material and is not a successful refresh.</p>
+          <div id="historical-review-body"></div>
+          <div class="actions"><button id="historical-refresh" class="button quiet" type="button">Refresh review</button></div>
+        </section>
+
+        <section id="historical-message-tools" class="historical-message-tools" aria-labelledby="historical-message-title" hidden>
+          <h3 id="historical-message-title">Public confirmation-message material</h3>
+          <p>The confirmation-message bytes, their SHA-256, and the pairing-authority fingerprint are public pairing material. They are not secret-derived values.</p>
+          <p>Calculate the confirmation tag outside this product, using the exact message bytes and the fixed recipe shown in the review above. This page cannot compute, derive, verify, or store a tag, and it never accepts a configured secret.</p>
+          <div class="actions historical-copy-actions">
+            <button id="historical-copy-preparation-id" class="button quiet" type="button">Copy preparation ID</button>
+            <button id="historical-copy-fingerprint" class="button quiet" type="button">Copy pairing-authority fingerprint</button>
+            <button id="historical-copy-message" class="button quiet" type="button">Copy confirmation-message Base64</button>
+            <button id="historical-copy-message-hash" class="button quiet" type="button">Copy confirmation-message SHA-256</button>
+            <button id="historical-copy-recipe" class="button quiet" type="button">Copy confirmation recipe</button>
+            <button id="historical-download-message" class="button quiet" type="button">Download confirmation-message bytes</button>
+          </div>
+        </section>
+
+        <form id="historical-confirmation-form" novalidate hidden>
+          <fieldset>
+            <legend>Independently produced confirmation tag</legend>
+            <div class="field"><label for="historical-confirmation-tag">Confirmation tag</label><input id="historical-confirmation-tag" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required aria-describedby="historical-confirmation-help historical-confirmation-error"><p id="historical-confirmation-help" class="hint">Paste the tag you produced outside this product. It is sent once in one dedicated request header and is never placed in the URL, the request body, a cookie, browser state, or any status text. The field is cleared after every attempt; clearing a field does not zeroize immutable browser strings.</p><p id="historical-confirmation-error" class="field-error"></p></div>
+          </fieldset>
+          <div class="actions"><button id="historical-confirm" class="button primary" type="submit">Submit confirmation tag</button></div>
+        </form>
+
+        <section id="historical-outcome" class="historical-outcome" aria-labelledby="historical-outcome-title" hidden>
+          <h3 id="historical-outcome-title">Confirmation outcome</h3>
+          <div id="historical-outcome-body"></div>
+        </section>
+      </div>
+
+      <div id="historical-status" class="status-area historical-status" aria-label="Historical pairing status" aria-live="polite" aria-atomic="true" hidden><p id="historical-status-message"></p><code id="historical-status-code"></code></div>
+    </section>
+
     <section id="status-area" class="status-area" aria-label="Request status" aria-live="assertive" aria-atomic="true" hidden><p id="status-message" role="alert"></p><code id="status-code"></code><button id="retry-bootstrap" class="button quiet" type="button" hidden>Retry bootstrap</button></section>
     <div id="live-status" class="sr-only" aria-live="polite" aria-atomic="true"></div>
   </main>
