@@ -730,6 +730,10 @@
   // on the shared request helper, so no later request can carry it.
   const HP_CONFIRMATION_HEADER="X-Admissible-Historical-Pairing-Confirmation";
   const HP_MAX_PAYLOADS=256;
+  // The accepted bounded public-message size policy. The launcher refuses to
+  // build a confirmation message larger than this, so a declared length above
+  // the bound cannot describe a message this page is allowed to export.
+  const HP_MAX_CONFIRMATION_MESSAGE_BYTES=65536;
   // Every fixed launcher code mapped to one bounded sentence. Raw response
   // JSON, exception text, response headers, owner input, credential values and
   // archive or document paths are never displayed.
@@ -1334,9 +1338,11 @@
   // are public pairing material, not secret-derived values. There is no tag
   // derivation, no message authentication code, no key import, no browser-side
   // signing and no credential generation anywhere on this page.
+  function hpIdentityMember(key){
+    return hpMember(hpObject(hp.review,"pairing_identity"),key);
+  }
   function hpIdentityValue(key){
-    const identity=hpObject(hp.review,"pairing_identity");
-    const value=hpMember(identity,key);
+    const value=hpIdentityMember(key);
     return typeof value==="string"?value:"";
   }
   async function hpCopyPublic(label,value){
@@ -1363,12 +1369,37 @@
     for(let index=0;index<binary.length;index+=1)bytes[index]=binary.charCodeAt(index);
     return bytes;
   }
+  function hpDeclaredMessageByteLength(value){
+    // A declared length is usable only when it is an exact non-negative safe
+    // integer inside the accepted bounded public-message size policy. A string,
+    // a null, an absent member, a fraction, a negative value, a non-finite
+    // value, an unsafe integer and an over-bound value are all refused here,
+    // before anything at all is decoded.
+    if(typeof value!=="number"||!Number.isSafeInteger(value))return null;
+    if(value<0||value>HP_MAX_CONFIRMATION_MESSAGE_BYTES)return null;
+    return value;
+  }
   function historicalDownloadMessage(){
     const base64=hpIdentityValue("confirmation_message_base64");
     if(!base64){hpFailure("HISTORICAL_PAIRING_UNAVAILABLE");return;}
+    const declared=hpDeclaredMessageByteLength(hpIdentityMember("confirmation_message_byte_length"));
+    if(declared===null){hpFailure("HISTORICAL_PAIRING_UNAVAILABLE");return;}
     let bytes;
+    // Only the launcher-provided Base64 is decoded, and a malformed value is
+    // refused here rather than escaping as an unhandled rejection.
     try{bytes=hpDecodedMessageBytes(base64);}
-    catch(_error){hpFailure("HISTORICAL_PAIRING_UNAVAILABLE");return;}
+    catch(_error){bytes=null;}
+    if(bytes===null||bytes.length!==declared){
+      // Either the value did not decode, or the launcher's own declared length
+      // and the decoded bytes disagree. This says exactly one thing: the browser
+      // cannot safely export a message whose declared length and decoded bytes
+      // disagree. It is not a statement about the launcher, the pairing
+      // authority, the confirmation tag, the configured secret, the archive, or
+      // any result, and the review and preparation state are left intact.
+      bytes=null;
+      hpFailure("HISTORICAL_PAIRING_UNAVAILABLE");
+      return;
+    }
     const blob=new Blob([bytes],{type:"application/octet-stream"});
     const objectUrl=URL.createObjectURL(blob);
     try{
