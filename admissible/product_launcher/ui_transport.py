@@ -19,6 +19,16 @@ CSRF_HEADER = "X-Admissible-UI-CSRF"
 OWNER_HEADER = "X-Admissible-Owner-Authorization"
 DIGEST_HEADER = "X-Admissible-Owner-Authorization-Digest"
 G2_TOKEN_HEADER = "X-Admissible-Control-Token"
+# The one independently generated historical-pairing confirmation credential.
+# The transport owns only its occurrence handling: it counts the header
+# instances and hands the single exact string through unchanged. It never
+# strips, cases, decodes, trims, compares, hashes, logs, persists, or caches
+# the value, and the accepted coordinator stays the sole syntax validator and
+# credential verifier.
+HISTORICAL_PAIRING_CONFIRMATION_HEADER = (
+    "X-Admissible-Historical-Pairing-Confirmation"
+)
+HISTORICAL_PAIRINGS_SEGMENT = "historical-pairings"
 MAX_REQUEST_BYTES = 1024 * 1024
 MAX_ERROR_BYTES = 4096
 # Header values are parsed from wire bytes as Latin-1, so string length equals
@@ -36,6 +46,17 @@ def _pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise ValueError("duplicate")
         out[key] = value
     return out
+
+
+def _historical_pairing_enabled(launcher: object) -> bool:
+    """Report the launcher's own configured historical-pairing availability.
+
+    A launcher that never heard of the feature answers ``False`` through the
+    default, so an injected or older launcher object keeps exactly its previous
+    route inventory and its previous NOT_FOUND behavior.
+    """
+
+    return bool(getattr(launcher, "historical_pairing_available", False))
 
 
 class UIRequestContext:
@@ -58,7 +79,19 @@ class _UIHandler(BaseHTTPRequestHandler):
     server: _UIServer
     protocol_version = "HTTP/1.1"
 
+    # All three request-log hooks are explicitly overridden as no-ops. Relying
+    # on the inherited implementations would leave the request line, the status
+    # line, and every error line flowing through the base class, so a future
+    # change to `log_message` alone could start emitting them. Nothing about a
+    # request -- least of all a confirmation-tag header -- is ever written to
+    # stderr, stdout, a logger, or a warning by this handler.
     def log_message(self, *_args: object) -> None:
+        return
+
+    def log_request(self, *_args: object, **_kwargs: object) -> None:
+        return
+
+    def log_error(self, *_args: object, **_kwargs: object) -> None:
         return
 
     def _send(self, status: int, payload: object, *, content_type: str = "application/json") -> None:
@@ -229,6 +262,43 @@ class _UIHandler(BaseHTTPRequestHandler):
                 status, body = launcher.proxy_g2("GET", f"/api/v1/runs/{parts[5]}/result")
                 self._send(status, body)
                 return
+            # Optional historical evaluation pairing. Every branch below is
+            # conditional on the launcher owning one configured service, so a
+            # launcher without the feature never reaches them and falls through
+            # to exactly the same NOT_FOUND an unknown route receives. No
+            # FEATURE_DISABLED answer exists and no partial feature is revealed.
+            if _historical_pairing_enabled(launcher):
+                if (
+                    len(parts) == 6
+                    and parts[4] == HISTORICAL_PAIRINGS_SEGMENT
+                    and parts[5] == "payloads"
+                ):
+                    if urlsplit(self.path).query:
+                        self._error(400, "QUERY_NOT_ALLOWED")
+                        return
+                    status, body = launcher.list_historical_pairing_payloads()
+                    self._send(status, body)
+                    return
+                if (
+                    len(parts) == 8
+                    and parts[4] == HISTORICAL_PAIRINGS_SEGMENT
+                    and parts[5] == "preparations"
+                    and parts[6]
+                    and parts[7]
+                ):
+                    # The complete locator lives in the path: an opaque
+                    # preparation identifier and the complete expected authority
+                    # fingerprint. Reviewing extends no TTL, reserves nothing,
+                    # confirms nothing, and reads no configured secret.
+                    if urlsplit(self.path).query:
+                        self._error(400, "QUERY_NOT_ALLOWED")
+                        return
+                    status, body = launcher.review_historical_pairing(
+                        preparation_id=parts[6],
+                        expected_authority_fingerprint=parts[7],
+                    )
+                    self._send(status, body)
+                    return
         except KeyError:
             self._error(404, "NOT_FOUND")
             return
@@ -309,6 +379,93 @@ class _UIHandler(BaseHTTPRequestHandler):
                 )
                 self._send(status, payload)
                 return
+            # Optional historical evaluation pairing. The existing mutating
+            # guards above have already run, so a disabled feature reaches the
+            # same trailing NOT_FOUND that any unknown POST path receives, after
+            # exactly the same Host, Origin and CSRF refusals.
+            if _historical_pairing_enabled(launcher):
+                if (
+                    len(parts) == 6
+                    and parts[4] == HISTORICAL_PAIRINGS_SEGMENT
+                    and parts[5] == "preparations"
+                ):
+                    if urlsplit(self.path).query:
+                        self._error(400, "QUERY_NOT_ALLOWED")
+                        return
+                    # Exactly these five owner-supplied fields. Any additional
+                    # field -- a preparation identifier, a fingerprint, an
+                    # archive root, a document path, a secret, a tag, a result,
+                    # or an evidence record -- is refused as INVALID_FIELDS, so
+                    # no request can ever supply canonical authority material.
+                    body = self._json(
+                        {
+                            "payload_id",
+                            "actor_id",
+                            "result_claims",
+                            "claim_verification_plan",
+                            "verification_evidence_bindings",
+                        }
+                    )
+                    if body is None:
+                        return
+                    status, payload = launcher.prepare_historical_pairing(
+                        payload_id=body["payload_id"],
+                        actor_id=body["actor_id"],
+                        result_claims=body["result_claims"],
+                        claim_verification_plan=body["claim_verification_plan"],
+                        verification_evidence_bindings=body[
+                            "verification_evidence_bindings"
+                        ],
+                    )
+                    self._send(status, payload)
+                    return
+                if (
+                    len(parts) == 8
+                    and parts[4] == HISTORICAL_PAIRINGS_SEGMENT
+                    and parts[5] == "preparations"
+                    and parts[6]
+                    and parts[7] == "confirmation"
+                ):
+                    if urlsplit(self.path).query:
+                        self._error(400, "QUERY_NOT_ALLOWED")
+                        return
+                    # The body carries only the expected authority fingerprint:
+                    # no actor, payload, claim, plan, binding, archive root,
+                    # secret, or tag may be restated here, and the prepared
+                    # authority is never re-derived or mutated by this route.
+                    body = self._json({"expected_authority_fingerprint"})
+                    if body is None:
+                        return
+                    # Header access happens only after the exact body field set
+                    # has already been accepted.
+                    tags = self._all_headers(
+                        HISTORICAL_PAIRING_CONFIRMATION_HEADER
+                    )
+                    if not tags:
+                        self._error(400, "CONFIRMATION_TAG_REQUIRED")
+                        return
+                    if len(tags) != 1:
+                        # Duplicate instances are refused, never joined,
+                        # ordered, or reduced to one of the values.
+                        self._error(400, "CONFIRMATION_TAG_MALFORMED")
+                        return
+                    presented_tag = tags[0]
+                    try:
+                        status, payload = launcher.confirm_historical_pairing(
+                            preparation_id=parts[6],
+                            expected_authority_fingerprint=body[
+                                "expected_authority_fingerprint"
+                            ],
+                            presented_confirmation_tag=presented_tag,
+                        )
+                    finally:
+                        # This drops the route-local reference only. The
+                        # original immutable Python string and the HTTP parser's
+                        # own header storage are untouched, and no zeroization
+                        # of either is performed or claimed.
+                        presented_tag = ""
+                    self._send(status, payload)
+                    return
         except Exception:
             self._error(500, "WRITE_UNAVAILABLE")
             return
@@ -432,6 +589,8 @@ def proxy_http(
 __all__ = [
     "CSRF_HEADER",
     "DIGEST_HEADER",
+    "HISTORICAL_PAIRINGS_SEGMENT",
+    "HISTORICAL_PAIRING_CONFIRMATION_HEADER",
     "OWNER_HEADER",
     "SERVICE_NAME",
     "SERVICE_VERSION",

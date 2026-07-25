@@ -54,6 +54,13 @@ from admissible.product_launcher.recovery import (
     classify_recovery,
     emit_recovery_record,
 )
+from admissible.product_launcher.historical_pairing_registry import (
+    HistoricalPairingConfiguration,
+)
+from admissible.product_launcher.historical_pairing_service import (
+    HistoricalPairingService,
+    build_historical_pairing_service,
+)
 from admissible.product_launcher.preflight_runner import ProductionPreflightApplication
 from admissible.product_launcher.ui_transport import (
     DIGEST_HEADER,
@@ -110,10 +117,25 @@ class ProductLauncher:
         browser_opener: Callable[[str], object] | None = None,
         verify_head: bool = True,
         clock: Callable[[], str] = _now,
+        historical_pairing_configuration: HistoricalPairingConfiguration | None = None,
+        historical_pairing_secret: bytes | None = None,
     ):
         self.configuration = configuration.validated()
         if verify_head:
             verify_required_source_head(self.configuration)
+        # The optional historical-pairing feature is decided, loaded, and
+        # refused here, before any directory, worker, or socket exists. Both
+        # inputs stay outside LauncherConfiguration: the secret must never
+        # become part of the shared non-secret configuration object. Exactly one
+        # of them is a configuration defect, never a quiet disable, and a
+        # malformed configured document aborts construction before a UI server
+        # could ever be started against a half-configured feature.
+        self._historical_pairing: HistoricalPairingService | None = (
+            build_historical_pairing_service(
+                configuration=historical_pairing_configuration,
+                configured_secret=historical_pairing_secret,
+            )
+        )
         self.authorization_mode = self.configuration.authorization_mode
         self._id_generator = id_generator or (lambda: secrets.token_hex(16))
         self._clock = clock
@@ -237,6 +259,17 @@ class ProductLauncher:
                     self._contracts.clear()
                     self._recoveries.clear()
                     self._launched_runs.clear()
+                    # Request-serving components are already stopped above. The
+                    # historical-pairing service becomes unreachable from this
+                    # launcher here, which drops the registry, the coordinator,
+                    # and every in-memory preparation and review with it. The
+                    # configured secret is immutable Python bytes: releasing the
+                    # reference is all that happens and no zeroization is
+                    # claimed. Nothing deletes or mutates the archive or any
+                    # configured payload document. An external caller that kept
+                    # its own reference to the service still holds an ordinary
+                    # Python object this launcher cannot erase.
+                    self._historical_pairing = None
                     self._g2_token = ""
                     self._csrf_nonce = ""
 
@@ -728,6 +761,102 @@ class ProductLauncher:
             token=self._g2_token,
             body=body,
             extra_headers=extra_headers,
+        )
+
+    # -- optional historical evaluation pairing ---------------------------
+    #
+    # Every method below takes the launcher lock only long enough to refuse a
+    # closed launcher and snapshot the service reference. Registry lookup, V5
+    # derivation, review construction, confirmation verification, archive
+    # persistence, archive reload, and presentation serialization all run after
+    # that lock is released, so a slow or blocked pairing operation can never
+    # stall authoring, preflight, launching, or recovery.
+
+    @property
+    def historical_pairing_available(self) -> bool:
+        """Report only whether one configured historical-pairing service exists.
+
+        This is the single feature-availability fact the transport may consult.
+        It names no payload, path, archive root, or secret, and it is never
+        advertised in bootstrap.
+        """
+
+        with self._lock:
+            return self._historical_pairing is not None
+
+    def _historical_pairing_snapshot(
+        self,
+    ) -> tuple[HistoricalPairingService | None, tuple[int, dict[str, object]] | None]:
+        """Refuse closed state and snapshot the service under the launcher lock."""
+
+        with self._lock:
+            if self._closed:
+                return None, (409, {"error": "LAUNCHER_CLOSED"})
+            service = self._historical_pairing
+        if service is None:
+            return None, (404, {"error": "NOT_FOUND"})
+        return service, None
+
+    def list_historical_pairing_payloads(self) -> tuple[int, dict[str, object]]:
+        service, refusal = self._historical_pairing_snapshot()
+        if refusal is not None:
+            return refusal
+        return service.payloads()
+
+    def prepare_historical_pairing(
+        self,
+        *,
+        payload_id: str,
+        actor_id: object,
+        result_claims: object,
+        claim_verification_plan: object,
+        verification_evidence_bindings: object,
+    ) -> tuple[int, dict[str, object]]:
+        service, refusal = self._historical_pairing_snapshot()
+        if refusal is not None:
+            return refusal
+        return service.prepare(
+            payload_id=payload_id,
+            actor_id=actor_id,
+            result_claims=result_claims,
+            claim_verification_plan=claim_verification_plan,
+            verification_evidence_bindings=verification_evidence_bindings,
+        )
+
+    def review_historical_pairing(
+        self,
+        *,
+        preparation_id: str,
+        expected_authority_fingerprint: str,
+    ) -> tuple[int, dict[str, object]]:
+        service, refusal = self._historical_pairing_snapshot()
+        if refusal is not None:
+            return refusal
+        return service.review(
+            preparation_id=preparation_id,
+            expected_authority_fingerprint=expected_authority_fingerprint,
+        )
+
+    def confirm_historical_pairing(
+        self,
+        *,
+        preparation_id: str,
+        expected_authority_fingerprint: str,
+        presented_confirmation_tag: str,
+    ) -> tuple[int, dict[str, object]]:
+        """Forward one presented tag straight through to the owning service.
+
+        The tag is never stored on the launcher, never logged, and never enters
+        any launcher registry, preparation record, or recovery record.
+        """
+
+        service, refusal = self._historical_pairing_snapshot()
+        if refusal is not None:
+            return refusal
+        return service.confirm(
+            preparation_id=preparation_id,
+            expected_authority_fingerprint=expected_authority_fingerprint,
+            presented_confirmation_tag=presented_confirmation_tag,
         )
 
 
