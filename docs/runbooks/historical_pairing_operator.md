@@ -256,6 +256,14 @@ In the browser, use **Download confirmation-message bytes**. The page decodes
 the launcher-supplied Base64 and checks the decoded length against the declared
 length before offering the file.
 
+What is checked automatically here is a served-asset smoke only: the launcher
+really serves the page and the script, the download control is really wired, and
+the script really decodes the Base64 and compares the decoded length against the
+declared length. That is asset wiring verified, and it is
+**not a real-browser end-to-end proof** that a download completed:
+**the operator performs the browser download interactively**. If you would
+rather not depend on the browser at all, use the command line below instead.
+
 If you prefer the command line, copy the Base64 value shown in the review and
 decode it with a binary-safe writer:
 
@@ -431,3 +439,7 @@ adds no new execution or evaluation result.
   passes through it.
 * Secrets are immutable Python bytes and browser strings once read. Dropping a
   reference is not zeroization, and none is claimed.
+* The committed evidence for step 10 is a served-asset smoke: served page,
+  wired control, decoded length check. It is
+  **not a real-browser end-to-end proof** of a completed download, and
+  **the operator performs the browser download interactively**.

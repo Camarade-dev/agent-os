@@ -31,14 +31,44 @@ a claim is supported, that evidence exists, or that the asserted actor is who
 they say they are.  The derived V5 stays non-launchable, the tag stays a
 symmetric shared-secret code rather than a signature, ``actor_id`` stays
 asserted, and the archive stays free of any confirmation receipt.
+
+Environment support versus product refusal
+------------------------------------------
+
+Whether this host can run the workflow at all is decided *before* any product
+process is started, from explicit independently observed prerequisites only.
+Once that predicate has passed, every product outcome is an acceptance
+observation: a nonzero preflight or wrapper return code, malformed wrapper
+stdout, an unexpected exception, or a created run root is a **test failure**,
+never a skip.  Wrapper-result validation is a separate function that contains no
+``pytest.skip``, ``pytest.xfail`` or ``pytest.importorskip``, and the whole
+post-support region runs inside a guard that turns any skip attempt into a
+failure.  A supported-host product regression can therefore never present itself
+as a green selection with the load-bearing tests skipped.
+
+Browser evidence: what is and is not proven
+-------------------------------------------
+
+The committed browser evidence is a **served-asset smoke**: the launcher really
+serves the page and the script, the download button wiring really exists, and
+the script really decodes the launcher-supplied Base64 and compares the decoded
+length against the declared length.  No browser is driven here, so this is
+**not a real-browser end-to-end proof** that a download completed.  The operator
+performs the browser download interactively.  A wording guard refuses any
+runbook or docstring sentence that would upgrade this served-asset smoke into a
+claim that some automated client completed the download.
 """
 
 from __future__ import annotations
 
+import ast
 import base64
+import binascii
+import contextlib
 import hashlib
 import hmac
 import json
+import ntpath
 import os
 from pathlib import Path
 import re
@@ -54,6 +84,7 @@ import pytest
 
 from admissible.delegated_gate.canonical import canonical_bytes
 from admissible.delegated_gate.historical_evaluation import (
+    HistoricalEvaluationPairingAuthority,
     project_v5_runtime_authority_to_v2,
 )
 from admissible.delegated_gate.historical_evaluation_store import (
@@ -81,16 +112,25 @@ from admissible.delegated_gate.mission_profile import (
 from admissible.delegated_gate.native_canary import (
     load_historical_native_canary_authorization_payload_v4,
 )
+from admissible.delegated_gate.native_executor import (
+    ATTESTATION_CLASS_WRAPPER_CHAIN,
+    CURSOR_DISCOVERY_COMMAND,
+)
 from admissible.product_launcher.historical_pairing_enablement import (
     HISTORICAL_PAIRING_ENABLEMENT_SCHEMA_VERSION,
 )
 from admissible.product_launcher.historical_pairing_registry import (
     MAX_HISTORICAL_PAYLOAD_DOCUMENT_BYTES,
 )
+from admissible.product_launcher.preflight_runner import (
+    WRAPPER_ARGUMENT_ERROR,
+    WRAPPER_INTERNAL_ERROR,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNBOOK_PATH = REPO_ROOT / "docs" / "runbooks" / "historical_pairing_operator.md"
+MODULE_PATH = Path(__file__).resolve()
 
 # Every production file whose exported byte identity is proven before the
 # distribution is built.  A drift here means the isolated installation would not
@@ -154,6 +194,35 @@ SECRET_BYTES = (
     b"\x00\xff\r\n admissible-historical-pairing-acceptance\x80\x7f\t"
 )
 
+# The exact argparse failure code the installed preflight CLI returns for a
+# contract violation, and the exact code its bare ``except Exception`` returns
+# for an internal fault.  Both are product outcomes, never host conditions.
+PREFLIGHT_CLI_CONTRACT_EXIT = WRAPPER_ARGUMENT_ERROR
+PREFLIGHT_INTERNAL_EXIT = WRAPPER_INTERNAL_ERROR
+PREFLIGHT_ARGPARSE_EXIT = 2
+
+# Exactly the ordered boundary a public confirmation-message export must clear
+# before the installed tag helper is allowed to start.
+PUBLIC_MESSAGE_VERIFICATION_ORDER = (
+    "PUBLIC_EXPORT_READ",
+    "STRICT_BASE64_DECODE",
+    "LENGTH_VERIFIED",
+    "SHA256_VERIFIED",
+    "DOMAIN_VERIFIED",
+    "NUL_BOUNDARY_VERIFIED",
+    "ORACLE_EQUALITY_VERIFIED",
+    "MESSAGE_FILE_WRITTEN",
+    "INSTALLED_TAG_HELPER_STARTED",
+    "CONFIRMATION_SUBMITTED",
+)
+
+# The one accepted skip reason for a missing PowerShell interpreter.  It is
+# scoped to the runbook-command execution tests and to nothing else.
+POWERSHELL_SKIP_REASON = (
+    "PowerShell is unavailable, so the documented PowerShell runbook commands "
+    "cannot be executed on this host"
+)
+
 READINESS_TIMEOUT_SECONDS = 90.0
 HTTP_TIMEOUT_SECONDS = 30.0
 # Windows loopback occasionally resets a freshly accepted connection. Exactly
@@ -203,6 +272,121 @@ def _free_of(blob: bytes, needle: bytes) -> bool:
     return needle not in blob
 
 
+def _bounded_diagnostic(blob: bytes, *, limit: int = 400) -> str:
+    """Render a short, non-secret tail of a captured stream for a failure."""
+
+    text = blob[-limit:].decode("utf-8", "replace")
+    for material in (
+        SECRET_BYTES.decode("latin-1"),
+        base64.b64encode(SECRET_BYTES).decode("ascii"),
+        SECRET_BYTES.hex(),
+    ):
+        text = text.replace(material, "<redacted>")
+    return text
+
+
+# ---------------------------------------------------------------------------
+# 1. Environment-support classification -- decided before any product process.
+# ---------------------------------------------------------------------------
+
+
+def _deterministically_resolvable_backend() -> str | None:
+    """Locate the accepted local backend exactly where the contract requires it.
+
+    The wrapper-chain attestation resolves ``cursor-agent`` from the process
+    ``PATH``/``PATHEXT`` and cross-checks that winner against ``shutil.which``.
+    This predicate observes exactly that discovery surface and nothing else, so
+    "no accepted backend on this host" can never be confused with "the product
+    refused".
+    """
+
+    return shutil.which(CURSOR_DISCOVERY_COMMAND, path=os.environ.get("PATH", ""))
+
+
+def classify_operator_host_support() -> tuple[str, ...]:
+    """Return the ordered explicit reasons this host cannot run the workflow.
+
+    Every reason is an independently observed prerequisite.  No reason is ever
+    inferred from a product process return code, a product refusal, a product
+    exception, or any captured product output.
+    """
+
+    reasons: list[str] = []
+    if os.name != "nt":
+        reasons.append(
+            "os.name is not 'nt'; the installed operator runbook targets a "
+            "Windows operator"
+        )
+    for tool in ("git", "tar"):
+        if shutil.which(tool) is None:
+            reasons.append(
+                f"the {tool} executable is absent, so the faithful export "
+                "cannot be built"
+            )
+    if _deterministically_resolvable_backend() is None:
+        reasons.append(
+            f"the accepted local backend command {CURSOR_DISCOVERY_COMMAND!r} "
+            "is not discoverable on PATH/PATHEXT, where the provider-free "
+            "wrapper contract requires it"
+        )
+    return tuple(reasons)
+
+
+def _require_supported_operator_host() -> None:
+    """The one pre-invocation environment gate for the installed workflow."""
+
+    reasons = classify_operator_host_support()
+    if reasons:  # pragma: no cover - environment honest, pre-invocation only
+        pytest.skip("unsupported operator host: " + "; ".join(reasons))
+
+
+def powershell_is_available() -> bool:
+    """Observe the PowerShell interpreter itself, never a command's outcome."""
+
+    return shutil.which("powershell") is not None
+
+
+def _require_powershell() -> str:
+    if not powershell_is_available():
+        pytest.skip(POWERSHELL_SKIP_REASON)
+    return "powershell"
+
+
+class PostSupportSkipAttempted(AssertionError):
+    """A skip was attempted after environment support had already passed.
+
+    Once the support predicate passes, a skip can only be hiding a real product
+    regression, so it is converted into a failure rather than into a green
+    selection with the load-bearing tests skipped.
+    """
+
+
+@contextlib.contextmanager
+def forbid_skip(label: str):
+    """Run a region in which every skip attempt becomes a test failure."""
+
+    skipped = pytest.skip.Exception
+    saved = (pytest.skip, pytest.xfail, pytest.importorskip)
+
+    def _refuse(*_arguments, **_keywords):
+        raise PostSupportSkipAttempted(
+            f"{label} attempted to skip after environment support passed"
+        )
+
+    pytest.skip = _refuse
+    pytest.xfail = _refuse
+    pytest.importorskip = _refuse
+    try:
+        yield
+    except skipped as attempted:
+        raise PostSupportSkipAttempted(
+            f"{label} raised a skip outcome after environment support passed: "
+            f"{attempted!s:.200}"
+        ) from attempted
+    finally:
+        pytest.skip, pytest.xfail, pytest.importorskip = saved
+
+
 class InstalledStartupRefused(RuntimeError):
     """The installed launcher child never printed its readiness line.
 
@@ -234,6 +418,15 @@ class InstalledLauncher:
         self.readiness_line = ""
         self.stdout_bytes = b""
         self.stderr_bytes = b""
+        # Genuine-restart identity, captured while the child is still alive so
+        # a later assertion never has to trust a reused Python object.
+        self.pid: int | None = None
+        self.process_object_id: int | None = None
+        self.ready_at: float | None = None
+        self.closed_at: float | None = None
+        self.exit_code: int | None = None
+        # Exactly the headers this launcher's transport really put on the wire.
+        self.sent_headers: list[dict] = []
 
     def __enter__(self) -> "InstalledLauncher":
         environment = dict(os.environ)
@@ -247,6 +440,8 @@ class InstalledLauncher:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+        self.pid = self.process.pid
+        self.process_object_id = id(self.process)
         deadline = time.monotonic() + READINESS_TIMEOUT_SECONDS
         line = b""
         while time.monotonic() < deadline:
@@ -266,6 +461,7 @@ class InstalledLauncher:
             )
         self.ui_port = int(match.group(1))
         self.g2_port = int(match.group(2))
+        self.ready_at = time.monotonic()
         return self
 
     def __exit__(self, *_exception) -> None:
@@ -286,6 +482,8 @@ class InstalledLauncher:
         remaining_out, remaining_err = process.communicate(timeout=30)
         self.stdout_bytes += remaining_out or b""
         self.stderr_bytes += remaining_err or b""
+        self.exit_code = process.poll()
+        self.closed_at = time.monotonic()
 
     # -- transport ------------------------------------------------------
 
@@ -301,6 +499,7 @@ class InstalledLauncher:
             headers["Content-Length"] = str(len(data))
         if extra:
             headers.update(extra)
+        self.sent_headers.append({"path": path, **headers})
         last: OSError | None = None
         for _attempt in range(LOOPBACK_RETRIES):
             connection = HTTPConnection(
@@ -680,59 +879,253 @@ def _author_real_contract(installation, source, base: Path) -> SimpleNamespace:
     )
 
 
+def _provider_invocation_guard(base: Path) -> tuple[Path, Path]:
+    """Install an audit hook recording every child process the product starts.
+
+    The hook is the provider-invocation counter: the wrapper-chain attestation
+    is allowed to run its discovery probes, but a genuine provider invocation
+    would have to start ``node.exe`` or a ``cursor-agent`` launcher, and every
+    such start is recorded here.
+    """
+
+    guard = base / "providerguard"
+    guard.mkdir(exist_ok=True)
+    (guard / "sitecustomize.py").write_text(
+        "import atexit, os, sys\n"
+        "_log = os.environ.get('ADMISSIBLE_PROVIDER_AUDIT_LOG', '')\n"
+        "_events = []\n"
+        "_state = {'recording': True}\n"
+        "def _hook(event, args):\n"
+        "    if not _state['recording'] or event != 'subprocess.Popen':\n"
+        "        return\n"
+        "    try:\n"
+        "        executable, argv = args[0], args[1]\n"
+        "        first = executable\n"
+        "        if first is None and argv:\n"
+        "            first = argv[0] if not isinstance(argv, (str, bytes)) else argv\n"
+        "        text = '' if first is None else os.fsdecode(first)\n"
+        "    except Exception:\n"
+        "        text = '<unreadable>'\n"
+        "    _events.append(text)\n"
+        "sys.addaudithook(_hook)\n"
+        "def _flush():\n"
+        "    _state['recording'] = False\n"
+        "    if _log:\n"
+        "        with open(_log, 'w', encoding='utf-8') as handle:\n"
+        "            handle.write('\\n'.join(_events))\n"
+        "atexit.register(_flush)\n",
+        encoding="utf-8",
+    )
+    return guard, base / "provider-audit.txt"
+
+
+def _count_provider_invocations(started: tuple[str, ...]) -> int:
+    """Count child starts that would be a real provider invocation."""
+
+    invocations = 0
+    for entry in started:
+        stem = ntpath.splitext(ntpath.basename(entry))[0].casefold()
+        if stem == "node" or stem.startswith("cursor-agent"):
+            invocations += 1
+    return invocations
+
+
 def _acquire_real_wrapper(installation, source, contract, base: Path):
-    """Run the product's own preflight-only child and keep its exact envelope."""
+    """Invoke the product's own preflight-only child.
+
+    This function performs the invocation and nothing else.  It classifies
+    nothing, decides nothing about host support, and never skips: interpreting
+    what came back belongs to :func:`validate_wrapper_acquisition`.
+    """
 
     runs = base / "wrapper-runs"
     runs.mkdir()
     run_root = runs / contract.generated["run_id"]
-    completed = _run(
-        [
-            str(installation.python),
-            "-m",
-            "admissible.product_launcher.preflight_runner",
-            "--source-repository", str(source.path),
-            "--required-source-head", source.head,
-            "--run-root", str(run_root),
-            "--run-id", contract.generated["run_id"],
-            "--session-id", contract.generated["session_id"],
-            "--executable", "cursor-agent",
-            "--profile-document", str(contract.document),
-            "--attestation-class", "wrapper-chain",
-        ],
-        cwd=base,
-        timeout=900,
-    )
+    guard, audit_log = _provider_invocation_guard(base)
+    argv = [
+        str(installation.python),
+        "-m",
+        "admissible.product_launcher.preflight_runner",
+        "--source-repository", str(source.path),
+        "--required-source-head", source.head,
+        "--run-root", str(run_root),
+        "--run-id", contract.generated["run_id"],
+        "--session-id", contract.generated["session_id"],
+        "--executable", CURSOR_DISCOVERY_COMMAND,
+        "--profile-document", str(contract.document),
+        "--attestation-class", "wrapper-chain",
+    ]
+    invocation_error: BaseException | None = None
+    completed = None
+    try:
+        completed = _run(
+            argv,
+            cwd=base,
+            timeout=900,
+            env={
+                "PYTHONPATH": str(guard),
+                "ADMISSIBLE_PROVIDER_AUDIT_LOG": str(audit_log),
+            },
+        )
+    except (OSError, subprocess.SubprocessError) as failure:
+        # Recorded, never classified here: an invocation fault is a product
+        # observation the validator must turn into a failure.
+        invocation_error = failure
     wrapper = base / "wrapper.json"
-    wrapper.write_bytes(completed.stdout)
+    wrapper.write_bytes(b"" if completed is None else completed.stdout)
+    started = tuple(
+        line
+        for line in (
+            audit_log.read_text(encoding="utf-8").splitlines()
+            if audit_log.exists()
+            else []
+        )
+        if line
+    )
     return SimpleNamespace(
         path=wrapper,
-        returncode=completed.returncode,
+        argv=argv,
+        returncode=None if completed is None else completed.returncode,
+        stdout=b"" if completed is None else completed.stdout,
+        stderr=b"" if completed is None else completed.stderr,
         run_root=run_root,
-        stdout=completed.stdout,
+        invocation_error=invocation_error,
+        started_children=started,
+        provider_invocations=_count_provider_invocations(started),
+    )
+
+
+def validate_wrapper_acquisition(acquired) -> SimpleNamespace:
+    """Classify one already-completed wrapper acquisition, failing closed.
+
+    Every unexpected condition raises ``AssertionError``.  This function
+    deliberately contains no ``pytest.skip``, ``pytest.xfail`` or
+    ``pytest.importorskip`` call and catches no broad exception: after the
+    environment-support predicate has passed, a nonzero return code, malformed
+    stdout, a created run root, an invocation fault, or any provider invocation
+    is a product regression, not an unsupported host.
+    """
+
+    assert acquired.invocation_error is None, (
+        "the installed preflight child could not be invoked at all: "
+        f"{acquired.invocation_error!r}"
+    )
+    code = acquired.returncode
+    assert code is not None, "the installed preflight child produced no exit code"
+    if code == PREFLIGHT_INTERNAL_EXIT:
+        raise AssertionError(
+            "the installed preflight child returned "
+            f"{PREFLIGHT_INTERNAL_EXIT} (internal fault); this is a product "
+            "regression, not an unsupported host: "
+            f"{_bounded_diagnostic(acquired.stderr)!r}"
+        )
+    if code == PREFLIGHT_CLI_CONTRACT_EXIT:
+        raise AssertionError(
+            "the installed preflight child returned "
+            f"{PREFLIGHT_CLI_CONTRACT_EXIT} (CLI contract violation); the "
+            "committed argv no longer matches the installed command surface: "
+            f"{_bounded_diagnostic(acquired.stderr)!r}"
+        )
+    if code == PREFLIGHT_ARGPARSE_EXIT:
+        raise AssertionError(
+            f"the installed preflight child returned {PREFLIGHT_ARGPARSE_EXIT} "
+            "(argument parsing failure): "
+            f"{_bounded_diagnostic(acquired.stderr)!r}"
+        )
+    assert code == 0, (
+        f"the installed preflight child returned {code}: "
+        f"{_bounded_diagnostic(acquired.stderr)!r}"
+    )
+    assert acquired.stdout, "the installed preflight child printed no envelope"
+    try:
+        envelope = json.loads(acquired.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as malformed:
+        raise AssertionError(
+            "the installed preflight child printed malformed wrapper stdout: "
+            f"{malformed!s:.200}"
+        ) from malformed
+    assert isinstance(envelope, dict), "the wrapper envelope is not a JSON object"
+    status = envelope.get("status")
+    assert status == "PREFLIGHT_READY", (
+        f"the wrapper status is {status!r} rather than PREFLIGHT_READY: "
+        f"{_bounded_diagnostic(acquired.stderr)!r}"
+    )
+    attestation = envelope.get("attestation")
+    assert isinstance(attestation, dict), "the wrapper carries no attestation"
+    observed_class = attestation.get("attestation_class")
+    assert observed_class == ATTESTATION_CLASS_WRAPPER_CHAIN, (
+        f"the observed wrapper family is {observed_class!r} rather than the "
+        f"expected {ATTESTATION_CLASS_WRAPPER_CHAIN}"
+    )
+    assert "authorization_payload" in envelope, (
+        "the wrapper envelope carries no authorization payload"
+    )
+    assert acquired.provider_invocations == 0, (
+        "the provider-free wrapper acquisition started "
+        f"{acquired.provider_invocations} provider process(es): "
+        f"{acquired.started_children[:8]}"
+    )
+    assert not acquired.run_root.exists(), (
+        "preflight-only wrapper acquisition created a run root at "
+        f"{acquired.run_root}"
+    )
+    return SimpleNamespace(
+        real_path_executed=True,
+        substituted=False,
+        returncode=code,
+        status=status,
+        attestation_class=observed_class,
+        provider_invocations=acquired.provider_invocations,
+        run_root_created=False,
+        started_children=acquired.started_children,
+        envelope=envelope,
     )
 
 
 @pytest.fixture(scope="session")
-def workflow(tmp_path_factory):
+def real_wrapper_acquisition(tmp_path_factory):
+    """Build the isolated installation and acquire one real wrapper, once.
+
+    The support decision lives here and is taken *before* any product process
+    starts.  Everything after it runs inside :func:`forbid_skip`, so no product
+    outcome can be downgraded into an unsupported-environment skip.
+    """
+
+    _require_supported_operator_host()
+    reasons = classify_operator_host_support()
+
+    with forbid_skip("real wrapper acquisition"):
+        base = _require_external_root(tmp_path_factory)
+        installation = _build_isolated_installation(base)
+        source = _external_source_repository(base)
+        contract = _author_real_contract(installation, source, base)
+        acquired = _acquire_real_wrapper(installation, source, contract, base)
+        witness = validate_wrapper_acquisition(acquired)
+    return SimpleNamespace(
+        base=base,
+        installation=installation,
+        source=source,
+        contract=contract,
+        wrapper=acquired,
+        witness=witness,
+        support_reasons=reasons,
+    )
+
+
+@pytest.fixture(scope="session")
+def workflow(real_wrapper_acquisition):
     """Execute the complete installed operator workflow exactly once."""
 
-    if os.name != "nt":  # pragma: no cover - platform-honest skip
-        pytest.skip("the installed operator runbook targets a Windows operator")
-    for tool in ("git", "tar"):
-        if shutil.which(tool) is None:  # pragma: no cover - environment honest
-            pytest.skip(f"{tool} is required to build the faithful export")
+    with forbid_skip("the installed operator workflow"):
+        return _installed_operator_workflow(real_wrapper_acquisition)
 
-    base = _require_external_root(tmp_path_factory)
-    installation = _build_isolated_installation(base)
-    source = _external_source_repository(base)
-    contract = _author_real_contract(installation, source, base)
-    wrapper = _acquire_real_wrapper(installation, source, contract, base)
-    if wrapper.returncode != 0:  # pragma: no cover - environment honest
-        pytest.skip(
-            "the local backend could not be attested provider-free, so no real "
-            "preflight-only wrapper could be produced on this host"
-        )
+
+def _installed_operator_workflow(acquisition) -> SimpleNamespace:
+    base = acquisition.base
+    installation = acquisition.installation
+    source = acquisition.source
+    contract = acquisition.contract
+    wrapper = acquisition.wrapper
 
     # -- E. installed standalone-V4 extraction ---------------------------
     standalone = base / "standalone-v4.json"
@@ -839,6 +1232,8 @@ def workflow(tmp_path_factory):
 
     return SimpleNamespace(
         base=base,
+        acquisition=acquisition,
+        witness=acquisition.witness,
         installation=installation,
         source=source,
         contract=contract,
@@ -1009,6 +1404,135 @@ def _partial_configuration_smoke(
     return SimpleNamespace(results=results, runtime=runtime)
 
 
+class OperationJournal:
+    """The exact ordered operations one exported message really went through."""
+
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    def record(self, event: str) -> None:
+        assert event in PUBLIC_MESSAGE_VERIFICATION_ORDER, event
+        self.events.append(event)
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return f"OperationJournal({self.events!r})"
+
+
+class ExportedMessageIntegrityError(AssertionError):
+    """One refused public confirmation-message export.
+
+    Raising this means the installed tag helper was never started and the
+    operator-selected message file was never written.
+    """
+
+
+def verify_exported_confirmation_message(review, *, journal=None) -> bytes:
+    """Verify the public confirmation-message export and return exact bytes.
+
+    The checks run in exactly one order -- read, strict decode, declared length,
+    declared SHA-256, accepted domain prefix, single NUL framing boundary, then
+    equality against the accepted public-message construction rebuilt by the
+    product's own primitive.  Nothing here repairs declared metadata, replaces
+    exported bytes, reconstructs a file, adds the domain, or adds the separator:
+    the oracle only compares.
+    """
+
+    record = journal.record if journal is not None else (lambda _event: None)
+
+    identity = review["pairing_identity"]
+    encoded = identity["confirmation_message_base64"]
+    if not isinstance(encoded, str):
+        raise ExportedMessageIntegrityError(
+            f"the public Base64 export is {type(encoded).__name__}, not a string"
+        )
+    record("PUBLIC_EXPORT_READ")
+
+    try:
+        message = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as malformed:
+        raise ExportedMessageIntegrityError(
+            f"strict Base64 decoding refused the public export: {malformed!s:.120}"
+        ) from malformed
+    record("STRICT_BASE64_DECODE")
+
+    declared_length = identity["confirmation_message_byte_length"]
+    if not isinstance(declared_length, int) or isinstance(declared_length, bool):
+        raise ExportedMessageIntegrityError(
+            "the declared confirmation-message byte length is not an integer"
+        )
+    if len(message) != declared_length:
+        raise ExportedMessageIntegrityError(
+            f"decoded {len(message)} bytes against a declared length of "
+            f"{declared_length}"
+        )
+    record("LENGTH_VERIFIED")
+
+    declared_sha256 = identity["confirmation_message_sha256"]
+    observed_sha256 = hashlib.sha256(message).hexdigest()
+    if not isinstance(declared_sha256, str) or observed_sha256 != declared_sha256:
+        raise ExportedMessageIntegrityError(
+            "the exported bytes do not match the declared SHA-256"
+        )
+    record("SHA256_VERIFIED")
+
+    prefix = (
+        HISTORICAL_PAIRING_CONFIRMATION_DOMAIN
+        + HISTORICAL_PAIRING_CONFIRMATION_DOMAIN_SEPARATOR
+    )
+    if not message.startswith(prefix):
+        raise ExportedMessageIntegrityError(
+            "the exported bytes do not start with the accepted domain prefix"
+        )
+    record("DOMAIN_VERIFIED")
+
+    separator_index = len(HISTORICAL_PAIRING_CONFIRMATION_DOMAIN)
+    if (
+        message.count(HISTORICAL_PAIRING_CONFIRMATION_DOMAIN_SEPARATOR) != 1
+        or message[separator_index : separator_index + 1]
+        != HISTORICAL_PAIRING_CONFIRMATION_DOMAIN_SEPARATOR
+    ):
+        raise ExportedMessageIntegrityError(
+            "the exported bytes do not carry exactly one NUL framing boundary "
+            "immediately after the domain constant"
+        )
+    record("NUL_BOUNDARY_VERIFIED")
+
+    try:
+        authority_document = json.loads(message[len(prefix) :].decode("utf-8"))
+        authority = HistoricalEvaluationPairingAuthority.from_dict(
+            authority_document
+        ).validated()
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as bad:
+        raise ExportedMessageIntegrityError(
+            f"the framed tail is not one canonical pairing authority: {bad!s:.160}"
+        ) from bad
+    accepted = build_historical_pairing_confirmation_message(
+        pairing_authority=authority
+    )
+    if accepted != message:
+        raise ExportedMessageIntegrityError(
+            "the exported bytes differ from the accepted public-message "
+            "construction for the authority they carry"
+        )
+    record("ORACLE_EQUALITY_VERIFIED")
+    return message
+
+
+def export_verified_message_and_tag(review, message_file: Path, *, runner, journal):
+    """Verify, then write, then start the installed helper -- in that order.
+
+    The helper call is physically downstream of every integrity and framing
+    check, so a refused export can never reach it.
+    """
+
+    message = verify_exported_confirmation_message(review, journal=journal)
+    with open(message_file, "wb") as handle:
+        handle.write(message)
+    journal.record("MESSAGE_FILE_WRITTEN")
+    journal.record("INSTALLED_TAG_HELPER_STARTED")
+    return message, runner(message_file)
+
+
 def _prepare_and_export(launcher, base: Path, suffix: str, *, index: int):
     """Prepare one pairing and export its exact public confirmation message."""
 
@@ -1028,12 +1552,6 @@ def _prepare_and_export(launcher, base: Path, suffix: str, *, index: int):
         f"{PREPARATIONS_ROUTE}/{preparation_id}/{authority_fingerprint}",
     )
     assert review_status == 200, review
-    message = base64.b64decode(
-        review["pairing_identity"]["confirmation_message_base64"], validate=True
-    )
-    message_file = base / f"confirmation-message-{index}.bin"
-    with open(message_file, "wb") as handle:
-        handle.write(message)
     return SimpleNamespace(
         csrf=csrf,
         prepared=prepared,
@@ -1041,20 +1559,60 @@ def _prepare_and_export(launcher, base: Path, suffix: str, *, index: int):
         review=review,
         preparation_id=preparation_id,
         authority_fingerprint=authority_fingerprint,
-        message=message,
-        message_file=message_file,
+        message=None,
+        message_file=base / f"confirmation-message-{index}.bin",
+        journal=OperationJournal(),
     )
 
 
-def _installed_tag(installation, message_file: Path, secret_file: Path):
-    return _run(
-        [
-            str(installation.scripts / "admissible-historical-pairing-tag"),
-            "--message-file", str(message_file),
-            "--secret-file", str(secret_file),
-        ],
-        cwd=installation.venv,
+def _tag_runner(installation, secret_file: Path):
+    """Return a callable that starts the installed tag helper on a file."""
+
+    def _start(message_file: Path):
+        return _run(
+            [
+                str(installation.scripts / "admissible-historical-pairing-tag"),
+                "--message-file", str(message_file),
+                "--secret-file", str(secret_file),
+            ],
+            cwd=installation.venv,
+        )
+
+    return _start
+
+
+def _tag_from_helper_stdout(completed) -> str:
+    """Parse the submitted credential directly out of installed helper stdout.
+
+    There is no fallback: no in-process HMAC, no oracle value, and no repair.
+    A helper that did not print exactly one lowercase 64-hex line fails here.
+    """
+
+    assert completed.returncode == 0, _bounded_diagnostic(completed.stderr)
+    assert completed.stderr == b"", _bounded_diagnostic(completed.stderr)
+    raw = completed.stdout
+    terminator = os.linesep.encode("ascii")
+    assert raw.endswith(terminator), repr(raw[-16:])
+    text = raw[: -len(terminator)].decode("ascii")
+    # Diagnostics never carry the credential itself, only its shape.
+    assert len(text) == 64, len(text)
+    assert all(
+        character in "0123456789abcdef" for character in text
+    ), "the installed helper printed a non-lowercase-hex credential"
+    return text
+
+
+def _export_and_tag(installation, exported, secret_file: Path):
+    """Run the complete accepted export boundary for one preparation."""
+
+    message, completed = export_verified_message_and_tag(
+        exported.review,
+        exported.message_file,
+        runner=_tag_runner(installation, secret_file),
+        journal=exported.journal,
     )
+    exported.message = message
+    return completed
 
 
 def _archive_inventory(archive_root: Path):
@@ -1074,6 +1632,14 @@ def _refused_enabled_session(runtime: Path, refused) -> SimpleNamespace:
         runtime=runtime,
         readiness=refused.readiness,
         startup_refusal=refused,
+        launcher_object_id=None,
+        process_object_id=None,
+        pid=None,
+        argv0="",
+        ready_at=None,
+        closed_at=None,
+        exit_code=None,
+        sent_headers=[],
         stdout=refused.stdout,
         stderr=refused.stderr,
         payload_status=None,
@@ -1103,12 +1669,21 @@ def _refused_restart_session(runtime: Path, refused, archive_root: Path):
         runtime=runtime,
         readiness="" if refused is None else refused.readiness,
         startup_refusal=refused,
+        launcher_object_id=None,
+        process_object_id=None,
+        pid=None,
+        argv0="",
+        ready_at=None,
+        closed_at=None,
+        exit_code=None,
+        sent_headers=[],
         stdout=b"" if refused is None else refused.stdout,
         stderr=b"" if refused is None else refused.stderr,
         payload_status=None,
         payload_body=None,
         old_review=(None, {}),
         old_confirm=(None, {}),
+        first_terminated_before_second_start=False,
         archive_between=_archive_inventory(archive_root),
         archive_digests_between=_archive_digests(archive_root),
         replayed=None,
@@ -1167,11 +1742,11 @@ def _enabled_session(
 
         # --- the accepted path -------------------------------------------
         exported = _prepare_and_export(launcher, base, "", index=0)
-        tagged = _installed_tag(
-            installation, exported.message_file, secret_file
-        )
-        assert tagged.returncode == 0, tagged.stderr
-        tag = tagged.stdout.decode("ascii").rstrip("\r\n")
+        tagged = _export_and_tag(installation, exported, secret_file)
+        # The submitted credential is parsed out of installed helper stdout and
+        # from nothing else; the in-process oracle only ever compares.
+        tag = _tag_from_helper_stdout(tagged)
+        exported.journal.record("CONFIRMATION_SUBMITTED")
         confirm_status, confirmed = launcher.json_call(
             "POST",
             f"{PREPARATIONS_ROUTE}/{exported.preparation_id}/confirmation",
@@ -1209,6 +1784,14 @@ def _enabled_session(
         runtime=runtime,
         readiness=readiness,
         startup_refusal=None,
+        launcher_object_id=id(launcher),
+        process_object_id=launcher.process_object_id,
+        pid=launcher.pid,
+        argv0=launcher.argv[0],
+        ready_at=launcher.ready_at,
+        closed_at=launcher.closed_at,
+        exit_code=launcher.exit_code,
+        sent_headers=list(launcher.sent_headers),
         stdout=launcher.stdout_bytes,
         stderr=launcher.stderr_bytes,
         payload_status=payload_status,
@@ -1232,11 +1815,13 @@ def _enabled_session(
 
 
 def _negative_controls(launcher, installation, base: Path, secret_file: Path):
-    """Five independent preparations, each refused through a real request."""
+    """Independent preparations, each refused through one real request."""
 
     controls = {}
 
     wrong = _prepare_and_export(launcher, base, ".wrongtag", index=1)
+    _export_and_tag(installation, wrong, secret_file)
+    wrong.journal.record("CONFIRMATION_SUBMITTED")
     controls["wrong_tag"] = SimpleNamespace(
         exported=wrong,
         response=launcher.json_call(
@@ -1248,9 +1833,10 @@ def _negative_controls(launcher, installation, base: Path, secret_file: Path):
     )
 
     upper = _prepare_and_export(launcher, base, ".uppercase", index=2)
-    upper_tag = _installed_tag(
-        installation, upper.message_file, secret_file
-    ).stdout.decode("ascii").rstrip("\r\n")
+    upper_tag = _tag_from_helper_stdout(
+        _export_and_tag(installation, upper, secret_file)
+    )
+    upper.journal.record("CONFIRMATION_SUBMITTED")
     controls["uppercase_tag"] = SimpleNamespace(
         exported=upper,
         response=launcher.json_call(
@@ -1264,10 +1850,53 @@ def _negative_controls(launcher, installation, base: Path, secret_file: Path):
         ),
     )
 
+    # One character of the installed helper's own stdout is flipped.  If the
+    # submitted credential were anything other than exactly what the helper
+    # printed, this request could not be distinguished from the accepted one.
+    mutated = _prepare_and_export(launcher, base, ".mutatedstdout", index=7)
+    mutated_source = _tag_from_helper_stdout(
+        _export_and_tag(installation, mutated, secret_file)
+    )
+    flipped = ("1" if mutated_source[0] == "0" else "0") + mutated_source[1:]
+    assert flipped != mutated_source
+    mutated.journal.record("CONFIRMATION_SUBMITTED")
+    controls["mutated_helper_stdout"] = SimpleNamespace(
+        exported=mutated,
+        response=launcher.json_call(
+            "POST",
+            f"{PREPARATIONS_ROUTE}/{mutated.preparation_id}/confirmation",
+            body={"expected_authority_fingerprint": mutated.authority_fingerprint},
+            extra={CSRF_HEADER: mutated.csrf, CONFIRMATION_HEADER: flipped},
+        ),
+    )
+
+    # The helper is run against a different secret file, so its stdout differs
+    # from the in-process oracle value for the very same authority.  What is
+    # submitted is the helper's value, and it is refused.
+    foreign_secret = base / "foreign-secret.bin"
+    with open(foreign_secret, "wb") as handle:
+        handle.write(bytes((byte ^ 0x5A) for byte in SECRET_BYTES))
+    foreign = _prepare_and_export(launcher, base, ".foreignsecret", index=8)
+    foreign_tag = _tag_from_helper_stdout(
+        _export_and_tag(installation, foreign, foreign_secret)
+    )
+    foreign.journal.record("CONFIRMATION_SUBMITTED")
+    controls["foreign_secret_helper_tag"] = SimpleNamespace(
+        exported=foreign,
+        helper_tag=foreign_tag,
+        response=launcher.json_call(
+            "POST",
+            f"{PREPARATIONS_ROUTE}/{foreign.preparation_id}/confirmation",
+            body={"expected_authority_fingerprint": foreign.authority_fingerprint},
+            extra={CSRF_HEADER: foreign.csrf, CONFIRMATION_HEADER: foreign_tag},
+        ),
+    )
+
     authorization = _prepare_and_export(launcher, base, ".authheader", index=3)
-    authorization_tag = _installed_tag(
-        installation, authorization.message_file, secret_file
-    ).stdout.decode("ascii").rstrip("\r\n")
+    authorization_tag = _tag_from_helper_stdout(
+        _export_and_tag(installation, authorization, secret_file)
+    )
+    authorization.journal.record("CONFIRMATION_SUBMITTED")
     controls["authorization_channel"] = SimpleNamespace(
         exported=authorization,
         response=launcher.json_call(
@@ -1286,9 +1915,10 @@ def _negative_controls(launcher, installation, base: Path, secret_file: Path):
     )
 
     body_channel = _prepare_and_export(launcher, base, ".bodytag", index=4)
-    body_tag = _installed_tag(
-        installation, body_channel.message_file, secret_file
-    ).stdout.decode("ascii").rstrip("\r\n")
+    body_tag = _tag_from_helper_stdout(
+        _export_and_tag(installation, body_channel, secret_file)
+    )
+    body_channel.journal.record("CONFIRMATION_SUBMITTED")
     controls["json_channel"] = SimpleNamespace(
         exported=body_channel,
         response=launcher.json_call(
@@ -1305,9 +1935,10 @@ def _negative_controls(launcher, installation, base: Path, secret_file: Path):
     )
 
     stale = _prepare_and_export(launcher, base, ".stalefp", index=5)
-    stale_tag = _installed_tag(
-        installation, stale.message_file, secret_file
-    ).stdout.decode("ascii").rstrip("\r\n")
+    stale_tag = _tag_from_helper_stdout(
+        _export_and_tag(installation, stale, secret_file)
+    )
+    stale.journal.record("CONFIRMATION_SUBMITTED")
     controls["stale_fingerprint"] = SimpleNamespace(
         exported=stale,
         response=launcher.json_call(
@@ -1336,6 +1967,11 @@ def _restart_session(
         # The first session never confirmed anything, so there is no restart
         # semantics to observe and nothing is invented in its place.
         return _refused_restart_session(runtime, None, archive_root)
+    # The first launcher must already be a terminated process before the second
+    # one is even constructed, so readiness below can only come from a new child.
+    first_terminated_before_second_start = (
+        first.exit_code is not None and first.closed_at is not None
+    )
     arguments = [
         "--source-repository", str(source.path),
         "--required-source-head", source.head,
@@ -1376,10 +2012,9 @@ def _restart_session(
         archive_digests_between = _archive_digests(archive_root)
 
         replayed = _prepare_and_export(launcher, base, "", index=6)
-        tagged = _installed_tag(
-            installation, replayed.message_file, secret_file
-        )
-        tag = tagged.stdout.decode("ascii").rstrip("\r\n")
+        tagged = _export_and_tag(installation, replayed, secret_file)
+        tag = _tag_from_helper_stdout(tagged)
+        replayed.journal.record("CONFIRMATION_SUBMITTED")
         confirm = launcher.json_call(
             "POST",
             f"{PREPARATIONS_ROUTE}/{replayed.preparation_id}/confirmation",
@@ -1395,6 +2030,15 @@ def _restart_session(
         runtime=runtime,
         readiness=readiness,
         startup_refusal=None,
+        launcher_object_id=id(launcher),
+        process_object_id=launcher.process_object_id,
+        pid=launcher.pid,
+        argv0=launcher.argv[0],
+        ready_at=launcher.ready_at,
+        closed_at=launcher.closed_at,
+        exit_code=launcher.exit_code,
+        sent_headers=list(launcher.sent_headers),
+        first_terminated_before_second_start=first_terminated_before_second_start,
         stdout=launcher.stdout_bytes,
         stderr=launcher.stderr_bytes,
         payload_status=payload_status,
@@ -1422,6 +2066,392 @@ def _archive_digests(archive_root: Path) -> dict:
         for path in archive_root.rglob("*")
         if path.is_file()
     }
+
+
+# ---------------------------------------------------------------------------
+# A. Environment-support classification and the skip policy itself.
+# ---------------------------------------------------------------------------
+
+
+# Every skipped report this module produced, recorded by a real pytest hook so
+# the final supported-host selection can be proven to contain no skip at all.
+SKIP_LEDGER: list[tuple[str, str, str]] = []
+
+
+def pytest_runtest_logreport(report):  # pragma: no cover - pytest hook
+    if report.skipped and MODULE_PATH.name in report.nodeid:
+        SKIP_LEDGER.append((report.nodeid, report.when, str(report.longrepr)))
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _skip_ledger(request):
+    """Register this module as a plugin so its own skips are observable."""
+
+    manager = request.config.pluginmanager
+    name = "historical-pairing-operator-skip-ledger"
+    if not manager.has_plugin(name):
+        manager.register(sys.modules[__name__], name)
+        request.addfinalizer(lambda: manager.unregister(name=name))
+    return SKIP_LEDGER
+
+
+def _module_tree() -> ast.Module:
+    return ast.parse(MODULE_PATH.read_text(encoding="utf-8"))
+
+
+def _named_function(tree: ast.Module, name: str) -> ast.FunctionDef:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"{name} is not defined in this module")
+
+
+def _is_skip_call(child) -> bool:
+    if not isinstance(child, ast.Call):
+        return False
+    target = child.func
+    return (
+        isinstance(target, ast.Attribute)
+        and target.attr in {"skip", "xfail", "importorskip"}
+        and isinstance(target.value, ast.Name)
+        and target.value.id == "pytest"
+    )
+
+
+def _skip_calls(node) -> list[ast.Call]:
+    """Every ``pytest.skip``/``xfail``/``importorskip`` call inside *node*."""
+
+    return [child for child in ast.walk(node) if _is_skip_call(child)]
+
+
+def _outside_nested_functions(node):
+    """Walk *node* without descending into any nested function definition."""
+
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        yield child
+        yield from _outside_nested_functions(child)
+
+
+def _own_skip_calls(function: ast.FunctionDef) -> list[ast.Call]:
+    """Skip calls this function makes itself, not ones a nested helper makes."""
+
+    return [child for child in _outside_nested_functions(function) if _is_skip_call(child)]
+
+
+def _code_only(function: ast.FunctionDef) -> str:
+    """Render a function without its docstring, so prose cannot be scanned."""
+
+    body = list(function.body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    if not body:  # pragma: no cover - defensive
+        return ""
+    rendered = ast.Module(body=body, type_ignores=[])
+    return ast.unparse(rendered)
+
+
+def _identifiers(node) -> set[str]:
+    """Every name and attribute this code really touches, prose excluded."""
+
+    names = set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name):
+            names.add(child.id)
+        elif isinstance(child, ast.Attribute):
+            names.add(child.attr)
+    return names
+
+
+def _line_span(function: ast.FunctionDef) -> range:
+    return range(function.lineno, (function.end_lineno or function.lineno) + 1)
+
+
+def _synthetic_envelope() -> dict:
+    """The minimal accepted wrapper envelope shape, for fault injection only."""
+
+    return {
+        "status": "PREFLIGHT_READY",
+        "authorization_payload": {"payload_fingerprint": "0" * 64},
+        "attestation": {"attestation_class": ATTESTATION_CLASS_WRAPPER_CHAIN},
+        "where_diagnostic": {},
+        "durability_capability": {},
+    }
+
+
+def _synthetic_acquisition(tmp_path: Path, **overrides) -> SimpleNamespace:
+    envelope = overrides.pop("envelope", _synthetic_envelope())
+    stdout = overrides.pop(
+        "stdout", json.dumps(envelope, sort_keys=True).encode("utf-8")
+    )
+    fields = {
+        "path": tmp_path / "wrapper.json",
+        "argv": ["python", "-m", "admissible.product_launcher.preflight_runner"],
+        "returncode": 0,
+        "stdout": stdout,
+        "stderr": b"",
+        "run_root": tmp_path / "runs" / "run-0001",
+        "invocation_error": None,
+        "started_children": ("C:\\Windows\\System32\\where.exe",),
+        "provider_invocations": 0,
+    }
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def test_supported_host_executed_the_real_wrapper_acquisition_path(
+    real_wrapper_acquisition,
+):
+    """The one positive witness that the real provider-free path really ran.
+
+    It depends on the acquisition fixture alone, so it survives even if the
+    downstream complete-workflow fixture were to disappear or skip.
+    """
+
+    acquisition = real_wrapper_acquisition
+    witness = acquisition.witness
+    assert acquisition.support_reasons == ()
+    assert witness.real_path_executed is True
+    assert witness.substituted is False
+    assert acquisition.wrapper.invocation_error is None
+    assert witness.returncode == 0
+    assert witness.status == "PREFLIGHT_READY"
+    assert witness.attestation_class == ATTESTATION_CLASS_WRAPPER_CHAIN
+    assert witness.provider_invocations == 0
+    assert witness.run_root_created is False
+    assert not acquisition.wrapper.run_root.exists()
+    # The audit hook really observed the acquisition, so a zero provider count
+    # is a positive observation rather than a blind one.
+    assert acquisition.wrapper.started_children, (
+        "the provider-invocation audit recorded no child process at all"
+    )
+    # The complete E2E fixture is the real one, not a substitute: it is still
+    # defined here and still executes the complete installed workflow.
+    text = MODULE_PATH.read_text(encoding="utf-8")
+    tree = _module_tree()
+    complete = _named_function(tree, "workflow")
+    assert "_installed_operator_workflow" in (
+        ast.get_source_segment(text, complete) or ""
+    )
+    assert _skip_calls(_named_function(tree, "_installed_operator_workflow")) == []
+
+
+def test_environment_support_is_decided_from_observed_prerequisites_only():
+    reasons = classify_operator_host_support()
+    if os.name == "nt" and shutil.which("git") and shutil.which("tar"):
+        assert reasons == () or all("cursor-agent" in item for item in reasons)
+    classifier = _named_function(_module_tree(), "classify_operator_host_support")
+    touched = _identifiers(classifier)
+    for forbidden in (
+        "returncode",
+        "stdout",
+        "stderr",
+        "exit_code",
+        "wrapper",
+        "acquired",
+        "envelope",
+        "validate_wrapper_acquisition",
+        "_acquire_real_wrapper",
+    ):
+        assert forbidden not in touched, forbidden
+    # It observes prerequisites and starts no product process of its own.
+    assert touched & {"which", "environ", "name"}, touched
+    assert "run" not in touched and "Popen" not in touched
+
+
+@pytest.mark.parametrize(
+    "overrides,expected",
+    [
+        ({"returncode": PREFLIGHT_INTERNAL_EXIT, "stdout": b""}, "67"),
+        ({"returncode": PREFLIGHT_CLI_CONTRACT_EXIT, "stdout": b""}, "64"),
+        ({"returncode": PREFLIGHT_ARGPARSE_EXIT, "stdout": b""}, "2"),
+        ({"returncode": 3, "stdout": b""}, "returned 3"),
+        ({"returncode": None}, "no exit code"),
+        ({"stdout": b"not json at all"}, "malformed wrapper stdout"),
+        ({"stdout": b""}, "printed no envelope"),
+        ({"provider_invocations": 1}, "provider process"),
+    ],
+)
+def test_injected_wrapper_faults_become_test_failures(tmp_path, overrides, expected):
+    acquired = _synthetic_acquisition(tmp_path, **overrides)
+    with pytest.raises(AssertionError) as caught:
+        validate_wrapper_acquisition(acquired)
+    assert expected in str(caught.value)
+
+
+def test_injected_invocation_exception_becomes_a_test_failure(tmp_path):
+    acquired = _synthetic_acquisition(
+        tmp_path, invocation_error=OSError("spawn refused")
+    )
+    with pytest.raises(AssertionError) as caught:
+        validate_wrapper_acquisition(acquired)
+    assert "could not be invoked" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "mutation,expected",
+    [
+        ({"status": "PREFLIGHT_BLOCKED"}, "PREFLIGHT_READY"),
+        ({"attestation": {"attestation_class": "LOCAL_PACKAGE_BIN"}}, "wrapper family"),
+        ({"attestation": "not-a-mapping"}, "no attestation"),
+    ],
+)
+def test_injected_wrapper_schema_regressions_become_test_failures(
+    tmp_path, mutation, expected
+):
+    envelope = {**_synthetic_envelope(), **mutation}
+    acquired = _synthetic_acquisition(tmp_path, envelope=envelope)
+    with pytest.raises(AssertionError) as caught:
+        validate_wrapper_acquisition(acquired)
+    assert expected in str(caught.value)
+
+
+def test_a_product_refusal_that_created_a_run_root_becomes_a_test_failure(tmp_path):
+    acquired = _synthetic_acquisition(tmp_path)
+    acquired.run_root.mkdir(parents=True)
+    with pytest.raises(AssertionError) as caught:
+        validate_wrapper_acquisition(acquired)
+    assert "created a run root" in str(caught.value)
+
+
+def test_a_forced_post_support_skip_attempt_becomes_a_test_failure():
+    def _post_support_region():
+        pytest.skip("this must never be reachable after support has passed")
+
+    with pytest.raises(PostSupportSkipAttempted):
+        with forbid_skip("probe"):
+            _post_support_region()
+    # The guard restores the real outcome API afterwards.
+    assert pytest.skip is not None and hasattr(pytest.skip, "Exception")
+    skipped = pytest.skip.Exception
+
+    def _raises_the_outcome_directly():
+        raise skipped("smuggled skip outcome")
+
+    with pytest.raises(PostSupportSkipAttempted):
+        with forbid_skip("probe"):
+            _raises_the_outcome_directly()
+
+    def _broad_handler_converting_to_skip():
+        try:
+            raise RuntimeError("an arbitrary workflow exception")
+        except Exception:
+            pytest.skip("broadened environment skip")
+
+    with pytest.raises(PostSupportSkipAttempted):
+        with forbid_skip("probe"):
+            _broad_handler_converting_to_skip()
+
+
+def _behavioural_skip_probe_span(tree: ast.Module) -> range:
+    """Line span of the one test that deliberately provokes skip attempts."""
+
+    return _line_span(
+        _named_function(
+            tree, "test_a_forced_post_support_skip_attempt_becomes_a_test_failure"
+        )
+    )
+
+
+def test_wrapper_result_validation_contains_no_skip_of_any_kind():
+    text = MODULE_PATH.read_text(encoding="utf-8")
+    validator = _named_function(_module_tree(), "validate_wrapper_acquisition")
+    assert _skip_calls(validator) == []
+    code = _code_only(validator)
+    for forbidden in ("pytest.skip", "pytest.xfail", "pytest.importorskip"):
+        assert forbidden not in code, forbidden
+    # Unknown conditions fail closed rather than being swallowed.
+    for handler in (
+        node for node in ast.walk(validator) if isinstance(node, ast.ExceptHandler)
+    ):
+        assert handler.type is not None, "validation must not use a bare except"
+        caught = ast.get_source_segment(text, handler.type) or ""
+        assert not re.search(r"Exception|BaseException", caught), caught
+
+
+def test_no_skip_is_conditioned_on_a_product_return_code():
+    text = MODULE_PATH.read_text(encoding="utf-8")
+    tree = _module_tree()
+    probe = _behavioural_skip_probe_span(tree)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If) or node.lineno in probe:
+            continue
+        condition = ast.get_source_segment(text, node.test) or ""
+        if "returncode" not in condition and "exit_code" not in condition:
+            continue
+        for statement in node.body + node.orelse:
+            assert _skip_calls(statement) == [], condition
+
+
+def test_no_broad_exception_handler_ends_in_a_skip():
+    text = MODULE_PATH.read_text(encoding="utf-8")
+    tree = _module_tree()
+    probe = _behavioural_skip_probe_span(tree)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ExceptHandler) or node.lineno in probe:
+            continue
+        assert _skip_calls(node) == [], (
+            ast.get_source_segment(text, node) or ""
+        )[:200]
+
+
+def test_every_skip_call_site_is_an_approved_pre_invocation_predicate():
+    approved = {"_require_powershell", "_require_supported_operator_host"}
+    tree = _module_tree()
+    probe = _behavioural_skip_probe_span(tree)
+    observed = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.lineno not in probe
+        and _own_skip_calls(node)
+    }
+    assert observed == approved, observed
+    # Both approved predicates observe a prerequisite and nothing else.
+    for name in sorted(approved):
+        function = _named_function(tree, name)
+        touched = _identifiers(function)
+        for forbidden in ("returncode", "stdout", "stderr", "exit_code", "acquired"):
+            assert forbidden not in touched, (name, forbidden)
+        assert not [
+            node
+            for node in ast.walk(function)
+            if isinstance(node, ast.ExceptHandler)
+        ], name
+
+
+def test_environment_support_is_decided_before_the_wrapper_is_invoked():
+    tree = _module_tree()
+    gate = _code_only(_named_function(tree, "_require_supported_operator_host"))
+    assert "classify_operator_host_support" in gate
+    fixture = _named_function(tree, "real_wrapper_acquisition")
+    required = invoked = None
+    for node in ast.walk(fixture):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        if node.func.id == "_require_supported_operator_host":
+            required = node.lineno
+        if node.func.id == "_acquire_real_wrapper":
+            invoked = node.lineno
+    assert required is not None and invoked is not None
+    assert required < invoked, (required, invoked)
+    # The support decision is the only thing that may precede the guard.
+    body = _code_only(fixture)
+    assert body.index("_require_supported_operator_host") < body.index("forbid_skip")
+    assert body.index("forbid_skip") < body.index("_acquire_real_wrapper")
+
+
+def test_the_workflow_fixture_runs_entirely_inside_the_no_skip_guard():
+    fixture = _named_function(_module_tree(), "workflow")
+    body = _code_only(fixture)
+    assert "with forbid_skip(" in body
+    assert _skip_calls(fixture) == []
 
 
 # ---------------------------------------------------------------------------
@@ -1866,6 +2896,214 @@ def test_exported_message_is_the_accepted_already_domain_separated_bytes(
     assert workflow.session.exported.identity["confirmation_message_recipe"]
 
 
+def _reframed_review(review: dict, raw: bytes) -> dict:
+    """Re-declare the public export over *raw*, keeping the metadata honest."""
+
+    identity = dict(review["pairing_identity"])
+    identity["confirmation_message_base64"] = base64.b64encode(raw).decode("ascii")
+    identity["confirmation_message_byte_length"] = len(raw)
+    identity["confirmation_message_sha256"] = hashlib.sha256(raw).hexdigest()
+    return {**review, "pairing_identity": identity}
+
+
+def _relabelled_review(review: dict, **overrides) -> dict:
+    identity = {**review["pairing_identity"], **overrides}
+    return {**review, "pairing_identity": identity}
+
+
+# Every corruption of the public export that must be refused before the
+# installed tag helper is allowed to start.
+CORRUPTED_EXPORTS = (
+    "malformed_base64",
+    "whitespace_polluted_base64",
+    "declared_length_too_small",
+    "declared_length_too_large",
+    "wrong_sha256",
+    "wrong_domain",
+    "missing_nul",
+    "extra_framing_prefix",
+    "bytes_differ_from_accepted_authority",
+)
+
+
+def _corruptions(message: bytes) -> dict:
+    """Every refused public export, with the stage that must refuse it."""
+
+    prefix = (
+        HISTORICAL_PAIRING_CONFIRMATION_DOMAIN
+        + HISTORICAL_PAIRING_CONFIRMATION_DOMAIN_SEPARATOR
+    )
+    encoded = base64.b64encode(message).decode("ascii")
+    half = len(encoded) // 2
+    tail = json.loads(message[len(prefix):].decode("utf-8"))
+    return {
+        "malformed_base64": (
+            lambda review: _relabelled_review(
+                review, confirmation_message_base64=encoded[:half] + "!!" + encoded[half:]
+            ),
+            "PUBLIC_EXPORT_READ",
+        ),
+        "whitespace_polluted_base64": (
+            lambda review: _relabelled_review(
+                review, confirmation_message_base64=encoded[:half] + "\n " + encoded[half:]
+            ),
+            "PUBLIC_EXPORT_READ",
+        ),
+        "declared_length_too_small": (
+            lambda review: _relabelled_review(
+                review, confirmation_message_byte_length=len(message) - 1
+            ),
+            "STRICT_BASE64_DECODE",
+        ),
+        "declared_length_too_large": (
+            lambda review: _relabelled_review(
+                review, confirmation_message_byte_length=len(message) + 1
+            ),
+            "STRICT_BASE64_DECODE",
+        ),
+        "wrong_sha256": (
+            lambda review: _relabelled_review(
+                review,
+                confirmation_message_sha256=("f" * 64)
+                if review["pairing_identity"]["confirmation_message_sha256"][0] != "f"
+                else ("0" * 64),
+            ),
+            "LENGTH_VERIFIED",
+        ),
+        "wrong_domain": (
+            lambda review: _reframed_review(
+                review, b"x" + message[1:]
+            ),
+            "SHA256_VERIFIED",
+        ),
+        "missing_nul": (
+            lambda review: _reframed_review(
+                review,
+                HISTORICAL_PAIRING_CONFIRMATION_DOMAIN
+                + message[len(prefix):],
+            ),
+            "SHA256_VERIFIED",
+        ),
+        "extra_framing_prefix": (
+            lambda review: _reframed_review(review, prefix + message),
+            "DOMAIN_VERIFIED",
+        ),
+        "bytes_differ_from_accepted_authority": (
+            lambda review: _reframed_review(
+                review,
+                prefix
+                + json.dumps(tail, sort_keys=True, indent=1).encode("utf-8"),
+            ),
+            "NUL_BOUNDARY_VERIFIED",
+        ),
+    }
+
+
+class _HelperSpy:
+    """A stand-in for the installed helper that records every start."""
+
+    def __init__(self) -> None:
+        self.started: list[Path] = []
+
+    def __call__(self, message_file: Path):  # pragma: no cover - must never run
+        self.started.append(message_file)
+        raise AssertionError(
+            "the installed tag helper was started for a refused export"
+        )
+
+
+def test_public_message_verification_ran_in_exactly_the_required_order(workflow):
+    assert workflow.session.exported.journal.events == list(
+        PUBLIC_MESSAGE_VERIFICATION_ORDER
+    )
+    assert workflow.restart.replayed.journal.events == list(
+        PUBLIC_MESSAGE_VERIFICATION_ORDER
+    )
+    for name, control in workflow.session.negatives.items():
+        assert control.exported.journal.events == list(
+            PUBLIC_MESSAGE_VERIFICATION_ORDER
+        ), name
+
+
+def test_message_file_handed_to_the_helper_holds_only_verified_bytes(workflow):
+    exported = workflow.session.exported
+    assert exported.message_file.read_bytes() == exported.message
+    assert exported.message == verify_exported_confirmation_message(exported.review)
+    events = exported.journal.events
+    assert events.index("MESSAGE_FILE_WRITTEN") < events.index(
+        "INSTALLED_TAG_HELPER_STARTED"
+    )
+    for stage in (
+        "LENGTH_VERIFIED",
+        "SHA256_VERIFIED",
+        "DOMAIN_VERIFIED",
+        "NUL_BOUNDARY_VERIFIED",
+        "ORACLE_EQUALITY_VERIFIED",
+    ):
+        assert events.index(stage) < events.index("MESSAGE_FILE_WRITTEN"), stage
+
+
+@pytest.mark.parametrize("corruption", CORRUPTED_EXPORTS)
+def test_every_corrupted_export_is_refused_before_the_helper_starts(
+    workflow, tmp_path, corruption
+):
+    exported = workflow.session.exported
+    catalogue = _corruptions(exported.message)
+    assert tuple(catalogue) == CORRUPTED_EXPORTS
+    corrupt, expected_last_stage = catalogue[corruption]
+    review = corrupt(exported.review)
+    journal = OperationJournal()
+    spy = _HelperSpy()
+    message_file = tmp_path / f"{corruption}.bin"
+    with pytest.raises(ExportedMessageIntegrityError):
+        export_verified_message_and_tag(
+            review, message_file, runner=spy, journal=journal
+        )
+    assert spy.started == [], corruption
+    assert not message_file.exists(), corruption
+    assert "MESSAGE_FILE_WRITTEN" not in journal.events
+    assert "INSTALLED_TAG_HELPER_STARTED" not in journal.events
+    assert journal.events and journal.events[-1] == expected_last_stage, journal.events
+
+
+def test_the_oracle_only_compares_and_never_repairs_the_export():
+    text = MODULE_PATH.read_text(encoding="utf-8")
+    tree = _module_tree()
+    boundary = _named_function(tree, "verify_exported_confirmation_message")
+    source = ast.get_source_segment(text, boundary) or ""
+    # It never writes, never renames, never re-encodes and never re-frames.
+    for forbidden in (
+        "open(",
+        "write_bytes",
+        "write_text",
+        "b64encode",
+        "MESSAGE_FILE_WRITTEN",
+        "INSTALLED_TAG_HELPER_STARTED",
+    ):
+        assert forbidden not in source, forbidden
+    # ``message`` is bound exactly once, by the strict decode.
+    rebinds = [
+        node
+        for node in ast.walk(boundary)
+        if isinstance(node, ast.Name)
+        and node.id == "message"
+        and isinstance(node.ctx, ast.Store)
+    ]
+    assert len(rebinds) == 1, len(rebinds)
+    # It returns the exported bytes, never the reconstructed oracle bytes.
+    returns = [node for node in ast.walk(boundary) if isinstance(node, ast.Return)]
+    assert len(returns) == 1
+    assert isinstance(returns[0].value, ast.Name)
+    assert returns[0].value.id == "message"
+    writer = ast.get_source_segment(
+        text, _named_function(tree, "export_verified_message_and_tag")
+    ) or ""
+    assert writer.index("verify_exported_confirmation_message") < writer.index(
+        "open("
+    )
+    assert writer.index("open(") < writer.index("runner(")
+
+
 def test_visible_download_action_exposes_the_same_launcher_supplied_bytes(
     workflow,
 ):
@@ -1915,6 +3153,106 @@ def test_installed_tag_helper_prints_exactly_one_lowercase_hex_tag(workflow):
     )
     assert len(workflow.session.tag) == 64
     assert all(character in "0123456789abcdef" for character in workflow.session.tag)
+
+
+def test_the_submitted_header_value_is_exactly_installed_helper_stdout(workflow):
+    """The credential on the wire is parsed from helper stdout and nowhere else."""
+
+    session = workflow.session
+    parsed = _tag_from_helper_stdout(session.tagged)
+    assert session.tag == parsed
+    accepted_route = (
+        f"{PREPARATIONS_ROUTE}/{session.exported.preparation_id}/confirmation"
+    )
+    submitted = [
+        record[CONFIRMATION_HEADER]
+        for record in session.sent_headers
+        if record["path"] == accepted_route and CONFIRMATION_HEADER in record
+    ]
+    assert submitted, "no confirmation header reached the accepted route"
+    # Compared without printing either value, so a failure leaks no credential.
+    assert all(
+        hmac.compare_digest(value, parsed) for value in submitted
+    ), "the submitted header value was not exactly the installed helper's stdout"
+    assert len(submitted) == 2, len(submitted)
+
+
+def test_the_harness_never_falls_back_to_the_in_process_oracle(workflow):
+    """A helper that prints a different value is surfaced, never corrected."""
+
+    divergent = "ab" * 32
+    assert divergent != workflow.session.tag
+    completed = SimpleNamespace(
+        returncode=0,
+        stderr=b"",
+        stdout=divergent.encode("ascii") + os.linesep.encode("ascii"),
+    )
+    assert _tag_from_helper_stdout(completed) == divergent
+
+    text = MODULE_PATH.read_text(encoding="utf-8")
+    tree = _module_tree()
+    parser = ast.get_source_segment(
+        text, _named_function(tree, "_tag_from_helper_stdout")
+    ) or ""
+    for forbidden in (
+        "compute_historical_pairing_confirmation_tag",
+        "hmac",
+        "except",
+        "SECRET_BYTES",
+    ):
+        assert forbidden not in parser, forbidden
+
+    # Every value ever placed in the dedicated confirmation header is a
+    # helper-derived expression or an explicit negative-control literal; the
+    # in-process oracle is never one of them.
+    approved = {
+        "tag",
+        "upper_tag.upper()",
+        "flipped",
+        "foreign_tag",
+        "stale_tag",
+        "first.tag",
+        '"0" * 64',
+        '"a" * 64',
+        "parsed",
+        "divergent",
+    }
+    observed = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key, value in zip(node.keys, node.values):
+            if (
+                isinstance(key, ast.Name)
+                and key.id == "CONFIRMATION_HEADER"
+            ):
+                observed.add((ast.get_source_segment(text, value) or "").strip())
+    assert observed <= approved, observed - approved
+
+
+def test_no_tag_material_reached_a_file_environment_or_diagnostic(workflow):
+    """The credential stays memory-only across every observable channel."""
+
+    tags = {
+        workflow.session.tag,
+        workflow.restart.tag,
+        workflow.session.negatives["foreign_secret_helper_tag"].helper_tag,
+    }
+    for tag in tags:
+        assert tag, "an empty tag would make this scan vacuous"
+        encoded = tag.encode("ascii")
+        for stream in (
+            workflow.session.stdout,
+            workflow.session.stderr,
+            workflow.restart.stdout,
+            workflow.restart.stderr,
+        ):
+            assert _free_of(stream, encoded)
+        for name, value in os.environ.items():
+            assert tag not in value, name
+        assert tag not in _runbook_text(), "the runbook carries a real tag"
+        for record in workflow.session.sent_headers + workflow.restart.sent_headers:
+            assert tag not in json.dumps({"path": record["path"]}, sort_keys=True)
 
 
 def test_installed_tag_matches_the_accepted_confirmation_primitive(workflow):
@@ -2040,6 +3378,8 @@ def test_consumed_preparation_refuses_a_second_confirmation(workflow):
     "control,expected",
     [
         ("wrong_tag", (403, {"error": "CONFIRMATION_REJECTED"})),
+        ("mutated_helper_stdout", (403, {"error": "CONFIRMATION_REJECTED"})),
+        ("foreign_secret_helper_tag", (403, {"error": "CONFIRMATION_REJECTED"})),
         ("uppercase_tag", (400, {"error": "CONFIRMATION_TAG_MALFORMED"})),
         ("authorization_channel", (400, {"error": "CONFIRMATION_TAG_REQUIRED"})),
         ("json_channel", (400, {"error": "INVALID_FIELDS"})),
@@ -2190,6 +3530,45 @@ def test_no_product_created_file_anywhere_carries_the_secret(workflow):
 # ---------------------------------------------------------------------------
 # M. Restart semantics and deterministic replay.
 # ---------------------------------------------------------------------------
+
+
+def test_the_restart_is_a_genuinely_different_terminated_and_restarted_process(
+    workflow,
+):
+    """Pin the restart to two distinct real processes, not a reused object."""
+
+    first = workflow.session
+    second = workflow.restart
+    assert workflow.restart.startup_refusal is None
+    assert first.pid is not None and second.pid is not None
+    assert first.pid != second.pid, (first.pid, second.pid)
+    assert first.process_object_id != second.process_object_id
+    assert first.launcher_object_id != second.launcher_object_id
+    # The first child really exited, and it exited before the second one was
+    # even constructed, so the second readiness line cannot be the first's.
+    assert first.exit_code is not None, "the first launcher never terminated"
+    assert second.first_terminated_before_second_start is True
+    assert first.closed_at is not None and second.ready_at is not None
+    assert first.closed_at < second.ready_at, (first.closed_at, second.ready_at)
+    assert second.closed_at is not None and second.closed_at > second.ready_at
+    # Both children were started from the same isolated installation.
+    scripts = workflow.installation.scripts
+    for argv0 in (first.argv0, second.argv0):
+        assert Path(argv0).parent == scripts, argv0
+        assert Path(argv0).stem == "admissible", argv0
+    # Two different runtime roots, so no in-process state could be carried over.
+    assert first.runtime != second.runtime
+    # The replay is a fresh preparation on the restarted process, not a reset
+    # fixture or a reused object.
+    assert workflow.restart.replayed is not workflow.session.exported
+    assert (
+        workflow.restart.replayed.preparation_id
+        != workflow.session.exported.preparation_id
+    )
+    assert (
+        workflow.restart.replayed.message_file
+        != workflow.session.exported.message_file
+    )
 
 
 def test_restart_reaches_readiness_and_still_discovers_the_payload(workflow):
@@ -2491,115 +3870,536 @@ def test_runbook_names_the_exact_routes_and_confirmation_header():
         assert token in text, token
 
 
-def test_runbook_powershell_snippets_execute_with_the_documented_semantics(
-    workflow, tmp_path
-):
-    if shutil.which("powershell") is None:  # pragma: no cover - honest skip
-        pytest.skip("PowerShell is required to verify the documented snippets")
-    text = _runbook_text()
-    blocks = _fenced_blocks(text, "powershell")
-    joined = "\n".join(blocks)
+# ---------------------------------------------------------------------------
+# P. Literal execution of every documented executable runbook block.
+# ---------------------------------------------------------------------------
 
-    secret_snippet = _extract_snippet(joined, "WriteAllBytes", "secret")
-    assert "New-Object byte[]" in secret_snippet or "byte[]" in secret_snippet
-    secret_path = tmp_path / "secret.bin"
-    executed = _run(
-        [
-            "powershell",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            secret_snippet.replace("<SECRET-FILE>", str(secret_path)),
-        ],
-        timeout=180,
+
+# Every fenced block the runbook presents as an executable Windows command,
+# identified by its section number and by a stable literal marker.  The meta
+# test below requires this inventory and the executed inventory to be equal.
+RUNBOOK_EXECUTABLE_BLOCKS = (
+    ("extract", "3", "admissible-historical-pairing-v4-extract"),
+    ("secret", "4", "RandomNumberGenerator"),
+    ("enablement", "5", "UTF8Encoding"),
+    ("launch", "6", "--historical-pairing-secret-file"),
+    ("message", "10", "FromBase64String"),
+    ("integrity", "11", "Get-FileHash"),
+    ("tag", "12", "admissible-historical-pairing-tag"),
+    ("archive", "15", "Select-Object"),
+)
+
+_HEADING_PATTERN = re.compile(r"^## (\d+)\.\s*(.+)$", re.M)
+_POWERSHELL_FENCE = re.compile(r"^```powershell\s*\n(.*?)^```\s*$", re.M | re.S)
+_PLACEHOLDER_PATTERN = re.compile(r"<[A-Z][A-Z0-9-]*>")
+
+
+def _sectioned_powershell_blocks(text: str) -> tuple[tuple[str, str], ...]:
+    """Return ordered ``(section-number, literal-command)`` pairs."""
+
+    headings = [(match.start(), match.group(1)) for match in _HEADING_PATTERN.finditer(text)]
+    blocks = []
+    for fence in _POWERSHELL_FENCE.finditer(text):
+        section = "0"
+        for start, number in headings:
+            if start < fence.start():
+                section = number
+        blocks.append((section, fence.group(1).strip()))
+    return tuple(blocks)
+
+
+def _documented_executable_blocks() -> dict:
+    """Bind every documented executable block to its exact committed text."""
+
+    text = _runbook_text()
+    blocks = _sectioned_powershell_blocks(text)
+    assert len(blocks) == len(RUNBOOK_EXECUTABLE_BLOCKS), (
+        "the executable-block inventory drifted from the runbook",
+        [section for section, _ in blocks],
     )
-    assert executed.returncode == 0, executed.stderr[-400:]
-    assert secret_path.exists()
-    assert MIN_CONFIRMATION_SECRET_BYTES <= secret_path.stat().st_size <= (
+    documented = {}
+    for (label, section, marker), (observed_section, command) in zip(
+        RUNBOOK_EXECUTABLE_BLOCKS, blocks
+    ):
+        assert observed_section == section, (label, observed_section, section)
+        assert marker in command, (label, marker)
+        documented[label] = SimpleNamespace(
+            label=label, section=section, marker=marker, command=command
+        )
+    return documented
+
+
+def _substituted(command: str, replacements: dict) -> str:
+    """Replace only documented placeholders, and require every one to be gone."""
+
+    result = command
+    for placeholder, value in replacements.items():
+        assert placeholder in command, placeholder
+        result = result.replace(placeholder, value)
+    remaining = _PLACEHOLDER_PATTERN.findall(result)
+    assert remaining == [], remaining
+    return result
+
+
+def _powershell_environment(installation) -> dict:
+    return {
+        "PATH": str(installation.scripts) + os.pathsep + os.environ.get("PATH", "")
+    }
+
+
+def _powershell(command: str, *, env=None, cwd=None, timeout=240):
+    return _run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+        env=env,
+        cwd=cwd,
+        timeout=timeout,
+    )
+
+
+def _powershell_rows(command: str, *, env=None, timeout=240):
+    """Execute a documented command and report the real objects it emitted.
+
+    ``$ErrorActionPreference`` is raised to ``Stop`` and every emitted object is
+    printed with its actual property names, so a syntactically accepted but
+    semantically useless command -- an invalid ``Select-Object`` property, for
+    instance -- cannot pass as a blank column.
+    """
+
+    wrapped = (
+        "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; "
+        "$rows = @(" + command + "); "
+        "foreach ($row in $rows) { [Console]::Out.WriteLine("
+        "(($row.PSObject.Properties | ForEach-Object "
+        "{ $_.Name + '=' + [string]$_.Value }) -join '|')) }"
+    )
+    completed = _powershell(wrapped, env=env, timeout=timeout)
+    rows = []
+    for line in completed.stdout.decode("utf-8", "replace").splitlines():
+        if not line.strip():
+            continue
+        properties = {}
+        for field in line.split("|"):
+            name, _, value = field.partition("=")
+            properties[name] = value
+        rows.append(properties)
+    return completed, rows
+
+
+def _launch_documented_command(command: str, *, env, cwd):
+    """Start a documented long-running command and observe its readiness line."""
+
+    argv = ["powershell", "-NoProfile", "-NonInteractive", "-Command", command]
+    environment = dict(os.environ)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment.update(env)
+    SPAWNED_ARGV.append(list(argv))
+    SPAWNED_ENVIRONMENT_OVERLAYS.append(dict(env))
+    process = subprocess.Popen(
+        argv,
+        cwd=str(cwd),
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    deadline = time.monotonic() + READINESS_TIMEOUT_SECONDS
+    line = b""
+    while time.monotonic() < deadline:
+        line = process.stdout.readline()
+        if line or process.poll() is not None:
+            break
+    readiness = line.decode("utf-8", "replace").strip()
+    # The documented launcher is stopped by terminating the whole tree, exactly
+    # as Ctrl+C would; nothing is left holding a loopback port.
+    _run(["taskkill", "/T", "/F", "/PID", str(process.pid)], timeout=120)
+    try:
+        remaining_out, remaining_err = process.communicate(timeout=120)
+    except subprocess.TimeoutExpired:  # pragma: no cover - defensive
+        process.kill()
+        remaining_out, remaining_err = process.communicate(timeout=120)
+    return SimpleNamespace(
+        readiness=readiness,
+        pid=process.pid,
+        stdout=line + (remaining_out or b""),
+        stderr=remaining_err or b"",
+    )
+
+
+@pytest.fixture(scope="session")
+def runbook_execution(workflow, tmp_path_factory):
+    """Execute every documented executable runbook block, literally, once."""
+
+    _require_powershell()
+    documented = _documented_executable_blocks()
+    root = tmp_path_factory.mktemp("runbook")
+    assert REPO_ROOT not in root.resolve().parents
+    environment = _powershell_environment(workflow.installation)
+    coverage: dict = {}
+
+    def _record(label, *, command, completed, **observations):
+        coverage[label] = SimpleNamespace(
+            label=label,
+            section=documented[label].section,
+            literal=documented[label].command,
+            command=command,
+            completed=completed,
+            **observations,
+        )
+
+    # -- 3. extraction, run against the real acquired wrapper --------------
+    work = root / "work"
+    work.mkdir()
+    (work / "wrapper.json").write_bytes(workflow.wrapper.path.read_bytes())
+    extract_command = _substituted(
+        documented["extract"].command, {"<WORK-DIR>": str(work)}
+    ) + "; exit $LASTEXITCODE"
+    extracted = _powershell(extract_command, env=environment)
+    _record(
+        "extract",
+        command=extract_command,
+        completed=extracted,
+        output=work / "standalone-v4.json",
+    )
+
+    # -- 4. exact-byte secret file ----------------------------------------
+    secret_path = root / "secret.bin"
+    secret_command = _substituted(
+        documented["secret"].command, {"<SECRET-FILE>": str(secret_path)}
+    )
+    secret_executed = _powershell(secret_command, env=environment)
+    _record("secret", command=secret_command, completed=secret_executed, path=secret_path)
+
+    # -- 5. enablement document -------------------------------------------
+    config_path = root / "historical-pairing.json"
+    runbook_archive = root / "archive"
+    enablement_command = _substituted(
+        documented["enablement"].command,
+        {
+            "<ENABLEMENT-FILE>": str(config_path),
+            "<ARCHIVE-ROOT>": str(runbook_archive),
+            "<PAYLOAD-ID>": "runbook-rehearsal-001",
+            "<STANDALONE-V4-FILE>": str(work / "standalone-v4.json"),
+        },
+    )
+    enablement_executed = _powershell(enablement_command, env=environment)
+    _record(
+        "enablement",
+        command=enablement_command,
+        completed=enablement_executed,
+        path=config_path,
+        archive_root=runbook_archive,
+    )
+
+    # -- 6. the documented launch command, really started ------------------
+    runtime = root / "runtime"
+    runtime.mkdir()
+    launch_command = _substituted(
+        documented["launch"].command,
+        {
+            "<SOURCE-REPOSITORY>": str(workflow.source.path),
+            "<REQUIRED-SOURCE-HEAD>": workflow.source.head,
+            "<RUNTIME-ROOT>": str(runtime),
+            "<BACKEND-EXECUTABLE>": CURSOR_DISCOVERY_COMMAND,
+            "<ATTESTATION-CLASS>": "wrapper-chain",
+            "<ENABLEMENT-FILE>": str(config_path),
+            "<SECRET-FILE>": str(secret_path),
+        },
+    )
+    launched = _launch_documented_command(
+        launch_command, env=environment, cwd=runtime
+    )
+    _record(
+        "launch",
+        command=launch_command,
+        completed=launched,
+        runtime=runtime,
+        archive_root=runbook_archive,
+    )
+
+    # -- 10. public confirmation-message export ----------------------------
+    message_path = root / "confirmation-message.bin"
+    message_command = _substituted(
+        documented["message"].command,
+        {
+            "<CONFIRMATION-MESSAGE-FILE>": str(message_path),
+            "<CONFIRMATION-MESSAGE-BASE64>": base64.b64encode(
+                workflow.session.exported.message
+            ).decode("ascii"),
+        },
+    )
+    message_executed = _powershell(message_command, env=environment)
+    _record(
+        "message", command=message_command, completed=message_executed, path=message_path
+    )
+
+    # -- 11. integrity verification of the actual selected message file ----
+    identity = workflow.session.exported.review["pairing_identity"]
+    selected = workflow.session.exported.message_file
+    integrity_replacements = {
+        "<CONFIRMATION-MESSAGE-BYTE-LENGTH>": str(
+            identity["confirmation_message_byte_length"]
+        ),
+        "<CONFIRMATION-MESSAGE-SHA256>": identity["confirmation_message_sha256"],
+        "<CONFIRMATION-MESSAGE-FILE>": str(selected),
+    }
+    integrity_command = _substituted(
+        documented["integrity"].command, integrity_replacements
+    )
+    integrity_executed = _powershell(
+        "$ErrorActionPreference = 'Stop'; " + integrity_command, env=environment
+    )
+    # Independent negative executions of the very same documented command.
+    truncated = root / "truncated.bin"
+    truncated.write_bytes(workflow.session.exported.message[:-1])
+    rewritten = root / "rewritten.bin"
+    rewritten.write_bytes(b"x" + workflow.session.exported.message[1:])
+    missing = root / "absent.bin"
+    negatives = {}
+    for name, replacements in (
+        (
+            "wrong_length",
+            {**integrity_replacements, "<CONFIRMATION-MESSAGE-FILE>": str(truncated)},
+        ),
+        (
+            "wrong_sha256",
+            {**integrity_replacements, "<CONFIRMATION-MESSAGE-FILE>": str(rewritten)},
+        ),
+        (
+            "missing_file",
+            {**integrity_replacements, "<CONFIRMATION-MESSAGE-FILE>": str(missing)},
+        ),
+    ):
+        negatives[name] = _powershell(
+            "$ErrorActionPreference = 'Stop'; "
+            + _substituted(documented["integrity"].command, replacements),
+            env=environment,
+        )
+    _record(
+        "integrity",
+        command=integrity_command,
+        completed=integrity_executed,
+        selected=selected,
+        negatives=negatives,
+    )
+
+    # -- 12. the documented tag command ------------------------------------
+    tag_command = _substituted(
+        documented["tag"].command,
+        {
+            "<CONFIRMATION-MESSAGE-FILE>": str(message_path),
+            "<SECRET-FILE>": str(workflow.secret_file),
+        },
+    ) + "; exit $LASTEXITCODE"
+    tag_executed = _powershell(tag_command, env=environment)
+    _record("tag", command=tag_command, completed=tag_executed)
+
+    # -- 15. the documented archive verification ---------------------------
+    archive_command = _substituted(
+        documented["archive"].command, {"<ARCHIVE-ROOT>": str(workflow.archive_root)}
+    )
+    archive_executed, archive_rows = _powershell_rows(
+        archive_command, env=environment
+    )
+    # A hidden, recursively nested fourth file must be found by exactly this
+    # verification path.  It is created in an isolated copy so the real archive
+    # keeps its exactly three canonical documents.
+    copied = root / "archive-copy"
+    shutil.copytree(workflow.archive_root, copied)
+    nested = copied / PROFILE_DIRECTORY_NAME / "nested" / "deeper"
+    nested.mkdir(parents=True)
+    (nested / "hidden-fourth.json").write_bytes(b"{}")
+    nested_command = _substituted(
+        documented["archive"].command, {"<ARCHIVE-ROOT>": str(copied)}
+    )
+    nested_executed, nested_rows = _powershell_rows(nested_command, env=environment)
+    # A nonexistent property must fail rather than produce an accepted blank.
+    invalid_command = re.sub(
+        r"Select-Object\s+.*$",
+        "Select-Object NoSuchProperty",
+        nested_command,
+        flags=re.S,
+    )
+    invalid_executed, invalid_rows = _powershell_rows(invalid_command, env=environment)
+    _record(
+        "archive",
+        command=archive_command,
+        completed=archive_executed,
+        rows=archive_rows,
+        nested_command=nested_command,
+        nested_rows=nested_rows,
+        invalid_rows=invalid_rows,
+        invalid_completed=invalid_executed,
+        copied=copied,
+    )
+    return SimpleNamespace(root=root, documented=documented, coverage=coverage)
+
+
+def test_every_documented_executable_block_was_really_executed(runbook_execution):
+    """The meta test: documented executable blocks == exercised blocks."""
+
+    documented = set(runbook_execution.documented)
+    exercised = set(runbook_execution.coverage)
+    assert documented == exercised, documented.symmetric_difference(exercised)
+    assert documented == {label for label, _, _ in RUNBOOK_EXECUTABLE_BLOCKS}
+    for label, record in runbook_execution.coverage.items():
+        assert record.completed is not None, label
+        # Every entry is a real execution of the literal committed text with
+        # only documented placeholders substituted -- never a substring check.
+        # The literal is turned into an exact skeleton in which only the
+        # documented placeholders may differ, so no token can be dropped,
+        # reordered, or quietly rewritten into a test-only equivalent.
+        skeleton = "".join(
+            ".+?" if _PLACEHOLDER_PATTERN.fullmatch(part) else re.escape(part)
+            for part in re.split(r"(<[A-Z][A-Z0-9-]*>)", record.literal)
+        )
+        assert re.search(skeleton, record.command, re.S), (label, record.command)
+        assert _PLACEHOLDER_PATTERN.findall(record.command) == [], label
+
+
+def test_documented_extraction_block_writes_the_standalone_document(
+    workflow, runbook_execution
+):
+    record = runbook_execution.coverage["extract"]
+    assert record.completed.returncode == 0, _bounded_diagnostic(
+        record.completed.stderr
+    )
+    assert record.completed.stdout.replace(b"\r\n", b"\n").strip() == (
+        b"status=STANDALONE_V4_WRITTEN"
+    )
+    assert record.output.read_bytes() == workflow.standalone_bytes
+
+
+def test_documented_secret_block_writes_exact_bytes_inside_the_accepted_bounds(
+    runbook_execution,
+):
+    record = runbook_execution.coverage["secret"]
+    assert "New-Object byte[]" in record.literal or "byte[]" in record.literal
+    assert record.completed.returncode == 0, _bounded_diagnostic(
+        record.completed.stderr
+    )
+    assert record.path.exists()
+    assert MIN_CONFIRMATION_SECRET_BYTES <= record.path.stat().st_size <= (
         MAX_CONFIRMATION_SECRET_BYTES
     )
 
-    enablement_snippet = _extract_snippet(joined, "UTF8Encoding", "enablement")
-    config_path = tmp_path / "historical-pairing.json"
-    executed = _run(
-        [
-            "powershell",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            enablement_snippet
-            .replace("<ENABLEMENT-FILE>", str(config_path))
-            .replace("<ARCHIVE-ROOT>", str(tmp_path / "archive"))
-            .replace("<STANDALONE-V4-FILE>", str(tmp_path / "standalone-v4.json")),
-        ],
-        timeout=180,
+
+def test_documented_enablement_block_writes_strict_utf8_without_a_bom(
+    runbook_execution,
+):
+    record = runbook_execution.coverage["enablement"]
+    assert record.completed.returncode == 0, _bounded_diagnostic(
+        record.completed.stderr
     )
-    assert executed.returncode == 0, executed.stderr[-400:]
-    raw = config_path.read_bytes()
+    raw = record.path.read_bytes()
     assert not raw.startswith(b"\xef\xbb\xbf")
     document = json.loads(raw.decode("utf-8"))
     assert document["schema_version"] == HISTORICAL_PAIRING_ENABLEMENT_SCHEMA_VERSION
+    assert Path(document["archive_root"]) == record.archive_root
+    assert document["payloads"][0]["payload_id"] == "runbook-rehearsal-001"
 
-    message_snippet = _extract_snippet(joined, "FromBase64String", "message")
-    message_path = tmp_path / "confirmation-message.bin"
-    executed = _run(
-        [
-            "powershell",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            message_snippet
-            .replace(
-                "<CONFIRMATION-MESSAGE-BASE64>",
-                base64.b64encode(workflow.session.exported.message).decode("ascii"),
-            )
-            .replace("<CONFIRMATION-MESSAGE-FILE>", str(message_path)),
-        ],
-        timeout=180,
+
+def test_documented_launch_block_really_starts_the_installed_launcher(
+    runbook_execution,
+):
+    record = runbook_execution.coverage["launch"]
+    match = READINESS_PATTERN.match(record.completed.readiness)
+    assert match, (
+        record.completed.readiness,
+        _bounded_diagnostic(record.completed.stderr),
     )
-    assert executed.returncode == 0, executed.stderr[-400:]
-    assert message_path.read_bytes() == workflow.session.exported.message
+    assert (record.runtime / "runs").exists() or (
+        record.runtime / "contracts"
+    ).exists()
+    # No confirmation was made through this launch, so it published nothing.
+    assert _archive_inventory(record.archive_root) == []
+    for candidate in (int(match.group(1)), int(match.group(2))):
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.settimeout(2.0)
+            assert probe.connect_ex(("127.0.0.1", candidate)) != 0, candidate
+        finally:
+            probe.close()
 
-    tagged = _run(
-        [
-            str(workflow.installation.scripts / "admissible-historical-pairing-tag"),
-            "--message-file", str(message_path),
-            "--secret-file", str(workflow.secret_file),
-        ]
+
+def test_documented_message_block_writes_the_exact_exported_bytes(
+    workflow, runbook_execution
+):
+    record = runbook_execution.coverage["message"]
+    assert record.completed.returncode == 0, _bounded_diagnostic(
+        record.completed.stderr
     )
-    assert tagged.returncode == 0
-    assert tagged.stdout.decode("ascii").rstrip("\r\n") == workflow.session.tag
+    assert record.path.read_bytes() == workflow.session.exported.message
 
 
-def _extract_snippet(joined: str, marker: str, label: str) -> str:
-    """Return the one documented PowerShell statement group carrying *marker*."""
+def test_documented_integrity_block_passes_only_on_the_verified_message(
+    runbook_execution,
+):
+    """Step 11 runs literally, against the actual operator-selected file."""
 
-    candidates = [
-        block.strip()
-        for block in joined.split("\n\n")
-        if marker in block
-    ]
-    assert candidates, f"the runbook must document a {label} snippet using {marker}"
-    return candidates[0]
+    record = runbook_execution.coverage["integrity"]
+    assert str(record.selected) in record.command
+    assert record.completed.returncode == 0, _bounded_diagnostic(
+        record.completed.stderr
+    )
+    assert b"confirmation message integrity verified" in record.completed.stdout
+    for name, expected in (
+        ("wrong_length", b"declared length mismatch"),
+        ("wrong_sha256", b"declared sha256 mismatch"),
+    ):
+        negative = record.negatives[name]
+        assert negative.returncode != 0, name
+        assert expected in negative.stderr, (name, _bounded_diagnostic(negative.stderr))
+        assert b"confirmation message integrity verified" not in negative.stdout, name
+    missing = record.negatives["missing_file"]
+    assert missing.returncode != 0
+    assert b"confirmation message integrity verified" not in missing.stdout
 
 
-def test_runbook_archive_verification_command_is_real(workflow):
-    text = _runbook_text()
-    assert "Get-ChildItem" in text
-    completed = _run(
-        [
-            "powershell",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            f"Get-ChildItem -Recurse -File '{workflow.archive_root}' | "
-            "Measure-Object | Select-Object -ExpandProperty Count",
-        ],
-        timeout=180,
-    ) if shutil.which("powershell") else None
-    if completed is not None:
-        assert completed.returncode == 0, completed.stderr[-400:]
-        assert completed.stdout.decode("utf-8").strip() == "3"
+def test_documented_tag_block_reproduces_exactly_the_submitted_credential(
+    workflow, runbook_execution
+):
+    record = runbook_execution.coverage["tag"]
+    assert record.completed.returncode == 0, _bounded_diagnostic(
+        record.completed.stderr
+    )
+    printed = record.completed.stdout.decode("ascii").strip()
+    assert printed == workflow.session.tag
+    assert len(printed) == 64
+
+
+def test_documented_archive_block_reports_exactly_three_verifiable_rows(
+    workflow, runbook_execution
+):
+    record = runbook_execution.coverage["archive"]
+    assert "Get-ChildItem" in _runbook_text()
+    # The documented command must request exactly the two verifiable columns.
+    assert "Select-Object FullName, Length" in record.literal, record.literal
+    assert record.completed.returncode == 0, _bounded_diagnostic(
+        record.completed.stderr
+    )
+    assert len(record.rows) == 3, record.rows
+    suffixes = set()
+    for row in record.rows:
+        assert set(row) == {"FullName", "Length"}, row
+        assert row["FullName"].strip(), row
+        assert Path(row["FullName"]).is_file(), row
+        assert int(row["Length"]) > 0, row
+        suffixes.add(Path(row["FullName"]).name.split(".", 1)[1])
+    assert suffixes == {
+        PROFILE_FILE_SUFFIX.lstrip("."),
+        PAYLOAD_FILE_SUFFIX.lstrip("."),
+        AUTHORITY_FILE_SUFFIX.lstrip("."),
+    }, suffixes
+    # The complete verification path detects a hidden, recursively nested file.
+    assert len(record.nested_rows) == 4, record.nested_rows
+    assert any(
+        row["FullName"].endswith("hidden-fourth.json") for row in record.nested_rows
+    )
+    # An invalid property is a failure, not an accepted blank column.
+    invalid_names = {name for row in record.invalid_rows for name in row}
+    assert invalid_names != {"FullName", "Length"}, record.invalid_rows
+    assert invalid_names <= {"NoSuchProperty"}, invalid_names
+    # The real archive was never touched by any of this.
+    assert len(_archive_inventory(workflow.archive_root)) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -2621,3 +4421,216 @@ def test_every_launcher_process_terminated_and_released_its_ports(workflow):
                 assert probe.connect_ex(("127.0.0.1", candidate)) != 0, candidate
             finally:
                 probe.close()
+
+
+# ---------------------------------------------------------------------------
+# R. The browser-evidence claim guard.
+# ---------------------------------------------------------------------------
+
+
+# Wording that would upgrade the committed served-asset smoke into a claim the
+# evidence does not support.  A match is refused unless the very same sentence
+# negates it immediately, with no clause boundary in between.
+BROWSER_CLAIM_PATTERNS = (
+    r"browser[\s\-]*proven",
+    r"proven[\s\-]*(?:by|via|with|in)[\s\w,]{0,20}browser",
+    r"real[\s\-]*browser[\s\w,]{0,40}end[\s\-]*to[\s\-]*end",
+    r"end[\s\-]*to[\s\-]*end[\s\w,]{0,40}browser",
+    r"browser[\s\w,]{0,40}download[\s\w,]{0,20}verified",
+    r"verified[\s\w,]{0,30}browser[\s\w,]{0,20}download",
+    r"automated[\s\w,]{0,20}browser[\s\w,]{0,30}download",
+    r"browser[\s\w,]{0,30}successfully[\s\w,]{0,20}download",
+    r"download[\s\w,]{0,20}verified[\s\w,]{0,20}end[\s\-]*to[\s\-]*end",
+)
+# Wording that accurately scopes what the committed evidence really shows.
+ACCURATE_BROWSER_SCOPES = (
+    "served-asset smoke",
+    "asset wiring verified",
+    "not a real-browser end-to-end proof",
+    "the operator performs the browser download interactively",
+)
+_NEGATED_IMMEDIATELY = re.compile(
+    r"\b(?:not|never|no|without|rather than|neither)\b[^:;.]{0,40}$",
+    re.I,
+)
+
+
+def _unqualified_browser_claims(text: str) -> list[str]:
+    """Return every browser-proof claim that is not immediately negated."""
+
+    lowered = " ".join(text.lower().split())
+    offences = []
+    for pattern in BROWSER_CLAIM_PATTERNS:
+        for match in re.finditer(pattern, lowered):
+            window = lowered[max(0, match.start() - 42) : match.start()]
+            if _NEGATED_IMMEDIATELY.search(window):
+                continue
+            offences.append(
+                lowered[max(0, match.start() - 60) : match.end() + 40]
+            )
+    return offences
+
+
+def _module_docstrings() -> list[str]:
+    tree = _module_tree()
+    found = [ast.get_docstring(tree) or ""]
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            found.append(ast.get_docstring(node) or "")
+    return [item for item in found if item]
+
+
+def test_the_browser_claim_guard_itself_rejects_an_upgraded_claim():
+    """The guard must be semantic enough to kill a claim-upgrading mutation."""
+
+    for forged in (
+        "The asset smoke is a browser-proven download.",
+        "This is a real-browser end-to-end download of the message.",
+        "Browser download verified end to end.",
+        "An automated browser successfully downloaded the message.",
+        "The message download was verified end to end by a real browser.",
+    ):
+        assert _unqualified_browser_claims(forged), forged
+    for accurate in ACCURATE_BROWSER_SCOPES + (
+        "This is a served-asset smoke and not a real-browser end-to-end proof.",
+        "No browser-proven download is claimed anywhere.",
+        "The operator performs the browser download interactively.",
+    ):
+        assert _unqualified_browser_claims(accurate) == [], accurate
+    # A clause boundary must not let a negation elsewhere launder the claim.
+    assert _unqualified_browser_claims(
+        "This is not a smoke: it is a browser-proven download."
+    )
+
+
+def test_the_runbook_never_claims_a_browser_proven_download():
+    text = _runbook_text()
+    assert _unqualified_browser_claims(text) == [], _unqualified_browser_claims(text)
+    lowered = " ".join(text.lower().split())
+    for required in (
+        "not a real-browser end-to-end proof",
+        "the operator performs the browser download interactively",
+    ):
+        assert required in lowered, required
+
+
+def test_no_test_docstring_claims_a_browser_proven_download():
+    for docstring in _module_docstrings():
+        assert _unqualified_browser_claims(docstring) == [], docstring[:200]
+    smoke = _named_function(
+        _module_tree(),
+        "test_visible_download_action_exposes_the_same_launcher_supplied_bytes",
+    )
+    docstring = " ".join((ast.get_docstring(smoke) or "").lower().split())
+    assert "no browser is driven here" in docstring
+    assert "not presented as an end-to-end browser proof" in docstring
+    module_docstring = " ".join(
+        (ast.get_docstring(_module_tree()) or "").lower().split()
+    )
+    assert "served-asset smoke" in module_docstring
+    assert "not a real-browser end-to-end proof" in module_docstring
+
+
+# ---------------------------------------------------------------------------
+# S. No silent early return may turn an untested path into a pass.
+# ---------------------------------------------------------------------------
+
+
+def test_no_test_function_contains_an_early_return():
+    tree = _module_tree()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or not node.name.startswith("test_"):
+            continue
+        returns = [
+            child for child in ast.walk(node) if isinstance(child, ast.Return)
+        ]
+        assert returns == [], (node.name, [item.lineno for item in returns])
+
+
+def test_every_test_function_ends_through_at_least_one_assertion():
+    tree = _module_tree()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or not node.name.startswith("test_"):
+            continue
+        assertions = [
+            child
+            for child in ast.walk(node)
+            if isinstance(child, ast.Assert)
+            or (
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Attribute)
+                and child.func.attr == "raises"
+            )
+        ]
+        assert assertions, node.name
+
+
+def test_every_recorded_startup_refusal_path_is_asserted_by_a_test(workflow):
+    """A refused startup is recorded, then asserted -- never silently passed."""
+
+    assert workflow.session.startup_refusal is None
+    assert workflow.restart.startup_refusal is None
+    text = MODULE_PATH.read_text(encoding="utf-8")
+    assert "assert session.startup_refusal is None" in text
+    assert "assert workflow.restart.startup_refusal is None" in text
+    # The archive verification test executes a real command unconditionally, so
+    # no PowerShell-absent branch can turn an untested path into a pass.
+    archive_test = _named_function(
+        _module_tree(),
+        "test_documented_archive_block_reports_exactly_three_verifiable_rows",
+    )
+    branches = [
+        node
+        for node in ast.walk(archive_test)
+        if isinstance(node, (ast.If, ast.IfExp))
+    ]
+    assert branches == [], [node.lineno for node in branches]
+    assert [argument.arg for argument in archive_test.args.args] == [
+        "workflow",
+        "runbook_execution",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# T. The final supported-host selection contains no skip at all.
+# ---------------------------------------------------------------------------
+
+
+def test_exactly_one_positive_supported_host_real_path_witness_exists():
+    text = MODULE_PATH.read_text(encoding="utf-8")
+    witness = _named_function(
+        _module_tree(),
+        "test_supported_host_executed_the_real_wrapper_acquisition_path",
+    )
+    source = ast.get_source_segment(text, witness) or ""
+    for required in (
+        "real_wrapper_acquisition",
+        "real_path_executed",
+        "substituted is False",
+        "PREFLIGHT_READY",
+        "attestation_class == ATTESTATION_CLASS_WRAPPER_CHAIN",
+        "provider_invocations == 0",
+        "run_root_created is False",
+        "_installed_operator_workflow",
+    ):
+        assert required in source, required
+    # The witness depends on the acquisition fixture alone, so a downstream
+    # workflow skip can never take it with it.
+    assert [argument.arg for argument in witness.args.args] == [
+        "real_wrapper_acquisition"
+    ]
+
+
+def test_the_final_supported_host_selection_contains_no_skip(_skip_ledger):
+    """The last word: on a supported host this module skips nothing at all."""
+
+    _require_supported_operator_host()
+    allowed = () if powershell_is_available() else (POWERSHELL_SKIP_REASON,)
+    unexpected = [
+        entry
+        for entry in _skip_ledger
+        if not any(reason in entry[2] for reason in allowed)
+    ]
+    assert unexpected == [], unexpected
+    if not allowed:
+        assert _skip_ledger == [], _skip_ledger
