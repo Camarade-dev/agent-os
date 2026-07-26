@@ -3,9 +3,12 @@
 import ast
 import base64
 import builtins
+import contextlib
+import functools
 import hashlib
 import hmac
 import importlib
+import io
 import json
 import os
 from pathlib import Path
@@ -13,14 +16,19 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import textwrap
 import tomllib
-from types import SimpleNamespace
 from types import FunctionType
+from types import MappingProxyType
+from types import MemberDescriptorType
+from types import MethodType
+from types import SimpleNamespace
 import zipfile
 
 import pytest
 
+from admissible import historical_pairing_secret_file as secret_reader_module
 from admissible.delegated_gate.historical_evaluation import (
     HistoricalEvaluationPairingAuthority,
 )
@@ -1111,10 +1119,18 @@ def test_hmac_call_shape_and_read_order_are_statically_pinned():
     assert ast.unparse(hmac_call.keywords[2].value) == "hashlib.sha256"
 
 
-def test_wheel_built_and_installed_outside_repository_contains_all_declared_assets(
-    tmp_path: Path,
-):
-    source_root = tmp_path / "source"
+@pytest.fixture(scope="module")
+def installed_distribution(tmp_path_factory: pytest.TempPathFactory):
+    """Build one wheel outside the repository and install it into its own tree.
+
+    The build and the installation are module-scoped because both the packaging
+    assertions and the installed-execution assertions need exactly the same
+    artifact, and building it twice would prove nothing extra.  Nothing in this
+    fixture reads from the repository except the copied source snapshot.
+    """
+
+    root = tmp_path_factory.mktemp("dist")
+    source_root = root / "source"
     source_root.mkdir()
     for package in ("admissible", "agent_os"):
         shutil.copytree(
@@ -1124,7 +1140,7 @@ def test_wheel_built_and_installed_outside_repository_contains_all_declared_asse
         )
     for name in ("pyproject.toml", "README.md"):
         shutil.copy2(ROOT / name, source_root / name)
-    wheel_root = tmp_path / "wheel"
+    wheel_root = root / "wheel"
     wheel_root.mkdir()
     environment = os.environ.copy()
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -1148,6 +1164,43 @@ def test_wheel_built_and_installed_outside_repository_contains_all_declared_asse
     assert build.returncode == 0, build.stdout + build.stderr
     wheels = list(wheel_root.glob("*.whl"))
     assert len(wheels) == 1
+    install_root = root / "install"
+    install = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--no-deps",
+            "--no-index",
+            "--target",
+            os.fspath(install_root),
+            os.fspath(wheels[0]),
+        ],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert install.returncode == 0, install.stdout + install.stderr
+    run_root = root / "run"
+    run_root.mkdir()
+    return SimpleNamespace(
+        source_root=source_root,
+        wheel_path=wheels[0],
+        install=install,
+        install_root=install_root,
+        run_root=run_root,
+    )
+
+
+def test_wheel_built_and_installed_outside_repository_contains_all_declared_assets(
+    installed_distribution,
+):
+    wheels = [installed_distribution.wheel_path]
+    install = installed_distribution.install
+    install_root = installed_distribution.install_root
     with zipfile.ZipFile(wheels[0]) as archive:
         names = set(archive.namelist())
         assert "admissible/operator_tools/__init__.py" in names
@@ -1166,25 +1219,6 @@ def test_wheel_built_and_installed_outside_repository_contains_all_declared_asse
             "admissible.operator_tools.historical_pairing_tag:main"
         ) in entry_points
 
-    install_root = tmp_path / "install"
-    install = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--no-deps",
-            "--no-index",
-            "--target",
-            os.fspath(install_root),
-            os.fspath(wheels[0]),
-        ],
-        cwd=tmp_path,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
     assert install.returncode == 0, install.stdout + install.stderr
     assert (install_root / "admissible" / "operator_tools" / "__init__.py").is_file()
     assert (
@@ -1496,3 +1530,1540 @@ def test_message_refusal_output_is_one_path_free_fixed_line(
     assert captured.err.count(os.linesep.encode()) == 1
     for forbidden in (b"C:", b"private", b"message.bin", b"secret.bin", VECTOR_TAG.encode()):
         assert forbidden not in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Step 5C2E2.1: bounded application-owned retention scanner.
+#
+# The committed scanner walked only exact ``dict`` mappings, so ``vars(cls)``
+# -- a ``MappingProxyType`` -- was skipped and every class-namespace retention
+# form escaped.  It also recognized no ``bytearray``, ``memoryview``, Latin-1
+# text or live HMAC object, and it truncated silently once its depth bound was
+# reached.  The scanner below closes those gaps and fails deterministically
+# instead of truncating.
+# ---------------------------------------------------------------------------
+
+
+MAX_OWNED_GRAPH_DEPTH = 24
+MAX_OWNED_GRAPH_NODES = 100000
+
+
+class OwnedGraphBoundExceeded(AssertionError):
+    """Deterministic failure raised when a declared traversal bound is hit."""
+
+
+def _entropy_block(label: bytes, length: int) -> bytes:
+    """Deterministic high-entropy bytes: reproducible, yet structure-free.
+
+    A high-entropy sentinel is what lets every disclosure check compare
+    *complete* values.  Short-fragment matching is never needed, so the scanner
+    cannot manufacture broad false positives out of ordinary module content.
+    """
+
+    block = b""
+    counter = 0
+    while len(block) < length:
+        block += hashlib.sha256(label + counter.to_bytes(4, "big")).digest()
+        counter += 1
+    return block[:length]
+
+
+RETENTION_SECRET = _entropy_block(b"5C2E2.1-retention-secret", 48)
+RETENTION_MESSAGE = _entropy_block(b"5C2E2.1-retention-message", 96)
+RETENTION_TAG = hmac.new(
+    key=RETENTION_SECRET,
+    msg=RETENTION_MESSAGE,
+    digestmod=hashlib.sha256,
+).hexdigest()
+
+OWNED_MODULES = frozenset({tool.__name__, secret_reader_module.__name__})
+
+# ``__builtins__`` reaches the whole interpreter and the import-machinery
+# entries reach the whole loader graph; walking either would be a heap scan
+# rather than an application-owned scan.  Every other module attribute --
+# including ``__all__`` and ``__doc__`` -- is traversed.
+_INTERPRETER_OWNED_MODULE_KEYS = frozenset(
+    {"__builtins__", "__loader__", "__spec__", "__cached__"}
+)
+
+# Structural carriers are traversed wherever they are reached from an owned
+# root, because they are transparent holders rather than foreign objects.
+_STRUCTURAL_TYPES = (
+    functools.partial,
+    MethodType,
+    SimpleNamespace,
+    BaseException,
+)
+
+
+class OwnedGraphScanner:
+    """Bounded, cycle-safe, descriptor-free application-owned retention walker.
+
+    Traversal is restricted to explicitly supplied application-owned roots plus
+    the structural carriers reachable from them.  It never walks the complete
+    Python heap and never walks ``sys.modules``.  It invokes no property, no
+    ``__getattr__``, no ``__getattribute__`` override, no iterator protocol on
+    an unknown object, and no descriptor other than a slot ``member_descriptor``
+    -- whose ``__get__`` is a plain C-level slot read.
+    """
+
+    def __init__(
+        self,
+        *,
+        secret: bytes,
+        message: bytes,
+        tag: str,
+        owned_modules: frozenset,
+        max_depth: int = MAX_OWNED_GRAPH_DEPTH,
+        max_nodes: int = MAX_OWNED_GRAPH_NODES,
+    ) -> None:
+        self.owned_modules = owned_modules
+        self.max_depth = max_depth
+        self.max_nodes = max_nodes
+        self.tag = tag
+        self.byte_forms = {
+            "secret-bytes": secret,
+            "secret-hex-bytes": secret.hex().encode("ascii"),
+            "secret-base64-bytes": base64.b64encode(secret),
+            "message-bytes": message,
+            "message-hex-bytes": message.hex().encode("ascii"),
+            "message-base64-bytes": base64.b64encode(message),
+            "tag-bytes": tag.encode("ascii"),
+            "tag-digest-bytes": bytes.fromhex(tag),
+        }
+        self.text_forms = {
+            "secret-latin1-text": secret.decode("latin-1"),
+            "secret-hex-text": secret.hex(),
+            "secret-base64-text": base64.b64encode(secret).decode("ascii"),
+            "message-latin1-text": message.decode("latin-1"),
+            "message-hex-text": message.hex(),
+            "message-base64-text": base64.b64encode(message).decode("ascii"),
+            "tag-text": tag,
+        }
+
+    # -- disclosure classification -----------------------------------------
+
+    def disclosure_form(self, value):
+        """Name the complete-secret disclosure form a leaf carries, if any.
+
+        Only *complete* forms are recognized, by equality or by containment of
+        the whole form.  No short fragment is ever matched, so an ordinary
+        module string cannot be reported by accident.
+        """
+
+        raw = None
+        if isinstance(value, (bytes, bytearray)):
+            raw = bytes(value)
+        elif isinstance(value, memoryview):
+            try:
+                raw = value.tobytes()
+            except ValueError:
+                raw = None
+        if raw is not None:
+            for name, form in self.byte_forms.items():
+                if raw == form or form in raw:
+                    return name
+            return None
+        if isinstance(value, str):
+            for name, form in self.text_forms.items():
+                if value == form or form in value:
+                    return name
+            return None
+        if type(value) is hmac.HMAC:
+            # A live HMAC retains the normalized key inside its own state.
+            # ``hexdigest`` copies the inner hash and mutates nothing, and the
+            # expected tag is supplied to the scanner rather than discovered.
+            if value.hexdigest() == self.tag:
+                return "hmac-object"
+        return None
+
+    def _safe_label(self, key, index):
+        """Label a mapping key without ever placing material into a path."""
+
+        if (
+            type(key) is str
+            and key.isidentifier()
+            and self.disclosure_form(key) is None
+        ):
+            return key
+        return "#%d" % index
+
+    # -- traversal ----------------------------------------------------------
+
+    @staticmethod
+    def _instance_namespace(value):
+        """Read ``__dict__`` without invoking ``__getattr__`` or an override."""
+
+        try:
+            namespace = object.__getattribute__(value, "__dict__")
+        except AttributeError:
+            return None
+        return namespace if isinstance(namespace, dict) else None
+
+    def _declared_module(self, value):
+        """Read a class ``__module__`` without consulting a metaclass hook."""
+
+        return vars(value).get("__module__")
+
+    def _children(self, path, value):
+        children = []
+
+        if isinstance(value, (str, bytes, bytearray, memoryview, int, float)):
+            return children
+        if value is None or isinstance(value, complex) or value is Ellipsis:
+            return children
+
+        if isinstance(value, MappingProxyType):
+            for index, (key, item) in enumerate(value.items()):
+                label = self._safe_label(key, index)
+                children.append((f"{path}<key {label}>", key))
+                children.append((f"{path}[{label}]", item))
+            return children
+
+        if isinstance(value, dict):
+            # ``dict.items`` is called unbound so an overridden ``items`` on a
+            # dict subclass cannot run in place of the real mapping read.
+            for index, (key, item) in enumerate(dict.items(value)):
+                label = self._safe_label(key, index)
+                children.append((f"{path}<key {label}>", key))
+                children.append((f"{path}[{label}]", item))
+            return children
+
+        if isinstance(value, (list, tuple)):
+            for index, item in enumerate(tuple(value)):
+                children.append((f"{path}[{index}]", item))
+            return children
+
+        if isinstance(value, (set, frozenset)):
+            for index, item in enumerate(sorted(value, key=id)):
+                children.append((f"{path}{{{index}}}", item))
+            return children
+
+        if isinstance(value, functools.partial):
+            children.append((f"{path}.func", value.func))
+            children.append((f"{path}.args", value.args))
+            children.append((f"{path}.keywords", value.keywords))
+            return children
+
+        if isinstance(value, MethodType):
+            children.append((f"{path}.__self__", value.__self__))
+            children.append((f"{path}.__func__", value.__func__))
+            return children
+
+        if isinstance(value, BaseException):
+            children.append((f"{path}.args", value.args))
+            if value.__cause__ is not None:
+                children.append((f"{path}.__cause__", value.__cause__))
+            if value.__context__ is not None:
+                children.append((f"{path}.__context__", value.__context__))
+            namespace = self._instance_namespace(value)
+            if namespace is not None:
+                children.append((f"{path}.__dict__", namespace))
+                if "__notes__" in namespace:
+                    children.append((f"{path}.__notes__", namespace["__notes__"]))
+            children.extend(self._traceback_children(path, value.__traceback__))
+            return children
+
+        if isinstance(value, FunctionType):
+            if value.__module__ not in self.owned_modules:
+                return children
+            children.append((f"{path}.__defaults__", value.__defaults__))
+            children.append((f"{path}.__kwdefaults__", value.__kwdefaults__))
+            if value.__closure__ is not None:
+                for index, cell in enumerate(value.__closure__):
+                    try:
+                        contents = cell.cell_contents
+                    except ValueError:
+                        continue
+                    children.append((f"{path}.__closure__[{index}]", contents))
+            children.append((f"{path}.__dict__", value.__dict__))
+            return children
+
+        if isinstance(value, type):
+            # ``vars`` of a class returns a ``MappingProxyType`` rather than an
+            # exact ``dict``; reading its items yields the raw descriptor
+            # objects and executes none of them.
+            if self._declared_module(value) not in self.owned_modules:
+                return children
+            children.append((f"{path}.__dict__", vars(value)))
+            return children
+
+        value_type = type(value)
+        if value_type.__module__ in self.owned_modules or isinstance(
+            value, _STRUCTURAL_TYPES
+        ):
+            namespace = self._instance_namespace(value)
+            if namespace is not None:
+                children.append((f"{path}.__dict__", namespace))
+            children.extend(self._slot_children(path, value, value_type))
+        return children
+
+    def _slot_children(self, path, value, value_type):
+        """Read declared ``__slots__`` through member descriptors only."""
+
+        children = []
+        for klass in value_type.__mro__:
+            for name, member in vars(klass).items():
+                if type(member) is not MemberDescriptorType:
+                    continue
+                try:
+                    held = member.__get__(value, klass)
+                except AttributeError:
+                    continue
+                children.append((f"{path}.{name}", held))
+        return children
+
+    def _traceback_children(self, path, traceback_object):
+        """Collect locals of owned frames only, never of foreign frames."""
+
+        children = []
+        index = 0
+        while traceback_object is not None:
+            frame = traceback_object.tb_frame
+            if frame.f_globals.get("__name__") in self.owned_modules:
+                children.append(
+                    (
+                        f"{path}.__traceback__[{index}].f_locals",
+                        dict(frame.f_locals),
+                    )
+                )
+            traceback_object = traceback_object.tb_next
+            index += 1
+        return children
+
+    def scan(self, roots):
+        """Breadth-first so every object is reported at its shortest path.
+
+        Breadth-first order also makes the reported ownership path
+        deterministic when one object is reachable through several owned
+        routes, which an exact-path assertion depends on.
+        """
+
+        findings = []
+        visited = set()
+        # Every visited object is kept alive: a collected object's ``id`` can be
+        # reused, which would silently mark a *different* object as visited.
+        alive = []
+        pending = [(name, value, 0) for name, value in roots.items()]
+        cursor = 0
+        examined = 0
+        while cursor < len(pending):
+            path, value, depth = pending[cursor]
+            cursor += 1
+            if depth > self.max_depth:
+                raise OwnedGraphBoundExceeded(f"depth bound exceeded at {path}")
+            marker = id(value)
+            if marker in visited:
+                continue
+            visited.add(marker)
+            alive.append(value)
+            examined += 1
+            if examined > self.max_nodes:
+                raise OwnedGraphBoundExceeded(f"node bound exceeded at {path}")
+            form = self.disclosure_form(value)
+            if form is not None:
+                findings.append((path, form))
+            for child_path, child in self._children(path, value):
+                pending.append((child_path, child, depth + 1))
+        assert len(alive) == examined
+        return sorted(set(findings))
+
+
+def _owned_roots():
+    """Explicit application-owned roots: the helper and its neutral leaf."""
+
+    roots = {}
+    for module in (tool, secret_reader_module):
+        for name, value in vars(module).items():
+            if name in _INTERPRETER_OWNED_MODULE_KEYS:
+                continue
+            roots[f"{module.__name__}.{name}"] = value
+    return roots
+
+
+def _scanner(**overrides):
+    arguments = {
+        "secret": RETENTION_SECRET,
+        "message": RETENTION_MESSAGE,
+        "tag": RETENTION_TAG,
+        "owned_modules": OWNED_MODULES,
+    }
+    arguments.update(overrides)
+    return OwnedGraphScanner(**arguments)
+
+
+# ---------------------------------------------------------------------------
+# Owned witness carriers.
+#
+# Every carrier declares the helper module as its owner, so a witness is placed
+# on exactly the graph the scanner is asked to walk against the real helper --
+# the same shape a retention mutant produces.  Each carrier is attached through
+# ``monkeypatch`` and removed again, so no production object keeps it.
+# ---------------------------------------------------------------------------
+
+
+MODULE = tool.__name__
+ERROR_CLASS = tool.HistoricalPairingTagMessageFileError
+CLASS_NAMESPACE = f"{MODULE}.HistoricalPairingTagMessageFileError.__dict__[witness]"
+
+
+class _OwnedSlotCarrier:
+    """Owned instance whose only storage is a declared slot."""
+
+    __slots__ = ("held",)
+
+    def __init__(self, held):
+        self.held = held
+
+
+class _OwnedHostileAccess:
+    """Owned class whose descriptors must never run during a scan.
+
+    ``__getattribute__`` forwards dunder names because ``isinstance`` itself
+    consults ``__class__``; every ordinary attribute name is trapped, and an
+    ordinary name is exactly what an attribute-reading scanner would touch.
+    """
+
+    @property
+    def trap(self):
+        raise AssertionError("property executed during owned-graph scan")
+
+    def __getattr__(self, name):
+        raise AssertionError(f"__getattr__ executed during owned-graph scan: {name}")
+
+    def __getattribute__(self, name):
+        if name.startswith("__") and name.endswith("__"):
+            return object.__getattribute__(self, name)
+        raise AssertionError(
+            f"__getattribute__ executed during owned-graph scan: {name}"
+        )
+
+
+_OwnedSlotCarrier.__module__ = MODULE
+_OwnedHostileAccess.__module__ = MODULE
+
+
+def _owned_default_body(positional=None, *, keyword=None):
+    return positional, keyword
+
+
+def _owned_frame_body(payload):
+    held = payload
+    raise RuntimeError("owned-frame-retention-witness")
+
+
+def _owned_function(body, *, defaults=None, kwdefaults=None):
+    """Rebuild ``body`` so its globals -- and therefore its owner -- are ours."""
+
+    built = FunctionType(
+        body.__code__,
+        {"__name__": MODULE, "__builtins__": builtins},
+        body.__name__,
+    )
+    built.__module__ = MODULE
+    if defaults is not None:
+        built.__defaults__ = defaults
+    if kwdefaults is not None:
+        built.__kwdefaults__ = kwdefaults
+    return built
+
+
+def _owned_frame_witness():
+    """Raise inside an owned frame and keep the resulting traceback."""
+
+    raiser = _owned_function(_owned_frame_body)
+    try:
+        raiser(RETENTION_SECRET)
+    except RuntimeError as failure:
+        return failure
+    raise AssertionError("owned frame witness did not raise")
+
+
+def _witness_secret_bytes_on_class(monkeypatch):
+    monkeypatch.setattr(ERROR_CLASS, "witness", RETENTION_SECRET, raising=False)
+    return [(CLASS_NAMESPACE, "secret-bytes")]
+
+
+def _witness_bytearray_on_class(monkeypatch):
+    monkeypatch.setattr(
+        ERROR_CLASS, "witness", bytearray(RETENTION_SECRET), raising=False
+    )
+    return [(CLASS_NAMESPACE, "secret-bytes")]
+
+
+def _witness_latin1_module_global(monkeypatch):
+    monkeypatch.setattr(
+        tool, "witness_text", RETENTION_SECRET.decode("latin-1"), raising=False
+    )
+    return [(f"{MODULE}.witness_text", "secret-latin1-text")]
+
+
+def _witness_latin1_nested_container(monkeypatch):
+    nested = {"outer": ({"inner": [RETENTION_SECRET.decode("latin-1")]},)}
+    monkeypatch.setattr(tool, "witness_nested", nested, raising=False)
+    return [
+        (f"{MODULE}.witness_nested[outer][0][inner][0]", "secret-latin1-text")
+    ]
+
+
+def _witness_hmac_object_on_class(monkeypatch):
+    live = hmac.new(
+        key=RETENTION_SECRET,
+        msg=RETENTION_MESSAGE,
+        digestmod=hashlib.sha256,
+    )
+    monkeypatch.setattr(ERROR_CLASS, "witness", live, raising=False)
+    return [(CLASS_NAMESPACE, "hmac-object")]
+
+
+def _witness_tag_text_on_class(monkeypatch):
+    monkeypatch.setattr(ERROR_CLASS, "witness", RETENTION_TAG, raising=False)
+    return [(CLASS_NAMESPACE, "tag-text")]
+
+
+def _witness_mapping_proxy(monkeypatch):
+    monkeypatch.setattr(
+        tool,
+        "witness_proxy",
+        MappingProxyType({"held": RETENTION_SECRET}),
+        raising=False,
+    )
+    return [(f"{MODULE}.witness_proxy[held]", "secret-bytes")]
+
+
+def _witness_object_slots(monkeypatch):
+    monkeypatch.setattr(
+        tool, "witness_slots", _OwnedSlotCarrier(RETENTION_SECRET), raising=False
+    )
+    return [(f"{MODULE}.witness_slots.held", "secret-bytes")]
+
+
+def _witness_function_defaults_and_kwdefaults(monkeypatch):
+    carrier = _owned_function(
+        _owned_default_body,
+        defaults=(RETENTION_SECRET,),
+        kwdefaults={"keyword": bytearray(RETENTION_SECRET)},
+    )
+    # A plain function attribute is a third, independent owned root.
+    carrier.retained = RETENTION_SECRET.hex()
+    monkeypatch.setattr(tool, "witness_function", carrier, raising=False)
+    return [
+        (f"{MODULE}.witness_function.__defaults__[0]", "secret-bytes"),
+        (f"{MODULE}.witness_function.__kwdefaults__[keyword]", "secret-bytes"),
+        (f"{MODULE}.witness_function.__dict__[retained]", "secret-hex-text"),
+    ]
+
+
+def _witness_partial(monkeypatch):
+    held = functools.partial(
+        _owned_function(_owned_default_body),
+        RETENTION_SECRET,
+        keyword=bytearray(RETENTION_SECRET),
+    )
+    monkeypatch.setattr(tool, "witness_partial", held, raising=False)
+    return [
+        (f"{MODULE}.witness_partial.args[0]", "secret-bytes"),
+        (f"{MODULE}.witness_partial.keywords[keyword]", "secret-bytes"),
+    ]
+
+
+def _witness_exception_state(monkeypatch):
+    cause = RuntimeError(RETENTION_SECRET.hex())
+    context = RuntimeError(base64.b64encode(RETENTION_SECRET).decode("ascii"))
+    failure = ERROR_CLASS(tool.HISTORICAL_PAIRING_TAG_MESSAGE_UNAVAILABLE)
+    failure.args = (RETENTION_SECRET.decode("latin-1"),)
+    failure.__cause__ = cause
+    failure.__context__ = context
+    failure.add_note(RETENTION_TAG)
+    failure.retained = bytearray(RETENTION_SECRET)
+    monkeypatch.setattr(tool, "witness_error", failure, raising=False)
+    return [
+        (f"{MODULE}.witness_error.args[0]", "secret-latin1-text"),
+        (f"{MODULE}.witness_error.__cause__.args[0]", "secret-hex-text"),
+        (f"{MODULE}.witness_error.__context__.args[0]", "secret-base64-text"),
+        (f"{MODULE}.witness_error.__notes__[0]", "tag-text"),
+        (f"{MODULE}.witness_error.__dict__[retained]", "secret-bytes"),
+    ]
+
+
+def _witness_owned_traceback_frame(monkeypatch):
+    monkeypatch.setattr(
+        tool, "witness_frame", _owned_frame_witness(), raising=False
+    )
+    return [
+        (
+            f"{MODULE}.witness_frame.__traceback__[1].f_locals[payload]",
+            "secret-bytes",
+        )
+    ]
+
+
+RETENTION_WITNESSES = {
+    "secret-bytes-on-class-attribute": _witness_secret_bytes_on_class,
+    "bytearray-on-class-attribute": _witness_bytearray_on_class,
+    "latin1-text-on-module-global": _witness_latin1_module_global,
+    "latin1-text-in-nested-container": _witness_latin1_nested_container,
+    "hmac-object-on-class-attribute": _witness_hmac_object_on_class,
+    "tag-text-on-class-attribute": _witness_tag_text_on_class,
+    "secret-in-mapping-proxy": _witness_mapping_proxy,
+    "secret-in-object-slots": _witness_object_slots,
+    "secret-in-function-defaults-and-kwdefaults": (
+        _witness_function_defaults_and_kwdefaults
+    ),
+    "secret-in-partial": _witness_partial,
+    "secret-in-exception-state": _witness_exception_state,
+    "secret-in-owned-traceback-frame-local": _witness_owned_traceback_frame,
+}
+
+
+def _describe(findings):
+    """Diagnostics carry an ownership path and a form name -- never material."""
+
+    return sorted(f"{path} :: {form}" for path, form in findings)
+
+
+# Scanner unit behaviour.
+
+
+def test_disclosure_detector_recognizes_every_required_complete_form():
+    scanner = _scanner()
+    secret = RETENTION_SECRET
+    message = RETENTION_MESSAGE
+    recognized = {
+        "identity": scanner.disclosure_form(secret),
+        "equal-copy": scanner.disclosure_form(bytes(bytearray(secret))),
+        "bytearray": scanner.disclosure_form(bytearray(secret)),
+        "memoryview": scanner.disclosure_form(memoryview(secret)),
+        "latin1-text": scanner.disclosure_form(secret.decode("latin-1")),
+        "hex-bytes": scanner.disclosure_form(secret.hex().encode("ascii")),
+        "hex-text": scanner.disclosure_form(secret.hex()),
+        "base64-bytes": scanner.disclosure_form(base64.b64encode(secret)),
+        "base64-text": scanner.disclosure_form(
+            base64.b64encode(secret).decode("ascii")
+        ),
+        "tag-bytes": scanner.disclosure_form(RETENTION_TAG.encode("ascii")),
+        "tag-text": scanner.disclosure_form(RETENTION_TAG),
+        "message-bytes": scanner.disclosure_form(message),
+        "hmac-object": scanner.disclosure_form(
+            hmac.new(key=secret, msg=message, digestmod=hashlib.sha256)
+        ),
+    }
+    assert all(form is not None for form in recognized.values()), recognized
+    assert recognized["identity"] == "secret-bytes"
+    assert recognized["equal-copy"] == "secret-bytes"
+    assert recognized["bytearray"] == "secret-bytes"
+    assert recognized["memoryview"] == "secret-bytes"
+    assert recognized["latin1-text"] == "secret-latin1-text"
+    assert recognized["hmac-object"] == "hmac-object"
+    # An embedded complete form is a disclosure; an unrelated value is not.
+    assert scanner.disclosure_form(b"prefix" + secret + b"suffix") == "secret-bytes"
+    assert scanner.disclosure_form(RETENTION_TAG[:32]) is None
+    assert scanner.disclosure_form(secret[:16]) is None
+    for ordinary in (
+        b"",
+        b"rb",
+        "--message-file",
+        "HISTORICAL_PAIRING_TAG_MESSAGE_UNAVAILABLE",
+        tool.__doc__,
+        secret_reader_module.__doc__,
+        hmac.new(key=b"k" * 16, msg=b"other", digestmod=hashlib.sha256),
+    ):
+        assert scanner.disclosure_form(ordinary) is None
+
+
+def test_owned_graph_scan_of_the_clean_helper_reports_no_disclosure(
+    tmp_path: Path,
+    capfdbinary,
+):
+    result, captured = _run_direct(
+        tmp_path,
+        capfdbinary,
+        message=RETENTION_MESSAGE,
+        secret=RETENTION_SECRET,
+    )
+    assert result == 0
+    assert captured.out == RETENTION_TAG.encode("ascii") + os.linesep.encode("ascii")
+    assert captured.err == b""
+    findings = _scanner().scan(_owned_roots())
+    assert findings == [], _describe(findings)
+
+
+@pytest.mark.parametrize("witness", sorted(RETENTION_WITNESSES))
+def test_owned_graph_scan_detects_each_required_retention_witness(
+    witness: str,
+    tmp_path: Path,
+    capfdbinary,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    scanner = _scanner()
+    result, _captured = _run_direct(
+        tmp_path,
+        capfdbinary,
+        message=RETENTION_MESSAGE,
+        secret=RETENTION_SECRET,
+    )
+    assert result == 0
+    assert scanner.scan(_owned_roots()) == []
+
+    expected = RETENTION_WITNESSES[witness](monkeypatch)
+    detected = scanner.scan(_owned_roots())
+    assert detected == sorted(expected), _describe(detected)
+
+    monkeypatch.undo()
+    assert scanner.scan(_owned_roots()) == []
+
+
+def test_owned_graph_scan_never_executes_a_property_or_attribute_hook(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    hostile = _OwnedHostileAccess()
+    object.__setattr__(hostile, "held", RETENTION_SECRET)
+    monkeypatch.setattr(tool, "witness_hostile", hostile, raising=False)
+    monkeypatch.setattr(
+        tool, "witness_hostile_class", _OwnedHostileAccess, raising=False
+    )
+    detected = _scanner().scan(_owned_roots())
+    assert detected == [(f"{MODULE}.witness_hostile.__dict__[held]", "secret-bytes")], (
+        _describe(detected)
+    )
+
+
+def test_owned_graph_scan_is_cycle_safe_and_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    cycle = {"self": None, "held": RETENTION_SECRET}
+    cycle["self"] = cycle
+    monkeypatch.setattr(tool, "witness_cycle", cycle, raising=False)
+    assert _scanner().scan(_owned_roots()) == [
+        (f"{MODULE}.witness_cycle[held]", "secret-bytes")
+    ]
+
+    deep = RETENTION_SECRET
+    for _level in range(40):
+        deep = [deep]
+    monkeypatch.setattr(tool, "witness_deep", deep, raising=False)
+    with pytest.raises(OwnedGraphBoundExceeded, match="depth bound exceeded"):
+        _scanner().scan(_owned_roots())
+    with pytest.raises(OwnedGraphBoundExceeded, match="node bound exceeded"):
+        _scanner(max_nodes=5).scan(_owned_roots())
+
+
+def test_owned_graph_scan_walks_neither_sys_modules_nor_the_whole_heap():
+    roots = _owned_roots()
+    assert set(roots) == {
+        f"{module.__name__}.{name}"
+        for module in (tool, secret_reader_module)
+        for name in vars(module)
+        if name not in _INTERPRETER_OWNED_MODULE_KEYS
+    }
+    assert f"{MODULE}.__builtins__" not in roots
+    scanner = _scanner()
+    # An imported module reached from an owned root is a leaf: descending into
+    # one would turn the owned scan into a walk of ``sys.modules``.
+    imported = [value for value in roots.values() if isinstance(value, type(sys))]
+    assert {module.__name__ for module in imported} >= {"os", "sys", "hmac"}
+    for module in imported:
+        assert scanner._children("probe", module) == []
+    # A bounded owned graph, not a heap: far below the live object population.
+    counted = []
+    original = scanner._children
+
+    def counting(path, value):
+        counted.append(path)
+        return original(path, value)
+
+    scanner._children = counting
+    assert scanner.scan(roots) == []
+    assert len(counted) < 2000
+
+
+def test_scan_diagnostics_disclose_only_path_and_form(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(ERROR_CLASS, "witness", RETENTION_SECRET, raising=False)
+    # Both mapping keys are themselves complete disclosure forms, so a key
+    # label that echoed the key would leak material straight into the path.
+    keyed = {
+        RETENTION_SECRET.decode("latin-1"): RETENTION_TAG,
+        base64.b64encode(RETENTION_SECRET).decode("ascii"): RETENTION_MESSAGE,
+    }
+    monkeypatch.setattr(tool, "witness_keyed", keyed, raising=False)
+    findings = _scanner().scan(_owned_roots())
+    rendered = "\n".join(_describe(findings))
+    assert (CLASS_NAMESPACE, "secret-bytes") in findings
+    assert (f"{MODULE}.witness_keyed<key #0>", "secret-latin1-text") in findings
+    assert (f"{MODULE}.witness_keyed<key #1>", "secret-base64-text") in findings
+    assert (f"{MODULE}.witness_keyed[#0]", "tag-text") in findings
+    assert (f"{MODULE}.witness_keyed[#1]", "message-bytes") in findings
+    for material in (
+        RETENTION_SECRET.decode("latin-1"),
+        RETENTION_SECRET.hex(),
+        base64.b64encode(RETENTION_SECRET).decode("ascii"),
+        RETENTION_MESSAGE.decode("latin-1"),
+        RETENTION_TAG,
+    ):
+        assert material not in rendered
+
+
+# ---------------------------------------------------------------------------
+# Behavioural no-contact and no-persistence observation.
+#
+# A final directory snapshot cannot see a file that was created and removed
+# again inside one invocation.  The observer below records the *operations*
+# instead, so a create-write-close-rename-delete sequence is caught even when
+# the directory it happened in ends the test perfectly clean.
+# ---------------------------------------------------------------------------
+
+
+_WRITE_OPEN_FLAGS = ("w", "a", "x", "+")
+
+_OS_WRITE_FLAGS = (
+    os.O_WRONLY
+    | os.O_RDWR
+    | os.O_CREAT
+    | os.O_TRUNC
+    | os.O_APPEND
+    | getattr(os, "O_EXCL", 0)
+)
+
+
+class SideEffectObserver:
+    """Record every file, mutation, temporary, contact and scan operation."""
+
+    def __init__(self, *, allowed_reads):
+        self.events = []
+        self.allowed_reads = [Path(item) for item in allowed_reads]
+        self._saved = []
+
+    # -- recording ----------------------------------------------------------
+
+    def _target(self, value):
+        try:
+            return Path(os.fsdecode(value))
+        except (TypeError, ValueError):
+            return None
+
+    def record(self, kind, target, *, writing):
+        self.events.append((kind, self._target(target), bool(writing)))
+
+    def read_only_source_opens(self):
+        return [
+            (target, kind)
+            for kind, target, writing in self.events
+            if not writing and kind in {"builtins.open", "io.open", "os.open"}
+        ]
+
+    def mutating_events(self):
+        return [
+            (kind, target)
+            for kind, target, writing in self.events
+            if writing or kind not in {"builtins.open", "io.open", "os.open"}
+        ]
+
+    def unauthorized_reads(self):
+        """Read-only opens of anything other than a configured source."""
+
+        return [
+            (kind, target)
+            for kind, target, writing in self.events
+            if not writing and target not in self.allowed_reads
+        ]
+
+    # -- installation -------------------------------------------------------
+
+    def _patch(self, owner, name, replacement):
+        self._saved.append((owner, name, getattr(owner, name)))
+        setattr(owner, name, replacement)
+
+    def _open_spy(self, kind, original):
+        def spy(target, mode="r", *args, **kwargs):
+            writing = any(flag in str(mode) for flag in _WRITE_OPEN_FLAGS)
+            self.record(kind, target, writing=writing)
+            return original(target, mode, *args, **kwargs)
+
+        return spy
+
+    def _path_open_spy(self, original):
+        def spy(path_self, mode="r", *args, **kwargs):
+            writing = any(flag in str(mode) for flag in _WRITE_OPEN_FLAGS)
+            self.record("Path.open", path_self, writing=writing)
+            return original(path_self, mode, *args, **kwargs)
+
+        return spy
+
+    def _os_open_spy(self, original):
+        def spy(target, flags, *args, **kwargs):
+            self.record("os.open", target, writing=bool(flags & _OS_WRITE_FLAGS))
+            return original(target, flags, *args, **kwargs)
+
+        return spy
+
+    def _mutation_spy(self, kind, original):
+        def spy(first, *args, **kwargs):
+            self.record(kind, first, writing=True)
+            return original(first, *args, **kwargs)
+
+        return spy
+
+    def _temporary_spy(self, kind, original):
+        def spy(*args, **kwargs):
+            self.record(kind, None, writing=True)
+            return original(*args, **kwargs)
+
+        return spy
+
+    def _forbidden_spy(self, kind):
+        def spy(*args, **kwargs):
+            target = args[0] if args else None
+            self.record(kind, target, writing=True)
+            raise AssertionError(f"forbidden runtime surface reached: {kind}")
+
+        return spy
+
+    def install(self):
+        import http.client
+        import socket
+        import urllib.request
+
+        # File opening and creation.
+        self._patch(builtins, "open", self._open_spy("builtins.open", builtins.open))
+        self._patch(io, "open", self._open_spy("io.open", io.open))
+        self._patch(os, "open", self._os_open_spy(os.open))
+        self._patch(Path, "open", self._path_open_spy(Path.open))
+        for name in ("write_bytes", "write_text", "touch"):
+            self._patch(
+                Path,
+                name,
+                self._mutation_spy(f"Path.{name}", getattr(Path, name)),
+            )
+
+        # Mutation and removal.
+        for name in ("rename", "replace", "remove", "unlink"):
+            self._patch(
+                os,
+                name,
+                self._mutation_spy(f"os.{name}", getattr(os, name)),
+            )
+        for name in ("rename", "replace", "unlink"):
+            self._patch(
+                Path,
+                name,
+                self._mutation_spy(f"Path.{name}", getattr(Path, name)),
+            )
+
+        # Temporary files.
+        for name in ("mkstemp", "NamedTemporaryFile", "mkdtemp"):
+            self._patch(
+                tempfile,
+                name,
+                self._temporary_spy(f"tempfile.{name}", getattr(tempfile, name)),
+            )
+
+        # Existing forbidden surfaces.
+        self._patch(socket, "socket", self._forbidden_spy("socket.socket"))
+        self._patch(
+            socket, "create_connection", self._forbidden_spy("socket.create_connection")
+        )
+        self._patch(
+            http.client, "HTTPConnection", self._forbidden_spy("http.HTTPConnection")
+        )
+        self._patch(
+            http.client, "HTTPSConnection", self._forbidden_spy("http.HTTPSConnection")
+        )
+        self._patch(urllib.request, "urlopen", self._forbidden_spy("urllib.urlopen"))
+        for name in ("Popen", "run", "check_output", "check_call", "call"):
+            self._patch(
+                subprocess, name, self._forbidden_spy(f"subprocess.{name}")
+            )
+        for name in ("listdir", "scandir", "walk"):
+            self._patch(os, name, self._forbidden_spy(f"os.{name}"))
+        for name in ("iterdir", "glob", "rglob"):
+            self._patch(Path, name, self._forbidden_spy(f"Path.{name}"))
+        for name in ("putenv", "unsetenv"):
+            self._patch(os, name, self._forbidden_spy(f"os.{name}"))
+
+    def remove(self):
+        for owner, name, original in reversed(self._saved):
+            setattr(owner, name, original)
+        self._saved.clear()
+
+
+@contextlib.contextmanager
+def _observed_runtime(*, allowed_reads):
+    """Observe one runtime window only.
+
+    Every module the observer patches is imported before the window opens and
+    the helper is warmed up by the caller, so ordinary import-time reads are
+    attributed to import and can never appear as a recorded runtime operation.
+    """
+
+    import http.client  # noqa: F401  (imported before the window opens)
+    import socket  # noqa: F401
+    import urllib.request  # noqa: F401
+
+    observer = SideEffectObserver(allowed_reads=allowed_reads)
+    environment_before = dict(os.environ)
+    observer.install()
+    try:
+        yield observer
+    finally:
+        observer.remove()
+    assert dict(os.environ) == environment_before
+
+
+def _warm_up_helper(root: Path, capfdbinary):
+    """Run one invocation before observation so no import is attributed to it."""
+
+    message_path, secret_path = _write_inputs(
+        root,
+        message=RETENTION_MESSAGE,
+        secret=RETENTION_SECRET,
+    )
+    assert tool.main(_argv(message_path, secret_path)) == 0
+    capfdbinary.readouterr()
+    return message_path, secret_path
+
+
+def test_successful_invocation_performs_only_two_read_only_source_opens(
+    tmp_path: Path,
+    capfdbinary,
+):
+    warm_root = tmp_path / "warm"
+    warm_root.mkdir()
+    _warm_up_helper(warm_root, capfdbinary)
+
+    observed_root = tmp_path / "observed"
+    observed_root.mkdir()
+    message_path, secret_path = _write_inputs(
+        observed_root,
+        message=RETENTION_MESSAGE,
+        secret=RETENTION_SECRET,
+    )
+    with _observed_runtime(allowed_reads=[message_path, secret_path]) as observer:
+        result = tool.main(_argv(message_path, secret_path))
+    captured = capfdbinary.readouterr()
+    assert result == 0
+    assert captured.out == RETENTION_TAG.encode("ascii") + os.linesep.encode("ascii")
+    assert captured.err == b""
+    assert observer.events == [
+        ("builtins.open", message_path, False),
+        ("builtins.open", secret_path, False),
+    ]
+    assert observer.mutating_events() == []
+    assert observer.unauthorized_reads() == []
+    assert observer.read_only_source_opens() == [
+        (message_path, "builtins.open"),
+        (secret_path, "builtins.open"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        tool.HISTORICAL_PAIRING_TAG_MESSAGE_PATH_INVALID,
+        tool.HISTORICAL_PAIRING_TAG_MESSAGE_UNAVAILABLE,
+        tool.HISTORICAL_PAIRING_TAG_MESSAGE_LENGTH_INVALID,
+    ],
+)
+def test_bounded_refusal_writes_creates_and_removes_nothing(
+    code: str,
+    tmp_path: Path,
+    capfdbinary,
+):
+    warm_root = tmp_path / "warm"
+    warm_root.mkdir()
+    _warm_up_helper(warm_root, capfdbinary)
+
+    refused_root = tmp_path / "refused"
+    refused_root.mkdir()
+    message_path = refused_root / "message.bin"
+    secret_path = refused_root / "secret.bin"
+    secret_path.write_bytes(RETENTION_SECRET)
+    expected_entries = {secret_path}
+    if code == tool.HISTORICAL_PAIRING_TAG_MESSAGE_LENGTH_INVALID:
+        message_path.write_bytes(b"")
+        expected_entries.add(message_path)
+    elif code == tool.HISTORICAL_PAIRING_TAG_MESSAGE_UNAVAILABLE:
+        pass  # left missing
+    else:
+        message_path = Path("relative-message.bin")
+
+    with _observed_runtime(
+        allowed_reads=[message_path, secret_path]
+    ) as observer:
+        result = tool.main(_argv(message_path, secret_path))
+    captured = capfdbinary.readouterr()
+    assert result == tool.HISTORICAL_PAIRING_TAG_EXIT_CODE
+    assert captured.out == b""
+    assert captured.err == f"error={code}".encode("ascii") + os.linesep.encode("ascii")
+    assert observer.mutating_events() == []
+    assert observer.unauthorized_reads() == []
+    assert set(refused_root.iterdir()) == expected_entries
+
+
+def test_observer_detects_a_create_write_close_rename_and_delete_that_leaves_no_trace(
+    tmp_path: Path,
+):
+    """The observer's own positive control: a clean directory proves nothing."""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    first = workspace / "leaked.bin"
+    second = workspace / "renamed.bin"
+
+    with _observed_runtime(allowed_reads=[]) as observer:
+        first.write_bytes(RETENTION_TAG.encode("ascii"))
+        first.rename(second)
+        with io.open(second, "rb") as handle:
+            assert handle.read() == RETENTION_TAG.encode("ascii")
+        os.remove(second)
+        handle_descriptor, temporary_name = tempfile.mkstemp(dir=os.fspath(workspace))
+        os.close(handle_descriptor)
+        os.unlink(temporary_name)
+
+    # The directory is spotless, so only the recorded operations can testify.
+    assert list(workspace.iterdir()) == []
+    kinds = [kind for kind, _target, _writing in observer.events]
+    assert "Path.write_bytes" in kinds
+    assert "Path.rename" in kinds
+    assert "io.open" in kinds
+    assert "os.remove" in kinds
+    assert "tempfile.mkstemp" in kinds
+    assert "os.unlink" in kinds
+    assert observer.mutating_events() != []
+
+
+def test_observer_refuses_contact_process_and_directory_scan_surfaces(tmp_path: Path):
+    import socket
+    import urllib.request
+
+    workspace = tmp_path / "contact"
+    workspace.mkdir()
+    with _observed_runtime(allowed_reads=[]) as observer:
+        for attempt in (
+            lambda: socket.socket(),
+            lambda: urllib.request.urlopen("http://127.0.0.1:1/"),
+            lambda: subprocess.run([sys.executable, "-c", "pass"]),
+            lambda: os.listdir(os.fspath(workspace)),
+            lambda: list(workspace.iterdir()),
+            lambda: os.putenv("HISTORICAL_PAIRING_TAG_PROBE", "1"),
+        ):
+            with pytest.raises(AssertionError, match="forbidden runtime surface"):
+                attempt()
+    assert {kind for kind, _target, _writing in observer.events} == {
+        "socket.socket",
+        "urllib.urlopen",
+        "subprocess.run",
+        "os.listdir",
+        "Path.iterdir",
+        "os.putenv",
+    }
+
+
+# Every surface the guard must watch, pinned so it can never silently shrink.
+REQUIRED_OBSERVED_SURFACES = (
+    (builtins, "open"),
+    (io, "open"),
+    (os, "open"),
+    (Path, "open"),
+    (Path, "write_bytes"),
+    (Path, "write_text"),
+    (Path, "touch"),
+    (os, "rename"),
+    (os, "replace"),
+    (os, "remove"),
+    (os, "unlink"),
+    (Path, "rename"),
+    (Path, "replace"),
+    (Path, "unlink"),
+    (tempfile, "mkstemp"),
+    (tempfile, "NamedTemporaryFile"),
+    (tempfile, "mkdtemp"),
+    (subprocess, "Popen"),
+    (subprocess, "run"),
+    (subprocess, "check_output"),
+    (os, "listdir"),
+    (os, "scandir"),
+    (os, "walk"),
+    (Path, "iterdir"),
+    (Path, "glob"),
+    (Path, "rglob"),
+    (os, "putenv"),
+    (os, "unsetenv"),
+)
+
+
+def test_side_effect_observer_covers_every_required_surface_and_restores_it():
+    import http.client
+    import socket
+    import urllib.request
+
+    required = REQUIRED_OBSERVED_SURFACES + (
+        (socket, "socket"),
+        (socket, "create_connection"),
+        (http.client, "HTTPConnection"),
+        (http.client, "HTTPSConnection"),
+        (urllib.request, "urlopen"),
+    )
+    before = {
+        (owner.__name__, name): getattr(owner, name) for owner, name in required
+    }
+    with _observed_runtime(allowed_reads=[]):
+        observed = {
+            (owner.__name__, name)
+            for owner, name in required
+            if getattr(owner, name) is not before[(owner.__name__, name)]
+        }
+    assert observed == set(before)
+    after = {
+        (owner.__name__, name): getattr(owner, name) for owner, name in required
+    }
+    assert after == before
+
+
+# ---------------------------------------------------------------------------
+# Behavioural message opacity.
+# ---------------------------------------------------------------------------
+
+
+# Valid JSON whose exact bytes are deliberately non-canonical: CRLF, padding
+# whitespace, unsorted keys, a duplicated key, and an escape spelling a parser
+# would normalize.  It stays parseable so a parse-and-reserialize mutant runs
+# to completion and is caught behaviourally rather than by a token scan.
+NONCANONICAL_JSON_MESSAGE = (
+    b"{\r\n"
+    b'  "zeta"  :  "\\u0041\\u0042",\r\n'
+    b'  "alpha" : 1,\r\n'
+    b'  "alpha" : 2,\r\n'
+    b'  "beta"  : [ 1,2 ,3 ]\r\n'
+    b"}\r\n"
+)
+
+
+def _canonical_reserialization(raw: bytes) -> bytes:
+    return json.dumps(
+        json.loads(raw.decode("utf-8")),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def test_noncanonical_json_message_is_opaque_and_reaches_hmac_by_identity(
+    tmp_path: Path,
+    capfdbinary,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    message_path, secret_path = _write_inputs(
+        tmp_path,
+        message=NONCANONICAL_JSON_MESSAGE,
+        secret=RETENTION_SECRET,
+    )
+    raw = message_path.read_bytes()
+    assert raw == NONCANONICAL_JSON_MESSAGE
+    canonical = _canonical_reserialization(raw)
+    assert canonical != raw
+    assert json.loads(raw.decode("utf-8")) == json.loads(canonical.decode("utf-8"))
+    # Computed before ``hmac.new`` is instrumented, so the expectation itself
+    # never lands in the recorded submissions.
+    expected_output = _expected_output(RETENTION_SECRET, raw)
+    canonical_output = _expected_output(RETENTION_SECRET, canonical)
+
+    returned = []
+    submitted = []
+    original_reader = tool._read_historical_pairing_message_file
+    original_new = tool.hmac.new
+
+    def recording_reader(path):
+        value = original_reader(path)
+        returned.append(value)
+        return value
+
+    def recording_new(*, key, msg, digestmod):
+        submitted.append(msg)
+        return original_new(key=key, msg=msg, digestmod=digestmod)
+
+    monkeypatch.setattr(
+        tool, "_read_historical_pairing_message_file", recording_reader
+    )
+    monkeypatch.setattr(tool.hmac, "new", recording_new)
+    assert tool.main(_argv(message_path, secret_path)) == 0
+    captured = capfdbinary.readouterr()
+
+    assert len(returned) == 1
+    assert len(submitted) == 1
+    # Identity, not equality: no copy, reserialization or normalization stands
+    # between the exact file bytes and the computation.
+    assert submitted[0] is returned[0]
+    assert submitted[0] == raw
+    assert captured.out == expected_output
+    assert captured.out != canonical_output
+    assert captured.err == b""
+
+
+def test_canonical_reserialization_of_the_message_changes_the_tag(
+    tmp_path: Path,
+    capfdbinary,
+):
+    raw_root = tmp_path / "raw"
+    canonical_root = tmp_path / "canonical"
+    raw_root.mkdir()
+    canonical_root.mkdir()
+    canonical = _canonical_reserialization(NONCANONICAL_JSON_MESSAGE)
+    raw_inputs = _write_inputs(
+        raw_root, message=NONCANONICAL_JSON_MESSAGE, secret=RETENTION_SECRET
+    )
+    canonical_inputs = _write_inputs(
+        canonical_root, message=canonical, secret=RETENTION_SECRET
+    )
+    assert tool.main(_argv(*raw_inputs)) == 0
+    raw_output = capfdbinary.readouterr().out
+    assert tool.main(_argv(*canonical_inputs)) == 0
+    canonical_output = capfdbinary.readouterr().out
+    assert raw_output == _expected_output(RETENTION_SECRET, NONCANONICAL_JSON_MESSAGE)
+    assert canonical_output == _expected_output(RETENTION_SECRET, canonical)
+    assert raw_output != canonical_output
+    # The helper never parses: it cannot know the two files mean the same thing.
+    assert json.loads(NONCANONICAL_JSON_MESSAGE.decode("utf-8")) == json.loads(
+        canonical.decode("utf-8")
+    )
+
+
+# ---------------------------------------------------------------------------
+# Installed-distribution execution.
+#
+# Building and installing a wheel proves packaging.  Only *running* the
+# installed artifact, with the repository absent from the child's import
+# search, proves the distribution is self-sufficient.
+# ---------------------------------------------------------------------------
+
+
+def _installed_environment(install_root: Path) -> dict:
+    environment = os.environ.copy()
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["PYTHONHASHSEED"] = "0"
+    environment["PYTHONNOUSERSITE"] = "1"
+    # Exactly the install tree: no repository path, no inherited PYTHONPATH.
+    environment["PYTHONPATH"] = os.fspath(install_root)
+    return environment
+
+
+def _console_script(install_root: Path) -> Path:
+    candidates = sorted(
+        candidate
+        for directory in ("bin", "Scripts")
+        for candidate in (install_root / directory).glob(
+            "admissible-historical-pairing-tag*"
+        )
+        if candidate.is_file()
+    )
+    assert candidates, f"installed console script missing under {install_root}"
+    return candidates[0]
+
+
+def _installed_inputs(run_root: Path) -> tuple[Path, Path]:
+    return _write_inputs(
+        run_root,
+        message=RETENTION_MESSAGE,
+        secret=RETENTION_SECRET,
+    )
+
+
+def _run_installed(command, installed_distribution, arguments):
+    return subprocess.run(
+        [*command, *arguments],
+        cwd=installed_distribution.run_root,
+        env=_installed_environment(installed_distribution.install_root),
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_installed_module_and_console_script_emit_byte_exact_output(
+    installed_distribution,
+):
+    message_path, secret_path = _installed_inputs(installed_distribution.run_root)
+    expected = RETENTION_TAG.encode("ascii") + os.linesep.encode("ascii")
+    invocations = {
+        "module": [
+            sys.executable,
+            "-m",
+            "admissible.operator_tools.historical_pairing_tag",
+        ],
+        "console-script": [os.fspath(_console_script(
+            installed_distribution.install_root
+        ))],
+    }
+    for label, command in invocations.items():
+        completed = _run_installed(
+            command, installed_distribution, _argv(message_path, secret_path)
+        )
+        assert completed.returncode == 0, (label, completed.stderr)
+        assert completed.stdout == expected, label
+        assert completed.stderr == b"", label
+
+
+def test_installed_distribution_resolves_without_a_source_tree_fallback(
+    installed_distribution,
+):
+    install_root = installed_distribution.install_root
+    probe = textwrap.dedent(
+        """
+        import json
+        import sys
+        import admissible
+        import admissible.operator_tools
+        import admissible.operator_tools.historical_pairing_tag as helper
+        import admissible.historical_pairing_secret_file as leaf
+        print(json.dumps({
+            "helper": helper.__file__,
+            "leaf": leaf.__file__,
+            "package": admissible.__file__,
+            "package_path": list(admissible.__path__),
+            "operator_path": list(admissible.operator_tools.__path__),
+            "sys_path": [entry for entry in sys.path if entry],
+        }))
+        """
+    )
+    completed = _run_installed(
+        [sys.executable, "-c", probe], installed_distribution, []
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == b""
+    origins = json.loads(completed.stdout.decode("utf-8"))
+
+    installed = os.path.normcase(os.fspath(install_root))
+    repository = os.path.normcase(os.fspath(ROOT))
+    for key in ("helper", "leaf", "package"):
+        assert os.path.normcase(origins[key]).startswith(installed), (key, origins[key])
+    for key in ("package_path", "operator_path"):
+        for entry in origins[key]:
+            assert os.path.normcase(entry).startswith(installed), (key, entry)
+    searched = (
+        origins["sys_path"] + origins["package_path"] + origins["operator_path"]
+    )
+    for entry in searched:
+        normalized = os.path.normcase(entry)
+        assert normalized != repository
+        assert not normalized.startswith(repository + os.sep)
+
+
+def test_installed_console_script_help_abbreviation_and_refusal_exit_codes(
+    installed_distribution,
+):
+    script = _console_script(installed_distribution.install_root)
+    module = [
+        sys.executable,
+        "-m",
+        "admissible.operator_tools.historical_pairing_tag",
+    ]
+    message_path, secret_path = _installed_inputs(installed_distribution.run_root)
+
+    for command in ([os.fspath(script)], module):
+        helped = _run_installed(command, installed_distribution, ["--help"])
+        assert helped.returncode == 0
+        assert b"--message-file" in helped.stdout
+        assert b"--secret-file" in helped.stdout
+        assert helped.stderr == b""
+
+        abbreviated = _run_installed(
+            command,
+            installed_distribution,
+            [
+                "--message-file",
+                os.fspath(message_path),
+                "--secret-file",
+                os.fspath(secret_path),
+                "--message",
+                os.fspath(message_path),
+            ],
+        )
+        assert abbreviated.returncode == 2
+        assert abbreviated.stdout == b""
+        assert b"unrecognized arguments" in abbreviated.stderr
+
+        refused = _run_installed(
+            command,
+            installed_distribution,
+            [
+                "--message-file",
+                "relative-message.bin",
+                "--secret-file",
+                os.fspath(secret_path),
+            ],
+        )
+        assert refused.returncode == tool.HISTORICAL_PAIRING_TAG_EXIT_CODE
+        assert refused.stdout == b""
+        assert refused.stderr == (
+            b"error=" + tool.HISTORICAL_PAIRING_TAG_MESSAGE_PATH_INVALID.encode("ascii")
+            + os.linesep.encode("ascii")
+        )
+
+
+# ---------------------------------------------------------------------------
+# Real file-level reparse point.
+# ---------------------------------------------------------------------------
+
+
+def _create_real_file_reparse_point(directory: Path) -> Path:
+    """Create one real file-level reparse point, or skip honestly.
+
+    An unprivileged file symbolic link is a genuine file-level reparse point on
+    Windows when Developer Mode is enabled.  No dependency is added and no
+    elevation is requested: when the platform refuses, the committed synthetic
+    reparse-point test remains the only coverage and the limitation is reported
+    rather than emulated with a directory junction.
+    """
+
+    target = directory / "reparse-target.bin"
+    target.write_bytes(RETENTION_MESSAGE)
+    link = directory / "reparse-message.bin"
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError) as failure:
+        pytest.skip(
+            "platform cannot create an unprivileged file-level reparse point: "
+            f"{failure}"
+        )
+    metadata = os.lstat(link)
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    if not (attributes & tool._REPARSE_POINT_FLAG) and not stat.S_ISLNK(
+        metadata.st_mode
+    ):
+        pytest.skip("platform reports no reparse-point metadata for the fixture")
+    return link
+
+
+def test_real_file_level_reparse_point_message_is_refused_before_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    link = _create_real_file_reparse_point(tmp_path)
+    metadata = os.lstat(link)
+    assert bool(
+        getattr(metadata, "st_file_attributes", 0) & tool._REPARSE_POINT_FLAG
+    ) or stat.S_ISLNK(metadata.st_mode)
+    assert link.read_bytes() == RETENTION_MESSAGE  # the link really resolves
+
+    opened = []
+    monkeypatch.setattr(builtins, "open", lambda *args, **kwargs: opened.append(args))
+    with pytest.raises(tool.HistoricalPairingTagMessageFileError) as refusal:
+        tool._read_historical_pairing_message_file(link)
+    assert refusal.value.code == tool.HISTORICAL_PAIRING_TAG_MESSAGE_UNAVAILABLE
+    assert opened == []
+
+
+def test_real_file_level_reparse_point_message_refusal_is_one_bounded_line(
+    tmp_path: Path,
+    capfdbinary,
+):
+    link = _create_real_file_reparse_point(tmp_path)
+    secret_path = tmp_path / "secret.bin"
+    secret_path.write_bytes(RETENTION_SECRET)
+    result = tool.main(_argv(link, secret_path))
+    captured = capfdbinary.readouterr()
+    assert result == tool.HISTORICAL_PAIRING_TAG_EXIT_CODE
+    assert captured.out == b""
+    assert captured.err == (
+        b"error=" + tool.HISTORICAL_PAIRING_TAG_MESSAGE_UNAVAILABLE.encode("ascii")
+        + os.linesep.encode("ascii")
+    )
