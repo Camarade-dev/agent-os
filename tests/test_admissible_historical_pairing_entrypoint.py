@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import ast
 import base64
+from collections import deque
+import functools
 import json
 import os
 from pathlib import Path
@@ -24,7 +26,18 @@ import subprocess
 import sys
 import threading
 from http.client import HTTPConnection
-from types import SimpleNamespace
+from types import (
+    CellType,
+    FrameType,
+    FunctionType,
+    MappingProxyType,
+    MemberDescriptorType,
+    MethodType,
+    ModuleType,
+    SimpleNamespace,
+    TracebackType,
+)
+from typing import NamedTuple
 
 import pytest
 
@@ -42,6 +55,8 @@ from admissible.historical_pairing_secret_file import (
     HISTORICAL_PAIRING_SECRET_LENGTH_INVALID,
     HISTORICAL_PAIRING_SECRET_PATH_INVALID,
     HISTORICAL_PAIRING_SECRET_UNAVAILABLE,
+    MAX_HISTORICAL_PAIRING_SECRET_BYTES,
+    MIN_HISTORICAL_PAIRING_SECRET_BYTES,
     HistoricalPairingSecretFileError,
 )
 from admissible.product_launcher import __main__ as entrypoint
@@ -205,18 +220,37 @@ def historical_payload(
 
 
 class _FakeLauncher:
-    """Records exactly what the entrypoint handed to the constructor seam."""
+    """Records exactly what the entrypoint handed to the constructor seam.
 
-    def __init__(self, recorder, args, kwargs, *, serve_error=None):
+    ``start``, ``serve_forever`` and ``close`` each accept one optional injected
+    failure so the entrypoint's complete post-construction lifecycle -- not only
+    its serving phase -- can be driven deterministically.  All three default to
+    the pre-existing succeed-and-record behavior.
+    """
+
+    def __init__(
+        self,
+        recorder,
+        args,
+        kwargs,
+        *,
+        serve_error=None,
+        start_error=None,
+        close_error=None,
+    ):
         self.args = args
         self.kwargs = kwargs
         self.ui_port = 43101
         self.g2_port = 43102
         self._recorder = recorder
         self._serve_error = serve_error
+        self._start_error = start_error
+        self._close_error = close_error
 
     def start(self):
         self._recorder.events.append("start")
+        if self._start_error is not None:
+            raise self._start_error
         return self
 
     def serve_forever(self):
@@ -226,6 +260,8 @@ class _FakeLauncher:
 
     def close(self):
         self._recorder.events.append("close")
+        if self._close_error is not None:
+            raise self._close_error
 
 
 def _recorder() -> SimpleNamespace:
@@ -236,6 +272,10 @@ def _recorder() -> SimpleNamespace:
         launcher_calls=[],
         launchers=[],
         namespace=None,
+        # Every frame that called the constructor seam, kept alive so the
+        # entrypoint's own local secret reference can still be read after the
+        # frame has returned or unwound.
+        caller_frames=[],
     )
 
 
@@ -279,6 +319,8 @@ def _install_launcher_double(
     *,
     construction_error: BaseException | None = None,
     serve_error: BaseException | None = None,
+    start_error: BaseException | None = None,
+    close_error: BaseException | None = None,
     forbidden: bool = False,
 ):
     def _factory(*args, **kwargs):
@@ -288,9 +330,20 @@ def _install_launcher_double(
             )
         recorder.events.append("construct_launcher")
         recorder.launcher_calls.append((args, kwargs))
+        # The calling frame is the entrypoint's own frame.  Holding it keeps its
+        # locals readable after it returns or unwinds, which is the only way to
+        # observe that the entrypoint really dropped its local secret reference.
+        recorder.caller_frames.append(sys._getframe(1))
         if construction_error is not None:
             raise construction_error
-        launcher = _FakeLauncher(recorder, args, kwargs, serve_error=serve_error)
+        launcher = _FakeLauncher(
+            recorder,
+            args,
+            kwargs,
+            serve_error=serve_error,
+            start_error=start_error,
+            close_error=close_error,
+        )
         recorder.launchers.append(launcher)
         return launcher
 
@@ -783,33 +836,419 @@ def test_close_runs_even_when_serving_raises(
 
 
 # ---------------------------------------------------------------------------
-# E. Entrypoint-owned secret-reference minimization.
+# E. Entrypoint-owned secret custody.
+#
+# The scanner below replaces the earlier one-level scan of the entrypoint's
+# module globals.  That scan could only ever see a secret bound directly to a
+# module name (or sitting one level inside a plain container bound to one), so
+# every ordinary indirection -- a default argument, a closure cell, an object
+# field, a slot, a nested mapping, a partial, an exception attribute, a retained
+# traceback frame -- was invisible to it, and a regression that retained the
+# configured secret through any of them would have shipped undetected.
+#
+# Scope and policy
+# ----------------
+#
+# The traversal is deliberately *not* a heap walk.  It starts from explicit
+# application-owned roots (the entrypoint module namespace, and any exception or
+# traceback the test itself decided to retain) and it never leaves that
+# ownership boundary:
+#
+#   * a module is descended only when its ``__name__`` is an owned module;
+#   * a class is descended only when its ``__module__`` is an owned module;
+#   * a function is never descended through ``__globals__``, so reaching one
+#     function can never pull in an entire foreign module's state;
+#   * a frame is descended only when its code object's filename is an owned
+#     entrypoint source file;
+#   * an object explicitly named as an accepted recipient (the constructed
+#     launcher, which legitimately holds the configured secret for its whole
+#     lifetime) is a hard stop and is reported as such rather than silently
+#     skipped;
+#   * import machinery names (``__builtins__`` and friends) are never followed.
+#
+# Everything is bounded: an identity-based visited set, a maximum depth, a
+# maximum visited-node count, and a deterministic ``_ScanBudgetExceeded`` failure
+# when either bound is reached.  No property, descriptor, or other user code is
+# executed to obtain a value: instance dictionaries come from
+# ``object.__getattribute__``, exception state comes from ``BaseException``'s own
+# descriptors rather than from possibly-overridden attributes, and slots are read
+# through their real member descriptors.
 # ---------------------------------------------------------------------------
 
 
-def _module_state_holding(module, needle: bytes) -> list[str]:
-    """Bounded one-level scan of a module's globals for the configured secret."""
+# One high-entropy binary sentinel, used as the configured secret by every
+# custody test.  It is deliberately hostile to careless handling: it is not
+# valid UTF-8 (``\xc3\x28`` is a truncated two-byte sequence and
+# ``\xed\xa0\x80`` is an encoded surrogate), and it carries a NUL, a CRLF,
+# ordinary spaces, and high bytes.  A defect that decodes, trims, splits on
+# lines, or NUL-terminates it therefore changes its value rather than merely
+# moving it, and every such change is still detected by the encodings below.
+SENTINEL_SECRET = (
+    b"\x9f\x00\xc3\x28 \xed\xa0\x80SENTINEL\r\n\xfe\xff \x80\x13"
+    b"\xa7\xd4\x6b\x00\xf0\x9f\x92\xa9 \x7f\xbe\xef\r\n\xc2"
+)
 
-    encodings = {
-        needle,
-        base64.b64encode(needle),
-        needle.hex().encode("ascii"),
-    }
-    found = []
-    for name, value in list(vars(module).items()):
-        candidates = [value]
-        if isinstance(value, (list, tuple, set, frozenset)):
-            candidates = list(value)
-        elif isinstance(value, dict):
-            candidates = list(value.keys()) + list(value.values())
-        for candidate in candidates:
-            if isinstance(candidate, (bytes, bytearray)) and bytes(candidate) in encodings:
-                found.append(name)
-            elif isinstance(candidate, str) and any(
-                item.decode("latin-1") in candidate for item in encodings
-            ):
-                found.append(name)
-    return found
+# Bounds for the traversal.  Both are far above what a clean application-owned
+# graph needs and far below a heap walk, so exceeding either is a real signal
+# that the ownership boundary leaked rather than a tuning accident.
+_SCAN_MAX_DEPTH = 32
+_SCAN_MAX_NODES = 50_000
+
+# Module-namespace names that are import machinery rather than application
+# state.  Following them would leave the application-owned graph immediately.
+_IMPORT_MACHINERY_NAMES = frozenset(
+    {"__builtins__", "__loader__", "__spec__", "__cached__", "__path__"}
+)
+
+# Read through ``BaseException``'s own descriptors so an exception subclass that
+# overrides ``args``/``__cause__``/``__context__`` with a property cannot run its
+# code during a scan, and cannot hide a retained secret behind one either.
+_EXCEPTION_ARGS = BaseException.__dict__["args"]
+_EXCEPTION_CAUSE = BaseException.__dict__["__cause__"]
+_EXCEPTION_CONTEXT = BaseException.__dict__["__context__"]
+_EXCEPTION_TRACEBACK = BaseException.__dict__["__traceback__"]
+
+
+class _ScanBudgetExceeded(AssertionError):
+    """Deterministic refusal when the bounded traversal budget is exhausted.
+
+    Raised rather than returning a partial answer: a truncated scan that
+    silently reported "no disclosure" would be exactly the false negative this
+    whole section exists to remove.
+    """
+
+
+class _Disclosure(NamedTuple):
+    """One located disclosure: where it is and what form it took.
+
+    It deliberately carries no secret material, so it is safe to place in an
+    assertion message, a diff, or a failure report.
+    """
+
+    path: str
+    form: str
+
+
+class _ScanResult(NamedTuple):
+    disclosures: tuple
+    visited: int
+    depth: int
+    stopped_at: tuple
+
+    @property
+    def paths(self) -> tuple:
+        return tuple(item.path for item in self.disclosures)
+
+
+def _secret_forms(secret: bytes):
+    """The byte and text forms whose *complete* presence counts as disclosure."""
+
+    encoded = base64.b64encode(secret)
+    hexed = secret.hex().encode("ascii")
+    byte_forms = (("exact", secret), ("base64", encoded), ("hex", hexed))
+    text_forms = (
+        # Latin-1 is total over bytes, so this is the exact text representation
+        # of the sentinel and not a lossy approximation of it.
+        ("text", secret.decode("latin-1")),
+        ("base64-text", encoded.decode("ascii")),
+        ("hex-text", hexed.decode("ascii")),
+    )
+    return byte_forms, text_forms
+
+
+def _text_form(value: str, text_forms) -> str | None:
+    for label, form in text_forms:
+        if form in value:
+            return label
+    return None
+
+
+def _disclosure_form(value, secret: bytes, byte_forms, text_forms) -> str | None:
+    """Classify one value, matching only *complete* secrets and encodings.
+
+    Nothing shorter than the whole secret (or the whole of one of its explicit
+    encodings) is ever reported, so an incidental short byte run can never
+    manufacture an unbounded stream of false positives.
+    """
+
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        try:
+            raw = bytes(value)
+        except (TypeError, ValueError):  # pragma: no cover - exotic buffer
+            return None
+        if value is secret:
+            return "identity"
+        for label, form in byte_forms:
+            if form not in raw:
+                continue
+            if label != "exact":
+                return label
+            return "copy" if raw == form else "embedded"
+        return None
+    if isinstance(value, str):
+        return _text_form(value, text_forms)
+    return None
+
+
+def _attribute_segment(name: str, text_forms) -> str:
+    """One ``.name`` path segment, redacted if the name itself discloses."""
+
+    return f".{'<redacted>' if _text_form(name, text_forms) else name}"
+
+
+def _key_segment(key, text_forms) -> str:
+    """One ``["key"]`` path segment, redacted if the key itself discloses."""
+
+    if isinstance(key, str):
+        if _text_form(key, text_forms):
+            return '["<redacted>"]'
+        return f'["{key}"]'
+    if isinstance(key, int) and not isinstance(key, bool):
+        return f"[{key}]"
+    return "[<key>]"
+
+
+def _descriptor_value(descriptor, obj):
+    try:
+        return descriptor.__get__(obj, type(obj))
+    except Exception:  # pragma: no cover - defensive only
+        return None
+
+
+def _instance_dict(obj):
+    """The real instance dictionary, without triggering a ``__dict__`` property."""
+
+    try:
+        mapping = object.__getattribute__(obj, "__dict__")
+    except Exception:  # pragma: no cover - objects without an instance dict
+        return None
+    return mapping if isinstance(mapping, dict) else None
+
+
+def _slot_items(obj):
+    """Yield ``(name, value)`` for every declared slot without running user code.
+
+    Slot values are read through the real ``member_descriptor`` found on the
+    declaring class, so a same-named property defined further along the MRO is
+    never invoked.
+    """
+
+    for cls in getattr(type(obj), "__mro__", ()):
+        declared = cls.__dict__.get("__slots__")
+        if declared is None:
+            continue
+        names = (declared,) if isinstance(declared, str) else tuple(declared)
+        for name in names:
+            descriptor = cls.__dict__.get(name)
+            if not isinstance(descriptor, MemberDescriptorType):
+                continue
+            try:
+                yield name, descriptor.__get__(obj, cls)
+            except AttributeError:
+                # An unset slot holds nothing and therefore discloses nothing.
+                continue
+
+
+def _member_children(obj, path: str, text_forms):
+    mapping = _instance_dict(obj)
+    if mapping is not None:
+        for name, value in list(mapping.items()):
+            yield f"{path}{_attribute_segment(str(name), text_forms)}", value
+    for name, value in _slot_items(obj):
+        yield f"{path}{_attribute_segment(name, text_forms)}", value
+
+
+def _namespace_children(obj, path: str, text_forms):
+    for name, value in sorted(vars(obj).items(), key=lambda item: item[0]):
+        if name in _IMPORT_MACHINERY_NAMES:
+            continue
+        yield f"{path}{_attribute_segment(name, text_forms)}", value
+
+
+def _application_children(
+    obj, path: str, *, owned_modules, owned_frame_files, text_forms
+):
+    """Yield every application-owned child of ``obj`` as ``(path, value)``."""
+
+    if isinstance(obj, ModuleType):
+        if getattr(obj, "__name__", None) in owned_modules:
+            yield from _namespace_children(obj, path, text_forms)
+        return
+    if isinstance(obj, type):
+        if getattr(obj, "__module__", None) in owned_modules:
+            yield from _namespace_children(obj, path, text_forms)
+        return
+    if isinstance(obj, (str, bytes, bytearray, memoryview, int, float, complex)):
+        return
+    if obj is None:
+        return
+    if isinstance(obj, TracebackType):
+        yield f"{path}.tb_frame", obj.tb_frame
+        if obj.tb_next is not None:
+            yield f"{path}.tb_next", obj.tb_next
+        return
+    if isinstance(obj, FrameType):
+        if obj.f_code.co_filename not in owned_frame_files:
+            # A frame outside the entrypoint's own source is not application
+            # state; its globals are never followed either.
+            return
+        for name, value in sorted(obj.f_locals.items(), key=lambda item: item[0]):
+            yield f"{path}.f_locals{_key_segment(name, text_forms)}", value
+        return
+    if isinstance(obj, BaseException):
+        args = _descriptor_value(_EXCEPTION_ARGS, obj)
+        if isinstance(args, tuple):
+            for index, value in enumerate(args):
+                yield f"{path}.args[{index}]", value
+        for label, descriptor in (
+            ("__cause__", _EXCEPTION_CAUSE),
+            ("__context__", _EXCEPTION_CONTEXT),
+            ("__traceback__", _EXCEPTION_TRACEBACK),
+        ):
+            value = _descriptor_value(descriptor, obj)
+            if value is not None:
+                yield f"{path}.{label}", value
+        # ``__notes__`` and every custom attribute live in the instance
+        # dictionary and are reached here.
+        yield from _member_children(obj, path, text_forms)
+        return
+    if isinstance(obj, functools.partial):
+        yield f"{path}.func", obj.func
+        for index, value in enumerate(obj.args):
+            yield f"{path}.args[{index}]", value
+        for key, value in list(obj.keywords.items()):
+            yield f"{path}.keywords{_key_segment(key, text_forms)}", value
+        yield from _member_children(obj, path, text_forms)
+        return
+    if isinstance(obj, MethodType):
+        yield f"{path}.__self__", obj.__self__
+        yield f"{path}.__func__", obj.__func__
+        return
+    if isinstance(obj, FunctionType):
+        for index, value in enumerate(obj.__defaults__ or ()):
+            yield f"{path}.__defaults__[{index}]", value
+        for key, value in list((obj.__kwdefaults__ or {}).items()):
+            yield f"{path}.__kwdefaults__{_key_segment(key, text_forms)}", value
+        for index, cell in enumerate(obj.__closure__ or ()):
+            try:
+                contents = cell.cell_contents
+            except ValueError:
+                # An empty cell -- exactly what a shared cell rebound to nothing
+                # looks like when the closure has not run yet.
+                continue
+            yield f"{path}.__closure__[{index}].cell_contents", contents
+        for name, value in list(vars(obj).items()):
+            yield f"{path}{_attribute_segment(str(name), text_forms)}", value
+        return
+    if isinstance(obj, CellType):
+        try:
+            yield f"{path}.cell_contents", obj.cell_contents
+        except ValueError:
+            pass
+        return
+    if isinstance(obj, (dict, MappingProxyType)):
+        for index, (key, value) in enumerate(list(obj.items())):
+            yield f"{path}.<key {index}>", key
+            yield f"{path}{_key_segment(key, text_forms)}", value
+        return
+    if isinstance(obj, (list, tuple)):
+        for index, value in enumerate(list(obj)):
+            yield f"{path}[{index}]", value
+        return
+    if isinstance(obj, (set, frozenset)):
+        for index, value in enumerate(list(obj)):
+            yield f"{path}.<member {index}>", value
+        return
+    yield from _member_children(obj, path, text_forms)
+
+
+def _scan_application_owned(
+    roots,
+    secret: bytes,
+    *,
+    owned_modules=(),
+    owned_frame_files=(),
+    recipient_ids=(),
+    max_depth: int = _SCAN_MAX_DEPTH,
+    max_nodes: int = _SCAN_MAX_NODES,
+) -> _ScanResult:
+    """Breadth-first, cycle-safe, bounded scan of an application-owned graph."""
+
+    byte_forms, text_forms = _secret_forms(secret)
+    owned_modules = frozenset(owned_modules)
+    owned_frame_files = frozenset(owned_frame_files)
+    recipient_ids = frozenset(recipient_ids)
+    seen: set[int] = set()
+    keepalive: list = []
+    disclosures: list[_Disclosure] = []
+    stopped_at: list[str] = []
+    visited = 0
+    deepest = 0
+    queue = deque((label, value, 0) for label, value in roots)
+    while queue:
+        path, value, depth = queue.popleft()
+        identity = id(value)
+        visited += 1
+        deepest = max(deepest, depth)
+        if visited > max_nodes:
+            raise _ScanBudgetExceeded(
+                f"visited more than {max_nodes} application-owned nodes; "
+                f"the ownership boundary leaked at {path}"
+            )
+        if identity in recipient_ids:
+            # An accepted recipient of the configured secret.  Reported, never
+            # silently skipped, so the boundary stays visible in the result.
+            stopped_at.append(path)
+            continue
+        # Classification happens before de-duplication on purpose.  One secret
+        # object commonly sits at several ownership paths at once -- a partial's
+        # positional argument and its keyword, two frame locals along one
+        # traceback -- and reporting only the first would hide every other place
+        # a reader would have to go and remove it.
+        form = _disclosure_form(value, secret, byte_forms, text_forms)
+        if form is not None:
+            disclosures.append(_Disclosure(path, form))
+            continue
+        if identity in seen:
+            # Already descended through another path; its children are already
+            # queued or reported, so re-descending would only loop.
+            continue
+        seen.add(identity)
+        # Kept alive for the whole scan so a freed object's address can never be
+        # reused by a later one and silently look "already visited".
+        keepalive.append(value)
+        if depth >= max_depth:
+            raise _ScanBudgetExceeded(
+                f"reached the maximum depth of {max_depth} at {path}"
+            )
+        for child_path, child in _application_children(
+            value,
+            path,
+            owned_modules=owned_modules,
+            owned_frame_files=owned_frame_files,
+            text_forms=text_forms,
+        ):
+            queue.append((child_path, child, depth + 1))
+    return _ScanResult(
+        disclosures=tuple(sorted(set(disclosures))),
+        visited=visited,
+        depth=deepest,
+        stopped_at=tuple(sorted(set(stopped_at))),
+    )
+
+
+def _entrypoint_custody(
+    secret: bytes, *, extra_roots=(), recipient_ids=()
+) -> _ScanResult:
+    """Scan exactly the real entrypoint's own application-owned state."""
+
+    return _scan_application_owned(
+        [("module", entrypoint), *extra_roots],
+        secret,
+        owned_modules=frozenset({entrypoint.__name__}),
+        owned_frame_files=frozenset({str(ENTRYPOINT_SOURCE)}),
+        recipient_ids=recipient_ids,
+    )
 
 
 def test_enabled_startup_retains_no_secret_in_entrypoint_state_or_output(
@@ -843,7 +1282,13 @@ def test_enabled_startup_retains_no_secret_in_entrypoint_state_or_output(
     ):
         assert encoded not in captured.out
         assert encoded not in captured.err
-    assert _module_state_holding(entrypoint, CONFIGURED_SECRET) == []
+    # The doubles installed on the entrypoint module are test state, not
+    # application state: the recording loader closes over the configured secret
+    # and the recording constructor closes over the recorder that captured it.
+    # Removing them first is what makes the scan below a statement about the
+    # entrypoint and not about its test harness.
+    monkeypatch.undo()
+    assert _entrypoint_custody(CONFIGURED_SECRET).paths == ()
     # The launcher legitimately received it; the entrypoint kept nothing.
     assert recorder.launcher_calls[0][1]["historical_pairing_secret"] is (
         CONFIGURED_SECRET
@@ -897,6 +1342,728 @@ def test_secret_reference_is_dropped_from_the_entrypoint_frame_on_failure(
                 ), name
         traceback = traceback.tb_next
     assert inspected >= 2
+
+
+# ---------------------------------------------------------------------------
+# E1. The scanner itself: sentinel properties, bounds, and ownership boundary.
+# ---------------------------------------------------------------------------
+
+
+# One synthetic owned module.  Every positive control below builds its retention
+# form here rather than in the product, so the scanner's ability to find a form
+# is proven independently of whether the product currently contains one.
+_PROBE_MODULE_NAME = "admissible_entrypoint_custody_probe"
+
+# ``co_filename`` is whatever the import system compiled this file under, which
+# is normally identical to ``__file__``; both spellings are accepted so a probe
+# frame is recognized as owned either way.
+_OWNED_TEST_FRAME_FILES = frozenset({__file__, str(Path(__file__).resolve())})
+
+
+def _probe_module() -> ModuleType:
+    return ModuleType(_PROBE_MODULE_NAME)
+
+
+def _probe_custody(module, *, extra_roots=(), recipient_ids=()) -> _ScanResult:
+    return _scan_application_owned(
+        [("module", module), *extra_roots],
+        SENTINEL_SECRET,
+        owned_modules=frozenset({_PROBE_MODULE_NAME}),
+        owned_frame_files=_OWNED_TEST_FRAME_FILES,
+        recipient_ids=recipient_ids,
+    )
+
+
+def test_the_sentinel_carries_every_required_disclosure_hazard():
+    """The sentinel is a real secret-file value and a hostile one.
+
+    Every assertion below is reduced to a boolean or a count first.  A failing
+    ``assert b"\\x00" in SENTINEL_SECRET`` would print the whole sentinel into
+    the report, and no test in this section is allowed to disclose the material
+    it exists to protect.
+    """
+
+    with pytest.raises(UnicodeDecodeError):
+        SENTINEL_SECRET.decode("utf-8")
+    carries_nul = b"\x00" in SENTINEL_SECRET
+    carries_crlf = b"\r\n" in SENTINEL_SECRET
+    carries_space = b" " in SENTINEL_SECRET
+    carries_high_bytes = any(byte >= 0x80 for byte in SENTINEL_SECRET)
+    assert carries_nul and carries_crlf and carries_space and carries_high_bytes
+    assert len(set(SENTINEL_SECRET)) >= 24
+    # It is configurable through the real accepted secret-file reader, so every
+    # test that writes it to disk is exercising a genuinely acceptable secret.
+    assert (
+        MIN_HISTORICAL_PAIRING_SECRET_BYTES
+        <= len(SENTINEL_SECRET)
+        <= MAX_HISTORICAL_PAIRING_SECRET_BYTES
+    )
+    # Latin-1 is total over bytes, so the text form is exact rather than lossy.
+    assert SENTINEL_SECRET.decode("latin-1").encode("latin-1") == SENTINEL_SECRET
+
+
+_DISCLOSURE_FORMS = (
+    ("the exact object", lambda: SENTINEL_SECRET, "identity"),
+    ("equal copied bytes", lambda: bytes(bytearray(SENTINEL_SECRET)), "copy"),
+    ("bytes embedding the secret", lambda: b"k=" + SENTINEL_SECRET + b";", "embedded"),
+    ("a bytearray", lambda: bytearray(SENTINEL_SECRET), "copy"),
+    ("a memoryview", lambda: memoryview(bytes(bytearray(SENTINEL_SECRET))), "copy"),
+    ("the latin-1 text form", lambda: SENTINEL_SECRET.decode("latin-1"), "text"),
+    (
+        "text embedding the latin-1 form",
+        lambda: "secret=" + SENTINEL_SECRET.decode("latin-1"),
+        "text",
+    ),
+    ("base64 bytes", lambda: base64.b64encode(SENTINEL_SECRET), "base64"),
+    (
+        "base64 text",
+        lambda: base64.b64encode(SENTINEL_SECRET).decode("ascii"),
+        "base64-text",
+    ),
+    ("lowercase hex bytes", lambda: SENTINEL_SECRET.hex().encode("ascii"), "hex"),
+    ("lowercase hex text", lambda: SENTINEL_SECRET.hex(), "hex-text"),
+)
+
+
+@pytest.mark.parametrize(
+    "make,form",
+    [(make, form) for _label, make, form in _DISCLOSURE_FORMS],
+    ids=[label for label, _make, _form in _DISCLOSURE_FORMS],
+)
+def test_every_required_disclosure_form_is_classified(make, form):
+    module = _probe_module()
+    module._value = make()
+
+    result = _probe_custody(module)
+
+    assert result.paths == ("module._value",)
+    assert result.disclosures[0].form == form
+
+
+# Named rather than parametrized by value: a bytes parameter would put secret
+# fragments straight into the generated test identifiers.
+_NON_DISCLOSING_VALUES = (
+    ("empty bytes", lambda: b""),
+    ("a leading fragment", lambda: SENTINEL_SECRET[:8]),
+    ("a trailing fragment", lambda: SENTINEL_SECRET[8:]),
+    ("a hex fragment", lambda: SENTINEL_SECRET.hex()[:20]),
+    (
+        "a base64 fragment",
+        lambda: base64.b64encode(SENTINEL_SECRET).decode("ascii")[:16],
+    ),
+    ("a bounded startup code", lambda: "HISTORICAL_PAIRING_STARTUP_REFUSED"),
+    ("the secret length", lambda: str(len(SENTINEL_SECRET))),
+)
+
+
+@pytest.mark.parametrize(
+    "make",
+    [make for _label, make in _NON_DISCLOSING_VALUES],
+    ids=[label for label, _make in _NON_DISCLOSING_VALUES],
+)
+def test_partial_material_is_never_classified_as_a_disclosure(make):
+    """Only a complete secret or a complete explicit encoding counts.
+
+    Reporting arbitrary fragments would make the scanner fire on unrelated
+    state, and a scanner that cries wolf gets its assertion weakened later.
+    """
+
+    module = _probe_module()
+    module._value = make()
+
+    assert _probe_custody(module).paths == ()
+
+
+def test_the_traversal_bound_fails_deterministically_rather_than_truncating():
+    """Exceeding either bound raises; it never returns a reassuring empty list."""
+
+    deep = _probe_module()
+    node = {"credential": SENTINEL_SECRET}
+    for _ in range(_SCAN_MAX_DEPTH + 8):
+        node = {"next": node}
+    deep._deep = node
+    with pytest.raises(_ScanBudgetExceeded) as raised_depth:
+        _probe_custody(deep)
+    assert "maximum depth" in str(raised_depth.value)
+
+    wide = _probe_module()
+    # Distinct objects, so identity de-duplication cannot quietly shrink the
+    # traversal below the bound the way interned small integers would.
+    wide._wide = [object() for _ in range(512)]
+    with pytest.raises(_ScanBudgetExceeded) as raised_nodes:
+        _scan_application_owned(
+            [("module", wide)],
+            SENTINEL_SECRET,
+            owned_modules=frozenset({_PROBE_MODULE_NAME}),
+            max_nodes=256,
+        )
+    assert "application-owned nodes" in str(raised_nodes.value)
+
+
+def test_a_reference_cycle_terminates_instead_of_looping():
+    module = _probe_module()
+    left: dict = {}
+    right = {"left": left}
+    left["right"] = right
+    left["credential"] = SENTINEL_SECRET
+    module._cycle = left
+
+    result = _probe_custody(module)
+
+    assert result.paths == ('module._cycle["credential"]',)
+
+
+def test_the_scan_stops_at_the_application_ownership_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The traversal is an owned-graph walk, never a heap walk.
+
+    A foreign module the entrypoint imports is out of scope even though it is
+    trivially reachable by name from the entrypoint's own namespace; the same
+    object bound in the entrypoint's own namespace is found immediately.  That
+    pair is what keeps the ownership rule honest in both directions.
+    """
+
+    monkeypatch.setattr(
+        launcher_module, "_custody_probe_foreign", SENTINEL_SECRET, raising=False
+    )
+    assert entrypoint.ProductLauncher.__module__ == launcher_module.__name__
+    assert _entrypoint_custody(SENTINEL_SECRET).paths == ()
+
+    monkeypatch.setattr(
+        entrypoint, "_custody_probe_owned", SENTINEL_SECRET, raising=False
+    )
+    assert _entrypoint_custody(SENTINEL_SECRET).paths == ("module._custody_probe_owned",)
+
+
+def test_the_clean_entrypoint_graph_stays_far_inside_the_traversal_bounds():
+    result = _entrypoint_custody(SENTINEL_SECRET)
+
+    assert result.paths == ()
+    assert result.stopped_at == ()
+    assert 0 < result.visited < _SCAN_MAX_NODES // 8
+    assert result.depth < _SCAN_MAX_DEPTH // 2
+
+
+def _plant_object_attribute(module):
+    module._custody_holder = _AttributeHolder(SENTINEL_SECRET)
+    return "module._custody_holder.secret"
+
+
+def _plant_function_defaults(module):
+    def _keep(held=SENTINEL_SECRET):  # pragma: no cover - never called
+        return held
+
+    module._custody_keep = _keep
+    return "module._custody_keep.__defaults__[0]"
+
+
+def _plant_nested_mapping(module):
+    module._custody_state = {"a": {"b": {"credential": SENTINEL_SECRET}}}
+    return 'module._custody_state["a"]["b"]["credential"]'
+
+
+def _plant_partial(module):
+    module._custody_bound = functools.partial(_consume, SENTINEL_SECRET)
+    return "module._custody_bound.args[0]"
+
+
+def _plant_slot_holder(module):
+    module._custody_slots = _SlotHolder(SENTINEL_SECRET)
+    return "module._custody_slots.credential"
+
+
+_REAL_MODULE_PLANTS = (
+    ("object attribute", "_custody_holder", _plant_object_attribute),
+    ("function defaults", "_custody_keep", _plant_function_defaults),
+    ("nested mapping", "_custody_state", _plant_nested_mapping),
+    ("functools.partial", "_custody_bound", _plant_partial),
+    ("object slots", "_custody_slots", _plant_slot_holder),
+)
+
+
+@pytest.mark.parametrize(
+    "name,plant",
+    [(name, plant) for _label, name, plant in _REAL_MODULE_PLANTS],
+    ids=[label for label, _name, _plant in _REAL_MODULE_PLANTS],
+)
+def test_indirect_retention_is_found_in_the_real_entrypoint_module(
+    monkeypatch: pytest.MonkeyPatch, name, plant
+):
+    """Non-vacuity on the shipped module, not only on a synthetic probe.
+
+    The earlier one-level scan saw a module global and nothing else, so each of
+    these placements would have gone unreported even though every one of them is
+    genuine application-owned retention.  ``monkeypatch`` removes the plant
+    again, so the module is left exactly as it was found.
+    """
+
+    assert _entrypoint_custody(SENTINEL_SECRET).paths == ()
+
+    monkeypatch.setattr(entrypoint, name, None, raising=False)
+    expected = plant(entrypoint)
+
+    assert _entrypoint_custody(SENTINEL_SECRET).paths == (expected,)
+
+
+# ---------------------------------------------------------------------------
+# E2. Positive controls: every real retention form is located exactly.
+# ---------------------------------------------------------------------------
+
+
+class _AttributeHolder:
+    def __init__(self, secret):
+        self.secret = secret
+
+    def read(self):  # pragma: no cover - only ever referenced, never called
+        return self.secret
+
+
+class _SlotHolder:
+    __slots__ = ("credential",)
+
+    def __init__(self, secret):
+        self.credential = secret
+
+
+def _consume(*args, **kwargs):  # pragma: no cover - a partial target, never called
+    return None
+
+
+def _retained_owned_traceback(secret: bytes) -> BaseException:
+    """One retained exception whose owned frames still hold the secret."""
+
+    def _raise(held):
+        raise ValueError("owned frame")
+
+    try:
+        _raise(secret)
+    except ValueError as exc:
+        return exc
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _shared_cell_reader():
+    """A closure reading the *same* cell the caller rebinds afterwards."""
+
+    secret = SENTINEL_SECRET
+
+    def _peek():
+        return secret
+
+    secret = None
+    return _peek
+
+
+def _copied_value_reader():
+    """A closure over a separate immutable copy, which rebinding cannot reach.
+
+    ``bytes(b)`` returns ``b`` itself for an immutable ``bytes``, so the copy is
+    forced through a ``bytearray`` to produce a genuinely distinct object.
+    """
+
+    secret = SENTINEL_SECRET
+    duplicate = bytes(bytearray(secret))
+
+    def _peek():
+        return duplicate
+
+    secret = None
+    return _peek
+
+
+def _form_module_global(module):
+    module._retained_secret = SENTINEL_SECRET
+    return ("module._retained_secret",)
+
+
+def _form_default_argument_closure(module):
+    def _build():
+        secret = SENTINEL_SECRET
+
+        def _peek(held=secret):
+            return held
+
+        secret = None
+        return _peek
+
+    module._captured = _build()
+    # The value was captured at definition time, so rebinding the local reached
+    # nothing: this really is retention and not a shared cell.
+    captured_the_secret = module._captured() is SENTINEL_SECRET
+    assert captured_the_secret
+    return ("module._captured.__defaults__[0]",)
+
+
+def _form_function_defaults(module):
+    def _keep(held=SENTINEL_SECRET):
+        return held
+
+    module._keep_default = _keep
+    return ("module._keep_default.__defaults__[0]",)
+
+
+def _form_function_kwdefaults(module):
+    def _keep(*, held=SENTINEL_SECRET):
+        return held
+
+    module._keep_kwdefault = _keep
+    return ('module._keep_kwdefault.__kwdefaults__["held"]',)
+
+
+def _form_function_attribute(module):
+    def _keep():
+        return None
+
+    _keep.configured_secret = SENTINEL_SECRET
+    module._keep_attribute = _keep
+    return ("module._keep_attribute.configured_secret",)
+
+
+def _form_object_attribute(module):
+    module._holder = _AttributeHolder(SENTINEL_SECRET)
+    return ("module._holder.secret",)
+
+
+def _form_object_slot(module):
+    module._slot_holder = _SlotHolder(SENTINEL_SECRET)
+    assert not hasattr(module._slot_holder, "__dict__")
+    return ("module._slot_holder.credential",)
+
+
+def _form_nested_mapping(module):
+    module._state = {"outer": {"inner": {"credential": SENTINEL_SECRET}}}
+    return ('module._state["outer"]["inner"]["credential"]',)
+
+
+def _form_nested_sequence(module):
+    module._records = [("configured", [SENTINEL_SECRET])]
+    return ("module._records[0][1][0]",)
+
+
+def _form_partial(module):
+    module._bound = functools.partial(
+        _consume, SENTINEL_SECRET, credential=SENTINEL_SECRET
+    )
+    return ("module._bound.args[0]", 'module._bound.keywords["credential"]')
+
+
+def _form_exception_attribute(module):
+    error = RuntimeError("bounded")
+    error.configured_secret = SENTINEL_SECRET
+    module._error = error
+    return ("module._error.configured_secret",)
+
+
+def _form_retained_traceback(module):
+    module._error = _retained_owned_traceback(SENTINEL_SECRET)
+    return (
+        'module._error.__traceback__.tb_frame.f_locals["secret"]',
+        'module._error.__traceback__.tb_next.tb_frame.f_locals["held"]',
+    )
+
+
+_RETENTION_FORMS = (
+    ("module-level bytes global", _form_module_global),
+    ("value-capturing closure default argument", _form_default_argument_closure),
+    ("function __defaults__", _form_function_defaults),
+    ("function __kwdefaults__", _form_function_kwdefaults),
+    ("function attribute", _form_function_attribute),
+    ("module-level object attribute", _form_object_attribute),
+    ("object __slots__", _form_object_slot),
+    ("three-level nested mapping", _form_nested_mapping),
+    ("nested list inside tuple inside list", _form_nested_sequence),
+    ("functools.partial argument and keyword", _form_partial),
+    ("exception custom attribute", _form_exception_attribute),
+    ("retained owned traceback frame", _form_retained_traceback),
+)
+
+
+@pytest.mark.parametrize(
+    "build",
+    [build for _label, build in _RETENTION_FORMS],
+    ids=[label for label, _build in _RETENTION_FORMS],
+)
+def test_the_scanner_locates_every_real_retention_form(build):
+    """Each form: clean control empty, injected form found at its exact path."""
+
+    assert _probe_custody(_probe_module()).paths == ()
+
+    module = _probe_module()
+    expected = build(module)
+    result = _probe_custody(module)
+
+    assert result.paths == tuple(sorted(expected))
+    # Diagnosable without disclosing: the result names a location and an
+    # encoding, and never carries the material itself.  The membership tests are
+    # reduced to booleans so a failure cannot print what it just found.
+    for item in result.disclosures:
+        path_discloses = any(
+            form in item.path
+            for form in (
+                SENTINEL_SECRET.decode("latin-1"),
+                SENTINEL_SECRET.hex(),
+                base64.b64encode(SENTINEL_SECRET).decode("ascii"),
+            )
+        )
+        assert not path_discloses
+        assert item.form in {
+            "identity",
+            "copy",
+            "embedded",
+            "text",
+            "base64",
+            "base64-text",
+            "hex",
+            "hex-text",
+        }
+
+
+def test_every_required_retention_form_is_covered_exactly_once():
+    """The twelve required forms are all present and none was quietly dropped."""
+
+    labels = [label for label, _build in _RETENTION_FORMS]
+    assert len(labels) == len(set(labels)) == 12
+
+
+def _target_bound_method(module):
+    module._bound_method = _AttributeHolder(SENTINEL_SECRET).read
+    return "module._bound_method.__self__.secret"
+
+
+def _target_mapping_proxy(module):
+    module._proxy = MappingProxyType({"credential": SENTINEL_SECRET})
+    return 'module._proxy["credential"]'
+
+
+def _target_frozenset(module):
+    module._members = frozenset({SENTINEL_SECRET})
+    return "module._members.<member 0>"
+
+
+def _target_set(module):
+    module._set = {SENTINEL_SECRET}
+    return "module._set.<member 0>"
+
+
+def _target_mapping_key(module):
+    module._keyed = {SENTINEL_SECRET: "value"}
+    return "module._keyed.<key 0>"
+
+
+def _target_closure_cell(module):
+    module._reader = _copied_value_reader()
+    return "module._reader.__closure__[0].cell_contents"
+
+
+_TRAVERSAL_TARGETS = (
+    ("bound method __self__", _target_bound_method),
+    ("MappingProxyType value", _target_mapping_proxy),
+    ("frozenset member", _target_frozenset),
+    ("set member", _target_set),
+    ("dict key", _target_mapping_key),
+    ("closure cell contents", _target_closure_cell),
+)
+
+
+@pytest.mark.parametrize(
+    "plant",
+    [plant for _label, plant in _TRAVERSAL_TARGETS],
+    ids=[label for label, _plant in _TRAVERSAL_TARGETS],
+)
+def test_every_declared_traversal_target_is_actually_inspected(plant):
+    """The remaining declared inspection targets, each proven non-vacuous.
+
+    A traversal branch nothing exercises is a branch that can be deleted without
+    a single test noticing, which is how a scanner quietly stops scanning.
+    """
+
+    module = _probe_module()
+    expected = plant(module)
+
+    assert _probe_custody(module).paths == (expected,)
+
+
+def test_a_retained_exception_supplied_as_a_root_is_inspected_directly():
+    """An exception the test retains is a root in its own right, not only a global."""
+
+    error = RuntimeError("bounded")
+    error.configured_secret = SENTINEL_SECRET
+    error.__cause__ = ValueError(SENTINEL_SECRET.hex())
+    error.__context__ = RuntimeError(base64.b64encode(SENTINEL_SECRET))
+    error.add_note("note=" + SENTINEL_SECRET.decode("latin-1"))
+
+    result = _scan_application_owned(
+        [("exception", error)],
+        SENTINEL_SECRET,
+        owned_modules=frozenset({_PROBE_MODULE_NAME}),
+        owned_frame_files=_OWNED_TEST_FRAME_FILES,
+    )
+
+    assert result.paths == (
+        "exception.__cause__.args[0]",
+        "exception.__context__.args[0]",
+        "exception.__notes__[0]",
+        "exception.configured_secret",
+    )
+
+
+def test_a_closure_sharing_the_rebound_cell_is_not_retention():
+    """Why a closure over the entrypoint's own local cell is behaviourally inert.
+
+    The entrypoint's ``finally: secret = None`` rebinds the very cell such a
+    closure reads, so the closure observes ``None`` and retains nothing.  That
+    is a genuine equivalence, not a gap in the scanner: the four value-capturing
+    routes below all use the same sentinel and are all reported.
+    """
+
+    shared = _probe_module()
+    shared._peek = _shared_cell_reader()
+    assert shared._peek() is None
+    assert shared._peek.__closure__[0].cell_contents is None
+    assert _probe_custody(shared).paths == ()
+
+    default_argument = _probe_module()
+    copied = _probe_module()
+    copied._peek = _copied_value_reader()
+    field = _probe_module()
+    nested = _probe_module()
+    captures = (
+        ("default argument", default_argument, _form_default_argument_closure(default_argument)),
+        ("separate immutable copy", copied, ("module._peek.__closure__[0].cell_contents",)),
+        ("object field", field, _form_object_attribute(field)),
+        ("nested container", nested, _form_nested_mapping(nested)),
+    )
+    for label, module, expected in captures:
+        assert _probe_custody(module).paths == tuple(sorted(expected)), label
+    # The copy is a distinct object carrying identical bytes, which is exactly
+    # the form an "it is not the same object, so it is not the secret" defect
+    # would produce.
+    equal_bytes = copied._peek() == SENTINEL_SECRET
+    distinct_object = copied._peek() is not SENTINEL_SECRET
+    assert equal_bytes and distinct_object
+    assert _probe_custody(copied).disclosures[0].form == "copy"
+
+
+# ---------------------------------------------------------------------------
+# E3. Every startup outcome leaves no application-owned secret behind.
+# ---------------------------------------------------------------------------
+
+
+_STARTUP_OUTCOMES = (
+    "constructor success",
+    "recognized historical constructor failure",
+    "unrelated constructor failure",
+    "start failure",
+    "serve failure",
+    "close failure",
+)
+
+
+def _startup_outcome(case: str):
+    """Return ``(launcher double kwargs, escaping type, exit code)``."""
+
+    if case == "constructor success":
+        return {}, None, 0
+    if case == "recognized historical constructor failure":
+        return (
+            {"construction_error": MalformedHistoricalPayloadDocument("refused")},
+            None,
+            3,
+        )
+    if case == "unrelated constructor failure":
+        return (
+            {"construction_error": ValueError("unable to observe source repository HEAD")},
+            ValueError,
+            None,
+        )
+    if case == "start failure":
+        return {"start_error": RuntimeError("ui server refused to bind")}, RuntimeError, None
+    if case == "serve failure":
+        return {"serve_error": RuntimeError("serving loop failed")}, RuntimeError, None
+    return {"close_error": RuntimeError("close refused")}, RuntimeError, None
+
+
+@pytest.mark.parametrize("case", _STARTUP_OUTCOMES)
+def test_no_application_owned_secret_survives_any_startup_outcome(
+    monkeypatch: pytest.MonkeyPatch, workspace: SimpleNamespace, capsys, case
+):
+    kwargs, escaping, exit_code = _startup_outcome(case)
+    recorder = _recorder()
+    _install_loader_doubles(monkeypatch, recorder, secret=SENTINEL_SECRET)
+    _install_launcher_double(monkeypatch, recorder, **kwargs)
+    argv = _argv(
+        source=workspace.source,
+        head=workspace.head,
+        run_parent=workspace.run_parent,
+        contracts=workspace.contracts,
+        extra=(
+            "--historical-pairing-config",
+            str(workspace.historical / "c.json"),
+            "--historical-pairing-secret-file",
+            str(workspace.historical / "s.bin"),
+        ),
+    )
+
+    retained = None
+    if escaping is None:
+        assert entrypoint.main(argv) == exit_code
+    else:
+        with pytest.raises(escaping) as caught:
+            entrypoint.main(argv)
+        # Retained on purpose: an escaping exception keeps its frames alive, and
+        # those frames are exactly where a dropped-reference defect would still
+        # be visible.  It is released at the end of this test.
+        retained = caught.value
+
+    captured = capsys.readouterr()
+    # Reduced to one boolean so a failure reports "output disclosed the secret"
+    # instead of printing the secret and the output that carried it.
+    output_discloses = any(
+        encoded in stream
+        for encoded in (
+            SENTINEL_SECRET.decode("latin-1"),
+            base64.b64encode(SENTINEL_SECRET).decode("ascii"),
+            SENTINEL_SECRET.hex(),
+        )
+        for stream in (captured.out, captured.err)
+    )
+    assert not output_discloses
+
+    # The constructed launcher is the accepted recipient and holds the
+    # configured secret for its whole lifetime by design.  The scan stops at
+    # that boundary and reports the stop, rather than reporting the accepted
+    # design as a leak or silently pretending the boundary is not there.
+    recipients = frozenset(id(launcher) for launcher in recorder.launchers)
+    frames = list(recorder.caller_frames)
+    # The doubles are test state living on the entrypoint module; removing them
+    # is what makes the scan a statement about the entrypoint.
+    monkeypatch.undo()
+
+    result = _entrypoint_custody(
+        SENTINEL_SECRET,
+        extra_roots=() if retained is None else (("exception", retained),),
+        recipient_ids=recipients,
+    )
+    assert result.paths == (), case
+
+    if case in {"start failure", "serve failure", "close failure"}:
+        # The launcher really was reachable from a retained entrypoint frame, so
+        # the recipient boundary above is load-bearing rather than decorative.
+        assert result.stopped_at, case
+
+    assert len(frames) == 1
+    assert frames[0].f_code.co_filename == str(ENTRYPOINT_SOURCE)
+    assert frames[0].f_code.co_name == "_launcher_with_historical_pairing"
+    # Constructor success and constructor failure alike: the entrypoint's own
+    # local reference is gone by the time the frame is observable.
+    assert frames[0].f_locals["secret"] is None
+    assert frames[0].f_locals["loaded_configuration"] is ACCEPTED_CONFIGURATION
+    del retained
+
+
+def test_the_startup_outcome_matrix_covers_the_whole_lifecycle():
+    assert len(_STARTUP_OUTCOMES) == len(set(_STARTUP_OUTCOMES)) == 6
 
 
 # ---------------------------------------------------------------------------
@@ -1865,3 +3032,384 @@ def test_a_partial_subprocess_launch_refuses_with_one_bounded_line(
     assert completed.stderr == "error=HISTORICAL_PAIRING_CONFIGURATION_INCOMPLETE\n"
     assert not (tmp_path / "runs").exists()
     assert not (tmp_path / "contracts").exists()
+
+
+# ---------------------------------------------------------------------------
+# P. The exact bytes a refused startup writes to the two standard streams.
+#
+# The subprocess assertions above all run with ``text=True``, and universal
+# newline translation silently rewrites a ``\r\n`` terminator into ``\n`` before
+# any of them can see it.  A real operator, a shell redirect, and a log
+# collector all see the untranslated bytes, so the byte-exact contract is pinned
+# here with binary capture instead.  On this platform the production write of a
+# single ``"\n"`` through ``sys.stderr`` really does emit ``os.linesep``; the
+# expectation is derived from ``os.linesep`` rather than hardcoded, and no
+# production behavior is changed to force one terminator or the other.
+# ---------------------------------------------------------------------------
+
+
+def _startup_stderr_expectation(code: str) -> bytes:
+    return b"error=" + code.encode("ascii") + os.linesep.encode("ascii")
+
+
+def _run_startup_to_completion(
+    extra: tuple[str, ...], workspace_root: Path, source: SimpleNamespace
+) -> subprocess.CompletedProcess:
+    """Run the real module and capture both streams as raw, untranslated bytes."""
+
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "admissible.product_launcher",
+            *_argv(
+                source=source.path,
+                head=source.head,
+                run_parent=workspace_root / "runs",
+                contracts=workspace_root / "contracts",
+                extra=extra,
+            ),
+        ],
+        cwd=PACKAGE_ROOT,
+        env=_subprocess_environment(),
+        # Deliberately no ``text=True``: newline translation is exactly what
+        # this test exists to see through.
+        capture_output=True,
+        timeout=120,
+    )
+
+
+_EXACT_STDERR_CASES = (
+    "partial configuration",
+    "enablement document refusal",
+    "secret file refusal",
+    "product launcher historical construction refusal",
+)
+
+
+@pytest.mark.parametrize("case", _EXACT_STDERR_CASES)
+def test_a_refused_startup_writes_exactly_one_bounded_stderr_line_of_bytes(
+    tmp_path: Path,
+    source_repository: SimpleNamespace,
+    historical_files: SimpleNamespace,
+    historical_payload: NativeCanaryAuthorizationPayloadV4,
+    case,
+):
+    root = historical_files.root
+    secret_file = root / "sentinel-secret.bin"
+    secret_file.write_bytes(SENTINEL_SECRET)
+    configured_secret = SENTINEL_SECRET
+    configuration_path = historical_files.configuration
+    secret_path = secret_file
+
+    if case == "partial configuration":
+        extra = ("--historical-pairing-config", str(configuration_path))
+        expected = entrypoint.HISTORICAL_PAIRING_CONFIGURATION_INCOMPLETE
+    elif case == "enablement document refusal":
+        configuration_path = root / "malformed-enablement.json"
+        configuration_path.write_text("{not json", encoding="utf-8")
+        expected = HISTORICAL_PAIRING_CONFIG_MALFORMED
+        extra = (
+            "--historical-pairing-config",
+            str(configuration_path),
+            "--historical-pairing-secret-file",
+            str(secret_path),
+        )
+    elif case == "secret file refusal":
+        secret_path = root / "too-short-secret.bin"
+        configured_secret = b"tooshort"
+        secret_path.write_bytes(configured_secret)
+        expected = HISTORICAL_PAIRING_SECRET_LENGTH_INVALID
+        extra = (
+            "--historical-pairing-config",
+            str(configuration_path),
+            "--historical-pairing-secret-file",
+            str(secret_path),
+        )
+    else:
+        # A real ``ProductLauncher`` construction: both loaders succeed, the
+        # source HEAD verifies, and the accepted registry refuses the configured
+        # standalone V4 document inside the constructor.
+        historical_files.document.write_bytes(b'{"not": "a payload"}')
+        expected = entrypoint.HISTORICAL_PAIRING_PAYLOAD_REFUSED
+        extra = (
+            "--historical-pairing-config",
+            str(configuration_path),
+            "--historical-pairing-secret-file",
+            str(secret_path),
+        )
+
+    completed = _run_startup_to_completion(extra, tmp_path, source_repository)
+
+    assert completed.returncode == entrypoint.HISTORICAL_PAIRING_STARTUP_EXIT_CODE
+    assert completed.stdout == b""
+    assert completed.stderr == _startup_stderr_expectation(expected)
+    # One line, terminated by the platform's own newline exactly once, with no
+    # second terminator and no blank continuation line after it.
+    assert completed.stderr.count(b"\n") == 1
+    assert completed.stderr.count(os.linesep.encode("ascii")) == 1
+    assert not completed.stderr.endswith(os.linesep.encode("ascii") * 2)
+    assert completed.stderr.endswith(os.linesep.encode("ascii"))
+    # ASCII only: no encoded secret byte, no mojibake, no BOM.
+    assert max(completed.stderr) < 0x80
+    assert b"Traceback" not in completed.stderr
+    assert b"File \"" not in completed.stderr
+
+    combined = completed.stdout + completed.stderr
+    forbidden = (
+        configured_secret,
+        base64.b64encode(configured_secret),
+        configured_secret.hex().encode("ascii"),
+        str(secret_path).encode("utf-8", "surrogateescape"),
+        str(configuration_path).encode("utf-8", "surrogateescape"),
+        str(historical_files.document).encode("utf-8", "surrogateescape"),
+        str(len(configured_secret)).encode("ascii"),
+    )
+    # One boolean, so a failure names the defect instead of printing the
+    # material that proves it.
+    discloses = any(material in combined for material in forbidden)
+    assert not discloses
+    assert not (tmp_path / "runs").exists()
+    assert not (tmp_path / "contracts").exists()
+
+
+def test_the_exact_stderr_matrix_covers_every_required_refusal_stage():
+    assert len(_EXACT_STDERR_CASES) == len(set(_EXACT_STDERR_CASES)) == 4
+
+
+# ---------------------------------------------------------------------------
+# Q. Startup children never carry the configured secret on any channel.
+# ---------------------------------------------------------------------------
+
+
+class _ChildInvocation(NamedTuple):
+    argv: tuple
+    environment: dict
+    cwd: object
+    stdin: object
+    payload: object
+
+
+def _install_child_process_observer(monkeypatch: pytest.MonkeyPatch) -> list:
+    """Record every child process this startup creates, on every channel.
+
+    Both ``subprocess.run`` and ``Popen.__init__`` are observed, so a child
+    created through either route is seen, and the real call is always performed
+    afterwards: this is an observer, not a replacement for child creation.
+    """
+
+    invocations: list[_ChildInvocation] = []
+
+    def _record(args, kwargs) -> None:
+        argv = args if isinstance(args, (list, tuple)) else [args]
+        environment = kwargs.get("env")
+        invocations.append(
+            _ChildInvocation(
+                argv=tuple(str(item) for item in argv),
+                # ``env=None`` means the child inherits this process's whole
+                # environment, so that is what has to be inspected.  Recording an
+                # empty mapping instead would make the test vacuous.
+                environment=dict(os.environ)
+                if environment is None
+                else {str(key): str(value) for key, value in dict(environment).items()},
+                cwd=kwargs.get("cwd"),
+                stdin=kwargs.get("stdin"),
+                payload=kwargs.get("input"),
+            )
+        )
+
+    real_run = subprocess.run
+
+    def _run(args, **kwargs):
+        _record(args, kwargs)
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", _run)
+
+    real_init = subprocess.Popen.__init__
+
+    def _init(self, args, *rest, **kwargs):
+        _record(args, kwargs)
+        return real_init(self, args, *rest, **kwargs)
+
+    monkeypatch.setattr(subprocess.Popen, "__init__", _init)
+    return invocations
+
+
+def test_no_startup_child_receives_the_configured_secret_or_its_locators(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    source_repository: SimpleNamespace,
+    historical_files: SimpleNamespace,
+    capsys,
+):
+    """A real enabled construction, with every child invocation inspected.
+
+    The expected source-HEAD ``git`` verification really does occur here; what
+    matters is that neither it nor any other child sees the configured secret in
+    any form, nor either of the two configured locators.
+    """
+
+    secret_file = historical_files.root / "sentinel-secret.bin"
+    secret_file.write_bytes(SENTINEL_SECRET)
+    invocations = _install_child_process_observer(monkeypatch)
+    # Return from serving immediately: this test is about construction and
+    # start, and the real ``serve_forever`` would block the suite forever.
+    monkeypatch.setattr(
+        launcher_module.ProductLauncher, "serve_forever", lambda self: None
+    )
+
+    exit_code = entrypoint.main(
+        _argv(
+            source=source_repository.path,
+            head=source_repository.head,
+            run_parent=tmp_path / "runs",
+            contracts=tmp_path / "contracts",
+            extra=(
+                "--historical-pairing-config",
+                str(historical_files.configuration),
+                "--historical-pairing-secret-file",
+                str(secret_file),
+            ),
+        )
+    )
+
+    assert exit_code == 0
+    assert invocations, "the startup created no child at all"
+    # The expected source-HEAD verification is present rather than assumed.
+    assert any("rev-parse" in item for call in invocations for item in call.argv)
+
+    forbidden_text = (
+        SENTINEL_SECRET.decode("latin-1"),
+        base64.b64encode(SENTINEL_SECRET).decode("ascii"),
+        SENTINEL_SECRET.hex(),
+        str(secret_file),
+        str(historical_files.configuration),
+    )
+    forbidden_bytes = (
+        SENTINEL_SECRET,
+        base64.b64encode(SENTINEL_SECRET),
+        SENTINEL_SECRET.hex().encode("ascii"),
+        str(secret_file).encode("utf-8", "surrogateescape"),
+        str(historical_files.configuration).encode("utf-8", "surrogateescape"),
+    )
+    for index, call in enumerate(invocations):
+        channels = [
+            *call.argv,
+            *call.environment.keys(),
+            *call.environment.values(),
+        ]
+        if call.cwd is not None:
+            channels.append(str(call.cwd))
+        for supplied in (call.stdin, call.payload):
+            if isinstance(supplied, str):
+                channels.append(supplied)
+        text_discloses = any(
+            material in channel for channel in channels for material in forbidden_text
+        )
+        assert not text_discloses, index
+
+        byte_channels = [item.encode("utf-8", "surrogateescape") for item in call.argv]
+        for supplied in (call.stdin, call.payload):
+            if isinstance(supplied, (bytes, bytearray)):
+                byte_channels.append(bytes(supplied))
+        byte_discloses = any(
+            material in channel
+            for channel in byte_channels
+            for material in forbidden_bytes
+        )
+        assert not byte_discloses, index
+
+    capsys.readouterr()
+
+
+# ---------------------------------------------------------------------------
+# R. Inherited argparse abbreviation: documented, not repaired.
+# ---------------------------------------------------------------------------
+
+
+def test_the_secret_abbreviation_stays_a_locator_and_is_refused_by_the_loader(
+    monkeypatch: pytest.MonkeyPatch,
+    workspace: SimpleNamespace,
+    historical_files: SimpleNamespace,
+    capsys,
+):
+    """``--historical-pairing-secret`` is argparse prefix matching, not an option.
+
+    The parser declares exactly two historical options and neither of them
+    accepts literal secret material.  argparse's long-standing prefix
+    abbreviation resolves the shorter spelling to the *file* option, which is
+    repository-wide behavior for every option in every parser here and is not
+    modified by this slice: ``allow_abbrev`` is left alone, no destination is
+    added, and no abbreviation is blocked.  What is pinned is the consequence
+    that matters -- the value stays a filesystem locator, and a literal-looking
+    value is refused by the accepted secret-file loader rather than being read
+    as the secret itself.
+
+    The separate, inherited ``--h`` ambiguity between ``--help`` and the two
+    historical options is recorded here as a compatibility note only; it is
+    pre-existing argparse behavior and is out of scope for this slice.
+    """
+
+    parser = entrypoint.build_parser()
+    assert not [
+        action for action in parser._actions if action.dest == "historical_pairing_secret"
+    ]
+    assert {
+        option
+        for action in parser._actions
+        for option in action.option_strings
+        if option.startswith("--historical")
+    } == NEW_OPTION_STRINGS
+
+    literal = "not-a-path-just-literal-secret-text"
+    namespace = parser.parse_args(
+        [
+            "--source-repository",
+            "S",
+            "--required-source-head",
+            "H",
+            "--run-parent",
+            "R",
+            "--contract-documents-directory",
+            "C",
+            "--executable",
+            "E",
+            "--historical-pairing-secret",
+            literal,
+        ]
+    )
+    # It landed on the file destination, unchanged, and it is a Path locator --
+    # never bytes, never decoded text, never a literal secret.
+    assert not hasattr(namespace, "historical_pairing_secret")
+    assert type(namespace.historical_pairing_secret_file) is type(Path("."))
+    assert isinstance(namespace.historical_pairing_secret_file, Path)
+    assert namespace.historical_pairing_secret_file == Path(literal)
+    assert not namespace.historical_pairing_secret_file.is_absolute()
+
+    # End to end: the accepted loader refuses that relative, literal-looking
+    # locator with its own bounded code.  No launcher is ever constructed.
+    recorder = _recorder()
+    _install_launcher_double(monkeypatch, recorder, forbidden=True)
+
+    exit_code = entrypoint.main(
+        _argv(
+            source=workspace.source,
+            head=workspace.head,
+            run_parent=workspace.run_parent,
+            contracts=workspace.contracts,
+            extra=(
+                "--historical-pairing-config",
+                str(historical_files.configuration),
+                "--historical-pairing-secret",
+                literal,
+            ),
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == entrypoint.HISTORICAL_PAIRING_STARTUP_EXIT_CODE
+    assert captured.out == ""
+    assert captured.err == f"error={HISTORICAL_PAIRING_SECRET_PATH_INVALID}\n"
+    assert recorder.events == []
+    _assert_no_launcher_side_effects(workspace)
