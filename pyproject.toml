@@ -17,6 +17,7 @@ test = ["pytest"]
 agent-os = "agent_os.cli:main"
 admissible = "admissible.product_launcher.__main__:main"
 admissible-historical-pairing-tag = "admissible.operator_tools.historical_pairing_tag:main"
+admissible-historical-pairing-v4-extract = "admissible.operator_tools.historical_pairing_v4_extract:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

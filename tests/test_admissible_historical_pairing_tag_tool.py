@@ -355,6 +355,9 @@ def test_console_script_declaration_targets_main_and_existing_scripts_are_unchan
         "admissible-historical-pairing-tag": (
             "admissible.operator_tools.historical_pairing_tag:main"
         ),
+        "admissible-historical-pairing-v4-extract": (
+            "admissible.operator_tools.historical_pairing_v4_extract:main"
+        ),
     }
     module_name, attribute = scripts["admissible-historical-pairing-tag"].split(":")
     target = getattr(importlib.import_module(module_name), attribute)
