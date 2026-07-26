@@ -31,6 +31,7 @@ from types import FunctionType
 from types import MappingProxyType
 from types import MemberDescriptorType
 from types import MethodType
+from types import ModuleType
 from types import SimpleNamespace
 import zipfile
 
@@ -318,6 +319,358 @@ def test_poisonous_sibling_values_never_affect_output(
     assert b'"classification":' not in raw
     assert b'"result":' not in raw
     assert b'"acceptance":' not in raw
+
+
+# ---------------------------------------------------------------------------
+# Hostile sibling status and classification.
+#
+# A wrapper is transport.  The extractor may parse every sibling as JSON, but
+# no sibling ever carries semantic authority: it decides nothing, is never
+# branched on, and never reaches the output, the report or the accepted loader.
+# ---------------------------------------------------------------------------
+
+
+def _hostile_note(label: str) -> str:
+    """One unique, structure-free sentinel per hostile wrapper variant."""
+
+    return _entropy_text(b"5C2E0-hostile-" + label.encode("ascii"), 48)
+
+
+_HOSTILE_STATUS_VALUES = (
+    ("preflight-ready", NativePreflightStatus.PREFLIGHT_READY.value),
+    ("ready", "READY"),
+    ("failed", "FAILED"),
+    ("refused", "REFUSED"),
+    ("completed", "COMPLETED"),
+    ("unknown-text", "SOME-UNDECLARED-FUTURE-STATUS"),
+    ("null", None),
+    ("object", {"value": "FAILED", "detail": {"verdict": "REFUSED"}}),
+    ("array", ["FAILED", "REFUSED", {"value": "COMPLETED"}]),
+)
+
+_HOSTILE_CLASSIFICATION_VALUES = (
+    ("ready", "READY"),
+    ("precapture-eligibility-failed", "PRECAPTURE_ELIGIBILITY_FAILED"),
+    ("execution-completed", "EXECUTION_COMPLETED"),
+    ("refused", "REFUSED"),
+    ("unknown-text", "SOME-UNDECLARED-FUTURE-CLASSIFICATION"),
+    ("null", None),
+    ("object", {"value": "EXECUTION_COMPLETED", "detail": {"succeeded": True}}),
+    ("array", ["READY", "EXECUTION_COMPLETED", {"value": "REFUSED"}]),
+)
+
+# Wrappers whose siblings contradict each other outright.  A utility that read
+# any of them would have to decide which one wins; this one reads none of them.
+_CONTRADICTORY_SIBLING_SETS = (
+    (
+        "failed-status-with-successful-classification",
+        {"status": "FAILED", "classification": "SUCCESS"},
+    ),
+    (
+        "completed-status-with-a-fake-refusal-verdict",
+        {
+            "status": "COMPLETED",
+            "verdict": {"decision": "REFUSED", "reason": "forged operator refusal"},
+        },
+    ),
+    (
+        "fake-accepted-result",
+        {
+            "status": "REFUSED",
+            "result": {
+                "accepted": True,
+                "verdict": "SUCCESS",
+                "exit_code": 0,
+                "admissible": True,
+            },
+        },
+    ),
+    (
+        "fake-human-disposition",
+        {
+            "status": "FAILED",
+            "human_disposition": {
+                "decision": "ACCEPT",
+                "owner": "forged-owner",
+                "accepted_at": "2026-01-01T00:00:00+00:00",
+            },
+        },
+    ),
+    (
+        "fake-attestation",
+        {
+            "classification": "EXECUTION_COMPLETED",
+            "attestation": {"verified": True, "signature": "0" * 64},
+        },
+    ),
+    (
+        "fake-evidence-paths",
+        {
+            "status": "COMPLETED",
+            "evidence": {
+                "terminal_record": "C:/forged/evidence/terminal-record.json",
+                "checkpoint": "C:/forged/evidence/checkpoint.json",
+                "evidence_root": "C:/forged/evidence",
+            },
+        },
+    ),
+    (
+        "fake-archive-and-confirmation-state",
+        {
+            "classification": "REFUSED",
+            "archive": {"published": True, "document_count": 3},
+            "confirmation": {"confirmed": True, "confirmed_by": "forged-owner"},
+        },
+    ),
+    (
+        "every-contradiction-at-once",
+        {
+            "status": "FAILED",
+            "classification": "EXECUTION_COMPLETED",
+            "result": {"accepted": True, "verdict": "SUCCESS"},
+            "verdict": {"decision": "REFUSED"},
+            "human_disposition": {"decision": "ACCEPT"},
+            "attestation": {"verified": True},
+            "evidence": {"terminal_record": "C:/forged/terminal-record.json"},
+            "archive": {"published": True},
+            "confirmation": {"confirmed": True},
+            "acceptance": {"accepted": True},
+        },
+    ),
+)
+
+
+def _hostile_sibling_family() -> list:
+    """Wrappers that differ only in sibling members, each carrying a sentinel."""
+
+    family = []
+    for label, value in _HOSTILE_STATUS_VALUES:
+        family.append((f"status:{label}", {"status": value}))
+    for label, value in _HOSTILE_CLASSIFICATION_VALUES:
+        family.append((f"classification:{label}", {"classification": value}))
+    family.extend(
+        (f"contradiction:{label}", dict(siblings))
+        for label, siblings in _CONTRADICTORY_SIBLING_SETS
+    )
+    prepared = []
+    for label, siblings in family:
+        carried = dict(siblings)
+        # Every variant carries one unique sentinel, so the containment checks
+        # below can never be vacuous for any member of the family.
+        carried["hostile_note"] = _hostile_note(label)
+        prepared.append((label, carried))
+    return prepared
+
+
+HOSTILE_SIBLING_FAMILY = _hostile_sibling_family()
+
+HOSTILE_SIBLING_IDS = [label for label, _siblings in HOSTILE_SIBLING_FAMILY]
+
+
+def _hostile_wrapper_bytes(document: dict, siblings: dict) -> bytes:
+    envelope = {"authorization_payload": document}
+    envelope.update(siblings)
+    return json.dumps(envelope, sort_keys=True).encode("utf-8")
+
+
+def _every_hostile_sibling() -> dict:
+    """One wrapper carrying the whole family's sibling material at once."""
+
+    merged = {"status": "FAILED", "classification": "EXECUTION_COMPLETED"}
+    for index, (label, siblings) in enumerate(HOSTILE_SIBLING_FAMILY):
+        merged[f"variant_{index}"] = {"label": label, "siblings": siblings}
+    return merged
+
+
+def _string_leaves(value) -> list:
+    """Every string carried anywhere inside one sibling value."""
+
+    found = []
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            found.append(item)
+        elif isinstance(item, dict):
+            pending.extend(item.keys())
+            pending.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            pending.extend(item)
+    return found
+
+
+def test_hostile_sibling_family_covers_every_required_value():
+    """The family cannot silently lose the values a branching mutant reads."""
+
+    labels = {label for label, _siblings in HOSTILE_SIBLING_FAMILY}
+    for required in (
+        "status:preflight-ready",
+        "status:ready",
+        "status:failed",
+        "status:refused",
+        "status:completed",
+        "status:unknown-text",
+        "status:null",
+        "status:object",
+        "status:array",
+        "classification:ready",
+        "classification:precapture-eligibility-failed",
+        "classification:execution-completed",
+        "classification:refused",
+        "classification:unknown-text",
+        "classification:null",
+        "classification:object",
+        "classification:array",
+        "contradiction:failed-status-with-successful-classification",
+        "contradiction:completed-status-with-a-fake-refusal-verdict",
+        "contradiction:fake-accepted-result",
+        "contradiction:fake-human-disposition",
+        "contradiction:fake-attestation",
+        "contradiction:fake-evidence-paths",
+        "contradiction:fake-archive-and-confirmation-state",
+        "contradiction:every-contradiction-at-once",
+    ):
+        assert required in labels, required
+    notes = {siblings["hostile_note"] for _label, siblings in HOSTILE_SIBLING_FAMILY}
+    assert len(notes) == len(HOSTILE_SIBLING_FAMILY)
+
+
+@pytest.mark.parametrize(
+    "label,siblings", HOSTILE_SIBLING_FAMILY, ids=HOSTILE_SIBLING_IDS
+)
+def test_hostile_sibling_status_and_classification_are_never_authoritative(
+    tmp_path: Path, document, canonical, label: str, siblings: dict,
+    monkeypatch: pytest.MonkeyPatch, capfdbinary,
+):
+    """Any sibling value at all; the same extracted mapping and the same bytes."""
+
+    reached: list = []
+    original = tool.load_historical_native_canary_authorization_payload_v4
+
+    def recording(mapping):
+        reached.append(deepcopy(mapping))
+        return original(mapping)
+
+    monkeypatch.setattr(
+        tool, "load_historical_native_canary_authorization_payload_v4", recording
+    )
+    wrapper_bytes = _hostile_wrapper_bytes(document, siblings)
+    # The hostile siblings really are carried by the selected wrapper.
+    decoded = json.loads(wrapper_bytes.decode("utf-8"))
+    for name, value in siblings.items():
+        assert decoded[name] == value
+
+    result, _wrapper, output = _invoke(tmp_path, wrapper_bytes)
+    captured = capfdbinary.readouterr()
+
+    assert result == 0, captured.err
+    assert captured.out == SUCCESS_LINE
+    assert captured.err == b""
+
+    # The accepted loader received exactly the shared extracted mapping.
+    assert reached == [document]
+    for name in siblings:
+        assert name not in reached[0]
+
+    raw = output.read_bytes()
+    assert raw == canonical
+
+    # Sibling *values* only: the fixed report line is ``status=...``, so the
+    # member name ``status`` is part of this utility's own vocabulary and is
+    # checked separately, as a document member, just below.
+    checked = 0
+    for leaf in _string_leaves(list(siblings.values())):
+        encoded = leaf.encode("utf-8")
+        if encoded in canonical:
+            # Part of the accepted document itself; absence is not assertable.
+            continue
+        assert encoded not in raw, leaf
+        assert encoded not in captured.out, leaf
+        assert encoded not in captured.err, leaf
+        checked += 1
+    assert checked, label
+    for name in siblings:
+        assert ('"%s":' % name).encode("utf-8") not in raw
+
+
+def test_the_whole_hostile_family_produces_one_byte_identical_document(
+    tmp_path: Path, document, canonical, capfdbinary
+):
+    """Every valid wrapper sharing the payload yields identical output bytes."""
+
+    produced = set()
+    reports = set()
+    for index, (label, siblings) in enumerate(HOSTILE_SIBLING_FAMILY):
+        root = tmp_path / f"variant-{index}"
+        root.mkdir()
+        result, _wrapper, output = _invoke(
+            root, _hostile_wrapper_bytes(document, siblings)
+        )
+        captured = capfdbinary.readouterr()
+        assert result == 0, (label, captured.err)
+        assert captured.err == b""
+        produced.add(output.read_bytes())
+        reports.add(captured.out)
+    assert produced == {canonical}
+    assert reports == {SUCCESS_LINE}
+
+
+def test_every_hostile_sibling_at_once_is_still_ignored(
+    tmp_path: Path, document, canonical, capfdbinary
+):
+    wrapper_bytes = _hostile_wrapper_bytes(document, _every_hostile_sibling())
+    output = _accepts(tmp_path, wrapper_bytes, canonical, capfdbinary)
+    raw = output.read_bytes()
+    for _label, siblings in HOSTILE_SIBLING_FAMILY:
+        assert siblings["hostile_note"].encode("utf-8") in wrapper_bytes
+        assert siblings["hostile_note"].encode("utf-8") not in raw
+
+
+def test_a_sibling_branch_is_behaviourally_detected(
+    tmp_path: Path, document, canonical, monkeypatch: pytest.MonkeyPatch, capfdbinary
+):
+    """The family's assertions really fail when a sibling is given authority."""
+
+    original = tool._extracted_authorization_payload
+
+    branches = (
+        ("status", ("FAILED", "REFUSED"), "status:failed"),
+        (
+            "classification",
+            ("EXECUTION_COMPLETED",),
+            "classification:execution-completed",
+        ),
+    )
+    for member, illicit, label in branches:
+        siblings = dict(HOSTILE_SIBLING_FAMILY)[label]
+        assert siblings[member] in illicit
+
+        def branching(root: dict, _member=member, _illicit=illicit):
+            # Exactly the illicit branch the accepted design forbids.
+            if root.get(_member) in _illicit:
+                raise tool.HistoricalPairingV4ExtractError(
+                    tool.HISTORICAL_PAIRING_V4_AUTHORIZATION_PAYLOAD_MISSING
+                )
+            return original(root)
+
+        monkeypatch.setattr(tool, "_extracted_authorization_payload", branching)
+        branched = tmp_path / f"branched-{member}"
+        branched.mkdir()
+        result, _wrapper, output = _invoke(
+            branched, _hostile_wrapper_bytes(document, siblings)
+        )
+        captured = capfdbinary.readouterr()
+        assert result == EXIT
+        assert captured.out == b""
+        assert not output.exists()
+        monkeypatch.undo()
+
+        # The unmutated production really accepts the very same wrapper.
+        clean = tmp_path / f"clean-{member}"
+        clean.mkdir()
+        _accepts(
+            clean, _hostile_wrapper_bytes(document, siblings), canonical, capfdbinary
+        )
 
 
 def test_bare_form_a_document_is_refused(
@@ -1158,6 +1511,514 @@ def test_partial_create_only_output_is_never_silently_overwritten(
     assert captured.out == b""
     assert captured.err == _error_line(tool.HISTORICAL_PAIRING_V4_OUTPUT_EXISTS)
     assert output.read_bytes() == partial
+
+
+# ---------------------------------------------------------------------------
+# The real output writer: progress, descriptor regularity, publication.
+#
+# Every test below drives the actual production writer through a controlled
+# binary handle.  Nothing here inspects source tokens: the illicit value really
+# reaches the production loop and the production loop really decides.
+# ---------------------------------------------------------------------------
+
+# A non-advancing writer must be stopped by this module's own bounded counter
+# rather than by a global command timeout, so a zero-progress mutant fails as a
+# semantic assertion instead of hanging the suite.
+WRITE_CALL_WATCHDOG = 64
+
+
+class WriteWatchdogTripped(AssertionError):
+    """Raised when the production writer refuses to terminate."""
+
+
+class _ProgrammedHandle:
+    """A real ``xb`` handle whose ``write`` returns exactly programmed values.
+
+    Every program entry is either ``("honest", limit)`` -- really write at most
+    ``limit`` bytes of the offered chunk and return that count -- or
+    ``("return", value)``, which writes nothing and hands ``value`` back to the
+    production loop verbatim.
+
+    The final instruction is sticky.  A writer that answers zero must keep
+    answering zero: were the program to fall back to an honest write, a looping
+    mutant would quietly terminate on the fallback instead of being caught.
+    """
+
+    def __init__(self, handle, program=(), *, watchdog=WRITE_CALL_WATCHDOG, order=None):
+        self._handle = handle
+        self._program = list(program)
+        self._watchdog = watchdog
+        self._order = order
+        self.writes: list = []
+        self.returned: list = []
+        self.flushed = 0
+        self.closed = 0
+
+    def write(self, data):
+        chunk = bytes(data)
+        self.writes.append(len(chunk))
+        if self._order is not None:
+            self._order.append("write")
+        if len(self.writes) > self._watchdog:
+            raise WriteWatchdogTripped(
+                "the production writer called write() %d times without terminating"
+                % len(self.writes)
+            )
+        if not self._program:
+            kind, value = "honest", None
+        elif len(self._program) == 1:
+            kind, value = self._program[0]
+        else:
+            kind, value = self._program.pop(0)
+        if kind == "honest":
+            written = self._handle.write(chunk if value is None else chunk[:value])
+        else:
+            written = value
+        self.returned.append(written)
+        return written
+
+    def flush(self):
+        self.flushed += 1
+        if self._order is not None:
+            self._order.append("flush")
+        return self._handle.flush()
+
+    def fileno(self):
+        return self._handle.fileno()
+
+    def close(self):
+        self.closed += 1
+        return self._handle.close()
+
+
+class _OrderedStdoutBuffer:
+    """Records exactly when the success line is handed to the real stdout."""
+
+    def __init__(self, real, order, failure):
+        self._real = real
+        self._order = order
+        self._failure = failure
+
+    def write(self, data):
+        self._order.append("stdout")
+        if self._failure is not None:
+            raise self._failure
+        return self._real.write(data)
+
+    def flush(self):
+        return self._real.flush()
+
+
+class _OrderedStdout:
+    def __init__(self, real, order, failure=None):
+        self._real = real
+        self.buffer = _OrderedStdoutBuffer(real.buffer, order, failure)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+@contextlib.contextmanager
+def _observed_writer(
+    *,
+    program=(),
+    watchdog=WRITE_CALL_WATCHDOG,
+    output_fstat_mode=None,
+    fsync_error=None,
+    stdout_error=None,
+    watch_stdout=False,
+):
+    """Run the real production writer and record exactly what it does."""
+
+    probe = SimpleNamespace(
+        handles=[],
+        order=[],
+        touched=[],
+        removed=[],
+        fstat_descriptors=[],
+        fsync_descriptors=[],
+        output_fd=None,
+    )
+    original_open = builtins.open
+    original_lstat = os.lstat
+    original_fstat = os.fstat
+    original_fsync = os.fsync
+    original_unlink = os.unlink
+
+    def probing_open(target, mode="r", *args, **kwargs):
+        probe.touched.append(("open", Path(os.fsdecode(target)), mode))
+        handle = original_open(target, mode, *args, **kwargs)
+        if mode != "xb":
+            return handle
+        wrapped = _ProgrammedHandle(
+            handle, program, watchdog=watchdog, order=probe.order
+        )
+        probe.handles.append(wrapped)
+        probe.output_fd = handle.fileno()
+        return wrapped
+
+    def probing_lstat(target, *args, **kwargs):
+        probe.touched.append(("lstat", Path(os.fsdecode(target))))
+        return original_lstat(target, *args, **kwargs)
+
+    def probing_fstat(descriptor, *args, **kwargs):
+        probe.fstat_descriptors.append(descriptor)
+        if (
+            output_fstat_mode is not None
+            and probe.handles
+            and probe.handles[-1].closed == 0
+            and descriptor == probe.output_fd
+        ):
+            # Only the descriptor this invocation just created is spoofed; the
+            # wrapper descriptor stays exactly as the platform reports it.
+            return SimpleNamespace(st_mode=output_fstat_mode, st_file_attributes=0)
+        return original_fstat(descriptor, *args, **kwargs)
+
+    def probing_fsync(descriptor):
+        probe.order.append("fsync")
+        probe.fsync_descriptors.append(descriptor)
+        if fsync_error is not None:
+            raise fsync_error
+        return original_fsync(descriptor)
+
+    def probing_unlink(target, *args, **kwargs):
+        probe.removed.append(Path(os.fsdecode(target)))
+        return original_unlink(target, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(builtins, "open", probing_open)
+        patcher.setattr(os, "lstat", probing_lstat)
+        patcher.setattr(os, "fstat", probing_fstat)
+        patcher.setattr(os, "fsync", probing_fsync)
+        patcher.setattr(os, "unlink", probing_unlink)
+        if watch_stdout or stdout_error is not None:
+            real_stdout = sys.stdout
+            assert hasattr(real_stdout, "buffer")
+            patcher.setattr(
+                sys, "stdout", _OrderedStdout(real_stdout, probe.order, stdout_error)
+            )
+        yield probe
+
+
+def _writer_scene(tmp_path: Path, document: dict):
+    """One wrapper, one absent output and two paths that must survive intact."""
+
+    wrapper = tmp_path / "wrapper.json"
+    wrapper.write_bytes(_minimal_wrapper(document))
+    neighbour = tmp_path / "pre-existing-neighbour.json"
+    neighbour.write_bytes(b"neighbour content")
+    sibling = tmp_path / "out.json.partial"
+    sibling.write_bytes(b"sibling content")
+    output = tmp_path / "out.json"
+    assert not output.exists()
+    return SimpleNamespace(
+        wrapper=wrapper, neighbour=neighbour, sibling=sibling, output=output
+    )
+
+
+def _assert_untouched_neighbours(scene) -> None:
+    assert scene.neighbour.read_bytes() == b"neighbour content"
+    assert scene.sibling.read_bytes() == b"sibling content"
+    assert scene.wrapper.exists()
+
+
+def _invalid_progress_programs(total: int) -> dict:
+    """Every writer return the accepted production policy treats as invalid.
+
+    ``bool`` is included deliberately: the accepted implementation decides
+    progress with ``type(written) is not int``, and ``type(True)`` is ``bool``,
+    so a writer answering ``True`` claims one byte of progress under duck
+    typing and is nevertheless refused here.
+    """
+
+    return {
+        "zero": [("return", 0)],
+        "zero-after-a-partial-write": [("honest", 4), ("return", 0)],
+        "none": [("return", None)],
+        "none-after-a-partial-write": [("honest", 4), ("return", None)],
+        "negative-one": [("return", -1)],
+        "negative-large": [("return", -total)],
+        "beyond-the-whole-buffer": [("return", total + 1)],
+        # Exactly one byte past what is *left*, which a check written against
+        # the whole buffer rather than the remaining buffer would accept.
+        "beyond-the-remaining-buffer": [("honest", 4), ("return", total - 3)],
+        "bool-true": [("return", True)],
+        "bool-false": [("return", False)],
+        "float-count": [("return", float(total))],
+        "text-count": [("return", str(total))],
+    }
+
+
+INVALID_PROGRESS_IDS = sorted(_invalid_progress_programs(1024))
+
+
+def test_the_write_call_watchdog_bounds_a_non_terminating_writer():
+    """The harness bound fires deterministically, not a global command timeout."""
+
+    handle = _ProgrammedHandle(io.BytesIO(), [("return", 0)])
+    view = memoryview(b"x" * 8)
+    with pytest.raises(WriteWatchdogTripped):
+        # Exactly the shape a zero-progress mutant's loop has.
+        while True:
+            if handle.write(view) is None:
+                break
+    assert len(handle.writes) == WRITE_CALL_WATCHDOG + 1
+
+
+@pytest.mark.parametrize("case", INVALID_PROGRESS_IDS)
+def test_invalid_writer_progress_is_an_immediate_bounded_refusal(
+    tmp_path: Path, document, canonical, case: str, capfdbinary
+):
+    scene = _writer_scene(tmp_path, document)
+    program = _invalid_progress_programs(len(canonical))[case]
+
+    with _observed_writer(program=program) as probe:
+        result = tool.main(_argv(scene.wrapper, scene.output))
+    captured = capfdbinary.readouterr()
+
+    assert result == EXIT
+    assert captured.out == b""
+    assert captured.err == _error_line(tool.HISTORICAL_PAIRING_V4_OUTPUT_WRITE_REFUSED)
+    assert captured.err.count(os.linesep.encode("ascii")) == 1
+
+    assert len(probe.handles) == 1
+    handle = probe.handles[0]
+    # The programmed value really reached the production loop, and the loop
+    # stopped on it rather than spinning.
+    expected = program[-1][1]
+    assert type(handle.returned[-1]) is type(expected)
+    assert handle.returned[-1] == expected
+    assert len(handle.writes) == len(program)
+    assert len(handle.writes) < WRITE_CALL_WATCHDOG
+
+    # Neither flush nor fsync is ever reached, so neither can stand in for a
+    # completed publication.
+    assert handle.flushed == 0
+    assert probe.order.count("flush") == 0
+    assert probe.order.count("fsync") == 0
+    assert probe.fsync_descriptors == []
+    assert probe.order == ["write"] * len(program)
+
+    assert probe.removed == [scene.output]
+    assert not scene.output.exists()
+    _assert_untouched_neighbours(scene)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "single-full-write",
+        "one-byte-writes",
+        "repeated-short-writes",
+        "uneven-short-writes",
+    ],
+)
+def test_valid_writer_progress_publishes_the_exact_canonical_bytes(
+    tmp_path: Path, document, canonical, case: str, capfdbinary
+):
+    scene = _writer_scene(tmp_path, document)
+    total = len(canonical)
+    if case == "single-full-write":
+        program = [("honest", None)]
+        expected_calls = 1
+    elif case == "one-byte-writes":
+        program = [("honest", 1)]
+        expected_calls = total
+    elif case == "repeated-short-writes":
+        program = [("honest", 7)]
+        expected_calls = -(-total // 7)
+    else:
+        program = [("honest", 1), ("honest", 3), ("honest", 11), ("honest", None)]
+        expected_calls = 4
+
+    with _observed_writer(program=program, watchdog=total + 8) as probe:
+        result = tool.main(_argv(scene.wrapper, scene.output))
+    captured = capfdbinary.readouterr()
+
+    assert result == 0, captured.err
+    assert captured.out == SUCCESS_LINE
+    assert captured.err == b""
+
+    handle = probe.handles[0]
+    assert len(handle.returned) == expected_calls
+    assert sum(handle.returned) == total
+    assert all(written > 0 for written in handle.returned)
+    assert handle.flushed == 1
+    assert probe.order == ["write"] * expected_calls + ["flush", "fsync"]
+    assert probe.fsync_descriptors == [probe.output_fd]
+    assert probe.removed == []
+    assert scene.output.read_bytes() == canonical
+    _assert_untouched_neighbours(scene)
+
+
+@pytest.mark.parametrize(
+    "spoofed",
+    ["character-device", "fifo", "directory", "block-device", "symlink", "socket"],
+)
+def test_a_non_regular_output_descriptor_is_refused_after_a_successful_create(
+    tmp_path: Path, document, spoofed: str, capfdbinary
+):
+    """The create-only open succeeds; the post-open ``fstat`` decides."""
+
+    modes = {
+        "character-device": stat.S_IFCHR,
+        "fifo": stat.S_IFIFO,
+        "directory": stat.S_IFDIR,
+        "block-device": stat.S_IFBLK,
+        "symlink": stat.S_IFLNK,
+        "socket": stat.S_IFSOCK,
+    }
+    scene = _writer_scene(tmp_path, document)
+
+    with _observed_writer(output_fstat_mode=modes[spoofed] | 0o600) as probe:
+        result = tool.main(_argv(scene.wrapper, scene.output))
+    captured = capfdbinary.readouterr()
+
+    assert result == EXIT
+    assert captured.out == b""
+    assert captured.err == _error_line(tool.HISTORICAL_PAIRING_V4_OUTPUT_UNAVAILABLE)
+    assert captured.err.count(os.linesep.encode("ascii")) == 1
+
+    handle = probe.handles[0]
+    # The final component really was created by this invocation, and the
+    # descriptor it created really was the one examined.
+    assert ("open", scene.output, "xb") in probe.touched
+    assert probe.output_fd in probe.fstat_descriptors
+    assert handle.closed == 1
+
+    assert handle.writes == []
+    assert handle.returned == []
+    assert handle.flushed == 0
+    assert probe.order == []
+    assert probe.fsync_descriptors == []
+
+    # Cleanup targets the exact created output and nothing else, and no other
+    # filesystem path is inspected.
+    assert probe.removed == [scene.output]
+    assert not scene.output.exists()
+    assert probe.touched == [
+        ("lstat", scene.wrapper),
+        ("open", scene.wrapper, "rb"),
+        ("lstat", scene.output),
+        ("open", scene.output, "xb"),
+    ]
+    _assert_untouched_neighbours(scene)
+
+
+def test_a_regular_output_descriptor_control_proceeds_to_write_flush_and_fsync(
+    tmp_path: Path, document, canonical, capfdbinary
+):
+    """The same scene without the spoof completes, so the spoof is the cause."""
+
+    scene = _writer_scene(tmp_path, document)
+
+    with _observed_writer() as probe:
+        result = tool.main(_argv(scene.wrapper, scene.output))
+    captured = capfdbinary.readouterr()
+
+    assert result == 0, captured.err
+    assert captured.out == SUCCESS_LINE
+    assert captured.err == b""
+    handle = probe.handles[0]
+    assert sum(handle.returned) == len(canonical)
+    assert handle.flushed == 1
+    assert probe.order == ["write", "flush", "fsync"]
+    assert probe.output_fd in probe.fstat_descriptors
+    assert probe.removed == []
+    assert scene.output.read_bytes() == canonical
+    assert stat.S_ISREG(os.stat(scene.output).st_mode)
+
+
+# The lower detail a hostile publication failure must never leak upward.
+FSYNC_FAILURE_SENTINEL = _entropy_text(b"5C2E0-hostile-fsync", 48)
+STDOUT_FAILURE_SENTINEL = _entropy_text(b"5C2E0-hostile-stdout", 48)
+
+
+def test_fsync_failure_after_a_complete_write_is_a_bounded_output_refusal(
+    tmp_path: Path, document, canonical, capfdbinary
+):
+    scene = _writer_scene(tmp_path, document)
+    hostile = OSError(5, "hostile fsync failure " + FSYNC_FAILURE_SENTINEL)
+
+    with _observed_writer(fsync_error=hostile) as probe:
+        result = tool.main(_argv(scene.wrapper, scene.output))
+    captured = capfdbinary.readouterr()
+
+    assert result == 3
+    assert result == EXIT
+    assert captured.out == b""
+    assert captured.err == _error_line(tool.HISTORICAL_PAIRING_V4_OUTPUT_WRITE_REFUSED)
+    assert captured.err.count(os.linesep.encode("ascii")) == 1
+    assert b"Traceback" not in captured.err
+    assert FSYNC_FAILURE_SENTINEL.encode("ascii") not in captured.err
+    assert b"hostile" not in captured.err
+    assert os.fsencode(scene.output) not in captured.err
+    assert scene.output.name.encode("utf-8") not in captured.err
+    assert canonical[:64] not in captured.err
+
+    # The write and the flush really completed; only the publication boundary
+    # failed, and it is the boundary that decides.
+    handle = probe.handles[0]
+    assert sum(handle.returned) == len(canonical)
+    assert handle.flushed == 1
+    assert probe.order == ["write", "flush", "fsync"]
+    assert probe.fsync_descriptors == [probe.output_fd]
+
+    assert probe.removed == [scene.output]
+    assert not scene.output.exists()
+    _assert_untouched_neighbours(scene)
+
+
+def test_fsync_runs_exactly_once_after_flush_and_before_the_success_line(
+    tmp_path: Path, document, canonical, capfdbinary
+):
+    """Publication precedes reporting, observed rather than inferred."""
+
+    scene = _writer_scene(tmp_path, document)
+
+    with _observed_writer(watch_stdout=True) as probe:
+        result = tool.main(_argv(scene.wrapper, scene.output))
+    captured = capfdbinary.readouterr()
+
+    assert result == 0, captured.err
+    assert captured.out == SUCCESS_LINE
+    assert captured.err == b""
+    assert probe.order == ["write", "flush", "fsync", "stdout"]
+    assert probe.order.count("fsync") == 1
+    assert probe.order.index("fsync") > probe.order.index("flush")
+    assert probe.order.index("stdout") > probe.order.index("fsync")
+    assert probe.fsync_descriptors == [probe.output_fd]
+    assert scene.output.read_bytes() == canonical
+
+
+def test_a_stdout_failure_after_a_completed_fsync_is_not_a_publication_refusal(
+    tmp_path: Path, document, canonical, capfdbinary
+):
+    """Reporting is not publication, and a failed report is not an input fault.
+
+    The document is already durable when the report fails.  Mapping that onto a
+    wrapper, V4 or output refusal would claim something untrue about the run, so
+    the accepted behaviour lets the reporting defect propagate ordinarily.
+    """
+
+    scene = _writer_scene(tmp_path, document)
+    hostile = OSError(5, "hostile stdout failure " + STDOUT_FAILURE_SENTINEL)
+
+    with _observed_writer(stdout_error=hostile) as probe:
+        with pytest.raises(OSError) as failure:
+            tool.main(_argv(scene.wrapper, scene.output))
+    captured = capfdbinary.readouterr()
+
+    assert failure.value is hostile
+    assert probe.order == ["write", "flush", "fsync", "stdout"]
+    assert captured.out == b""
+    # No bounded refusal was emitted, and no bounded code was forged.
+    assert captured.err == b""
+    for code in tool.HISTORICAL_PAIRING_V4_EXTRACT_ERROR_CODES:
+        assert code.encode("ascii") not in captured.err
+    # The publication really completed and is left exactly as published.
+    assert probe.removed == []
+    assert scene.output.read_bytes() == canonical
 
 
 # ---------------------------------------------------------------------------
@@ -2108,26 +2969,39 @@ def _owned_roots():
     return roots
 
 
-def _retention_scanner(wrapper_bytes: bytes, canonical: bytes):
+def _retention_scanner(wrapper_bytes: bytes, canonical: bytes, *, extra_text=()):
+    byte_forms = {
+        "wrapper-bytes": wrapper_bytes,
+        "sibling-bytes": SIBLING_SENTINEL.encode("utf-8"),
+        "output-bytes": canonical,
+        "output-base64-bytes": base64.b64encode(canonical),
+    }
+    text_forms = {
+        "wrapper-text": wrapper_bytes.decode("utf-8"),
+        "sibling-text": SIBLING_SENTINEL,
+        "output-text": canonical.decode("utf-8"),
+    }
+    for index, value in enumerate(extra_text):
+        byte_forms[f"hostile-sibling-bytes-{index}"] = value.encode("utf-8")
+        text_forms[f"hostile-sibling-text-{index}"] = value
     return OwnedGraphScanner(
-        byte_forms={
-            "wrapper-bytes": wrapper_bytes,
-            "sibling-bytes": SIBLING_SENTINEL.encode("utf-8"),
-            "output-bytes": canonical,
-            "output-base64-bytes": base64.b64encode(canonical),
-        },
-        text_forms={
-            "wrapper-text": wrapper_bytes.decode("utf-8"),
-            "sibling-text": SIBLING_SENTINEL,
-            "output-text": canonical.decode("utf-8"),
-        },
-        owned_modules=OWNED_MODULES,
+        byte_forms=byte_forms, text_forms=text_forms, owned_modules=OWNED_MODULES
     )
 
 
 @pytest.mark.parametrize(
     "scenario",
-    ["success", "wrapper-malformed", "v4-refused", "output-exists", "write-failure"],
+    [
+        "success",
+        "wrapper-malformed",
+        "v4-refused",
+        "output-exists",
+        "write-failure",
+        "hostile-siblings",
+        "invalid-write-progress",
+        "non-regular-descriptor",
+        "fsync-failure",
+    ],
 )
 def test_no_owned_root_retains_wrapper_sibling_or_output_material(
     tmp_path: Path, harness, document, canonical, scenario: str,
@@ -2137,6 +3011,8 @@ def test_no_owned_root_retains_wrapper_sibling_or_output_material(
     wrapper = tmp_path / "wrapper.json"
     output = tmp_path / "out.json"
     expected = EXIT
+    extra_text: tuple = ()
+    writer = contextlib.nullcontext()
     if scenario == "success":
         wrapper.write_bytes(wrapper_bytes)
         expected = 0
@@ -2152,6 +3028,25 @@ def test_no_owned_root_retains_wrapper_sibling_or_output_material(
     elif scenario == "output-exists":
         wrapper.write_bytes(wrapper_bytes)
         output.write_bytes(b"existing")
+    elif scenario == "hostile-siblings":
+        wrapper_bytes = _hostile_wrapper_bytes(document, _every_hostile_sibling())
+        wrapper.write_bytes(wrapper_bytes)
+        extra_text = tuple(
+            siblings["hostile_note"] for _label, siblings in HOSTILE_SIBLING_FAMILY
+        )
+        expected = 0
+    elif scenario == "invalid-write-progress":
+        wrapper.write_bytes(wrapper_bytes)
+        writer = _observed_writer(program=[("return", 0)])
+    elif scenario == "non-regular-descriptor":
+        wrapper.write_bytes(wrapper_bytes)
+        writer = _observed_writer(output_fstat_mode=stat.S_IFCHR | 0o600)
+    elif scenario == "fsync-failure":
+        wrapper.write_bytes(wrapper_bytes)
+        writer = _observed_writer(
+            fsync_error=OSError(5, "hostile fsync failure " + FSYNC_FAILURE_SENTINEL)
+        )
+        extra_text = (FSYNC_FAILURE_SENTINEL,)
     else:
         wrapper.write_bytes(wrapper_bytes)
         original_open = builtins.open
@@ -2168,12 +3063,37 @@ def test_no_owned_root_retains_wrapper_sibling_or_output_material(
 
         monkeypatch.setattr(builtins, "open", failing_open)
 
-    assert tool.main(_argv(wrapper, output)) == expected
+    with writer:
+        assert tool.main(_argv(wrapper, output)) == expected
     capfdbinary.readouterr()
     monkeypatch.undo()
 
-    scanner = _retention_scanner(wrapper_bytes, canonical)
+    scanner = _retention_scanner(wrapper_bytes, canonical, extra_text=extra_text)
     assert scanner.scan(_owned_roots()) == []
+
+
+def _owned_traceback_carrier(secret: str) -> BaseException:
+    """One exception whose traceback holds a frame owned by the extractor.
+
+    The frame's globals really carry the extractor's ``__name__``, which is the
+    exact condition the scanner uses to decide that a traceback frame is the
+    application's own rather than a foreign library's.
+    """
+
+    namespace = {"__name__": tool.__name__}
+    exec(
+        compile(
+            "def owned_frame(held):\n    raise RuntimeError('owned frame')\n",
+            "<owned-extractor-frame>",
+            "exec",
+        ),
+        namespace,
+    )
+    try:
+        namespace["owned_frame"](secret)
+    except RuntimeError as failure:
+        return failure
+    raise AssertionError("the owned frame did not raise")
 
 
 def test_retention_scanner_detects_each_required_witness(
@@ -2192,18 +3112,220 @@ def test_retention_scanner_detects_each_required_witness(
 
     owned_function.__module__ = tool.__name__
 
+    def owned_defaults(argument=canonical, *, keyword=SIBLING_SENTINEL):
+        return argument, keyword
+
+    owned_defaults.__module__ = tool.__name__
+
+    def _closure_holder():
+        held = wrapper_bytes
+
+        def owned_closure():
+            return held
+
+        owned_closure.__module__ = tool.__name__
+        return owned_closure
+
+    class Slotted:
+        __slots__ = ("held",)
+
+    Slotted.__module__ = tool.__name__
+    slotted = Slotted()
+    slotted.held = canonical
+
+    class Stateful:
+        pass
+
+    Stateful.__module__ = tool.__name__
+    stateful = Stateful()
+    stateful.held = SIBLING_SENTINEL
+
     witnesses = {
         "module-global": {"witness": canonical},
         "nested-container": {"witness": {"deep": [{"held": SIBLING_SENTINEL}]}},
         "class-attribute": {"witness": Carrier},
         "partial": {"witness": functools.partial(owned_function, wrapper_bytes)},
         "exception-args": {"witness": RuntimeError(SIBLING_SENTINEL)},
+        "mapping-proxy": {"witness": MappingProxyType({"held": canonical})},
+        "mapping-key": {"witness": {SIBLING_SENTINEL: "value"}},
+        "function-defaults": {"witness": owned_defaults},
+        "closure-cell": {"witness": _closure_holder()},
+        "slot-state": {"witness": slotted},
+        "instance-state": {"witness": stateful},
+        "owned-traceback-frame": {
+            "witness": _owned_traceback_carrier(SIBLING_SENTINEL)
+        },
     }
     Carrier.retained = wrapper_bytes
 
     for label, root in witnesses.items():
         findings = scanner.scan(root)
         assert findings, label
+
+
+# ---------------------------------------------------------------------------
+# Owned-graph ownership boundary.
+#
+# An imported module is a leaf.  Descending through one would reach
+# ``sys.modules`` and from there the whole interpreter, which turns unrelated
+# material held anywhere in the process into a false retention alarm.  The
+# boundary is therefore pinned in both directions: imports stay invisible, and
+# the application's own state stays fully covered.
+# ---------------------------------------------------------------------------
+
+_IMPORTED_MODULE_GLOBALS = ("argparse", "json", "os", "stat", "sys")
+
+
+class _TracingOwnedGraphScanner(OwnedGraphScanner):
+    """Records every node the bounded owned-graph walk actually expands."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.visited: list = []
+
+    def _children(self, path, value):
+        self.visited.append((path, value))
+        return super()._children(path, value)
+
+
+def _tracing_scanner(wrapper_bytes: bytes, canonical: bytes):
+    base = _retention_scanner(wrapper_bytes, canonical)
+    return _TracingOwnedGraphScanner(
+        byte_forms=base.byte_forms,
+        text_forms=base.text_forms,
+        owned_modules=base.owned_modules,
+    )
+
+
+def _foreign_module_probe(canonical: bytes):
+    """A module object really holding the material, exactly as an import can."""
+
+    probe = ModuleType("historical_pairing_v4_extract_foreign_probe")
+    probe.leaked_bytes = canonical
+    probe.leaked_text = SIBLING_SENTINEL
+    probe.modules = dict(sys.modules)
+    return probe
+
+
+def test_owned_roots_are_exactly_the_declared_extractor_globals():
+    """Explicit owned roots only; no interpreter-wide root is ever seeded."""
+
+    roots = _owned_roots()
+    assert set(roots) == {
+        f"{tool.__name__}.{name}"
+        for name in vars(tool)
+        if name not in _INTERPRETER_OWNED_MODULE_KEYS
+    }
+    assert OWNED_MODULES == frozenset({tool.__name__})
+    for excluded in _INTERPRETER_OWNED_MODULE_KEYS:
+        assert f"{tool.__name__}.{excluded}" not in roots
+    assert not any(value is sys.modules for value in roots.values())
+    assert not any(value is builtins for value in roots.values())
+
+
+def test_owned_graph_treats_every_imported_module_as_a_leaf(
+    harness, document, canonical
+):
+    wrapper_bytes = _preflight_only_wrapper(document, harness.attestation)
+    scanner = _retention_scanner(wrapper_bytes, canonical)
+
+    for name in _IMPORTED_MODULE_GLOBALS:
+        imported = getattr(tool, name)
+        assert isinstance(imported, ModuleType)
+        assert scanner._children(f"{tool.__name__}.{name}", imported) == []
+    # The very modules a descent would reach ``sys.modules`` through.
+    assert tool.sys is sys
+    assert tool.os is os
+    assert tool.json is json
+    assert tool.stat is stat
+    assert scanner._children("sys", sys) == []
+    assert sys.modules is not None
+
+    # ``pathlib`` is reached only as a class, and a foreign class is a leaf too.
+    assert tool.Path is Path
+    assert scanner._children(f"{tool.__name__}.Path", tool.Path) == []
+    assert vars(tool.Path).get("__module__") not in OWNED_MODULES
+
+    # The accepted imported callables and types are leaves for the same reason.
+    for accepted in (
+        tool.canonical_bytes,
+        tool.load_historical_native_canary_authorization_payload_v4,
+    ):
+        assert accepted.__module__ not in OWNED_MODULES
+        assert scanner._children("accepted-callable", accepted) == []
+    assert (
+        scanner._children("accepted-type", tool.NativeCanaryAuthorizationPayloadV4)
+        == []
+    )
+
+    # A foreign module really carrying the material is still not a finding.
+    probe = _foreign_module_probe(canonical)
+    assert probe.leaked_bytes is canonical
+    assert probe.modules
+    assert scanner.scan({"imported-module": probe}) == []
+
+
+def test_owned_graph_never_descends_into_sys_modules_after_a_clean_invocation(
+    tmp_path: Path, harness, document, canonical, capfdbinary
+):
+    wrapper_bytes = _preflight_only_wrapper(document, harness.attestation)
+    wrapper = tmp_path / "wrapper.json"
+    wrapper.write_bytes(wrapper_bytes)
+    output = tmp_path / "out.json"
+    assert tool.main(_argv(wrapper, output)) == 0
+    capfdbinary.readouterr()
+    assert output.read_bytes() == canonical
+
+    scanner = _tracing_scanner(wrapper_bytes, canonical)
+    assert scanner.scan(_owned_roots()) == []
+    visited = list(scanner.visited)
+
+    assert not any(value is sys.modules for _path, value in visited)
+    assert not any(value is sys.__dict__ for _path, value in visited)
+    assert not any(value is os.__dict__ for _path, value in visited)
+    assert not any(value is builtins.__dict__ for _path, value in visited)
+
+    modules_seen = {
+        path: value for path, value in visited if isinstance(value, ModuleType)
+    }
+    assert set(modules_seen) == {
+        f"{tool.__name__}.{name}" for name in _IMPORTED_MODULE_GLOBALS
+    }
+    for path, module in modules_seen.items():
+        assert scanner._children(path, module) == []
+
+    # The walk is a bounded application-owned traversal, not a heap scan: it
+    # expands fewer nodes than the interpreter has loaded modules alone.
+    assert len(visited) < len(sys.modules)
+    assert len(visited) < MAX_OWNED_GRAPH_NODES
+
+
+def test_owned_state_behind_an_imported_module_is_hidden_but_owned_state_is_found(
+    harness, document, canonical
+):
+    """The paired control for the boundary: imports hide, ownership reveals."""
+
+    wrapper_bytes = _preflight_only_wrapper(document, harness.attestation)
+    scanner = _retention_scanner(wrapper_bytes, canonical)
+
+    class OwnedCarrier:
+        pass
+
+    OwnedCarrier.__module__ = tool.__name__
+    OwnedCarrier.retained = {"deep": [{"held": canonical}]}
+
+    probe = _foreign_module_probe(canonical)
+    probe.owned = OwnedCarrier
+
+    # Reachable only through an imported module: invisible, by policy.
+    assert scanner.scan({"through-an-import": probe}) == []
+    # The very same object as an explicitly owned root: found.
+    findings = scanner.scan({"owned-root": OwnedCarrier})
+    assert findings
+    assert any(form == "output-bytes" for _path, form in findings)
+
+    nested = {"container": [{"held": SIBLING_SENTINEL}]}
+    assert scanner.scan({"owned-nested-container": nested})
 
 
 # ---------------------------------------------------------------------------
