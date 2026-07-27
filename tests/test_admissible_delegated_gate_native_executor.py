@@ -2609,6 +2609,85 @@ def test_path_or_pathext_change_between_request_and_pre_spawn_blocks_with_zero_r
     assert h.runner.invocations == []
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows command-line limit")
+def test_unspawnable_argv_is_refused_before_the_native_attempt_is_reserved(tmp_path: Path):
+    """The exact defect that killed native-cursor-neon-relay-001.
+
+    That run reserved its single native attempt and *then* died at
+    ``CreateProcessW`` with WinError 206.  The guard must refuse first, so the
+    attempt slot, the provider budget and the runner all stay untouched.
+    """
+
+    from admissible.delegated_gate.native_executor import (
+        NativeArgvTooLongError,
+        WINDOWS_MAX_COMMAND_LINE_CHARS,
+    )
+
+    h, _ = _wrapper_chain_harness(tmp_path)
+    state = h.session_store.load(h.session_id)
+    base = build_native_agent_prompt(
+        mission=state.mission, gate_contract=state.current_gate, work_workspace=h.work
+    )
+    # Keep the harness-controlled header; make the final argv unspawnable while
+    # staying inside the 65536-byte prompt bound -- exactly the regime the real
+    # 64660-byte Neon Relay prompt lives in.
+    prompt = base + ("X" * (64000 - len(base.encode("utf-8"))))
+    assert WINDOWS_MAX_COMMAND_LINE_CHARS < len(prompt.encode("utf-8")) <= 65536
+    request = NativeExecutionRequest.create(
+        session_id=state.session_id, gate_id=state.current_gate.gate_id, execution_attempt_index=0,
+        mission_fingerprint=state.mission.mission_fingerprint,
+        gate_contract_fingerprint=state.current_gate.contract_fingerprint,
+        work_workspace=h.work, evidence_store_root=h.store.directory,
+        artifact_directory=h.store.artifact_directory,
+        attestation=h.attestation, prompt=prompt, timeout_seconds=30,
+        stdout_byte_limit=4096, stderr_byte_limit=2048,
+    )
+    h.store.create_request(request)
+    with pytest.raises(NativeArgvTooLongError) as excinfo:
+        h.executor.execute(
+            request=request, prompt=prompt, source_repository=h.source, canary_parent=h.root,
+            allowed_parent_children=frozenset({h.work.name}), evidence_store_root=h.store.directory,
+            artifact_directory=h.store.artifact_directory, required_commit_message=REQUIRED_COMMIT_MESSAGE,
+            required_material_paths=EXPECTED_MATERIAL_PATHS, execution_store=h.store,
+        )
+
+    assert str(WINDOWS_MAX_COMMAND_LINE_CHARS) in str(excinfo.value)
+    assert "X" * 100 not in str(excinfo.value), "diagnostic must not carry prompt content"
+    # Nothing was consumed: no attempt, no process, no runner call.
+    assert not h.store.has_attempt_reserved(state.session_id, state.current_gate.gate_id, 0)
+    assert not h.store.has_process_started(state.session_id, state.current_gate.gate_id, 0)
+    assert h.runner.invocations == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows command-line limit")
+def test_a_spawnable_argv_still_reserves_and_runs(tmp_path: Path):
+    """The guard is not simply refusing everything."""
+
+    h, _ = _wrapper_chain_harness(tmp_path)
+    state = h.session_store.load(h.session_id)
+    prompt = build_native_agent_prompt(
+        mission=state.mission, gate_contract=state.current_gate, work_workspace=h.work
+    )
+    request = NativeExecutionRequest.create(
+        session_id=state.session_id, gate_id=state.current_gate.gate_id, execution_attempt_index=0,
+        mission_fingerprint=state.mission.mission_fingerprint,
+        gate_contract_fingerprint=state.current_gate.contract_fingerprint,
+        work_workspace=h.work, evidence_store_root=h.store.directory,
+        artifact_directory=h.store.artifact_directory,
+        attestation=h.attestation, prompt=prompt, timeout_seconds=30,
+        stdout_byte_limit=4096, stderr_byte_limit=2048,
+    )
+    h.store.create_request(request)
+    h.executor.execute(
+        request=request, prompt=prompt, source_repository=h.source, canary_parent=h.root,
+        allowed_parent_children=frozenset({h.work.name}), evidence_store_root=h.store.directory,
+        artifact_directory=h.store.artifact_directory, required_commit_message=REQUIRED_COMMIT_MESSAGE,
+        required_material_paths=EXPECTED_MATERIAL_PATHS, execution_store=h.store,
+    )
+    assert h.store.has_attempt_reserved(state.session_id, state.current_gate.gate_id, 0)
+    assert len(h.runner.invocations) == 1
+
+
 def test_powershell_inventory_requires_adjacent_wrappers_and_rejects_substitutions(tmp_path: Path):
     root = _wrapper_chain_installation(tmp_path)
     with pytest.raises(ValueError, match="adjacent .ps1"):

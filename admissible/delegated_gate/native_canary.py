@@ -41,6 +41,7 @@ from admissible.delegated_gate.fixture_registry import (
 from admissible.delegated_gate.mission_profile import (
     FLAGSHIP_INCIDENT_REPLAY_PROFILE,
     NEON_RELAY_PROFILE,
+    NEON_RELAY_V2_PROFILE,
     NEON_SIEGE_PROFILE,
     ONE_SHOT_PROFILE_BUDGETS,
     WORKFLOW_RECOVERY_PROFILE,
@@ -61,10 +62,22 @@ from admissible.delegated_gate.durability import (
 from admissible.delegated_gate.events import CheckpointRecorded, GateExecutionStarted
 from admissible.delegated_gate.models import CommandEvidence, EvidenceKind, EvidenceStatus, GateClause, GateContract, GatePlan, Mission, VerificationCommand
 from admissible.delegated_gate.native_executor import (
+    ATTESTATION_CLASS_ACP_STDIO,
     ATTESTATION_CLASS_PACKAGE_BIN,
     ATTESTATION_CLASS_WRAPPER_CHAIN,
+    ACP_STDIO_NON_CLAIMS,
+    ACP_STDIO_READY_REASON,
+    AcpStdioBackendAttestation,
     AtomicNativeExecutionStore,
     BackendAttestation,
+    NATIVE_PROMPT_TRANSPORTS,
+    NativeArgvTooLongError,
+    PROMPT_TRANSPORT_ACP_STDIO,
+    PROMPT_TRANSPORT_ARGV,
+    WINDOWS_MAX_COMMAND_LINE_CHARS,
+    require_prompt_transport,
+    require_windows_spawnable_argv,
+    windows_serialized_command_line,
     CAPTURE_EXPECTED_SUCCESS_STATUS,
     CURSOR_DISCOVERY_COMMAND,
     CursorNativeBackendConfig,
@@ -146,6 +159,7 @@ PACKAGE_BIN_READY_REASON = "LOCAL_CURSOR_CAPABILITIES_ATTESTED"
 CLASS_READINESS_REASONS: dict[str, str] = {
     ATTESTATION_CLASS_WRAPPER_CHAIN: WRAPPER_CHAIN_READY_REASON,
     ATTESTATION_CLASS_PACKAGE_BIN: PACKAGE_BIN_READY_REASON,
+    ATTESTATION_CLASS_ACP_STDIO: ACP_STDIO_READY_REASON,
 }
 # Deterministic run-root children the committed CLI always creates.  They are
 # bound into the payload so an authorized digest cannot be reused against a
@@ -460,6 +474,7 @@ def registered_profiles() -> dict[str, NativeMissionProfile]:
             WORKFLOW_RECOVERY_V2_PROFILE,
             NEON_SIEGE_PROFILE,
             NEON_RELAY_PROFILE,
+            NEON_RELAY_V2_PROFILE,
         )
     }
 
@@ -506,8 +521,16 @@ def create_canary_session(*, session_id: str, profile: NativeMissionProfile | No
     return new_session_state(session_id=session_id, mission=mission, gate_plan=GatePlan.create(mission=mission, ordered_gate_contracts=(gate,)))
 
 
-def build_native_agent_prompt(*, mission: Mission, gate_contract: GateContract, work_workspace: str | Path, required_commit_message: str | None = REQUIRED_COMMIT_MESSAGE, completion_conditions: str | None = None, profile: NativeMissionProfile | None = None) -> str:
-    mission.validated(); gate_contract.validated(); workspace, _ = _safe_directory(work_workspace, "assigned work workspace")
+def build_native_agent_prompt(*, mission: Mission, gate_contract: GateContract, work_workspace: str | Path, required_commit_message: str | None = REQUIRED_COMMIT_MESSAGE, completion_conditions: str | None = None, profile: NativeMissionProfile | None = None, allow_projected_workspace: bool = False) -> str:
+    mission.validated(); gate_contract.validated()
+    if allow_projected_workspace:
+        # Preflight projection only: the run root does not exist yet, so the
+        # workspace path is resolved lexically instead of on disk.  Every other
+        # byte of the prompt is identical to the one execution will build, which
+        # is what makes the preflight argv measurement exact.
+        workspace = _lexical_absolute(work_workspace, "projected work workspace")
+    else:
+        workspace, _ = _safe_directory(work_workspace, "assigned work workspace")
     clauses = "\n".join(f"- [{clause.clause_id}] {clause.text}" for clause in gate_contract.clauses)
     if profile is not None:
         profile = profile.validated()
@@ -1283,6 +1306,8 @@ class NativeCanaryAuthorizationPayload:
             # The owner explicitly authorizes the weaker class with every
             # non-claim spelled out; a mismatch is not authorizable.
             if tuple(self.attestation_non_claims) != WRAPPER_CHAIN_NON_CLAIMS: raise ValueError("authorization non-claims differ from the wrapper-chain attestation class")
+        elif self.backend_attestation_class == ATTESTATION_CLASS_ACP_STDIO:
+            if tuple(self.attestation_non_claims) != ACP_STDIO_NON_CLAIMS: raise ValueError("authorization non-claims differ from the ACP stdio attestation class")
         else:
             raise ValueError("authorization attestation class is unsupported")
         # Exact class/reason pairing: the readiness reason is the concrete
@@ -2753,6 +2778,8 @@ class NativeCanaryAuthorizationPayloadV4:
             if tuple(self.attestation_non_claims) != PACKAGE_BIN_NON_CLAIMS: raise ValueError("authorization non-claims differ from the package-bin attestation class")
         elif self.backend_attestation_class == ATTESTATION_CLASS_WRAPPER_CHAIN:
             if tuple(self.attestation_non_claims) != WRAPPER_CHAIN_NON_CLAIMS: raise ValueError("authorization non-claims differ from the wrapper-chain attestation class")
+        elif self.backend_attestation_class == ATTESTATION_CLASS_ACP_STDIO:
+            if tuple(self.attestation_non_claims) != ACP_STDIO_NON_CLAIMS: raise ValueError("authorization non-claims differ from the ACP stdio attestation class")
         else:
             raise ValueError("authorization attestation class is unsupported")
         require_nonempty_text(self.backend_readiness_reason,"authorization readiness reason",max_bytes=256)
@@ -3001,6 +3028,90 @@ def _write_run_metadata_once(path: Path, payload: Mapping[str, Any]) -> None:
         raise NativeEvidenceInvalid("canary metadata is write-once") from exc
 
 
+NATIVE_ARGV_LIMIT_REASON = "NATIVE_ARGV_WINDOWS_COMMAND_LINE_LIMIT"
+NATIVE_TRANSPORT_BINDING_REASON = "NATIVE_PROMPT_TRANSPORT_BINDING_REFUSED"
+
+
+def authorized_prompt_transport(
+    profile: NativeMissionProfile | None, attestation: BackendAttestation
+) -> str:
+    """The one transport both the profile and the attestation agree on.
+
+    Both are inside the canonical authorization payload, so the transport is
+    bound *before* the owner authorizes.  Disagreement is refused rather than
+    resolved, and nothing here consults the prompt or its length.
+    """
+
+    attested = require_prompt_transport(
+        attestation.prompt_transport, "attested prompt transport"
+    )
+    declared = require_prompt_transport(
+        profile.prompt_transport if profile is not None else PROMPT_TRANSPORT_ARGV,
+        "profile prompt transport",
+    )
+    if attested != declared:
+        raise ValueError(
+            "profile prompt transport and backend attestation transport disagree: "
+            f"profile={declared} attestation={attested}"
+        )
+    return attested
+
+
+def preflight_prompt_transport_guard(
+    *,
+    profile: NativeMissionProfile | None,
+    session_id: str,
+    run_root: str | Path,
+    attestation: BackendAttestation,
+    transport: str,
+) -> dict[str, Any]:
+    """Prove the authorized transport can actually launch, before anything exists.
+
+    For ``ARGV_PROMPT`` this measures the *final prompt-bearing* argv with the
+    exact quoting semantics ``subprocess`` uses for ``CreateProcessW`` and
+    refuses anything past the platform limit.  For ``ACP_STDIO`` it measures the
+    short static server argv and additionally proves the prompt is absent from
+    argv entirely.
+
+    Runs before run-root creation, before native-attempt reservation and before
+    any spawn, so a refusal consumes no attempt and no provider invocation.  The
+    returned diagnostic carries measured lengths only -- never prompt content.
+    """
+
+    workspace = _lexical_absolute(
+        Path(_lexical_absolute(run_root, "future run root")) / WORKSPACE_DIRECTORY_NAME,
+        "projected work workspace",
+    )
+    state = create_canary_session(session_id=session_id, profile=profile)
+    gate = state.gate_plan.ordered_gate_contracts[0]
+    prompt = build_native_agent_prompt(
+        mission=state.mission, gate_contract=gate, work_workspace=workspace,
+        required_commit_message=(
+            profile.required_commit_message if profile is not None else REQUIRED_COMMIT_MESSAGE
+        ),
+        completion_conditions=(
+            profile.completion_conditions_text if profile is not None else None
+        ),
+        profile=profile, allow_projected_workspace=True,
+    )
+    argv = attestation.argv(prompt=prompt)
+    if transport == PROMPT_TRANSPORT_ACP_STDIO:
+        if any(prompt in member for member in argv):
+            raise ValueError("ACP transport argv must never contain the prompt")
+    serialized = require_windows_spawnable_argv(
+        argv, label=f"{transport} prompt-bearing argv"
+    )
+    return {
+        "prompt_transport": transport,
+        "serialized_command_line_chars": serialized,
+        "serialized_command_line_limit_chars": WINDOWS_MAX_COMMAND_LINE_CHARS,
+        "argv_member_count": len(argv),
+        "prompt_in_argv": transport == PROMPT_TRANSPORT_ARGV,
+        "prompt_chars": len(prompt),
+        "prompt_utf8_bytes": len(prompt.encode("utf-8")),
+    }
+
+
 def _validate_future_run_root(
     *, run_root_value: str | Path, run_id: str, source: Path
 ) -> Path:
@@ -3023,7 +3134,7 @@ def build_parser() -> argparse.ArgumentParser:
     profile_selection = parser.add_mutually_exclusive_group()
     profile_selection.add_argument("--profile-id",default=None,help="Explicit registered mission-profile selection; omitted with no document selects the historical canary mission with its exact historical defaults. No environment fallback exists.")
     profile_selection.add_argument("--profile-document",default=None,help="Absolute path to one exact runtime-v2 NativeMissionProfile JSON document. No registry fallback or insertion occurs.")
-    parser.add_argument("--attestation-class",choices=["package-bin","wrapper-chain"],default="package-bin",help="Explicit attestation class. wrapper-chain is the weaker LOCAL_WRAPPER_CHAIN class: it derives every launcher file from canonical host cursor-agent discovery, establishes no publisher provenance, and requires owner authorization naming that exact class.")
+    parser.add_argument("--attestation-class",choices=["package-bin","wrapper-chain","acp-stdio"],default="package-bin",help="Explicit attestation class. wrapper-chain is the weaker LOCAL_WRAPPER_CHAIN class: it derives every launcher file from canonical host cursor-agent discovery, establishes no publisher provenance, and requires owner authorization naming that exact class. acp-stdio is LOCAL_ACP_STDIO: the same wrapper-chain launcher authority bound to the fixed '<node> <index.js> acp' server argv, with the prompt carried over ACP stdin instead of argv.")
     parser.add_argument("--owner-authorization",help="Explicit owner phrase; never persisted"); parser.add_argument("--preflight-only",action="store_true",help="Print local attestation and authorization payload without creating a run")
     return parser
 
@@ -3063,7 +3174,7 @@ def main(argv: list[str] | None = None, *, _validated_profile: NativeMissionProf
     if not 1<=timeout_seconds<=3600: print(json.dumps({**blocked,"detail":"timeout must be from 1 through 3600 seconds"},sort_keys=True)); return 2
     try: source,_=_safe_directory(args.source_repository,"source repository")
     except ValueError as exc: print(json.dumps({**blocked,"detail":str(exc)},sort_keys=True)); return 2
-    attestation_class=ATTESTATION_CLASS_WRAPPER_CHAIN if args.attestation_class=="wrapper-chain" else ATTESTATION_CLASS_PACKAGE_BIN
+    attestation_class={"wrapper-chain":ATTESTATION_CLASS_WRAPPER_CHAIN,"acp-stdio":ATTESTATION_CLASS_ACP_STDIO}.get(args.attestation_class,ATTESTATION_CLASS_PACKAGE_BIN)
     try: config=CursorNativeBackendConfig(executable=args.executable,launcher_prefix=tuple(args.executable_prefix_arg),model=model,attestation_class=attestation_class)
     except ValueError as exc: print(json.dumps({**blocked,"detail":str(exc)},sort_keys=True)); return 2
     try:
@@ -3077,6 +3188,23 @@ def main(argv: list[str] | None = None, *, _validated_profile: NativeMissionProf
     if not decision.ready or decision.attestation is None: print(json.dumps({**blocked,"detail":decision.detail,"reason_code":decision.reason_code,"where_diagnostic":where_diagnostic},sort_keys=True)); return 2
     ready,detail=_git_source_preflight(source,args.required_source_head)
     if not ready: print(json.dumps({**blocked,"detail":detail,"where_diagnostic":where_diagnostic},sort_keys=True)); return 2
+    # Transport binding and launch-feasibility, before the run root exists and
+    # before any attempt is reserved.  An argv transport whose final
+    # prompt-bearing command line exceeds the Windows limit is refused here
+    # rather than crashing at spawn and consuming the single native attempt.
+    try:
+        authorized_transport=authorized_prompt_transport(profile,decision.attestation)
+    except ValueError as exc:
+        print(json.dumps({**blocked,"detail":str(exc),"reason_code":NATIVE_TRANSPORT_BINDING_REASON,"where_diagnostic":where_diagnostic},sort_keys=True)); return 2
+    try:
+        transport_diagnostic=preflight_prompt_transport_guard(
+            profile=profile,session_id=args.session_id,run_root=args.run_root,
+            attestation=decision.attestation,transport=authorized_transport,
+        )
+    except NativeArgvTooLongError as exc:
+        print(json.dumps({**blocked,"detail":str(exc),"reason_code":NATIVE_ARGV_LIMIT_REASON,"where_diagnostic":where_diagnostic},sort_keys=True)); return 2
+    except (ValueError, NativeEvidenceInvalid) as exc:
+        print(json.dumps({**blocked,"detail":str(exc),"reason_code":NATIVE_TRANSPORT_BINDING_REASON,"where_diagnostic":where_diagnostic},sort_keys=True)); return 2
     try:
         future_run_root=_validate_future_run_root(
             run_root_value=args.run_root, run_id=args.run_id, source=source
@@ -3106,7 +3234,7 @@ def main(argv: list[str] | None = None, *, _validated_profile: NativeMissionProf
         payload.validated_for_authorization(active_source_repository=source)
     except (ValueError, NativeEvidenceInvalid, RuntimeError) as exc:
         print(json.dumps({**blocked,"detail":str(exc),"where_diagnostic":where_diagnostic,"durability_capability":capability_diagnostic},sort_keys=True)); return 2
-    if args.preflight_only: print(json.dumps({"status":NativePreflightStatus.PREFLIGHT_READY.value,"authorization_payload":payload.to_dict(),"attestation":decision.attestation.to_dict(),"where_diagnostic":where_diagnostic,"durability_capability":capability_diagnostic},sort_keys=True)); return 0
+    if args.preflight_only: print(json.dumps({"status":NativePreflightStatus.PREFLIGHT_READY.value,"authorization_payload":payload.to_dict(),"attestation":decision.attestation.to_dict(),"where_diagnostic":where_diagnostic,"durability_capability":capability_diagnostic,"prompt_transport":transport_diagnostic},sort_keys=True)); return 0
     if not args.owner_authorization or not _authorized(args.owner_authorization,payload,active_source_repository=source): print(json.dumps({**blocked,"detail":"owner authorization did not match the exact canonical payload","durability_capability":capability_diagnostic},sort_keys=True)); return 2
     try:
         # Recheck freshness after authorization; the successful probe itself
@@ -3130,7 +3258,7 @@ def main(argv: list[str] | None = None, *, _validated_profile: NativeMissionProf
         except (ValueError, NativeEvidenceInvalid, RuntimeError) as exc:
             print(json.dumps({**blocked,"detail":f"initialized workspace is not launchable: {exc}"},sort_keys=True)); return 2
     evidence=(run_root/EVIDENCE_DIRECTORY_NAME); evidence.mkdir(); _safe_directory(evidence,"evidence directory")
-    _write_run_metadata_once(evidence/RUN_PREFLIGHT_METADATA_FILE_NAME,{"classification":CANARY_CLASSIFICATION,"authorization_payload":payload.to_dict(),"attestation":decision.attestation.to_dict(),"local_capability_status":decision.status.value,"durability_capability":capability_diagnostic})
+    _write_run_metadata_once(evidence/RUN_PREFLIGHT_METADATA_FILE_NAME,{"classification":CANARY_CLASSIFICATION,"authorization_payload":payload.to_dict(),"attestation":decision.attestation.to_dict(),"local_capability_status":decision.status.value,"durability_capability":capability_diagnostic,"prompt_transport":transport_diagnostic})
     session_store=AtomicDelegatedSessionStore(evidence/"delegated-state"); execution_store=AtomicNativeExecutionStore(evidence/NATIVE_SIDECAR_DIRECTORY_NAME); session_store.create(create_canary_session(session_id=args.session_id, profile=profile))
     execution_source = (
         Path(profile.effective_workspace_source.local_repository_path)
@@ -3207,4 +3335,4 @@ def run_native_mission_application(
 if __name__ == "__main__": sys.exit(main())
 
 
-__all__=["AUTHORIZATION_SCHEMA_VERSION","AUTHORIZATION_SCHEMA_VERSION_LEGACY_V2","AUTHORIZATION_SCHEMA_VERSION_V4","LEGACY_CANARY_PROFILE_ID","LEGACY_CANARY_FIXTURE_ID","LEGACY_CANARY_FIXTURE_VERSION","RUN_PREFLIGHT_METADATA_FILE_NAME","InitializedWorkspaceIdentity","LocalRepositoryAuthorityObservation","NativeCanaryAuthorizationPayloadV4","build_profile_authorization_payload","load_historical_native_canary_authorization_payload_v4","fixture_builder_registry","legacy_canary_profile","observe_initialized_workspace_identity","registered_profiles","resolve_fixture_builder","resolve_registered_profile","CANARY_NON_CLAIMS","CLASS_READINESS_REASONS","EVIDENCE_DIRECTORY_NAME","NATIVE_SIDECAR_DIRECTORY_NAME","PACKAGE_BIN_READY_REASON","WORKSPACE_DIRECTORY_NAME","BEHAVIORAL_EVIDENCE_SCHEMA_VERSION","CANARY_CLASSIFICATION","CANARY_FIXTURE_VERSION","CANARY_GATE_ID","CANARY_MISSION","CANARY_MISSION_ID","DEFAULT_STDERR_BYTE_LIMIT","DEFAULT_STDOUT_BYTE_LIMIT","DEFAULT_TIMEOUT_SECONDS","EXPECTED_MATERIAL_PATHS","FixtureRepository","MAX_AUDITOR_INVOCATIONS","MAX_NATIVE_PHASE_ATTEMPTS","MAX_PROVIDER_INVOCATIONS","MAX_REPAIR_ROUNDS","MAX_RETRIES","NativeCanaryAuthorizationPayload","NativeCanaryCoordinator","NativeCanaryOutcome","NativeCanaryStatus","ProductVerdict","OWNER_AUTHORIZATION_DIGEST_ENV","REQUIRED_COMMIT_MESSAGE","BehavioralVerifierEvidence","EvidenceOnlyCanaryReconstruction","build_authorization_payload","build_canary_repository","build_workflow_console_repository","build_native_agent_prompt","build_parser","create_canary_session","load_behavioral_verifier","main","npm_test_argv","reconstruct_completed_canary_success","reconstruct_completed_native_mission","run_behavioral_verifier","run_native_mission_application","_materialize_local_repository_copy","_observe_local_repository_source","_validate_future_run_root"]
+__all__=["NATIVE_ARGV_LIMIT_REASON","NATIVE_TRANSPORT_BINDING_REASON","authorized_prompt_transport","preflight_prompt_transport_guard","AUTHORIZATION_SCHEMA_VERSION","AUTHORIZATION_SCHEMA_VERSION_LEGACY_V2","AUTHORIZATION_SCHEMA_VERSION_V4","LEGACY_CANARY_PROFILE_ID","LEGACY_CANARY_FIXTURE_ID","LEGACY_CANARY_FIXTURE_VERSION","RUN_PREFLIGHT_METADATA_FILE_NAME","InitializedWorkspaceIdentity","LocalRepositoryAuthorityObservation","NativeCanaryAuthorizationPayloadV4","build_profile_authorization_payload","load_historical_native_canary_authorization_payload_v4","fixture_builder_registry","legacy_canary_profile","observe_initialized_workspace_identity","registered_profiles","resolve_fixture_builder","resolve_registered_profile","CANARY_NON_CLAIMS","CLASS_READINESS_REASONS","EVIDENCE_DIRECTORY_NAME","NATIVE_SIDECAR_DIRECTORY_NAME","PACKAGE_BIN_READY_REASON","WORKSPACE_DIRECTORY_NAME","BEHAVIORAL_EVIDENCE_SCHEMA_VERSION","CANARY_CLASSIFICATION","CANARY_FIXTURE_VERSION","CANARY_GATE_ID","CANARY_MISSION","CANARY_MISSION_ID","DEFAULT_STDERR_BYTE_LIMIT","DEFAULT_STDOUT_BYTE_LIMIT","DEFAULT_TIMEOUT_SECONDS","EXPECTED_MATERIAL_PATHS","FixtureRepository","MAX_AUDITOR_INVOCATIONS","MAX_NATIVE_PHASE_ATTEMPTS","MAX_PROVIDER_INVOCATIONS","MAX_REPAIR_ROUNDS","MAX_RETRIES","NativeCanaryAuthorizationPayload","NativeCanaryCoordinator","NativeCanaryOutcome","NativeCanaryStatus","ProductVerdict","OWNER_AUTHORIZATION_DIGEST_ENV","REQUIRED_COMMIT_MESSAGE","BehavioralVerifierEvidence","EvidenceOnlyCanaryReconstruction","build_authorization_payload","build_canary_repository","build_workflow_console_repository","build_native_agent_prompt","build_parser","create_canary_session","load_behavioral_verifier","main","npm_test_argv","reconstruct_completed_canary_success","reconstruct_completed_native_mission","run_behavioral_verifier","run_native_mission_application","_materialize_local_repository_copy","_observe_local_repository_source","_validate_future_run_root"]

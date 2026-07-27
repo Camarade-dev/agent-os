@@ -1707,9 +1707,20 @@ def test_registration_adds_neon_relay_once_and_preserves_every_previous_identity
     assert resolve_registered_profile(EXPECTED_PROFILE_ID) == PROFILE
     for profile_id, digest in LEGACY_FINGERPRINTS.items():
         assert profiles[profile_id].profile_fingerprint == digest
-    assert set(profiles) == set(LEGACY_FINGERPRINTS) | {EXPECTED_PROFILE_ID}
+    # The ACP transport repair registers neon-relay-v2 alongside v1 rather than
+    # replacing it: v1's own identity above is unchanged, and v2 carries the
+    # same mission on a new run identity because v1's argv transport cannot be
+    # spawned on Windows and its single native attempt is durably consumed.
+    assert set(profiles) == set(LEGACY_FINGERPRINTS) | {EXPECTED_PROFILE_ID, "neon-relay-v2"}
+    v2 = resolve_registered_profile("neon-relay-v2")
+    assert v2.profile_fingerprint == (
+        "3dd4ce6198e450b420afab4ed1e19acfcb7e807e292d87cafdc475ad0ca2c3b6"
+    )
+    assert v2.profile_fingerprint != PROFILE.profile_fingerprint
+    assert v2.mission_text == PROFILE.mission_text
+    assert v2.verifier_source_sha256 == PROFILE.verifier_source_sha256
     with pytest.raises(ValueError, match="unknown mission profile"):
-        resolve_registered_profile("neon-relay-v2")
+        resolve_registered_profile("neon-relay-v3")
 
 
 def test_neon_siege_definition_remains_unchanged():

@@ -19,7 +19,8 @@ import re
 import shutil
 import stat
 import subprocess
-from typing import Any, Callable, Mapping, Protocol
+import time
+from typing import Any, Callable, Mapping, Protocol, Sequence
 import weakref
 
 from admissible.delegated_gate.canonical import (
@@ -63,6 +64,84 @@ WINDOWS_COMMAND_RESOLUTION_SCHEMA_VERSION = "admissible_windows_command_resoluti
 WINDOWS_WHERE_DIAGNOSTIC_SCHEMA_VERSION = "admissible_windows_where_diagnostic_v1"
 ATTESTATION_CLASS_PACKAGE_BIN = "PACKAGE_BIN_PROVENANCE"
 ATTESTATION_CLASS_WRAPPER_CHAIN = "LOCAL_WRAPPER_CHAIN"
+ATTESTATION_CLASS_ACP_STDIO = "LOCAL_ACP_STDIO"
+ACP_STDIO_ATTESTATION_SCHEMA_VERSION = "admissible_cursor_acp_stdio_attestation_v1"
+
+# --- native prompt-transport authority ------------------------------------
+#
+# The transport is *how the exact prompt bytes reach the provider process*, and
+# it is authority, never inference.  ``ARGV_PROMPT`` places the complete prompt
+# in the final argv member; ``ACP_STDIO`` keeps the prompt out of argv entirely
+# and submits it as one ACP ``session/prompt`` message over the server's stdin.
+#
+# A transport is bound before owner authorization by the pair
+# (profile ``prompt_transport``, backend attestation class/fingerprint) -- both
+# of which are inside the canonical V4 authorization payload.  Nothing after
+# authorization may select or change it, and it is never derived from prompt
+# length.
+PROMPT_TRANSPORT_ARGV = "ARGV_PROMPT"
+PROMPT_TRANSPORT_ACP_STDIO = "ACP_STDIO"
+NATIVE_PROMPT_TRANSPORTS: frozenset[str] = frozenset(
+    {PROMPT_TRANSPORT_ARGV, PROMPT_TRANSPORT_ACP_STDIO}
+)
+
+
+def require_prompt_transport(value: Any, label: str) -> str:
+    """Reject any unknown transport rather than defaulting silently."""
+
+    if not isinstance(value, str) or value not in NATIVE_PROMPT_TRANSPORTS:
+        raise ValueError(
+            f"{label} must be one of {sorted(NATIVE_PROMPT_TRANSPORTS)}"
+        )
+    return value
+
+
+# --- Windows command-line spawn limit -------------------------------------
+#
+# ``CreateProcessW`` accepts an ``lpCommandLine`` of at most 32767 characters
+# *including* the terminating NUL, so 32766 usable characters is the real
+# ceiling.  Exceeding it raises WinError 206 (ERROR_FILENAME_EXCED_RANGE),
+# surfaced by CPython as ``FileNotFoundError``, before any process exists.
+#
+# This bound was established empirically on the target host: a serialized
+# command line of 32766 characters spawns, and 32767 raises WinError 206.
+WINDOWS_MAX_COMMAND_LINE_CHARS = 32766
+
+
+def windows_serialized_command_line(argv: Sequence[str]) -> str:
+    """Serialize argv exactly as ``subprocess`` hands it to ``CreateProcessW``."""
+
+    return subprocess.list2cmdline(list(argv))
+
+
+def require_windows_spawnable_argv(
+    argv: Sequence[str], *, label: str = "native argv"
+) -> int:
+    """Fail closed when the *final* argv cannot be spawned on Windows.
+
+    The caller must pass the complete prompt-bearing argv.  Validating the
+    static template (whose prompt member is still the ``{prompt}`` placeholder)
+    proves nothing -- that placeholder is 8 characters and the real member can
+    be tens of thousands.  The individual argument length is equally
+    insufficient: the limit applies to the whole serialized command line.
+
+    The raised diagnostic carries measured lengths only and never any prompt
+    content.
+    """
+
+    if os.name != "nt":
+        # Only Windows has an exact modelled limit here.  POSIX ``execve``
+        # bounds (ARG_MAX) are not modelled, so behavior is unchanged there.
+        return len(windows_serialized_command_line(argv))
+    length = len(windows_serialized_command_line(argv))
+    if length > WINDOWS_MAX_COMMAND_LINE_CHARS:
+        raise NativeArgvTooLongError(
+            f"{label} cannot be spawned on Windows: serialized command line is "
+            f"{length} characters and the limit is "
+            f"{WINDOWS_MAX_COMMAND_LINE_CHARS} characters "
+            f"(argv members={len(argv)})"
+        )
+    return length
 CAPTURE_ATTEMPT_SCHEMA_VERSION = "admissible_native_capture_attempt_v1"
 CAPTURE_ATTEMPT_SCHEMA_VERSION_V2 = "admissible_native_capture_attempt_v2"
 CAPTURE_EXPECTED_SUCCESS_STATUS = "CHECKPOINT_CAPTURED"
@@ -112,6 +191,28 @@ WRAPPER_CHAIN_CLAIMS: dict[str, bool] = {
     "production_trustworthiness_established": False,
     "windows_wide_command_behavior_established": False,
     "hostile_environment_protection_established": False,
+}
+BACKEND_PROTOCOL_VERSION_ACP_STDIO = "cursor-agent-acp-stdio-v1"
+ACP_SUBCOMMAND = "acp"
+ACP_STDIO_READY_REASON = "LOCAL_CURSOR_ACP_STDIO_ATTESTED_FOR_EXPERIMENT"
+ACP_STDIO_BLOCKED_REASON = "LOCAL_ACP_STDIO_ATTESTATION_BLOCKED"
+ACP_STDIO_CWD_POLICY = "acp-server-cwd-equals-authorized-work-workspace"
+ACP_STDIO_PROMPT_BINDING_POLICY = (
+    "prompt-never-in-argv;submitted-as-one-session/prompt-text-block;"
+    "sha256-utf8-equality-with-request-prompt-fingerprint-required-before-submission"
+)
+ACP_STDIO_NON_CLAIMS: tuple[str, ...] = WRAPPER_CHAIN_NON_CLAIMS + (
+    "the acp subcommand is a hidden cursor cli surface with no stability guarantee",
+    "acp protocol conformance beyond the exercised initialize/session methods is unproven",
+    "a successful acp turn does not establish checkpoint capture or product acceptance",
+    "acp transport establishes prompt delivery only, never task success",
+)
+ACP_STDIO_CLAIMS: dict[str, bool] = {
+    **WRAPPER_CHAIN_CLAIMS,
+    "prompt_excluded_from_argv": True,
+    "prompt_fingerprint_bound_before_submission": True,
+    "acp_protocol_conformance_proven": False,
+    "acp_turn_proves_task_success": False,
 }
 EXPECTED_CURSOR_PACKAGE_NAME = "@anysphere/agent-cli-runtime"
 PROCESS_TREE_CLEANUP_POLICY = "managed-process-tree-hard-timeout-and-proven-empty"
@@ -192,6 +293,16 @@ class NativeEvidenceNotFound(NativeExecutionStoreError):
 
 class NativeEvidenceInvalid(NativeExecutionStoreError):
     pass
+
+
+class NativeArgvTooLongError(NativeEvidenceInvalid, ValueError):
+    """An argv-transport command line cannot be spawned on this platform.
+
+    It is deliberately both a ``NativeEvidenceInvalid`` and a ``ValueError`` so
+    every existing fail-closed handler catches it: preflight reports
+    PREFLIGHT_BLOCKED, and the coordinator -- which only ever sees this *before*
+    an attempt is reserved -- refuses without consuming the native attempt.
+    """
 
 
 class NativeCommittedButDurabilityUncertain(NativeExecutionStoreError):
@@ -447,9 +558,11 @@ class CursorNativeBackendConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.executable, str) or not self.executable or "\x00" in self.executable:
             raise ValueError("a native Cursor executable is required")
-        if self.attestation_class not in {ATTESTATION_CLASS_PACKAGE_BIN, ATTESTATION_CLASS_WRAPPER_CHAIN}:
+        if self.attestation_class not in {
+            ATTESTATION_CLASS_PACKAGE_BIN, ATTESTATION_CLASS_WRAPPER_CHAIN, ATTESTATION_CLASS_ACP_STDIO,
+        }:
             raise ValueError("unsupported native attestation class")
-        if self.attestation_class == ATTESTATION_CLASS_WRAPPER_CHAIN and (
+        if self.attestation_class in {ATTESTATION_CLASS_WRAPPER_CHAIN, ATTESTATION_CLASS_ACP_STDIO} and (
             self.executable != CURSOR_DISCOVERY_COMMAND or self.launcher_prefix
         ):
             # Wrapper-chain mode derives every launcher file from canonical
@@ -1568,6 +1681,16 @@ class WrapperChainBackendAttestation:
             raise ValueError("wrapper-chain attestation fingerprint mismatch")
         return self
 
+    @property
+    def prompt_transport(self) -> str:
+        """Wrapper-chain is and stays the historical argv transport.
+
+        This is a derived property, never a serialized field, so every
+        historical wrapper-chain attestation fingerprint is unchanged.
+        """
+
+        return PROMPT_TRANSPORT_ARGV
+
     def argv(self, *, prompt: str) -> tuple[str, ...]:
         require_nonempty_text(prompt, "native agent prompt")
         if not prompt.startswith(NATIVE_PROMPT_HEADER):
@@ -1802,6 +1925,13 @@ class NativeBackendAttestation:
     def non_claims(self) -> tuple[str, ...]:
         return PACKAGE_BIN_NON_CLAIMS
 
+    @property
+    def prompt_transport(self) -> str:
+        """Package-bin is and stays the historical argv transport (derived,
+        never serialized, so historical fingerprints are unchanged)."""
+
+        return PROMPT_TRANSPORT_ARGV
+
     def argv(self, *, prompt: str) -> tuple[str, ...]:
         require_nonempty_text(prompt, "native agent prompt")
         if not prompt.startswith(NATIVE_PROMPT_HEADER):
@@ -1964,7 +2094,184 @@ def _attest_native_cursor(config: CursorNativeBackendConfig) -> NativeBackendAtt
     return NativeBackendAttestation(**{**provisional.__dict__, "attestation_fingerprint": fingerprint(provisional._body())}).validated()
 
 
-BackendAttestation = NativeBackendAttestation | WrapperChainBackendAttestation
+@dataclass(frozen=True)
+class AcpStdioBackendAttestation:
+    """LOCAL_ACP_STDIO attestation: the wrapper chain plus an ACP stdio transport.
+
+    Every launcher fact (node identity, ``index.js`` identity, selected version,
+    complete inventory, wrapper bytes) is carried by the embedded, independently
+    validated ``LOCAL_WRAPPER_CHAIN`` attestation, so this class adds exactly one
+    thing: the fixed ``<node> <index.js> acp`` server argv and the transport
+    authority that keeps the prompt *out* of argv.
+
+    It deliberately claims nothing about ACP protocol conformance and nothing
+    about task success: a completed ACP turn proves prompt delivery and provider
+    completion only.  Checkpoint capture and product acceptance stay downstream
+    and independent.
+    """
+
+    schema_version: str
+    attestation_class: str
+    backend_identity: str
+    backend_protocol_version: str
+    prompt_transport: str
+    wrapper_chain: WrapperChainBackendAttestation
+    executable: NativeBackendFileAttestation
+    launcher_prefix: tuple[NativeBackendFileAttestation, ...]
+    version_inventory: tuple[str, ...]
+    selected_version: str
+    selected_version_root: str
+    static_argv_template: tuple[str, ...]
+    selected_model: str
+    environment_allowlist: tuple[str, ...]
+    cwd_policy: str
+    prompt_fingerprint_binding_policy: str
+    claims: Mapping[str, bool]
+    non_claims: tuple[str, ...]
+    attestation_fingerprint: str
+
+    def _body(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "attestation_class": self.attestation_class,
+            "backend_identity": self.backend_identity,
+            "backend_protocol_version": self.backend_protocol_version,
+            "prompt_transport": self.prompt_transport,
+            "wrapper_chain": self.wrapper_chain.to_dict(),
+            "executable": self.executable.to_dict(),
+            "launcher_prefix": [item.to_dict() for item in self.launcher_prefix],
+            "version_inventory": list(self.version_inventory),
+            "selected_version": self.selected_version,
+            "selected_version_root": self.selected_version_root,
+            "static_argv_template": list(self.static_argv_template),
+            "selected_model": self.selected_model,
+            "environment_allowlist": list(self.environment_allowlist),
+            "cwd_policy": self.cwd_policy,
+            "prompt_fingerprint_binding_policy": self.prompt_fingerprint_binding_policy,
+            "claims": dict(self.claims), "non_claims": list(self.non_claims),
+        }
+
+    def validated(self) -> "AcpStdioBackendAttestation":
+        if (
+            self.schema_version != ACP_STDIO_ATTESTATION_SCHEMA_VERSION
+            or self.attestation_class != ATTESTATION_CLASS_ACP_STDIO
+            or self.backend_identity != BACKEND_IDENTITY
+            or self.backend_protocol_version != BACKEND_PROTOCOL_VERSION_ACP_STDIO
+        ):
+            raise ValueError("unsupported ACP stdio backend attestation")
+        if require_prompt_transport(self.prompt_transport, "ACP attestation transport") != PROMPT_TRANSPORT_ACP_STDIO:
+            raise ValueError("ACP stdio attestation must declare the ACP_STDIO transport")
+        chain = self.wrapper_chain.validated()
+        # Every launcher fact is the wrapper chain's; none may be restated
+        # differently here.
+        if self.executable != chain.executable or self.launcher_prefix != chain.launcher_prefix:
+            raise ValueError("ACP attestation launcher differs from its wrapper chain")
+        if (
+            self.version_inventory != chain.version_inventory
+            or self.selected_version != chain.selected_version
+            or self.selected_version_root != chain.selected_version_root
+        ):
+            raise ValueError("ACP attestation version selection differs from its wrapper chain")
+        if self.selected_model != chain.selected_model or self.environment_allowlist != chain.environment_allowlist:
+            raise ValueError("ACP attestation model or environment allowlist differs from its wrapper chain")
+        _validate_argv(self.static_argv_template, "ACP static argv template")
+        if len(self.static_argv_template) != 3:
+            raise ValueError("ACP static argv template must be <node> <index.js> acp")
+        if (
+            self.static_argv_template[0] != chain.executable.canonical_path
+            or self.static_argv_template[1] != chain.launcher_prefix[0].canonical_path
+            or self.static_argv_template[2] != ACP_SUBCOMMAND
+        ):
+            raise ValueError("ACP static argv template differs from the attested runtime, entry and acp subcommand")
+        if "{prompt}" in self.static_argv_template:
+            raise ValueError("ACP transport must never carry a prompt placeholder in argv")
+        # The ACP server argv is short and fixed; it must remain spawnable.
+        require_windows_spawnable_argv(self.static_argv_template, label="ACP static argv template")
+        if self.cwd_policy != ACP_STDIO_CWD_POLICY:
+            raise ValueError("ACP attestation cwd policy differs from the audited policy")
+        if self.prompt_fingerprint_binding_policy != ACP_STDIO_PROMPT_BINDING_POLICY:
+            raise ValueError("ACP attestation prompt-binding policy differs from the audited policy")
+        if dict(self.claims) != ACP_STDIO_CLAIMS:
+            raise ValueError("ACP claim set differs from the audited non-overclaiming claims")
+        if tuple(self.non_claims) != ACP_STDIO_NON_CLAIMS:
+            raise ValueError("ACP explicit non-claims differ from the audited set")
+        require_sha256(self.attestation_fingerprint, "ACP stdio attestation fingerprint")
+        if fingerprint(self._body()) != self.attestation_fingerprint:
+            raise ValueError("ACP stdio attestation fingerprint mismatch")
+        return self
+
+    def argv(self, *, prompt: str) -> tuple[str, ...]:
+        """Return the ACP *server* argv; the prompt never enters it.
+
+        The prompt is still validated here so a malformed or header-less prompt
+        is refused at exactly the same boundary as the argv transport.
+        """
+
+        require_nonempty_text(prompt, "native agent prompt")
+        if not prompt.startswith(NATIVE_PROMPT_HEADER):
+            raise NativeEvidenceInvalid("native prompt lacks the harness-controlled header")
+        return tuple(self.static_argv_template)
+
+    def to_dict(self) -> dict[str, Any]:
+        result = self._body(); result["attestation_fingerprint"] = self.attestation_fingerprint; return result
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "AcpStdioBackendAttestation":
+        require_exact_keys(data, set(cls.__dataclass_fields__), "ACP stdio backend attestation")
+        values = dict(data)
+        values["wrapper_chain"] = WrapperChainBackendAttestation.from_dict(data["wrapper_chain"])
+        values["executable"] = NativeBackendFileAttestation.from_dict(data["executable"])
+        values["launcher_prefix"] = tuple(NativeBackendFileAttestation.from_dict(item) for item in data["launcher_prefix"])
+        values["claims"] = dict(data["claims"]) if isinstance(data["claims"], Mapping) else data["claims"]
+        for key in ("version_inventory", "static_argv_template", "environment_allowlist", "non_claims"):
+            values[key] = require_string_list(data[key], key)
+        return cls(**values).validated()
+
+
+def _attest_acp_stdio_cursor_observed(
+    config: CursorNativeBackendConfig, *, discovery: WrapperChainDiscovery | None = None,
+) -> tuple[AcpStdioBackendAttestation, WindowsWhereDiagnostic]:
+    """Derive the ACP attestation from a freshly observed wrapper chain.
+
+    Cursor is never executed: the wrapper chain is static discovery/parse only,
+    and the ACP server itself is not started during attestation or preflight.
+    """
+
+    if config.attestation_class != ATTESTATION_CLASS_ACP_STDIO:
+        raise ValueError("ACP attestation requires the explicitly configured LOCAL_ACP_STDIO class")
+    chain_config = CursorNativeBackendConfig(
+        executable=config.executable, launcher_prefix=config.launcher_prefix,
+        model=config.model, environment_allowlist=config.environment_allowlist,
+        attestation_class=ATTESTATION_CLASS_WRAPPER_CHAIN,
+    )
+    chain, where_diagnostic = _attest_wrapper_chain_cursor_observed(chain_config, discovery=discovery)
+    template = (
+        chain.executable.canonical_path, chain.launcher_prefix[0].canonical_path, ACP_SUBCOMMAND,
+    )
+    provisional = AcpStdioBackendAttestation(
+        schema_version=ACP_STDIO_ATTESTATION_SCHEMA_VERSION,
+        attestation_class=ATTESTATION_CLASS_ACP_STDIO,
+        backend_identity=BACKEND_IDENTITY,
+        backend_protocol_version=BACKEND_PROTOCOL_VERSION_ACP_STDIO,
+        prompt_transport=PROMPT_TRANSPORT_ACP_STDIO,
+        wrapper_chain=chain, executable=chain.executable, launcher_prefix=chain.launcher_prefix,
+        version_inventory=chain.version_inventory, selected_version=chain.selected_version,
+        selected_version_root=chain.selected_version_root, static_argv_template=template,
+        selected_model=chain.selected_model, environment_allowlist=chain.environment_allowlist,
+        cwd_policy=ACP_STDIO_CWD_POLICY,
+        prompt_fingerprint_binding_policy=ACP_STDIO_PROMPT_BINDING_POLICY,
+        claims=ACP_STDIO_CLAIMS, non_claims=ACP_STDIO_NON_CLAIMS,
+        attestation_fingerprint="0" * 64,
+    )
+    attestation = AcpStdioBackendAttestation(
+        **{**provisional.__dict__, "attestation_fingerprint": fingerprint(provisional._body())}
+    ).validated()
+    return attestation, where_diagnostic
+
+
+BackendAttestation = (
+    NativeBackendAttestation | WrapperChainBackendAttestation | AcpStdioBackendAttestation
+)
 
 
 def attestation_from_dict(data: Mapping[str, Any]) -> BackendAttestation:
@@ -1975,6 +2282,8 @@ def attestation_from_dict(data: Mapping[str, Any]) -> BackendAttestation:
     schema_version = data.get("schema_version")
     if schema_version == WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION_LEGACY_V1:
         raise ValueError("legacy wrapper-chain v1 attestation is inert and cannot authorize new execution")
+    if schema_version == ACP_STDIO_ATTESTATION_SCHEMA_VERSION:
+        return AcpStdioBackendAttestation.from_dict(data)
     if schema_version == WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION:
         return WrapperChainBackendAttestation.from_dict(data)
     return NativeBackendAttestation.from_dict(data)
@@ -1988,6 +2297,8 @@ def _attest_local_backend(config: CursorNativeBackendConfig) -> BackendAttestati
     own explicit configuration and owner authorization.
     """
 
+    if config.attestation_class == ATTESTATION_CLASS_ACP_STDIO:
+        return _attest_acp_stdio_cursor_observed(config)[0]
     if config.attestation_class == ATTESTATION_CLASS_WRAPPER_CHAIN:
         return _attest_wrapper_chain_cursor(config)
     return _attest_native_cursor(config)
@@ -2000,10 +2311,25 @@ def preflight_native_cursor(*, config: CursorNativeBackendConfig, work_workspace
     executes the launcher bundle at all; capability behavior stays unproven.
     """
 
+    acp_stdio = config.attestation_class == ATTESTATION_CLASS_ACP_STDIO
     wrapper_chain = config.attestation_class == ATTESTATION_CLASS_WRAPPER_CHAIN
     try:
         if work_workspace is not None:
             _safe_directory(work_workspace, "preflight work workspace")
+        if acp_stdio:
+            attestation, where_diagnostic = _attest_acp_stdio_cursor_observed(config)
+            return NativePreflightDecision(
+                NativePreflightStatus.PREFLIGHT_READY, ACP_STDIO_READY_REASON,
+                "Wrapper-chain launcher authority attested statically, then bound to the fixed "
+                "<node> <index.js> acp server argv. The complete prompt never enters argv; it is "
+                "submitted as one ACP session/prompt message over stdin after its SHA-256 is proven "
+                "equal to the durable request prompt fingerprint. Cursor was not executed. ACP "
+                "protocol conformance, publisher provenance, payload signature and CLI capability "
+                "behavior are explicitly NOT established, and a completed ACP turn establishes "
+                "neither checkpoint capture nor product acceptance; suitable only for an "
+                "owner-authorized local experiment.",
+                attestation, where_diagnostic,
+            )
         if wrapper_chain:
             attestation, where_diagnostic = _attest_wrapper_chain_cursor_observed(config)
             return NativePreflightDecision(
@@ -2015,11 +2341,17 @@ def preflight_native_cursor(*, config: CursorNativeBackendConfig, work_workspace
         return NativePreflightDecision(NativePreflightStatus.PREFLIGHT_READY, "LOCAL_CURSOR_CAPABILITIES_ATTESTED", "Local Cursor version/help probes advertised the required bounded experiment flags.", attestation)
     except _WhereDiagnosticContradiction as exc:
         return NativePreflightDecision(
-            NativePreflightStatus.PREFLIGHT_BLOCKED, WRAPPER_CHAIN_BLOCKED_REASON,
+            NativePreflightStatus.PREFLIGHT_BLOCKED,
+            ACP_STDIO_BLOCKED_REASON if acp_stdio else WRAPPER_CHAIN_BLOCKED_REASON,
             str(exc), None, exc.diagnostic,
         )
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        return NativePreflightDecision(NativePreflightStatus.PREFLIGHT_BLOCKED, WRAPPER_CHAIN_BLOCKED_REASON if wrapper_chain else "LOCAL_CAPABILITY_ATTESTATION_BLOCKED", str(exc), None)
+        blocked_reason = (
+            ACP_STDIO_BLOCKED_REASON if acp_stdio
+            else WRAPPER_CHAIN_BLOCKED_REASON if wrapper_chain
+            else "LOCAL_CAPABILITY_ATTESTATION_BLOCKED"
+        )
+        return NativePreflightDecision(NativePreflightStatus.PREFLIGHT_BLOCKED, blocked_reason, str(exc), None)
 
 
 @dataclass(frozen=True)
@@ -2652,6 +2984,12 @@ class NativeProcessInvocation:
     timeout_seconds: int
     max_capture_bytes: int
     process_started: Callable[[_NativeProcessCreationProof], None]
+    # ARGV_PROMPT keeps ``prompt`` None: the prompt is already the final argv
+    # member.  ACP_STDIO carries the exact prompt here because it must never
+    # appear in argv.
+    prompt_transport: str = PROMPT_TRANSPORT_ARGV
+    prompt: str | None = None
+    prompt_fingerprint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2704,6 +3042,260 @@ class ManagedNativeProcessRunner:
             observed.stdout_bytes, observed.stderr_bytes,
             observed.output_truncated, process.pid,
         )
+
+
+ACP_TERMINATION_PROTOCOL_FAILED = "acp_protocol_failed"
+ACP_PROMPT_ECHO_REDACTION = "<redacted: prompt echo>"
+# Reasonable bounds for one native ACP turn.  The overall wall-clock budget is
+# always the request's ``timeout_seconds``; these only bound the early,
+# pre-submission handshake so a dead server is detected quickly rather than
+# consuming the entire mission budget.
+ACP_HANDSHAKE_TIMEOUT_SECONDS = 120.0
+ACP_SHUTDOWN_GRACE_SECONDS = 30.0
+
+
+class AcpStdioNativeProcessRunner:
+    """Real ACP-over-stdio runner for the native lane. It never retries.
+
+    The complete prompt is submitted as one ``session/prompt`` text block after
+    its UTF-8 SHA-256 is proven equal to the durable request fingerprint.  It
+    never enters argv, and the ACP server's own echo of the user message is
+    redacted out of the retained stdout evidence so the prompt is not newly
+    persisted merely because this transport is used.
+
+    Every failure mode -- malformed JSON, a mismatched response id, premature
+    EOF, timeout, capture overflow -- is terminal and fails closed.  A completed
+    ACP turn establishes provider completion only; checkpoint capture and
+    product acceptance remain downstream and independent.
+    """
+
+    def __init__(self, *, handshake_timeout_seconds: float = ACP_HANDSHAKE_TIMEOUT_SECONDS) -> None:
+        self.handshake_timeout_seconds = handshake_timeout_seconds
+
+    def run(self, invocation: NativeProcessInvocation) -> NativeProcessOutcome:
+        # Lazily import the accepted ACP protocol client (RUN_047).  A
+        # module-level import would couple the delegated-gate lane to the whole
+        # V0 backend package at import time; the framing class itself is
+        # process-agnostic and is reused verbatim rather than reimplemented.
+        from admissible.cursor_acp_transport import (
+            ACP_METHOD_INITIALIZE,
+            ACP_METHOD_SESSION_NEW,
+            ACP_METHOD_SESSION_PROMPT,
+            AcpConnection,
+            MSG_EOF,
+            MSG_JSON,
+            MSG_MALFORMED,
+            MSG_TIMEOUT,
+            SUPPORTED_PROTOCOL_VERSIONS,
+        )
+
+        if invocation.prompt_transport != PROMPT_TRANSPORT_ACP_STDIO:
+            raise NativeEvidenceInvalid("ACP runner refuses a non-ACP invocation")
+        prompt = invocation.prompt
+        if not isinstance(prompt, str) or not prompt:
+            raise NativeEvidenceInvalid("ACP invocation carries no prompt")
+        # -- prompt-byte integrity, proven before the server is even started --
+        digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        if invocation.prompt_fingerprint is None or digest != invocation.prompt_fingerprint:
+            raise NativeEvidenceInvalid(
+                "ACP prompt bytes differ from the durable request prompt fingerprint"
+            )
+        if any(prompt in member for member in invocation.argv):
+            raise NativeEvidenceInvalid("ACP argv must never contain the prompt")
+
+        redaction_needle = json.dumps(prompt, ensure_ascii=False)[1:-1]
+        retained: list[str] = []
+        retained_bytes = 0
+        limit = max(1, invocation.max_capture_bytes)
+        overflowed = False
+
+        def retain(line: str) -> None:
+            nonlocal retained_bytes, overflowed
+            if len(line) >= len(redaction_needle):
+                line = line.replace(redaction_needle, ACP_PROMPT_ECHO_REDACTION)
+            encoded = len(line.encode("utf-8"))
+            if retained_bytes + encoded > limit:
+                overflowed = True
+                return
+            retained.append(line)
+            retained_bytes += encoded
+
+        process = ManagedProcess(
+            list(invocation.argv), cwd=invocation.cwd, env=dict(invocation.env),
+            want_stdin=True, max_capture_bytes=limit, on_stdout_line=retain,
+        )
+        try:
+            process.start()
+        except ManagedProcessError as exc:
+            raise NativeProcessStartError(f"native process could not start: {exc}") from exc
+        try:
+            # Unreachable until an OS process exists; this CREATE_ONLY
+            # publication remains the only constructor for PROCESS_STARTED.
+            invocation.process_started(_NativeProcessCreationProof._after_successful_spawn(process.pid))
+        except BaseException:
+            process.terminate(reason="process_start_evidence_publication_failed")
+            raise
+
+        connection = AcpConnection(process)
+        deadline = time.monotonic() + float(invocation.timeout_seconds)
+        failure: str | None = None
+        timed_out = False
+        turn_completed = False
+
+        def remaining(cap: float | None = None) -> float:
+            left = max(0.0, deadline - time.monotonic())
+            return left if cap is None else min(left, cap)
+
+        def await_response(request_id: Any, cap: float | None) -> tuple[dict[str, Any] | None, str | None]:
+            """Read until the response for ``request_id`` arrives.
+
+            Server-to-client requests are answered inline so the turn cannot
+            stall; notifications are recorded by the stdout retainer already.
+            """
+
+            while True:
+                budget = remaining(cap)
+                if budget <= 0:
+                    return None, "timeout"
+                kind, payload = connection.read_message(budget)
+                if kind == MSG_TIMEOUT:
+                    return None, "timeout"
+                if kind == MSG_EOF:
+                    return None, "premature_eof"
+                if kind == MSG_MALFORMED:
+                    return None, "malformed_json"
+                if kind != MSG_JSON or not isinstance(payload, Mapping):
+                    return None, "malformed_jsonrpc"
+                method = payload.get("method")
+                message_id = payload.get("id")
+                if method is not None and message_id is None:
+                    # Notification (session/update and friends). Already
+                    # retained as bounded stdout evidence.
+                    continue
+                if method is not None:
+                    reply = _acp_client_reply(method, payload.get("params"))
+                    if reply is None:
+                        return None, f"unanswerable_server_request:{_bounded_token(method)}"
+                    try:
+                        _acp_send_response(connection, message_id, reply)
+                    except Exception:
+                        return None, "response_write_failed"
+                    continue
+                if message_id != request_id:
+                    return None, "response_id_mismatch"
+                if "error" in payload:
+                    return None, "jsonrpc_error"
+                result = payload.get("result")
+                if not isinstance(result, Mapping):
+                    return None, "malformed_result"
+                return dict(result), None
+
+        try:
+            connection.send(ACP_METHOD_INITIALIZE, {"protocolVersion": 1, "clientCapabilities": {}}, request_id=1)
+            init, failure = await_response(1, self.handshake_timeout_seconds)
+            if failure is None and init is not None:
+                version = init.get("protocolVersion")
+                if version not in SUPPORTED_PROTOCOL_VERSIONS:
+                    failure = "unsupported_protocol_version"
+            if failure is None:
+                connection.send(ACP_METHOD_SESSION_NEW, {"cwd": invocation.cwd, "mcpServers": []}, request_id=2)
+                session, failure = await_response(2, self.handshake_timeout_seconds)
+                session_id = session.get("sessionId") if session else None
+                if failure is None and not isinstance(session_id, str):
+                    failure = "missing_session_id"
+            if failure is None:
+                # The one and only prompt submission. Exact bytes, no trim, no
+                # normalization, no splitting, no fallback encoding.
+                connection.send(
+                    ACP_METHOD_SESSION_PROMPT,
+                    {"sessionId": session_id, "prompt": [{"type": "text", "text": prompt}]},
+                    request_id=3,
+                )
+                terminal, failure = await_response(3, None)
+                if failure is None and terminal is not None:
+                    turn_completed = True
+        except Exception as exc:  # a write failure is terminal, never retried
+            failure = failure or f"transport_error:{_bounded_token(type(exc).__name__)}"
+
+        if failure == "timeout":
+            timed_out = True
+        if overflowed:
+            failure = failure or "capture_overflow"
+
+        # -- shutdown; the ACP server does not exit on its own after a turn --
+        connection.close_write()
+        exit_code = process.wait(timeout=remaining(ACP_SHUTDOWN_GRACE_SECONDS))
+        still_running = process.poll() is None
+        if still_running:
+            observed = process.terminate(
+                reason=TERMINATION_HARD_TIMEOUT if timed_out
+                else TERMINATION_COMPLETED if turn_completed and failure is None
+                else ACP_TERMINATION_PROTOCOL_FAILED
+            )
+        else:
+            observed = process.finish(
+                reason=TERMINATION_COMPLETED if turn_completed and failure is None
+                else ACP_TERMINATION_PROTOCOL_FAILED
+            )
+        if observed.output_truncated:
+            failure = failure or "capture_overflow"
+        # Cross-check the OS exit against protocol completion: a server that
+        # died by itself with a nonzero code never proves a completed turn.
+        if not still_running and observed.exit_code not in (0, None) and failure is None:
+            failure = "provider_exit_nonzero"
+
+        # The turn's protocol outcome -- not the exit code of a server we shut
+        # down ourselves -- is the authority for success.
+        returncode = 0 if (turn_completed and failure is None) else 1
+        stdout_text = "".join(retained)
+        return NativeProcessOutcome(
+            returncode, stdout_text, process.captured_stderr(), timed_out,
+            observed.cleanup_proven, observed.cleanup_observation,
+            observed.termination_reason, tuple(observed.remaining_process_ids),
+            observed.stdout_bytes, observed.stderr_bytes,
+            observed.output_truncated or overflowed, process.pid,
+        )
+
+
+def _bounded_token(value: Any, *, limit: int = 64) -> str:
+    text = str(value)
+    return text[:limit]
+
+
+def _acp_send_response(connection: Any, message_id: Any, result: Mapping[str, Any]) -> None:
+    payload = {"jsonrpc": "2.0", "id": message_id, "result": dict(result)}
+    connection.process.send_stdin(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _acp_client_reply(method: str, params: Any) -> dict[str, Any] | None:
+    """Answer the small set of server-to-client requests this client accepts.
+
+    ``clientCapabilities`` is empty, so the agent uses its own filesystem and
+    terminal tools and never calls ``fs/*`` or ``terminal/*`` on us.  The one
+    request that still arrives is ``session/request_permission``; granting it is
+    the exact ACP analogue of the argv transport's ``--force --trust``.  Any
+    other server request is unanswerable and fails the turn closed rather than
+    being silently ignored (which would stall until the timeout).
+    """
+
+    if method != "session/request_permission":
+        return None
+    options = params.get("options") if isinstance(params, Mapping) else None
+    if not isinstance(options, list):
+        return None
+    chosen: str | None = None
+    for preferred in ("allow_always", "allow_once"):
+        for option in options:
+            if isinstance(option, Mapping) and option.get("kind") == preferred:
+                candidate = option.get("optionId")
+                if isinstance(candidate, str) and candidate:
+                    chosen = candidate
+                    break
+        if chosen is not None:
+            break
+    if chosen is None:
+        return None
+    return {"outcome": {"outcome": "selected", "optionId": chosen}}
 
 
 @dataclass(frozen=True)
@@ -3159,6 +3751,19 @@ class NativeDelegatedExecutor:
         self._local_attestor = local_attestor or _attest_local_backend
         self.harden_git_environment = harden_git_environment
         self._git_metadata_inspector = git_metadata_inspector
+        self._explicit_process_runner = process_runner is not None
+        self._acp_process_runner: NativeProcessRunner = AcpStdioNativeProcessRunner()
+
+    def _runner_for(self, transport: str) -> NativeProcessRunner:
+        """Select the runner the *authorized* transport requires.
+
+        An explicitly injected runner always wins so a test seam is never
+        silently bypassed; otherwise each transport gets its real runner.
+        """
+
+        if self._explicit_process_runner or transport == PROMPT_TRANSPORT_ARGV:
+            return self.process_runner
+        return self._acp_process_runner
 
     def attest_local_backend(self) -> BackendAttestation:
         """Explicit authority-bearing local re-attestation; never implicit parse work."""
@@ -3221,6 +3826,17 @@ class NativeDelegatedExecutor:
             self._git_metadata_inspector(source, False)
         initial = _repository_observation(workspace, harden_git=self.harden_git_environment); source_before = _repository_observation(source, harden_git=self.harden_git_environment); source_authority_before = _repository_authority_fingerprint(source, source_before, harden_git=self.harden_git_environment); parent_before = _parent_inventory(parent, allowed_children=measured_parent_exclusions)
         argv = request.backend_attestation.argv(prompt=prompt)
+        transport = require_prompt_transport(
+            request.backend_attestation.prompt_transport, "request backend transport"
+        )
+        if transport == PROMPT_TRANSPORT_ARGV:
+            # Fail closed *before* the attempt is reserved: an argv that cannot
+            # be serialized within the platform limit is unspawnable, and
+            # burning the single native attempt on a predictable spawn crash is
+            # exactly the defect this guard exists to prevent.
+            require_windows_spawnable_argv(argv, label="native prompt-bearing argv")
+        elif any(prompt in member for member in argv):
+            raise NativeEvidenceInvalid("ACP transport argv must never contain the prompt")
         argv_fingerprint = hashlib.sha256(canonical_bytes(list(argv))).hexdigest()
         reservation = store.create_attempt_reserved(
             request=request, argv_fingerprint=argv_fingerprint,
@@ -3239,8 +3855,11 @@ class NativeDelegatedExecutor:
         invocation = NativeProcessInvocation(
             argv, str(workspace), provider_environment, request.timeout_seconds,
             max(request.stdout_byte_limit, request.stderr_byte_limit), process_started,
+            prompt_transport=transport,
+            prompt=prompt if transport == PROMPT_TRANSPORT_ACP_STDIO else None,
+            prompt_fingerprint=request.prompt_fingerprint if transport == PROMPT_TRANSPORT_ACP_STDIO else None,
         )
-        outcome = self.process_runner.run(invocation)
+        outcome = self._runner_for(transport).run(invocation)
         if started_record is None:
             raise NativeProcessStartError("native runner returned without durable process-start evidence")
         ended_at = self.clock()
@@ -3764,6 +4383,14 @@ class AtomicNativeExecutionStore:
 
 
 __all__ = [
+    "ACP_STDIO_ATTESTATION_SCHEMA_VERSION", "ACP_STDIO_BLOCKED_REASON", "ACP_STDIO_CLAIMS",
+    "ACP_STDIO_CWD_POLICY", "ACP_STDIO_NON_CLAIMS", "ACP_STDIO_PROMPT_BINDING_POLICY",
+    "ACP_STDIO_READY_REASON", "ACP_SUBCOMMAND", "ATTESTATION_CLASS_ACP_STDIO",
+    "AcpStdioBackendAttestation", "AcpStdioNativeProcessRunner",
+    "BACKEND_PROTOCOL_VERSION_ACP_STDIO", "NATIVE_PROMPT_TRANSPORTS",
+    "NativeArgvTooLongError", "PROMPT_TRANSPORT_ACP_STDIO", "PROMPT_TRANSPORT_ARGV",
+    "WINDOWS_MAX_COMMAND_LINE_CHARS", "require_prompt_transport",
+    "require_windows_spawnable_argv", "windows_serialized_command_line",
     "ARTIFACT_SCHEMA_VERSION", "ATTESTATION_CLASS_PACKAGE_BIN", "ATTESTATION_CLASS_WRAPPER_CHAIN", "ATTESTATION_SCHEMA_VERSION", "ATTEMPT_RESERVED_SCHEMA_VERSION", "BACKEND_IDENTITY", "BACKEND_PROTOCOL_VERSION", "CAPTURE_ATTEMPT_SCHEMA_VERSION", "CAPTURE_ATTEMPT_SCHEMA_VERSION_V2", "CAPTURE_EXPECTED_SUCCESS_STATUS", "CURSOR_DISCOVERY_COMMAND", "CURSOR_DISCOVERY_MECHANISM", "DEFAULT_ENVIRONMENT_ALLOWLIST", "EXECUTION_ELIGIBILITY_SCHEMA_VERSION", "EXPECTED_CURSOR_PACKAGE_NAME", "NATIVE_PROMPT_HEADER", "PACKAGE_BIN_NON_CLAIMS", "PROCESS_OBSERVATION_SCHEMA_VERSION", "PROCESS_STARTED_SCHEMA_VERSION", "REQUEST_SCHEMA_VERSION", "RESULT_SCHEMA_VERSION", "TERMINAL_SCHEMA_VERSION", "TERMINAL_SCHEMA_VERSION_V2", "WINDOWS_COMMAND_RESOLUTION_SCHEMA_VERSION", "WINDOWS_WHERE_DIAGNOSTIC_SCHEMA_VERSION", "WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION", "WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION_LEGACY_V1", "WRAPPER_CHAIN_BLOCKED_REASON", "WRAPPER_CHAIN_CLAIMS", "WRAPPER_CHAIN_DISCOVERY_MECHANISM", "WRAPPER_CHAIN_NON_CLAIMS", "WRAPPER_CHAIN_READY_REASON",
     "AtomicNativeExecutionStore", "BackendAttestation", "CursorInstallationProvenance", "CursorNativeBackendConfig", "CursorWrapperChainResolution", "DeterministicWindowsCommandResolution", "HostWrapperChainDiscovery", "PowerShellCommandCandidate", "PowerShellCommandObservation", "WhereCommandObservation", "WindowsPathCandidate", "WindowsWhereDiagnostic", "WindowsWhereDiagnosticStatus", "WrapperChainBackendAttestation", "WrapperChainDiscovery", "attestation_from_dict", "ManagedNativeProcessRunner", "NativeArtifactReference", "NativeAttemptReserved", "NativeBackendAttestation", "NativeBackendFileAttestation", "NativeCanaryTerminalRecord", "NativeCaptureTerminalStatus", "NativeCheckpointCaptureAttempt", "NativeCommittedButDurabilityUncertain", "NativeDelegatedExecutor", "NativeEvidenceInvalid", "NativeEvidenceNotFound", "NativeExecutionEligibility", "NativeExecutionRequest", "NativeExecutionRequestBinding", "NativeExecutionResult", "NativeExecutionStatus", "NativeExecutionStoreError", "NativeFilesystemIdentity", "NativeLifecycleCounts", "NativePreflightDecision", "NativePreflightStatus", "NativeProcessInvocation", "NativeProcessObservation", "NativeProcessObservationPublicationError", "NativeProcessOutcome", "NativeProcessRunner", "NativeProcessStarted", "NativeProcessStartError", "NativeRequestAlreadyExists", "NativeResultAlreadyExists", "NativeResultIneligible", "preflight_native_cursor",
 ]

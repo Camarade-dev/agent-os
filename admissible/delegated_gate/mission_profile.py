@@ -39,6 +39,11 @@ from admissible.delegated_gate.canonical import (
     require_string_list,
 )
 from admissible.delegated_gate.models import EvidenceKind, VerificationCommand
+from admissible.delegated_gate.native_executor import (
+    PROMPT_TRANSPORT_ACP_STDIO,
+    PROMPT_TRANSPORT_ARGV,
+    require_prompt_transport,
+)
 
 
 MISSION_PROFILE_SCHEMA_VERSION = "admissible_native_mission_profile_v1"
@@ -942,11 +947,22 @@ class NativeMissionProfile:
     claim_authority: ClaimAuthority | None = None
     claim_verification_plan_authority: ClaimVerificationPlanAuthority | None = None
     verification_evidence_binding_authority: VerificationEvidenceBindingAuthority | None = None
+    # How the exact prompt bytes reach the provider process.  Bound here so the
+    # transport is authority *before* owner authorization, never inferred after
+    # it and never derived from prompt length.
+    #
+    # Serialization is omit-when-default: a profile on the historical
+    # ``ARGV_PROMPT`` transport produces byte-identical canonical bytes to the
+    # pre-transport schema, so every persisted document still parses and every
+    # historical ``profile_fingerprint`` is unchanged.
+    prompt_transport: str = PROMPT_TRANSPORT_ARGV
 
     def _body(self) -> dict[str, Any]:
         """The complete canonical profile body, fingerprint field excluded."""
 
         data = dict(self.__dict__)
+        if self.prompt_transport == PROMPT_TRANSPORT_ARGV:
+            data.pop("prompt_transport")
         if self.schema_version in {MISSION_PROFILE_SCHEMA_VERSION_V2, MISSION_PROFILE_SCHEMA_VERSION_V3, MISSION_PROFILE_SCHEMA_VERSION_V4, MISSION_PROFILE_SCHEMA_VERSION_V5}:
             for key in (
                 "fixture_id",
@@ -1051,6 +1067,13 @@ class NativeMissionProfile:
             MISSION_PROFILE_SCHEMA_VERSION_V5,
         }:
             raise ValueError("unsupported native mission profile schema")
+        # Unknown transports are rejected outright rather than defaulted.
+        require_prompt_transport(self.prompt_transport, "profile prompt transport")
+        if self.prompt_transport != PROMPT_TRANSPORT_ARGV and not self.is_launchable_runtime_profile:
+            # Historical V1/V3/V4/V5 documents keep their exact previous
+            # transport semantics and stay non-launchable; only the launchable
+            # runtime-v2 schema may carry a non-argv transport.
+            raise ValueError("only a launchable runtime-v2 profile may select a non-argv prompt transport")
         require_identifier(self.profile_id, "profile_id")
         if self.schema_version == MISSION_PROFILE_SCHEMA_VERSION:
             require_identifier(self.fixture_id, "profile fixture_id")
@@ -1293,11 +1316,25 @@ class NativeMissionProfile:
             "claim_authority",
             "claim_verification_plan_authority",
             "verification_evidence_binding_authority",
+            "prompt_transport",
         }
+        # ``prompt_transport`` is omitted whenever it is the historical
+        # ARGV_PROMPT default, so every persisted document keeps parsing with
+        # its original exact key set.  Only the launchable runtime-v2 schema may
+        # carry the key at all.
+        transport_key = {"prompt_transport"} if "prompt_transport" in data else set()
+        if transport_key and data.get("prompt_transport") == PROMPT_TRANSPORT_ARGV:
+            # Omit-when-default is a canonical *form*, not merely an encoding
+            # convenience: allowing the redundant key would let two distinct
+            # documents share one profile fingerprint.
+            raise ValueError(
+                "the default ARGV_PROMPT transport must be omitted so each profile "
+                "has exactly one canonical document"
+            )
         if schema == MISSION_PROFILE_SCHEMA_VERSION:
             require_exact_keys(data, v1_fields, "native mission profile v1")
         elif schema == MISSION_PROFILE_SCHEMA_VERSION_V2:
-            require_exact_keys(data, v2_fields, "native mission profile v2")
+            require_exact_keys(data, v2_fields | transport_key, "native mission profile v2")
         elif schema == MISSION_PROFILE_SCHEMA_VERSION_V3:
             require_exact_keys(data, v2_fields | {"claim_authority"}, "native mission profile v3")
         elif schema == MISSION_PROFILE_SCHEMA_VERSION_V4:
@@ -2565,6 +2602,50 @@ NEON_RELAY_PROFILE = create_native_mission_profile(
 )
 
 
+# ---------------------------------------------------------------------------
+# Runtime-v2 mission profile: neon-relay-v2 (ACP_STDIO transport).
+#
+# neon-relay-v1's argv transport is mathematically unspawnable on Windows: its
+# exact prompt is 64660 characters and CreateProcessW accepts at most 32766
+# serialized command-line characters, so no argv-based launch of this mission
+# can ever exist.  v2 changes exactly two things -- the run identity (v1's
+# single native attempt is durably consumed by the PROCESS_SPAWN_FAILED run) and
+# the prompt transport.
+#
+# Every mission-bearing field below is taken *from the v1 profile object* rather
+# than restated, so the mission text, completion conditions, frozen verifier and
+# its SHA-256, required material paths, fixture, budgets, model, timeouts,
+# checkpoint command and required commit message are byte-identical by
+# construction.  The profile fingerprint and canonical document necessarily
+# differ because the identity and transport differ.
+# ---------------------------------------------------------------------------
+
+NEON_RELAY_V2_PROFILE = create_native_mission_profile(
+    schema_version=MISSION_PROFILE_SCHEMA_VERSION_V2,
+    profile_id="neon-relay-v2",
+    run_id="native-cursor-neon-relay-002",
+    session_id="native-cursor-neon-relay-002",
+    gate_id=NEON_RELAY_PROFILE.gate_id,
+    mission_id=NEON_RELAY_PROFILE.mission_id,
+    mission_text=NEON_RELAY_PROFILE.mission_text,
+    gate_objective=NEON_RELAY_PROFILE.gate_objective,
+    gate_clauses=NEON_RELAY_PROFILE.gate_clauses,
+    required_evidence_kinds=NEON_RELAY_PROFILE.required_evidence_kinds,
+    checkpoint_commands=NEON_RELAY_PROFILE.checkpoint_commands,
+    completion_conditions_text=NEON_RELAY_PROFILE.completion_conditions_text,
+    budgets=NEON_RELAY_PROFILE.budgets,
+    timeout_seconds=NEON_RELAY_PROFILE.timeout_seconds,
+    stdout_byte_limit=NEON_RELAY_PROFILE.stdout_byte_limit,
+    stderr_byte_limit=NEON_RELAY_PROFILE.stderr_byte_limit,
+    model=NEON_RELAY_PROFILE.model,
+    workspace_source=NEON_RELAY_PROFILE.workspace_source,
+    git_end_state_policy=NEON_RELAY_PROFILE.git_end_state_policy,
+    verification=NEON_RELAY_PROFILE.verification,
+    runtime_prompt=NEON_RELAY_PROFILE.runtime_prompt,
+    prompt_transport=PROMPT_TRANSPORT_ACP_STDIO,
+)
+
+
 __all__ = [
     "FLAGSHIP_COMPLETION_CONDITIONS_TEXT",
     "FLAGSHIP_INCIDENT_REPLAY_PROFILE",
@@ -2587,6 +2668,9 @@ __all__ = [
     "MAX_VERIFICATION_EVIDENCE_BINDINGS",
     "NEON_RELAY_FIXTURE_REPOSITORY_PATH",
     "NEON_RELAY_PROFILE",
+    "NEON_RELAY_V2_PROFILE",
+    "PROMPT_TRANSPORT_ACP_STDIO",
+    "PROMPT_TRANSPORT_ARGV",
     "NEON_RELAY_VERIFIER_OUTPUT_LIMIT_BYTES",
     "NEON_RELAY_VERIFIER_TIMEOUT_SECONDS",
     "NEON_SIEGE_PROFILE",

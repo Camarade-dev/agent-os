@@ -80,6 +80,12 @@ LEGACY_IDENTITIES = {
     # Git repository; its own complete identity is pinned in
     # tests/test_admissible_neon_relay_profile.py.
     "neon-relay-v1": "8ef57625f3fb369ff87d2981ff15753fcd45f0328c74bcb05ed81c8a61c9999d",
+    # The ACP transport repair likewise extends the pin instead of weakening
+    # it: every identity above is unchanged, and neon-relay-v1 in particular is
+    # byte-identical.  neon-relay-v2 is the same mission on a new run identity
+    # and the ACP_STDIO prompt transport, because v1's argv transport is
+    # unspawnable on Windows and v1's single native attempt is durably consumed.
+    "neon-relay-v2": "3dd4ce6198e450b420afab4ed1e19acfcb7e807e292d87cafdc475ad0ca2c3b6",
 }
 
 
