@@ -18,6 +18,7 @@ import sys
 
 import pytest
 
+from admissible.delegated_gate.acp_authority import AcpAuthorityEvidence
 from admissible.delegated_gate.native_executor import (
     ACP_STDIO_CLAIMS,
     ACP_STDIO_NON_CLAIMS,
@@ -96,7 +97,10 @@ def make_invocation(
     max_capture_bytes: int = 1024 * 1024,
     fingerprint: str | None = None,
     transport: str = PROMPT_TRANSPORT_ACP_STDIO,
+    evidence: AcpAuthorityEvidence | None = None,
 ) -> NativeProcessInvocation:
+    if evidence is None and transport == PROMPT_TRANSPORT_ACP_STDIO:
+        evidence = AcpAuthorityEvidence(Path(cwd).parent / "acp-authority.jsonl", redact=(prompt,))
     return NativeProcessInvocation(
         argv, cwd, {}, timeout_seconds, max_capture_bytes, started,
         prompt_transport=transport, prompt=prompt,
@@ -104,6 +108,7 @@ def make_invocation(
             fingerprint if fingerprint is not None
             else hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         ),
+        acp_authority_evidence=evidence,
     )
 
 
@@ -444,16 +449,31 @@ def test_runner_never_retries_a_failed_turn(tmp_path):
 
 
 def test_permission_requests_are_answered_so_the_turn_cannot_stall(tmp_path):
+    """The turn still cannot stall -- but the answer is now a narrow refusal.
+
+    This scripted request carries no ``toolCall`` at all, so the deny-by-default
+    policy cannot positively classify it and selects ``reject-once``.  Before the
+    run-003 repair the same request was answered ``allow-always``.
+    """
+
     prompt = build_prompt(2048)
     started = StartedRecorder()
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    evidence = AcpAuthorityEvidence(tmp_path / "authority.jsonl", redact=(prompt,))
 
     outcome = AcpStdioNativeProcessRunner().run(
         make_invocation(server_argv("permission_request"), prompt,
-                        cwd=str(tmp_path), started=started, timeout_seconds=30)
+                        cwd=str(workspace), started=started, timeout_seconds=30,
+                        evidence=evidence)
     )
 
     assert outcome.returncode == 0
-    assert "permission=allow-always" in outcome.stdout
+    assert "permission=reject-once" in outcome.stdout
+    assert "allow-always" not in outcome.stdout.split("session/request_permission")[-1].split("permission=")[-1]
+    decisions = [r for r in evidence.records if r["record_type"] == "permission_decision"]
+    assert [record["decision"] for record in decisions] == ["REJECT"]
+    assert decisions[0]["selected_option_kind"] == "reject_once"
 
 
 # ---------------------------------------------------------------------------

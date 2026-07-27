@@ -1714,9 +1714,12 @@ def test_registration_adds_neon_relay_once_and_preserves_every_previous_identity
     # The backend-drift repair extends the registry the same way again: v2's own
     # single native attempt is durably consumed by the authorized run that
     # crashed inside drift observation, so neon-relay-v3 carries the identical
-    # mission on a third run identity.
+    # mission on a third run identity.  The ACP client-authority repair extends
+    # it once more: v3's attempt is durably consumed by the run whose client
+    # granted allow_always and then died on cursor/update_todos, so neon-relay-v4
+    # carries the identical mission on a fourth run identity.
     assert set(profiles) == set(LEGACY_FINGERPRINTS) | {
-        EXPECTED_PROFILE_ID, "neon-relay-v2", "neon-relay-v3",
+        EXPECTED_PROFILE_ID, "neon-relay-v2", "neon-relay-v3", "neon-relay-v4",
     }
     v2 = resolve_registered_profile("neon-relay-v2")
     assert v2.profile_fingerprint == (
@@ -1732,8 +1735,18 @@ def test_registration_adds_neon_relay_once_and_preserves_every_previous_identity
     assert len({v3.profile_fingerprint, v2.profile_fingerprint, PROFILE.profile_fingerprint}) == 3
     assert v3.mission_text == PROFILE.mission_text
     assert v3.verifier_source_sha256 == PROFILE.verifier_source_sha256
+    v4 = resolve_registered_profile("neon-relay-v4")
+    assert v4.profile_fingerprint == (
+        "6380e810995b6cd97db408fe4f434328890dafd48d0f5a7468eca010fa8fc97a"
+    )
+    assert len({
+        v4.profile_fingerprint, v3.profile_fingerprint, v2.profile_fingerprint,
+        PROFILE.profile_fingerprint,
+    }) == 4
+    assert v4.mission_text == PROFILE.mission_text
+    assert v4.verifier_source_sha256 == PROFILE.verifier_source_sha256
     with pytest.raises(ValueError, match="unknown mission profile"):
-        resolve_registered_profile("neon-relay-v4")
+        resolve_registered_profile("neon-relay-v5")
 
 
 def test_neon_siege_definition_remains_unchanged():

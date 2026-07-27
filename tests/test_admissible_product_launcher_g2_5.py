@@ -874,7 +874,16 @@ PROTECTED_PATH_PREFIXES = (
 #     later edit to it changes a pinned identity and fails the profile module.
 #     It adds no route, no UI and no archive file, and the neon siege entry
 #     below is its structural precedent: one reviewed file, never the directory.
+#   - The Neon Relay run-003 ACP client-authority repair authorized one new
+#     reviewed module, admissible/delegated_gate/acp_authority.py: the explicit
+#     fail-closed server-request table, the deny-by-default permission policy,
+#     the durable permission-decision log, the deterministic Windows
+#     shell-folder derivation and the workspace-pollution boundary.  It is a
+#     single file, not the directory; it adds no route, no UI, no canonical
+#     document and no archive file; it imports nothing from the product service
+#     or read model; and it executes no command and deletes no path.
 AUTHORIZED_REPAIR_PATHS = frozenset({
+    "admissible/delegated_gate/acp_authority.py",
     "admissible/delegated_gate/historical_evaluation.py",
     "admissible/delegated_gate/historical_evaluation_store.py",
     "admissible/delegated_gate/historical_pairing_confirmation.py",
@@ -973,7 +982,13 @@ def test_protected_path_guard_still_rejects_unauthorized_changes():
     # authorized filename - must still be refused, so the entry cannot have been
     # written as a prefix or widened into admissible/delegated_gate/.
     assert _unauthorized_protected_paths(["admissible/delegated_gate/neon_relay_mission.py"]) == []
+    # The same is true of the run-003 ACP client-authority entry: one file, and
+    # neither a prefix nor a licence for a sibling in the same directory.
+    assert _unauthorized_protected_paths(["admissible/delegated_gate/acp_authority.py"]) == []
     for unlisted in (
+        "admissible/delegated_gate/acp_authority_v2.py",
+        "admissible/delegated_gate/acp_permission_policy.py",
+        "admissible/delegated_gate/acp_authority/policy.py",
         "admissible/delegated_gate/neon_relay_mission_v2.py",
         "admissible/delegated_gate/neon_relay_verifier.py",
         "admissible/delegated_gate/neon_relay/mission.py",

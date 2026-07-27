@@ -3256,7 +3256,9 @@ def test_acp_drift_authority_is_both_the_acp_layer_and_its_nested_wrapper_chain(
     # The ACP view is the chain view plus, and only plus, the ACP layer.
     assert acp.wrappers[: len(chain_only.wrappers)] == chain_only.wrappers
     assert acp.diagnostics[: len(chain_only.diagnostics)] == chain_only.diagnostics
-    assert len(acp.wrappers) == len(chain_only.wrappers) + 6
+    # Five transport dimensions, the derived Windows shell-folder authority, and
+    # the body fingerprint.
+    assert len(acp.wrappers) == len(chain_only.wrappers) + 7
 
 
 # --- refusals: live installation material ------------------------------------
@@ -3372,12 +3374,15 @@ def test_changed_acp_class_schema_or_policy_is_refused(tmp_path: Path):
     _, discovery, attestation = _acp_attestation(tmp_path)
     expectations = (
         ({"attestation_class": ATTESTATION_CLASS_WRAPPER_CHAIN}, "acp_attestation_class"),
-        ({"schema_version": "admissible_cursor_acp_stdio_attestation_v2"}, "acp_attestation_class"),
+        ({"schema_version": "admissible_cursor_acp_stdio_attestation_v3"}, "acp_attestation_class"),
         ({"backend_protocol_version": "cursor-agent-acp-stdio-v2"}, "acp_attestation_class"),
         ({"cwd_policy": "anywhere"}, "acp_prompt_binding_policy"),
         ({"prompt_fingerprint_binding_policy": "unbound"}, "acp_prompt_binding_policy"),
         ({"non_claims": ()}, "acp_prompt_binding_policy"),
         ({"claims": {"acp_protocol_conformance_established": True}}, "acp_prompt_binding_policy"),
+        ({"environment_derivation_policy": "inherit"}, "acp_derived_environment"),
+        ({"derived_environment": {"SystemDrive": "Z:", "ProgramData": r"Z:\ProgramData",
+                                  "ALLUSERSPROFILE": r"Z:\ProgramData"}}, "acp_derived_environment"),
         ({"attestation_fingerprint": "0" * 64}, "acp_attestation_fingerprint"),
     )
     for changes, expected in expectations:
@@ -3385,6 +3390,35 @@ def test_changed_acp_class_schema_or_policy_is_refused(tmp_path: Path):
             _tampered(attestation, **changes), post_run_wrapper_chain_attestation=_post_run_chain(discovery),
         )
         assert f"{expected}:CONTENT_DRIFT" in drift.blocking_diagnostics
+        assert not drift.clean and not drift.post_run_eligible
+
+
+def test_changed_derived_windows_environment_or_derivation_authority_is_drift(tmp_path: Path):
+    """G.14: the deterministic shell-folder authority is a drift dimension.
+
+    A changed value and a changed derivation policy are both refused, and the
+    clean attestation re-derives to exactly the same three names live.
+    """
+
+    _, discovery, attestation = _acp_attestation(tmp_path)
+    if os.name == "nt":
+        assert set(attestation.derived_environment) == {
+            "SystemDrive", "ProgramData", "ALLUSERSPROFILE",
+        }
+    clean = _observe_backend_drift(attestation, post_run_wrapper_chain_attestation=_post_run_chain(discovery))
+    assert "acp_derived_environment:NO_DRIFT" in clean.diagnostics and clean.clean
+
+    mutations = (
+        {"derived_environment": {**dict(attestation.derived_environment), "ProgramData": r"C:\Elsewhere"}},
+        {"derived_environment": {}},
+        {"environment_derivation_policy": "inherited-from-the-parent-environment"},
+    )
+    for changes in mutations:
+        drift = _observe_backend_drift(
+            _tampered(attestation, **changes),
+            post_run_wrapper_chain_attestation=_post_run_chain(discovery),
+        )
+        assert "acp_derived_environment:CONTENT_DRIFT" in drift.blocking_diagnostics
         assert not drift.clean and not drift.post_run_eligible
 
 
@@ -3609,7 +3643,7 @@ def test_real_acp_attestation_reaches_the_fake_acp_managed_process(tmp_path: Pat
     eligibility = h.store.load_execution_eligibility(h.session_id, CANARY_GATE_ID, 0)
     assert eligibility.eligible and not eligibility.ineligibility_reasons
     acp_diagnostics = tuple(item for item in eligibility.backend_drift_diagnostics if item.startswith("acp_"))
-    assert len(acp_diagnostics) == 6 and all(item.endswith(":NO_DRIFT") for item in acp_diagnostics)
+    assert len(acp_diagnostics) == 7 and all(item.endswith(":NO_DRIFT") for item in acp_diagnostics)
     assert eligibility.catalog_validation == "NO_DRIFT" and eligibility.selected_version_validation == "NO_DRIFT"
     assert "command_resolution:NO_DRIFT" in eligibility.backend_drift_diagnostics
 
@@ -3629,6 +3663,28 @@ def test_real_acp_attestation_reaches_the_fake_acp_managed_process(tmp_path: Pat
     assert observation.process["process_id"] == started.process_id
     assert observation.process["cleanup_observation"] == OBSERVATION_PROVEN_EMPTY
     assert observation.process["cleanup_confirmed"] and not observation.process["orphan_process_ids"]
+
+    # The executor -- not the runner -- supplies the durable client-authority
+    # sink, rooted in the evidence store's artifact directory, and binds the
+    # attested launcher files as the only out-of-workspace paths a permitted
+    # command may name.
+    sink = invocation.acp_authority_evidence
+    assert sink is not None
+    assert sink.path.parent == h.store.artifact_directory
+    assert sink.path.name == (
+        f"{h.session_id}.{CANARY_GATE_ID}.attempt-0.native.acp-client-authority.jsonl"
+    )
+    assert invocation.acp_additional_authorized_paths == frozenset(
+        {h.attestation.executable.canonical_path}
+        | {item.canonical_path for item in h.attestation.launcher_prefix}
+    )
+    # The deterministic shell-folder authority reached the real child.
+    if os.name == "nt":
+        assert set(native_executor.WINDOWS_SHELL_FOLDER_NAMES).issubset(invocation.env)
+        assert invocation.env["ALLUSERSPROFILE"] == invocation.env["ProgramData"]
+        assert dict(h.attestation.derived_environment) == {
+            name: invocation.env[name] for name in native_executor.WINDOWS_SHELL_FOLDER_NAMES
+        }
 
     # The prompt never entered argv, the result, or any retained diagnostic.
     assert not any(prompt in member for member in invocation.argv)

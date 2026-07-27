@@ -91,6 +91,12 @@ LEGACY_IDENTITIES = {
     # because v2's single native attempt is durably consumed by the authorized
     # run that crashed inside drift observation.
     "neon-relay-v3": "d871015d5a0ca8fc1ed050264a5c30845162cce8396fae6fa5fa2f0352253ec6",
+    # The ACP client-authority repair extends the pin the same way: neon-relay-v4
+    # is the same mission and the same ACP_STDIO transport on a fourth run
+    # identity, because v3's single native attempt is durably consumed by the
+    # authorized run whose client granted allow_always and then died on an
+    # unanswerable cursor/update_todos request.
+    "neon-relay-v4": "6380e810995b6cd97db408fe4f434328890dafd48d0f5a7468eca010fa8fc97a",
 }
 
 

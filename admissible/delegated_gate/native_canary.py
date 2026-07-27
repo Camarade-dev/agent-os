@@ -43,6 +43,7 @@ from admissible.delegated_gate.mission_profile import (
     NEON_RELAY_PROFILE,
     NEON_RELAY_V2_PROFILE,
     NEON_RELAY_V3_PROFILE,
+    NEON_RELAY_V4_PROFILE,
     NEON_SIEGE_PROFILE,
     ONE_SHOT_PROFILE_BUDGETS,
     WORKFLOW_RECOVERY_PROFILE,
@@ -477,6 +478,7 @@ def registered_profiles() -> dict[str, NativeMissionProfile]:
             NEON_RELAY_PROFILE,
             NEON_RELAY_V2_PROFILE,
             NEON_RELAY_V3_PROFILE,
+            NEON_RELAY_V4_PROFILE,
         )
     }
 
@@ -3127,6 +3129,28 @@ def _validate_future_run_root(
     return run_root
 
 
+def _require_derived_environment_outside_run_root(
+    attestation: BackendAttestation, future_run_root: Path
+) -> None:
+    """Refuse a shell-folder authority that resolves into the future run root.
+
+    The work workspace is created inside the run root, so a ``ProgramData`` or
+    ``SystemDrive`` that resolves there would put the child's shell folders
+    inside the very tree the mission is measured on.
+    """
+
+    derived = getattr(attestation, "derived_environment", None)
+    if not derived:
+        return
+    root = os.path.normpath(str(future_run_root))
+    for name, value in dict(derived).items():
+        probe = os.path.normpath(value) + (os.sep if name == "SystemDrive" else "")
+        if _inside(Path(probe), Path(root)) or os.path.normcase(probe.rstrip(os.sep)) == os.path.normcase(root):
+            raise ValueError(
+                f"derived environment value {name} resolves inside the future run root"
+            )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser=argparse.ArgumentParser(prog="python -m admissible.delegated_gate.native_canary",description="Future-only one-shot locally-attested native Cursor canary")
     parser.add_argument("--source-repository",required=True); parser.add_argument("--required-source-head",required=True); parser.add_argument("--run-root",required=True); parser.add_argument("--run-id",required=True); parser.add_argument("--session-id",required=True)
@@ -3211,6 +3235,14 @@ def main(argv: list[str] | None = None, *, _validated_profile: NativeMissionProf
         future_run_root=_validate_future_run_root(
             run_root_value=args.run_root, run_id=args.run_id, source=source
         )
+    except ValueError as exc:
+        print(json.dumps({**blocked,"detail":str(exc),"where_diagnostic":where_diagnostic},sort_keys=True)); return 2
+    # The derived Windows shell-folder authority must resolve outside the run
+    # root the work workspace will live under.  Preflight is the earliest point
+    # where that root is known, and a disagreement refuses here rather than
+    # after the single native attempt has been reserved.
+    try:
+        _require_derived_environment_outside_run_root(decision.attestation, future_run_root)
     except ValueError as exc:
         print(json.dumps({**blocked,"detail":str(exc),"where_diagnostic":where_diagnostic},sort_keys=True)); return 2
     capability: DurabilityCapabilityResult = probe_platform_durability(

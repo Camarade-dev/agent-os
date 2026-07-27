@@ -2687,6 +2687,53 @@ NEON_RELAY_V3_PROFILE = create_native_mission_profile(
 )
 
 
+# ---------------------------------------------------------------------------
+# Runtime-v2 mission profile: neon-relay-v4 (ACP_STDIO transport).
+#
+# v3's single native attempt is durably consumed.  Its authorized run reserved
+# the attempt, spawned a real ACP provider, and then died on the client side of
+# the protocol: ``cursor/update_todos`` was unanswerable, every permission
+# request had already been granted with ``allow_always``, and the child
+# environment omitted SystemDrive/ProgramData/ALLUSERSPROFILE, so Windows
+# resolved ``%SystemDrive%`` literally inside the work workspace.
+#
+# The repair is entirely in the client and the backend attestation -- an
+# explicit server-request table, a deny-by-default permission policy, durable
+# permission evidence and a derived shell-folder environment.  None of that is a
+# profile field, so v4 changes exactly one thing here: the run identity.  Every
+# mission-bearing field is taken from the v3 profile object rather than
+# restated, so mission text, completion conditions, frozen verifier and its
+# SHA-256, required material paths, fixture, budgets, model, timeouts,
+# checkpoint command, human-review non-claims and required commit message are
+# byte-identical to v3 (and therefore to v2 and v1) by construction.
+# ---------------------------------------------------------------------------
+
+NEON_RELAY_V4_PROFILE = create_native_mission_profile(
+    schema_version=MISSION_PROFILE_SCHEMA_VERSION_V2,
+    profile_id="neon-relay-v4",
+    run_id="native-cursor-neon-relay-004",
+    session_id="native-cursor-neon-relay-004",
+    gate_id=NEON_RELAY_V3_PROFILE.gate_id,
+    mission_id=NEON_RELAY_V3_PROFILE.mission_id,
+    mission_text=NEON_RELAY_V3_PROFILE.mission_text,
+    gate_objective=NEON_RELAY_V3_PROFILE.gate_objective,
+    gate_clauses=NEON_RELAY_V3_PROFILE.gate_clauses,
+    required_evidence_kinds=NEON_RELAY_V3_PROFILE.required_evidence_kinds,
+    checkpoint_commands=NEON_RELAY_V3_PROFILE.checkpoint_commands,
+    completion_conditions_text=NEON_RELAY_V3_PROFILE.completion_conditions_text,
+    budgets=NEON_RELAY_V3_PROFILE.budgets,
+    timeout_seconds=NEON_RELAY_V3_PROFILE.timeout_seconds,
+    stdout_byte_limit=NEON_RELAY_V3_PROFILE.stdout_byte_limit,
+    stderr_byte_limit=NEON_RELAY_V3_PROFILE.stderr_byte_limit,
+    model=NEON_RELAY_V3_PROFILE.model,
+    workspace_source=NEON_RELAY_V3_PROFILE.workspace_source,
+    git_end_state_policy=NEON_RELAY_V3_PROFILE.git_end_state_policy,
+    verification=NEON_RELAY_V3_PROFILE.verification,
+    runtime_prompt=NEON_RELAY_V3_PROFILE.runtime_prompt,
+    prompt_transport=NEON_RELAY_V3_PROFILE.prompt_transport,
+)
+
+
 __all__ = [
     "FLAGSHIP_COMPLETION_CONDITIONS_TEXT",
     "FLAGSHIP_INCIDENT_REPLAY_PROFILE",
@@ -2711,6 +2758,7 @@ __all__ = [
     "NEON_RELAY_PROFILE",
     "NEON_RELAY_V2_PROFILE",
     "NEON_RELAY_V3_PROFILE",
+    "NEON_RELAY_V4_PROFILE",
     "PROMPT_TRANSPORT_ACP_STDIO",
     "PROMPT_TRANSPORT_ARGV",
     "NEON_RELAY_VERIFIER_OUTPUT_LIMIT_BYTES",

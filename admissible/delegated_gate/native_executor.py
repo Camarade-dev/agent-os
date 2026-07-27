@@ -23,6 +23,23 @@ import time
 from typing import Any, Callable, Mapping, Protocol, Sequence
 import weakref
 
+from admissible.delegated_gate.acp_authority import (
+    ACP_AUTHORITY_EVIDENCE_SCHEMA_VERSION,
+    AcpAuthorityEvidence,
+    AcpAuthorityRefusal,
+    AcpEvidenceWriteError,
+    AcpServerRequestDispatcher,
+    FAILURE_RESPONSE_WRITE,
+    FAILURE_WORKSPACE_POLLUTED,
+    POLLUTION_STAGE_POST_STARTUP,
+    WINDOWS_SHELL_FOLDER_DERIVATION_POLICY,
+    WINDOWS_SHELL_FOLDER_NAMES,
+    bounded_token as _bounded_token,
+    derived_windows_environment,
+    observe_workspace_pollution,
+    validate_derived_windows_environment,
+    workspace_inventory,
+)
 from admissible.delegated_gate.canonical import (
     canonical_bytes,
     fingerprint,
@@ -65,7 +82,13 @@ WINDOWS_WHERE_DIAGNOSTIC_SCHEMA_VERSION = "admissible_windows_where_diagnostic_v
 ATTESTATION_CLASS_PACKAGE_BIN = "PACKAGE_BIN_PROVENANCE"
 ATTESTATION_CLASS_WRAPPER_CHAIN = "LOCAL_WRAPPER_CHAIN"
 ATTESTATION_CLASS_ACP_STDIO = "LOCAL_ACP_STDIO"
-ACP_STDIO_ATTESTATION_SCHEMA_VERSION = "admissible_cursor_acp_stdio_attestation_v1"
+ACP_STDIO_ATTESTATION_SCHEMA_VERSION_LEGACY_V1 = "admissible_cursor_acp_stdio_attestation_v1"
+# v2 binds the deterministic Windows shell-folder authority (names, values and
+# derivation policy) into the attestation body and therefore into its
+# fingerprint.  The v1 body cannot express that authority, so -- exactly like
+# the legacy wrapper-chain v1 -- it is inert: it still names its class for
+# historical reading, but it can never authorize a new execution.
+ACP_STDIO_ATTESTATION_SCHEMA_VERSION = "admissible_cursor_acp_stdio_attestation_v2"
 
 # --- native prompt-transport authority ------------------------------------
 #
@@ -206,6 +229,10 @@ ACP_STDIO_NON_CLAIMS: tuple[str, ...] = WRAPPER_CHAIN_NON_CLAIMS + (
     "acp protocol conformance beyond the exercised initialize/session methods is unproven",
     "a successful acp turn does not establish checkpoint capture or product acceptance",
     "acp transport establishes prompt delivery only, never task success",
+    "the client permission policy bounds acp permission requests only; it is not a sandbox "
+    "and it does not observe effects the provider produces through any other channel",
+    "deterministic shell-folder derivation prevents literal %SystemDrive% workspace paths; "
+    "it does not contain the provider and proves nothing about what the provider writes",
 )
 ACP_STDIO_CLAIMS: dict[str, bool] = {
     **WRAPPER_CHAIN_CLAIMS,
@@ -213,6 +240,10 @@ ACP_STDIO_CLAIMS: dict[str, bool] = {
     "prompt_fingerprint_bound_before_submission": True,
     "acp_protocol_conformance_proven": False,
     "acp_turn_proves_task_success": False,
+    "server_requests_dispatched_from_an_explicit_fail_closed_table": True,
+    "permission_authority_is_deny_by_default_and_never_allow_always": True,
+    "windows_shell_folder_environment_is_derived_not_inherited": True,
+    "permission_policy_is_a_sandbox": False,
 }
 EXPECTED_CURSOR_PACKAGE_NAME = "@anysphere/agent-cli-runtime"
 PROCESS_TREE_CLEANUP_POLICY = "managed-process-tree-hard-timeout-and-proven-empty"
@@ -573,14 +604,39 @@ class CursorNativeBackendConfig:
         require_nonempty_text(self.model, "Cursor model", max_bytes=256)
         if not isinstance(self.environment_allowlist, tuple) or not self.environment_allowlist:
             raise ValueError("environment allowlist must be a non-empty tuple")
+        derived = {name.upper() for name in WINDOWS_SHELL_FOLDER_NAMES}
         for name in self.environment_allowlist:
             if not isinstance(name, str) or not name or not name.replace("_", "").isalnum():
                 raise ValueError("environment allowlist contains an invalid name")
+            if name.upper() in derived:
+                # These three are derived from the attested SYSTEMROOT; allowing
+                # them to be inherited would reintroduce a parent-controlled
+                # value into an otherwise deterministic child environment.
+                raise ValueError("Windows shell-folder names are derived, never allowlisted")
 
-    def build_environment(self, *, base: Mapping[str, str] | None = None) -> dict[str, str]:
+    def build_environment(
+        self, *, base: Mapping[str, str] | None = None,
+        work_workspace: str | Path | None = None,
+        derive_shell_folders: bool = True,
+    ) -> dict[str, str]:
+        """Allowlist the parent environment, then *derive* the shell folders.
+
+        The three Windows shell-folder names are deliberately absent from the
+        allowlist: they are never inherited.  They are derived from the attested
+        ``SYSTEMROOT`` instead, because a child that lacks them makes Windows
+        resolve ``%SystemDrive%`` literally and create a
+        ``%SystemDrive%\\ProgramData\\...`` tree inside the work workspace -- the
+        exact run-003 cleanup livelock.
+        """
+
         source = os.environ if base is None else base
         allowed = {name.upper() for name in self.environment_allowlist}
-        return {key: value for key, value in source.items() if key.upper() in allowed}
+        environment = {key: value for key, value in source.items() if key.upper() in allowed}
+        if derive_shell_folders:
+            environment.update(
+                derived_windows_environment(environment, work_workspace=work_workspace)
+            )
+        return environment
 
 
 def _hardened_git_environment(
@@ -2124,6 +2180,8 @@ class AcpStdioBackendAttestation:
     static_argv_template: tuple[str, ...]
     selected_model: str
     environment_allowlist: tuple[str, ...]
+    derived_environment: Mapping[str, str]
+    environment_derivation_policy: str
     cwd_policy: str
     prompt_fingerprint_binding_policy: str
     claims: Mapping[str, bool]
@@ -2146,6 +2204,8 @@ class AcpStdioBackendAttestation:
             "static_argv_template": list(self.static_argv_template),
             "selected_model": self.selected_model,
             "environment_allowlist": list(self.environment_allowlist),
+            "derived_environment": dict(self.derived_environment),
+            "environment_derivation_policy": self.environment_derivation_policy,
             "cwd_policy": self.cwd_policy,
             "prompt_fingerprint_binding_policy": self.prompt_fingerprint_binding_policy,
             "claims": dict(self.claims), "non_claims": list(self.non_claims),
@@ -2174,6 +2234,14 @@ class AcpStdioBackendAttestation:
             raise ValueError("ACP attestation version selection differs from its wrapper chain")
         if self.selected_model != chain.selected_model or self.environment_allowlist != chain.environment_allowlist:
             raise ValueError("ACP attestation model or environment allowlist differs from its wrapper chain")
+        if self.environment_derivation_policy != WINDOWS_SHELL_FOLDER_DERIVATION_POLICY:
+            raise ValueError("ACP attestation environment derivation policy differs from the audited policy")
+        try:
+            validate_derived_windows_environment(self.derived_environment)
+        except AcpAuthorityRefusal as exc:
+            raise ValueError(f"ACP derived environment authority is invalid: {exc}") from exc
+        if os.name == "nt" and not self.derived_environment:
+            raise ValueError("a Windows ACP attestation must bind the derived shell-folder authority")
         _validate_argv(self.static_argv_template, "ACP static argv template")
         if len(self.static_argv_template) != 3:
             raise ValueError("ACP static argv template must be <node> <index.js> acp")
@@ -2223,6 +2291,10 @@ class AcpStdioBackendAttestation:
         values["executable"] = NativeBackendFileAttestation.from_dict(data["executable"])
         values["launcher_prefix"] = tuple(NativeBackendFileAttestation.from_dict(item) for item in data["launcher_prefix"])
         values["claims"] = dict(data["claims"]) if isinstance(data["claims"], Mapping) else data["claims"]
+        values["derived_environment"] = (
+            dict(data["derived_environment"])
+            if isinstance(data["derived_environment"], Mapping) else data["derived_environment"]
+        )
         for key in ("version_inventory", "static_argv_template", "environment_allowlist", "non_claims"):
             values[key] = require_string_list(data[key], key)
         return cls(**values).validated()
@@ -2230,6 +2302,7 @@ class AcpStdioBackendAttestation:
 
 def _attest_acp_stdio_cursor_observed(
     config: CursorNativeBackendConfig, *, discovery: WrapperChainDiscovery | None = None,
+    work_workspace: str | Path | None = None,
 ) -> tuple[AcpStdioBackendAttestation, WindowsWhereDiagnostic]:
     """Derive the ACP attestation from a freshly observed wrapper chain.
 
@@ -2248,6 +2321,11 @@ def _attest_acp_stdio_cursor_observed(
     template = (
         chain.executable.canonical_path, chain.launcher_prefix[0].canonical_path, ACP_SUBCOMMAND,
     )
+    # Derived once here, bound into the body, and re-derived at drift
+    # observation: preflight and execution refuse on any disagreement.
+    derived = derived_windows_environment(
+        config.build_environment(derive_shell_folders=False), work_workspace=work_workspace,
+    )
     provisional = AcpStdioBackendAttestation(
         schema_version=ACP_STDIO_ATTESTATION_SCHEMA_VERSION,
         attestation_class=ATTESTATION_CLASS_ACP_STDIO,
@@ -2258,6 +2336,8 @@ def _attest_acp_stdio_cursor_observed(
         version_inventory=chain.version_inventory, selected_version=chain.selected_version,
         selected_version_root=chain.selected_version_root, static_argv_template=template,
         selected_model=chain.selected_model, environment_allowlist=chain.environment_allowlist,
+        derived_environment=derived,
+        environment_derivation_policy=WINDOWS_SHELL_FOLDER_DERIVATION_POLICY,
         cwd_policy=ACP_STDIO_CWD_POLICY,
         prompt_fingerprint_binding_policy=ACP_STDIO_PROMPT_BINDING_POLICY,
         claims=ACP_STDIO_CLAIMS, non_claims=ACP_STDIO_NON_CLAIMS,
@@ -2282,6 +2362,11 @@ def attestation_from_dict(data: Mapping[str, Any]) -> BackendAttestation:
     schema_version = data.get("schema_version")
     if schema_version == WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION_LEGACY_V1:
         raise ValueError("legacy wrapper-chain v1 attestation is inert and cannot authorize new execution")
+    if schema_version == ACP_STDIO_ATTESTATION_SCHEMA_VERSION_LEGACY_V1:
+        raise ValueError(
+            "legacy ACP stdio v1 attestation carries no derived Windows shell-folder authority "
+            "and cannot authorize new execution"
+        )
     if schema_version == ACP_STDIO_ATTESTATION_SCHEMA_VERSION:
         return AcpStdioBackendAttestation.from_dict(data)
     if schema_version == WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION:
@@ -2317,11 +2402,15 @@ def preflight_native_cursor(*, config: CursorNativeBackendConfig, work_workspace
         if work_workspace is not None:
             _safe_directory(work_workspace, "preflight work workspace")
         if acp_stdio:
-            attestation, where_diagnostic = _attest_acp_stdio_cursor_observed(config)
+            attestation, where_diagnostic = _attest_acp_stdio_cursor_observed(
+                config, work_workspace=work_workspace,
+            )
             return NativePreflightDecision(
                 NativePreflightStatus.PREFLIGHT_READY, ACP_STDIO_READY_REASON,
                 "Wrapper-chain launcher authority attested statically, then bound to the fixed "
-                "<node> <index.js> acp server argv. The complete prompt never enters argv; it is "
+                "<node> <index.js> acp server argv, together with the deterministic Windows "
+                "shell-folder authority derived from the attested SYSTEMROOT. The complete prompt "
+                "never enters argv; it is "
                 "submitted as one ACP session/prompt message over stdin after its SHA-256 is proven "
                 "equal to the durable request prompt fingerprint. Cursor was not executed. ACP "
                 "protocol conformance, publisher provenance, payload signature and CLI capability "
@@ -2990,6 +3079,16 @@ class NativeProcessInvocation:
     prompt_transport: str = PROMPT_TRANSPORT_ARGV
     prompt: str | None = None
     prompt_fingerprint: str | None = None
+    # ACP_STDIO only: the durable client-authority evidence sink every
+    # permission decision, answered server request, protocol failure and
+    # workspace-pollution observation is written to *before* the reply.  A
+    # missing sink is refused rather than defaulted, because an unrecorded
+    # approval must be impossible.
+    acp_authority_evidence: AcpAuthorityEvidence | None = None
+    # Absolute paths the backend attestation already binds (the Git executable
+    # and its material), which a permitted command may reference even though
+    # they are outside the work workspace.
+    acp_additional_authorized_paths: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -3006,6 +3105,10 @@ class NativeProcessOutcome:
     observed_stderr_bytes: int = 0
     output_truncated: bool = False
     process_id: int | None = None
+    #: Exact ACP protocol boundary, e.g.
+    #: ``unanswerable_server_request:cursor/update_todos``.  ``None`` for every
+    #: non-ACP runner and for a turn that completed.
+    protocol_failure_detail: str | None = None
 
 
 class NativeProcessRunner(Protocol):
@@ -3067,6 +3170,13 @@ class AcpStdioNativeProcessRunner:
     EOF, timeout, capture overflow -- is terminal and fails closed.  A completed
     ACP turn establishes provider completion only; checkpoint capture and
     product acceptance remain downstream and independent.
+
+    Server-to-client requests are answered by an explicit
+    :class:`AcpServerRequestDispatcher`, whose permission policy is
+    deny-by-default and never selects ``allow-always``.  Between session
+    creation and prompt submission the workspace is re-inventoried: a server
+    startup that already polluted the working tree fails closed *before* the
+    mission is submitted.
     """
 
     def __init__(self, *, handshake_timeout_seconds: float = ACP_HANDSHAKE_TIMEOUT_SECONDS) -> None:
@@ -3102,6 +3212,17 @@ class AcpStdioNativeProcessRunner:
             )
         if any(prompt in member for member in invocation.argv):
             raise NativeEvidenceInvalid("ACP argv must never contain the prompt")
+        evidence = invocation.acp_authority_evidence
+        if evidence is None:
+            # An approval that cannot be recorded must be impossible, so the
+            # sink is a precondition of the transport rather than an option.
+            raise NativeEvidenceInvalid(
+                "ACP invocation carries no durable client-authority evidence sink"
+            )
+        dispatcher = AcpServerRequestDispatcher(
+            evidence=evidence, workspace=invocation.cwd,
+            additional_authorized_paths=invocation.acp_additional_authorized_paths,
+        )
 
         redaction_needle = json.dumps(prompt, ensure_ascii=False)[1:-1]
         retained: list[str] = []
@@ -3119,6 +3240,10 @@ class AcpStdioNativeProcessRunner:
                 return
             retained.append(line)
             retained_bytes += encoded
+
+        # Taken before the server exists, so any addition observed after
+        # startup is attributable to the server rather than to us.
+        workspace_before = workspace_inventory(invocation.cwd)
 
         process = ManagedProcess(
             list(invocation.argv), cwd=invocation.cwd, env=dict(invocation.env),
@@ -3173,13 +3298,16 @@ class AcpStdioNativeProcessRunner:
                     # retained as bounded stdout evidence.
                     continue
                 if method is not None:
-                    reply = _acp_client_reply(method, payload.get("params"))
-                    if reply is None:
-                        return None, f"unanswerable_server_request:{_bounded_token(method)}"
-                    try:
-                        _acp_send_response(connection, message_id, reply)
-                    except Exception:
-                        return None, "response_write_failed"
+                    outcome = dispatcher.dispatch(
+                        method=method, message_id=message_id, params=payload.get("params"),
+                    )
+                    if outcome.response is not None:
+                        try:
+                            _acp_send_message(connection, outcome.response)
+                        except Exception:
+                            return None, FAILURE_RESPONSE_WRITE
+                    if outcome.failure is not None:
+                        return None, outcome.failure
                     continue
                 if message_id != request_id:
                     return None, "response_id_mismatch"
@@ -3204,6 +3332,24 @@ class AcpStdioNativeProcessRunner:
                 if failure is None and not isinstance(session_id, str):
                     failure = "missing_session_id"
             if failure is None:
+                # Second clean-workspace boundary: server startup and session
+                # creation must not have written into the working tree.  A
+                # polluted workspace is never cleaned automatically and never
+                # prompted over -- the mission is simply not submitted.
+                pollution = observe_workspace_pollution(
+                    workspace_before, workspace_inventory(invocation.cwd),
+                )
+                if pollution.polluted:
+                    try:
+                        evidence.record_workspace_pollution(
+                            workspace=invocation.cwd, added=pollution.added,
+                            classifications=pollution.classifications,
+                            stage=POLLUTION_STAGE_POST_STARTUP,
+                        )
+                    except AcpEvidenceWriteError:
+                        pass
+                    failure = f"{FAILURE_WORKSPACE_POLLUTED}:{len(pollution.added)}"
+            if failure is None:
                 # The one and only prompt submission. Exact bytes, no trim, no
                 # normalization, no splitting, no fallback encoding.
                 connection.send(
@@ -3224,18 +3370,28 @@ class AcpStdioNativeProcessRunner:
 
         # -- shutdown; the ACP server does not exit on its own after a turn --
         connection.close_write()
+        # The exact boundary is persisted here so it survives independently of
+        # the process observation, whose schema is fixed and whose
+        # ``termination_reason`` keeps the historical ``acp_protocol_failed``
+        # prefix for compatibility.
+        if failure is not None:
+            try:
+                evidence.record_protocol_failure(detail=failure)
+            except AcpEvidenceWriteError:
+                pass
+        protocol_reason = _acp_protocol_failure_reason(failure)
         exit_code = process.wait(timeout=remaining(ACP_SHUTDOWN_GRACE_SECONDS))
         still_running = process.poll() is None
         if still_running:
             observed = process.terminate(
                 reason=TERMINATION_HARD_TIMEOUT if timed_out
                 else TERMINATION_COMPLETED if turn_completed and failure is None
-                else ACP_TERMINATION_PROTOCOL_FAILED
+                else protocol_reason
             )
         else:
             observed = process.finish(
                 reason=TERMINATION_COMPLETED if turn_completed and failure is None
-                else ACP_TERMINATION_PROTOCOL_FAILED
+                else protocol_reason
             )
         if observed.output_truncated:
             failure = failure or "capture_overflow"
@@ -3254,48 +3410,26 @@ class AcpStdioNativeProcessRunner:
             observed.termination_reason, tuple(observed.remaining_process_ids),
             observed.stdout_bytes, observed.stderr_bytes,
             observed.output_truncated or overflowed, process.pid,
+            protocol_failure_detail=failure,
         )
 
 
-def _bounded_token(value: Any, *, limit: int = 64) -> str:
-    text = str(value)
-    return text[:limit]
+def _acp_protocol_failure_reason(failure: str | None) -> str:
+    """Distinguish the exact boundary while keeping the historical prefix.
 
-
-def _acp_send_response(connection: Any, message_id: Any, result: Mapping[str, Any]) -> None:
-    payload = {"jsonrpc": "2.0", "id": message_id, "result": dict(result)}
-    connection.process.send_stdin(json.dumps(payload, ensure_ascii=False) + "\n")
-
-
-def _acp_client_reply(method: str, params: Any) -> dict[str, Any] | None:
-    """Answer the small set of server-to-client requests this client accepts.
-
-    ``clientCapabilities`` is empty, so the agent uses its own filesystem and
-    terminal tools and never calls ``fs/*`` or ``terminal/*`` on us.  The one
-    request that still arrives is ``session/request_permission``; granting it is
-    the exact ACP analogue of the argv transport's ``--force --trust``.  Any
-    other server request is unanswerable and fails the turn closed rather than
-    being silently ignored (which would stall until the timeout).
+    Consumers that classify on ``acp_protocol_failed`` keep matching, because
+    the high-level token is still the reason's prefix; the exact boundary is
+    appended rather than replacing it.
     """
 
-    if method != "session/request_permission":
-        return None
-    options = params.get("options") if isinstance(params, Mapping) else None
-    if not isinstance(options, list):
-        return None
-    chosen: str | None = None
-    for preferred in ("allow_always", "allow_once"):
-        for option in options:
-            if isinstance(option, Mapping) and option.get("kind") == preferred:
-                candidate = option.get("optionId")
-                if isinstance(candidate, str) and candidate:
-                    chosen = candidate
-                    break
-        if chosen is not None:
-            break
-    if chosen is None:
-        return None
-    return {"outcome": {"outcome": "selected", "optionId": chosen}}
+    if not failure:
+        return ACP_TERMINATION_PROTOCOL_FAILED
+    detail = _bounded_token(failure, limit=200)
+    return f"{ACP_TERMINATION_PROTOCOL_FAILED}:{detail}"
+
+
+def _acp_send_message(connection: Any, payload: Mapping[str, Any]) -> None:
+    connection.process.send_stdin(json.dumps(dict(payload), ensure_ascii=False) + "\n")
 
 
 @dataclass(frozen=True)
@@ -3660,11 +3794,26 @@ def _wrapper_chain_material_drift(
     return wrappers, command_resolution, catalog, selected, tuple(diagnostics)
 
 
+def _live_derived_environment(attestation: AcpStdioBackendAttestation) -> dict[str, str] | None:
+    """Re-derive the shell-folder authority now; ``None`` when it cannot be derived."""
+
+    config = CursorNativeBackendConfig(
+        executable=CURSOR_DISCOVERY_COMMAND, model=attestation.selected_model,
+        environment_allowlist=attestation.environment_allowlist,
+        attestation_class=ATTESTATION_CLASS_ACP_STDIO,
+    )
+    try:
+        return derived_windows_environment(config.build_environment(derive_shell_folders=False))
+    except (AcpAuthorityRefusal, OSError, ValueError):
+        return None
+
+
 def _acp_transport_drift(attestation: AcpStdioBackendAttestation) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Classify the exactly-one layer ``LOCAL_ACP_STDIO`` adds to its chain.
+    """Classify the exactly-two layers ``LOCAL_ACP_STDIO`` adds to its chain.
 
     The nested chain owns every live launcher fact, so this layer is derived
-    from the attestation body alone: it proves the ACP class/schema, the
+    from the attestation body plus one live re-derivation: it proves the ACP
+    class/schema, the
     ACP_STDIO transport, the fixed ``<node> <index.js> acp`` server argv, the
     prompt-binding policy, and that none of the chain's launcher/version facts
     were restated differently here.  It reads no prompt and emits no prompt
@@ -3704,6 +3853,14 @@ def _acp_transport_drift(attestation: AcpStdioBackendAttestation) -> tuple[tuple
             and attestation.prompt_fingerprint_binding_policy == ACP_STDIO_PROMPT_BINDING_POLICY
             and dict(attestation.claims) == ACP_STDIO_CLAIMS
             and tuple(attestation.non_claims) == ACP_STDIO_NON_CLAIMS
+        )),
+        # The derived Windows shell-folder authority is re-derived live and
+        # compared value by value: a changed value, a changed derivation policy
+        # or a host that can no longer derive it at all is drift, and drift
+        # refuses the run.
+        ("acp_derived_environment", (
+            attestation.environment_derivation_policy == WINDOWS_SHELL_FOLDER_DERIVATION_POLICY
+            and _live_derived_environment(attestation) == dict(attestation.derived_environment)
         )),
         ("acp_attestation_fingerprint", fingerprint(attestation._body()) == attestation.attestation_fingerprint),
     )
@@ -3937,6 +4094,16 @@ class NativeDelegatedExecutor:
             require_windows_spawnable_argv(argv, label="native prompt-bearing argv")
         elif any(prompt in member for member in argv):
             raise NativeEvidenceInvalid("ACP transport argv must never contain the prompt")
+        # The deterministic child environment is constructed here, before the
+        # attempt is reserved: a shell-folder authority that cannot be derived,
+        # or that resolves inside the work workspace, must refuse without
+        # consuming the single native attempt.
+        try:
+            provider_environment = self.config.build_environment(work_workspace=workspace)
+        except AcpAuthorityRefusal as exc:
+            raise NativeEvidenceInvalid(f"deterministic child environment is unavailable: {exc}") from exc
+        if self.harden_git_environment:
+            provider_environment = _hardened_git_environment(base=provider_environment)
         # Prove the attested class is drift-observable *before* the attempt is
         # reserved and before any spawn.  The post-run observation below stays
         # the eligibility authority; this call exists so a class the observer
@@ -3955,15 +4122,33 @@ class NativeDelegatedExecutor:
                 binding=store.load_request_structural(request.session_id, request.gate_id, 0),
                 reservation=reservation, proof=proof, started_at=self.clock(),
             )
-        provider_environment = self.config.build_environment()
-        if self.harden_git_environment:
-            provider_environment = _hardened_git_environment(base=provider_environment)
+        acp_evidence: AcpAuthorityEvidence | None = None
+        acp_authorized_paths: frozenset[str] = frozenset()
+        if transport == PROMPT_TRANSPORT_ACP_STDIO:
+            evidence_name = (
+                f"{request.session_id}.{request.gate_id}"
+                f".attempt-{request.execution_attempt_index}.native.acp-client-authority.jsonl"
+            )
+            acp_evidence = AcpAuthorityEvidence(
+                artifacts / evidence_name, redact=(prompt,), clock=self.clock,
+            )
+            # The launcher files the attestation already binds are the only
+            # absolute paths a permitted command may name outside the workspace.
+            acp_authorized_paths = frozenset(
+                item.canonical_path
+                for item in (
+                    request.backend_attestation.executable,
+                    *request.backend_attestation.launcher_prefix,
+                )
+            )
         invocation = NativeProcessInvocation(
             argv, str(workspace), provider_environment, request.timeout_seconds,
             max(request.stdout_byte_limit, request.stderr_byte_limit), process_started,
             prompt_transport=transport,
             prompt=prompt if transport == PROMPT_TRANSPORT_ACP_STDIO else None,
             prompt_fingerprint=request.prompt_fingerprint if transport == PROMPT_TRANSPORT_ACP_STDIO else None,
+            acp_authority_evidence=acp_evidence,
+            acp_additional_authorized_paths=acp_authorized_paths,
         )
         outcome = self._runner_for(transport).run(invocation)
         if started_record is None:
@@ -4492,7 +4677,12 @@ class AtomicNativeExecutionStore:
 
 
 __all__ = [
-    "ACP_STDIO_ATTESTATION_SCHEMA_VERSION", "ACP_STDIO_BLOCKED_REASON", "ACP_STDIO_CLAIMS",
+    "ACP_AUTHORITY_EVIDENCE_SCHEMA_VERSION", "ACP_STDIO_ATTESTATION_SCHEMA_VERSION",
+    "ACP_STDIO_ATTESTATION_SCHEMA_VERSION_LEGACY_V1",
+    "ACP_TERMINATION_PROTOCOL_FAILED",
+    "AcpAuthorityEvidence", "AcpEvidenceWriteError", "AcpServerRequestDispatcher",
+    "WINDOWS_SHELL_FOLDER_DERIVATION_POLICY", "WINDOWS_SHELL_FOLDER_NAMES",
+    "ACP_STDIO_BLOCKED_REASON", "ACP_STDIO_CLAIMS",
     "ACP_STDIO_CWD_POLICY", "ACP_STDIO_NON_CLAIMS", "ACP_STDIO_PROMPT_BINDING_POLICY",
     "ACP_STDIO_READY_REASON", "ACP_SUBCOMMAND", "ATTESTATION_CLASS_ACP_STDIO",
     "AcpStdioBackendAttestation", "AcpStdioNativeProcessRunner",

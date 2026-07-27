@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 
@@ -36,8 +37,34 @@ SCENARIO_OVERFLOW = "overflow"
 SCENARIO_PERMISSION_REQUEST = "permission_request"
 SCENARIO_UNSUPPORTED_PROTOCOL = "unsupported_protocol"
 SCENARIO_SPAWN_CHILD = "spawn_child"
+# -- run-003 client-authority repair scenarios --------------------------------
+SCENARIO_UPDATE_TODOS = "update_todos"
+SCENARIO_MALFORMED_UPDATE_TODOS = "malformed_update_todos"
+SCENARIO_UNKNOWN_REQUEST = "unknown_request"
+SCENARIO_PERMISSION_SAFE = "permission_safe"
+SCENARIO_PERMISSION_DESTRUCTIVE = "permission_destructive"
+SCENARIO_STARTUP_POLLUTION = "startup_pollution"
 
 SESSION_ID = "sess-fake-native-0001"
+
+# The exact option block the installed Cursor CLI offers (run-003 evidence).
+PERMISSION_OPTIONS = [
+    {"optionId": "allow-once", "name": "Allow once", "kind": "allow_once"},
+    {"optionId": "allow-always", "name": "Allow always", "kind": "allow_always"},
+    {"optionId": "reject-once", "name": "Reject", "kind": "reject_once"},
+]
+
+# Verbatim from the run-003 stdout artifact.
+RUN_003_DESTRUCTIVE_TITLE = (
+    "`cmd /c \"rmdir /s /q %SystemDrive%\" 2>$null; if (Test-Path -LiteralPath "
+    "'%SystemDrive%') { Remove-Item -LiteralPath '%SystemDrive%' -Recurse -Force }; "
+    "git status --short; Get-ChildItem -Force | Select-Object Name`"
+)
+SAFE_TITLE = "`Get-ChildItem -Force | Format-Table Name, Mode; git status --short`"
+
+# The literal tree Windows shell-folder resolution created in run 003 when
+# SystemDrive/ProgramData/ALLUSERSPROFILE were missing from the child.
+POLLUTION_RELATIVE_PATH = "%SystemDrive%/ProgramData/Microsoft/Windows/Caches"
 
 
 def emit(message: dict) -> None:
@@ -110,6 +137,10 @@ def main() -> int:
         elif method == "session/new":
             if scenario == SCENARIO_PREMATURE_EOF:
                 return 0
+            if scenario == SCENARIO_STARTUP_POLLUTION:
+                # Server startup writes into the working tree, exactly as the
+                # run-003 shell-folder resolution did, *before* any prompt.
+                os.makedirs(POLLUTION_RELATIVE_PATH, exist_ok=True)
             emit({
                 "jsonrpc": "2.0", "id": message_id,
                 "result": {
@@ -163,13 +194,36 @@ def main() -> int:
                 emit({
                     "jsonrpc": "2.0", "id": "perm-1",
                     "method": "session/request_permission",
+                    "params": {"sessionId": SESSION_ID, "options": list(PERMISSION_OPTIONS)},
+                })
+                reply = read_message()
+                if reply is None:
+                    return 1
+                outcome = (reply.get("result") or {}).get("outcome") or {}
+                emit_update({"sessionUpdate": "agent_message_chunk",
+                             "content": {"type": "text",
+                                         "text": f"permission={outcome.get('optionId')}"}})
+            if scenario in (SCENARIO_PERMISSION_SAFE, SCENARIO_PERMISSION_DESTRUCTIVE):
+                title = (
+                    SAFE_TITLE if scenario == SCENARIO_PERMISSION_SAFE
+                    else RUN_003_DESTRUCTIVE_TITLE
+                )
+                emit({
+                    "jsonrpc": "2.0", "id": 7,
+                    "method": "session/request_permission",
                     "params": {
                         "sessionId": SESSION_ID,
-                        "options": [
-                            {"optionId": "allow-once", "name": "Allow once", "kind": "allow_once"},
-                            {"optionId": "allow-always", "name": "Allow always", "kind": "allow_always"},
-                            {"optionId": "reject-once", "name": "Reject", "kind": "reject_once"},
-                        ],
+                        "toolCall": {
+                            "toolCallId": "call-fake-0001",
+                            "title": title,
+                            "kind": "execute",
+                            "status": "pending",
+                            "content": [{
+                                "type": "content",
+                                "content": {"type": "text", "text": "Not in allowlist"},
+                            }],
+                        },
+                        "options": list(PERMISSION_OPTIONS),
                     },
                 })
                 reply = read_message()
@@ -179,6 +233,37 @@ def main() -> int:
                 emit_update({"sessionUpdate": "agent_message_chunk",
                              "content": {"type": "text",
                                          "text": f"permission={outcome.get('optionId')}"}})
+            if scenario in (SCENARIO_UPDATE_TODOS, SCENARIO_MALFORMED_UPDATE_TODOS):
+                todos = (
+                    [
+                        {"id": "1", "content": "Implement domain modules", "status": "in_progress"},
+                        {"id": "2", "content": "Implement presentation", "status": "pending"},
+                    ]
+                    if scenario == SCENARIO_UPDATE_TODOS
+                    # An unknown status is exactly what strict validation exists
+                    # to refuse; the CLI's own converter emits only four.
+                    else [{"id": "1", "content": "Do the thing", "status": "half-done"}]
+                )
+                emit({
+                    "jsonrpc": "2.0", "id": 2, "method": "cursor/update_todos",
+                    "params": {
+                        "toolCallId": "call-todo-0001", "todos": todos, "merge": False,
+                    },
+                })
+                reply = read_message()
+                if reply is None:
+                    return 1
+                emit_update({"sessionUpdate": "agent_message_chunk",
+                             "content": {"type": "text",
+                                         "text": f"todos={json.dumps(reply, sort_keys=True)}"}})
+            if scenario == SCENARIO_UNKNOWN_REQUEST:
+                emit({
+                    "jsonrpc": "2.0", "id": 5, "method": "cursor/ask_question",
+                    "params": {"toolCallId": "call-ask-0001", "title": "anything"},
+                })
+                reply = read_message()
+                if reply is None:
+                    return 1
 
             emit_update({"sessionUpdate": "agent_message_chunk",
                          "content": {"type": "text", "text": "fake acp turn complete"}})
