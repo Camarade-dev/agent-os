@@ -713,7 +713,17 @@ def test_conservative_source_config_rejects_size_and_entry_bounds_before_git(tmp
         ('[credential "https://example"]', "oauthRefreshToken = evil"),
         ('[credential "https://example"]', "helper = evil"),
         ('[credential "https://example"]', "tokenCommand = evil"),
-        ('[remote "origin"]', "url = https://example.invalid/repo"),
+        # remote.<name>.url / .fetch and branch.<name>.remote / .merge are inert
+        # source metadata and are admitted by
+        # tests/test_admissible_source_inert_git_metadata.py.  Their
+        # command-bearing and push-bearing siblings stay refused here.
+        ('[remote "origin"]', "pushurl = https://example.invalid/repo"),
+        ('[remote "origin"]', "uploadpack = evil"),
+        ('[remote "origin"]', "receivepack = evil"),
+        ('[remote "origin"]', "proxy = http://example.invalid:8080"),
+        ('[branch "main"]', "rebase = true"),
+        ('[branch "main"]', "pushRemote = origin"),
+        ('[url "https://example.invalid/"]', "insteadOf = https://real.invalid/"),
     ),
 )
 def test_source_allowlist_rejects_adjacent_behavior_keys_before_git(

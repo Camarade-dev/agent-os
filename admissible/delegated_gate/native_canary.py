@@ -1467,6 +1467,25 @@ _SOURCE_LOCAL_CONFIG_ALLOWLIST = frozenset(
         "extensions.refstorage",
     }
 )
+# Narrowly bounded inert source-side metadata.  An ordinary developer clone
+# records where it came from; none of these keys can run a command, redirect a
+# hook, install a filter or credential helper, or make the source preflight
+# contact anything.  Membership is by exact (section, variable) pair so that no
+# sibling key -- pushurl, uploadpack, receivepack, proxy, rebase, pushRemote --
+# is admitted by prefix, suffix or substring.  This applies to the *source*
+# repository only: the materialized target workspace keeps its independent
+# no-remote, no-push, no-command final-state law.
+_SOURCE_INERT_CONFIG_FAMILIES: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("remote", "url"),
+        ("remote", "fetch"),
+        ("branch", "remote"),
+        ("branch", "merge"),
+    }
+)
+_SOURCE_INERT_SUBSECTION_LIMIT = 255
+_SOURCE_INERT_VALUE_LIMIT = 2048
+_BRANCH_REMOTE_LOCAL_VALUE = "."
 _TARGET_LOCAL_USER_NAME = "Admissible Native Mission"
 _TARGET_LOCAL_USER_EMAIL = "admissible-native@local.invalid"
 
@@ -1575,6 +1594,299 @@ def _git_config_boolean(value: str, label: str) -> bool:
     raise NativeEvidenceInvalid(f"{label} is not a canonical Git boolean")
 
 
+def _has_control_characters(value: str) -> bool:
+    return any(ord(character) < 32 or ord(character) == 127 for character in value)
+
+
+def _is_structural_git_subsection(value: str) -> bool:
+    """Structural validity of one already-parsed Git subsection name.
+
+    The name is never re-parsed out of raw text here: it arrives already split
+    off by Git (or by the conservative pre-Git grammar) and is only checked for
+    emptiness, bounds, control characters and the delimiters that would make a
+    subsection structurally ambiguous.
+    """
+
+    if not value or len(value) > _SOURCE_INERT_SUBSECTION_LIMIT:
+        return False
+    if value != value.strip():
+        return False
+    if _has_control_characters(value):
+        return False
+    return not any(character in value for character in ('"', "\\", "[", "]"))
+
+
+def _bounded_config_label(section: str, subsection: str | None, name: str) -> str:
+    """Owner-facing key label that never echoes a value or a malformed name."""
+
+    if subsection is None:
+        return f"{section.casefold()}.{name.casefold()}"
+    if _is_structural_git_subsection(subsection):
+        return f"{section.casefold()}.{subsection.casefold()}.{name.casefold()}"
+    return f"{section.casefold()}.<subsection>.{name.casefold()}"
+
+
+def _require_inert_config_value(value: str, label: str) -> None:
+    """Reject values that are empty, unbounded, control-bearing or option-like."""
+
+    if not value.strip():
+        raise NativeEvidenceInvalid(f"local Git configuration value is empty: {label}")
+    if len(value) > _SOURCE_INERT_VALUE_LIMIT:
+        raise NativeEvidenceInvalid(f"local Git configuration value exceeds its bound: {label}")
+    if _has_control_characters(value):
+        raise NativeEvidenceInvalid(
+            f"local Git configuration value carries a control character: {label}"
+        )
+    if value.startswith("-"):
+        raise NativeEvidenceInvalid(f"local Git configuration value is option-like: {label}")
+
+
+def _require_git_ref_format(repository: Path, *arguments: str, label: str, kind: str) -> None:
+    """Validate an already-structural ref with Git's own local ref checker.
+
+    ``git check-ref-format`` is purely lexical: it never resolves a ref, opens
+    the object database or contacts a remote.  The Git failure text is
+    deliberately discarded so no hostile value reaches owner-facing output.
+    """
+
+    try:
+        _git_read_only(repository, "check-ref-format", *arguments)
+    except RuntimeError:
+        raise NativeEvidenceInvalid(
+            f"local Git configuration {kind} is malformed: {label}"
+        ) from None
+
+
+def _require_inert_remote_url(value: str, label: str) -> None:
+    """Accept an inactive locator; refuse anything that encodes a helper.
+
+    The source preflight never fetches, pushes or otherwise invokes this value,
+    so nothing about the named host is being trusted -- only that the locator
+    itself is inert metadata that can sit beside a repository read locally.
+    Git's ``<transport>::<address>`` remote-helper form (``ext::`` runs an
+    arbitrary command) is refused outright.
+    """
+
+    _require_inert_config_value(value, label)
+    if "::" in value:
+        raise NativeEvidenceInvalid(
+            f"local Git configuration encodes a remote helper: {label}"
+        )
+
+
+def _require_inert_fetch_refspec(repository: Path, value: str, label: str) -> None:
+    _require_inert_config_value(value, label)
+    specification = value[1:] if value.startswith("+") else value
+    source_pattern, separator, destination = specification.partition(":")
+    malformed = NativeEvidenceInvalid(
+        f"local Git configuration fetch refspec is malformed: {label}"
+    )
+    if not separator or not source_pattern or not destination:
+        raise malformed
+    if not destination.startswith("refs/"):
+        raise malformed
+    if ("*" in source_pattern) != ("*" in destination):
+        raise malformed
+    for side in (source_pattern, destination):
+        if side.count("*") > 1 or side.startswith("-") or any(c.isspace() for c in side):
+            raise malformed
+        _require_git_ref_format(
+            repository, "--refspec-pattern", side, label=label, kind="fetch refspec"
+        )
+
+
+def _require_inert_branch_remote(value: str, label: str) -> None:
+    _require_inert_config_value(value, label)
+    # "." is Git's documented value for a branch that merges from this same
+    # repository; it names no remote at all.
+    if value == _BRANCH_REMOTE_LOCAL_VALUE:
+        return
+    if not _is_structural_git_subsection(value) or any(c.isspace() for c in value):
+        raise NativeEvidenceInvalid(
+            f"local Git configuration branch remote is malformed: {label}"
+        )
+
+
+def _require_inert_branch_merge(repository: Path, value: str, label: str) -> None:
+    _require_inert_config_value(value, label)
+    if not value.startswith("refs/") or "*" in value or any(c.isspace() for c in value):
+        raise NativeEvidenceInvalid(
+            f"local Git configuration branch merge ref is malformed: {label}"
+        )
+    _require_git_ref_format(repository, value, label=label, kind="branch merge ref")
+
+
+def _validate_source_scalar_config_value(key: str, value: str) -> None:
+    """Value policy for the subsection-free source allowlist."""
+
+    if key in {
+        "core.filemode",
+        "core.bare",
+        "core.logallrefupdates",
+        "core.symlinks",
+        "core.ignorecase",
+        "core.precomposeunicode",
+    }:
+        _git_config_boolean(value, key)
+    elif key == "core.repositoryformatversion" and value not in {"0", "1"}:
+        raise NativeEvidenceInvalid("core.repositoryformatversion is unsupported")
+    elif key == "core.autocrlf" and value.casefold() not in {"true", "false", "input"}:
+        raise NativeEvidenceInvalid("core.autocrlf is unsupported")
+    elif key == "core.safecrlf" and value.casefold() not in {"true", "false", "warn"}:
+        raise NativeEvidenceInvalid("core.safecrlf is unsupported")
+    elif key == "extensions.objectformat" and value.casefold() not in {"sha1", "sha256"}:
+        raise NativeEvidenceInvalid("extensions.objectformat is unsupported")
+    elif key == "extensions.refstorage" and value.casefold() not in {"files", "reftable"}:
+        raise NativeEvidenceInvalid("extensions.refstorage is unsupported")
+    elif key in {"user.name", "user.email"} and not value:
+        raise NativeEvidenceInvalid(f"{key} must not be empty")
+    elif key in {"commit.gpgsign", "tag.gpgsign"} and value.casefold() != "false":
+        raise NativeEvidenceInvalid(f"{key} must be explicitly disabled")
+
+
+def _screen_inert_source_config_family(entry: _LocalGitConfigEntry) -> None:
+    """Pre-Git structural screen for a subsectioned source-config entry.
+
+    This only ever narrows: it refuses everything outside the four inert
+    families before Git is invoked at all, and deliberately does not authorize
+    a value -- the value policy is applied to Git's own parsed value later.
+    """
+
+    label = _bounded_config_label(entry.section, entry.subsection, entry.name)
+    if (entry.section.casefold(), entry.name.casefold()) not in _SOURCE_INERT_CONFIG_FAMILIES:
+        raise NativeEvidenceInvalid(
+            f"local Git configuration key is outside the source allowlist: {label}"
+        )
+    if not _is_structural_git_subsection(entry.subsection or ""):
+        raise NativeEvidenceInvalid(
+            "local Git configuration subsection name is malformed: "
+            f"{entry.section.casefold()}.{entry.name.casefold()}"
+        )
+    if not entry.value.strip():
+        raise NativeEvidenceInvalid(f"local Git configuration value is empty: {label}")
+
+
+def _git_parsed_local_configuration(repository: Path) -> tuple[_LocalGitConfigEntry, ...]:
+    """Return the local configuration exactly as Git's own parser reports it.
+
+    ``git config --local --list --null`` is Git's authoritative parsed view of
+    ``.git/config``.  Quoting, escaping, continuation, inline comments, key
+    casing and subsection splitting are resolved by Git instead of being
+    re-implemented over raw text.  ``--local`` excludes owner, system, command
+    line and environment configuration; the command contacts nothing and runs
+    no configured program.  Git exits 1 with empty output for a config that
+    holds no entries, which is a legitimate observation rather than a failure.
+    """
+
+    completed = subprocess.run(
+        [
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "--no-pager",
+            "config",
+            "--local",
+            "--list",
+            "--null",
+        ],
+        cwd=repository,
+        env=_hardened_git_environment(),
+        shell=False,
+        check=False,
+        capture_output=True,
+        timeout=60,
+    )
+    if completed.returncode not in {0, 1} or (completed.returncode == 1 and completed.stdout):
+        raise NativeEvidenceInvalid("local Git configuration could not be parsed by Git")
+    if len(completed.stdout) > 1024 * 1024:
+        raise NativeEvidenceInvalid("local Git configuration exceeds the parsed-inspection bound")
+    try:
+        payload = completed.stdout.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise NativeEvidenceInvalid("local Git configuration is not valid UTF-8") from exc
+    entries: list[_LocalGitConfigEntry] = []
+    for record in payload.split("\0"):
+        if not record:
+            continue
+        key, separator, value = record.partition("\n")
+        if not separator:
+            raise NativeEvidenceInvalid("local Git configuration contains a valueless key")
+        pieces = key.split(".")
+        if len(pieces) < 2 or not pieces[0] or not pieces[-1]:
+            raise NativeEvidenceInvalid("local Git configuration key is structurally ambiguous")
+        entries.append(
+            _LocalGitConfigEntry(
+                section=pieces[0],
+                subsection=".".join(pieces[1:-1]) if len(pieces) > 2 else None,
+                name=pieces[-1],
+                value=value,
+            )
+        )
+        if len(entries) > 10_000:
+            raise NativeEvidenceInvalid("local Git configuration has too many entries")
+    return tuple(entries)
+
+
+def _authorize_source_config_entry(repository: Path, entry: _LocalGitConfigEntry) -> None:
+    section = entry.section.casefold()
+    name = entry.name.casefold()
+    label = _bounded_config_label(entry.section, entry.subsection, entry.name)
+    if entry.subsection is None:
+        if entry.canonical_key not in _SOURCE_LOCAL_CONFIG_ALLOWLIST:
+            raise NativeEvidenceInvalid(
+                f"local Git configuration key is outside the source allowlist: {label}"
+            )
+        _validate_source_scalar_config_value(entry.canonical_key, entry.value)
+        return
+    family = (section, name)
+    if family not in _SOURCE_INERT_CONFIG_FAMILIES:
+        raise NativeEvidenceInvalid(
+            f"local Git configuration key is outside the source allowlist: {label}"
+        )
+    subsection = entry.subsection
+    if not _is_structural_git_subsection(subsection):
+        raise NativeEvidenceInvalid(
+            f"local Git configuration subsection name is malformed: {section}.{name}"
+        )
+    if section == "branch":
+        _require_git_ref_format(
+            repository, f"refs/heads/{subsection}", label=label, kind="branch name"
+        )
+    if family == ("remote", "url"):
+        _require_inert_remote_url(entry.value, label)
+    elif family == ("remote", "fetch"):
+        _require_inert_fetch_refspec(repository, entry.value, label)
+    elif family == ("branch", "remote"):
+        _require_inert_branch_remote(entry.value, label)
+    else:
+        _require_inert_branch_merge(repository, entry.value, label)
+
+
+def _authorize_inert_source_git_configuration(
+    repository: Path, parsed_entries: tuple[_LocalGitConfigEntry, ...]
+) -> None:
+    """Decide the source-config question on Git's own parsed configuration.
+
+    The conservative pre-Git grammar has already refused every physical line it
+    cannot read unambiguously, so Git is only ever asked about a configuration
+    that carries no include, no command-bearing key and no smuggled
+    continuation.  Git's ordered key list must then agree exactly with the
+    pre-Git reading -- duplicates and order included -- and every authorization
+    decision below is taken on the section, optional subsection, variable name
+    and value that Git itself emitted.
+    """
+
+    git_entries = _git_parsed_local_configuration(repository)
+    if [entry.canonical_key for entry in git_entries] != [
+        entry.canonical_key for entry in parsed_entries
+    ]:
+        raise NativeEvidenceInvalid(
+            "local Git configuration disagrees with Git's own parsed configuration"
+        )
+    for entry in git_entries:
+        _authorize_source_config_entry(repository, entry)
+
+
 def _validate_attributes_file(repository: Path, value: str) -> None:
     if not value or value.startswith("~") or value.startswith("%("):
         raise NativeEvidenceInvalid("core.attributesFile is external or indeterminate")
@@ -1602,33 +1914,14 @@ def _validate_local_git_config_security(
         name = entry.name.casefold()
         key = entry.canonical_key
         if allowed_hooks_path is None:
-            if entry.subsection is not None or key not in _SOURCE_LOCAL_CONFIG_ALLOWLIST:
+            if entry.subsection is not None:
+                _screen_inert_source_config_family(entry)
+                continue
+            if key not in _SOURCE_LOCAL_CONFIG_ALLOWLIST:
                 raise NativeEvidenceInvalid(
                     f"local Git configuration key is outside the source allowlist: {key}"
                 )
-            if key in {
-                "core.filemode",
-                "core.bare",
-                "core.logallrefupdates",
-                "core.symlinks",
-                "core.ignorecase",
-                "core.precomposeunicode",
-            }:
-                _git_config_boolean(entry.value, key)
-            elif key == "core.repositoryformatversion" and entry.value not in {"0", "1"}:
-                raise NativeEvidenceInvalid("core.repositoryformatversion is unsupported")
-            elif key == "core.autocrlf" and entry.value.casefold() not in {"true", "false", "input"}:
-                raise NativeEvidenceInvalid("core.autocrlf is unsupported")
-            elif key == "core.safecrlf" and entry.value.casefold() not in {"true", "false", "warn"}:
-                raise NativeEvidenceInvalid("core.safecrlf is unsupported")
-            elif key == "extensions.objectformat" and entry.value.casefold() not in {"sha1", "sha256"}:
-                raise NativeEvidenceInvalid("extensions.objectformat is unsupported")
-            elif key == "extensions.refstorage" and entry.value.casefold() not in {"files", "reftable"}:
-                raise NativeEvidenceInvalid("extensions.refstorage is unsupported")
-            elif key in {"user.name", "user.email"} and not entry.value:
-                raise NativeEvidenceInvalid(f"{key} must not be empty")
-            elif key in {"commit.gpgsign", "tag.gpgsign"} and entry.value.casefold() != "false":
-                raise NativeEvidenceInvalid(f"{key} must be explicitly disabled")
+            _validate_source_scalar_config_value(key, entry.value)
             continue
         if section == "include" and name == "path":
             raise NativeEvidenceInvalid("local Git configuration contains include.path")
@@ -1743,6 +2036,12 @@ def _inspect_local_git_metadata(
             raise NativeEvidenceInvalid(f"local repository source has in-progress Git state: {name}")
     if _lexists(repository / ".gitmodules"):
         raise NativeEvidenceInvalid("local repository source contains submodule metadata")
+    if allowed_hooks_path is None:
+        # Deliberately last: every purely local refusal above -- redirecting
+        # .git, unsafe hooks, command-bearing or unreadable config, alternates,
+        # linked-worktree metadata, in-progress state, submodules -- still
+        # happens before any Git subprocess observes this repository.
+        _authorize_inert_source_git_configuration(repository, entries)
     return entries
 
 
