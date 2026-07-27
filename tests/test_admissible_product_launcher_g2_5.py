@@ -864,6 +864,16 @@ PROTECTED_PATH_PREFIXES = (
 #     document, and no archive file, and it changes neither preparation nor
 #     confirmation semantics.  The companion payload registry lives outside the
 #     protected trees in admissible/product_launcher/ and needs no entry here.
+#   - NEON_RELAY_PREP_2 authorized the reviewed neon-relay-v1 native mission
+#     definition: one module holding the mission text, completion conditions,
+#     required material paths, required commit message and the frozen verifier
+#     source.  It is registered exactly once and pinned by the profile
+#     fingerprint 8ef57625f3fb369ff87d2981ff15753fcd45f0328c74bcb05ed81c8a61c9999d
+#     and the verifier digest
+#     0e2afbd206933ad621b22e80755725d6436ea1f65319c914738254b0cfe001c5, so any
+#     later edit to it changes a pinned identity and fails the profile module.
+#     It adds no route, no UI and no archive file, and the neon siege entry
+#     below is its structural precedent: one reviewed file, never the directory.
 AUTHORIZED_REPAIR_PATHS = frozenset({
     "admissible/delegated_gate/historical_evaluation.py",
     "admissible/delegated_gate/historical_evaluation_store.py",
@@ -876,6 +886,7 @@ AUTHORIZED_REPAIR_PATHS = frozenset({
     "admissible/delegated_gate/native_executor.py",
     "admissible/delegated_gate/fixture_registry.py",
     "admissible/delegated_gate/mission_profile.py",
+    "admissible/delegated_gate/neon_relay_mission.py",
     "admissible/delegated_gate/neon_siege_mission.py",
     "admissible/product_read_model/presentation_types.py",
     "admissible/product_service/control.py",
@@ -957,6 +968,30 @@ def test_protected_path_guard_still_rejects_unauthorized_changes():
     ]
     assert _unauthorized_protected_paths(list(real) + intruders) == sorted(intruders)
 
+    # The neon relay authorization names exactly one file. A sibling module in
+    # the same protected directory - including one whose name merely extends the
+    # authorized filename - must still be refused, so the entry cannot have been
+    # written as a prefix or widened into admissible/delegated_gate/.
+    assert _unauthorized_protected_paths(["admissible/delegated_gate/neon_relay_mission.py"]) == []
+    for unlisted in (
+        "admissible/delegated_gate/neon_relay_mission_v2.py",
+        "admissible/delegated_gate/neon_relay_verifier.py",
+        "admissible/delegated_gate/neon_relay/mission.py",
+    ):
+        assert _unauthorized_protected_paths([unlisted]) == [unlisted]
+        assert _unauthorized_protected_paths(list(real) + [unlisted]) == [unlisted]
+
+    # An authorization matches one whole path, never a string prefix of one. A
+    # path that merely starts with an authorized entry stays a violation, so the
+    # comparison cannot be relaxed from equality to a prefix test.
+    for extended in (
+        "admissible/delegated_gate/neon_relay_mission.py.bak",
+        "admissible/delegated_gate/mission_profile.pyi",
+        "admissible/delegated_gate/native_canary.py.orig",
+        "admissible/product_service/control.py.rej",
+    ):
+        assert _unauthorized_protected_paths([extended]) == [extended]
+
     # Authorization is per file, never per directory.
     assert _unauthorized_protected_paths(["admissible/product_service/control.py"]) == []
     assert _unauthorized_protected_paths(["admissible/product_service/other.py"]) == [
@@ -967,8 +1002,10 @@ def test_protected_path_guard_still_rejects_unauthorized_changes():
         "admissible/product_read_model/renderer_v2.py"
     ]
 
-    # A bare protected filename must not match by prefix.
+    # A bare protected filename must not match by prefix, in either direction:
+    # neither a sibling that shares its stem nor a path that extends it.
     assert _unauthorized_protected_paths(["admissible/checkpoint_helpers.py"]) == []
+    assert _unauthorized_protected_paths(["admissible/checkpoint.py.bak"]) == []
 
     # Unprotected trees stay out of scope.
     assert _unauthorized_protected_paths(["tests/test_admissible_product_launcher_g2_5.py"]) == []
