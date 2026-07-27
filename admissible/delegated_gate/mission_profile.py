@@ -2426,6 +2426,145 @@ NEON_SIEGE_PROFILE = create_native_mission_profile(
 )
 
 
+# ---------------------------------------------------------------------------
+# Runtime-v2 mission profile: neon-relay-v1.
+#
+# This is the first registered profile whose workspace source is an existing
+# ordinary local Git repository rather than a registered fixture builder.  The
+# absolute fixture path below is the immutable blank Neon Relay fixture; its
+# exact HEAD is not a field of the accepted ``WorkspaceSourceAuthority`` schema,
+# so it is bound instead by the committed profile tests and, at authorization
+# time, by the independently observed ``initialized_workspace`` identity inside
+# the canonical v4 authorization payload.
+# ---------------------------------------------------------------------------
+
+from admissible.delegated_gate.neon_relay_mission import (  # noqa: E402
+    NEON_RELAY_COMPLETION_CONDITIONS_TEXT,
+    NEON_RELAY_MISSION_TEXT,
+    NEON_RELAY_REQUIRED_COMMIT_MESSAGE,
+    NEON_RELAY_REQUIRED_MATERIAL_PATHS,
+    NEON_RELAY_VERIFIER_SOURCE,
+    NEON_RELAY_VERIFIER_SOURCE_SHA256,
+)
+
+NEON_RELAY_FIXTURE_REPOSITORY_PATH = (
+    r"C:\Users\stris\Documents\Projets\ENTRE\admissible-neon-relay-source"
+)
+NEON_RELAY_VERIFIER_TIMEOUT_SECONDS = 180
+NEON_RELAY_VERIFIER_OUTPUT_LIMIT_BYTES = 262144
+
+NEON_RELAY_PROFILE = create_native_mission_profile(
+    schema_version=MISSION_PROFILE_SCHEMA_VERSION_V2,
+    profile_id="neon-relay-v1",
+    run_id="native-cursor-neon-relay-001",
+    session_id="native-cursor-neon-relay-001",
+    gate_id="neon-relay-gate",
+    mission_id="native-neon-relay",
+    mission_text=NEON_RELAY_MISSION_TEXT,
+    gate_objective=(
+        "Deliver a complete, dependency-free, browser-playable Neon Relay game whose "
+        "seeded domain layer satisfies the owner-frozen behavioral contract under the "
+        "one-shot, one-commit offline law."
+    ),
+    gate_clauses=(
+        (
+            "neon-relay.material",
+            "Every one of the fourteen required material paths exists and is created or "
+            "materially changed between the fixture initial commit and the task commit.",
+        ),
+        (
+            "neon-relay.git",
+            "Exactly one clean local task commit exists with the exact required complete "
+            "message, a clean worktree and index, no untracked file and zero remotes.",
+        ),
+        (
+            "neon-relay.checkpoint",
+            "The public npm-test checkpoint command runs to termination and exits zero "
+            "inside its configured timeout and capture bound.",
+        ),
+        (
+            "neon-relay.behavior",
+            "The owner-frozen independent behavioral verifier reports every clause from "
+            "C01_required_paths through C18_enemy_archetypes satisfied and emits its exact "
+            "final success line.",
+        ),
+        (
+            "neon-relay.nonclaims",
+            "The bounded non-claims are reported rather than silently assumed: visual "
+            "quality, control feel and complete human playability are not established, no "
+            "browser was launched, and no server or network access was attempted.",
+        ),
+        (
+            "neon-relay.human-visual-review",
+            "Visual quality, product coherence and playability remain reserved for a "
+            "separate human review and are established by no automated step in this run.",
+        ),
+    ),
+    required_evidence_kinds=(
+        EvidenceKind.TARGET_TREE.value,
+        EvidenceKind.GIT_STATE.value,
+        EvidenceKind.VERIFICATION_COMMAND.value,
+    ),
+    checkpoint_commands=(
+        ProfileCheckpointCommand(
+            command_id="npm-test",
+            argv=("npm.cmd", "test"),
+            timeout_seconds=300,
+            max_capture_bytes=1024 * 1024,
+        ),
+    ),
+    completion_conditions_text=NEON_RELAY_COMPLETION_CONDITIONS_TEXT,
+    budgets=ONE_SHOT_PROFILE_BUDGETS,
+    timeout_seconds=2700,
+    stdout_byte_limit=8 * 1024 * 1024,
+    stderr_byte_limit=1 * 1024 * 1024,
+    model="auto",
+    workspace_source=WorkspaceSourceAuthority(
+        kind=WorkspaceSourceKind.EXISTING_LOCAL_GIT_REPOSITORY,
+        local_repository_path=NEON_RELAY_FIXTURE_REPOSITORY_PATH,
+    ),
+    git_end_state_policy=GitEndStatePolicy(
+        required_commits_added=1,
+        required_complete_commit_message=NEON_RELAY_REQUIRED_COMMIT_MESSAGE,
+        final_worktree_clean=True,
+        final_index_clean=True,
+        final_remotes_absent=True,
+        required_material_paths=NEON_RELAY_REQUIRED_MATERIAL_PATHS,
+    ),
+    verification=VerificationAuthority(
+        mode=VerificationMode.FROZEN_BEHAVIORAL,
+        verifier_source=NEON_RELAY_VERIFIER_SOURCE,
+        verifier_source_sha256=NEON_RELAY_VERIFIER_SOURCE_SHA256,
+        verifier_timeout_seconds=NEON_RELAY_VERIFIER_TIMEOUT_SECONDS,
+        verifier_output_limit_bytes=NEON_RELAY_VERIFIER_OUTPUT_LIMIT_BYTES,
+        disclose_complete_source=True,
+    ),
+    runtime_prompt=RuntimePromptAuthority(
+        permitted_effects=(
+            "Create, edit and locally commit files only inside the assigned workspace.",
+            "Run local dependency-free commands such as node, npm test and git inside the "
+            "assigned workspace.",
+        ),
+        forbidden_effects=(
+            "Do not install any production or development dependency and do not create "
+            "node_modules.",
+            "Do not use the network, a CDN, an external asset, a server, a port or a "
+            "browser subprocess.",
+            "Do not add a Git remote, push, deploy or touch anything outside the assigned "
+            "workspace.",
+            "Do not add a start script, a watch command or a development server.",
+        ),
+        stop_clause=(
+            "Stop immediately after npm test has terminated successfully and exactly one "
+            "local commit exists whose complete message is exactly "
+            f"`{NEON_RELAY_REQUIRED_COMMIT_MESSAGE}`, the worktree and index are clean, no "
+            "untracked file remains and zero remotes exist. Perform no push, no deployment "
+            "and no optional polish after that commit."
+        ),
+    ),
+)
+
+
 __all__ = [
     "FLAGSHIP_COMPLETION_CONDITIONS_TEXT",
     "FLAGSHIP_INCIDENT_REPLAY_PROFILE",
@@ -2446,6 +2585,10 @@ __all__ = [
     "MAX_NEGATIVE_CONTROLS_PER_OBLIGATION",
     "MAX_REFERENCE_CASES_PER_OBLIGATION",
     "MAX_VERIFICATION_EVIDENCE_BINDINGS",
+    "NEON_RELAY_FIXTURE_REPOSITORY_PATH",
+    "NEON_RELAY_PROFILE",
+    "NEON_RELAY_VERIFIER_OUTPUT_LIMIT_BYTES",
+    "NEON_RELAY_VERIFIER_TIMEOUT_SECONDS",
     "NEON_SIEGE_PROFILE",
     "ONE_SHOT_PROFILE_BUDGETS",
     "WORKFLOW_RECOVERY_COMPLETION_CONDITIONS_TEXT",

@@ -73,6 +73,13 @@ LEGACY_IDENTITIES = {
     "workflow-recovery-v1": "ed67459c803bf439ee3325cdf9fa069d48677408412ff283ab86a4234d9ae2f8",
     "workflow-recovery-v2": "e4bdcf5a2f5ae1cae6435bc8881eff40e6154762e9cbd76c6054bd0e61e78724",
     "neon-siege-v1": "da7a93272544a05b60887973a80c72e2541104053162646c5daa5a30920a5b35",
+    # NEON_RELAY_PREP_2 deliberately extends this exact pin rather than
+    # weakening it: the registered set is still asserted by equality, and the
+    # five identities above are unchanged.  neon-relay-v1 is the first
+    # registered runtime-v2 profile whose workspace source is an existing local
+    # Git repository; its own complete identity is pinned in
+    # tests/test_admissible_neon_relay_profile.py.
+    "neon-relay-v1": "8ef57625f3fb369ff87d2981ff15753fcd45f0328c74bcb05ed81c8a61c9999d",
 }
 
 
