@@ -86,6 +86,11 @@ LEGACY_IDENTITIES = {
     # and the ACP_STDIO prompt transport, because v1's argv transport is
     # unspawnable on Windows and v1's single native attempt is durably consumed.
     "neon-relay-v2": "3dd4ce6198e450b420afab4ed1e19acfcb7e807e292d87cafdc475ad0ca2c3b6",
+    # The backend-drift repair extends the pin once more: neon-relay-v3 is the
+    # same mission and the same ACP_STDIO transport on a third run identity,
+    # because v2's single native attempt is durably consumed by the authorized
+    # run that crashed inside drift observation.
+    "neon-relay-v3": "d871015d5a0ca8fc1ed050264a5c30845162cce8396fae6fa5fa2f0352253ec6",
 }
 
 

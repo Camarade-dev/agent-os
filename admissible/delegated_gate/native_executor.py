@@ -3619,45 +3619,131 @@ class _BackendDrift:
         return not self.blocking_diagnostics
 
 
+def _wrapper_chain_material_drift(
+    chain: WrapperChainBackendAttestation,
+    post_run_wrapper_chain_attestation: WrapperChainBackendAttestation | None,
+) -> tuple[tuple[str, ...], str, str, str, tuple[str, ...]]:
+    """Classify the one wrapper-chain launcher/routing authority.
+
+    Wrapper bytes, package manifest, version catalog, selected-version root and
+    command resolution live here and nowhere else.  ``LOCAL_ACP_STDIO`` embeds a
+    ``LOCAL_WRAPPER_CHAIN`` attestation precisely so both classes are measured by
+    these identical comparisons instead of by a second, divergent copy.
+    """
+
+    wrappers = (
+        _attested_file_drift(chain.cmd_wrapper),
+        _attested_file_drift(chain.powershell_wrapper),
+        _attested_file_drift(chain.package_manifest),
+        *tuple(_attested_file_drift(item) for item in chain.version_wrapper_copies),
+    )
+    diagnostics: list[str] = []
+    diagnostics.extend((f"cmd_wrapper:{wrappers[0]}", f"powershell_wrapper:{wrappers[1]}",f"selected_package_manifest:{wrappers[2]}"))
+    diagnostics.extend(f"selected_wrapper_copy_{index}:{value}" for index,value in enumerate(wrappers[3:]))
+    if post_run_wrapper_chain_attestation is None:
+        command_resolution = "UNREADABLE"
+    else:
+        command_resolution = (
+            "NO_DRIFT"
+            if post_run_wrapper_chain_attestation.command_resolution == chain.command_resolution
+            else "IDENTITY_ONLY_DRIFT"
+        )
+    diagnostics.append(f"command_resolution:{command_resolution}")
+    try:
+        inventory, selected_version = _select_wrapper_version(Path(chain.command_resolution.wrapper_root))
+        catalog = "NO_DRIFT" if inventory == chain.version_inventory else "VERSION_INVENTORY_DRIFT"
+        selected = _attested_directory_drift(chain.selected_version_root,chain.selected_version_root_identity) if selected_version == chain.selected_version else "SELECTED_VERSION_DRIFT"
+    except (OSError, ValueError):
+        catalog = "UNREADABLE"
+        selected = "UNREADABLE"
+    diagnostics.extend((f"version_inventory:{catalog}", f"selected_version:{selected}"))
+    return wrappers, command_resolution, catalog, selected, tuple(diagnostics)
+
+
+def _acp_transport_drift(attestation: AcpStdioBackendAttestation) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Classify the exactly-one layer ``LOCAL_ACP_STDIO`` adds to its chain.
+
+    The nested chain owns every live launcher fact, so this layer is derived
+    from the attestation body alone: it proves the ACP class/schema, the
+    ACP_STDIO transport, the fixed ``<node> <index.js> acp`` server argv, the
+    prompt-binding policy, and that none of the chain's launcher/version facts
+    were restated differently here.  It reads no prompt and emits no prompt
+    bytes, so the retained diagnostics stay prompt-free by construction.
+    """
+
+    chain = attestation.wrapper_chain
+    checks: tuple[tuple[str, bool], ...] = (
+        ("acp_attestation_class", (
+            attestation.schema_version == ACP_STDIO_ATTESTATION_SCHEMA_VERSION
+            and attestation.attestation_class == ATTESTATION_CLASS_ACP_STDIO
+            and attestation.backend_identity == BACKEND_IDENTITY
+            and attestation.backend_protocol_version == BACKEND_PROTOCOL_VERSION_ACP_STDIO
+            and chain.schema_version == WRAPPER_CHAIN_ATTESTATION_SCHEMA_VERSION
+            and chain.attestation_class == ATTESTATION_CLASS_WRAPPER_CHAIN
+        )),
+        ("acp_prompt_transport", attestation.prompt_transport == PROMPT_TRANSPORT_ACP_STDIO),
+        ("acp_static_argv", (
+            len(attestation.static_argv_template) == 3
+            and bool(chain.launcher_prefix)
+            and attestation.static_argv_template[0] == chain.executable.canonical_path
+            and attestation.static_argv_template[1] == chain.launcher_prefix[0].canonical_path
+            and attestation.static_argv_template[2] == ACP_SUBCOMMAND
+            and "{prompt}" not in attestation.static_argv_template
+        )),
+        ("acp_wrapper_chain_binding", (
+            attestation.executable == chain.executable
+            and attestation.launcher_prefix == chain.launcher_prefix
+            and attestation.version_inventory == chain.version_inventory
+            and attestation.selected_version == chain.selected_version
+            and attestation.selected_version_root == chain.selected_version_root
+            and attestation.selected_model == chain.selected_model
+            and attestation.environment_allowlist == chain.environment_allowlist
+        )),
+        ("acp_prompt_binding_policy", (
+            attestation.cwd_policy == ACP_STDIO_CWD_POLICY
+            and attestation.prompt_fingerprint_binding_policy == ACP_STDIO_PROMPT_BINDING_POLICY
+            and dict(attestation.claims) == ACP_STDIO_CLAIMS
+            and tuple(attestation.non_claims) == ACP_STDIO_NON_CLAIMS
+        )),
+        ("acp_attestation_fingerprint", fingerprint(attestation._body()) == attestation.attestation_fingerprint),
+    )
+    values = tuple("NO_DRIFT" if satisfied else "CONTENT_DRIFT" for _, satisfied in checks)
+    diagnostics = tuple(f"{name}:{value}" for (name, _), value in zip(checks, values))
+    return values, diagnostics
+
+
 def _observe_backend_drift(
     attestation: BackendAttestation,
     *, post_run_wrapper_chain_attestation: WrapperChainBackendAttestation | None = None,
 ) -> _BackendDrift:
+    """Classify one attested backend against the live installation, fail-closed.
+
+    Every supported class is handled by its own explicit branch; an unsupported
+    class raises rather than being duck-typed into a neighbouring branch, and
+    ``execute`` calls this before it reserves the attempt so an inexpressible
+    attestation can never burn the native attempt or crash after a real spawn.
+    """
+
     executable = _attested_file_drift(attestation.executable)
     launchers = tuple(_attested_file_drift(item) for item in attestation.launcher_prefix)
-    wrappers: tuple[str, ...] = ()
     command_resolution = "NOT_APPLICABLE"
     catalog = "NOT_APPLICABLE"
     selected = "NOT_APPLICABLE"
     diagnostics: list[str] = [f"pinned_executable:{executable}"]
     diagnostics.extend(f"pinned_launcher_{index}:{value}" for index, value in enumerate(launchers))
-    if isinstance(attestation, WrapperChainBackendAttestation):
-        wrappers = (
-            _attested_file_drift(attestation.cmd_wrapper),
-            _attested_file_drift(attestation.powershell_wrapper),
-            _attested_file_drift(attestation.package_manifest),
-            *tuple(_attested_file_drift(item) for item in attestation.version_wrapper_copies),
+    if isinstance(attestation, AcpStdioBackendAttestation):
+        chain_wrappers, command_resolution, catalog, selected, chain_diagnostics = _wrapper_chain_material_drift(
+            attestation.wrapper_chain, post_run_wrapper_chain_attestation,
         )
-        diagnostics.extend((f"cmd_wrapper:{wrappers[0]}", f"powershell_wrapper:{wrappers[1]}",f"selected_package_manifest:{wrappers[2]}"))
-        diagnostics.extend(f"selected_wrapper_copy_{index}:{value}" for index,value in enumerate(wrappers[3:]))
-        if post_run_wrapper_chain_attestation is None:
-            command_resolution = "UNREADABLE"
-        else:
-            command_resolution = (
-                "NO_DRIFT"
-                if post_run_wrapper_chain_attestation.command_resolution == attestation.command_resolution
-                else "IDENTITY_ONLY_DRIFT"
-            )
-        diagnostics.append(f"command_resolution:{command_resolution}")
-        try:
-            inventory, selected_version = _select_wrapper_version(Path(attestation.command_resolution.wrapper_root))
-            catalog = "NO_DRIFT" if inventory == attestation.version_inventory else "VERSION_INVENTORY_DRIFT"
-            selected = _attested_directory_drift(attestation.selected_version_root,attestation.selected_version_root_identity) if selected_version == attestation.selected_version else "SELECTED_VERSION_DRIFT"
-        except (OSError, ValueError):
-            catalog = "UNREADABLE"
-            selected = "UNREADABLE"
-        diagnostics.extend((f"version_inventory:{catalog}", f"selected_version:{selected}"))
-    else:
+        acp_values, acp_diagnostics = _acp_transport_drift(attestation)
+        wrappers = (*chain_wrappers, *acp_values)
+        diagnostics.extend(chain_diagnostics); diagnostics.extend(acp_diagnostics)
+    elif isinstance(attestation, WrapperChainBackendAttestation):
+        wrappers, command_resolution, catalog, selected, chain_diagnostics = _wrapper_chain_material_drift(
+            attestation, post_run_wrapper_chain_attestation,
+        )
+        diagnostics.extend(chain_diagnostics)
+    elif isinstance(attestation, NativeBackendAttestation):
         # Package-bin authority includes the discovered shim, manifest and
         # mapped launcher.  Any change remains conservatively ineligible.
         package_items = (
@@ -3671,7 +3757,21 @@ def _observe_backend_drift(
             _attested_directory_drift(attestation.provenance.package_root,attestation.provenance.package_root_identity),
         )
         diagnostics.extend(f"package_chain_{index}:{value}" for index, value in enumerate(wrappers))
+    else:
+        raise NativeEvidenceInvalid("backend attestation class has no drift-observation authority")
     return _BackendDrift(executable, launchers, wrappers, command_resolution, catalog, selected, tuple(diagnostics))
+
+
+def _wrapper_chain_command_authority(
+    attestation: BackendAttestation,
+) -> WrapperChainBackendAttestation | None:
+    """The nested attestation carrying an attested class's command resolution."""
+
+    if isinstance(attestation, AcpStdioBackendAttestation):
+        return attestation.wrapper_chain
+    if isinstance(attestation, WrapperChainBackendAttestation):
+        return attestation
+    return None
 
 
 def _result_from_observation(observation: NativeProcessObservation, *, backend_attestation_fingerprint: str, harden_git: bool | None = None) -> NativeExecutionResult:
@@ -3837,6 +3937,12 @@ class NativeDelegatedExecutor:
             require_windows_spawnable_argv(argv, label="native prompt-bearing argv")
         elif any(prompt in member for member in argv):
             raise NativeEvidenceInvalid("ACP transport argv must never contain the prompt")
+        # Prove the attested class is drift-observable *before* the attempt is
+        # reserved and before any spawn.  The post-run observation below stays
+        # the eligibility authority; this call exists so a class the observer
+        # cannot express fails closed here instead of raising after a real
+        # provider process has already consumed the single native attempt.
+        _observe_backend_drift(request.backend_attestation)
         argv_fingerprint = hashlib.sha256(canonical_bytes(list(argv))).hexdigest()
         reservation = store.create_attempt_reserved(
             request=request, argv_fingerprint=argv_fingerprint,
@@ -3908,11 +4014,14 @@ class NativeDelegatedExecutor:
             raise NativeProcessObservationPublicationError(f"process observation publication failed: {exc}") from exc
 
         post_run_wrapper_chain_attestation: WrapperChainBackendAttestation | None = None
-        if isinstance(request.backend_attestation, WrapperChainBackendAttestation):
+        if _wrapper_chain_command_authority(request.backend_attestation) is not None:
             try:
                 refreshed = self.attest_local_backend()
-                if isinstance(refreshed, WrapperChainBackendAttestation):
-                    post_run_wrapper_chain_attestation = refreshed
+                # Only a same-class refresh may supply the comparison; a class
+                # change is never silently reinterpreted as command-resolution
+                # agreement.
+                if type(refreshed) is type(request.backend_attestation):
+                    post_run_wrapper_chain_attestation = _wrapper_chain_command_authority(refreshed)
             except NativeEvidenceInvalid:
                 # The raw file/directory comparisons below remain durable.  A
                 # failed post-run resolution refresh is conservatively surfaced

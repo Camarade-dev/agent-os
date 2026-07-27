@@ -2646,6 +2646,47 @@ NEON_RELAY_V2_PROFILE = create_native_mission_profile(
 )
 
 
+# ---------------------------------------------------------------------------
+# Runtime-v2 mission profile: neon-relay-v3 (ACP_STDIO transport).
+#
+# v2's single native attempt is durably consumed: the authorized run reserved
+# it, spawned a real ACP provider and then raised inside backend-drift
+# observation, so ``native-cursor-neon-relay-002`` can never be reused.  v3
+# changes exactly one thing -- the run identity.  The transport stays ACP_STDIO
+# and every mission-bearing field is taken from the v2 profile object rather
+# than restated, so mission text, completion conditions, frozen verifier and its
+# SHA-256, required material paths, fixture, budgets, model, timeouts,
+# checkpoint command and required commit message are byte-identical to v2 (and
+# therefore to v1) by construction.  The profile fingerprint and canonical
+# document necessarily differ because the identity differs.
+# ---------------------------------------------------------------------------
+
+NEON_RELAY_V3_PROFILE = create_native_mission_profile(
+    schema_version=MISSION_PROFILE_SCHEMA_VERSION_V2,
+    profile_id="neon-relay-v3",
+    run_id="native-cursor-neon-relay-003",
+    session_id="native-cursor-neon-relay-003",
+    gate_id=NEON_RELAY_V2_PROFILE.gate_id,
+    mission_id=NEON_RELAY_V2_PROFILE.mission_id,
+    mission_text=NEON_RELAY_V2_PROFILE.mission_text,
+    gate_objective=NEON_RELAY_V2_PROFILE.gate_objective,
+    gate_clauses=NEON_RELAY_V2_PROFILE.gate_clauses,
+    required_evidence_kinds=NEON_RELAY_V2_PROFILE.required_evidence_kinds,
+    checkpoint_commands=NEON_RELAY_V2_PROFILE.checkpoint_commands,
+    completion_conditions_text=NEON_RELAY_V2_PROFILE.completion_conditions_text,
+    budgets=NEON_RELAY_V2_PROFILE.budgets,
+    timeout_seconds=NEON_RELAY_V2_PROFILE.timeout_seconds,
+    stdout_byte_limit=NEON_RELAY_V2_PROFILE.stdout_byte_limit,
+    stderr_byte_limit=NEON_RELAY_V2_PROFILE.stderr_byte_limit,
+    model=NEON_RELAY_V2_PROFILE.model,
+    workspace_source=NEON_RELAY_V2_PROFILE.workspace_source,
+    git_end_state_policy=NEON_RELAY_V2_PROFILE.git_end_state_policy,
+    verification=NEON_RELAY_V2_PROFILE.verification,
+    runtime_prompt=NEON_RELAY_V2_PROFILE.runtime_prompt,
+    prompt_transport=NEON_RELAY_V2_PROFILE.prompt_transport,
+)
+
+
 __all__ = [
     "FLAGSHIP_COMPLETION_CONDITIONS_TEXT",
     "FLAGSHIP_INCIDENT_REPLAY_PROFILE",
@@ -2669,6 +2710,7 @@ __all__ = [
     "NEON_RELAY_FIXTURE_REPOSITORY_PATH",
     "NEON_RELAY_PROFILE",
     "NEON_RELAY_V2_PROFILE",
+    "NEON_RELAY_V3_PROFILE",
     "PROMPT_TRANSPORT_ACP_STDIO",
     "PROMPT_TRANSPORT_ARGV",
     "NEON_RELAY_VERIFIER_OUTPUT_LIMIT_BYTES",

@@ -1711,7 +1711,13 @@ def test_registration_adds_neon_relay_once_and_preserves_every_previous_identity
     # replacing it: v1's own identity above is unchanged, and v2 carries the
     # same mission on a new run identity because v1's argv transport cannot be
     # spawned on Windows and its single native attempt is durably consumed.
-    assert set(profiles) == set(LEGACY_FINGERPRINTS) | {EXPECTED_PROFILE_ID, "neon-relay-v2"}
+    # The backend-drift repair extends the registry the same way again: v2's own
+    # single native attempt is durably consumed by the authorized run that
+    # crashed inside drift observation, so neon-relay-v3 carries the identical
+    # mission on a third run identity.
+    assert set(profiles) == set(LEGACY_FINGERPRINTS) | {
+        EXPECTED_PROFILE_ID, "neon-relay-v2", "neon-relay-v3",
+    }
     v2 = resolve_registered_profile("neon-relay-v2")
     assert v2.profile_fingerprint == (
         "3dd4ce6198e450b420afab4ed1e19acfcb7e807e292d87cafdc475ad0ca2c3b6"
@@ -1719,8 +1725,15 @@ def test_registration_adds_neon_relay_once_and_preserves_every_previous_identity
     assert v2.profile_fingerprint != PROFILE.profile_fingerprint
     assert v2.mission_text == PROFILE.mission_text
     assert v2.verifier_source_sha256 == PROFILE.verifier_source_sha256
+    v3 = resolve_registered_profile("neon-relay-v3")
+    assert v3.profile_fingerprint == (
+        "d871015d5a0ca8fc1ed050264a5c30845162cce8396fae6fa5fa2f0352253ec6"
+    )
+    assert len({v3.profile_fingerprint, v2.profile_fingerprint, PROFILE.profile_fingerprint}) == 3
+    assert v3.mission_text == PROFILE.mission_text
+    assert v3.verifier_source_sha256 == PROFILE.verifier_source_sha256
     with pytest.raises(ValueError, match="unknown mission profile"):
-        resolve_registered_profile("neon-relay-v3")
+        resolve_registered_profile("neon-relay-v4")
 
 
 def test_neon_siege_definition_remains_unchanged():

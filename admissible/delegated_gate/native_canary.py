@@ -42,6 +42,7 @@ from admissible.delegated_gate.mission_profile import (
     FLAGSHIP_INCIDENT_REPLAY_PROFILE,
     NEON_RELAY_PROFILE,
     NEON_RELAY_V2_PROFILE,
+    NEON_RELAY_V3_PROFILE,
     NEON_SIEGE_PROFILE,
     ONE_SHOT_PROFILE_BUDGETS,
     WORKFLOW_RECOVERY_PROFILE,
@@ -475,6 +476,7 @@ def registered_profiles() -> dict[str, NativeMissionProfile]:
             NEON_SIEGE_PROFILE,
             NEON_RELAY_PROFILE,
             NEON_RELAY_V2_PROFILE,
+            NEON_RELAY_V3_PROFILE,
         )
     }
 

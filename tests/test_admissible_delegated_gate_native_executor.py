@@ -3152,3 +3152,519 @@ def test_contradictory_terminal_over_completed_success_is_recognized_never_succe
     assert outcome.status is NativeCanaryStatus.CHECKPOINT_CAPTURE_FAILED and not outcome.canary_success
     assert len(h.runner.invocations) == 1
     assert not tuple(h.store.directory.glob("*.attempt-1.*"))
+
+
+# --- ACP_STDIO backend drift observation ------------------------------------
+#
+# Regression cover for the authorized Neon Relay V2 run, which reserved its
+# single native attempt, spawned a real ACP provider for ~10 minutes and then
+# raised ``AttributeError: 'AcpStdioBackendAttestation' object has no attribute
+# 'provenance'`` inside ``_observe_backend_drift``.  The drift observer branched
+# on ``WrapperChainBackendAttestation`` and duck-typed *everything else* as the
+# package-bin class, so the ACP class fell into a branch that cannot describe it.
+
+from admissible.delegated_gate.native_executor import (
+    ACP_SUBCOMMAND,
+    ATTESTATION_CLASS_ACP_STDIO,
+    AcpStdioBackendAttestation,
+    PROMPT_TRANSPORT_ACP_STDIO,
+    PROMPT_TRANSPORT_ARGV,
+    _attest_acp_stdio_cursor_observed,
+    _observe_backend_drift,
+    _wrapper_chain_command_authority,
+)
+
+_ACP_CONFIG = CursorNativeBackendConfig(executable="cursor-agent", attestation_class=ATTESTATION_CLASS_ACP_STDIO)
+
+
+def _acp_attestor(discovery: FakeWrapperChainDiscovery):
+    return lambda config: _attest_acp_stdio_cursor_observed(config, discovery=discovery)[0]
+
+
+def _acp_attestation(tmp_path: Path) -> tuple[Path, FakeWrapperChainDiscovery, AcpStdioBackendAttestation]:
+    root = _wrapper_chain_installation(tmp_path)
+    discovery = FakeWrapperChainDiscovery(root)
+    return root, discovery, _acp_attestor(discovery)(_ACP_CONFIG)
+
+
+def _acp_harness(tmp_path: Path, *, runner: FakeNativeProcessRunner | None = None) -> tuple[Harness, FakeWrapperChainDiscovery]:
+    source_parent = tmp_path / "source-parent"; source_parent.mkdir(); source = build_canary_repository(source_parent, repository_name="source").repository
+    root = tmp_path / "run"; root.mkdir(); work = build_canary_repository(root).repository; evidence = root / "evidence"; evidence.mkdir()
+    discovery = FakeWrapperChainDiscovery(_wrapper_chain_installation(tmp_path))
+    attestor = _acp_attestor(discovery)
+    attestation = attestor(_ACP_CONFIG)
+    fake = runner or FakeNativeProcessRunner(); store = AtomicNativeExecutionStore(evidence / "native-execution"); session_store = AtomicDelegatedSessionStore(evidence / "delegated-state")
+    session_id = "acp-stdio-session"; session_store.create(create_canary_session(session_id=session_id))
+    executor = NativeDelegatedExecutor(config=_ACP_CONFIG, process_runner=fake, clock=Clock(), local_attestor=attestor)
+    coordinator = NativeCanaryCoordinator(session_store=session_store, execution_store=store, executor=executor, backend_attestation=attestation, source_repository=source, work_workspace=work, canary_parent=root, evidence_directory=evidence, timeout_seconds=30, stdout_byte_limit=4096, stderr_byte_limit=2048)
+    return Harness(root, source, work, evidence, _ACP_CONFIG, attestation, fake, store, session_store, executor, coordinator, session_id), discovery
+
+
+def _post_run_chain(discovery: FakeWrapperChainDiscovery) -> WrapperChainBackendAttestation | None:
+    """The nested command-resolution authority a post-run refresh supplies.
+
+    ``None`` when the live installation can no longer be attested at all, which
+    is exactly what ``execute`` records when its refresh raises.
+    """
+
+    try:
+        return _wrapper_chain_command_authority(_acp_attestor(discovery)(_ACP_CONFIG))
+    except (OSError, ValueError, NativeEvidenceInvalid):
+        return None
+
+
+# --- the exact former traceback ---------------------------------------------
+
+
+def test_acp_attestation_has_no_provenance_and_the_former_drift_expression_raised(tmp_path: Path):
+    """Pin the historical defect: the observed expression, on the observed type."""
+
+    _, discovery, attestation = _acp_attestation(tmp_path)
+    assert isinstance(attestation, AcpStdioBackendAttestation)
+    assert not isinstance(attestation, (NativeBackendAttestation, WrapperChainBackendAttestation))
+    assert not hasattr(attestation, "provenance")
+    with pytest.raises(AttributeError) as exc:
+        attestation.provenance.discovered_shim  # the exact former drift-observation access
+    assert "provenance" in str(exc.value)
+    # The repaired observer traverses the same object without touching it.
+    drift = _observe_backend_drift(attestation, post_run_wrapper_chain_attestation=_post_run_chain(discovery))
+    assert drift.clean and "pinned_executable:NO_DRIFT" in drift.diagnostics
+
+
+def test_unchanged_acp_attestation_passes_drift_observation(tmp_path: Path):
+    _, discovery, attestation = _acp_attestation(tmp_path)
+    drift = _observe_backend_drift(attestation, post_run_wrapper_chain_attestation=_post_run_chain(discovery))
+    assert drift.clean and drift.post_run_eligible and not drift.blocking_diagnostics
+    assert (drift.executable, drift.command_resolution, drift.catalog, drift.selected_version) == ("NO_DRIFT", "NO_DRIFT", "NO_DRIFT", "NO_DRIFT")
+    assert drift.launchers == ("NO_DRIFT",)
+    # Both authorities are exercised: the nested chain's material facts and the
+    # ACP layer the chain cannot express.
+    assert {item.split(":", 1)[0] for item in drift.diagnostics} >= {
+        "cmd_wrapper", "powershell_wrapper", "selected_package_manifest", "command_resolution",
+        "version_inventory", "selected_version", "acp_attestation_class", "acp_prompt_transport",
+        "acp_static_argv", "acp_wrapper_chain_binding", "acp_prompt_binding_policy",
+        "acp_attestation_fingerprint",
+    }
+    assert all(item.rsplit(":", 1)[-1] == "NO_DRIFT" for item in drift.diagnostics if item.startswith("acp_"))
+
+
+def test_acp_drift_authority_is_both_the_acp_layer_and_its_nested_wrapper_chain(tmp_path: Path):
+    _, discovery, attestation = _acp_attestation(tmp_path)
+    assert _wrapper_chain_command_authority(attestation) is attestation.wrapper_chain
+    chain_only = _observe_backend_drift(attestation.wrapper_chain, post_run_wrapper_chain_attestation=_post_run_chain(discovery))
+    acp = _observe_backend_drift(attestation, post_run_wrapper_chain_attestation=_post_run_chain(discovery))
+    # The ACP view is the chain view plus, and only plus, the ACP layer.
+    assert acp.wrappers[: len(chain_only.wrappers)] == chain_only.wrappers
+    assert acp.diagnostics[: len(chain_only.diagnostics)] == chain_only.diagnostics
+    assert len(acp.wrappers) == len(chain_only.wrappers) + 6
+
+
+# --- refusals: live installation material ------------------------------------
+
+
+def test_changed_node_identity_is_refused(tmp_path: Path):
+    _, discovery, attestation = _acp_attestation(tmp_path)
+    executable = Path(attestation.executable.canonical_path)
+    executable.write_bytes(executable.read_bytes() + b"x")
+    drift = _observe_backend_drift(attestation, post_run_wrapper_chain_attestation=_post_run_chain(discovery))
+    assert drift.executable == "CONTENT_DRIFT" and not drift.clean and not drift.post_run_eligible
+    assert "pinned_executable:CONTENT_DRIFT" in drift.blocking_diagnostics
+
+
+def test_changed_index_js_identity_is_refused(tmp_path: Path):
+    _, discovery, attestation = _acp_attestation(tmp_path)
+    launcher = Path(attestation.launcher_prefix[0].canonical_path)
+    launcher.write_bytes(launcher.read_bytes() + b"// drift\n")
+    drift = _observe_backend_drift(attestation, post_run_wrapper_chain_attestation=_post_run_chain(discovery))
+    assert drift.launchers == ("CONTENT_DRIFT",) and not drift.clean
+    assert "pinned_launcher_0:CONTENT_DRIFT" in drift.blocking_diagnostics
+
+
+def test_changed_selected_version_is_refused(tmp_path: Path):
+    root, discovery, attestation = _acp_attestation(tmp_path)
+    (root / "versions" / "2026.08.01-cafecafe").mkdir()  # strictly newer than the attested selection
+    drift = _observe_backend_drift(attestation, post_run_wrapper_chain_attestation=_post_run_chain(discovery))
+    assert drift.selected_version == "SELECTED_VERSION_DRIFT" and not drift.clean
+    assert "selected_version:SELECTED_VERSION_DRIFT" in drift.blocking_diagnostics
+    # A selection the live installation cannot even attest never downgrades to a
+    # clean command-resolution comparison.
+    assert _post_run_chain(discovery) is None and drift.command_resolution == "UNREADABLE"
+
+
+def test_changed_version_inventory_alone_is_refused(tmp_path: Path):
+    root, discovery, attestation = _acp_attestation(tmp_path)
+    (root / "versions" / "2026.01.01-0000000").mkdir()  # older: inventory moves, selection does not
+    drift = _observe_backend_drift(attestation, post_run_wrapper_chain_attestation=_post_run_chain(discovery))
+    assert drift.catalog == "VERSION_INVENTORY_DRIFT" and drift.selected_version == "NO_DRIFT"
+    assert not drift.clean and "version_inventory:VERSION_INVENTORY_DRIFT" in drift.blocking_diagnostics
+
+
+def test_changed_path_command_resolution_authority_is_refused(tmp_path: Path):
+    root, discovery, attestation = _acp_attestation(tmp_path)
+    earlier = tmp_path / "acp-earlier-path"; earlier.mkdir()
+    discovery.path = _path_value(earlier, root, "C:\\Windows")
+    drift = _observe_backend_drift(attestation, post_run_wrapper_chain_attestation=_post_run_chain(discovery))
+    assert drift.command_resolution == "IDENTITY_ONLY_DRIFT" and not drift.clean
+    assert "command_resolution:IDENTITY_ONLY_DRIFT" in drift.blocking_diagnostics
+
+
+def test_absent_post_run_command_resolution_authority_is_refused(tmp_path: Path):
+    _, _, attestation = _acp_attestation(tmp_path)
+    drift = _observe_backend_drift(attestation)
+    assert drift.command_resolution == "UNREADABLE" and not drift.clean
+    assert "command_resolution:UNREADABLE" in drift.blocking_diagnostics
+
+
+# --- refusals: the ACP layer itself ------------------------------------------
+
+
+def _tampered(attestation: AcpStdioBackendAttestation, **changes: object) -> AcpStdioBackendAttestation:
+    """A structurally-invalid ACP attestation the drift observer must classify.
+
+    ``validated()`` refuses these at parse time; drift observation must classify
+    rather than raise so an already-published observation is never lost.
+    """
+
+    return replace(attestation, **changes)
+
+
+def test_changed_prompt_transport_is_refused(tmp_path: Path):
+    _, discovery, attestation = _acp_attestation(tmp_path)
+    drift = _observe_backend_drift(
+        _tampered(attestation, prompt_transport=PROMPT_TRANSPORT_ARGV),
+        post_run_wrapper_chain_attestation=_post_run_chain(discovery),
+    )
+    assert "acp_prompt_transport:CONTENT_DRIFT" in drift.blocking_diagnostics
+    assert not drift.clean and not drift.post_run_eligible
+
+
+def test_changed_static_acp_argv_is_refused(tmp_path: Path):
+    _, discovery, attestation = _acp_attestation(tmp_path)
+    chain = attestation.wrapper_chain
+    for template in (
+        (chain.executable.canonical_path, chain.launcher_prefix[0].canonical_path, "chat"),
+        (chain.executable.canonical_path, chain.launcher_prefix[0].canonical_path),
+        (chain.executable.canonical_path, chain.launcher_prefix[0].canonical_path, ACP_SUBCOMMAND, "{prompt}"),
+    ):
+        drift = _observe_backend_drift(
+            _tampered(attestation, static_argv_template=template),
+            post_run_wrapper_chain_attestation=_post_run_chain(discovery),
+        )
+        assert "acp_static_argv:CONTENT_DRIFT" in drift.blocking_diagnostics and not drift.clean
+
+
+def test_acp_restating_its_chains_launcher_or_version_facts_is_refused(tmp_path: Path):
+    _, discovery, attestation = _acp_attestation(tmp_path)
+    for changes in (
+        {"selected_version": "2099.12.31-ffffffff"},
+        {"version_inventory": ("2099.12.31-ffffffff",)},
+        {"selected_version_root": str(tmp_path / "elsewhere")},
+        {"selected_model": "some-other-model"},
+        {"environment_allowlist": ("PATH",)},
+    ):
+        drift = _observe_backend_drift(
+            _tampered(attestation, **changes), post_run_wrapper_chain_attestation=_post_run_chain(discovery),
+        )
+        assert "acp_wrapper_chain_binding:CONTENT_DRIFT" in drift.blocking_diagnostics
+
+
+def test_changed_acp_class_schema_or_policy_is_refused(tmp_path: Path):
+    _, discovery, attestation = _acp_attestation(tmp_path)
+    expectations = (
+        ({"attestation_class": ATTESTATION_CLASS_WRAPPER_CHAIN}, "acp_attestation_class"),
+        ({"schema_version": "admissible_cursor_acp_stdio_attestation_v2"}, "acp_attestation_class"),
+        ({"backend_protocol_version": "cursor-agent-acp-stdio-v2"}, "acp_attestation_class"),
+        ({"cwd_policy": "anywhere"}, "acp_prompt_binding_policy"),
+        ({"prompt_fingerprint_binding_policy": "unbound"}, "acp_prompt_binding_policy"),
+        ({"non_claims": ()}, "acp_prompt_binding_policy"),
+        ({"claims": {"acp_protocol_conformance_established": True}}, "acp_prompt_binding_policy"),
+        ({"attestation_fingerprint": "0" * 64}, "acp_attestation_fingerprint"),
+    )
+    for changes, expected in expectations:
+        drift = _observe_backend_drift(
+            _tampered(attestation, **changes), post_run_wrapper_chain_attestation=_post_run_chain(discovery),
+        )
+        assert f"{expected}:CONTENT_DRIFT" in drift.blocking_diagnostics
+        assert not drift.clean and not drift.post_run_eligible
+
+
+def test_unknown_attestation_class_is_refused_and_never_duck_typed(tmp_path: Path):
+    _, _, attestation = _acp_attestation(tmp_path)
+
+    @dataclass(frozen=True)
+    class ForeignAttestation:
+        """Carries exactly the duck-typed surface the observer used to rely on."""
+
+        executable: NativeBackendFileAttestation
+        launcher_prefix: tuple[NativeBackendFileAttestation, ...]
+        provenance: object
+
+    foreign = ForeignAttestation(attestation.executable, attestation.launcher_prefix, object())
+    with pytest.raises(NativeEvidenceInvalid, match="drift-observation authority"):
+        _observe_backend_drift(foreign)
+    assert _wrapper_chain_command_authority(foreign) is None
+
+
+# --- ARGV wrapper-chain behavior is byte-for-byte unchanged ------------------
+
+
+def test_wrapper_chain_drift_diagnostics_remain_byte_identical(tmp_path: Path):
+    root, discovery, chain = _wrapper_attestation(tmp_path)
+    refreshed = _attest_wrapper_chain_cursor(_WRAPPER_CONFIG, discovery=discovery)
+    drift = _observe_backend_drift(chain, post_run_wrapper_chain_attestation=refreshed)
+    assert drift.diagnostics == (
+        "pinned_executable:NO_DRIFT",
+        "pinned_launcher_0:NO_DRIFT",
+        "cmd_wrapper:NO_DRIFT",
+        "powershell_wrapper:NO_DRIFT",
+        "selected_package_manifest:NO_DRIFT",
+        "selected_wrapper_copy_0:NO_DRIFT",
+        "selected_wrapper_copy_1:NO_DRIFT",
+        "command_resolution:NO_DRIFT",
+        "version_inventory:NO_DRIFT",
+        "selected_version:NO_DRIFT",
+    )
+    assert len(drift.wrappers) == 5 and drift.clean
+    # The package-bin class keeps its own untouched branch.
+    package_root = tmp_path / "package"; package_root.mkdir()
+    package = _observe_backend_drift(_harness(package_root).attestation)
+    assert (package.command_resolution, package.catalog, package.selected_version) == ("NOT_APPLICABLE",) * 3
+    assert all(item.startswith("package_chain_") for item in package.diagnostics[2:])
+
+
+# --- executor lifecycle on the ACP lane --------------------------------------
+
+
+def test_acp_spawn_failure_reserves_the_attempt_but_publishes_no_process_started(tmp_path: Path):
+    h, _ = _acp_harness(tmp_path, runner=FakeNativeProcessRunner(spawn_error=True))
+    request, prompt = _request(h)
+    h.store.create_request(request)
+    with pytest.raises(NativeProcessStartError):
+        h.executor.execute(
+            request=request, prompt=prompt, source_repository=h.source, canary_parent=h.root,
+            allowed_parent_children=frozenset({h.work.name}), evidence_store_root=h.store.directory,
+            artifact_directory=h.store.artifact_directory, required_commit_message=REQUIRED_COMMIT_MESSAGE,
+            required_material_paths=EXPECTED_MATERIAL_PATHS, execution_store=h.store,
+        )
+    assert h.store.has_attempt_reserved(h.session_id, CANARY_GATE_ID, 0)
+    assert not h.store.has_process_started(h.session_id, CANARY_GATE_ID, 0)
+    assert not h.store.has_process_observation(h.session_id, CANARY_GATE_ID, 0)
+    assert not h.store.has_execution_eligibility(h.session_id, CANARY_GATE_ID, 0)
+    assert not h.store.has_result(h.session_id, CANARY_GATE_ID, 0)
+    assert len(h.runner.invocations) == 1
+
+
+def test_acp_drift_is_observed_before_the_attempt_is_reserved(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The V2 failure mode -- crashing after burning the attempt -- is structural now."""
+
+    h, _ = _acp_harness(tmp_path)
+    request, prompt = _request(h)
+    h.store.create_request(request)
+    seen: list[str] = []
+
+    def refusing(attestation, **kwargs):
+        seen.append("observed")
+        raise NativeEvidenceInvalid("backend attestation class has no drift-observation authority")
+
+    monkeypatch.setattr(native_executor, "_observe_backend_drift", refusing)
+    with pytest.raises(NativeEvidenceInvalid, match="drift-observation authority"):
+        h.executor.execute(
+            request=request, prompt=prompt, source_repository=h.source, canary_parent=h.root,
+            allowed_parent_children=frozenset({h.work.name}), evidence_store_root=h.store.directory,
+            artifact_directory=h.store.artifact_directory, required_commit_message=REQUIRED_COMMIT_MESSAGE,
+            required_material_paths=EXPECTED_MATERIAL_PATHS, execution_store=h.store,
+        )
+    assert seen == ["observed"]
+    assert not h.store.has_attempt_reserved(h.session_id, CANARY_GATE_ID, 0)
+    assert not h.store.has_process_started(h.session_id, CANARY_GATE_ID, 0)
+    assert h.runner.invocations == []
+
+
+def test_acp_drift_failure_is_never_reported_as_provider_completion(tmp_path: Path):
+    h, discovery = _acp_harness(tmp_path)
+    moved = tmp_path / "moved"; moved.mkdir()
+    h.runner.after_start = lambda: setattr(discovery, "path", _path_value(moved, discovery.root, "C:\\Windows"))
+    outcome = h.coordinator.run(session_id=h.session_id)
+    assert outcome.status is NativeCanaryStatus.PRECAPTURE_ELIGIBILITY_FAILED and not outcome.canary_success
+    eligibility = h.store.load_execution_eligibility(h.session_id, CANARY_GATE_ID, 0)
+    assert not eligibility.eligible and "post_run_backend_drift" in eligibility.ineligibility_reasons
+    assert "command_resolution:IDENTITY_ONLY_DRIFT" in eligibility.backend_drift_diagnostics
+    # The process observation stays durable; only the accepted result is withheld.
+    observation = h.store.load_process_observation(h.session_id, CANARY_GATE_ID, 0)
+    assert observation.process_completion_observed and not h.store.has_result(h.session_id, CANARY_GATE_ID, 0)
+    assert (outcome.native_attempts_reserved, outcome.native_processes_started, outcome.provider_invocations) == (1, 1, 1)
+
+
+# --- the real fake-ACP managed-process path ---------------------------------
+#
+# These drive a *real* child process through the real ``AcpStdioNativeProcessRunner``
+# and ``ManagedProcess``: the attested ``node.exe`` is a copy of this interpreter
+# and the attested ``index.js`` is the deterministic fake entry bundle, so the
+# pinned ``<node.exe> <index.js> acp`` argv is spawned exactly as attested.  No
+# Cursor agent and no model is ever contacted.
+
+from admissible.delegated_gate.native_executor import AcpStdioNativeProcessRunner
+
+_ACP_ENTRY_FIXTURE = Path(__file__).parent / "fixtures" / "admissible" / "fake_acp_cursor_entry.py"
+
+
+def _acp_success_plan(tmp_path: Path) -> Path:
+    """The mission's physical effects, from the same helper the ARGV lane uses."""
+
+    scratch = tmp_path / "acp-plan"; scratch.mkdir()
+    sample = build_canary_repository(scratch, repository_name="plan-sample").repository
+    _materialize_success(sample)
+    plan = {
+        "files": {relative: (sample / relative).read_text(encoding="utf-8") for relative in sorted(EXPECTED_MATERIAL_PATHS)},
+        "commit_message": REQUIRED_COMMIT_MESSAGE,
+    }
+    path = tmp_path / "acp-plan.json"; path.write_text(json.dumps(plan), encoding="utf-8")
+    return path
+
+
+def _acp_entry_installation(tmp_path: Path, plan: Path) -> Path:
+    """A wrapper-chain installation whose attested entry really serves ACP."""
+
+    root = _wrapper_chain_installation(tmp_path)
+    entry = json.dumps(str(_ACP_ENTRY_FIXTURE)); plan_literal = json.dumps(str(plan))
+    program = (
+        "import runpy, sys\n"
+        f"sys.argv = [{entry}, *sys.argv[1:], '--plan', {plan_literal}]\n"
+        f"runpy.run_path({entry}, run_name='__main__')\n"
+    )
+    for version in sorted((root / "versions").iterdir()):
+        (version / "index.js").write_text(program, encoding="utf-8", newline="\n")
+    return root
+
+
+@dataclass
+class ObservingAcpRunner:
+    """The real ACP runner, plus witnesses for the PROCESS_STARTED ordering."""
+
+    store: AtomicNativeExecutionStore
+    session_id: str
+    invocations: list[NativeProcessInvocation] = field(default_factory=list)
+    started_published_before_spawn: list[bool] = field(default_factory=list)
+    started_published_at_callback: list[bool] = field(default_factory=list)
+    observed_process_ids: list[int] = field(default_factory=list)
+
+    def run(self, invocation: NativeProcessInvocation) -> NativeProcessOutcome:
+        self.invocations.append(invocation)
+        self.started_published_before_spawn.append(self.store.has_process_started(self.session_id, CANARY_GATE_ID, 0))
+        publish = invocation.process_started
+
+        def observed(proof: _NativeProcessCreationProof) -> None:
+            self.observed_process_ids.append(proof.process_id)
+            publish(proof)
+            self.started_published_at_callback.append(self.store.has_process_started(self.session_id, CANARY_GATE_ID, 0))
+
+        return AcpStdioNativeProcessRunner().run(replace(invocation, process_started=observed))
+
+
+def _real_acp_harness(tmp_path: Path) -> tuple[Harness, ObservingAcpRunner]:
+    source_parent = tmp_path / "source-parent"; source_parent.mkdir(); source = build_canary_repository(source_parent, repository_name="source").repository
+    root = tmp_path / "run"; root.mkdir(); work = build_canary_repository(root).repository; evidence = root / "evidence"; evidence.mkdir()
+    discovery = FakeWrapperChainDiscovery(_acp_entry_installation(tmp_path, _acp_success_plan(tmp_path)))
+    attestor = _acp_attestor(discovery)
+    attestation = attestor(_ACP_CONFIG)
+    store = AtomicNativeExecutionStore(evidence / "native-execution"); session_store = AtomicDelegatedSessionStore(evidence / "delegated-state")
+    session_id = "acp-managed-process-session"; session_store.create(create_canary_session(session_id=session_id))
+    runner = ObservingAcpRunner(store, session_id)
+    executor = NativeDelegatedExecutor(config=_ACP_CONFIG, process_runner=runner, clock=Clock(), local_attestor=attestor)
+    coordinator = NativeCanaryCoordinator(session_store=session_store, execution_store=store, executor=executor, backend_attestation=attestation, source_repository=source, work_workspace=work, canary_parent=root, evidence_directory=evidence, timeout_seconds=240, stdout_byte_limit=1 << 20, stderr_byte_limit=1 << 18)
+    return Harness(root, source, work, evidence, _ACP_CONFIG, attestation, runner, store, session_store, executor, coordinator, session_id), runner
+
+
+def _real_acp_request(h: Harness) -> tuple[NativeExecutionRequest, str]:
+    state = h.session_store.load(h.session_id)
+    prompt = build_native_agent_prompt(mission=state.mission, gate_contract=state.current_gate, work_workspace=h.work)
+    return NativeExecutionRequest.create(
+        session_id=state.session_id, gate_id=state.current_gate.gate_id, execution_attempt_index=0,
+        mission_fingerprint=state.mission.mission_fingerprint,
+        gate_contract_fingerprint=state.current_gate.contract_fingerprint, work_workspace=h.work,
+        evidence_store_root=h.store.directory, artifact_directory=h.store.artifact_directory,
+        attestation=h.attestation, prompt=prompt, timeout_seconds=240,
+        stdout_byte_limit=1 << 20, stderr_byte_limit=1 << 18,
+    ), prompt
+
+
+def test_real_acp_attestation_reaches_the_fake_acp_managed_process(tmp_path: Path):
+    """The exact V2 traceback path, end to end, against a real child process."""
+
+    h, runner = _real_acp_harness(tmp_path)
+    request, prompt = _real_acp_request(h)
+    h.store.create_request(request)
+    issued = h.executor.execute(
+        request=request, prompt=prompt, source_repository=h.source, canary_parent=h.root,
+        allowed_parent_children=frozenset({h.work.name}), evidence_store_root=h.store.directory,
+        artifact_directory=h.store.artifact_directory, required_commit_message=REQUIRED_COMMIT_MESSAGE,
+        required_material_paths=EXPECTED_MATERIAL_PATHS, execution_store=h.store,
+    )
+    result = h.store.write_result(issued)
+    assert result.status is NativeExecutionStatus.PROCESS_SUCCEEDED and result.process_exit_code == 0
+    assert result.commits_added == 1 and result.final_commit_message == REQUIRED_COMMIT_MESSAGE
+    assert EXPECTED_MATERIAL_PATHS.issubset(set(result.changed_material_files))
+
+    # Drift observation ran on the ACP class and reported no drift at all.
+    eligibility = h.store.load_execution_eligibility(h.session_id, CANARY_GATE_ID, 0)
+    assert eligibility.eligible and not eligibility.ineligibility_reasons
+    acp_diagnostics = tuple(item for item in eligibility.backend_drift_diagnostics if item.startswith("acp_"))
+    assert len(acp_diagnostics) == 6 and all(item.endswith(":NO_DRIFT") for item in acp_diagnostics)
+    assert eligibility.catalog_validation == "NO_DRIFT" and eligibility.selected_version_validation == "NO_DRIFT"
+    assert "command_resolution:NO_DRIFT" in eligibility.backend_drift_diagnostics
+
+    # Exactly one real process, spawned on the exact attested ACP server argv.
+    assert len(runner.invocations) == 1
+    invocation = runner.invocations[0]
+    assert invocation.argv == h.attestation.static_argv_template and invocation.argv[-1] == ACP_SUBCOMMAND
+    assert invocation.prompt_transport == PROMPT_TRANSPORT_ACP_STDIO
+
+    # PROCESS_STARTED is published only once a real OS PID exists.
+    assert runner.started_published_before_spawn == [False]
+    assert runner.started_published_at_callback == [True]
+    started = h.store.load_process_started(h.session_id, CANARY_GATE_ID, 0)
+    observation = h.store.load_process_observation(h.session_id, CANARY_GATE_ID, 0)
+    assert runner.observed_process_ids == [started.process_id]
+    assert started.process_id > 0 and started.process_id != os.getpid()
+    assert observation.process["process_id"] == started.process_id
+    assert observation.process["cleanup_observation"] == OBSERVATION_PROVEN_EMPTY
+    assert observation.process["cleanup_confirmed"] and not observation.process["orphan_process_ids"]
+
+    # The prompt never entered argv, the result, or any retained diagnostic.
+    assert not any(prompt in member for member in invocation.argv)
+    assert not any(prompt in member for member in result.argv)
+    assert not any(prompt in item for item in eligibility.backend_drift_diagnostics)
+
+
+def test_real_acp_execution_never_retries_or_spawns_a_second_process(tmp_path: Path):
+    h, runner = _real_acp_harness(tmp_path)
+    request, prompt = _real_acp_request(h)
+    h.store.create_request(request)
+    arguments = dict(
+        request=request, prompt=prompt, source_repository=h.source, canary_parent=h.root,
+        allowed_parent_children=frozenset({h.work.name}), evidence_store_root=h.store.directory,
+        artifact_directory=h.store.artifact_directory, required_commit_message=REQUIRED_COMMIT_MESSAGE,
+        required_material_paths=EXPECTED_MATERIAL_PATHS, execution_store=h.store,
+    )
+    h.store.write_result(h.executor.execute(**arguments))
+    with pytest.raises(NativeResultAlreadyExists):
+        h.executor.execute(**arguments)
+    assert len(runner.invocations) == 1 and len(runner.observed_process_ids) == 1
+    assert not tuple(h.store.directory.glob("*.attempt-1.*"))
+
+
+def test_an_unconditional_acp_drift_pass_is_killed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Direct mutation witness: neutering the ACP layer must change the verdict."""
+
+    _, discovery, attestation = _acp_attestation(tmp_path)
+    tampered = _tampered(attestation, prompt_transport=PROMPT_TRANSPORT_ARGV)
+    assert not _observe_backend_drift(tampered, post_run_wrapper_chain_attestation=_post_run_chain(discovery)).clean
+
+    names = ("acp_attestation_class", "acp_prompt_transport", "acp_static_argv",
+             "acp_wrapper_chain_binding", "acp_prompt_binding_policy", "acp_attestation_fingerprint")
+    monkeypatch.setattr(
+        native_executor, "_acp_transport_drift",
+        lambda attestation: (("NO_DRIFT",) * len(names), tuple(f"{name}:NO_DRIFT" for name in names)),
+    )
+    mutant = _observe_backend_drift(tampered, post_run_wrapper_chain_attestation=_post_run_chain(discovery))
+    assert mutant.clean and mutant.post_run_eligible
