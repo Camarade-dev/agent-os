@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shutil
 import socket
 import subprocess
 
@@ -38,7 +39,10 @@ from admissible.delegated_gate.native_canary import (
     _materialize_local_repository_copy,
     _observe_local_repository_source,
 )
-from admissible.delegated_gate.native_executor import _hardened_git_environment
+from admissible.delegated_gate.native_executor import (
+    _HARDENED_GIT_ENVIRONMENT,
+    _hardened_git_environment,
+)
 
 
 AGENT_OS_ORIGIN_URL = "https://github.com/Camarade-dev/agent-os.git"
@@ -905,5 +909,551 @@ def test_target_sanitization_refuses_a_copied_source_configuration(tmp_path: Pat
             )
     finally:
         native_canary_module._render_target_git_config = original_render
+
+
+# --------------------------------------------------------------------------
+# J. call contract of the Git-parser subprocess
+#
+# ``_git_parsed_local_configuration`` is the authorization authority for source
+# configuration, so *how* it asks Git is itself a contract: the exact
+# local-listing argv and an explicit hardened child environment.  Neither is
+# observable from the parsed result alone, so both are pinned directly on the
+# real subprocess call.
+# --------------------------------------------------------------------------
+
+_PARSER_ARGV = (
+    "git",
+    "-c",
+    "core.fsmonitor=false",
+    "--no-pager",
+    "config",
+    "--local",
+    "--list",
+    "--null",
+)
+
+# Restated deliberately rather than read back from the production constant: the
+# child environment is the contract under test, so a mutant that empties or
+# narrows ``_HARDENED_GIT_ENVIRONMENT`` must fail here too.  The null-device
+# value is the platform-appropriate one production uses.
+_REQUIRED_CHILD_GIT_ENVIRONMENT = {
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": "NUL" if os.name == "nt" else os.devnull,
+    "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_NO_LAZY_FETCH": "1",
+    "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_PAGER": "",
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "core.fsmonitor",
+    "GIT_CONFIG_VALUE_0": "false",
+}
+
+_BROADER_CONFIG_SCOPE_FLAGS = frozenset(
+    {"--global", "--system", "--worktree", "--show-origin", "--show-scope", "--includes"}
+)
+
+
+class _GitSubprocessCall:
+    """One recorded ``subprocess.run`` invocation, as the product spelled it."""
+
+    __slots__ = ("argv", "cwd", "environment", "environment_snapshot")
+
+    def __init__(self, argv: tuple[str, ...], cwd, environment) -> None:
+        self.argv = argv
+        self.cwd = cwd
+        # The live object proves aliasing; the snapshot proves call-time values.
+        self.environment = environment
+        self.environment_snapshot = None if environment is None else dict(environment)
+
+
+class _GitSubprocessRecorder:
+    def __init__(self) -> None:
+        self.calls: list[_GitSubprocessCall] = []
+
+    def reset(self) -> None:
+        self.calls.clear()
+
+    @property
+    def config_listing_calls(self) -> list[_GitSubprocessCall]:
+        """Every Git *config listing* call, however a mutant spells its scope."""
+
+        return [
+            call
+            for call in self.calls
+            if Path(call.argv[0]).name.casefold() in {"git", "git.exe"}
+            and "config" in call.argv
+            and any(item.startswith("--list") for item in call.argv)
+        ]
+
+
+@pytest.fixture()
+def recorded_git_subprocesses(monkeypatch: pytest.MonkeyPatch) -> _GitSubprocessRecorder:
+    """Record the real argv/environment, then delegate to the real execution."""
+
+    recorder = _GitSubprocessRecorder()
+    original_run = subprocess.run
+
+    def recording_run(argv, *rest, **keywords):
+        recorded = tuple(
+            str(item) for item in (argv if isinstance(argv, (list, tuple)) else [argv])
+        )
+        recorder.calls.append(
+            _GitSubprocessCall(recorded, keywords.get("cwd"), keywords.get("env"))
+        )
+        return original_run(argv, *rest, **keywords)
+
+    monkeypatch.setattr(subprocess, "run", recording_run)
+    return recorder
+
+
+def _assert_parser_call_contract(call: _GitSubprocessCall) -> None:
+    """The exact accepted local-listing authority and hardened child policy."""
+
+    assert call.argv == _PARSER_ARGV, call.argv
+    assert call.argv.count("--local") == 1, call.argv
+    assert not (set(call.argv) & _BROADER_CONFIG_SCOPE_FLAGS), call.argv
+
+    environment = call.environment_snapshot
+    assert environment is not None, "the parser subprocess inherited an implicit environment"
+    for name, value in _REQUIRED_CHILD_GIT_ENVIRONMENT.items():
+        assert environment.get(name) == value, (name, environment.get(name))
+
+    # An explicitly built child mapping -- neither the parent's own environment
+    # nor the shared module-level policy dictionary.
+    assert isinstance(call.environment, dict), type(call.environment)
+    assert call.environment is not os.environ
+    assert call.environment is not _HARDENED_GIT_ENVIRONMENT
+
+
+def _record_parser_invocation(
+    recorder: _GitSubprocessRecorder, repository: Path
+) -> tuple[tuple, Exception | None]:
+    """Invoke the real parser, keeping the recorded call observable either way.
+
+    A command that no longer asks Git the accepted local-listing question can
+    also make Git's own output unparseable.  The call contract must stay the
+    deciding assertion, so the refusal is captured rather than propagated here
+    and re-asserted after the contract has been checked.
+    """
+
+    recorder.reset()
+    try:
+        return native_canary_module._git_parsed_local_configuration(repository), None
+    except NativeEvidenceInvalid as exc:
+        return (), exc
+
+
+def test_parsed_local_configuration_pins_its_argv_and_hardened_child_environment(
+    tmp_path: Path,
+    observed_network: _NetworkObservation,
+    recorded_git_subprocesses: _GitSubprocessRecorder,
+):
+    repository = _external_repository(tmp_path / "parser-call-contract")
+    _configure_ordinary_origin(repository)
+
+    observed_network.reset()
+    entries, failure = _record_parser_invocation(recorded_git_subprocesses, repository)
+
+    listings = recorded_git_subprocesses.config_listing_calls
+    assert len(listings) == 1, [call.argv for call in listings]
+    _assert_parser_call_contract(listings[0])
+    assert Path(str(listings[0].cwd)).resolve() == repository.resolve()
+
+    assert failure is None, failure
+    assert [entry.canonical_key for entry in entries]
+    assert observed_network.argv == observed_network.git_argv
+
+
+def test_parser_child_environment_is_freshly_built_for_every_invocation(
+    tmp_path: Path, recorded_git_subprocesses: _GitSubprocessRecorder
+):
+    """A shared mutable environment would stay corrupted for the next child."""
+
+    repository = _external_repository(tmp_path / "parser-unshared-environment")
+
+    _, first_failure = _record_parser_invocation(recorded_git_subprocesses, repository)
+    first = recorded_git_subprocesses.config_listing_calls[-1]
+    _assert_parser_call_contract(first)
+    assert first_failure is None, first_failure
+
+    first.environment["GIT_CONFIG_NOSYSTEM"] = "0"
+    first.environment["GIT_CONFIG_COUNT"] = "9"
+    first.environment.pop("GIT_TERMINAL_PROMPT", None)
+
+    _, second_failure = _record_parser_invocation(recorded_git_subprocesses, repository)
+    second = recorded_git_subprocesses.config_listing_calls[-1]
+
+    assert second.environment is not first.environment
+    _assert_parser_call_contract(second)
+    assert second_failure is None, second_failure
+
+
+# --------------------------------------------------------------------------
+# K. hostile non-local configuration control
+#
+# Every Git configuration scope the source parser does not own is made hostile
+# at once.  This is why the call contract above exists: it is the behavioral
+# demonstration, not the authority, for the single ``env=None`` mutation.
+# --------------------------------------------------------------------------
+
+_HOSTILE_EXTERNAL_KEYS = (
+    "core.sshcommand",
+    "core.pager",
+    "credential.helper",
+    "inertprobe.globalmarker",
+    "inertprobe.systemmarker",
+    "inertprobe.xdgmarker",
+    "inertprobe.envmarker",
+)
+
+
+def _hostile_marker_program(root: Path) -> tuple[Path, Path]:
+    """A real program that leaves a marker file if anything ever runs it."""
+
+    root.mkdir(parents=True, exist_ok=True)
+    marker = root / "hostile-executed.marker"
+    if os.name == "nt":
+        program = root / "hostile-locator.bat"
+        program.write_text(f'@echo off\r\n> "{marker}" echo executed\r\n', encoding="ascii")
+    else:
+        program = root / "hostile-locator.sh"
+        program.write_text(f'#!/bin/sh\necho executed > "{marker}"\n', encoding="ascii")
+        program.chmod(0o755)
+    return program, marker
+
+
+def _inject_hostile_external_git_configuration(
+    monkeypatch: pytest.MonkeyPatch, root: Path, program: Path
+) -> None:
+    """Point owner, system, XDG and environment Git configuration at a program."""
+
+    root.mkdir(parents=True, exist_ok=True)
+    locator = program.as_posix()
+    global_config = root / "hostile-global.gitconfig"
+    global_config.write_text(
+        f"[core]\n\tsshCommand = {locator}\n\tpager = {locator}\n"
+        f"[credential]\n\thelper = !{locator}\n"
+        "[inertprobe]\n\tglobalmarker = hostile-global\n",
+        encoding="utf-8",
+    )
+    system_config = root / "hostile-system.gitconfig"
+    system_config.write_text(
+        f"[core]\n\tsshCommand = {locator}\n"
+        "[inertprobe]\n\tsystemmarker = hostile-system\n",
+        encoding="utf-8",
+    )
+    xdg_home = root / "hostile-xdg"
+    (xdg_home / "git").mkdir(parents=True, exist_ok=True)
+    (xdg_home / "git" / "config").write_text(
+        f"[core]\n\tsshCommand = {locator}\n"
+        "[inertprobe]\n\txdgmarker = hostile-xdg\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("GIT_CONFIG_NOSYSTEM", raising=False)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(system_config))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_home))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "2")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.sshCommand")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(program))
+    monkeypatch.setenv("GIT_CONFIG_KEY_1", "inertprobe.envmarker")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_1", "hostile-env")
+
+
+def _unhardened_config_keys(repository: Path, environment: dict[str, str]) -> set[str]:
+    """Control listing: what an unhardened, unscoped Git invocation would see."""
+
+    completed = subprocess.run(
+        ["git", "config", "--list", "--null"],
+        cwd=repository,
+        env=environment,
+        shell=False,
+        check=False,
+        capture_output=True,
+    )
+    assert completed.returncode in {0, 1}, completed.stderr
+    return {
+        record.partition("\n")[0].casefold()
+        for record in completed.stdout.decode("utf-8").split("\0")
+        if record
+    }
+
+
+def test_hostile_external_git_configuration_never_enters_the_source_decision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    observed_network: _NetworkObservation,
+    recorded_git_subprocesses: _GitSubprocessRecorder,
+):
+    repository = _external_repository(tmp_path / "hostile-external-scopes")
+    _configure_ordinary_origin(repository)
+    head = _head(repository)
+    expected_local = [key.casefold() for key, _ in _git_config_oracle(repository)]
+    assert "remote.origin.url" in expected_local
+
+    program, marker = _hostile_marker_program(tmp_path / "hostile-program")
+    _inject_hostile_external_git_configuration(
+        monkeypatch, tmp_path / "hostile-scopes", program
+    )
+
+    # Control: the injection is real -- an unhardened listing sees all of it.
+    ambient = _unhardened_config_keys(repository, dict(os.environ))
+    assert {
+        "core.sshcommand",
+        "inertprobe.globalmarker",
+        "inertprobe.systemmarker",
+        "inertprobe.envmarker",
+    } <= ambient, ambient
+    xdg_environment = dict(os.environ)
+    xdg_environment.pop("GIT_CONFIG_GLOBAL", None)
+    xdg_environment["HOME"] = str(tmp_path / "absent-home")
+    xdg_environment["USERPROFILE"] = str(tmp_path / "absent-home")
+    assert "inertprobe.xdgmarker" in _unhardened_config_keys(repository, xdg_environment)
+
+    observed_network.reset()
+    entries, failure = _record_parser_invocation(recorded_git_subprocesses, repository)
+    assert recorded_git_subprocesses.config_listing_calls
+    _assert_parser_call_contract(recorded_git_subprocesses.config_listing_calls[0])
+
+    assert failure is None, failure
+    assert [entry.canonical_key for entry in entries] == expected_local
+    parsed = {entry.canonical_key for entry in entries}
+    for hostile in _HOSTILE_EXTERNAL_KEYS:
+        assert hostile not in parsed, hostile
+    assert "core.fsmonitor" not in parsed
+
+    # The complete source decision still accepts, on local metadata alone.
+    _inspect_local_git_metadata(repository)
+    assert _git_source_preflight(repository, head)[0] is True
+
+    listings = recorded_git_subprocesses.config_listing_calls
+    assert listings
+    for call in listings:
+        _assert_parser_call_contract(call)
+
+    assert not marker.exists(), "a hostile configured program was executed"
+    assert observed_network.argv == observed_network.git_argv
+    for argv in observed_network.git_argv:
+        assert not ({item.casefold() for item in argv[1:]} & _FORBIDDEN_GIT_VERBS), argv
+        assert str(program) not in argv, argv
+        assert program.as_posix() not in argv, argv
+
+
+def test_parser_reports_exactly_the_repository_local_configuration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recorded_git_subprocesses: _GitSubprocessRecorder,
+):
+    """``--local`` is the exact scope: nothing wider, nothing collapsed."""
+
+    repository = _external_repository(tmp_path / "exact-local-authority")
+    _write_config(
+        repository,
+        _MINIMAL_CORE
+        + '[remote "origin"]\n'
+        + "\turl = https://a.invalid/one\n"
+        + "\turl = https://a.invalid/two\n",
+    )
+    physical = native_canary_module._parse_local_git_config(repository / ".git" / "config")
+    oracle = _git_config_oracle(repository)
+
+    program, marker = _hostile_marker_program(tmp_path / "exact-local-program")
+    _inject_hostile_external_git_configuration(
+        monkeypatch, tmp_path / "exact-local-scopes", program
+    )
+
+    entries, failure = _record_parser_invocation(recorded_git_subprocesses, repository)
+
+    listings = recorded_git_subprocesses.config_listing_calls
+    assert len(listings) == 1, [call.argv for call in listings]
+    _assert_parser_call_contract(listings[0])
+    assert failure is None, failure
+
+    observed = [(entry.canonical_key, entry.value) for entry in entries]
+    assert observed == [(key.casefold(), value) for key, value in oracle]
+    assert [key for key, _ in observed] == [entry.canonical_key for entry in physical]
+
+    # Duplicate local entries stay independently visible, in file order.
+    assert [value for key, value in observed if key == "remote.origin.url"] == [
+        "https://a.invalid/one",
+        "https://a.invalid/two",
+    ]
+
+    listed = {key for key, _ in observed}
+    assert listed == {
+        "core.repositoryformatversion",
+        "core.filemode",
+        "core.bare",
+        "remote.origin.url",
+    }
+    # Command-line ``-c`` configuration is deliberately outside a local listing.
+    assert "core.fsmonitor" not in listed
+    for hostile in _HOSTILE_EXTERNAL_KEYS:
+        assert hostile not in listed, hostile
+    assert not marker.exists()
+
+
+# --------------------------------------------------------------------------
+# L. defense in depth on the target workspace
+#
+# Two target guards are normally shadowed by an earlier layer.  Each is pinned
+# below under a controlled compound fault that disables only the earlier layer,
+# so the guard under test is provably the deciding refusal.  Neither test is
+# permission to weaken the layers in front of it.
+# --------------------------------------------------------------------------
+
+
+def test_target_subsection_rejection_decides_when_the_renderer_leaks_a_remote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, observed_network: _NetworkObservation
+):
+    """Compound fault: the allowlist comparison agrees, subsections still refuse."""
+
+    repository = _external_repository(tmp_path / "subsection-leak-source")
+    _configure_ordinary_origin(repository)
+    target = tmp_path / "subsection-leak-target"
+    shutil.copytree(repository, target, copy_function=shutil.copy2, symlinks=False)
+
+    leaked = ("remote", "url", AGENT_OS_ORIGIN_URL)
+    original_settings = native_canary_module._normalized_target_config_settings
+    original_render = native_canary_module._render_target_git_config
+
+    def leaking_settings(copied_entries, hooks):
+        # The expected-configuration layer is made to expect the leak, so it
+        # cannot be the clause that refuses.
+        return (*original_settings(copied_entries, hooks), leaked)
+
+    def leaking_render(settings):
+        assert leaked in settings
+        body = original_render(tuple(item for item in settings if item != leaked))
+        return body + f'[remote "origin"]\n\turl = {AGENT_OS_ORIGIN_URL}\n'.encode("utf-8")
+
+    monkeypatch.setattr(
+        native_canary_module, "_normalized_target_config_settings", leaking_settings
+    )
+    monkeypatch.setattr(native_canary_module, "_render_target_git_config", leaking_render)
+
+    observed_network.reset()
+    hooks, settings = native_canary_module._sanitize_target_git_metadata(target)
+
+    entries = native_canary_module._parse_local_git_config(target / ".git" / "config")
+    observed = tuple(
+        (entry.section.casefold(), entry.name.casefold(), entry.value) for entry in entries
+    )
+    expected = tuple(
+        (section.casefold(), name.casefold(), value) for section, name, value in settings
+    )
+    # The earlier allowlist comparison agrees exactly; only the subsection law
+    # separates this target from acceptance.
+    assert observed == expected
+    assert [entry.canonical_key for entry in entries][-1] == "remote.origin.url"
+    assert any(entry.subsection is not None for entry in entries)
+
+    # Every other clause of the verification is satisfied in this scenario.
+    assert list(os.scandir(hooks)) == []
+    native_canary_module._inspect_local_git_metadata(target, allowed_hooks_path=hooks)
+    environment = _hardened_git_environment()
+    for name, value in _REQUIRED_CHILD_GIT_ENVIRONMENT.items():
+        assert environment.get(name) == value, name
+    configured_hooks = Path(
+        native_canary_module._git_read_only(
+            target, "config", "--local", "--get", "core.hooksPath"
+        ).stdout.strip()
+    )
+    assert configured_hooks.resolve(strict=True) == hooks.resolve(strict=True)
+    origins = native_canary_module._git_read_only(
+        target, "config", "--show-origin", "--show-scope", "--list"
+    ).stdout.splitlines()
+    assert not any(line.casefold().startswith(("global\t", "system\t")) for line in origins)
+
+    with pytest.raises(NativeEvidenceInvalid, match="differs from its allowlist"):
+        native_canary_module._verify_sanitized_target_git_metadata(target, hooks, settings)
+
+    assert observed_network.argv == observed_network.git_argv
+    for argv in observed_network.git_argv:
+        assert not ({item.casefold() for item in argv[1:]} & _FORBIDDEN_GIT_VERBS), argv
+
+
+def test_final_target_remotes_gate_decides_when_sanitization_and_verification_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, observed_network: _NetworkObservation
+):
+    """Compound fault: the last authority is ``target_observation.remotes``."""
+
+    repository = _external_repository(tmp_path / "remotes-gate-source")
+    _configure_ordinary_origin(repository)
+    source_before = _observe_local_repository_source(repository)
+    assert source_before.remotes
+
+    destination = tmp_path / "remotes-gate-destination"
+    destination.mkdir()
+
+    original_sanitize = native_canary_module._sanitize_target_git_metadata
+    original_observe = native_canary_module._observe_local_repository_source
+    observations: list = []
+
+    def leaking_sanitize(target):
+        hooks, settings = original_sanitize(target)
+        config = target / ".git" / "config"
+        config.write_bytes(
+            config.read_bytes()
+            + f'[remote "origin"]\n\turl = {AGENT_OS_ORIGIN_URL}\n'.encode("utf-8")
+        )
+        return hooks, settings
+
+    def recording_observe(repository_value, **keywords):
+        observation = original_observe(repository_value, **keywords)
+        observations.append(observation)
+        return observation
+
+    monkeypatch.setattr(
+        native_canary_module, "_sanitize_target_git_metadata", leaking_sanitize
+    )
+    # The whole sanitized-config verification layer is simulated as failing.
+    monkeypatch.setattr(
+        native_canary_module,
+        "_verify_sanitized_target_git_metadata",
+        lambda *arguments, **keywords: None,
+    )
+    monkeypatch.setattr(
+        native_canary_module, "_observe_local_repository_source", recording_observe
+    )
+
+    observed_network.reset()
+    with pytest.raises(NativeEvidenceInvalid, match="not clean and remote-free"):
+        _materialize_local_repository_copy(
+            profile=_profile(repository),
+            destination_parent=destination,
+            repository_name="work",
+        )
+
+    target = destination / "work"
+    target_observations = [
+        observation
+        for observation in observations
+        if Path(observation.repository).resolve() == target.resolve()
+    ]
+    assert len(target_observations) == 1
+    target_observation = target_observations[0]
+
+    # The surviving remote is the sole reason: every other condition standing
+    # between this target and acceptance is already satisfied.
+    assert target_observation.remotes
+    assert target_observation.porcelain_status == ""
+    assert target_observation.head == source_before.head
+    assert target_observation.material_tree_hash == source_before.material_tree_hash
+    assert target_observation.commit_count == source_before.commit_count
+    assert (
+        target_observation.complete_commit_message == source_before.complete_commit_message
+    )
+    assert (
+        target_observation.worktree_material_tree_hash
+        == source_before.worktree_material_tree_hash
+    )
+
+    assert not target.exists()
+    assert _observe_local_repository_source(repository) == source_before
+    assert observed_network.argv == observed_network.git_argv
+    for argv in observed_network.git_argv:
+        assert not ({item.casefold() for item in argv[1:]} & _FORBIDDEN_GIT_VERBS), argv
 
     assert not (destination / "work").exists()
