@@ -97,6 +97,15 @@ LEGACY_IDENTITIES = {
     # authorized run whose client granted allow_always and then died on an
     # unanswerable cursor/update_todos request.
     "neon-relay-v4": "6380e810995b6cd97db408fe4f434328890dafd48d0f5a7468eca010fa8fc97a",
+    # The mission-scoped effect repair extends the pin the same way again, and
+    # every identity above is byte-identical -- which is the point: the new
+    # optional `mission_effect_authority` field is omitted when absent, so no
+    # profile that predates it has a different canonical document.
+    # neon-relay-v5 is the same mission and the same ACP_STDIO transport on a
+    # fifth run identity, because an independent liveness audit established that
+    # the V4 authority boundary categorically refuses the mission's own required
+    # edits, its local test execution and its Git finalization.
+    "neon-relay-v5": "676adb0760e992745952aaf8aa829c99baab792cd3ba171a3070e8394fd125c8",
 }
 
 

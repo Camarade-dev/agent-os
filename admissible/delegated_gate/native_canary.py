@@ -44,6 +44,7 @@ from admissible.delegated_gate.mission_profile import (
     NEON_RELAY_V2_PROFILE,
     NEON_RELAY_V3_PROFILE,
     NEON_RELAY_V4_PROFILE,
+    NEON_RELAY_V5_PROFILE,
     NEON_SIEGE_PROFILE,
     ONE_SHOT_PROFILE_BUDGETS,
     WORKFLOW_RECOVERY_PROFILE,
@@ -479,6 +480,7 @@ def registered_profiles() -> dict[str, NativeMissionProfile]:
             NEON_RELAY_V2_PROFILE,
             NEON_RELAY_V3_PROFILE,
             NEON_RELAY_V4_PROFILE,
+            NEON_RELAY_V5_PROFILE,
         )
     }
 
@@ -1100,7 +1102,7 @@ class NativeCanaryCoordinator(EvidenceOnlyCanaryReconstruction):
         except NativeCommittedButDurabilityUncertain as exc: return self._outcome(status=NativeCanaryStatus.DURABILITY_UNCERTAIN,state=state,request=request,detail=str(exc))
         try:
             git_policy = self.profile.effective_git_end_state_policy
-            issued=self.executor.execute(request=request,prompt=prompt,source_repository=self.source_repository,canary_parent=self.canary_parent,allowed_parent_children=frozenset({self.work_workspace.name}),evidence_store_root=self.execution_store.directory,artifact_directory=self.execution_store.artifact_directory,required_commit_message=git_policy.required_complete_commit_message,required_material_paths=frozenset(git_policy.required_material_paths),required_commits_added=git_policy.required_commits_added,final_worktree_clean_required=git_policy.final_worktree_clean,final_index_clean_required=git_policy.final_index_clean,final_remotes_absent_required=git_policy.final_remotes_absent,execution_store=self.execution_store)
+            issued=self.executor.execute(request=request,prompt=prompt,source_repository=self.source_repository,canary_parent=self.canary_parent,allowed_parent_children=frozenset({self.work_workspace.name}),evidence_store_root=self.execution_store.directory,artifact_directory=self.execution_store.artifact_directory,required_commit_message=git_policy.required_complete_commit_message,required_material_paths=frozenset(git_policy.required_material_paths),mission_effect_authority=self.profile.mission_effect_authority,required_commits_added=git_policy.required_commits_added,final_worktree_clean_required=git_policy.final_worktree_clean,final_index_clean_required=git_policy.final_index_clean,final_remotes_absent_required=git_policy.final_remotes_absent,execution_store=self.execution_store)
             result=self.execution_store.write_result(issued)
         except NativeResultIneligible as exc:
             observation=self.execution_store.load_process_observation(session_id,gate.gate_id,0)

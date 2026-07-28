@@ -38,6 +38,10 @@ from admissible.delegated_gate.canonical import (
     require_strict_int,
     require_string_list,
 )
+from admissible.delegated_gate.mission_effect_authority import (
+    MissionEffectAuthority,
+    NEON_RELAY_MISSION_EFFECT_AUTHORITY,
+)
 from admissible.delegated_gate.models import EvidenceKind, VerificationCommand
 from admissible.delegated_gate.native_executor import (
     PROMPT_TRANSPORT_ACP_STDIO,
@@ -956,6 +960,17 @@ class NativeMissionProfile:
     # pre-transport schema, so every persisted document still parses and every
     # historical ``profile_fingerprint`` is unchanged.
     prompt_transport: str = PROMPT_TRANSPORT_ARGV
+    # The owner-authorized, closed enumeration of the exact effects this
+    # mission's provider may cause.  ``None`` means the historical categorical
+    # boundary: no edit, no local verification and no Git mutation is
+    # expressible at all.
+    #
+    # Serialization is omit-when-``None`` for the same reason
+    # ``prompt_transport`` is omit-when-default: every profile that predates
+    # this field produces byte-identical canonical bytes, so every persisted
+    # document still parses and every historical ``profile_fingerprint`` --
+    # including neon-relay-v1 through v4 -- is unchanged.
+    mission_effect_authority: MissionEffectAuthority | None = None
 
     def _body(self) -> dict[str, Any]:
         """The complete canonical profile body, fingerprint field excluded."""
@@ -963,6 +978,10 @@ class NativeMissionProfile:
         data = dict(self.__dict__)
         if self.prompt_transport == PROMPT_TRANSPORT_ARGV:
             data.pop("prompt_transport")
+        if self.mission_effect_authority is None:
+            data.pop("mission_effect_authority")
+        else:
+            data["mission_effect_authority"] = self.mission_effect_authority.to_dict()
         if self.schema_version in {MISSION_PROFILE_SCHEMA_VERSION_V2, MISSION_PROFILE_SCHEMA_VERSION_V3, MISSION_PROFILE_SCHEMA_VERSION_V4, MISSION_PROFILE_SCHEMA_VERSION_V5}:
             for key in (
                 "fixture_id",
@@ -1003,6 +1022,7 @@ class NativeMissionProfile:
                 "verification_evidence_binding_authority",
             ):
                 data.pop(key)
+            data.pop("mission_effect_authority", None)
         data["gate_clauses"] = [list(clause) for clause in self.gate_clauses]
         data["required_evidence_kinds"] = list(self.required_evidence_kinds)
         data["checkpoint_commands"] = [command.to_dict() for command in self.checkpoint_commands]
@@ -1155,6 +1175,24 @@ class NativeMissionProfile:
                 raise ValueError("internal v2 verifier mirrors contradict verification authority")
             if self.fixture_initial_commit_message is not None:
                 raise ValueError("v2 initialized commit identity is observed into the payload, not profile-supplied")
+        if self.mission_effect_authority is not None:
+            if self.schema_version == MISSION_PROFILE_SCHEMA_VERSION:
+                raise ValueError("v1 profile cannot carry mission-scoped effect authority")
+            if not isinstance(self.mission_effect_authority, MissionEffectAuthority):
+                raise ValueError("mission effect authority has an invalid type")
+            authority = self.mission_effect_authority.validated()
+            # One authority, not two.  The writable set and the commit message
+            # are the *same* facts the Git end-state policy already carries, so
+            # an effect authority that could drift from them is refused here
+            # rather than discovered at execution time.
+            if authority.writable_material_paths != self.required_material_paths:
+                raise ValueError(
+                    "mission effect authority writable paths contradict the required material paths"
+                )
+            if authority.exact_commit_message != self.required_commit_message:
+                raise ValueError(
+                    "mission effect authority commit message contradicts the required commit message"
+                )
         require_identifier(self.run_id, "profile run_id")
         require_identifier(self.session_id, "profile session_id")
         require_identifier(self.gate_id, "profile gate_id")
@@ -1317,12 +1355,24 @@ class NativeMissionProfile:
             "claim_verification_plan_authority",
             "verification_evidence_binding_authority",
             "prompt_transport",
+            "mission_effect_authority",
         }
         # ``prompt_transport`` is omitted whenever it is the historical
         # ARGV_PROMPT default, so every persisted document keeps parsing with
         # its original exact key set.  Only the launchable runtime-v2 schema may
         # carry the key at all.
         transport_key = {"prompt_transport"} if "prompt_transport" in data else set()
+        # Same omit-when-default rule: a profile that carries no mission-scoped
+        # effect authority omits the key entirely, so its canonical document is
+        # byte-identical to the pre-authority schema.
+        effects_key = (
+            {"mission_effect_authority"} if "mission_effect_authority" in data else set()
+        )
+        if effects_key and data.get("mission_effect_authority") is None:
+            raise ValueError(
+                "an absent mission effect authority must be omitted so each profile "
+                "has exactly one canonical document"
+            )
         if transport_key and data.get("prompt_transport") == PROMPT_TRANSPORT_ARGV:
             # Omit-when-default is a canonical *form*, not merely an encoding
             # convenience: allowing the redundant key would let two distinct
@@ -1334,16 +1384,21 @@ class NativeMissionProfile:
         if schema == MISSION_PROFILE_SCHEMA_VERSION:
             require_exact_keys(data, v1_fields, "native mission profile v1")
         elif schema == MISSION_PROFILE_SCHEMA_VERSION_V2:
-            require_exact_keys(data, v2_fields | transport_key, "native mission profile v2")
+            require_exact_keys(data, v2_fields | transport_key | effects_key, "native mission profile v2")
         elif schema == MISSION_PROFILE_SCHEMA_VERSION_V3:
-            require_exact_keys(data, v2_fields | {"claim_authority"}, "native mission profile v3")
+            require_exact_keys(data, v2_fields | {"claim_authority"} | effects_key, "native mission profile v3")
         elif schema == MISSION_PROFILE_SCHEMA_VERSION_V4:
-            require_exact_keys(data, v2_fields | {"claim_authority", "claim_verification_plan_authority"}, "native mission profile v4")
+            require_exact_keys(data, v2_fields | {"claim_authority", "claim_verification_plan_authority"} | effects_key, "native mission profile v4")
         elif schema == MISSION_PROFILE_SCHEMA_VERSION_V5:
-            require_exact_keys(data, v2_fields | {"claim_authority", "claim_verification_plan_authority", "verification_evidence_binding_authority"}, "native mission profile v5")
+            require_exact_keys(data, v2_fields | {"claim_authority", "claim_verification_plan_authority", "verification_evidence_binding_authority"} | effects_key, "native mission profile v5")
         else:
             raise ValueError("unsupported native mission profile schema")
         values = dict(data)
+        values["mission_effect_authority"] = (
+            MissionEffectAuthority.from_dict(data["mission_effect_authority"])
+            if effects_key
+            else None
+        )
         raw_clauses = data["gate_clauses"]
         if not isinstance(raw_clauses, list) or any(
             not isinstance(clause, list) or len(clause) != 2 or any(not isinstance(part, str) for part in clause)
@@ -1436,6 +1491,9 @@ def create_native_mission_profile(**values: Any) -> NativeMissionProfile:
     """
 
     schema_version = values.pop("schema_version", MISSION_PROFILE_SCHEMA_VERSION)
+    effects = values.get("mission_effect_authority")
+    if isinstance(effects, Mapping):
+        values["mission_effect_authority"] = MissionEffectAuthority.from_dict(effects)
     if schema_version in {MISSION_PROFILE_SCHEMA_VERSION_V2, MISSION_PROFILE_SCHEMA_VERSION_V3, MISSION_PROFILE_SCHEMA_VERSION_V4, MISSION_PROFILE_SCHEMA_VERSION_V5}:
         source = values.get("workspace_source")
         policy = values.get("git_end_state_policy")
@@ -2734,6 +2792,62 @@ NEON_RELAY_V4_PROFILE = create_native_mission_profile(
 )
 
 
+# ---------------------------------------------------------------------------
+# Runtime-v2 mission profile: neon-relay-v5 (ACP_STDIO transport).
+#
+# v4's single native attempt was never spent: an independent liveness audit
+# established, before any launch, that the V4 authority boundary categorically
+# refuses the mission's own required edits, its local test execution, and its
+# Git staging and exact commit.  A run under v4 could only have burned its
+# attempt on a mission that could not be performed.
+#
+# v5 therefore changes exactly two things, and nothing else:
+#
+#   * the run identity (v4's identity is retired with its preparation as
+#     historical, provider-free evidence);
+#   * the mission-scoped effect authority, which is *added* -- v4 carried none,
+#     because none existed.
+#
+# Every mission-bearing field is taken from the v4 profile object rather than
+# restated, so mission text, completion conditions, frozen verifier and its
+# SHA-256, required material paths, fixture, budgets, model, timeouts,
+# checkpoint command, runtime prompt, human-review non-claims and required
+# commit message are byte-identical to v4 (and therefore to v3, v2 and v1) by
+# construction.  The effect authority is itself derived from the same mission
+# constants those fields come from, and the profile validator refuses any
+# profile whose authority contradicts its Git end-state policy.
+#
+# The profile fingerprint and canonical document necessarily differ, because
+# the identity differs and the effect authority is new.
+# ---------------------------------------------------------------------------
+
+NEON_RELAY_V5_PROFILE = create_native_mission_profile(
+    schema_version=MISSION_PROFILE_SCHEMA_VERSION_V2,
+    profile_id="neon-relay-v5",
+    run_id="native-cursor-neon-relay-005",
+    session_id="native-cursor-neon-relay-005",
+    gate_id=NEON_RELAY_V4_PROFILE.gate_id,
+    mission_id=NEON_RELAY_V4_PROFILE.mission_id,
+    mission_text=NEON_RELAY_V4_PROFILE.mission_text,
+    gate_objective=NEON_RELAY_V4_PROFILE.gate_objective,
+    gate_clauses=NEON_RELAY_V4_PROFILE.gate_clauses,
+    required_evidence_kinds=NEON_RELAY_V4_PROFILE.required_evidence_kinds,
+    checkpoint_commands=NEON_RELAY_V4_PROFILE.checkpoint_commands,
+    completion_conditions_text=NEON_RELAY_V4_PROFILE.completion_conditions_text,
+    budgets=NEON_RELAY_V4_PROFILE.budgets,
+    timeout_seconds=NEON_RELAY_V4_PROFILE.timeout_seconds,
+    stdout_byte_limit=NEON_RELAY_V4_PROFILE.stdout_byte_limit,
+    stderr_byte_limit=NEON_RELAY_V4_PROFILE.stderr_byte_limit,
+    model=NEON_RELAY_V4_PROFILE.model,
+    workspace_source=NEON_RELAY_V4_PROFILE.workspace_source,
+    git_end_state_policy=NEON_RELAY_V4_PROFILE.git_end_state_policy,
+    verification=NEON_RELAY_V4_PROFILE.verification,
+    runtime_prompt=NEON_RELAY_V4_PROFILE.runtime_prompt,
+    prompt_transport=NEON_RELAY_V4_PROFILE.prompt_transport,
+    mission_effect_authority=NEON_RELAY_MISSION_EFFECT_AUTHORITY,
+)
+
+
 __all__ = [
     "FLAGSHIP_COMPLETION_CONDITIONS_TEXT",
     "FLAGSHIP_INCIDENT_REPLAY_PROFILE",
@@ -2759,6 +2873,9 @@ __all__ = [
     "NEON_RELAY_V2_PROFILE",
     "NEON_RELAY_V3_PROFILE",
     "NEON_RELAY_V4_PROFILE",
+    "NEON_RELAY_V5_PROFILE",
+    "NEON_RELAY_MISSION_EFFECT_AUTHORITY",
+    "MissionEffectAuthority",
     "PROMPT_TRANSPORT_ACP_STDIO",
     "PROMPT_TRANSPORT_ARGV",
     "NEON_RELAY_VERIFIER_OUTPUT_LIMIT_BYTES",

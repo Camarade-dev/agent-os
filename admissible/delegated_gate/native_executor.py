@@ -30,16 +30,22 @@ from admissible.delegated_gate.acp_authority import (
     AcpEvidenceWriteError,
     AcpServerRequestDispatcher,
     FAILURE_RESPONSE_WRITE,
+    FAILURE_WORKSPACE_IDENTITY_CHANGED,
     FAILURE_WORKSPACE_POLLUTED,
+    IDENTITY_STAGE_PRE_PROMPT,
     POLLUTION_STAGE_POST_STARTUP,
     WINDOWS_SHELL_FOLDER_DERIVATION_POLICY,
     WINDOWS_SHELL_FOLDER_NAMES,
     bounded_token as _bounded_token,
+    capture_workspace_identity,
+    compare_workspace_identity,
     derived_windows_environment,
     observe_workspace_pollution,
     validate_derived_windows_environment,
     workspace_inventory,
 )
+from admissible.delegated_gate.acp_mission_effects import MissionEffectRuntime
+from admissible.delegated_gate.mission_effect_authority import MissionEffectAuthority
 from admissible.delegated_gate.canonical import (
     canonical_bytes,
     fingerprint,
@@ -3089,6 +3095,10 @@ class NativeProcessInvocation:
     # and its material), which a permitted command may reference even though
     # they are outside the work workspace.
     acp_additional_authorized_paths: frozenset[str] = frozenset()
+    # ACP_STDIO only: the owner-authorized, profile-bound mission-scoped effect
+    # authority.  ``None`` keeps the categorical V4 boundary exactly as it was:
+    # no edit, no npm, no Git mutation is expressible at all.
+    acp_mission_effects: "MissionEffectRuntime | None" = None
 
 
 @dataclass(frozen=True)
@@ -3222,6 +3232,7 @@ class AcpStdioNativeProcessRunner:
         dispatcher = AcpServerRequestDispatcher(
             evidence=evidence, workspace=invocation.cwd,
             additional_authorized_paths=invocation.acp_additional_authorized_paths,
+            mission_effects=invocation.acp_mission_effects,
         )
 
         redaction_needle = json.dumps(prompt, ensure_ascii=False)[1:-1]
@@ -3241,9 +3252,13 @@ class AcpStdioNativeProcessRunner:
             retained.append(line)
             retained_bytes += encoded
 
-        # Taken before the server exists, so any addition observed after
-        # startup is attributable to the server rather than to us.
+        # Taken before the server exists, so any change observed after startup
+        # is attributable to the server rather than to us.  The path inventory
+        # answers "did a path appear?"; the complete identity also answers "did
+        # an existing tracked file's content, mode, index or HEAD move?", which
+        # a path-name comparison is structurally blind to.
         workspace_before = workspace_inventory(invocation.cwd)
+        identity_before = capture_workspace_identity(invocation.cwd)
 
         process = ManagedProcess(
             list(invocation.argv), cwd=invocation.cwd, env=dict(invocation.env),
@@ -3333,9 +3348,9 @@ class AcpStdioNativeProcessRunner:
                     failure = "missing_session_id"
             if failure is None:
                 # Second clean-workspace boundary: server startup and session
-                # creation must not have written into the working tree.  A
-                # polluted workspace is never cleaned automatically and never
-                # prompted over -- the mission is simply not submitted.
+                # creation must not have touched the working tree.  A moved
+                # workspace is never cleaned automatically and never prompted
+                # over -- the mission is simply not submitted.
                 pollution = observe_workspace_pollution(
                     workspace_before, workspace_inventory(invocation.cwd),
                 )
@@ -3349,6 +3364,21 @@ class AcpStdioNativeProcessRunner:
                     except AcpEvidenceWriteError:
                         pass
                     failure = f"{FAILURE_WORKSPACE_POLLUTED}:{len(pollution.added)}"
+                else:
+                    # No path appeared, so any difference here is exactly the
+                    # in-place mutation the inventory cannot see.
+                    differences = compare_workspace_identity(
+                        identity_before, capture_workspace_identity(invocation.cwd),
+                    )
+                    if differences:
+                        try:
+                            evidence.record_workspace_identity_difference(
+                                workspace=invocation.cwd, differences=differences,
+                                stage=IDENTITY_STAGE_PRE_PROMPT,
+                            )
+                        except AcpEvidenceWriteError:
+                            pass
+                        failure = f"{FAILURE_WORKSPACE_IDENTITY_CHANGED}:{len(differences)}"
             if failure is None:
                 # The one and only prompt submission. Exact bytes, no trim, no
                 # normalization, no splitting, no fallback encoding.
@@ -4037,6 +4067,7 @@ class NativeDelegatedExecutor:
         artifact_directory: str | Path,
         required_commit_message: str | None,
         required_material_paths: frozenset[str],
+        mission_effect_authority: "MissionEffectAuthority | None" = None,
         required_commits_added: int = 1,
         final_worktree_clean_required: bool = True,
         final_index_clean_required: bool = True,
@@ -4124,6 +4155,7 @@ class NativeDelegatedExecutor:
             )
         acp_evidence: AcpAuthorityEvidence | None = None
         acp_authorized_paths: frozenset[str] = frozenset()
+        acp_mission_effects: MissionEffectRuntime | None = None
         if transport == PROMPT_TRANSPORT_ACP_STDIO:
             evidence_name = (
                 f"{request.session_id}.{request.gate_id}"
@@ -4141,6 +4173,22 @@ class NativeDelegatedExecutor:
                     *request.backend_attestation.launcher_prefix,
                 )
             )
+            if mission_effect_authority is not None:
+                # Bound to the *observed* initial HEAD of the delivered
+                # workspace, so "HEAD is still the fixture HEAD" is a fact this
+                # executor measured rather than a value the profile asserted.
+                acp_mission_effects = MissionEffectRuntime(
+                    authority=mission_effect_authority,
+                    workspace=str(workspace),
+                    fixture_head=initial.git_head,
+                    # The same source/parent boundary this executor compares
+                    # before and after the run, re-observed before every Git
+                    # mutation approval: a stage or a commit is never granted
+                    # while the world outside the workspace has already moved.
+                    source_repository=str(source),
+                    parent_directory=str(parent),
+                    excluded_parent_children=measured_parent_exclusions,
+                )
         invocation = NativeProcessInvocation(
             argv, str(workspace), provider_environment, request.timeout_seconds,
             max(request.stdout_byte_limit, request.stderr_byte_limit), process_started,
@@ -4149,6 +4197,7 @@ class NativeDelegatedExecutor:
             prompt_fingerprint=request.prompt_fingerprint if transport == PROMPT_TRANSPORT_ACP_STDIO else None,
             acp_authority_evidence=acp_evidence,
             acp_additional_authorized_paths=acp_authorized_paths,
+            acp_mission_effects=acp_mission_effects,
         )
         outcome = self._runner_for(transport).run(invocation)
         if started_record is None:

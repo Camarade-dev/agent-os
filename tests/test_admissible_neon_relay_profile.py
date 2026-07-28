@@ -1717,9 +1717,15 @@ def test_registration_adds_neon_relay_once_and_preserves_every_previous_identity
     # mission on a third run identity.  The ACP client-authority repair extends
     # it once more: v3's attempt is durably consumed by the run whose client
     # granted allow_always and then died on cursor/update_todos, so neon-relay-v4
-    # carries the identical mission on a fourth run identity.
+    # carries the identical mission on a fourth run identity.  The
+    # mission-scoped effect repair extends it a third time: an independent
+    # liveness audit established that the V4 authority boundary refuses the
+    # mission's own required edits, its local test and its Git finalization, so
+    # neon-relay-v5 carries the identical mission on a fifth run identity with
+    # an owner-authorized effect authority attached.
     assert set(profiles) == set(LEGACY_FINGERPRINTS) | {
         EXPECTED_PROFILE_ID, "neon-relay-v2", "neon-relay-v3", "neon-relay-v4",
+        "neon-relay-v5",
     }
     v2 = resolve_registered_profile("neon-relay-v2")
     assert v2.profile_fingerprint == (
@@ -1745,8 +1751,26 @@ def test_registration_adds_neon_relay_once_and_preserves_every_previous_identity
     }) == 4
     assert v4.mission_text == PROFILE.mission_text
     assert v4.verifier_source_sha256 == PROFILE.verifier_source_sha256
+    v5 = resolve_registered_profile("neon-relay-v5")
+    assert v5.profile_fingerprint == (
+        "676adb0760e992745952aaf8aa829c99baab792cd3ba171a3070e8394fd125c8"
+    )
+    assert len({
+        v5.profile_fingerprint, v4.profile_fingerprint, v3.profile_fingerprint,
+        v2.profile_fingerprint, PROFILE.profile_fingerprint,
+    }) == 5
+    assert v5.mission_text == PROFILE.mission_text
+    assert v5.verifier_source_sha256 == PROFILE.verifier_source_sha256
+    # v5 is the only registered profile carrying a mission-scoped effect
+    # authority; every historical identity still carries none.
+    assert v5.mission_effect_authority is not None
+    assert all(
+        profile.mission_effect_authority is None
+        for profile_id, profile in profiles.items()
+        if profile_id != "neon-relay-v5"
+    )
     with pytest.raises(ValueError, match="unknown mission profile"):
-        resolve_registered_profile("neon-relay-v5")
+        resolve_registered_profile("neon-relay-v6")
 
 
 def test_neon_siege_definition_remains_unchanged():

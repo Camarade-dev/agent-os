@@ -22,6 +22,8 @@ import pytest
 
 import admissible.delegated_gate.native_executor as native_executor
 from admissible.delegated_gate.acp_authority import (
+    ACP_METHOD_ASK_QUESTION,
+    ACP_METHOD_CREATE_PLAN,
     ACP_METHOD_REQUEST_PERMISSION,
     ACP_METHOD_UPDATE_TODOS,
     ACP_SUPPORTED_SERVER_REQUEST_METHODS,
@@ -285,21 +287,32 @@ def test_the_todo_status_vocabulary_is_exactly_the_cli_s_own_four():
 # ---------------------------------------------------------------------------
 
 
-def test_the_dispatch_table_is_exactly_two_methods_with_no_wildcard(evidence, workspace):
+def test_the_dispatch_table_is_an_exact_closed_set_with_no_wildcard(evidence, workspace):
+    """The table grew by exactly two audited methods; it is still closed.
+
+    ``cursor/ask_question`` and ``cursor/create_plan`` were added only after
+    their request and response shapes were read out of the installed CLI's own
+    bundle.  Every other ``cursor/*`` method -- including ones that exist, like
+    ``cursor/task`` and ``cursor/generate_image`` -- is still unanswerable, so
+    no wildcard was introduced along with them.
+    """
+
     assert ACP_SUPPORTED_SERVER_REQUEST_METHODS == (
-        ACP_METHOD_REQUEST_PERMISSION, ACP_METHOD_UPDATE_TODOS,
+        ACP_METHOD_ASK_QUESTION, ACP_METHOD_CREATE_PLAN,
+        ACP_METHOD_UPDATE_TODOS, ACP_METHOD_REQUEST_PERMISSION,
     )
     dispatcher = AcpServerRequestDispatcher(evidence=evidence, workspace=str(workspace))
-    for method in ("cursor/ask_question", "cursor/create_plan", "cursor/task",
-                   "fs/read_text_file", "terminal/create", "session/anything", ""):
+    unanswerable = (
+        "cursor/task", "cursor/generate_image", "cursor/list_available_models",
+        "cursor/", "cursor/ask_question_", "fs/read_text_file", "terminal/create",
+        "session/anything", "",
+    )
+    for method in unanswerable:
         outcome = dispatcher.dispatch(method=method, message_id=9, params={})
         assert outcome.response is None
         assert outcome.failure == f"{FAILURE_UNANSWERABLE_SERVER_REQUEST}:{method}"
     persisted = [r for r in evidence.records if r["record_type"] == RECORD_PROTOCOL_FAILURE]
-    assert [r["method"] for r in persisted] == [
-        "cursor/ask_question", "cursor/create_plan", "cursor/task",
-        "fs/read_text_file", "terminal/create", "session/anything", "",
-    ]
+    assert [r["method"] for r in persisted] == list(unanswerable)
 
 
 def test_unknown_server_request_fails_closed_over_the_real_transport(tmp_path, workspace):
@@ -316,14 +329,14 @@ def test_unknown_server_request_fails_closed_over_the_real_transport(tmp_path, w
 
     assert outcome.returncode == 1
     assert outcome.protocol_failure_detail == (
-        f"{FAILURE_UNANSWERABLE_SERVER_REQUEST}:cursor/ask_question"
+        f"{FAILURE_UNANSWERABLE_SERVER_REQUEST}:cursor/task"
     )
     on_disk = [
         json.loads(line)
         for line in (tmp_path / "authority.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     assert any(
-        r["record_type"] == RECORD_PROTOCOL_FAILURE and r["method"] == "cursor/ask_question"
+        r["record_type"] == RECORD_PROTOCOL_FAILURE and r["method"] == "cursor/task"
         for r in on_disk
     )
     assert len(started.proofs) == 1
@@ -1054,7 +1067,7 @@ def test_the_exact_protocol_boundary_is_kept_beside_the_compatible_classificatio
                         cwd=str(workspace), started=StartedRecorder(), evidence=log)
     )
     assert outcome.termination_reason.startswith(native_executor.ACP_TERMINATION_PROTOCOL_FAILED)
-    assert "cursor/ask_question" in outcome.termination_reason
+    assert "cursor/task" in outcome.termination_reason
     assert len(outcome.termination_reason.encode("utf-8")) <= 256
 
 
@@ -1078,7 +1091,9 @@ def test_mutation_witness_restoring_unconditional_allow_always_fails_the_suite(
 
     import admissible.delegated_gate.acp_authority as authority
 
-    def unconditional_allow_always(request, *, workspace, additional_authorized_paths=frozenset()):
+    def unconditional_allow_always(
+        request, *, workspace, additional_authorized_paths=frozenset(), mission_effects=None,
+    ):
         # The exact pre-repair preference order.
         for preferred in ("allow_always", "allow_once"):
             for option in request.options:

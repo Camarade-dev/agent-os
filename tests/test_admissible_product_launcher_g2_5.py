@@ -882,8 +882,34 @@ PROTECTED_PATH_PREFIXES = (
 #     single file, not the directory; it adds no route, no UI, no canonical
 #     document and no archive file; it imports nothing from the product service
 #     or read model; and it executes no command and deletes no path.
+#   - The Neon Relay mission-scoped effect repair authorized two new reviewed
+#     modules, following the acp_authority.py precedent above: one reviewed file
+#     each, never the directory.
+#       * admissible/delegated_gate/mission_effect_authority.py is canonical,
+#         immutable data only - a closed enumeration of one mission's exact
+#         writable paths, creatable directories, local verification spellings,
+#         Git staging forms and single exact commit message, bound by one
+#         non-self-referential fingerprint.  It holds no callable, no path
+#         handle and no environment lookup; it touches no filesystem, starts no
+#         process and contacts no provider.  Its Neon Relay instance is pinned
+#         by the authority fingerprint
+#         99986849ee621a825e52f1ecb362b920f1011b5665c7500d724159f482144e99 and,
+#         through the profile body, by the neon-relay-v5 profile fingerprint
+#         676adb0760e992745952aaf8aa829c99baab792cd3ba171a3070e8394fd125c8, so
+#         any later edit to it changes a pinned identity and fails the profile
+#         module.
+#       * admissible/delegated_gate/acp_mission_effects.py is the decision
+#         procedure that consults that authority.  It authorizes no category:
+#         every accept path terminates in an exact enumerated member, and its
+#         Git approvals are granted only after an independent, hardened,
+#         read-only observation of the live repository.  It adds no route, no
+#         UI, no canonical document and no archive file; it imports nothing from
+#         the product service or read model; and the only subprocess it starts
+#         is a read-only `git` observation of the authorized workspace.
 AUTHORIZED_REPAIR_PATHS = frozenset({
     "admissible/delegated_gate/acp_authority.py",
+    "admissible/delegated_gate/acp_mission_effects.py",
+    "admissible/delegated_gate/mission_effect_authority.py",
     "admissible/delegated_gate/historical_evaluation.py",
     "admissible/delegated_gate/historical_evaluation_store.py",
     "admissible/delegated_gate/historical_pairing_confirmation.py",
