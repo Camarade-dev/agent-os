@@ -29,6 +29,7 @@ from admissible.capsule.common import (
     require_sha256,
     require_strict_int,
 )
+from admissible.capsule.intake import AcceptedMaterialIdentity
 
 
 CHECKPOINT_IDENTITY_SCHEMA_VERSION = "admissible_capsule_checkpoint_identity_v1"
@@ -55,6 +56,8 @@ class BehaviorRefusalCode(str, Enum):
     ASSERTION_FAILED = "BEHAVIOR_ASSERTION_FAILED"
     VERIFIER_CRASHED = "BEHAVIOR_VERIFIER_CRASHED"
     OUTPUT_TRUNCATED_UNSAFE = "BEHAVIOR_OUTPUT_TRUNCATED_UNSAFE"
+    TREE_MUTATED = "BEHAVIOR_TREE_MUTATED"
+    COPY_IDENTITY_MISMATCH = "BEHAVIOR_COPY_IDENTITY_MISMATCH"
 
 
 @dataclass(frozen=True)
@@ -155,9 +158,10 @@ class BehavioralVerifierIdentity:
 class VerificationCopy:
     """A separate, materially independent copy used for one verification pass.
 
-    `purpose` distinguishes a checkpoint copy from a behavior copy; the two
-    must never share a `copy_id` or `root_fingerprint` — see
-    `require_independent_copies`.
+    `purpose` distinguishes a checkpoint copy from a behavior copy. The two
+    copies must have different `copy_id` values while carrying the same root
+    fingerprint, because they are independent copies of identical accepted
+    material.
     """
 
     schema_version: str
@@ -335,6 +339,7 @@ class ByteHashPair:
 
 @dataclass(frozen=True)
 class CheckpointResult:
+    accepted_material: AcceptedMaterialIdentity
     identity: CheckpointIdentity
     copy: VerificationCopy
     capture: CommandCapture
@@ -343,6 +348,7 @@ class CheckpointResult:
     refusal_code: CheckpointRefusalCode | None
 
     def validated(self) -> "CheckpointResult":
+        self.accepted_material.validated()
         self.identity.validated()
         self.copy.validated()
         if self.copy.purpose != "checkpoint":
@@ -354,6 +360,22 @@ class CheckpointResult:
             raise ValueError("a passed checkpoint cannot carry a refusal code")
         if not self.passed and self.refusal_code is None:
             raise ValueError("a refused checkpoint requires a refusal code")
+        expected_root = self.accepted_material.canonical_manifest_fingerprint
+        identity_mismatch = (
+            self.identity.tree_hash != expected_root
+            or self.copy.root_fingerprint != expected_root
+            or self.byte_hashes.before_hash != expected_root
+        )
+        if identity_mismatch and (
+            self.passed or self.refusal_code is not CheckpointRefusalCode.COPY_IDENTITY_MISMATCH
+        ):
+            raise ValueError("checkpoint copy is not bound to its accepted material")
+        if not identity_mismatch and self.refusal_code is CheckpointRefusalCode.COPY_IDENTITY_MISMATCH:
+            raise ValueError("checkpoint copy-identity refusal has no mismatch witness")
+        if self.byte_hashes.mutated and not identity_mismatch and (
+            self.passed or self.refusal_code is not CheckpointRefusalCode.TREE_MUTATED
+        ):
+            raise ValueError("checkpoint mutation must refuse with TREE_MUTATED")
         if self.passed and (
             self.capture.exit_code != 0
             or self.capture.timed_out
@@ -365,6 +387,7 @@ class CheckpointResult:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "accepted_material": self.accepted_material.to_dict(),
             "identity": self.identity.to_dict(),
             "copy": self.copy.to_dict(),
             "capture": self.capture.to_dict(),
@@ -376,9 +399,20 @@ class CheckpointResult:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "CheckpointResult":
         require_exact_keys(
-            data, {"identity", "copy", "capture", "byte_hashes", "passed", "refusal_code"}, "checkpoint result"
+            data,
+            {
+                "accepted_material",
+                "identity",
+                "copy",
+                "capture",
+                "byte_hashes",
+                "passed",
+                "refusal_code",
+            },
+            "checkpoint result",
         )
         return cls(
+            accepted_material=AcceptedMaterialIdentity.from_dict(data["accepted_material"]),
             identity=CheckpointIdentity.from_dict(data["identity"]),
             copy=VerificationCopy.from_dict(data["copy"]),
             capture=CommandCapture.from_dict(data["capture"]),
@@ -390,6 +424,7 @@ class CheckpointResult:
 
 @dataclass(frozen=True)
 class BehaviorResult:
+    accepted_material: AcceptedMaterialIdentity
     identity: BehavioralVerifierIdentity
     copy: VerificationCopy
     capture: CommandCapture
@@ -398,6 +433,7 @@ class BehaviorResult:
     refusal_code: BehaviorRefusalCode | None
 
     def validated(self) -> "BehaviorResult":
+        self.accepted_material.validated()
         self.identity.validated()
         self.copy.validated()
         if self.copy.purpose != "behavior":
@@ -409,12 +445,33 @@ class BehaviorResult:
             raise ValueError("a passed behavioral run cannot carry a refusal code")
         if not self.passed and self.refusal_code is None:
             raise ValueError("a refused behavioral run requires a refusal code")
-        if self.passed and (self.capture.exit_code != 0 or self.capture.timed_out or not self.capture.output_safe):
+        expected_root = self.accepted_material.canonical_manifest_fingerprint
+        identity_mismatch = (
+            self.copy.root_fingerprint != expected_root
+            or self.byte_hashes.before_hash != expected_root
+        )
+        if identity_mismatch and (
+            self.passed or self.refusal_code is not BehaviorRefusalCode.COPY_IDENTITY_MISMATCH
+        ):
+            raise ValueError("behavior copy is not bound to its accepted material")
+        if not identity_mismatch and self.refusal_code is BehaviorRefusalCode.COPY_IDENTITY_MISMATCH:
+            raise ValueError("behavior copy-identity refusal has no mismatch witness")
+        if self.byte_hashes.mutated and not identity_mismatch and (
+            self.passed or self.refusal_code is not BehaviorRefusalCode.TREE_MUTATED
+        ):
+            raise ValueError("behavior mutation must refuse with TREE_MUTATED")
+        if self.passed and (
+            self.capture.exit_code != 0
+            or self.capture.timed_out
+            or not self.capture.output_safe
+            or self.byte_hashes.mutated
+        ):
             raise ValueError("passed behavioral evidence contradicts its captured process result")
         return self
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "accepted_material": self.accepted_material.to_dict(),
             "identity": self.identity.to_dict(),
             "copy": self.copy.to_dict(),
             "capture": self.capture.to_dict(),
@@ -426,9 +483,20 @@ class BehaviorResult:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "BehaviorResult":
         require_exact_keys(
-            data, {"identity", "copy", "capture", "byte_hashes", "passed", "refusal_code"}, "behavior result"
+            data,
+            {
+                "accepted_material",
+                "identity",
+                "copy",
+                "capture",
+                "byte_hashes",
+                "passed",
+                "refusal_code",
+            },
+            "behavior result",
         )
         return cls(
+            accepted_material=AcceptedMaterialIdentity.from_dict(data["accepted_material"]),
             identity=BehavioralVerifierIdentity.from_dict(data["identity"]),
             copy=VerificationCopy.from_dict(data["copy"]),
             capture=CommandCapture.from_dict(data["capture"]),
@@ -467,6 +535,8 @@ class IndependentVerificationResult:
         self.checkpoint.validated()
         if self.behavior is not None:
             self.behavior.validated()
+            if self.checkpoint.accepted_material != self.behavior.accepted_material:
+                raise ValueError("checkpoint and behavior must bind the same accepted material")
             require_independent_copies(self.checkpoint.copy, self.behavior.copy)
         return self
 

@@ -37,6 +37,7 @@ from admissible.capsule.events import (
     SessionFailed,
 )
 from admissible.capsule.finalizer import FinalizationOutcome
+from admissible.capsule.intake import AcceptedMaterialIdentity
 from admissible.capsule.state import TERMINAL_PHASES, CapsuleSessionState, Phase, mint_state
 from admissible.capsule.verification import require_independent_copies
 
@@ -54,8 +55,11 @@ def _next(state: CapsuleSessionState, **changes: Any) -> CapsuleSessionState:
         "capsule_authority": state.capsule_authority,
         "provider_output": state.provider_output,
         "intake_evidence": state.intake_evidence,
+        "accepted_material": state.accepted_material,
         "checkpoint_result": state.checkpoint_result,
         "behavior_result": state.behavior_result,
+        "finalization_evidence": state.finalization_evidence,
+        "durability_receipt": state.durability_receipt,
         "finalization_result": state.finalization_result,
         "refusal_reason": state.refusal_reason,
         "failure_code": state.failure_code,
@@ -101,7 +105,15 @@ def reduce(state: CapsuleSessionState, event: CapsuleEvent) -> CapsuleSessionSta
         evidence = event.intake_evidence
         evidence.validated()
         if evidence.ruling == "ACCEPTED":
-            return _next(state, phase=Phase.INTAKE_ACCEPTED, intake_evidence=evidence)
+            if not evidence.published:
+                raise IllegalTransition("accepted intake is not durably published")
+            accepted_material = AcceptedMaterialIdentity.from_intake_evidence(evidence)
+            return _next(
+                state,
+                phase=Phase.INTAKE_ACCEPTED,
+                intake_evidence=evidence,
+                accepted_material=accepted_material,
+            )
         return _next(
             state,
             phase=Phase.REFUSED,
@@ -119,6 +131,8 @@ def reduce(state: CapsuleSessionState, event: CapsuleEvent) -> CapsuleSessionSta
             raise IllegalTransition("a checkpoint verdict is not legal outside VERIFYING_CHECKPOINT")
         result = event.checkpoint_result
         result.validated()
+        if state.accepted_material is None or result.accepted_material != state.accepted_material:
+            raise IllegalTransition("checkpoint verification is bound to different accepted material")
         if result.passed:
             # A checkpoint PASS never implies behavioral acceptance: entering
             # VERIFYING_BEHAVIOR only starts an independent verification pass.
@@ -137,6 +151,8 @@ def reduce(state: CapsuleSessionState, event: CapsuleEvent) -> CapsuleSessionSta
             raise IllegalTransition("behavioral verification requires a passed checkpoint")
         result = event.behavior_result
         result.validated()
+        if state.accepted_material is None or result.accepted_material != state.accepted_material:
+            raise IllegalTransition("behavioral verification is bound to different accepted material")
         require_independent_copies(state.checkpoint_result.copy, result.copy)
         if result.passed:
             return _next(state, phase=Phase.FINALIZATION_READY, behavior_result=result)
@@ -150,13 +166,39 @@ def reduce(state: CapsuleSessionState, event: CapsuleEvent) -> CapsuleSessionSta
     if isinstance(event, FinalizationStarted):
         if state.phase != Phase.FINALIZATION_READY:
             raise IllegalTransition("finalization may only start once behavioral verification has passed")
-        return _next(state, phase=Phase.FINALIZING)
+        evidence = event.finalization_evidence
+        receipt = event.durability_receipt
+        evidence.validated()
+        receipt.verify(evidence)
+        if state.accepted_material is None or evidence.accepted_material != state.accepted_material:
+            raise IllegalTransition("finalization authorization is bound to different accepted material")
+        if receipt.store_authority != evidence.finalizer_authority.evidence_store_authority:
+            raise IllegalTransition("finalization durability receipt belongs to another authority")
+        return _next(
+            state,
+            phase=Phase.FINALIZING,
+            finalization_evidence=evidence,
+            durability_receipt=receipt,
+        )
 
     if isinstance(event, FinalizationCompleted):
         if state.phase != Phase.FINALIZING:
             raise IllegalTransition("a finalization outcome is not legal outside FINALIZING")
         result = event.finalization_result
         result.validated()
+        if state.finalization_evidence is None or state.durability_receipt is None:
+            raise IllegalTransition("finalization completed without state authorization")
+        if (
+            result.accepted_material != state.accepted_material
+            or result.expected_tree != state.finalization_evidence.expected_tree
+            or result.finalizer_authority != state.finalization_evidence.finalizer_authority
+            or result.parent != state.finalization_evidence.parent
+            or result.publication_ref != state.finalization_evidence.publication_ref
+            or result.resulting_commit != state.finalization_evidence.resulting_commit
+            or result.durable_evidence != state.finalization_evidence
+            or result.durability_receipt != state.durability_receipt
+        ):
+            raise IllegalTransition("finalization result differs from the transaction authorized by state")
         if result.outcome in (
             FinalizationOutcome.PUBLISHED,
             FinalizationOutcome.IDEMPOTENT_SAME_ACCEPTED_IDENTITY,

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-from admissible.capsule.finalizer import FinalizationResult
+from admissible.capsule.finalizer import DurabilityReceipt, FinalizationEvidence, FinalizationResult
 from admissible.capsule.intake import IntakeEvidence
 from admissible.capsule.models import ProviderOutput
 from admissible.capsule.verification import BehaviorResult, CheckpointResult
@@ -66,7 +66,8 @@ class BehaviorVerified:
 
 @dataclass(frozen=True)
 class FinalizationStarted:
-    pass
+    finalization_evidence: FinalizationEvidence
+    durability_receipt: DurabilityReceipt
 
 
 @dataclass(frozen=True)

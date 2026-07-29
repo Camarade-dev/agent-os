@@ -31,7 +31,6 @@ from admissible.capsule.common import (
     fingerprint,
     fsync_directory,
     mode_type,
-    require_bool,
     require_exact_keys,
     require_nonempty_text,
     require_sha256,
@@ -41,7 +40,8 @@ from admissible.capsule.common import (
 
 
 INTAKE_AUTHORITY_SCHEMA_VERSION = "admissible_capsule_intake_authority_v1"
-INTAKE_EVIDENCE_SCHEMA_VERSION = "admissible_capsule_intake_evidence_v1"
+INTAKE_EVIDENCE_SCHEMA_VERSION = "admissible_capsule_intake_evidence_v2"
+ACCEPTED_MATERIAL_IDENTITY_SCHEMA_VERSION = "admissible_capsule_accepted_material_identity_v1"
 
 _IDENTITY_FIELDS = (
     "st_dev",
@@ -89,6 +89,16 @@ class RejectionCode(str, Enum):
     INVALID_UTF8 = "INVALID_UTF8"
     MALFORMED_PACKAGE_JSON = "MALFORMED_PACKAGE_JSON"
     PACKAGE_JSON_NOT_OBJECT = "PACKAGE_JSON_NOT_OBJECT"
+
+
+class IntakePublicationState(str, Enum):
+    """Durable intake states; each name describes an effect already completed."""
+
+    REJECTED = "REJECTED"
+    CANDIDATE_VALIDATED = "CANDIDATE_VALIDATED"
+    PUBLICATION_PREPARED = "PUBLICATION_PREPARED"
+    DESTINATION_RENAME_COMPLETED = "DESTINATION_RENAME_COMPLETED"
+    ACCEPTED_INTAKE_PUBLISHED = "ACCEPTED_INTAKE_PUBLISHED"
 
 
 @dataclass(frozen=True)
@@ -304,14 +314,133 @@ class IntakeFileRecord:
     relative_path: str
     size: int
     sha256: str
+    git_mode: str
+
+    def validated(self) -> "IntakeFileRecord":
+        require_nonempty_text(self.relative_path, "intake file relative_path", max_bytes=4096)
+        require_strict_int(self.size, "intake file size", minimum=0, maximum=1024 * 1024 * 1024)
+        require_sha256(self.sha256, "intake file sha256")
+        if self.git_mode not in {"100644", "100755"}:
+            raise ValueError("accepted regular-file mode must be 100644 or 100755")
+        return self
 
     def to_dict(self) -> dict[str, Any]:
-        return {"relative_path": self.relative_path, "size": self.size, "sha256": self.sha256}
+        return {
+            "relative_path": self.relative_path,
+            "size": self.size,
+            "sha256": self.sha256,
+            "git_mode": self.git_mode,
+        }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "IntakeFileRecord":
-        require_exact_keys(data, {"relative_path", "size", "sha256"}, "intake file record")
-        return cls(**dict(data))
+        require_exact_keys(data, {"relative_path", "size", "sha256", "git_mode"}, "intake file record")
+        return cls(**dict(data)).validated()
+
+
+@dataclass(frozen=True)
+class AcceptedMaterialIdentity:
+    """Closed identity of the exact regular-file material accepted by intake."""
+
+    schema_version: str
+    intake_authority_fingerprint: str
+    authorized_relative_paths: tuple[str, ...]
+    files: tuple[IntakeFileRecord, ...]
+    canonical_manifest_fingerprint: str
+    intake_evidence_fingerprint: str
+    material_fingerprint: str
+
+    @classmethod
+    def from_intake_evidence(cls, evidence: "IntakeEvidence") -> "AcceptedMaterialIdentity":
+        evidence.validated()
+        if not evidence.published:
+            raise ValueError("accepted-material identity requires published accepted intake evidence")
+        files = tuple(sorted(evidence.files, key=lambda item: item.relative_path))
+        paths = tuple(item.relative_path for item in files)
+        manifest = fingerprint([item.to_dict() for item in files])
+        body = {
+            "schema_version": ACCEPTED_MATERIAL_IDENTITY_SCHEMA_VERSION,
+            "intake_authority_fingerprint": evidence.authority_fingerprint,
+            "authorized_relative_paths": list(paths),
+            "files": [item.to_dict() for item in files],
+            "canonical_manifest_fingerprint": manifest,
+            "intake_evidence_fingerprint": evidence.evidence_fingerprint,
+        }
+        return cls(
+            schema_version=ACCEPTED_MATERIAL_IDENTITY_SCHEMA_VERSION,
+            intake_authority_fingerprint=evidence.authority_fingerprint,
+            authorized_relative_paths=paths,
+            files=files,
+            canonical_manifest_fingerprint=manifest,
+            intake_evidence_fingerprint=evidence.evidence_fingerprint,
+            material_fingerprint=fingerprint(body),
+        ).validated()
+
+    def _body(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "intake_authority_fingerprint": self.intake_authority_fingerprint,
+            "authorized_relative_paths": list(self.authorized_relative_paths),
+            "files": [item.to_dict() for item in self.files],
+            "canonical_manifest_fingerprint": self.canonical_manifest_fingerprint,
+            "intake_evidence_fingerprint": self.intake_evidence_fingerprint,
+        }
+
+    def validated(self) -> "AcceptedMaterialIdentity":
+        if self.schema_version != ACCEPTED_MATERIAL_IDENTITY_SCHEMA_VERSION:
+            raise ValueError("unsupported accepted-material identity schema")
+        require_sha256(self.intake_authority_fingerprint, "intake authority fingerprint")
+        if not isinstance(self.authorized_relative_paths, tuple) or not self.authorized_relative_paths:
+            raise ValueError("accepted-material paths must be a non-empty immutable tuple")
+        if not isinstance(self.files, tuple) or not self.files:
+            raise ValueError("accepted-material files must be a non-empty immutable tuple")
+        for item in self.files:
+            if not isinstance(item, IntakeFileRecord):
+                raise ValueError("invalid accepted-material file record")
+            item.validated()
+        paths = tuple(item.relative_path for item in self.files)
+        if paths != tuple(sorted(paths)) or len(set(paths)) != len(paths):
+            raise ValueError("accepted-material files must have unique canonical path order")
+        if self.authorized_relative_paths != paths:
+            raise ValueError("accepted-material authorized path set differs from its files")
+        require_sha256(self.canonical_manifest_fingerprint, "canonical accepted manifest fingerprint")
+        if fingerprint([item.to_dict() for item in self.files]) != self.canonical_manifest_fingerprint:
+            raise ValueError("canonical accepted manifest fingerprint mismatch")
+        require_sha256(self.intake_evidence_fingerprint, "canonical intake evidence fingerprint")
+        require_sha256(self.material_fingerprint, "accepted-material fingerprint")
+        if fingerprint(self._body()) != self.material_fingerprint:
+            raise ValueError("accepted-material fingerprint mismatch")
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**self._body(), "material_fingerprint": self.material_fingerprint}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "AcceptedMaterialIdentity":
+        require_exact_keys(
+            data,
+            {
+                "schema_version",
+                "intake_authority_fingerprint",
+                "authorized_relative_paths",
+                "files",
+                "canonical_manifest_fingerprint",
+                "intake_evidence_fingerprint",
+                "material_fingerprint",
+            },
+            "accepted-material identity",
+        )
+        if not isinstance(data["authorized_relative_paths"], list) or not isinstance(data["files"], list):
+            raise ValueError("accepted-material paths and files must be arrays")
+        return cls(
+            schema_version=data["schema_version"],
+            intake_authority_fingerprint=data["intake_authority_fingerprint"],
+            authorized_relative_paths=tuple(data["authorized_relative_paths"]),
+            files=tuple(IntakeFileRecord.from_dict(item) for item in data["files"]),
+            canonical_manifest_fingerprint=data["canonical_manifest_fingerprint"],
+            intake_evidence_fingerprint=data["intake_evidence_fingerprint"],
+            material_fingerprint=data["material_fingerprint"],
+        ).validated()
 
 
 @dataclass(frozen=True)
@@ -324,7 +453,7 @@ class IntakeEvidence:
     rejection_reasons: tuple[RejectionReason, ...]
     files: tuple[IntakeFileRecord, ...]
     aggregate_fingerprint: str | None
-    published: bool
+    publication_state: IntakePublicationState
     evidence_fingerprint: str
 
     @classmethod
@@ -336,7 +465,7 @@ class IntakeEvidence:
         rejection_reasons: tuple[RejectionReason, ...],
         files: tuple[IntakeFileRecord, ...],
         aggregate_fingerprint: str | None,
-        published: bool,
+        publication_state: IntakePublicationState,
     ) -> "IntakeEvidence":
         body = {
             "schema_version": INTAKE_EVIDENCE_SCHEMA_VERSION,
@@ -345,7 +474,7 @@ class IntakeEvidence:
             "rejection_reasons": [reason.to_dict() for reason in rejection_reasons],
             "files": [record.to_dict() for record in files],
             "aggregate_fingerprint": aggregate_fingerprint,
-            "published": published,
+            "publication_state": publication_state.value,
         }
         return cls(
             schema_version=INTAKE_EVIDENCE_SCHEMA_VERSION,
@@ -354,7 +483,7 @@ class IntakeEvidence:
             rejection_reasons=rejection_reasons,
             files=files,
             aggregate_fingerprint=aggregate_fingerprint,
-            published=published,
+            publication_state=publication_state,
             evidence_fingerprint=fingerprint(body),
         ).validated()
 
@@ -366,8 +495,12 @@ class IntakeEvidence:
             "rejection_reasons": [reason.to_dict() for reason in self.rejection_reasons],
             "files": [record.to_dict() for record in self.files],
             "aggregate_fingerprint": self.aggregate_fingerprint,
-            "published": self.published,
+            "publication_state": self.publication_state.value,
         }
+
+    @property
+    def published(self) -> bool:
+        return self.publication_state is IntakePublicationState.ACCEPTED_INTAKE_PUBLISHED
 
     def validated(self) -> "IntakeEvidence":
         if self.schema_version != INTAKE_EVIDENCE_SCHEMA_VERSION:
@@ -379,11 +512,25 @@ class IntakeEvidence:
             raise ValueError("ACCEPTED evidence cannot carry rejection reasons")
         if self.ruling == "REJECTED" and not self.rejection_reasons:
             raise ValueError("REJECTED evidence requires at least one rejection reason")
-        if self.ruling == "REJECTED" and self.published:
-            raise ValueError("rejected intake can never be published")
+        if not isinstance(self.publication_state, IntakePublicationState):
+            raise ValueError("unknown intake publication state")
+        if self.ruling == "REJECTED" and self.publication_state is not IntakePublicationState.REJECTED:
+            raise ValueError("rejected intake must use the REJECTED publication state")
+        if self.ruling == "ACCEPTED" and self.publication_state is IntakePublicationState.REJECTED:
+            raise ValueError("accepted intake cannot use the REJECTED publication state")
         if self.ruling == "ACCEPTED" and (not self.files or self.aggregate_fingerprint is None):
             raise ValueError("ACCEPTED evidence requires complete accepted files and an aggregate fingerprint")
-        require_bool(self.published, "published")
+        if not isinstance(self.files, tuple):
+            raise ValueError("intake files must be immutable")
+        for record in self.files:
+            record.validated()
+        paths = [record.relative_path for record in self.files]
+        if paths != sorted(paths) or len(paths) != len(set(paths)):
+            raise ValueError("intake files must have unique canonical path order")
+        if self.aggregate_fingerprint is not None:
+            require_sha256(self.aggregate_fingerprint, "aggregate fingerprint")
+            if fingerprint([record.to_dict() for record in self.files]) != self.aggregate_fingerprint:
+                raise ValueError("aggregate fingerprint does not match intake files")
         require_sha256(self.evidence_fingerprint, "evidence_fingerprint")
         if fingerprint(self._body()) != self.evidence_fingerprint:
             raise ValueError("intake evidence fingerprint mismatch")
@@ -405,7 +552,7 @@ class IntakeEvidence:
                 "rejection_reasons",
                 "files",
                 "aggregate_fingerprint",
-                "published",
+                "publication_state",
                 "evidence_fingerprint",
             },
             "intake evidence",
@@ -419,7 +566,7 @@ class IntakeEvidence:
             rejection_reasons=tuple(RejectionReason.from_dict(item) for item in data["rejection_reasons"]),
             files=tuple(IntakeFileRecord.from_dict(item) for item in data["files"]),
             aggregate_fingerprint=data["aggregate_fingerprint"],
-            published=data["published"],
+            publication_state=IntakePublicationState(data["publication_state"]),
             evidence_fingerprint=data["evidence_fingerprint"],
         ).validated()
 
@@ -575,8 +722,11 @@ class CanonicalIntake:
                                 "package.json top-level value must be an object",
                             )
             self.file_records[relative] = IntakeFileRecord(
-                relative_path=relative, size=len(raw), sha256=sha256_bytes(raw)
-            )
+                relative_path=relative,
+                size=len(raw),
+                sha256=sha256_bytes(raw),
+                git_mode="100755" if before.st_mode & 0o111 else "100644",
+            ).validated()
             self._file_identity[relative] = _identity(before)
         finally:
             os.close(descriptor)
@@ -656,7 +806,7 @@ class CanonicalIntake:
 
     def aggregate_fingerprint(self) -> str | None:
         public = []
-        for path in self.authority.authority_paths:
+        for path in sorted(self.authority.authority_paths):
             record = self.file_records.get(path)
             if record is None:
                 return None
@@ -706,15 +856,24 @@ class CanonicalIntake:
         for path in self.authority.authority_paths:
             self._read_confirmed(path)
 
-    def evidence(self, *, ruling: str, published: bool) -> IntakeEvidence:
-        files = tuple(self.file_records[path] for path in self.authority.authority_paths if path in self.file_records)
+    def evidence(
+        self,
+        *,
+        ruling: str,
+        publication_state: IntakePublicationState,
+    ) -> IntakeEvidence:
+        files = tuple(
+            self.file_records[path]
+            for path in sorted(self.authority.authority_paths)
+            if path in self.file_records
+        )
         return IntakeEvidence.create(
             authority_fingerprint=self.authority.authority_fingerprint,
             ruling=ruling,
             rejection_reasons=tuple(self.reasons),
             files=files if ruling == "ACCEPTED" else (),
             aggregate_fingerprint=self.aggregate_fingerprint() if ruling == "ACCEPTED" else None,
-            published=published,
+            publication_state=publication_state,
         )
 
     def copy_and_publish(
@@ -724,6 +883,7 @@ class CanonicalIntake:
         *,
         crash_after_copy: int | None = None,
         crash_before_evidence: bool = False,
+        crash_after_preparation: bool = False,
     ) -> IntakeEvidence:
         """Copy only accepted bytes, with atomic staging and canonical evidence.
 
@@ -736,9 +896,17 @@ class CanonicalIntake:
         if evidence_path.exists() or evidence_path.is_symlink():
             raise FileExistsError(f"evidence already exists: {evidence_path}")
         if self.reasons:
-            evidence = self.evidence(ruling="REJECTED", published=False)
+            evidence = self.evidence(
+                ruling="REJECTED",
+                publication_state=IntakePublicationState.REJECTED,
+            )
             atomic_json(evidence_path, evidence.to_dict())
             return evidence
+        candidate = self.evidence(
+            ruling="ACCEPTED",
+            publication_state=IntakePublicationState.CANDIDATE_VALIDATED,
+        )
+        atomic_json(evidence_path, candidate.to_dict(), crash_before_replace=crash_before_evidence)
         destination.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
         staging = destination.parent / f".{destination.name}.staging-{os.getpid()}-{uuid.uuid4().hex}"
         os.mkdir(staging, 0o700)
@@ -755,7 +923,10 @@ class CanonicalIntake:
                     while offset < len(raw):
                         offset += os.write(descriptor, raw[offset:])
                     os.fsync(descriptor)
-                    os.fchmod(descriptor, 0o644)
+                    os.fchmod(
+                        descriptor,
+                        0o755 if self.file_records[relative].git_mode == "100755" else 0o644,
+                    )
                 finally:
                     os.close(descriptor)
                 copied_count += 1
@@ -766,11 +937,26 @@ class CanonicalIntake:
             os.chmod(staging, 0o755)
             fsync_directory(staging)
             self._confirm_namespace()
-            evidence = self.evidence(ruling="ACCEPTED", published=True)
-            atomic_json(evidence_path, evidence.to_dict(), crash_before_replace=crash_before_evidence)
+            prepared = self.evidence(
+                ruling="ACCEPTED",
+                publication_state=IntakePublicationState.PUBLICATION_PREPARED,
+            )
+            atomic_json(evidence_path, prepared.to_dict())
+            if crash_after_preparation:
+                raise CrashInjected("crash injected after intake publication preparation")
             os.rename(staging, destination)
             fsync_directory(destination.parent)
-            return evidence
+            renamed = self.evidence(
+                ruling="ACCEPTED",
+                publication_state=IntakePublicationState.DESTINATION_RENAME_COMPLETED,
+            )
+            atomic_json(evidence_path, renamed.to_dict())
+            published = self.evidence(
+                ruling="ACCEPTED",
+                publication_state=IntakePublicationState.ACCEPTED_INTAKE_PUBLISHED,
+            )
+            atomic_json(evidence_path, published.to_dict())
+            return published
         except BaseException as error:
             if shutil.os.path.exists(staging):
                 shutil.rmtree(staging, ignore_errors=True)
@@ -782,7 +968,10 @@ class CanonicalIntake:
                     parts[2] if len(parts) > 2 else "source changed during copy",
                 )
                 self.reasons.sort(key=lambda item: (item.path, item.code.value, item.detail))
-                evidence = self.evidence(ruling="REJECTED", published=False)
+                evidence = self.evidence(
+                    ruling="REJECTED",
+                    publication_state=IntakePublicationState.REJECTED,
+                )
                 atomic_json(evidence_path, evidence.to_dict())
                 return evidence
             raise
@@ -796,6 +985,7 @@ def validate_and_copy(
     *,
     crash_after_copy: int | None = None,
     crash_before_evidence: bool = False,
+    crash_after_preparation: bool = False,
 ) -> IntakeEvidence:
     with CanonicalIntake(source, authority) as intake:
         intake.observe()
@@ -804,4 +994,5 @@ def validate_and_copy(
             evidence_path,
             crash_after_copy=crash_after_copy,
             crash_before_evidence=crash_before_evidence,
+            crash_after_preparation=crash_after_preparation,
         )
