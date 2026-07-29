@@ -18,9 +18,11 @@ authenticated Codex app-server control process
   -> sealed Docker capsule effects
   -> frozen untrusted provider-output tree
   -> CanonicalIntake
-  -> independent checkpoint verification
-  -> independent behavioral verification
-  -> AdmissibleFinalizer
+  -> canonical AcceptedMaterialIdentity
+  -> independent checkpoint copy of that material
+  -> independent behavioral copy of that material
+  -> durable finalization preparation
+  -> AdmissibleFinalizer compare-and-swap
   -> accepted Git commit
 ```
 
@@ -40,7 +42,12 @@ The implementation keeps these identities separate:
 - `DurableControllerAuthority` binds the closed dynamic-tool set to
   request-before-effect durability and exactly-one-result pairing.
 - `IntakeAuthority` defines the exact allowed output byte namespace.
+- `AcceptedMaterialIdentity` binds the intake authority, exact sorted path
+  set, regular-file modes, accepted byte hashes, accepted manifest
+  fingerprint, and final published intake-evidence fingerprint.
 - checkpoint and behavioral verifier identities remain independent.
+- `FinalizerAuthority` binds the exact bare repository, publication ref,
+  closed Git environment policy, and finalizer-owned evidence store.
 - `AdmissibleFinalizer` alone owns the accepted Git ref transaction.
 
 The trusted computing base is the Linux kernel and bubblewrap isolation,
@@ -222,7 +229,11 @@ The log covers:
 - canonical dynamic-tool request/result pairs;
 - cleanup and complete process-tree evidence;
 - frozen `ProviderOutput`;
-- explicit session terminal classification.
+- explicit provider-session terminal classification;
+- the canonical accepted-material identity;
+- checkpoint and behavioral results bound to that identity;
+- durable finalization evidence and its read-back receipt;
+- the exact finalization result.
 
 `provider-output.json` is atomically published before its corresponding log
 record. Reconstruction validates the complete hash chain, event ordering,
@@ -233,6 +244,39 @@ If a crash occurs after a request fsync but before its paired result fsync,
 reconstruction derives `CRASH_UNPAIRED_REQUEST`. It never assumes that the
 effect failed, succeeded, or is safe to replay.
 
+## Accepted-material continuity and publication
+
+Canonical intake writes only truthful states. `CANDIDATE_VALIDATED` records a
+completed observation, `PUBLICATION_PREPARED` records a fully fsynced staging
+tree, `DESTINATION_RENAME_COMPLETED` is written only after the destination
+rename and parent-directory fsync, and `ACCEPTED_INTAKE_PUBLISHED` is the only
+state the reducer accepts. A crash between preparation evidence and rename
+therefore leaves no accepted destination and no evidence claiming publication.
+
+The checkpoint and behavioral verifier use separate private copies with
+different copy IDs. Both copies must have the same root fingerprint: the
+canonical accepted manifest fingerprint. Each result carries the complete
+accepted-material identity, and its before/after byte hashes must equal that
+root. A changed root, different material identity, or mutation refuses; a
+checkpoint PASS never supplies a behavioral PASS.
+
+Finalization first builds from `git read-tree --empty`, inserts exactly the
+accepted paths, modes, and blobs, and recursively reads the resulting tree
+back. The parent contributes ancestry only and cannot contribute a tree entry.
+The prepared commit, exact tree, material identity, parent, publication ref,
+and finalizer authority are written to a finalizer-owned evidence store and
+read back before `update-ref`. The resulting typed durability receipt binds
+the exact evidence bytes and exact destination. There is no caller-provided
+durability boolean.
+
+Every finalizer Git process receives a minimal explicit environment. System,
+global, and XDG configuration are disabled; ambient `GIT_*` variables are not
+inherited; replacement refs and alternate object directories are absent;
+attributes and filters are neutralized; identity and timestamps are frozen;
+and `core.hooksPath` points at a guaranteed empty finalizer-owned directory.
+An update failure is classified as a compare-and-swap conflict only when the
+ref actually changed; other Git failures remain operational failures.
+
 ## Compatibility
 
 Historical ACP/Cursor implementation and fingerprints remain unchanged. That
@@ -242,9 +286,9 @@ code is retained as:
 - protocol handling and defense in depth;
 - not the root authority for the host-control/capsule backend.
 
-The generic `CapsuleBackend`, `ProviderOutput`, intake, verification, reducer,
-finalizer, and Git helper contracts were not widened for implementation
-convenience.
+The concrete backend records the repaired generic identity and verification
+contracts without adding concrete transport authority to `CapsuleBackend` or
+`ProviderOutput`.
 
 ## Provider-free witness versus remaining real canary
 
