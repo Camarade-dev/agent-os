@@ -15,6 +15,15 @@ it, and nothing in this package reinterprets its historical run evidence.
 """
 
 from admissible.capsule.backend import CapsuleAuthority, CapsuleBackend, CapsuleTerminalClassification
+from admissible.capsule.intake import (
+    NEON_RELAY_AUTHORITY,
+    CanonicalIntake,
+    IntakeAuthority,
+    IntakeEvidence,
+    RejectionCode,
+    path_policy_reasons,
+    validate_and_copy,
+)
 from admissible.capsule.models import (
     ByteTreeObservation,
     CleanupResult,
@@ -29,15 +38,22 @@ from admissible.capsule.models import (
 
 __all__ = [
     "ByteTreeObservation",
+    "CanonicalIntake",
     "CapsuleAuthority",
     "CapsuleBackend",
     "CapsuleTerminalClassification",
     "CleanupResult",
+    "IntakeAuthority",
+    "IntakeEvidence",
+    "NEON_RELAY_AUTHORITY",
     "ObservedEntry",
     "ProcessResult",
     "ProviderCompletionClaim",
     "ProviderOutput",
     "ProviderTerminalClassification",
+    "RejectionCode",
     "TransportResult",
     "WorkspaceReference",
+    "path_policy_reasons",
+    "validate_and_copy",
 ]
