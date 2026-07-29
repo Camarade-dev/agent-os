@@ -773,6 +773,8 @@ class OSBoundaryAuthority:
                 "capsule_broker_runtime_authority_fingerprint",
                 "codex_protocol_schema_identity",
                 "dynamic_tools_schema_identity",
+                "model_binding_policy_fingerprint",
+                "verified_serialization_witness_receipt_identity",
             },
             "boundary dependent authorities",
         )
@@ -788,6 +790,8 @@ class OSBoundaryAuthority:
             "capsule_broker_runtime_authority_fingerprint",
             "codex_protocol_schema_identity",
             "dynamic_tools_schema_identity",
+            "model_binding_policy_fingerprint",
+            "verified_serialization_witness_receipt_identity",
         ):
             require_sha256(self.dependent_authorities[key], key)
         launch_body = self._body()

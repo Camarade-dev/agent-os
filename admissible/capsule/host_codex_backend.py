@@ -63,6 +63,7 @@ from admissible.capsule.execution_authority import (
     HOST_CODEX_BACKEND_KIND,
     source_component_identity,
     synthetic_component_identity,
+    validate_component_identity_metadata,
 )
 from admissible.capsule.finalizer import (
     DurabilityReceipt,
@@ -73,10 +74,10 @@ from admissible.capsule.intake import AcceptedMaterialIdentity
 from admissible.capsule.model_authority import (
     CodexModelAuthority,
     ModelConfigurationError,
+    canary_model_binding_policy,
     canary_model_authority,
     validate_effective_thread_configuration,
 )
-from admissible.capsule.serialization_witness import serialization_witness_identity
 from admissible.capsule.models import (
     ByteTreeObservation,
     CleanupResult,
@@ -746,7 +747,12 @@ class ScriptedCodexAppServerConnection(AppServerConnection):
 class ScriptedCodexConnectionFactory(AppServerConnectionFactory):
     """Single-use factory that exposes the connection for response assertions."""
 
-    def __init__(self, connection: ScriptedCodexAppServerConnection):
+    def __init__(
+        self,
+        connection: ScriptedCodexAppServerConnection,
+        *,
+        codex_component_identity: Mapping[str, Any] | None = None,
+    ):
         self.connection = connection
         self.open_count = 0
         source = inspect.getsource(type(self)).encode("utf-8")
@@ -754,14 +760,23 @@ class ScriptedCodexConnectionFactory(AppServerConnectionFactory):
             component="scripted_connection_factory",
             fixture_material={"source_sha256": sha256_bytes(source)},
         )
-        self._codex_identity = synthetic_component_identity(
-            component="scripted_codex_app_server",
-            fixture_material={
-                "source_sha256": sha256_bytes(
-                    inspect.getsource(ScriptedCodexAppServerConnection).encode("utf-8")
-                ),
-                "protocol": CODEX_APP_SERVER_PROTOCOL_VERSION,
-            },
+        self._codex_identity = (
+            validate_component_identity_metadata(
+                codex_component_identity,
+                "scripted factory externally witnessed Codex",
+            )
+            if codex_component_identity is not None
+            else synthetic_component_identity(
+                component="scripted_codex_app_server",
+                fixture_material={
+                    "source_sha256": sha256_bytes(
+                        inspect.getsource(
+                            ScriptedCodexAppServerConnection
+                        ).encode("utf-8")
+                    ),
+                    "protocol": CODEX_APP_SERVER_PROTOCOL_VERSION,
+                },
+            )
         )
         self._bwrap_identity = synthetic_component_identity(
             component="synthetic_no_bwrap",
@@ -1088,7 +1103,6 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
         mission_prompt: str,
         mission_bytes: bytes | None = None,
         os_boundary_authority: OSBoundaryAuthority | None = None,
-        model_authority: CodexModelAuthority | None = None,
         event_timeout_seconds: float = 10.0,
         protocol_drain_timeout_seconds: float = 3.0,
         protocol_drain_record_limit: int = 64,
@@ -1142,15 +1156,27 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
             != self.connection_factory.authentication_boundary_state
         ):
             raise ValueError("control authority/connection factory substitution refused")
-        self.model_authority = (
-            model_authority.validated()
-            if model_authority is not None
-            else canary_model_authority(
-                codex_executable_identity=(
+        if self.session_store.trusted_witness_store is None:
+            raise ValueError(
+                "backend requires an externally anchored witness store"
+            )
+        self.model_binding_policy = canary_model_binding_policy(
+            codex_executable_identity=(
+                self.connection_factory.codex_component_identity
+            )
+        )
+        self.verified_witness_receipt = (
+            self.session_store.trusted_witness_store.load_current_verified_receipt(
+                expected_policy=self.model_binding_policy,
+                expected_executable_identity=(
                     self.connection_factory.codex_component_identity
                 ),
-                serialization_witness_identity=serialization_witness_identity(),
             )
+        )
+        self.model_authority = canary_model_authority(
+            model_binding_policy=self.model_binding_policy,
+            verified_witness_receipt=self.verified_witness_receipt,
+            trusted_witness_store=self.session_store.trusted_witness_store,
         )
         if dict(self.model_authority.codex_executable_identity) != dict(
             self.connection_factory.codex_component_identity
@@ -1194,6 +1220,12 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
                     "dynamic_tools_schema_identity": fingerprint(
                         dynamic_tools_grammar()
                     ),
+                    "model_binding_policy_fingerprint": (
+                        self.model_binding_policy.policy_fingerprint
+                    ),
+                    "verified_serialization_witness_receipt_identity": (
+                        self.verified_witness_receipt.receipt_identity
+                    ),
                 },
             )
         )
@@ -1218,6 +1250,12 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
             ),
             "codex_protocol_schema_identity": protocol_schema_identity(),
             "dynamic_tools_schema_identity": fingerprint(dynamic_tools_grammar()),
+            "model_binding_policy_fingerprint": (
+                self.model_binding_policy.policy_fingerprint
+            ),
+            "verified_serialization_witness_receipt_identity": (
+                self.verified_witness_receipt.receipt_identity
+            ),
         }
         if (
             dict(self.os_boundary_authority.dependent_authorities)
@@ -1257,6 +1295,40 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
         ):
             raise ValueError("control authority changed before launch")
 
+    def _revalidate_witness_binding(self) -> None:
+        """Reload the current durable evidence pack before launch or effects."""
+
+        store = self.session_store.trusted_witness_store
+        if store is None:
+            raise AppServerProtocolError(
+                "trusted serialization witness store is unavailable"
+            )
+        receipt = store.load_verified_receipt(
+            receipt_identity=self.verified_witness_receipt.receipt_identity,
+            witness_run_identity=self.verified_witness_receipt.witness_run_identity,
+            expected_policy=self.model_binding_policy,
+            expected_executable_identity=(
+                self.connection_factory.codex_component_identity
+            ),
+        )
+        rebound = canary_model_authority(
+            model_binding_policy=self.model_binding_policy,
+            verified_witness_receipt=receipt,
+            trusted_witness_store=store,
+        )
+        if (
+            receipt.receipt_identity
+            != self.verified_witness_receipt.receipt_identity
+            or receipt.witness_run_identity
+            != self.verified_witness_receipt.witness_run_identity
+            or rebound.authority_fingerprint
+            != self.model_authority.authority_fingerprint
+            or not rebound.receipt_revalidated
+        ):
+            raise AppServerProtocolError(
+                "durable serialization witness changed before launch or effect"
+            )
+
     def _require_validated_model_configuration(self) -> Mapping[str, Any]:
         """Refuse every effectful dynamic tool call before model validation.
 
@@ -1265,6 +1337,9 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
         explicit and independently testable rather than implied by call order.
         """
 
+        self._revalidate_witness_binding()
+        self.model_binding_policy.validated_canary()
+        self.model_authority.require_verified_receipt()
         binding = self._effective_model_binding
         if binding is None:
             raise AppServerProtocolError(
@@ -1288,6 +1363,7 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
         self,
         execution_authority: BackendExecutionAuthority,
     ) -> None:
+        self._revalidate_witness_binding()
         self._attest_control_binding()
         self._attest_capsule_authority()
         expected = {
@@ -1321,6 +1397,14 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
             != self.model_authority.authority_fingerprint
             or dict(execution_authority.model_authority)
             != self.model_authority.to_dict()
+            or execution_authority.model_binding_policy_fingerprint
+            != self.model_binding_policy.policy_fingerprint
+            or dict(execution_authority.model_binding_policy)
+            != self.model_binding_policy.to_dict()
+            or execution_authority.verified_witness_receipt_identity
+            != self.verified_witness_receipt.receipt_identity
+            or execution_authority.verified_witness_run_identity
+            != self.verified_witness_receipt.witness_run_identity
             or execution_authority.mission_fingerprint
             != sha256_bytes(self._mission_bytes)
             or execution_authority.prompt_fingerprint
@@ -1331,6 +1415,7 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
             raise ValueError("backend execution authority changed before launch")
 
     def prepare_workspace(self) -> WorkspaceReference:
+        self._revalidate_witness_binding()
         self._attest_control_binding()
         self._attest_capsule_authority()
         token = uuid.uuid4().hex
@@ -1350,7 +1435,9 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
             capsule_image_content_id=self.controller.execution_authority.image_identity,
             docker_executable_identity=self._docker_component_identity(),
             dynamic_tools_schema_identity=fingerprint(dynamic_tools_grammar()),
-            model_authority=self.model_authority.to_dict(),
+            model_authority=self.model_authority,
+            verified_witness_receipt=self.verified_witness_receipt,
+            trusted_witness_store=self.session_store.trusted_witness_store,
             protocol_request_policy_fingerprint=(
                 protocol_request_policy_fingerprint(self.model_authority)
             ),

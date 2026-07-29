@@ -562,7 +562,13 @@ class ReconstructedCapsuleSession:
 class DurableCapsuleSessionStore:
     """One append-only, fsynced, hash-chained log per capsule session."""
 
-    def __init__(self, root: Path, *, trusted_anchor_root: Path | None = None):
+    def __init__(
+        self,
+        root: Path,
+        *,
+        trusted_anchor_root: Path | None = None,
+        trusted_witness_store: Any | None = None,
+    ):
         if not root.is_absolute() or ".." in root.parts:
             raise ValueError("session journal root must be absolute without '..'")
         _reject_existing_symlink_components(root, "session journal root")
@@ -597,6 +603,93 @@ class DurableCapsuleSessionStore:
             _reject_existing_symlink_components(directory, "trusted journal directory")
             if created:
                 fsync_directory(directory.parent)
+        self._witness_store_reference_path = (
+            self.trusted_anchor_root / "codex-witness-store-reference.json"
+        )
+        self.trusted_witness_store = self._bind_trusted_witness_store(
+            trusted_witness_store
+        )
+
+    def _bind_trusted_witness_store(self, supplied: Any | None):
+        """Seal or reload the witness-store reference outside mutable logs."""
+
+        from admissible.capsule.serialization_witness import (
+            TrustedSerializationWitnessStore,
+            trusted_witness_verifier_identity,
+        )
+
+        if supplied is not None and not isinstance(
+            supplied, TrustedSerializationWitnessStore
+        ):
+            raise ValueError("trusted witness store has the wrong type")
+        if supplied is not None:
+            reference = dict(supplied.anchor_reference())
+            if self._witness_store_reference_path.exists():
+                existing = strict_json_loads(
+                    self._witness_store_reference_path.read_bytes(),
+                    label="trusted witness-store reference",
+                )
+                if existing != reference:
+                    raise ValueError(
+                        "session trust root is already bound to another witness store"
+                    )
+            else:
+                descriptor = os.open(
+                    self._witness_store_reference_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+                try:
+                    encoded = canonical_bytes(reference)
+                    offset = 0
+                    while offset < len(encoded):
+                        offset += os.write(descriptor, encoded[offset:])
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                fsync_directory(self.trusted_anchor_root)
+            return supplied
+        if not self._witness_store_reference_path.exists():
+            return None
+        reference = strict_json_loads(
+            self._witness_store_reference_path.read_bytes(),
+            label="trusted witness-store reference",
+        )
+        require_exact_keys(
+            reference,
+            {
+                "schema_version",
+                "canonical_root",
+                "canonical_trusted_anchor_root",
+                "store_root_identity",
+                "trusted_anchor_root_identity",
+                "store_anchor_fingerprint",
+                "trusted_verifier_identity",
+                "reference_identity",
+            },
+            "trusted witness-store reference",
+        )
+        body = {
+            key: value for key, value in reference.items()
+            if key != "reference_identity"
+        }
+        if (
+            reference["schema_version"]
+            != "admissible_codex_witness_store_reference_v1"
+            or fingerprint(body) != reference["reference_identity"]
+            or reference["trusted_verifier_identity"]
+            != trusted_witness_verifier_identity()
+        ):
+            raise ValueError("trusted witness-store reference is invalid")
+        candidate = TrustedSerializationWitnessStore(
+            Path(reference["canonical_root"]),
+            trusted_anchor_root=Path(
+                reference["canonical_trusted_anchor_root"]
+            ),
+        )
+        if dict(candidate.anchor_reference()) != dict(reference):
+            raise ValueError("trusted witness-store reference changed")
+        return candidate
 
     def session_directory(self, session_id: str) -> Path:
         require_identifier(session_id, "session_id")

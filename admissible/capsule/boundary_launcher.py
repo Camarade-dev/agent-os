@@ -145,6 +145,8 @@ def provider_free_os_boundary_authority(
                 "capsule_broker_runtime_authority_fingerprint": "2" * 64,
                 "codex_protocol_schema_identity": "3" * 64,
                 "dynamic_tools_schema_identity": "4" * 64,
+                "model_binding_policy_fingerprint": "5" * 64,
+                "verified_serialization_witness_receipt_identity": "6" * 64,
             }
         ),
     )
@@ -392,7 +394,7 @@ class CodexConfinementLaunchPolicy:
         require_sha256(self.pin_fingerprint, "Codex destination pin")
         if self.model_authority is None:
             raise ValueError("Codex confinement requires an explicit model authority")
-        self.model_authority.validated()
+        self.model_authority.validated().require_verified_receipt()
         if dict(self.model_authority.codex_executable_identity) != (
             self.codex_identity.to_dict()
         ):
@@ -545,6 +547,15 @@ class CodexConfinementLaunchPolicy:
                 ),
                 "model_configuration_fingerprint": (
                     self.model_authority.configuration_fingerprint
+                ),
+                "model_binding_policy_fingerprint": (
+                    self.model_authority.model_binding_policy_fingerprint
+                ),
+                "verified_serialization_witness_receipt_identity": (
+                    self.model_authority.verified_witness_receipt_identity
+                ),
+                "verified_serialization_witness_run_identity": (
+                    self.model_authority.verified_witness_run_identity
                 ),
                 "configured_model": self.model_authority.configured_model,
                 "configured_reasoning_effort": (
@@ -882,7 +893,11 @@ class BoundaryLauncher:
             ephemeral_root=ephemeral_root,
             session_id=session_id,
             authority_fingerprint=self.authority.authority_fingerprint,
-            configuration_bytes=model_authority.validated().ephemeral_config_bytes,
+            configuration_bytes=(
+                model_authority.validated()
+                .require_verified_receipt()
+                .ephemeral_config_bytes
+            ),
         )
         return self.auth_broker
 

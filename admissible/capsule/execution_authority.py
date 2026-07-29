@@ -27,7 +27,7 @@ from admissible.capsule.common import (
 
 FILE_IDENTITY_SCHEMA_VERSION = "admissible_executable_file_identity_v1"
 BACKEND_EXECUTION_AUTHORITY_SCHEMA_VERSION = (
-    "admissible_host_codex_docker_execution_authority_v4"
+    "admissible_host_codex_docker_execution_authority_v5"
 )
 HOST_CODEX_BACKEND_KIND = "host_codex_app_server_capsule_v1"
 
@@ -334,6 +334,11 @@ class BackendExecutionAuthority:
     codex_executable_identity: Mapping[str, Any]
     model_authority: Mapping[str, Any]
     model_authority_fingerprint: str
+    model_binding_policy: Mapping[str, Any]
+    model_binding_policy_fingerprint: str
+    verified_witness_receipt: Mapping[str, Any]
+    verified_witness_receipt_identity: str
+    verified_witness_run_identity: str
     host_control_policy_fingerprint: str
     bwrap_executable_identity: Mapping[str, Any]
     bwrap_argv_policy_fingerprint: str
@@ -364,7 +369,9 @@ class BackendExecutionAuthority:
         capsule_authority_fingerprint: str,
         generic_mission_fingerprint: str,
         codex_executable_identity: Mapping[str, Any],
-        model_authority: Mapping[str, Any],
+        model_authority: Any,
+        verified_witness_receipt: Any,
+        trusted_witness_store: Any,
         host_control_policy_fingerprint: str,
         bwrap_executable_identity: Mapping[str, Any],
         bwrap_argv_policy_fingerprint: str,
@@ -384,6 +391,53 @@ class BackendExecutionAuthority:
         terminal_policy: Mapping[str, Any],
         os_boundary_authority: Mapping[str, Any] | None = None,
     ) -> "BackendExecutionAuthority":
+        from admissible.capsule.model_authority import CodexModelAuthority
+        from admissible.capsule.serialization_witness import (
+            TrustedSerializationWitnessStore,
+            VerifiedSerializationWitnessReceipt,
+            validate_verified_receipt_metadata,
+        )
+
+        if not isinstance(model_authority, CodexModelAuthority):
+            raise ValueError(
+                "backend execution creation requires a live model authority"
+            )
+        bound_model = model_authority.validated().require_verified_receipt()
+        if not isinstance(
+            verified_witness_receipt,
+            VerifiedSerializationWitnessReceipt,
+        ):
+            raise ValueError(
+                "backend execution creation requires an opaque witness receipt"
+            )
+        if not isinstance(trusted_witness_store, TrustedSerializationWitnessStore):
+            raise ValueError(
+                "backend execution creation requires the trusted witness store"
+            )
+        bound_policy = bound_model.model_binding_policy
+        durable_receipt = trusted_witness_store.load_verified_receipt(
+            receipt_identity=verified_witness_receipt.receipt_identity,
+            witness_run_identity=verified_witness_receipt.witness_run_identity,
+            expected_policy=bound_policy,
+            expected_executable_identity=codex_executable_identity,
+        )
+        if durable_receipt.to_dict() != verified_witness_receipt.to_dict():
+            raise ValueError(
+                "backend receipt differs from revalidated durable evidence"
+            )
+        verified_witness_receipt = durable_receipt
+        receipt_metadata = validate_verified_receipt_metadata(
+            verified_witness_receipt.to_dict(),
+            expected_policy=bound_policy,
+            expected_executable_identity=codex_executable_identity,
+        )
+        if (
+            verified_witness_receipt.receipt_identity
+            != bound_model.verified_witness_receipt_identity
+            or verified_witness_receipt.witness_run_identity
+            != bound_model.verified_witness_run_identity
+        ):
+            raise ValueError("model authority and witness receipt differ")
         if os_boundary_authority is None:
             if connection_mode != "synthetic_provider_free":
                 raise ValueError(
@@ -413,15 +467,18 @@ class BackendExecutionAuthority:
                     ),
                     "codex_protocol_schema_identity": protocol_schema_identity(),
                     "dynamic_tools_schema_identity": dynamic_tools_schema_identity,
+                    "model_binding_policy_fingerprint": (
+                        bound_policy.policy_fingerprint
+                    ),
+                    "verified_serialization_witness_receipt_identity": (
+                        verified_witness_receipt.receipt_identity
+                    ),
                 },
             )
         else:
             from admissible.capsule.boundary_authority import OSBoundaryAuthority
 
             boundary = OSBoundaryAuthority.from_dict(os_boundary_authority)
-        from admissible.capsule.model_authority import CodexModelAuthority
-
-        bound_model = CodexModelAuthority.from_dict(model_authority)
         body = {
             "schema_version": BACKEND_EXECUTION_AUTHORITY_SCHEMA_VERSION,
             "backend_kind": HOST_CODEX_BACKEND_KIND,
@@ -432,6 +489,15 @@ class BackendExecutionAuthority:
             "codex_executable_identity": dict(codex_executable_identity),
             "model_authority": bound_model.to_dict(),
             "model_authority_fingerprint": bound_model.authority_fingerprint,
+            "model_binding_policy": bound_policy.to_dict(),
+            "model_binding_policy_fingerprint": bound_policy.policy_fingerprint,
+            "verified_witness_receipt": dict(receipt_metadata),
+            "verified_witness_receipt_identity": (
+                verified_witness_receipt.receipt_identity
+            ),
+            "verified_witness_run_identity": (
+                verified_witness_receipt.witness_run_identity
+            ),
             "host_control_policy_fingerprint": host_control_policy_fingerprint,
             "bwrap_executable_identity": dict(bwrap_executable_identity),
             "bwrap_argv_policy_fingerprint": bwrap_argv_policy_fingerprint,
@@ -505,7 +571,13 @@ class BackendExecutionAuthority:
             else validate_component_identity
         )
         component_validator(self.codex_executable_identity, "Codex executable")
-        from admissible.capsule.model_authority import CodexModelAuthority
+        from admissible.capsule.model_authority import (
+            CodexModelAuthority,
+            ModelBindingPolicy,
+        )
+        from admissible.capsule.serialization_witness import (
+            validate_verified_receipt_metadata,
+        )
 
         bound_model = CodexModelAuthority.from_dict(self.model_authority)
         require_sha256(self.model_authority_fingerprint, "model authority fingerprint")
@@ -523,6 +595,44 @@ class BackendExecutionAuthority:
             self.protocol_schema_identity
         ):
             raise ValueError("model authority binds another protocol schema identity")
+        bound_policy = ModelBindingPolicy.from_dict(self.model_binding_policy)
+        require_sha256(
+            self.model_binding_policy_fingerprint,
+            "model-binding policy fingerprint",
+        )
+        if (
+            bound_policy.policy_fingerprint
+            != self.model_binding_policy_fingerprint
+            or bound_model.model_binding_policy_fingerprint
+            != self.model_binding_policy_fingerprint
+            or bound_model.model_binding_policy.to_dict()
+            != bound_policy.to_dict()
+        ):
+            raise ValueError("execution and model-binding policies differ")
+        receipt = validate_verified_receipt_metadata(
+            self.verified_witness_receipt,
+            expected_policy=bound_policy,
+            expected_executable_identity=self.codex_executable_identity,
+        )
+        require_sha256(
+            self.verified_witness_receipt_identity,
+            "verified witness receipt identity",
+        )
+        require_identifier(
+            self.verified_witness_run_identity,
+            "verified witness run identity",
+        )
+        if (
+            receipt["receipt_identity"]
+            != self.verified_witness_receipt_identity
+            or receipt["witness_run_identity"]
+            != self.verified_witness_run_identity
+            or bound_model.verified_witness_receipt_identity
+            != self.verified_witness_receipt_identity
+            or bound_model.verified_witness_run_identity
+            != self.verified_witness_run_identity
+        ):
+            raise ValueError("execution authority witness binding differs")
         component_validator(self.bwrap_executable_identity, "bwrap executable")
         component_validator(self.docker_executable_identity, "Docker executable")
         factory_identity = component_validator(
@@ -591,8 +701,18 @@ class BackendExecutionAuthority:
             != self.protocol_schema_identity
             or boundary.dependent_authorities["dynamic_tools_schema_identity"]
             != self.dynamic_tools_schema_identity
+            or boundary.dependent_authorities[
+                "model_binding_policy_fingerprint"
+            ]
+            != self.model_binding_policy_fingerprint
+            or boundary.dependent_authorities[
+                "verified_serialization_witness_receipt_identity"
+            ]
+            != self.verified_witness_receipt_identity
         ):
-            raise ValueError("OS boundary image or protocol dependency differs")
+            raise ValueError(
+                "OS boundary image, protocol, model policy, or witness differs"
+            )
         required_budgets = {
             "event_timeout_ms",
             "protocol_drain_timeout_ms",
