@@ -55,9 +55,24 @@ from admissible.capsule.execution_authority import (
     synthetic_component_identity,
     validate_component_identity,
 )
+from admissible.capsule.model_authority import (
+    CodexModelAuthority,
+    validate_launch_configuration_bytes,
+)
 
 
 BOUNDARY_LIFECYCLE_SCHEMA_VERSION = "admissible_codex_boundary_lifecycle_v1"
+EPHEMERAL_CONFIG_FILENAME = "config.toml"
+#: The only Codex arguments the namespace bootstrap will exec.  No ``-c`` /
+#: ``--config`` override is ever passed: the configuration channel is the
+#: broker-generated ephemeral file plus the app-server request fields, and both
+#: are byte-bound into the model authority.
+#:
+#: ``--strict-config`` is deliberately *not* used.  Pinned 0.145.0 applies it to
+#: the ``thread/start`` configuration overlay as well, and the audited
+#: preventive control overlay legitimately carries feature keys this build does
+#: not recognize, so the flag would refuse the existing production thread.
+CODEX_APP_SERVER_ARGUMENTS = ["app-server", "--stdio"]
 CONTROLLER_ROOT = "/control"
 CONTROLLER_EXECUTABLE = "/runtime/controller"
 CONTROLLER_CWD = "/control/data"
@@ -326,6 +341,46 @@ class CodexConfinementLaunchPolicy:
     session_id: str
     pin_fingerprint: str
     runtime_dependency_descriptors: Mapping[str, int]
+    model_authority: "CodexModelAuthority | None" = None
+
+    def _reattest_effective_configuration(self) -> str:
+        """Re-read the broker-owned configuration bytes before starting Codex.
+
+        Only the non-secret ``config.toml`` is read, and only through the
+        already-held home directory descriptor.  ``auth.json`` is never opened
+        here, and no host pathname is reconstructed.
+        """
+
+        if self.model_authority is None:
+            raise ValueError("Codex confinement requires an explicit model authority")
+        flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(
+            EPHEMERAL_CONFIG_FILENAME,
+            flags,
+            dir_fd=self.codex_home_descriptor,
+        )
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ValueError("effective Codex configuration is not a private file")
+            expected = self.model_authority.ephemeral_config_bytes
+            if info.st_size != len(expected):
+                raise ValueError("effective Codex configuration size differs")
+            observed = bytearray()
+            while len(observed) <= len(expected):
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    break
+                observed.extend(chunk)
+            if os.fstat(descriptor).st_mtime_ns != info.st_mtime_ns:
+                raise ValueError("effective Codex configuration changed while attested")
+        finally:
+            os.close(descriptor)
+        return validate_launch_configuration_bytes(
+            bytes(observed), self.model_authority
+        )
 
     def validated(self) -> "CodexConfinementLaunchPolicy":
         self.bwrap_identity.reattest(label="Codex boundary bubblewrap executable")
@@ -335,6 +390,13 @@ class CodexConfinementLaunchPolicy:
         )
         require_identifier(self.session_id, "Codex boundary session")
         require_sha256(self.pin_fingerprint, "Codex destination pin")
+        if self.model_authority is None:
+            raise ValueError("Codex confinement requires an explicit model authority")
+        self.model_authority.validated()
+        if dict(self.model_authority.codex_executable_identity) != (
+            self.codex_identity.to_dict()
+        ):
+            raise ValueError("model authority binds another Codex executable")
         home = os.fstat(self.codex_home_descriptor)
         if not stat.S_ISDIR(home.st_mode):
             raise ValueError("Codex home descriptor is not a directory")
@@ -356,6 +418,7 @@ class CodexConfinementLaunchPolicy:
     @contextmanager
     def descriptor_launch(self):
         self.validated()
+        effective_config_identity = self._reattest_effective_configuration()
         opened: list[int] = []
         try:
             for identity in (
@@ -439,8 +502,7 @@ class CodexConfinementLaunchPolicy:
                     "--codex-executable",
                     CODEX_EXECUTABLE,
                     "--",
-                    "app-server",
-                    "--stdio",
+                    *CODEX_APP_SERVER_ARGUMENTS,
                 )
             )
             namespace_command = tuple(arguments[-6:])
@@ -478,6 +540,20 @@ class CodexConfinementLaunchPolicy:
                 "mount_namespace": "empty_exact_fd_bindings",
                 "workspace_visible": False,
                 "docker_visible": False,
+                "model_authority_fingerprint": (
+                    self.model_authority.authority_fingerprint
+                ),
+                "model_configuration_fingerprint": (
+                    self.model_authority.configuration_fingerprint
+                ),
+                "configured_model": self.model_authority.configured_model,
+                "configured_reasoning_effort": (
+                    self.model_authority.configured_reasoning_effort
+                ),
+                "effective_config_identity": effective_config_identity,
+                "user_or_project_config_discovery": False,
+                "config_override_arguments": False,
+                "codex_arguments": list(CODEX_APP_SERVER_ARGUMENTS),
             }
             yield BoundaryLaunchSpec(
                 argv=(
@@ -538,7 +614,7 @@ def namespace_bootstrap_main(argv: Sequence[str] | None = None) -> int:
     arguments = list(values.codex_arguments)
     if arguments and arguments[0] == "--":
         arguments.pop(0)
-    if arguments != ["app-server", "--stdio"]:
+    if arguments != CODEX_APP_SERVER_ARGUMENTS:
         raise ValueError("namespace bootstrap refuses non-app-server arguments")
     required_environment = {
         key: os.environ[key]
@@ -797,6 +873,7 @@ class BoundaryLauncher:
         source_descriptor: int,
         ephemeral_root: Path,
         session_id: str,
+        model_authority: CodexModelAuthority,
     ) -> AuthenticationBrokerProcess:
         if self.auth_broker is not None:
             raise ValueError("authentication broker already started")
@@ -805,6 +882,7 @@ class BoundaryLauncher:
             ephemeral_root=ephemeral_root,
             session_id=session_id,
             authority_fingerprint=self.authority.authority_fingerprint,
+            configuration_bytes=model_authority.validated().ephemeral_config_bytes,
         )
         return self.auth_broker
 

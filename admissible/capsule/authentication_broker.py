@@ -33,16 +33,14 @@ from admissible.capsule.common import (
     require_identifier,
     require_sha256,
     require_strict_int,
+    sha256_bytes,
 )
 
 
 AUTH_BROKER_MAX_SOURCE_BYTES = 16 * 1024 * 1024
+AUTH_BROKER_MAX_CONFIG_BYTES = 64 * 1024
 AUTH_FILENAME = "auth.json"
 CONFIG_FILENAME = "config.toml"
-MINIMAL_CONFIG = (
-    b"[analytics]\nenabled = false\n"
-    b"[features]\nweb_search = false\n"
-)
 
 
 def authentication_metadata_policy_fingerprint() -> str:
@@ -195,12 +193,24 @@ class AuthenticationBrokerResult:
                 {
                     "broker_identity",
                     "source_metadata",
+                    "configuration_identity",
                     "ephemeral_home_identity",
                     "successful_install",
                     "source_descriptor_closed",
                     "raw_authentication_in_evidence",
                 },
                 "prepared authentication evidence",
+            )
+            require_exact_keys(
+                self.evidence["configuration_identity"],
+                {
+                    "filename",
+                    "size",
+                    "sha256",
+                    "contains_authentication",
+                    "identity_fingerprint",
+                },
+                "ephemeral configuration identity",
             )
             require_exact_keys(
                 self.evidence["source_metadata"],
@@ -222,12 +232,29 @@ class AuthenticationBrokerResult:
                 "ephemeral home identity",
             )
             source = self.evidence["source_metadata"]
+            configuration = self.evidence["configuration_identity"]
             if (
                 self.evidence["broker_identity"]
                 != "content_attested_authentication_broker"
                 or source["file_type"] != "regular"
+                or configuration["filename"] != CONFIG_FILENAME
+                or configuration["contains_authentication"] is not False
             ):
                 raise ValueError("prepared authentication identity changed")
+            require_strict_int(
+                configuration["size"],
+                "ephemeral configuration size",
+                minimum=1,
+                maximum=AUTH_BROKER_MAX_CONFIG_BYTES,
+            )
+            require_sha256(configuration["sha256"], "ephemeral configuration identity")
+            configuration_body = {
+                key: configuration[key]
+                for key in configuration
+                if key != "identity_fingerprint"
+            }
+            if fingerprint(configuration_body) != configuration["identity_fingerprint"]:
+                raise ValueError("ephemeral configuration identity fingerprint mismatch")
             for key in (
                 "device",
                 "inode",
@@ -339,6 +366,39 @@ class AuthenticationBrokerResult:
         return cls(**dict(value)).validated()
 
 
+def _validated_configuration_bytes(value: Any) -> bytes:
+    """Accept only non-secret canonical configuration bytes.
+
+    The broker writes exactly these bytes to ``config.toml``.  Authentication
+    contents arrive separately, by descriptor, and never pass through here.
+    """
+
+    if not isinstance(value, (bytes, bytearray)) or not value:
+        raise ValueError("ephemeral Codex configuration bytes are required")
+    raw = bytes(value)
+    if len(raw) > AUTH_BROKER_MAX_CONFIG_BYTES:
+        raise ValueError("ephemeral Codex configuration exceeds its byte bound")
+    try:
+        raw.decode("utf-8", "strict")
+    except UnicodeDecodeError as error:
+        raise ValueError("ephemeral Codex configuration must be UTF-8") from error
+    if b"\x00" in raw:
+        raise ValueError("ephemeral Codex configuration must not contain NUL")
+    return raw
+
+
+def _configuration_identity(raw: bytes) -> dict[str, Any]:
+    """Non-secret configuration identity the general controller may know."""
+
+    body = {
+        "filename": CONFIG_FILENAME,
+        "size": len(raw),
+        "sha256": sha256_bytes(raw),
+        "contains_authentication": False,
+    }
+    return {**body, "identity_fingerprint": fingerprint(body)}
+
+
 def _source_metadata(descriptor: int) -> dict[str, Any]:
     info = os.fstat(descriptor)
     if not stat.S_ISREG(info.st_mode):
@@ -369,10 +429,12 @@ class AuthenticationBrokerServer:
         session_id: str,
         authority_fingerprint: str,
         expected_peer_pid: int,
+        configuration_bytes: bytes,
     ):
         self.channel = channel
         self.source_descriptor = source_descriptor
         self.ephemeral_root = ephemeral_root
+        self.configuration_bytes = _validated_configuration_bytes(configuration_bytes)
         self.session_id = require_identifier(session_id, "authentication session")
         self.authority_fingerprint = require_sha256(
             authority_fingerprint, "authentication authority"
@@ -431,7 +493,7 @@ class AuthenticationBrokerServer:
             0o600,
         )
         try:
-            os.write(config_fd, MINIMAL_CONFIG)
+            os.write(config_fd, self.configuration_bytes)
             os.fsync(config_fd)
         finally:
             os.close(config_fd)
@@ -446,6 +508,7 @@ class AuthenticationBrokerServer:
         return {
             "broker_identity": "content_attested_authentication_broker",
             "source_metadata": metadata,
+            "configuration_identity": _configuration_identity(self.configuration_bytes),
             "ephemeral_home_identity": {
                 "device": identity.st_dev,
                 "inode": identity.st_ino,
@@ -607,12 +670,16 @@ class AuthenticationBrokerProcess:
         session_id: str,
         authority_fingerprint: str,
         ephemeral_root: Path,
+        configuration_bytes: bytes,
     ):
         self.channel = channel
         self.pid = pid
         self.session_id = session_id
         self.authority_fingerprint = authority_fingerprint
         self.ephemeral_root = ephemeral_root
+        self.configuration_identity = _configuration_identity(
+            _validated_configuration_bytes(configuration_bytes)
+        )
         self.sequence = 0
         self.home_descriptor: int | None = None
         self.terminal_evidence: Mapping[str, Any] | None = None
@@ -626,7 +693,9 @@ class AuthenticationBrokerProcess:
         ephemeral_root: Path,
         session_id: str,
         authority_fingerprint: str,
+        configuration_bytes: bytes,
     ) -> "AuthenticationBrokerProcess":
+        configuration_bytes = _validated_configuration_bytes(configuration_bytes)
         parent, child = make_seqpacket_socketpair()
         launcher_pid = os.getpid()
         pid = os.fork()
@@ -641,6 +710,7 @@ class AuthenticationBrokerProcess:
                     session_id=session_id,
                     authority_fingerprint=authority_fingerprint,
                     expected_peer_pid=launcher_pid,
+                    configuration_bytes=configuration_bytes,
                 ).serve()
             finally:
                 os._exit(code)
@@ -652,6 +722,7 @@ class AuthenticationBrokerProcess:
             session_id=session_id,
             authority_fingerprint=authority_fingerprint,
             ephemeral_root=ephemeral_root,
+            configuration_bytes=configuration_bytes,
         )
 
     def _request(
@@ -705,7 +776,14 @@ class AuthenticationBrokerProcess:
         return result
 
     def prepare(self) -> AuthenticationBrokerResult:
-        return self._request("PREPARE")
+        result = self._request("PREPARE")
+        if dict(result.evidence["configuration_identity"]) != dict(
+            self.configuration_identity
+        ):
+            raise BrokerProtocolError(
+                "ephemeral Codex configuration identity differs from the bound policy"
+            )
+        return result
 
     def handoff(self) -> tuple[AuthenticationBrokerResult, int]:
         result = self._request("HANDOFF", expect_descriptor=True)

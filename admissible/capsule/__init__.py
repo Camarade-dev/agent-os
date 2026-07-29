@@ -47,9 +47,12 @@ from admissible.capsule.finalizer import (
     initialize_disposable_repository,
 )
 from admissible.capsule.intake import (
+    CANARY_EXACT_AUTHORITY,
+    CANARY_TXT_BYTES,
     NEON_RELAY_AUTHORITY,
     AcceptedMaterialIdentity,
     CanonicalIntake,
+    ExactMaterialRecord,
     IntakeAuthority,
     IntakeEvidence,
     IntakeFileRecord,
@@ -57,6 +60,24 @@ from admissible.capsule.intake import (
     RejectionCode,
     path_policy_reasons,
     validate_and_copy,
+)
+from admissible.capsule.model_authority import (
+    CANARY_CONFIGURED_MODEL,
+    CANARY_CONFIGURED_REASONING_EFFORT,
+    MODEL_CONFIGURATION_CHANNEL,
+    CodexModelAuthority,
+    ModelConfigurationError,
+    canary_model_authority,
+    ephemeral_config_bytes,
+    validate_effective_thread_configuration,
+)
+from admissible.capsule.serialization_witness import (
+    SerializationWitnessError,
+    SerializationWitnessRecord,
+    evaluate_serialization_witness,
+    extract_witness_record,
+    serialization_witness_identity,
+    witness_capture_policy,
 )
 from admissible.capsule.docker_controller import (
     CapsuleExecutionAuthority,
@@ -149,6 +170,23 @@ from admissible.capsule.verification import (
 )
 
 __all__ = [
+    "CANARY_CONFIGURED_MODEL",
+    "CANARY_CONFIGURED_REASONING_EFFORT",
+    "CANARY_EXACT_AUTHORITY",
+    "CANARY_TXT_BYTES",
+    "CodexModelAuthority",
+    "ExactMaterialRecord",
+    "MODEL_CONFIGURATION_CHANNEL",
+    "ModelConfigurationError",
+    "SerializationWitnessError",
+    "SerializationWitnessRecord",
+    "canary_model_authority",
+    "ephemeral_config_bytes",
+    "evaluate_serialization_witness",
+    "extract_witness_record",
+    "serialization_witness_identity",
+    "validate_effective_thread_configuration",
+    "witness_capture_policy",
     "AcceptedBlob",
     "AcceptedMaterialIdentity",
     "AdmissibleFinalizer",

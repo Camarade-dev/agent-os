@@ -70,6 +70,13 @@ from admissible.capsule.finalizer import (
     FinalizationResult,
 )
 from admissible.capsule.intake import AcceptedMaterialIdentity
+from admissible.capsule.model_authority import (
+    CodexModelAuthority,
+    ModelConfigurationError,
+    canary_model_authority,
+    validate_effective_thread_configuration,
+)
+from admissible.capsule.serialization_witness import serialization_witness_identity
 from admissible.capsule.models import (
     ByteTreeObservation,
     CleanupResult,
@@ -931,7 +938,22 @@ def preventive_control_config() -> dict[str, Any]:
     }
 
 
-def thread_start_request(request_id: str) -> dict[str, Any]:
+def thread_start_request(
+    request_id: str,
+    *,
+    model_authority: CodexModelAuthority,
+) -> dict[str, Any]:
+    """Bind the exact model and reasoning effort onto ``thread/start``.
+
+    The model arrives as the schema-typed ``model`` request field with
+    ``allowProviderModelFallback`` explicitly false.  ``ThreadStartParams``
+    declares no reasoning-effort property in pinned 0.145.0, so the effort
+    arrives through the ``config`` overlay; both are then reported back on
+    ``ThreadStartResponse`` and validated before any effect can run.
+    """
+
+    model_fields = model_authority.validated().thread_start_fields
+    overlay = {**preventive_control_config(), **model_fields.pop("config")}
     request = {
         "method": "thread/start",
         "id": request_id,
@@ -940,7 +962,8 @@ def thread_start_request(request_id: str) -> dict[str, Any]:
             "approvalPolicy": "never",
             "sandbox": "read-only",
             "ephemeral": True,
-            "config": preventive_control_config(),
+            **model_fields,
+            "config": overlay,
             "environments": [],
             "runtimeWorkspaceRoots": [],
             "selectedCapabilityRoots": [],
@@ -956,10 +979,17 @@ def thread_start_request(request_id: str) -> dict[str, Any]:
         request["params"],
         label="thread/start request",
     )
+    validate_bound_thread_start_request(request["params"], model_authority)
     return request
 
 
-def turn_start_request(request_id: str, *, thread_id: str, prompt: str) -> dict[str, Any]:
+def turn_start_request(
+    request_id: str,
+    *,
+    thread_id: str,
+    prompt: str,
+    model_authority: CodexModelAuthority,
+) -> dict[str, Any]:
     require_identifier(thread_id, "turn-start thread_id")
     require_nonempty_text(prompt, "capsule mission prompt", max_bytes=64 * 1024)
     request = {
@@ -967,6 +997,7 @@ def turn_start_request(request_id: str, *, thread_id: str, prompt: str) -> dict[
         "id": request_id,
         "params": {
             "threadId": thread_id,
+            **model_authority.validated().turn_start_fields,
             "input": [{"type": "text", "text": prompt}],
         },
     }
@@ -975,24 +1006,70 @@ def turn_start_request(request_id: str, *, thread_id: str, prompt: str) -> dict[
         request["params"],
         label="turn/start request",
     )
+    validate_bound_turn_start_request(request["params"], model_authority)
     return request
 
 
-def protocol_request_policy_fingerprint() -> str:
+def validate_bound_thread_start_request(
+    params: Mapping[str, Any],
+    model_authority: CodexModelAuthority,
+) -> None:
+    """Strictly validate the exact model/effort fields actually serialized."""
+
+    expected = model_authority.thread_start_fields
+    overlay = expected.pop("config")
+    if params.get("model") != expected["model"]:
+        raise ModelConfigurationError(
+            "thread/start request does not carry the bound model"
+        )
+    if params.get("allowProviderModelFallback") is not False:
+        raise ModelConfigurationError(
+            "thread/start request does not refuse provider model fallback"
+        )
+    config = params.get("config")
+    if not isinstance(config, Mapping):
+        raise ModelConfigurationError("thread/start request has no configuration overlay")
+    for key, value in overlay.items():
+        if config.get(key) != value:
+            raise ModelConfigurationError(
+                f"thread/start configuration overlay does not bind {key}"
+            )
+
+
+def validate_bound_turn_start_request(
+    params: Mapping[str, Any],
+    model_authority: CodexModelAuthority,
+) -> None:
+    expected = model_authority.turn_start_fields
+    if params.get("model") != expected["model"]:
+        raise ModelConfigurationError("turn/start request does not carry the bound model")
+    if params.get("effort") != expected["effort"]:
+        raise ModelConfigurationError(
+            "turn/start request does not carry the bound reasoning effort"
+        )
+
+
+def protocol_request_policy_fingerprint(
+    model_authority: CodexModelAuthority,
+) -> str:
     """Bind every caller-controlled protocol policy byte except session data."""
 
     return fingerprint(
         {
             "initialize_params": initialize_request("policy-request")["params"],
             "initialized_notification": {"method": "initialized", "params": {}},
-            "thread_start_params": thread_start_request("policy-request")["params"],
+            "thread_start_params": thread_start_request(
+                "policy-request", model_authority=model_authority
+            )["params"],
             "turn_start_shape": {
                 "method": "turn/start",
                 "params": {
                     "threadId": "<bound-thread-id>",
+                    **model_authority.turn_start_fields,
                     "input": [{"type": "text", "text": "<bound-prompt-bytes>"}],
                 },
             },
+            "model_authority_fingerprint": model_authority.authority_fingerprint,
         }
     )
 
@@ -1011,6 +1088,7 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
         mission_prompt: str,
         mission_bytes: bytes | None = None,
         os_boundary_authority: OSBoundaryAuthority | None = None,
+        model_authority: CodexModelAuthority | None = None,
         event_timeout_seconds: float = 10.0,
         protocol_drain_timeout_seconds: float = 3.0,
         protocol_drain_record_limit: int = 64,
@@ -1064,6 +1142,23 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
             != self.connection_factory.authentication_boundary_state
         ):
             raise ValueError("control authority/connection factory substitution refused")
+        self.model_authority = (
+            model_authority.validated()
+            if model_authority is not None
+            else canary_model_authority(
+                codex_executable_identity=(
+                    self.connection_factory.codex_component_identity
+                ),
+                serialization_witness_identity=serialization_witness_identity(),
+            )
+        )
+        if dict(self.model_authority.codex_executable_identity) != dict(
+            self.connection_factory.codex_component_identity
+        ):
+            raise ValueError("model authority binds another Codex executable")
+        # Set only after the app server reports the effective model
+        # configuration; no capsule effect may run before that.
+        self._effective_model_binding: Mapping[str, Any] | None = None
         self.event_timeout_seconds = event_timeout_seconds
         self.protocol_drain_timeout_seconds = protocol_drain_timeout_seconds
         self.protocol_drain_record_limit = protocol_drain_record_limit
@@ -1162,6 +1257,33 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
         ):
             raise ValueError("control authority changed before launch")
 
+    def _require_validated_model_configuration(self) -> Mapping[str, Any]:
+        """Refuse every effectful dynamic tool call before model validation.
+
+        ``_run_protocol`` validates ``ThreadStartResponse`` before ``turn/start``,
+        so this guard is ordering defence in depth: it makes the invariant
+        explicit and independently testable rather than implied by call order.
+        """
+
+        binding = self._effective_model_binding
+        if binding is None:
+            raise AppServerProtocolError(
+                "capsule effects are refused before the bound model "
+                "configuration is validated"
+            )
+        if (
+            binding.get("model_authority_fingerprint")
+            != self.model_authority.authority_fingerprint
+            or binding.get("app_server_effective_model")
+            != self.model_authority.configured_model
+            or binding.get("app_server_effective_reasoning_effort")
+            != self.model_authority.configured_reasoning_effort
+        ):
+            raise AppServerProtocolError(
+                "active session model configuration differs from the bound authority"
+            )
+        return binding
+
     def _attest_execution_binding(
         self,
         execution_authority: BackendExecutionAuthority,
@@ -1194,7 +1316,11 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
             or execution_authority.dynamic_tools_schema_identity
             != fingerprint(dynamic_tools_grammar())
             or execution_authority.protocol_request_policy_fingerprint
-            != protocol_request_policy_fingerprint()
+            != protocol_request_policy_fingerprint(self.model_authority)
+            or execution_authority.model_authority_fingerprint
+            != self.model_authority.authority_fingerprint
+            or dict(execution_authority.model_authority)
+            != self.model_authority.to_dict()
             or execution_authority.mission_fingerprint
             != sha256_bytes(self._mission_bytes)
             or execution_authority.prompt_fingerprint
@@ -1224,8 +1350,9 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
             capsule_image_content_id=self.controller.execution_authority.image_identity,
             docker_executable_identity=self._docker_component_identity(),
             dynamic_tools_schema_identity=fingerprint(dynamic_tools_grammar()),
+            model_authority=self.model_authority.to_dict(),
             protocol_request_policy_fingerprint=(
-                protocol_request_policy_fingerprint()
+                protocol_request_policy_fingerprint(self.model_authority)
             ),
             mission_bytes=self._mission_bytes,
             prompt_bytes=self._prompt_bytes,
@@ -1516,7 +1643,13 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
                 "initialize response does not attest the pinned control home/protocol"
             )
         connection.send({"method": "initialized", "params": {}})
-        connection.send(thread_start_request(thread_request_id))
+        self._effective_model_binding = None
+        connection.send(
+            thread_start_request(
+                thread_request_id,
+                model_authority=self.model_authority,
+            )
+        )
         thread_result, thread_started = self._expect_response_and_notification(
             connection,
             request_id=thread_request_id,
@@ -1531,6 +1664,12 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
             != {"type": "readOnly", "networkAccess": False}
         ):
             raise AppServerProtocolError("thread/start response changed the control policy")
+        # Configuration/protocol mismatch terminates here: before turn/start and
+        # therefore before any dynamic tool call can reach the capsule.
+        self._effective_model_binding = validate_effective_thread_configuration(
+            thread_result,
+            self.model_authority,
+        )
         thread = thread_result.get("thread")
         started_thread = thread_started.get("thread")
         if not isinstance(thread, Mapping) or not isinstance(started_thread, Mapping):
@@ -1552,6 +1691,7 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
                 turn_request_id,
                 thread_id=thread_id,
                 prompt=self.mission_prompt,
+                model_authority=self.model_authority,
             )
         )
         turn_result, turn_started = self._expect_response_and_notification(
@@ -1594,6 +1734,7 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
             if "id" in message and method != "item/tool/call":
                 raise AppServerProtocolError("native or unknown server request refused")
             if method == "item/tool/call":
+                self._require_validated_model_configuration()
                 request = self._parse_tool_call(session_id, handle, message)
                 active = items.get(request.call_id)
                 if (

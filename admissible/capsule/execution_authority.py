@@ -27,7 +27,7 @@ from admissible.capsule.common import (
 
 FILE_IDENTITY_SCHEMA_VERSION = "admissible_executable_file_identity_v1"
 BACKEND_EXECUTION_AUTHORITY_SCHEMA_VERSION = (
-    "admissible_host_codex_docker_execution_authority_v3"
+    "admissible_host_codex_docker_execution_authority_v4"
 )
 HOST_CODEX_BACKEND_KIND = "host_codex_app_server_capsule_v1"
 
@@ -332,6 +332,8 @@ class BackendExecutionAuthority:
     capsule_authority_fingerprint: str
     generic_mission_fingerprint: str
     codex_executable_identity: Mapping[str, Any]
+    model_authority: Mapping[str, Any]
+    model_authority_fingerprint: str
     host_control_policy_fingerprint: str
     bwrap_executable_identity: Mapping[str, Any]
     bwrap_argv_policy_fingerprint: str
@@ -362,6 +364,7 @@ class BackendExecutionAuthority:
         capsule_authority_fingerprint: str,
         generic_mission_fingerprint: str,
         codex_executable_identity: Mapping[str, Any],
+        model_authority: Mapping[str, Any],
         host_control_policy_fingerprint: str,
         bwrap_executable_identity: Mapping[str, Any],
         bwrap_argv_policy_fingerprint: str,
@@ -416,6 +419,9 @@ class BackendExecutionAuthority:
             from admissible.capsule.boundary_authority import OSBoundaryAuthority
 
             boundary = OSBoundaryAuthority.from_dict(os_boundary_authority)
+        from admissible.capsule.model_authority import CodexModelAuthority
+
+        bound_model = CodexModelAuthority.from_dict(model_authority)
         body = {
             "schema_version": BACKEND_EXECUTION_AUTHORITY_SCHEMA_VERSION,
             "backend_kind": HOST_CODEX_BACKEND_KIND,
@@ -424,6 +430,8 @@ class BackendExecutionAuthority:
             "capsule_authority_fingerprint": capsule_authority_fingerprint,
             "generic_mission_fingerprint": generic_mission_fingerprint,
             "codex_executable_identity": dict(codex_executable_identity),
+            "model_authority": bound_model.to_dict(),
+            "model_authority_fingerprint": bound_model.authority_fingerprint,
             "host_control_policy_fingerprint": host_control_policy_fingerprint,
             "bwrap_executable_identity": dict(bwrap_executable_identity),
             "bwrap_argv_policy_fingerprint": bwrap_argv_policy_fingerprint,
@@ -497,6 +505,24 @@ class BackendExecutionAuthority:
             else validate_component_identity
         )
         component_validator(self.codex_executable_identity, "Codex executable")
+        from admissible.capsule.model_authority import CodexModelAuthority
+
+        bound_model = CodexModelAuthority.from_dict(self.model_authority)
+        require_sha256(self.model_authority_fingerprint, "model authority fingerprint")
+        if bound_model.authority_fingerprint != self.model_authority_fingerprint:
+            raise ValueError("model authority binding differs")
+        if dict(bound_model.codex_executable_identity) != dict(
+            self.codex_executable_identity
+        ):
+            raise ValueError("model authority binds another Codex executable")
+        if bound_model.to_dict()["app_server_protocol_version"] != (
+            self.app_server_protocol_version
+        ):
+            raise ValueError("model authority binds another app-server protocol")
+        if bound_model.to_dict()["protocol_schema_identity"] != (
+            self.protocol_schema_identity
+        ):
+            raise ValueError("model authority binds another protocol schema identity")
         component_validator(self.bwrap_executable_identity, "bwrap executable")
         component_validator(self.docker_executable_identity, "Docker executable")
         factory_identity = component_validator(
