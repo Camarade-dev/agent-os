@@ -29,6 +29,7 @@ def test_package_discovery_configuration_includes_the_capsule_package():
     assert project["tool"]["setuptools"]["data-files"]["share/doc/agent-os"] == [
         "docs/admissible-host-codex-capsule-backend.md",
         "docs/admissible-codex-os-boundary.md",
+        "docs/admissible-codex-model-authority.md",
     ]
 
 
@@ -143,6 +144,16 @@ def test_sdist_and_wheel_contain_backend_documentation_and_generated_schemas(
         )
         for name in wheel_names
     )
+    assert any(
+        name.endswith("/docs/admissible-codex-model-authority.md")
+        for name in sdist_names
+    )
+    assert any(
+        name.endswith(
+            ".data/data/share/doc/agent-os/admissible-codex-model-authority.md"
+        )
+        for name in wheel_names
+    )
     required_schema_suffixes = {
         "admissible/capsule/protocol_schemas/manifest.json",
         "admissible/capsule/protocol_schemas/v1/InitializeParams.json",
@@ -157,7 +168,39 @@ def test_sdist_and_wheel_contain_backend_documentation_and_generated_schemas(
         "admissible/capsule/destination_manifests/codex-0.145.0-chatgpt.json",
     }
     assert required_schema_suffixes <= wheel_names
+    required_model_sources = {
+        "admissible/capsule/model_authority.py",
+        "admissible/capsule/serialization_witness.py",
+    }
+    assert required_model_sources <= wheel_names
     assert all("/tests/" not in name for name in sdist_names)
+
+    # Production model/configuration support ships; the synthetic witness
+    # credentials, endpoint fixtures and driver never do.
+    model_source = runtime_sources["admissible/capsule/model_authority.py"]
+    assert 'model = "{model}"' in model_source
+    assert "model_reasoning_effort" in model_source
+    assert "gpt-5.3-codex" in model_source
+    forbidden_witness_material = (
+        b"synthetic-provider-free-key",
+        b"SYNTHETIC_API_KEY",
+        b"model_providers.synthetic-loopback",
+        b"BEGIN PRIVATE KEY",
+        b"BEGIN CERTIFICATE",
+        b'{"OPENAI_API_KEY"',
+    )
+    for marker in forbidden_witness_material:
+        assert all(marker not in content for content in sdist_regular_bytes), marker
+        assert all(
+            marker not in content.encode("utf-8")
+            for content in runtime_sources.values()
+        ), marker
+    assert all(
+        "_canary_serialization_witness_driver" not in name
+        and not name.endswith(".pem")
+        and not name.endswith("/auth.json")
+        for name in sdist_names | wheel_names
+    )
     synthetic_auth_fixture = (
         b'{"synthetic_fixture":true,"opaque_fixture":"provider-free-only"}'
     )

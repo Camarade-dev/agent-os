@@ -40,6 +40,7 @@ agent_os = ["templates/*.md"]
 "share/doc/agent-os" = [
     "docs/admissible-host-codex-capsule-backend.md",
     "docs/admissible-codex-os-boundary.md",
+    "docs/admissible-codex-model-authority.md",
 ]
 
 [tool.pytest.ini_options]
