@@ -117,6 +117,14 @@ failure. Process exit code, normal versus forced close, EOF observation, and
 protocol classification remain independent evidence. A completed turn
 followed by exit 17 is not completion.
 
+Terminal classification has an explicit precedence rule. Once the protocol
+has established a non-completed refusal/failure, a later workspace-freeze
+failure is retained as additional cleanup/output evidence but cannot relabel
+that earlier cause as `CAPSULE_FAILED`. Cleanup failure still overrides every
+other class because complete cleanup is a terminal requirement. This removes
+process-close/snapshot ordering as a source of nondeterministic classification
+without hiding either fact.
+
 ## Preventive host-control boundary
 
 The control request uses a synthetic capability overlay with empty MCP

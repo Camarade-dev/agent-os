@@ -10,11 +10,14 @@ argv, the ephemeral `CODEX_HOME` configuration, `thread/start`, `turn/start` or
 the execution authority. It created and consumed no owner authority, and the
 future real run remains absent.
 
-The repair introduces exactly two things:
+The repair now has four narrowly coupled pieces:
 
-1. a canonical immutable **model authority** bound into
-   `BackendExecutionAuthority` and every dependent launch fingerprint;
-2. an optional closed **exact-material policy** in `CanonicalIntake`.
+1. a canonical immutable mission/run **model-binding policy**;
+2. an externally anchored, durable **verified serialization-witness receipt**;
+3. a model authority derived only by reopening that receipt and its complete
+   evidence pack;
+4. the already proven optional closed **exact-material policy** in
+   `CanonicalIntake`.
 
 The independently audited OS boundary, brokers, egress, controller, capsule,
 verification and finalizer are unchanged in design.
@@ -73,28 +76,48 @@ reasoning-effort vocabulary (`low`, `medium`, `high`).
 
 ## What is bound
 
-`CodexModelAuthority` binds, canonically and immutably:
+`ModelBindingPolicy` binds, canonically and immutably:
 
 * the configured model and configured reasoning effort;
+* `allowProviderModelFallback = false`;
 * the exact configuration channel identifier;
 * the exact `thread/start` and `turn/start` request fields;
 * the exact canonical ephemeral configuration bytes, their size and SHA-256;
 * the configuration fingerprint;
 * the pinned Codex executable identity;
 * the app-server protocol version and generated-schema identity;
-* the provider-free serialization-witness identity;
+* the provider-free observation-policy identity and trusted verifier identity;
 * the explicit prohibition record.
 
-Every field is re-derived on validation, so a caller-asserted string alone is
-never an attestation: `CodexModelAuthority.from_dict` recomputes the complete
-configuration body from the two configured values and refuses any record that
-does not match.
+The canary instance is closed to `gpt-5.3-codex`, `low`, fallback false, Codex
+0.145.0 with executable SHA-256
+`a2a05dafaa1acb002a45eaec0a462de5b13694fcfcd7bc43305f14781ce7be14`,
+and protocol-schema identity
+`cec0eb5631a013b3be09670f9aa05193b43cf47b9ad7443d6266fff8b7fe960f`.
+A future mission can seal another explicit policy, but it cannot inject that
+policy through the canary backend.
 
-`BackendExecutionAuthority` (schema `…_execution_authority_v4`) carries the
-model authority and its fingerprint. Changing either the model or the effort
-changes the model-authority fingerprint, the protocol-request-policy
-fingerprint, the backend execution-authority fingerprint and the bubblewrap
-launch fingerprint.
+`SerializationWitnessRecord` and its fingerprint are explicitly untrusted
+observations. `CodexModelAuthority.create` produces only an
+`ISOLATED_UNAUTHORIZED` object suitable for protocol/configuration analysis.
+It is never launch authority. A launchable model authority is derived only
+from an opaque verified receipt and a simultaneous reopen of its durable pack
+through the trusted store. Serialized authority bytes lose this live
+provenance and cannot restore it.
+
+`BackendExecutionAuthority` (schema `…_execution_authority_v5`) carries the
+complete policy, receipt metadata, receipt/run identities, model authority and
+all fingerprints. Its creation reopens the durable evidence again. Changing
+the model, effort, executable, protocol schema, verifier, receipt, or run
+changes the dependent OS-boundary authority, protocol-request policy, backend
+execution authority and bubblewrap launch fingerprint.
+
+`HostCodexAppServerCapsuleBackend` has no optional model-authority, model, or
+effort parameter. It obtains the path-bound witness store only from the
+externally anchored session trust root, constructs the one canary policy from
+the content-attested executable, loads the current receipt, and derives the
+authority. A valid-in-isolation authority for another model or for
+`medium`/`high` is therefore irrelevant to backend construction.
 
 ## Launch channel
 
@@ -116,6 +139,9 @@ launch fingerprint.
 
 ## Runtime enforcement
 
+Before preparation, launch, and every dynamic effect guard, the backend
+reopens the receipt, run anchor, external tail, and exact evidence pack. It
+then checks policy/authority/receipt/run/executable continuity.
 `_run_protocol` validates `ThreadStartResponse.model` and
 `ThreadStartResponse.reasoningEffort` against the bound authority *before*
 `turn/start` and therefore before any dynamic tool call. The validated binding
@@ -137,17 +163,18 @@ Three distinct claims are kept distinct, and the evidence names them:
   `CANARY_TIME_OBSERVATION_ONLY`. Offline serialization does **not** prove
   entitlement, and it does not prove final provider routing.
 
-## Provider-free serialization witness
+## Trusted provider-free serialization witness
 
-`admissible.capsule.serialization_witness` owns the capture policy and the
-checker; the harness lives in `tests/`. The witness runs the real pinned
+`admissible.capsule.serialization_witness` owns the parent verifier, store and
+receipt schemas; its confined child is
+`admissible.capsule.serialization_witness_runtime`. The trusted path runs the real pinned
 0.145.0 binary with synthetic authentication inside a private routeless
 network namespace whose only interface is loopback, against a local synthetic
 ChatGPT-compatible `/v1/responses` endpoint that answers every request with a
 terminal stream failure. No public DNS name, no public endpoint, and no real
 model or provider execution is involved.
 
-Only three non-secret values are captured: the request path, the serialized
+Only three request values are captured: the request path, the serialized
 `model` and the serialized `reasoning.effort`. Prompt contents, request input
 items, instructions, synthetic token contents, HTTP authorization, unrelated
 headers and response bodies are never recorded.
@@ -163,12 +190,41 @@ cleartext on loopback inside the private namespace. The sealed egress
 architecture is unchanged and still refuses every destination outside its
 manifest; it never terminates TLS.
 
+Before execution the trusted store publishes one run anchor binding a random
+run identity/nonce, sequence, previous tail, store anchor, verifier, policy,
+configuration and executable identities. After the terminal local refusal it
+atomically publishes and fsyncs the complete evidence pack, reads it back,
+publishes a receipt and advances the single-writer tail. Loading reopens every
+object and recomputes every identity. The store anchor is bound to the exact
+canonical path and directory device/inode, and its reference is sealed outside
+the mutable session journal. A copied directory or self-consistent hash chain
+under an unauthorized path does not acquire authority.
+
+The receipt binds the witness schema/run/nonce; executable content and
+before/after stat identity; protocol and configuration identities; configured,
+serialized and effective model/effort; fallback false; request path;
+namespace/no-route/no-resolver evidence; local endpoint policy; exact process
+terminal result; captured-request and full-pack fingerprints; verifier
+identity; and durability-receipt identity. It contains no prompt, synthetic
+credential, authorization header, or response body.
+
 The witness fails for `auto`, an omitted model, another model, changed model
 casing, an omitted effort, `medium`/`high`/`xhigh` effort, a substituted
-ephemeral configuration and a substituted executable identity.
+ephemeral configuration, executable, network evidence, run nonce, pack,
+receipt, tail or store. Fixed synthetic credentials, endpoint fixtures,
+certificates, keys, and test drivers are excluded from both distributions.
+The shipped verifier generates its credential and loopback port per run.
 
-Synthetic credentials, endpoint fixtures and the witness driver are excluded
-from both the wheel and the sdist.
+## Future preflight sealing
+
+Historical `canary-preflight-v1` is never opened for writing and remains an
+unconsumed model-unbound preparation. Future V2 preparations use an immutable
+content manifest that excludes both publication files. A separate final seal
+binds the exact manifest bytes, size, SHA-256 and fingerprint plus the model
+policy and witness receipt/run. The externally retained seal fingerprint is
+required when reloading. Thus neither document claims to contain its own final
+byte hash; content mutation, manifest mutation, and seal mutation are each
+detected.
 
 ## Optional exact-byte canonical intake
 
