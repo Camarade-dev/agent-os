@@ -89,6 +89,23 @@ def _docker(*arguments: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _process_descendants(root_pid: int) -> tuple[int, ...]:
+    pending = [root_pid]
+    found: list[int] = []
+    while pending:
+        parent = pending.pop()
+        children_file = Path(f"/proc/{parent}/task/{parent}/children")
+        try:
+            children = tuple(
+                int(value) for value in children_file.read_text().split()
+            )
+        except (FileNotFoundError, ProcessLookupError):
+            children = ()
+        found.extend(children)
+        pending.extend(children)
+    return tuple(found)
+
+
 @pytest.fixture(scope="module")
 def docker_ready():
     result = _docker("image", "inspect", "--format", "{{.Id}}", "ubuntu:24.04")
@@ -462,6 +479,20 @@ def test_codex_launch_uses_sealed_fd_arguments_private_namespaces_and_no_auth_pa
             assert os.fspath(synthetic_source).encode() not in b"\0".join(
                 arguments
             )
+            os.lseek(arguments_descriptor, 0, os.SEEK_SET)
+            completed = subprocess.run(
+                launch.argv,
+                executable=launch.executable,
+                pass_fds=launch.pass_fds,
+                capture_output=True,
+                env=dict(launch.environment),
+                cwd=launch.cwd,
+                check=False,
+                timeout=10,
+            )
+            assert completed.returncode == 0, completed.stderr.decode(
+                "utf-8", "replace"
+            )
     finally:
         os.close(home_descriptor)
         for item in (app_left, app_right, transfer_left, transfer_right):
@@ -484,6 +515,24 @@ def test_capsule_broker_refuses_host_bind_escalation_and_cleans_exact_objects(
     assert not hasattr(client, "docker_executable")
     assert not hasattr(client, "docker_identity")
     assert client.controller_authority.to_dict()["docker_socket_visible"] is False
+    broker_descendants = _process_descendants(client.process_pid)
+    sandboxed = tuple(
+        pid
+        for pid in broker_descendants
+        if Path(f"/proc/{pid}/root/runtime/docker").exists()
+    )
+    assert sandboxed, "capsule broker did not enter its empty mount namespace"
+    synthetic_from_broker_root = synthetic_auth.relative_to("/")
+    for pid in sandboxed:
+        assert not (
+            Path(f"/proc/{pid}/root") / synthetic_from_broker_root
+        ).exists()
+        command_line = Path(f"/proc/{pid}/cmdline").read_bytes()
+        environment = Path(f"/proc/{pid}/environ").read_bytes()
+        assert os.fspath(synthetic_auth).encode() not in command_line
+        assert os.fspath(synthetic_auth).encode() not in environment
+        assert SYNTHETIC_AUTHENTICATION.strip() not in command_line
+        assert SYNTHETIC_AUTHENTICATION.strip() not in environment
 
     with pytest.raises(BrokerProtocolError, match="refused"):
         client._request(

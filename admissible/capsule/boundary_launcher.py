@@ -443,9 +443,11 @@ class CodexConfinementLaunchPolicy:
                     "--stdio",
                 )
             )
+            namespace_command = tuple(arguments[-6:])
+            bwrap_arguments = arguments[:-6]
             argument_bytes = b"\0".join(
-                part.encode("utf-8") for part in arguments
-            ) + b"\0"
+                part.encode("utf-8") for part in bwrap_arguments
+            )
             arguments_fd = os.memfd_create(
                 "admissible-bwrap-arguments",
                 os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
@@ -462,8 +464,11 @@ class CodexConfinementLaunchPolicy:
                 | fcntl.F_SEAL_WRITE,
             )
             policy = {
-                "bwrap_arguments": arguments,
-                "bwrap_argument_transport": "sealed_memfd_--args",
+                "bwrap_arguments": bwrap_arguments,
+                "sandbox_command": namespace_command,
+                "bwrap_argument_transport": (
+                    "sealed_memfd_--args_options_command_in_argv"
+                ),
                 "authentication_source_path_in_argv": False,
                 "real_authentication_source_mounted": False,
                 "codex_home_binding": "broker_directory_fd_read_write",
@@ -475,7 +480,12 @@ class CodexConfinementLaunchPolicy:
                 "docker_visible": False,
             }
             yield BoundaryLaunchSpec(
-                argv=("bwrap-content-attested", "--args", str(arguments_fd)),
+                argv=(
+                    "bwrap-content-attested",
+                    "--args",
+                    str(arguments_fd),
+                    *namespace_command,
+                ),
                 executable=f"/proc/self/fd/{bwrap_fd}",
                 pass_fds=(
                     bwrap_fd,

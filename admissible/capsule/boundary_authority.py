@@ -310,6 +310,20 @@ def fixed_fd_topology() -> Mapping[str, Any]:
                 "codex_visible_after_handoff": True,
             },
             {
+                "name": "codex_launch_inputs",
+                "kind": (
+                    "sealed_bwrap_options_memfd_plus_exact_executable_"
+                    "and_runtime_fds"
+                ),
+                "endpoints": [
+                    "boundary_launcher",
+                    "bubblewrap",
+                    "codex_namespace",
+                ],
+                "controller_visible": False,
+                "codex_visible_after_handoff": False,
+            },
+            {
                 "name": "app_server",
                 "kind": "inherited_stream_socketpair",
                 "endpoints": ["controller", "codex"],
@@ -321,6 +335,34 @@ def fixed_fd_topology() -> Mapping[str, Any]:
                 "kind": "inherited_seqpacket_socketpair",
                 "endpoints": ["controller", "capsule_broker"],
                 "controller_visible": True,
+                "codex_visible_after_handoff": False,
+            },
+            {
+                "name": "capsule_broker_config",
+                "kind": "sealed_memfd",
+                "endpoints": ["boundary_launcher", "capsule_broker"],
+                "controller_visible": False,
+                "codex_visible_after_handoff": False,
+            },
+            {
+                "name": "capsule_broker_launch_inputs",
+                "kind": (
+                    "sealed_bwrap_options_memfd_plus_exact_runtime_"
+                    "and_broker_root_fds"
+                ),
+                "endpoints": [
+                    "boundary_launcher",
+                    "bubblewrap",
+                    "capsule_broker",
+                ],
+                "controller_visible": False,
+                "codex_visible_after_handoff": False,
+            },
+            {
+                "name": "docker_authority",
+                "kind": "exact_executable_and_socket_fd_bindings",
+                "endpoints": ["boundary_launcher", "capsule_broker"],
+                "controller_visible": False,
                 "codex_visible_after_handoff": False,
             },
             {
@@ -355,7 +397,13 @@ def fixed_controller_policy() -> Mapping[str, Any]:
         "host_user_manager_sockets_visible": False,
         "path_unix_sockets": "only_inherited_broker_channels",
         "abstract_unix_sockets": "separate_network_namespace",
-        "environment": ["LANG=C.UTF-8", "LC_ALL=C.UTF-8", "HOME=/nonexistent"],
+        "environment": [
+            "LANG=C.UTF-8",
+            "LC_ALL=C.UTF-8",
+            "HOME=/nonexistent",
+            "APP_SERVER_FD=<inherited>",
+            "CAPSULE_BROKER_FD=<inherited>",
+        ],
         "inherited_descriptors": ["app_server", "capsule_broker"],
         "cwd": "/control",
     }
@@ -379,6 +427,24 @@ def fixed_codex_policy() -> Mapping[str, Any]:
         "proc": "private_minimal",
         "dev": "minimal",
         "channels": ["app_server", "loopback_connect_proxy"],
+        "environment": [
+            "LANG=C.UTF-8",
+            "LC_ALL=C.UTF-8",
+            "HOME=/control/codex-home",
+            "CODEX_HOME=/control/codex-home",
+            "PATH=/runtime",
+            "APP_SERVER_FD=<inherited>",
+            "PROXY_TRANSFER_FD=<inherited>",
+            "BOUNDARY_SESSION_ID=<authority-bound>",
+            "DESTINATION_PIN_FINGERPRINT=<sealed>",
+        ],
+        "cwd": "/control/empty-cwd",
+        "inherited_descriptors": [
+            "ephemeral_codex_home",
+            "app_server",
+            "proxy_listener_transfer",
+            "exact_runtime_closure",
+        ],
     }
 
 
@@ -387,6 +453,32 @@ def fixed_capsule_broker_policy() -> Mapping[str, Any]:
         "schema_version": "admissible_capsule_broker_confinement_v1",
         "root_equivalent": True,
         "authentication_visible": False,
+        "launch": "exec_clean_content_attested_bwrap",
+        "mount_namespace": (
+            "empty_exact_runtime_docker_socket_and_broker_owned_roots"
+        ),
+        "pid_namespace": "private_outside_peer_pid_zero",
+        "network_namespace": "private_no_interfaces_except_docker_unix_socket",
+        "user_namespace": "private_uid_gid_mapping",
+        "cwd": "/runtime",
+        "environment": [
+            "LANG=C.UTF-8",
+            "LC_ALL=C.UTF-8",
+            "HOME=/nonexistent",
+            "DOCKER_CONFIG=/nonexistent",
+            "PYTHONDONTWRITEBYTECODE=1",
+            "CAPSULE_BROKER_CHANNEL_FD=<inherited>",
+            "CAPSULE_BROKER_CONFIG_FD=<sealed>",
+        ],
+        "inherited_descriptors": [
+            "closed_seqpacket_channel",
+            "sealed_configuration",
+            "content_attested_runtime_closure",
+            "content_attested_docker_executable",
+            "exact_docker_socket",
+            "broker_owned_workspace_roots",
+        ],
+        "crash_recovery": "same_confined_closed_broker_protocol",
         "interface": "authority_bound_closed_seqpacket_protocol",
         "caller_host_bind_paths": False,
         "arbitrary_images": False,

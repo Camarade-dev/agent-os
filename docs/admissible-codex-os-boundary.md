@@ -36,7 +36,8 @@ host network namespace
           |
           v
     capsule broker (TCB, root-equivalent)
-      Docker executable/socket authority; no auth input or auth protocol
+      exec-clean private mount/PID/network/user namespaces
+      exact Docker executable/socket FDs; no auth input or auth protocol
       exact image ID, mount graph, labels, limits and operations only
           |
           v
@@ -91,9 +92,10 @@ launch fingerprints. Production construction requires an explicit authority.
 A caller-provided `OS_ENFORCED` string is not an attestation.
 
 The launcher opens content-attested executables before confinement and uses
-descriptor-backed bubblewrap binds. Codex bubblewrap arguments are carried in
-a sealed memfd through `bwrap --args`; no authentication source path appears
-in ordinary bubblewrap argv. The controller is started inside an empty mount
+descriptor-backed bubblewrap binds. Codex bubblewrap options are carried in a
+sealed memfd through `bwrap --args`; the fixed namespace-bootstrap command is
+the only ordinary sandbox argv and no authentication source path appears
+there. The controller is started inside an empty mount
 view, with a closed environment, cwd and inherited descriptor set. It cannot
 see the source repository, authentication source, ephemeral Codex home,
 Docker executable/socket, host home, user-manager sockets, path sockets, or
@@ -167,7 +169,7 @@ duplicate keys, reject truncation/ancillary ambiguity, and bind the backend,
 controller and capsule sessions, broker/mission authorities, monotonically
 increasing sequence, and exact durable dynamic-tool request fingerprint.
 
-The fixed operations are `CREATE_SESSION`, `EXECUTE_TOOL`,
+The fixed operations are `CREATE_SESSION`, `RECOVER_CLEANUP`, `EXECUTE_TOOL`,
 `FREEZE_WORKSPACE`, `OBSERVE_FROZEN`, `BIND_FROZEN`,
 `TERMINATE_CLEANUP`, `GET_FROZEN_REFERENCE` and `SHUTDOWN`. Tool execution
 still accepts only the strict `capsule_effects` dynamicTools grammar.
@@ -176,7 +178,9 @@ Only the broker constructs Docker argv. It uses the content-attested Docker
 executable, exact image ID, broker-owned roots, unpredictable names, exact
 labels, fixed volume graph and fixed security/resource options. Before
 removal it proves exact ownership. Docker communication failure is `UNKNOWN`,
-never evidence of absence.
+never evidence of absence. Normal startup and forced-exit recovery both use
+the same exec-clean, empty-root broker namespace; recovery has no unconfined
+Docker-owning fallback.
 
 ## Durable lifecycle and failure truth
 

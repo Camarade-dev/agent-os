@@ -126,6 +126,7 @@ class BrokerRequest:
         require_identifier(self.request_id, "broker request id")
         if self.operation not in {
             "CREATE_SESSION",
+            "RECOVER_CLEANUP",
             "EXECUTE_TOOL",
             "FREEZE_WORKSPACE",
             "OBSERVE_FROZEN",

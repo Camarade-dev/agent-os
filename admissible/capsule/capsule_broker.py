@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
+import platform
 import socket
 import stat
+import subprocess
+import sys
+import sysconfig
 import time
 import uuid
 from dataclasses import dataclass
@@ -24,12 +29,14 @@ from admissible.capsule.broker_transport import (
     send_packet,
 )
 from admissible.capsule.common import (
+    canonical_bytes,
     fingerprint,
     require_exact_keys,
     require_identifier,
     require_sha256,
     require_strict_int,
     sha256_bytes,
+    strict_json_loads,
 )
 from admissible.capsule.docker_controller import (
     CapsuleExecutionAuthority,
@@ -49,6 +56,7 @@ from admissible.capsule.session_store import DurableToolRequest, DurableToolResu
 
 CAPSULE_BROKER_AUTHORITY_SCHEMA_VERSION = "admissible_capsule_broker_authority_v1"
 CAPSULE_BROKER_HELLO_SCHEMA_VERSION = "admissible_capsule_broker_hello_v1"
+CAPSULE_BROKER_CONFIG_SCHEMA_VERSION = "admissible_capsule_broker_config_v1"
 
 
 def capsule_broker_component_identity() -> Mapping[str, Any]:
@@ -151,6 +159,71 @@ def _limits_from_dict(value: Mapping[str, Any]) -> DockerCapsuleLimits:
     return DockerCapsuleLimits(**dict(value)).validated()
 
 
+def _read_bounded_descriptor(descriptor: int, limit: int = 256 * 1024) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    data = bytearray()
+    while len(data) <= limit:
+        chunk = os.read(descriptor, min(64 * 1024, limit + 1 - len(data)))
+        if not chunk:
+            break
+        data.extend(chunk)
+    if not data or len(data) > limit:
+        raise ValueError("capsule broker configuration exceeds its byte bound")
+    return bytes(data)
+
+
+def capsule_broker_subprocess_main() -> int:
+    """Exec-clean entry inside the capsule broker's empty mount namespace."""
+
+    channel_descriptor = int(os.environ["CAPSULE_BROKER_CHANNEL_FD"])
+    config_descriptor = int(os.environ["CAPSULE_BROKER_CONFIG_FD"])
+    raw = _read_bounded_descriptor(config_descriptor)
+    value = strict_json_loads(raw, label="capsule broker sealed configuration")
+    require_exact_keys(
+        value,
+        {
+            "schema_version",
+            "workspace_root",
+            "frozen_output_root",
+            "limits",
+            "docker_executable",
+            "expected_peer_pid",
+            "config_fingerprint",
+        },
+        "capsule broker sealed configuration",
+    )
+    body = {key: value[key] for key in value if key != "config_fingerprint"}
+    if (
+        value["schema_version"] != CAPSULE_BROKER_CONFIG_SCHEMA_VERSION
+        or fingerprint(body) != value["config_fingerprint"]
+        or value["docker_executable"] != "/runtime/docker"
+    ):
+        raise ValueError("capsule broker sealed configuration differs")
+    expected_peer_pid = value["expected_peer_pid"]
+    if (
+        isinstance(expected_peer_pid, bool)
+        or not isinstance(expected_peer_pid, int)
+        or expected_peer_pid != 0
+    ):
+        raise ValueError(
+            "capsule broker peer must be the outside-namespace socket creator"
+        )
+    channel = socket.socket(fileno=channel_descriptor)
+    controller = DockerCapsuleController(
+        workspace_root=Path(value["workspace_root"]),
+        frozen_output_root=Path(value["frozen_output_root"]),
+        limits=_limits_from_dict(value["limits"]),
+        docker_executable=Path("/runtime/docker"),
+    )
+    authority = CapsuleBrokerAuthority.create(controller=controller)
+    return CapsuleBrokerServer(
+        channel,
+        controller=controller,
+        authority=authority,
+        expected_peer_pid=expected_peer_pid,
+    ).serve()
+
+
 @dataclass(frozen=True)
 class CapsuleBrokerAuthority:
     schema_version: str
@@ -179,6 +252,7 @@ class CapsuleBrokerAuthority:
             "docker_controller_authority": controller.controller_authority.to_dict(),
             "fixed_interface": [
                 "CREATE_SESSION",
+                "RECOVER_CLEANUP",
                 "EXECUTE_TOOL",
                 "FREEZE_WORKSPACE",
                 "OBSERVE_FROZEN",
@@ -276,6 +350,7 @@ class CapsuleBrokerAuthority:
         ).validated()
         if self.fixed_interface != (
             "CREATE_SESSION",
+            "RECOVER_CLEANUP",
             "EXECUTE_TOOL",
             "FREEZE_WORKSPACE",
             "OBSERVE_FROZEN",
@@ -527,6 +602,53 @@ class CapsuleBrokerServer:
     def _dispatch(self, request: BrokerRequest) -> tuple[Mapping[str, Any], bool]:
         if request.authority_fingerprint != self.authority.authority_fingerprint:
             raise ValueError("capsule broker authority fingerprint differs")
+        if request.operation == "RECOVER_CLEANUP":
+            require_exact_keys(
+                request.payload,
+                {"handle"},
+                "capsule recovery payload",
+            )
+            if request.backend_session_id in self.sessions:
+                raise ValueError("capsule recovery session already exists")
+            public = _local_handle(request.payload["handle"])
+            if public.session_id != request.backend_session_id:
+                raise ValueError("capsule recovery backend session differs")
+            recovered = DockerWorkspaceHandle(
+                session_id=public.session_id,
+                controller_session_id=public.controller_session_id,
+                capsule_handle=public.capsule_handle,
+                mission_authority_fingerprint=(
+                    public.mission_authority_fingerprint
+                ),
+                workspace_id=public.workspace_id,
+                container_name=public.container_name,
+                container_id=public.container_id,
+                volume_name=public.volume_name,
+                source_path=self.controller.workspace_root / public.workspace_id,
+                frozen_path=(
+                    self.controller.frozen_output_root
+                    / "objects"
+                    / f"crash-recovery-{public.workspace_id}"
+                ),
+                started_monotonic=public.started_monotonic,
+                container_alive=True,
+            )
+            labels = self.controller._handle_labels(recovered)
+            self.controller._attest_object(
+                "container", recovered.container_id, labels
+            )
+            self.controller._attest_object(
+                "volume", recovered.volume_name, labels
+            )
+            cleanup = self.controller.cleanup(recovered)
+            return {
+                "session_id": public.session_id,
+                "container_name": public.container_name,
+                "volume_name": public.volume_name,
+                "cleanup": cleanup.to_dict(),
+                "ownership_proved_before_removal": cleanup.cleanup_proven,
+                "docker_absence_inferred_from_failure": False,
+            }, True
         if request.operation == "CREATE_SESSION":
             require_exact_keys(
                 request.payload,
@@ -845,6 +967,24 @@ class CapsuleBrokerClient:
         self._wire_bindings[session_id] = (controller_id, capsule_id)
         return handle
 
+    def recover_cleanup(
+        self,
+        handle: BrokerWorkspaceHandle,
+    ) -> Mapping[str, Any]:
+        """Clean one journal-recovered handle through the closed broker."""
+
+        self.attest_authority()
+        result = self._request(
+            operation="RECOVER_CLEANUP",
+            handle=None,
+            backend_session_id=handle.session_id,
+            controller_session_id=f"recovery-controller-{uuid.uuid4().hex}",
+            capsule_session_id=f"recovery-capsule-{uuid.uuid4().hex}",
+            tool_call_identity=f"recovery-cleanup-{handle.capsule_handle}",
+            payload={"handle": _public_handle(handle)},
+        )
+        return result.payload
+
     def execute(
         self,
         handle: BrokerWorkspaceHandle,
@@ -1095,34 +1235,305 @@ class CapsuleBrokerProcess:
     @classmethod
     def start(cls, config: CapsuleBrokerConfig) -> CapsuleBrokerClient:
         config.validated()
+        for root in (config.workspace_root, config.frozen_output_root):
+            root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if root.is_symlink():
+                raise ValueError("capsule broker root is a symlink")
         parent, child = make_seqpacket_socketpair()
         launcher_pid = os.getpid()
-        pid = os.fork()
-        if pid == 0:
-            parent.close()
-            code = 1
-            try:
-                controller = DockerCapsuleController(
-                    workspace_root=config.workspace_root,
-                    frozen_output_root=config.frozen_output_root,
-                    limits=config.limits,
-                    docker_executable=Path(
-                        os.path.realpath(config.docker_executable)
-                    ),
-                )
-                authority = CapsuleBrokerAuthority.create(controller=controller)
-                code = CapsuleBrokerServer(
-                    child,
-                    controller=controller,
-                    authority=authority,
-                    expected_peer_pid=launcher_pid,
-                ).serve()
-            finally:
-                os._exit(code)
+        bwrap_path = Path("/usr/bin/bwrap")
+        python_path = Path(f"/usr/bin/python{sys.version_info.major}.{sys.version_info.minor}")
+        stdlib_path = Path(
+            f"/usr/lib/python{sys.version_info.major}.{sys.version_info.minor}"
+        )
+        multiarch = sysconfig.get_config_var("MULTIARCH")
+        if not isinstance(multiarch, str) or not multiarch:
+            raise RuntimeError("Python multiarch runtime identity is unavailable")
+        platform_libraries = Path("/lib") / multiarch
+        loader_source = Path("/lib64/ld-linux-x86-64.so.2")
+        if platform.machine() in {"aarch64", "arm64"}:
+            loader_source = Path("/lib/ld-linux-aarch64.so.1")
+        loader_source = Path(os.path.realpath(loader_source))
+        docker_source = Path(os.path.realpath(config.docker_executable))
+        capsule_package = Path(__file__).parent
+        docker_socket = Path("/var/run/docker.sock")
+
+        descriptors: list[int] = []
+
+        def open_source(path: Path, *, directory: bool = False) -> int:
+            flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+            if directory:
+                flags |= os.O_DIRECTORY
+            descriptor = os.open(path, flags)
+            descriptors.append(descriptor)
+            return descriptor
+
+        bwrap_fd = open_source(bwrap_path)
+        python_fd = open_source(python_path)
+        stdlib_fd = open_source(stdlib_path, directory=True)
+        platform_libraries_fd = open_source(platform_libraries, directory=True)
+        loader_fd = open_source(loader_source)
+        docker_fd = open_source(docker_source)
+        capsule_package_fd = open_source(capsule_package, directory=True)
+        admissible_init_fd = os.memfd_create(
+            "admissible-capsule-broker-package-init",
+            os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+        )
+        descriptors.append(admissible_init_fd)
+        fcntl.fcntl(
+            admissible_init_fd,
+            fcntl.F_ADD_SEALS,
+            fcntl.F_SEAL_SEAL
+            | fcntl.F_SEAL_SHRINK
+            | fcntl.F_SEAL_GROW
+            | fcntl.F_SEAL_WRITE,
+        )
+        workspace_fd = open_source(config.workspace_root, directory=True)
+        frozen_fd = open_source(config.frozen_output_root, directory=True)
+        docker_socket_fd = os.open(
+            docker_socket,
+            os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        descriptors.append(docker_socket_fd)
+
+        config_body = {
+            "schema_version": CAPSULE_BROKER_CONFIG_SCHEMA_VERSION,
+            "workspace_root": os.fspath(config.workspace_root),
+            "frozen_output_root": os.fspath(config.frozen_output_root),
+            "limits": _limits_to_dict(config.limits),
+            "docker_executable": "/runtime/docker",
+            # Linux reports an inherited peer outside a private PID namespace
+            # as PID zero.  The unnameable socketpair still binds possession
+            # to the launcher, and the outside client independently checks
+            # SO_PEERCRED against launcher_pid.
+            "expected_peer_pid": 0,
+        }
+        config_bytes = canonical_bytes(
+            {**config_body, "config_fingerprint": fingerprint(config_body)}
+        )
+        config_fd = os.memfd_create(
+            "admissible-capsule-broker-config",
+            os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+        )
+        descriptors.append(config_fd)
+        os.write(config_fd, config_bytes)
+        os.lseek(config_fd, 0, os.SEEK_SET)
+        fcntl.fcntl(
+            config_fd,
+            fcntl.F_ADD_SEALS,
+            fcntl.F_SEAL_SEAL
+            | fcntl.F_SEAL_SHRINK
+            | fcntl.F_SEAL_GROW
+            | fcntl.F_SEAL_WRITE,
+        )
+
+        destination_parents: list[str] = []
+        seen_parents: set[str] = {
+            "/tmp",
+            "/runtime",
+            "/var",
+            "/var/run",
+            "/lib",
+            "/lib64",
+        }
+        for root in (config.workspace_root, config.frozen_output_root):
+            for parent_path in reversed(root.parents):
+                rendered = os.fspath(parent_path)
+                if rendered == "/" or rendered in seen_parents:
+                    continue
+                seen_parents.add(rendered)
+                destination_parents.append(rendered)
+
+        bwrap_arguments: list[str] = [
+            "--die-with-parent",
+            "--new-session",
+            "--unshare-all",
+            "--unshare-user",
+            "--disable-userns",
+            "--clearenv",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--tmpfs",
+            "/tmp",
+            "--tmpfs",
+            "/runtime",
+            "--dir",
+            "/runtime/site",
+            "--dir",
+            "/runtime/site/admissible",
+            "--tmpfs",
+            "/usr",
+            "--dir",
+            "/usr/bin",
+            "--dir",
+            "/usr/lib",
+            "--tmpfs",
+            "/lib",
+            "--dir",
+            os.fspath(Path("/lib") / multiarch),
+            "--tmpfs",
+            "/lib64",
+            "--tmpfs",
+            "/var",
+            "--dir",
+            "/var/run",
+        ]
+        for destination in destination_parents:
+            bwrap_arguments.extend(("--dir", destination))
+        bwrap_arguments.extend(
+            (
+                "--ro-bind-fd",
+                str(python_fd),
+                os.fspath(python_path),
+                "--ro-bind-fd",
+                str(stdlib_fd),
+                os.fspath(stdlib_path),
+                "--ro-bind-fd",
+                str(platform_libraries_fd),
+                os.fspath(Path("/lib") / multiarch),
+                "--ro-bind-fd",
+                str(loader_fd),
+                (
+                    "/lib/ld-linux-aarch64.so.1"
+                    if platform.machine() in {"aarch64", "arm64"}
+                    else "/lib64/ld-linux-x86-64.so.2"
+                ),
+                "--ro-bind-fd",
+                str(docker_fd),
+                "/runtime/docker",
+                "--ro-bind-fd",
+                str(capsule_package_fd),
+                "/runtime/site/admissible/capsule",
+                "--ro-bind-data",
+                str(admissible_init_fd),
+                "/runtime/site/admissible/__init__.py",
+                "--bind-fd",
+                str(workspace_fd),
+                os.fspath(config.workspace_root),
+                "--bind-fd",
+                str(frozen_fd),
+                os.fspath(config.frozen_output_root),
+                "--bind-fd",
+                str(docker_socket_fd),
+                "/var/run/docker.sock",
+                "--remount-ro",
+                "/runtime",
+                "--remount-ro",
+                "/usr",
+                "--remount-ro",
+                "/lib",
+                "--remount-ro",
+                "/lib64",
+                "--remount-ro",
+                "/var",
+                "--setenv",
+                "LANG",
+                "C.UTF-8",
+                "--setenv",
+                "LC_ALL",
+                "C.UTF-8",
+                "--setenv",
+                "HOME",
+                "/nonexistent",
+                "--setenv",
+                "DOCKER_CONFIG",
+                "/nonexistent",
+                "--setenv",
+                "PYTHONDONTWRITEBYTECODE",
+                "1",
+                "--setenv",
+                "CAPSULE_BROKER_CHANNEL_FD",
+                str(child.fileno()),
+                "--setenv",
+                "CAPSULE_BROKER_CONFIG_FD",
+                str(config_fd),
+                "--chdir",
+                "/runtime",
+            )
+        )
+        broker_command = (
+            os.fspath(python_path),
+            "-I",
+            "-c",
+            (
+                "import sys;"
+                "sys.path.insert(0,'/runtime/site');"
+                "from admissible.capsule.capsule_broker import "
+                "capsule_broker_subprocess_main;"
+                "raise SystemExit(capsule_broker_subprocess_main())"
+            ),
+        )
+        arguments_fd = os.memfd_create(
+            "admissible-capsule-broker-bwrap-args",
+            os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+        )
+        descriptors.append(arguments_fd)
+        os.write(
+            arguments_fd,
+            b"\0".join(item.encode("utf-8") for item in bwrap_arguments),
+        )
+        os.lseek(arguments_fd, 0, os.SEEK_SET)
+        fcntl.fcntl(
+            arguments_fd,
+            fcntl.F_ADD_SEALS,
+            fcntl.F_SEAL_SEAL
+            | fcntl.F_SEAL_SHRINK
+            | fcntl.F_SEAL_GROW
+            | fcntl.F_SEAL_WRITE,
+        )
+        process = subprocess.Popen(
+            (
+                "bwrap-content-attested",
+                "--args",
+                str(arguments_fd),
+                *broker_command,
+            ),
+            executable=f"/proc/self/fd/{bwrap_fd}",
+            pass_fds=(
+                *descriptors,
+                child.fileno(),
+            ),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            env={
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                "HOME": "/nonexistent",
+            },
+            cwd="/",
+            start_new_session=True,
+            close_fds=True,
+        )
+        pid = process.pid
         child.close()
-        raw, descriptors = receive_packet(parent)
-        if descriptors:
-            for descriptor in descriptors:
+        for descriptor in descriptors:
+            os.close(descriptor)
+        parent.settimeout(10)
+        try:
+            raw, received_descriptors = receive_packet(parent)
+        except BaseException as error:
+            parent.close()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+            startup_stderr = (
+                process.stderr.read(16384).decode("utf-8", "replace")
+                if process.stderr is not None
+                else ""
+            )
+            raise BrokerProtocolError(
+                f"confined capsule broker failed to start: {startup_stderr}"
+            ) from error
+        parent.settimeout(None)
+        if process.stderr is not None:
+            process.stderr.close()
+        if received_descriptors:
+            for descriptor in received_descriptors:
                 os.close(descriptor)
             parent.close()
             raise BrokerProtocolError("capsule broker hello carried descriptors")
@@ -1162,97 +1573,37 @@ class CapsuleBrokerProcess:
         """Run exact ownership-proving cleanup in a replacement broker child."""
 
         config.validated()
-        parent, child = make_seqpacket_socketpair()
-        pid = os.fork()
-        if pid == 0:
-            parent.close()
-            code = 1
-            try:
-                controller = DockerCapsuleController(
-                    workspace_root=config.workspace_root,
-                    frozen_output_root=config.frozen_output_root,
-                    limits=config.limits,
-                    docker_executable=Path(
-                        os.path.realpath(config.docker_executable)
-                    ),
+        client = cls.start(config)
+        try:
+            results = [client.recover_cleanup(handle) for handle in handles]
+            terminal = client.shutdown()
+            if terminal.get("broker_exit_normal") is not True:
+                raise BrokerProtocolError("recovery broker exit is unknown")
+        except BaseException:
+            if not client.closed:
+                client._transport.close()
+            raise
+        body = {
+            "classification": (
+                "FAILED_CLEANED"
+                if all(
+                    item["cleanup"]["container_removed"]
+                    and item["cleanup"]["volume_removed"]
+                    and item["cleanup"]["complete_process_tree_reaped"]
+                    for item in results
                 )
-                results: list[Mapping[str, Any]] = []
-                for public in handles:
-                    recovered = DockerWorkspaceHandle(
-                        session_id=public.session_id,
-                        controller_session_id=public.controller_session_id,
-                        capsule_handle=public.capsule_handle,
-                        mission_authority_fingerprint=(
-                            public.mission_authority_fingerprint
-                        ),
-                        workspace_id=public.workspace_id,
-                        container_name=public.container_name,
-                        container_id=public.container_id,
-                        volume_name=public.volume_name,
-                        source_path=config.workspace_root / public.workspace_id,
-                        frozen_path=(
-                            config.frozen_output_root
-                            / "objects"
-                            / f"crash-recovery-{public.workspace_id}"
-                        ),
-                        started_monotonic=public.started_monotonic,
-                        container_alive=True,
-                    )
-                    cleanup = controller.cleanup(recovered)
-                    results.append(
-                        {
-                            "session_id": public.session_id,
-                            "container_name": public.container_name,
-                            "volume_name": public.volume_name,
-                            "cleanup": cleanup.to_dict(),
-                        }
-                    )
-                body = {
-                    "classification": (
-                        "FAILED_CLEANED"
-                        if all(item["cleanup"]["container_removed"] for item in results)
-                        else "FAILED_CLEANUP_UNKNOWN"
-                    ),
-                    "results": results,
-                    "ownership_proved_before_removal": True,
-                    "docker_absence_inferred_from_failure": False,
-                }
-                send_packet(
-                    child,
-                    {**body, "recovery_fingerprint": fingerprint(body)},
-                )
-                code = 0 if body["classification"] == "FAILED_CLEANED" else 1
-            except (OSError, RuntimeError, ValueError) as error:
-                body = {
-                    "classification": "FAILED_CLEANUP_UNKNOWN",
-                    "results": [],
-                    "ownership_proved_before_removal": False,
-                    "docker_absence_inferred_from_failure": False,
-                    "failure_type": type(error).__name__,
-                }
-                try:
-                    send_packet(
-                        child,
-                        {**body, "recovery_fingerprint": fingerprint(body)},
-                    )
-                except OSError:
-                    pass
-            finally:
-                child.close()
-                os._exit(code)
-        child.close()
-        value, descriptors = receive_packet(parent)
-        parent.close()
-        if descriptors:
-            for descriptor in descriptors:
-                os.close(descriptor)
-            raise BrokerProtocolError("recovery broker returned descriptors")
-        waited, status = os.waitpid(pid, 0)
-        if waited != pid:
-            raise RuntimeError("wrong recovery broker process reaped")
-        body = {key: value[key] for key in value if key != "recovery_fingerprint"}
-        if fingerprint(body) != value.get("recovery_fingerprint"):
-            raise BrokerProtocolError("recovery broker fingerprint mismatch")
-        if os.waitstatus_to_exitcode(status) != 0:
+                else "FAILED_CLEANUP_UNKNOWN"
+            ),
+            "results": results,
+            "ownership_proved_before_removal": all(
+                item["ownership_proved_before_removal"] for item in results
+            ),
+            "docker_absence_inferred_from_failure": False,
+            "recovery_broker_terminal_fingerprint": terminal[
+                "broker_process_terminal_fingerprint"
+            ],
+        }
+        value = {**body, "recovery_fingerprint": fingerprint(body)}
+        if value["classification"] != "FAILED_CLEANED":
             raise BrokerProtocolError("recovery broker cleanup is unknown")
         return value

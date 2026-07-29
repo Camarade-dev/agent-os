@@ -22,6 +22,7 @@
     "operation": {
       "enum": [
         "CREATE_SESSION",
+        "RECOVER_CLEANUP",
         "EXECUTE_TOOL",
         "FREEZE_WORKSPACE",
         "OBSERVE_FROZEN",
