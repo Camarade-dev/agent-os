@@ -27,7 +27,8 @@ def test_package_discovery_configuration_includes_the_capsule_package():
         "wheel==0.45.1",
     ]
     assert project["tool"]["setuptools"]["data-files"]["share/doc/agent-os"] == [
-        "docs/admissible-host-codex-capsule-backend.md"
+        "docs/admissible-host-codex-capsule-backend.md",
+        "docs/admissible-codex-os-boundary.md",
     ]
 
 
@@ -120,8 +121,18 @@ def test_sdist_and_wheel_contain_backend_documentation_and_generated_schemas(
         for name in sdist_names
     )
     assert any(
+        name.endswith("/docs/admissible-codex-os-boundary.md")
+        for name in sdist_names
+    )
+    assert any(
         name.endswith(
             ".data/data/share/doc/agent-os/admissible-host-codex-capsule-backend.md"
+        )
+        for name in wheel_names
+    )
+    assert any(
+        name.endswith(
+            ".data/data/share/doc/agent-os/admissible-codex-os-boundary.md"
         )
         for name in wheel_names
     )
@@ -131,6 +142,12 @@ def test_sdist_and_wheel_contain_backend_documentation_and_generated_schemas(
         "admissible/capsule/protocol_schemas/v1/InitializeResponse.json",
         "admissible/capsule/protocol_schemas/v2/ThreadStartParams.json",
         "admissible/capsule/protocol_schemas/v2/TurnCompletedNotification.json",
+        "admissible/capsule/broker_schemas/CapsuleBrokerRequest.json",
+        "admissible/capsule/broker_schemas/CapsuleBrokerResult.json",
+        "admissible/capsule/broker_schemas/AuthenticationBrokerRequest.json",
+        "admissible/capsule/broker_schemas/AuthenticationBrokerResult.json",
+        "admissible/capsule/broker_schemas/EgressRelayEvidence.json",
+        "admissible/capsule/destination_manifests/codex-0.145.0-chatgpt.json",
     }
     assert required_schema_suffixes <= wheel_names
     assert all(

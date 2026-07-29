@@ -18,6 +18,7 @@ agent-os = "agent_os.cli:main"
 admissible = "admissible.product_launcher.__main__:main"
 admissible-historical-pairing-tag = "admissible.operator_tools.historical_pairing_tag:main"
 admissible-historical-pairing-v4-extract = "admissible.operator_tools.historical_pairing_v4_extract:main"
+admissible-codex-namespace-bootstrap = "admissible.capsule.boundary_launcher:namespace_bootstrap_main"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -31,10 +32,15 @@ agent_os = ["templates/*.md"]
     "protocol_schemas/*.json",
     "protocol_schemas/v1/*.json",
     "protocol_schemas/v2/*.json",
+    "broker_schemas/*.json",
+    "destination_manifests/*.json",
 ]
 
 [tool.setuptools.data-files]
-"share/doc/agent-os" = ["docs/admissible-host-codex-capsule-backend.md"]
+"share/doc/agent-os" = [
+    "docs/admissible-host-codex-capsule-backend.md",
+    "docs/admissible-codex-os-boundary.md",
+]
 
 [tool.pytest.ini_options]
 markers = [
