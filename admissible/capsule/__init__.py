@@ -48,6 +48,28 @@ from admissible.capsule.intake import (
     path_policy_reasons,
     validate_and_copy,
 )
+from admissible.capsule.docker_controller import (
+    CapsuleExecutionAuthority,
+    ControllerCleanupEvidence,
+    DockerCapsuleController,
+    DockerCapsuleLimits,
+    DurableControllerAuthority,
+)
+from admissible.capsule.host_codex_backend import (
+    CODEX_APP_SERVER_PROTOCOL_VERSION,
+    DYNAMIC_TOOL_NAMESPACE,
+    AppServerConnection,
+    AppServerConnectionFactory,
+    BwrapCodexConnectionFactory,
+    HostCodexAppServerCapsuleBackend,
+    ScriptedCodexAppServerConnection,
+    ScriptedCodexConnectionFactory,
+    dynamic_tools_grammar,
+)
+from admissible.capsule.host_control import (
+    AuthenticatedControlAuthority,
+    HostControlBwrapPolicy,
+)
 from admissible.capsule.models import (
     ByteTreeObservation,
     CleanupResult,
@@ -60,6 +82,15 @@ from admissible.capsule.models import (
     WorkspaceReference,
 )
 from admissible.capsule.reducer import IllegalTransition, reduce
+from admissible.capsule.session_store import (
+    DurableCapsuleSessionStore,
+    DurableToolRequest,
+    DurableToolResult,
+    ReconstructedCapsuleSession,
+    SessionTerminalClassification,
+    ToolIdDisposition,
+    ToolTerminalClassification,
+)
 from admissible.capsule.state import TERMINAL_PHASES, CapsuleSessionState, Phase, new_session_state
 from admissible.capsule.verification import (
     BehavioralVerifierIdentity,
@@ -78,16 +109,22 @@ from admissible.capsule.verification import (
 __all__ = [
     "AcceptedBlob",
     "AdmissibleFinalizer",
+    "AppServerConnection",
+    "AppServerConnectionFactory",
+    "AuthenticatedControlAuthority",
     "BehavioralVerifierIdentity",
     "BehaviorRefusalCode",
     "BehaviorResult",
     "BehaviorVerified",
     "ByteHashPair",
     "ByteTreeObservation",
+    "BwrapCodexConnectionFactory",
+    "CODEX_APP_SERVER_PROTOCOL_VERSION",
     "CanonicalIntake",
     "CapsuleAuthority",
     "CapsuleBackend",
     "CapsuleEvent",
+    "CapsuleExecutionAuthority",
     "CapsuleExecutionStarted",
     "CapsuleSessionState",
     "CapsuleTerminalClassification",
@@ -98,6 +135,14 @@ __all__ = [
     "CheckpointVerified",
     "CleanupResult",
     "CommandCapture",
+    "ControllerCleanupEvidence",
+    "DYNAMIC_TOOL_NAMESPACE",
+    "DockerCapsuleController",
+    "DockerCapsuleLimits",
+    "DurableCapsuleSessionStore",
+    "DurableControllerAuthority",
+    "DurableToolRequest",
+    "DurableToolResult",
     "FailureCode",
     "FinalizationCompleted",
     "FinalizationOutcome",
@@ -105,6 +150,8 @@ __all__ = [
     "FinalizationStarted",
     "FinalizerPreconditionError",
     "FROZEN_IDENTITY",
+    "HostCodexAppServerCapsuleBackend",
+    "HostControlBwrapPolicy",
     "IllegalTransition",
     "IndependentVerificationResult",
     "IntakeAuthority",
@@ -121,9 +168,15 @@ __all__ = [
     "ProviderTerminalClassification",
     "RefusalReason",
     "RejectionCode",
+    "ReconstructedCapsuleSession",
     "SessionFailed",
+    "SessionTerminalClassification",
+    "ScriptedCodexAppServerConnection",
+    "ScriptedCodexConnectionFactory",
     "TERMINAL_PHASES",
     "TransportResult",
+    "ToolIdDisposition",
+    "ToolTerminalClassification",
     "VerificationCopy",
     "WorkspaceReference",
     "initialize_disposable_repository",
@@ -132,4 +185,5 @@ __all__ = [
     "reduce",
     "require_independent_copies",
     "validate_and_copy",
+    "dynamic_tools_grammar",
 ]

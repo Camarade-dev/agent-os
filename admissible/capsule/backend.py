@@ -1,8 +1,8 @@
 """The generic CapsuleBackend interface.
 
 This module defines the contract a Linux capsule backend must satisfy. It is
-deliberately generic: nothing here names Neon Relay, Docker, Cursor, or any
-concrete provider transport. A capsule backend produces only an untrusted
+deliberately generic: nothing here names a concrete mission, runtime, agent,
+or provider transport. A capsule backend produces only an untrusted
 transient workspace and a `ProviderOutput` — it owns no Git stage, commit, or
 publication authority. Acceptance authority lives exclusively downstream, in
 canonical intake, independent verification, and the Admissible-owned
@@ -10,10 +10,9 @@ finalizer (see `admissible.capsule.intake`, `admissible.capsule.verification`,
 and `admissible.capsule.finalizer`).
 
 No concrete provider implementation is required or provided here. Historical
-Cursor/ACP backend code under `admissible.delegated_gate` and
-`admissible.v0_controller` remains historical Cursor backend support and
-protocol-handling defense in depth; it is not, and does not become, the
-trusted root authority for this capsule backend contract.
+backend code elsewhere in the package remains protocol-handling defense in
+depth; it is not, and does not become, the trusted root authority for this
+capsule backend contract.
 """
 
 from __future__ import annotations
@@ -60,7 +59,7 @@ class CapsuleAuthority:
     This is intentionally generic: `backend_kind` is a stable identifier
     (e.g. "linux_capsule_v1"), not a provider name, and
     `capsule_image_identity` is an opaque content identity (for example a
-    digest) rather than a Docker-specific reference string.
+    digest) rather than a runtime-specific reference string.
     """
 
     schema_version: str
@@ -139,8 +138,8 @@ class CapsuleBackend(abc.ABC):
     """A Linux capsule backend that produces only an untrusted workspace.
 
     Implementations MUST NOT stage, commit, or publish Git state, and MUST
-    NOT be coupled to a specific transport (Neon Relay, Docker command
-    strings, etc.) at the interface level — those details belong to a
+    NOT be coupled to a specific transport or runtime command at the interface
+    level — those details belong to a
     concrete backend, not this contract.
     """
 

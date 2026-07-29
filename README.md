@@ -321,6 +321,8 @@ provenance inputs, not runtime authority merely because they are present.
 
 ## Further technical documentation
 
+- [Host Codex app-server / capsule-effect backend v1](docs/admissible-host-codex-capsule-backend.md)
+
 - [Native executor and authority boundary](docs/admissible-native-executor-canary.md)
 - [Build Week read-only evidence replay](docs/admissible-build-week-demo.md)
 - [Admissible thesis](docs/Admissible_THESIS.md)
