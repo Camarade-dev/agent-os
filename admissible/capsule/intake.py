@@ -89,6 +89,9 @@ class RejectionCode(str, Enum):
     INVALID_UTF8 = "INVALID_UTF8"
     MALFORMED_PACKAGE_JSON = "MALFORMED_PACKAGE_JSON"
     PACKAGE_JSON_NOT_OBJECT = "PACKAGE_JSON_NOT_OBJECT"
+    EXACT_BYTES_MISMATCH = "EXACT_BYTES_MISMATCH"
+    EXACT_SIZE_MISMATCH = "EXACT_SIZE_MISMATCH"
+    EXACT_MODE_MISMATCH = "EXACT_MODE_MISMATCH"
 
 
 class IntakePublicationState(str, Enum):
@@ -102,11 +105,87 @@ class IntakePublicationState(str, Enum):
 
 
 @dataclass(frozen=True)
+class ExactMaterialRecord:
+    """One exact-authorized file: fixed path, mode, size and SHA-256.
+
+    A mission may authorize a path and bounds without fixing its bytes; this
+    record is the optional stronger form.  Its digest is always derived from
+    real bytes by `for_bytes`, never hand-entered.
+    """
+
+    relative_path: str
+    git_mode: str
+    size: int
+    sha256: str
+
+    @classmethod
+    def for_bytes(
+        cls,
+        relative_path: str,
+        content: bytes,
+        *,
+        git_mode: str = "100644",
+    ) -> "ExactMaterialRecord":
+        if not isinstance(content, (bytes, bytearray)):
+            raise ValueError("exact material content must be bytes")
+        raw = bytes(content)
+        return cls(
+            relative_path=relative_path,
+            git_mode=git_mode,
+            size=len(raw),
+            sha256=sha256_bytes(raw),
+        ).validated()
+
+    def validated(self) -> "ExactMaterialRecord":
+        require_nonempty_text(
+            self.relative_path, "exact material relative_path", max_bytes=4096
+        )
+        if path_policy_reasons(self.relative_path):
+            raise ValueError("exact material path is not a normalized relative path")
+        if self.git_mode not in {"100644", "100755"}:
+            raise ValueError("exact material mode must be 100644 or 100755")
+        require_strict_int(
+            self.size, "exact material size", minimum=0, maximum=1024 * 1024 * 1024
+        )
+        require_sha256(self.sha256, "exact material sha256")
+        return self
+
+    def matches(self, record: "IntakeFileRecord") -> bool:
+        return (
+            record.relative_path == self.relative_path
+            and record.git_mode == self.git_mode
+            and record.size == self.size
+            and record.sha256 == self.sha256
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "relative_path": self.relative_path,
+            "git_mode": self.git_mode,
+            "size": self.size,
+            "sha256": self.sha256,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ExactMaterialRecord":
+        require_exact_keys(
+            data,
+            {"relative_path", "git_mode", "size", "sha256"},
+            "exact material record",
+        )
+        return cls(**dict(data)).validated()
+
+
+@dataclass(frozen=True)
 class IntakeAuthority:
     """The exact authorized file/directory set and bounds for one mission.
 
     Mission-generic by construction: nothing in `CanonicalIntake` refers to
     a concrete mission name. `NEON_RELAY_AUTHORITY` below is one instance.
+
+    `exact_material` is the optional closed exact-byte policy.  When it is
+    empty the authority behaves exactly as before (paths and bounds only), and
+    its fingerprint is byte-identical to the pre-exact-policy fingerprint.
     """
 
     schema_version: str
@@ -117,6 +196,7 @@ class IntakeAuthority:
     aggregate_bytes: int
     observed_entries: int
     authority_fingerprint: str
+    exact_material: tuple[ExactMaterialRecord, ...] = ()
 
     @classmethod
     def create(
@@ -128,7 +208,14 @@ class IntakeAuthority:
         per_file_bytes: int = 1024 * 1024,
         aggregate_bytes: int = 8 * 1024 * 1024,
         observed_entries: int = 256,
+        exact_material: tuple[ExactMaterialRecord, ...] = (),
     ) -> "IntakeAuthority":
+        exact = tuple(
+            sorted(
+                (item.validated() for item in exact_material),
+                key=lambda item: item.relative_path,
+            )
+        )
         body = {
             "schema_version": INTAKE_AUTHORITY_SCHEMA_VERSION,
             "authority_id": authority_id,
@@ -138,6 +225,8 @@ class IntakeAuthority:
             "aggregate_bytes": aggregate_bytes,
             "observed_entries": observed_entries,
         }
+        if exact:
+            body["exact_material"] = [item.to_dict() for item in exact]
         return cls(
             schema_version=INTAKE_AUTHORITY_SCHEMA_VERSION,
             authority_id=authority_id,
@@ -147,10 +236,11 @@ class IntakeAuthority:
             aggregate_bytes=aggregate_bytes,
             observed_entries=observed_entries,
             authority_fingerprint=fingerprint(body),
+            exact_material=exact,
         ).validated()
 
     def _body(self) -> dict[str, Any]:
-        return {
+        body = {
             "schema_version": self.schema_version,
             "authority_id": self.authority_id,
             "authority_paths": list(self.authority_paths),
@@ -159,6 +249,13 @@ class IntakeAuthority:
             "aggregate_bytes": self.aggregate_bytes,
             "observed_entries": self.observed_entries,
         }
+        if self.exact_material:
+            body["exact_material"] = [item.to_dict() for item in self.exact_material]
+        return body
+
+    @property
+    def exact_material_by_path(self) -> dict[str, ExactMaterialRecord]:
+        return {item.relative_path: item for item in self.exact_material}
 
     def validated(self) -> "IntakeAuthority":
         if self.schema_version != INTAKE_AUTHORITY_SCHEMA_VERSION:
@@ -175,6 +272,19 @@ class IntakeAuthority:
         require_strict_int(self.per_file_bytes, "per_file_bytes", minimum=1, maximum=1024 * 1024 * 1024)
         require_strict_int(self.aggregate_bytes, "aggregate_bytes", minimum=1, maximum=1024 * 1024 * 1024)
         require_strict_int(self.observed_entries, "observed_entries", minimum=1, maximum=1_000_000)
+        if not isinstance(self.exact_material, tuple):
+            raise ValueError("intake exact material policy must be immutable")
+        exact_paths = [item.relative_path for item in self.exact_material]
+        if exact_paths != sorted(exact_paths) or len(set(exact_paths)) != len(exact_paths):
+            raise ValueError("exact material paths must have unique canonical order")
+        for item in self.exact_material:
+            if not isinstance(item, ExactMaterialRecord):
+                raise ValueError("invalid exact material record")
+            item.validated()
+            if item.relative_path not in self.authority_paths:
+                raise ValueError("exact material path is outside the intake authority")
+            if item.size > self.per_file_bytes:
+                raise ValueError("exact material size exceeds the per-file bound")
         require_sha256(self.authority_fingerprint, "authority_fingerprint")
         if fingerprint(self._body()) != self.authority_fingerprint:
             raise ValueError("intake authority fingerprint mismatch")
@@ -187,20 +297,25 @@ class IntakeAuthority:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "IntakeAuthority":
+        required = {
+            "schema_version",
+            "authority_id",
+            "authority_paths",
+            "allowed_directories",
+            "per_file_bytes",
+            "aggregate_bytes",
+            "observed_entries",
+            "authority_fingerprint",
+        }
+        keys = set(data) if isinstance(data, Mapping) else set()
         require_exact_keys(
             data,
-            {
-                "schema_version",
-                "authority_id",
-                "authority_paths",
-                "allowed_directories",
-                "per_file_bytes",
-                "aggregate_bytes",
-                "observed_entries",
-                "authority_fingerprint",
-            },
+            required | ({"exact_material"} if "exact_material" in keys else set()),
             "intake authority",
         )
+        raw_exact = data.get("exact_material", [])
+        if not isinstance(raw_exact, list):
+            raise ValueError("intake exact material policy must be an array")
         return cls(
             schema_version=data["schema_version"],
             authority_id=data["authority_id"],
@@ -210,6 +325,9 @@ class IntakeAuthority:
             aggregate_bytes=data["aggregate_bytes"],
             observed_entries=data["observed_entries"],
             authority_fingerprint=data["authority_fingerprint"],
+            exact_material=tuple(
+                ExactMaterialRecord.from_dict(item) for item in raw_exact
+            ),
         ).validated()
 
 
@@ -344,6 +462,26 @@ class IntakeFileRecord:
     def from_dict(cls, data: Mapping[str, Any]) -> "IntakeFileRecord":
         require_exact_keys(data, {"relative_path", "size", "sha256", "git_mode"}, "intake file record")
         return cls(**dict(data)).validated()
+
+
+#: The exact ChatGPT Codex canary witness file.  Its size and digest are
+#: derived from these bytes, never hand-entered.
+CANARY_TXT_RELATIVE_PATH = "CANARY.txt"
+CANARY_TXT_GIT_MODE = "100644"
+CANARY_TXT_BYTES = b"admissible-chatgpt-codex-canary-v1\n"
+
+CANARY_EXACT_AUTHORITY = IntakeAuthority.create(
+    authority_id="chatgpt_codex_canary_v1",
+    authority_paths=(CANARY_TXT_RELATIVE_PATH,),
+    allowed_directories=(),
+    exact_material=(
+        ExactMaterialRecord.for_bytes(
+            CANARY_TXT_RELATIVE_PATH,
+            CANARY_TXT_BYTES,
+            git_mode=CANARY_TXT_GIT_MODE,
+        ),
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -739,6 +877,39 @@ class CanonicalIntake:
         finally:
             os.close(descriptor)
 
+    def _apply_exact_material_policy(self) -> None:
+        """Reject wrong bytes, size or mode at intake, not only downstream.
+
+        Every exact violation is accumulated like every other rejection, so a
+        complete observation is still reported and intake itself rules
+        REJECTED before `ACCEPTED_INTAKE_PUBLISHED` can be reached.
+        """
+
+        for expected in self.authority.exact_material:
+            observed = self.file_records.get(expected.relative_path)
+            if observed is None:
+                # An absent or non-regular exact path is already reported by
+                # MISSING_PATH / EXPECTED_REGULAR_FILE.
+                continue
+            if observed.git_mode != expected.git_mode:
+                self._add_reason(
+                    RejectionCode.EXACT_MODE_MISMATCH,
+                    expected.relative_path,
+                    f"mode {observed.git_mode} is not the exact mode {expected.git_mode}",
+                )
+            if observed.size != expected.size:
+                self._add_reason(
+                    RejectionCode.EXACT_SIZE_MISMATCH,
+                    expected.relative_path,
+                    f"{observed.size} bytes is not the exact size {expected.size}",
+                )
+            if observed.sha256 != expected.sha256:
+                self._add_reason(
+                    RejectionCode.EXACT_BYTES_MISMATCH,
+                    expected.relative_path,
+                    "content digest is not the exact authorized digest",
+                )
+
     def observe(self) -> None:
         """Walk the complete source tree before any rejection is final."""
 
@@ -802,6 +973,8 @@ class CanonicalIntake:
                     RejectionCode.CASE_INSENSITIVE_COLLISION, "|".join(unique), "paths collide under Unicode case folding"
                 )
 
+        self._apply_exact_material_policy()
+
         aggregate_size = sum(
             record.size for path, record in self.file_records.items() if path in self.authority.authority_paths
         )
@@ -851,6 +1024,9 @@ class CanonicalIntake:
                 raise RuntimeError(f"SOURCE_MUTATED:{relative}:during-read")
             if len(raw) != record.size or sha256_bytes(raw) != record.sha256:
                 raise RuntimeError(f"SOURCE_MUTATED:{relative}:bytes")
+            exact = self.authority.exact_material_by_path.get(relative)
+            if exact is not None and not exact.matches(record):
+                raise RuntimeError(f"SOURCE_MUTATED:{relative}:exact-material")
             return raw
         finally:
             os.close(descriptor)
