@@ -622,18 +622,24 @@ def test_effectful_tool_calls_are_refused_before_model_validation(
 ):
     """The guard is independent of protocol call order."""
 
-    backend, _workspace, _connection, _session_id = _backend(
+    backend, workspace, _connection, _session_id = _backend(
         tmp_path, local_ubuntu_identity
     )
-    with pytest.raises(AppServerProtocolError, match="before the bound model"):
-        backend._require_validated_model_configuration()
-    backend._effective_model_binding = {
-        "model_authority_fingerprint": "0" * 64,
-        "app_server_effective_model": CANARY_CONFIGURED_MODEL,
-        "app_server_effective_reasoning_effort": CANARY_CONFIGURED_REASONING_EFFORT,
-    }
-    with pytest.raises(AppServerProtocolError, match="differs from the bound authority"):
-        backend._require_validated_model_configuration()
+    try:
+        with pytest.raises(AppServerProtocolError, match="before the bound model"):
+            backend._require_validated_model_configuration()
+        backend._effective_model_binding = {
+            "model_authority_fingerprint": "0" * 64,
+            "app_server_effective_model": CANARY_CONFIGURED_MODEL,
+            "app_server_effective_reasoning_effort": CANARY_CONFIGURED_REASONING_EFFORT,
+        }
+        with pytest.raises(
+            AppServerProtocolError, match="differs from the bound authority"
+        ):
+            backend._require_validated_model_configuration()
+    finally:
+        # This test never runs a session, so it owns the prepared capsule.
+        assert backend.cleanup(workspace).cleanup_proven is True
 
 
 def test_wrong_thread_terminal_event_is_refused(
