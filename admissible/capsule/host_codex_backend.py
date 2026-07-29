@@ -2201,12 +2201,26 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
             observation = self.controller.freeze_output(handle)
             freeze_succeeded = True
         except ValueError as error:
-            classification = SessionTerminalClassification.OUTPUT_LIMIT_REFUSED
-            detail = f"provider output freeze refused: {error}"
+            if classification == SessionTerminalClassification.COMPLETED:
+                classification = SessionTerminalClassification.OUTPUT_LIMIT_REFUSED
+                detail = f"provider output freeze refused: {error}"
+            else:
+                detail = (
+                    f"{detail}; post-terminal output freeze refused without "
+                    f"changing the established {classification.value} classification: "
+                    f"{error}"
+                )
             observation = ByteTreeObservation.create(entries=())
         except (OSError, RuntimeError) as error:
-            classification = SessionTerminalClassification.CAPSULE_FAILED
-            detail = f"provider output freeze failed: {error}"
+            if classification == SessionTerminalClassification.COMPLETED:
+                classification = SessionTerminalClassification.CAPSULE_FAILED
+                detail = f"provider output freeze failed: {error}"
+            else:
+                detail = (
+                    f"{detail}; post-terminal output freeze failed without "
+                    f"changing the established {classification.value} classification: "
+                    f"{error}"
+                )
             observation = ByteTreeObservation.create(entries=())
 
         try:

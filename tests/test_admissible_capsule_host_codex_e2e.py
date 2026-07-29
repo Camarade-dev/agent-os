@@ -142,6 +142,13 @@ class _CrashAfterEffectController(DockerCapsuleController):
         raise CrashInjected("synthetic crash after capsule effect")
 
 
+class _PostTerminalFreezeFailureController(DockerCapsuleController):
+    """Inject a later infrastructure failure after protocol refusal."""
+
+    def freeze_output(self, handle):
+        raise RuntimeError("injected post-terminal Docker freeze failure")
+
+
 def _backend(
     tmp_path: Path,
     image_identity: str,
@@ -723,6 +730,34 @@ def test_duplicate_json_keys_are_refused_before_protocol_semantics(
         == SessionTerminalClassification.APP_SERVER_PROTOCOL_FAILED
     )
     assert output.transport_result.closed_cleanly is False
+
+
+def test_protocol_refusal_precedes_a_later_snapshot_failure(
+    tmp_path: Path, local_ubuntu_identity: str
+):
+    """A later Docker error cannot erase an established parser refusal."""
+
+    backend, workspace, connection, session_id = _backend(
+        tmp_path,
+        local_ubuntu_identity,
+        controller_type=_PostTerminalFreezeFailureController,
+    )
+    raw = (
+        '{"method":"turn/completed","method":"turn/completed","params":'
+        + json.dumps(_turn_completed()["params"], separators=(",", ":"))
+        + "}"
+    )
+    connection.queue_messages([*_protocol_prefix(session_id), raw])
+    output = backend.run(workspace)
+    snapshot = backend.reconstruct(workspace)
+    assert (
+        snapshot.effective_terminal_classification
+        == SessionTerminalClassification.APP_SERVER_PROTOCOL_FAILED
+    )
+    assert output.execution_truth.controller_classification == (
+        SessionTerminalClassification.APP_SERVER_PROTOCOL_FAILED.value
+    )
+    assert output.cleanup_result.cleanup_proven is True
 
 
 def test_post_terminal_tool_request_fails_the_session(
