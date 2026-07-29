@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "admissible://capsule/CapsuleBrokerResult-v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "request_fingerprint",
+    "sequence",
+    "classification",
+    "terminal",
+    "payload",
+    "result_fingerprint"
+  ],
+  "properties": {
+    "schema_version": {"const": "admissible_capsule_broker_result_v1"},
+    "request_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "sequence": {"type": "integer", "minimum": 1, "maximum": 1000000},
+    "classification": {"enum": ["SUCCEEDED", "REFUSED", "FAILED", "UNKNOWN"]},
+    "terminal": {"type": "boolean"},
+    "payload": {"type": "object"},
+    "result_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

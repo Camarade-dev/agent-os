@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "admissible://capsule/CapsuleBrokerRequest-v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "request_id",
+    "operation",
+    "backend_session_id",
+    "controller_session_id",
+    "capsule_session_id",
+    "authority_fingerprint",
+    "sequence",
+    "tool_call_identity",
+    "payload",
+    "request_fingerprint"
+  ],
+  "properties": {
+    "schema_version": {"const": "admissible_capsule_broker_request_v1"},
+    "request_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"},
+    "operation": {
+      "enum": [
+        "CREATE_SESSION",
+        "EXECUTE_TOOL",
+        "FREEZE_WORKSPACE",
+        "OBSERVE_FROZEN",
+        "BIND_FROZEN",
+        "TERMINATE_CLEANUP",
+        "GET_FROZEN_REFERENCE",
+        "SHUTDOWN"
+      ]
+    },
+    "backend_session_id": {"type": "string"},
+    "controller_session_id": {"type": "string"},
+    "capsule_session_id": {"type": "string"},
+    "authority_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "sequence": {"type": "integer", "minimum": 1, "maximum": 1000000},
+    "tool_call_identity": {"type": "string"},
+    "payload": {"type": "object"},
+    "request_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

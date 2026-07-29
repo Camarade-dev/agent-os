@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "admissible://capsule/AuthenticationBrokerRequest-v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "session_id",
+    "operation",
+    "authority_fingerprint",
+    "sequence",
+    "metadata_policy_fingerprint",
+    "request_fingerprint"
+  ],
+  "properties": {
+    "schema_version": {"const": "admissible_auth_broker_request_v1"},
+    "session_id": {"type": "string"},
+    "operation": {"enum": ["PREPARE", "HANDOFF", "CLEANUP", "SHUTDOWN"]},
+    "authority_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "sequence": {"type": "integer", "minimum": 1, "maximum": 16},
+    "metadata_policy_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "request_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

@@ -23,6 +23,7 @@ from admissible.capsule.common import (
 from admissible.capsule.execution_authority import (
     ExecutableFileIdentity,
     validate_component_identity,
+    validate_component_identity_metadata,
 )
 
 
@@ -257,7 +258,11 @@ class AuthenticatedControlAuthority:
             raise ValueError("unsupported host-control authority schema")
         if self.codex_protocol_version != CODEX_APP_SERVER_PROTOCOL_VERSION:
             raise ValueError("wrong host-control Codex protocol version")
-        validate_component_identity(self.executable_identity, "control executable")
+        (
+            validate_component_identity_metadata
+            if self.authentication_boundary_state == "OS_ENFORCED"
+            else validate_component_identity
+        )(self.executable_identity, "control executable")
         require_sha256(self.policy_fingerprint, "host-control policy fingerprint")
         if self.authentication_boundary_state not in {
             "OS_ENFORCED",

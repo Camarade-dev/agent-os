@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "admissible://capsule/EgressRelayEvidence-v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "session_id",
+    "connection_id",
+    "destination_hostname",
+    "destination_port",
+    "pinned_ip",
+    "bytes_from_codex",
+    "bytes_to_codex",
+    "terminal_classification",
+    "evidence_fingerprint"
+  ],
+  "properties": {
+    "schema_version": {"const": "admissible_egress_relay_evidence_v1"},
+    "session_id": {"type": "string"},
+    "connection_id": {"type": "string"},
+    "destination_hostname": {"type": "string"},
+    "destination_port": {"const": 443},
+    "pinned_ip": {"type": "string"},
+    "bytes_from_codex": {"type": "integer", "minimum": 0},
+    "bytes_to_codex": {"type": "integer", "minimum": 0},
+    "terminal_classification": {"type": "string"},
+    "evidence_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

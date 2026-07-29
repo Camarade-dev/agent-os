@@ -27,7 +27,7 @@ from admissible.capsule.common import (
 
 FILE_IDENTITY_SCHEMA_VERSION = "admissible_executable_file_identity_v1"
 BACKEND_EXECUTION_AUTHORITY_SCHEMA_VERSION = (
-    "admissible_host_codex_docker_execution_authority_v2"
+    "admissible_host_codex_docker_execution_authority_v3"
 )
 HOST_CODEX_BACKEND_KIND = "host_codex_app_server_capsule_v1"
 
@@ -258,6 +258,69 @@ def validate_component_identity(value: Mapping[str, Any], label: str) -> Mapping
     return dict(value)
 
 
+def validate_component_identity_metadata(
+    value: Mapping[str, Any],
+    label: str,
+) -> Mapping[str, Any]:
+    """Validate public identity bytes without reopening a hidden executable.
+
+    The boundary launcher performs ``ExecutableFileIdentity.reattest`` before
+    confinement.  The already-confined controller may validate the resulting
+    immutable metadata but must not regain pathname access merely to validate
+    it.
+    """
+
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be an attested component identity")
+    if value.get("schema_version") != FILE_IDENTITY_SCHEMA_VERSION:
+        return validate_component_identity(value, label)
+    require_exact_keys(
+        value,
+        {
+            "schema_version",
+            "canonical_path",
+            "sha256",
+            "device",
+            "inode",
+            "mode",
+            "size",
+            "mtime_ns",
+            "identity_fingerprint",
+        },
+        label,
+    )
+    path = value["canonical_path"]
+    if (
+        not isinstance(path, str)
+        or not Path(path).is_absolute()
+        or ".." in Path(path).parts
+        or "\x00" in path
+    ):
+        raise ValueError(f"{label} has invalid canonical path metadata")
+    require_sha256(value["sha256"], f"{label} content identity")
+    for key, maximum in (
+        ("device", 2**63 - 1),
+        ("inode", 2**63 - 1),
+        ("mode", 0o7777),
+        ("size", 2**63 - 1),
+        ("mtime_ns", 2**63 - 1),
+    ):
+        require_strict_int(
+            value[key],
+            f"{label} {key}",
+            minimum=0,
+            maximum=maximum,
+        )
+    require_sha256(
+        value["identity_fingerprint"],
+        f"{label} identity fingerprint",
+    )
+    body = {key: value[key] for key in value if key != "identity_fingerprint"}
+    if fingerprint(body) != value["identity_fingerprint"]:
+        raise ValueError(f"{label} identity fingerprint mismatch")
+    return dict(value)
+
+
 @dataclass(frozen=True)
 class BackendExecutionAuthority:
     """Every authority and byte binding for one concrete backend session."""
@@ -286,6 +349,8 @@ class BackendExecutionAuthority:
     connection_mode: str
     connection_factory_identity: Mapping[str, Any]
     authentication_boundary_state: str
+    os_boundary_authority: Mapping[str, Any]
+    os_boundary_authority_fingerprint: str
     budgets: Mapping[str, Any]
     terminal_policy: Mapping[str, Any]
     authority_fingerprint: str
@@ -314,7 +379,43 @@ class BackendExecutionAuthority:
         authentication_boundary_state: str,
         budgets: Mapping[str, Any],
         terminal_policy: Mapping[str, Any],
+        os_boundary_authority: Mapping[str, Any] | None = None,
     ) -> "BackendExecutionAuthority":
+        if os_boundary_authority is None:
+            if connection_mode != "synthetic_provider_free":
+                raise ValueError(
+                    "production execution requires an explicit OS boundary authority"
+                )
+            from admissible.capsule.boundary_launcher import (
+                provider_free_os_boundary_authority,
+            )
+
+            boundary = provider_free_os_boundary_authority(
+                dependent_identities=(
+                    codex_executable_identity,
+                    bwrap_executable_identity,
+                    docker_executable_identity,
+                    connection_factory_identity,
+                ),
+                dependent_authorities={
+                    "capsule_image_content_id": capsule_image_content_id,
+                    "capsule_execution_authority_fingerprint": fingerprint(
+                        {
+                            "image_identity": capsule_image_content_id,
+                            "synthetic_compatibility": True,
+                        }
+                    ),
+                    "capsule_broker_runtime_authority_fingerprint": (
+                        controller_identity
+                    ),
+                    "codex_protocol_schema_identity": protocol_schema_identity(),
+                    "dynamic_tools_schema_identity": dynamic_tools_schema_identity,
+                },
+            )
+        else:
+            from admissible.capsule.boundary_authority import OSBoundaryAuthority
+
+            boundary = OSBoundaryAuthority.from_dict(os_boundary_authority)
         body = {
             "schema_version": BACKEND_EXECUTION_AUTHORITY_SCHEMA_VERSION,
             "backend_kind": HOST_CODEX_BACKEND_KIND,
@@ -340,6 +441,8 @@ class BackendExecutionAuthority:
             "connection_mode": connection_mode,
             "connection_factory_identity": dict(connection_factory_identity),
             "authentication_boundary_state": authentication_boundary_state,
+            "os_boundary_authority": boundary.to_dict(),
+            "os_boundary_authority_fingerprint": boundary.authority_fingerprint,
             "budgets": dict(budgets),
             "terminal_policy": dict(terminal_policy),
         }
@@ -382,13 +485,33 @@ class BackendExecutionAuthority:
             self.capsule_image_content_id.removeprefix("sha256:"),
             "capsule image content ID",
         )
-        validate_component_identity(self.codex_executable_identity, "Codex executable")
-        validate_component_identity(self.bwrap_executable_identity, "bwrap executable")
-        validate_component_identity(self.docker_executable_identity, "Docker executable")
-        factory_identity = validate_component_identity(
+        if self.connection_mode not in {
+            "production_bwrap",
+            "production_os_boundary",
+            "synthetic_provider_free",
+        }:
+            raise ValueError("connection mode substitution refused")
+        component_validator = (
+            validate_component_identity_metadata
+            if self.connection_mode == "production_os_boundary"
+            else validate_component_identity
+        )
+        component_validator(self.codex_executable_identity, "Codex executable")
+        component_validator(self.bwrap_executable_identity, "bwrap executable")
+        component_validator(self.docker_executable_identity, "Docker executable")
+        factory_identity = component_validator(
             self.connection_factory_identity,
             "connection factory",
         )
+        from admissible.capsule.boundary_authority import OSBoundaryAuthority
+
+        boundary = OSBoundaryAuthority.from_dict(self.os_boundary_authority)
+        require_sha256(
+            self.os_boundary_authority_fingerprint,
+            "OS boundary authority fingerprint",
+        )
+        if boundary.authority_fingerprint != self.os_boundary_authority_fingerprint:
+            raise ValueError("OS boundary authority binding differs")
         mission = base64.b64decode(self.mission_base64, validate=True)
         prompt = base64.b64decode(self.prompt_base64, validate=True)
         if sha256_bytes(mission) != self.mission_fingerprint:
@@ -399,8 +522,6 @@ class BackendExecutionAuthority:
             raise ValueError("prompt bytes and fingerprint disagree")
         require_identifier(self.backend_session_id, "backend session identity")
         require_identifier(self.run_id, "backend run identity")
-        if self.connection_mode not in {"production_bwrap", "synthetic_provider_free"}:
-            raise ValueError("connection mode substitution refused")
         if self.authentication_boundary_state not in {
             "OS_ENFORCED",
             "SYNTHETIC_PROVIDER_FREE",
@@ -408,12 +529,12 @@ class BackendExecutionAuthority:
         }:
             raise ValueError("unknown authentication-boundary state")
         if (
-            self.connection_mode == "production_bwrap"
+            self.connection_mode in {"production_bwrap", "production_os_boundary"}
             and self.authentication_boundary_state != "OS_ENFORCED"
         ):
             raise ValueError("production launch requires an OS-enforced authentication boundary")
         if (
-            self.connection_mode == "production_bwrap"
+            self.connection_mode in {"production_bwrap", "production_os_boundary"}
             and factory_identity.get("provider_request_capable") is not True
         ):
             raise ValueError("production factory lacks a provider-capable source attestation")
@@ -422,6 +543,30 @@ class BackendExecutionAuthority:
             and factory_identity.get("provider_request_capable") is not False
         ):
             raise ValueError("synthetic factory became provider-capable")
+        dependent_fingerprints = {
+            item["identity_fingerprint"] for item in boundary.dependent_identities
+        }
+        for label, identity in (
+            ("Codex", self.codex_executable_identity),
+            ("bubblewrap", self.bwrap_executable_identity),
+            ("Docker", self.docker_executable_identity),
+            ("connection factory", self.connection_factory_identity),
+        ):
+            if identity["identity_fingerprint"] not in dependent_fingerprints:
+                raise ValueError(f"{label} identity is absent from OS boundary dependencies")
+        if (
+            boundary.dependent_authorities["capsule_image_content_id"]
+            != self.capsule_image_content_id
+            or boundary.dependent_authorities[
+                "capsule_broker_runtime_authority_fingerprint"
+            ]
+            != self.controller_identity
+            or boundary.dependent_authorities["codex_protocol_schema_identity"]
+            != self.protocol_schema_identity
+            or boundary.dependent_authorities["dynamic_tools_schema_identity"]
+            != self.dynamic_tools_schema_identity
+        ):
+            raise ValueError("OS boundary image or protocol dependency differs")
         required_budgets = {
             "event_timeout_ms",
             "protocol_drain_timeout_ms",

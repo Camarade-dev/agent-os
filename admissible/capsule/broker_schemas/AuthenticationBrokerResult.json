@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "admissible://capsule/AuthenticationBrokerResult-v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "session_id",
+    "sequence",
+    "classification",
+    "evidence",
+    "result_fingerprint"
+  ],
+  "properties": {
+    "schema_version": {"const": "admissible_auth_broker_result_v1"},
+    "session_id": {"type": "string"},
+    "sequence": {"type": "integer", "minimum": 1, "maximum": 16},
+    "classification": {"enum": ["PREPARED", "HANDED_OFF", "CLEANED", "REFUSED", "FAILED"]},
+    "evidence": {"type": "object"},
+    "result_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

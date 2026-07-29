@@ -1,0 +1,27 @@
+{
+  "schema_version": "admissible_codex_destination_manifest_v1",
+  "codex_version": "0.145.0",
+  "policy_revision": "chatgpt_provider_free_observation_v1",
+  "destinations": [
+    {
+      "hostname": "chatgpt.com",
+      "port": 443,
+      "evidence": "OBSERVED_REQUIRED",
+      "canary_requirement": "REFUSE_RUN_IF_UNSEALED_REQUESTED"
+    },
+    {
+      "hostname": "ab.chatgpt.com",
+      "port": 443,
+      "evidence": "OBSERVED_STARTUP",
+      "canary_requirement": "REFUSE_RUN_IF_UNSEALED_REQUESTED"
+    },
+    {
+      "hostname": "auth.openai.com",
+      "port": 443,
+      "evidence": "STATICALLY_DISCOVERED_NOT_EXERCISED",
+      "canary_requirement": "REFUSE_RUN_IF_UNSEALED_REQUESTED"
+    }
+  ],
+  "dynamic_widening": false,
+  "manifest_fingerprint": "25eed412f6fe30b30b0aa911f05c5aeaeb04c86b9c5835a60a0605b8944323e4"
+}
