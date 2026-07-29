@@ -170,17 +170,26 @@ def test_sdist_and_wheel_contain_backend_documentation_and_generated_schemas(
     assert required_schema_suffixes <= wheel_names
     required_model_sources = {
         "admissible/capsule/model_authority.py",
+        "admissible/capsule/preflight_seal.py",
         "admissible/capsule/serialization_witness.py",
+        "admissible/capsule/serialization_witness_runtime.py",
     }
     assert required_model_sources <= wheel_names
     assert all("/tests/" not in name for name in sdist_names)
 
-    # Production model/configuration support ships; the synthetic witness
-    # credentials, endpoint fixtures and driver never do.
+    # Production model/configuration and trusted verifier code ships; no
+    # credential, fixed endpoint fixture, certificate, key, or test driver does.
     model_source = runtime_sources["admissible/capsule/model_authority.py"]
     assert 'model = "{model}"' in model_source
     assert "model_reasoning_effort" in model_source
     assert "gpt-5.3-codex" in model_source
+    witness_runtime_source = runtime_sources[
+        "admissible/capsule/serialization_witness_runtime.py"
+    ]
+    assert "1.1.1.1" not in witness_runtime_source
+    assert "chatgpt.com" not in witness_runtime_source
+    assert "getaddrinfo" not in witness_runtime_source
+    assert "create_connection" not in witness_runtime_source
     forbidden_witness_material = (
         b"synthetic-provider-free-key",
         b"SYNTHETIC_API_KEY",

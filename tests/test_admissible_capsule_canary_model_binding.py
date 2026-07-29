@@ -43,13 +43,13 @@ from admissible.capsule.model_authority import (
     MODEL_CONFIGURATION_CHANNEL,
     CodexModelAuthority,
     ModelConfigurationError,
-    canary_model_authority,
     ephemeral_config_bytes,
     require_exact_model,
     require_exact_reasoning_effort,
     validate_effective_thread_configuration,
     validate_launch_configuration_bytes,
 )
+from tests._verified_canary_binding import verified_canary_binding
 from admissible.capsule.serialization_witness import (
     SerializationWitnessError,
     evaluate_serialization_witness,
@@ -86,10 +86,8 @@ def _serialized(model: str, effort: str | None):
 
 
 def test_canary_authority_binds_the_exact_model_and_low_effort():
-    authority = canary_model_authority(
-        codex_executable_identity=_codex_component(),
-        serialization_witness_identity=serialization_witness_identity(),
-    )
+    binding = verified_canary_binding()
+    authority = binding["authority"]
     assert authority.configured_model == "gpt-5.3-codex"
     assert authority.configured_reasoning_effort == "low"
     assert authority.configuration_channel == MODEL_CONFIGURATION_CHANNEL
@@ -98,6 +96,13 @@ def test_canary_authority_binds_the_exact_model_and_low_effort():
     )
     assert authority.to_dict()["protocol_schema_identity"] == protocol_schema_identity()
     assert authority.serialization_witness_identity == serialization_witness_identity()
+    assert authority.receipt_revalidated is True
+    assert authority.model_binding_policy_fingerprint == (
+        binding["policy"].policy_fingerprint
+    )
+    assert authority.verified_witness_receipt_identity == (
+        binding["receipt"].receipt_identity
+    )
     prohibitions = authority.configuration["prohibitions"]
     assert prohibitions["auto_model_refused"] is True
     assert prohibitions["omitted_reasoning_effort_refused"] is True
@@ -264,6 +269,7 @@ def test_witness_records_only_the_minimum_non_secret_metadata():
     assert b"secret" not in rendered
     assert set(record.to_dict()) == {
         "schema_version",
+        "trust_state",
         "witness_policy_identity",
         "request_path",
         "serialized_model",
@@ -273,19 +279,20 @@ def test_witness_records_only_the_minimum_non_secret_metadata():
     policy = witness_capture_policy()
     assert policy["real_model_or_provider_execution"] is False
     assert policy["public_dns_or_endpoint"] is False
-    assert "provider_entitlement" in policy["does_not_prove"]
+    assert policy["trust_state"] == "UNTRUSTED_OBSERVATION_ONLY"
 
 
-def test_witness_accepts_the_exact_bound_serialization():
+def test_witness_comparison_remains_explicitly_untrusted():
     authority = _authority()
     record = extract_witness_record(
         request_path="/v1/responses",
         request_body=_serialized("gpt-5.3-codex", "low"),
     )
     evidence = evaluate_serialization_witness([record], authority)
-    assert evidence["provider_free_serialized_model"] == "gpt-5.3-codex"
-    assert evidence["provider_free_serialized_reasoning_effort"] == "low"
-    assert evidence["real_service_selected_model"] == "CANARY_TIME_OBSERVATION_ONLY"
+    assert evidence["configured_model"] == "gpt-5.3-codex"
+    assert evidence["configured_reasoning_effort"] == "low"
+    assert evidence["trust_state"] == "UNTRUSTED_OBSERVATION_ONLY"
+    assert evidence["verified_receipt"] is False
 
 
 @pytest.mark.parametrize(
@@ -420,10 +427,10 @@ def _launch_policy(
             Path("/usr/bin/bwrap"), label="launch bwrap"
         ),
         codex_identity=ExecutableFileIdentity.attest(
-            executable, label="synthetic pinned Codex"
+            executable, label="verified pinned Codex"
         ),
         namespace_bootstrap_identity=ExecutableFileIdentity.attest(
-            executable, label="synthetic namespace bootstrap"
+            Path("/usr/bin/true"), label="synthetic namespace bootstrap"
         ),
         codex_home_descriptor=home_descriptor,
         app_server_descriptor=app_right.fileno(),
@@ -455,37 +462,50 @@ def _authority_for(executable: Path, *, model, effort):
 
 
 def test_launch_fingerprint_changes_with_the_bound_model(tmp_path: Path):
-    executable = _static_probe(tmp_path)
-    fingerprints = {}
-    for label, model, effort in (
-        ("bound", CANARY_CONFIGURED_MODEL, CANARY_CONFIGURED_REASONING_EFFORT),
-        ("other-model", "gpt-5.6-sol", CANARY_CONFIGURED_REASONING_EFFORT),
-        ("other-effort", CANARY_CONFIGURED_MODEL, "high"),
+    binding = verified_canary_binding()
+    authority = binding["authority"]
+    policy, closers = _launch_policy(
+        tmp_path,
+        authority,
+        binding["codex"],
+        config=authority.ephemeral_config_bytes,
+    )
+    try:
+        with policy.descriptor_launch() as launch:
+            arguments = os.read(int(launch.argv[2]), 128 * 1024).split(b"\0")
+            assert b"-c" not in arguments and b"--config" not in arguments
+            assert launch.argv[-2:] == tuple(CODEX_APP_SERVER_ARGUMENTS)
+            assert launch.launch_fingerprint
+    finally:
+        _close(closers)
+    for isolated in (
+        _authority(model="gpt-5.6-sol"),
+        _authority(effort="medium"),
+        _authority(effort="high"),
     ):
-        authority = _authority_for(executable, model=model, effort=effort)
-        policy, closers = _launch_policy(
-            tmp_path, authority, executable, config=authority.ephemeral_config_bytes
+        refused, closers = _launch_policy(
+            tmp_path,
+            isolated,
+            binding["codex"],
+            config=isolated.ephemeral_config_bytes,
+            home_suffix=f"-{isolated.authority_fingerprint[:8]}",
         )
         try:
-            with policy.descriptor_launch() as launch:
-                fingerprints[label] = launch.launch_fingerprint
-                arguments = os.read(int(launch.argv[2]), 128 * 1024).split(b"\0")
-                assert b"-c" not in arguments and b"--config" not in arguments
-                assert launch.argv[-2:] == tuple(CODEX_APP_SERVER_ARGUMENTS)
+            with pytest.raises(
+                ModelConfigurationError, match="no revalidated durable"
+            ):
+                with refused.descriptor_launch():
+                    pass
         finally:
             _close(closers)
-    assert len(set(fingerprints.values())) == 3
 
 
 def test_launch_denies_user_and_project_configuration_discovery(tmp_path: Path):
     """No host config is visible and no override argument is ever passed."""
 
-    executable = _static_probe(tmp_path)
-    authority = _authority_for(
-        executable,
-        model=CANARY_CONFIGURED_MODEL,
-        effort=CANARY_CONFIGURED_REASONING_EFFORT,
-    )
+    binding = verified_canary_binding()
+    executable = binding["codex"]
+    authority = binding["authority"]
     policy, closers = _launch_policy(
         tmp_path, authority, executable, config=authority.ephemeral_config_bytes
     )
@@ -512,12 +532,9 @@ def test_launch_denies_user_and_project_configuration_discovery(tmp_path: Path):
 
 
 def test_launch_refuses_a_substituted_or_overriding_configuration(tmp_path: Path):
-    executable = _static_probe(tmp_path)
-    authority = _authority_for(
-        executable,
-        model=CANARY_CONFIGURED_MODEL,
-        effort=CANARY_CONFIGURED_REASONING_EFFORT,
-    )
+    binding = verified_canary_binding()
+    executable = binding["codex"]
+    authority = binding["authority"]
     substituted = authority.ephemeral_config_bytes.replace(
         b'model = "gpt-5.3-codex"', b'model = "gpt-5.3-codey"'
     )
@@ -545,7 +562,8 @@ def test_launch_refuses_a_substituted_or_overriding_configuration(tmp_path: Path
 
 
 def test_launch_refuses_a_model_authority_for_another_executable(tmp_path: Path):
-    executable = _static_probe(tmp_path)
+    binding = verified_canary_binding()
+    executable = binding["codex"]
     other = tmp_path / "other-codex"
     other.write_bytes(b"#!/bin/sh\nexit 0\n")
     other.chmod(0o755)
@@ -558,7 +576,9 @@ def test_launch_refuses_a_model_authority_for_another_executable(tmp_path: Path)
         tmp_path, foreign, executable, config=foreign.ephemeral_config_bytes
     )
     try:
-        with pytest.raises(ValueError, match="another Codex executable"):
+        with pytest.raises(
+            ModelConfigurationError, match="no revalidated durable"
+        ):
             with policy.descriptor_launch():
                 pass
     finally:
@@ -583,13 +603,26 @@ def test_namespace_bootstrap_refuses_any_other_codex_arguments():
 # --- execution authority binding ---------------------------------------
 
 
-def _execution_authority(model_authority: CodexModelAuthority):
-    component = model_authority.codex_executable_identity
+def _execution_authority(
+    model_authority: CodexModelAuthority | None = None,
+    *,
+    receipt=None,
+):
+    binding = verified_canary_binding()
+    model_authority = model_authority or binding["authority"]
+    receipt = receipt or binding["receipt"]
+    codex_component = binding["identity"].to_dict()
+    component = synthetic_component_identity(
+        component="execution-authority-fixture",
+        fixture_material={"source": "provider-free-unit"},
+    )
     return BackendExecutionAuthority.create(
         capsule_authority_fingerprint="1" * 64,
         generic_mission_fingerprint=sha256_bytes(b"mission"),
-        codex_executable_identity=component,
-        model_authority=model_authority.to_dict(),
+        codex_executable_identity=codex_component,
+        model_authority=model_authority,
+        verified_witness_receipt=receipt,
+        trusted_witness_store=binding["store"],
         host_control_policy_fingerprint="2" * 64,
         bwrap_executable_identity=component,
         bwrap_argv_policy_fingerprint="3" * 64,
@@ -635,25 +668,30 @@ def _execution_authority(model_authority: CodexModelAuthority):
 
 
 def test_model_authority_changes_the_complete_execution_authority():
-    bound = _execution_authority(_authority())
-    other_model = _execution_authority(_authority(model="gpt-5.6-sol"))
-    other_effort = _execution_authority(_authority(effort="high"))
-    assert bound.model_authority_fingerprint == _authority().authority_fingerprint
-    assert len(
-        {
-            bound.authority_fingerprint,
-            other_model.authority_fingerprint,
-            other_effort.authority_fingerprint,
-        }
-    ) == 3
-    assert (
-        bound.protocol_request_policy_fingerprint
-        != other_effort.protocol_request_policy_fingerprint
+    binding = verified_canary_binding()
+    bound = _execution_authority()
+    assert bound.model_authority_fingerprint == (
+        binding["authority"].authority_fingerprint
     )
+    assert bound.model_binding_policy_fingerprint == (
+        binding["policy"].policy_fingerprint
+    )
+    assert bound.verified_witness_receipt_identity == (
+        binding["receipt"].receipt_identity
+    )
+    for isolated in (
+        _authority(model="gpt-5.6-sol"),
+        _authority(effort="medium"),
+        _authority(effort="high"),
+    ):
+        with pytest.raises(
+            ModelConfigurationError, match="no revalidated durable"
+        ):
+            _execution_authority(isolated)
 
 
 def test_execution_authority_refuses_a_swapped_model_authority():
-    bound = _execution_authority(_authority())
+    bound = _execution_authority()
     forged = bound.to_dict()
     forged["model_authority"] = _authority(model="gpt-5.6-sol").to_dict()
     with pytest.raises(ValueError, match="model authority binding differs"):
@@ -667,40 +705,7 @@ def test_execution_authority_refuses_a_foreign_codex_in_the_model_authority():
         codex_executable_identity=_codex_component("another-codex"),
         serialization_witness_identity=serialization_witness_identity(),
     )
-    with pytest.raises(ValueError, match="another Codex executable"):
-        BackendExecutionAuthority.create(
-            **{
-                **{
-                    key: value
-                    for key, value in _execution_authority(_authority())
-                    .to_dict()
-                    .items()
-                    if key
-                    in {
-                        "capsule_authority_fingerprint",
-                        "generic_mission_fingerprint",
-                        "host_control_policy_fingerprint",
-                        "bwrap_argv_policy_fingerprint",
-                        "controller_identity",
-                        "capsule_image_content_id",
-                        "dynamic_tools_schema_identity",
-                        "backend_session_id",
-                        "run_id",
-                        "connection_mode",
-                        "authentication_boundary_state",
-                        "budgets",
-                        "terminal_policy",
-                    }
-                },
-                "codex_executable_identity": _codex_component(),
-                "model_authority": foreign.to_dict(),
-                "bwrap_executable_identity": _codex_component(),
-                "docker_executable_identity": _codex_component(),
-                "connection_factory_identity": _codex_component(),
-                "protocol_request_policy_fingerprint": (
-                    protocol_request_policy_fingerprint(foreign)
-                ),
-                "mission_bytes": b"mission",
-                "prompt_bytes": b"prompt",
-            }
-        )
+    with pytest.raises(
+        ModelConfigurationError, match="no revalidated durable"
+    ):
+        _execution_authority(foreign)

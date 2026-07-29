@@ -60,12 +60,19 @@ from admissible.capsule.execution_authority import (
     ExecutableFileIdentity,
     synthetic_component_identity,
 )
-from admissible.capsule.model_authority import canary_model_authority
+from admissible.capsule.model_authority import (
+    CANARY_CONFIGURED_MODEL,
+    CANARY_CONFIGURED_REASONING_EFFORT,
+    CodexModelAuthority,
+)
 from admissible.capsule.serialization_witness import serialization_witness_identity
+from tests._verified_canary_binding import verified_canary_binding
 
 
 def _witness_model_authority():
-    return canary_model_authority(
+    return CodexModelAuthority.create(
+        configured_model=CANARY_CONFIGURED_MODEL,
+        configured_reasoning_effort=CANARY_CONFIGURED_REASONING_EFFORT,
         codex_executable_identity=synthetic_component_identity(
             component="os-boundary-witness-codex",
             fixture_material={"source": "os-boundary-test"},
@@ -451,12 +458,8 @@ def test_codex_launch_uses_sealed_fd_arguments_private_namespaces_and_no_auth_pa
     synthetic_source.write_bytes(SYNTHETIC_AUTHENTICATION)
     home = tmp_path / "broker-owned-home"
     home.mkdir(mode=0o700)
-    launch_model_authority = canary_model_authority(
-        codex_executable_identity=ExecutableFileIdentity.attest(
-            executable, label="synthetic pinned Codex"
-        ).to_dict(),
-        serialization_witness_identity=serialization_witness_identity(),
-    )
+    binding = verified_canary_binding()
+    launch_model_authority = binding["authority"]
     (home / "config.toml").write_bytes(
         launch_model_authority.ephemeral_config_bytes
     )
@@ -472,7 +475,7 @@ def test_codex_launch_uses_sealed_fd_arguments_private_namespaces_and_no_auth_pa
                 Path("/usr/bin/bwrap"), label="Codex launch bwrap"
             ),
             codex_identity=ExecutableFileIdentity.attest(
-                executable, label="synthetic pinned Codex"
+                binding["codex"], label="verified pinned Codex"
             ),
             namespace_bootstrap_identity=ExecutableFileIdentity.attest(
                 executable, label="synthetic namespace bootstrap"

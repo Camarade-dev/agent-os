@@ -52,7 +52,11 @@ from admissible.capsule.execution_authority import (
     ExecutableFileIdentity,
     synthetic_component_identity,
 )
-from admissible.capsule.model_authority import canary_model_authority
+from admissible.capsule.model_authority import (
+    CANARY_CONFIGURED_MODEL,
+    CANARY_CONFIGURED_REASONING_EFFORT,
+    CodexModelAuthority,
+)
 from admissible.capsule.serialization_witness import serialization_witness_identity
 from admissible.capsule.intake import (
     AcceptedMaterialIdentity,
@@ -60,6 +64,7 @@ from admissible.capsule.intake import (
     IntakeFileRecord,
     IntakePublicationState,
 )
+from tests._verified_canary_binding import verified_canary_binding
 from admissible.capsule.models import (
     ByteTreeObservation,
     CleanupResult,
@@ -86,23 +91,28 @@ def _model_authority(component=None):
             component="contract-fixture",
             fixture_material={"source": "unit-test"},
         )
-    return canary_model_authority(
+    return CodexModelAuthority.create(
+        configured_model=CANARY_CONFIGURED_MODEL,
+        configured_reasoning_effort=CANARY_CONFIGURED_REASONING_EFFORT,
         codex_executable_identity=component,
         serialization_witness_identity=serialization_witness_identity(),
     )
 
 
 def _backend_authority() -> BackendExecutionAuthority:
+    binding = verified_canary_binding()
     component = synthetic_component_identity(
         component="contract-fixture",
         fixture_material={"source": "unit-test"},
     )
-    model_authority = _model_authority(component)
+    model_authority = binding["authority"]
     return BackendExecutionAuthority.create(
         capsule_authority_fingerprint="1" * 64,
         generic_mission_fingerprint=sha256_bytes(b"mission"),
-        codex_executable_identity=component,
-        model_authority=model_authority.to_dict(),
+        codex_executable_identity=binding["identity"].to_dict(),
+        model_authority=model_authority,
+        verified_witness_receipt=binding["receipt"],
+        trusted_witness_store=binding["store"],
         host_control_policy_fingerprint="2" * 64,
         bwrap_executable_identity=component,
         bwrap_argv_policy_fingerprint="3" * 64,
@@ -336,7 +346,9 @@ def test_backend_execution_authority_cross_binds_bytes_modes_and_schema():
     assert authority.protocol_schema_identity == protocol_schema_identity()
     assert (
         authority.protocol_request_policy_fingerprint
-        == protocol_request_policy_fingerprint(_model_authority())
+        == protocol_request_policy_fingerprint(
+            verified_canary_binding()["authority"]
+        )
     )
     assert authority.mission_fingerprint == sha256_bytes(b"mission")
     assert authority.prompt_fingerprint == sha256_bytes(b"prompt")

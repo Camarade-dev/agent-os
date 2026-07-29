@@ -69,6 +69,10 @@ from admissible.capsule.verification import (
     CommandCapture,
     VerificationCopy,
 )
+from tests._verified_canary_binding import (
+    create_verified_canary_binding,
+    verified_canary_binding,
+)
 
 
 THREAD_ID = "thread-synthetic-001"
@@ -148,6 +152,7 @@ def _backend(
     command_timeout: float = 5.0,
     event_timeout: float = 2.0,
     force_on_close: bool = False,
+    model_binding=None,
 ):
     limits = DockerCapsuleLimits(
         image_identity=image_identity,
@@ -165,8 +170,15 @@ def _backend(
         returncode=connection_returncode,
         force_on_close=force_on_close,
     )
-    connection_factory = ScriptedCodexConnectionFactory(connection)
-    store = DurableCapsuleSessionStore(tmp_path / "session-store")
+    binding = model_binding or verified_canary_binding()
+    connection_factory = ScriptedCodexConnectionFactory(
+        connection,
+        codex_component_identity=binding["identity"].to_dict(),
+    )
+    store = DurableCapsuleSessionStore(
+        tmp_path / "session-store",
+        trusted_witness_store=binding["store"],
+    )
     capsule_authority = CapsuleAuthority.create(
         backend_kind="host_codex_app_server_capsule_v1",
         capsule_image_identity=image_identity,
@@ -639,6 +651,44 @@ def test_effectful_tool_calls_are_refused_before_model_validation(
             backend._require_validated_model_configuration()
     finally:
         # This test never runs a session, so it owns the prepared capsule.
+        assert backend.cleanup(workspace).cleanup_proven is True
+
+
+def test_effect_guard_revalidates_durable_witness_before_any_request(
+    tmp_path: Path, local_ubuntu_identity: str
+):
+    """A changed durable pack wins over a caller-asserted effective binding."""
+
+    binding = create_verified_canary_binding(
+        tmp_path / "independent-witness-evidence"
+    )
+    backend, workspace, _connection, _session_id = _backend(
+        tmp_path,
+        local_ubuntu_identity,
+        model_binding=binding,
+    )
+    receipt = binding["receipt"]
+    pack = (
+        binding["store"].root
+        / receipt.to_dict()["evidence_pack_relative_path"]
+    )
+    pack.write_bytes(pack.read_bytes() + b"\n")
+    backend._effective_model_binding = {
+        "model_authority_fingerprint": (
+            backend.model_authority.authority_fingerprint
+        ),
+        "app_server_effective_model": CANARY_CONFIGURED_MODEL,
+        "app_server_effective_reasoning_effort": (
+            CANARY_CONFIGURED_REASONING_EFFORT
+        ),
+    }
+    try:
+        with pytest.raises(ValueError, match="evidence bytes changed"):
+            backend._require_validated_model_configuration()
+        snapshot = backend.reconstruct(workspace)
+        assert snapshot.requests == ()
+        assert snapshot.results == ()
+    finally:
         assert backend.cleanup(workspace).cleanup_proven is True
 
 

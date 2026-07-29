@@ -248,20 +248,15 @@ def test_namespace_is_private_and_routeless(tmp_path: Path, pinned_codex: Path):
             sys.executable,
             "-c",
             (
-                "import json,socket\n"
+                "import json,pathlib,socket\n"
                 "result={}\n"
                 "s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(1)\n"
                 "result['loopback_bound']=True\n"
-                "try:\n"
-                "    socket.create_connection(('1.1.1.1',443),timeout=2)\n"
-                "    result['egress']=True\n"
-                "except OSError:\n"
-                "    result['egress']=False\n"
-                "try:\n"
-                "    socket.getaddrinfo('chatgpt.com',443)\n"
-                "    result['dns']=True\n"
-                "except OSError:\n"
-                "    result['dns']=False\n"
+                "result['non_loopback_interfaces']=[name for _,name in "
+                "socket.if_nameindex() if name != 'lo']\n"
+                "routes=pathlib.Path('/proc/net/route').read_text().splitlines()[1:]\n"
+                "result['non_loopback_routes']=[line for line in routes "
+                "if line.split() and line.split()[0] != 'lo']\n"
                 "print(json.dumps(result))\n"
             ),
         ),
@@ -273,8 +268,8 @@ def test_namespace_is_private_and_routeless(tmp_path: Path, pinned_codex: Path):
     assert completed.returncode == 0, completed.stderr
     observed = json.loads(completed.stdout)
     assert observed["loopback_bound"] is True
-    assert observed["egress"] is False
-    assert observed["dns"] is False
+    assert observed["non_loopback_interfaces"] == []
+    assert observed["non_loopback_routes"] == []
 
 
 def test_pinned_executable_is_content_attested_not_a_mutable_symlink(
@@ -317,10 +312,11 @@ def test_pinned_client_serializes_the_exact_bound_model_and_effort(
     # Provider-free serialized evidence taken off the real request.
     records = _records(scenario)
     evidence = evaluate_serialization_witness(records, authority)
-    assert evidence["provider_free_serialized_model"] == "gpt-5.3-codex"
-    assert evidence["provider_free_serialized_reasoning_effort"] == "low"
+    assert evidence["configured_model"] == "gpt-5.3-codex"
+    assert evidence["configured_reasoning_effort"] == "low"
     assert evidence["observed_requests"] >= 1
-    assert evidence["real_service_selected_model"] == "CANARY_TIME_OBSERVATION_ONLY"
+    assert evidence["trust_state"] == "UNTRUSTED_OBSERVATION_ONLY"
+    assert evidence["verified_receipt"] is False
     assert records[0].request_path.endswith("/responses")
 
 
