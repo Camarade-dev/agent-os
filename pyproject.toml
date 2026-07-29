@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools==75.8.2", "wheel==0.45.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -26,6 +26,15 @@ include = ["agent_os*", "admissible*"]
 [tool.setuptools.package-data]
 agent_os = ["templates/*.md"]
 "admissible.product_ui" = ["index.html", "app.css", "app.js"]
+"admissible.capsule" = [
+    "protocol_schemas/README.md",
+    "protocol_schemas/*.json",
+    "protocol_schemas/v1/*.json",
+    "protocol_schemas/v2/*.json",
+]
+
+[tool.setuptools.data-files]
+"share/doc/agent-os" = ["docs/admissible-host-codex-capsule-backend.md"]
 
 [tool.pytest.ini_options]
 markers = [
