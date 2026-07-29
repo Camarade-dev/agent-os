@@ -52,6 +52,8 @@ from admissible.capsule.execution_authority import (
     ExecutableFileIdentity,
     synthetic_component_identity,
 )
+from admissible.capsule.model_authority import canary_model_authority
+from admissible.capsule.serialization_witness import serialization_witness_identity
 from admissible.capsule.intake import (
     AcceptedMaterialIdentity,
     IntakeEvidence,
@@ -78,15 +80,29 @@ from admissible.capsule.session_store import (
 )
 
 
+def _model_authority(component=None):
+    if component is None:
+        component = synthetic_component_identity(
+            component="contract-fixture",
+            fixture_material={"source": "unit-test"},
+        )
+    return canary_model_authority(
+        codex_executable_identity=component,
+        serialization_witness_identity=serialization_witness_identity(),
+    )
+
+
 def _backend_authority() -> BackendExecutionAuthority:
     component = synthetic_component_identity(
         component="contract-fixture",
         fixture_material={"source": "unit-test"},
     )
+    model_authority = _model_authority(component)
     return BackendExecutionAuthority.create(
         capsule_authority_fingerprint="1" * 64,
         generic_mission_fingerprint=sha256_bytes(b"mission"),
         codex_executable_identity=component,
+        model_authority=model_authority.to_dict(),
         host_control_policy_fingerprint="2" * 64,
         bwrap_executable_identity=component,
         bwrap_argv_policy_fingerprint="3" * 64,
@@ -94,7 +110,9 @@ def _backend_authority() -> BackendExecutionAuthority:
         capsule_image_content_id="sha256:" + "5" * 64,
         docker_executable_identity=component,
         dynamic_tools_schema_identity=fingerprint(dynamic_tools_grammar()),
-        protocol_request_policy_fingerprint=protocol_request_policy_fingerprint(),
+        protocol_request_policy_fingerprint=protocol_request_policy_fingerprint(
+            model_authority
+        ),
         mission_bytes=b"mission",
         prompt_bytes=b"prompt",
         backend_session_id="backend-session-001",
@@ -318,7 +336,7 @@ def test_backend_execution_authority_cross_binds_bytes_modes_and_schema():
     assert authority.protocol_schema_identity == protocol_schema_identity()
     assert (
         authority.protocol_request_policy_fingerprint
-        == protocol_request_policy_fingerprint()
+        == protocol_request_policy_fingerprint(_model_authority())
     )
     assert authority.mission_fingerprint == sha256_bytes(b"mission")
     assert authority.prompt_fingerprint == sha256_bytes(b"prompt")
@@ -584,7 +602,9 @@ def test_pinned_initialize_and_dynamic_tools_wire_shape_is_closed():
             "capabilities": {"experimentalApi": True},
         },
     }
-    request = thread_start_request("thread-request-001")
+    request = thread_start_request(
+        "thread-request-001", model_authority=_model_authority()
+    )
     assert request["method"] == "thread/start"
     assert request["params"]["cwd"] == "/control/empty"
     assert request["params"]["approvalPolicy"] == "never"
@@ -601,7 +621,9 @@ def test_pinned_initialize_and_dynamic_tools_wire_shape_is_closed():
 
 
 def test_readonly_alias_is_refused_and_exact_read_only_is_schema_valid():
-    request = thread_start_request("thread-request-001")
+    request = thread_start_request(
+        "thread-request-001", model_authority=_model_authority()
+    )
     validate_schema("v2/ThreadStartParams.json", request["params"])
     substituted = json.loads(json.dumps(request["params"]))
     substituted["sandbox"] = "readOnly"
@@ -631,7 +653,9 @@ def test_preventive_configuration_closes_native_web_and_mcp_capabilities():
         "skills",
         "web_search",
     } == set(configuration["features"])
-    request = thread_start_request("thread-request-001")
+    request = thread_start_request(
+        "thread-request-001", model_authority=_model_authority()
+    )
     assert request["params"]["environments"] == []
     assert request["params"]["runtimeWorkspaceRoots"] == []
     assert request["params"]["selectedCapabilityRoots"] == []

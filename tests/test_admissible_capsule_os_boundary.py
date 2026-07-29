@@ -60,6 +60,18 @@ from admissible.capsule.execution_authority import (
     ExecutableFileIdentity,
     synthetic_component_identity,
 )
+from admissible.capsule.model_authority import canary_model_authority
+from admissible.capsule.serialization_witness import serialization_witness_identity
+
+
+def _witness_model_authority():
+    return canary_model_authority(
+        codex_executable_identity=synthetic_component_identity(
+            component="os-boundary-witness-codex",
+            fixture_material={"source": "os-boundary-test"},
+        ),
+        serialization_witness_identity=serialization_witness_identity(),
+    )
 from admissible.capsule.session_store import (
     DurableToolRequest,
     ToolTerminalClassification,
@@ -186,6 +198,7 @@ def test_authentication_broker_fd_handoff_contains_no_path_or_bytes_and_wipes(
         ephemeral_root=homes,
         session_id="synthetic-auth-session",
         authority_fingerprint="a" * 64,
+        configuration_bytes=_witness_model_authority().ephemeral_config_bytes,
     )
     prepared = process.prepare()
     handed_off, home_descriptor = process.handoff()
@@ -236,6 +249,7 @@ def test_authentication_broker_forced_exit_is_failed_and_recovery_wipes(
         ephemeral_root=homes,
         session_id="synthetic-auth-crash",
         authority_fingerprint="e" * 64,
+        configuration_bytes=_witness_model_authority().ephemeral_config_bytes,
     )
     process.prepare()
     evidence = process.force_terminate_and_recover()
@@ -437,6 +451,15 @@ def test_codex_launch_uses_sealed_fd_arguments_private_namespaces_and_no_auth_pa
     synthetic_source.write_bytes(SYNTHETIC_AUTHENTICATION)
     home = tmp_path / "broker-owned-home"
     home.mkdir(mode=0o700)
+    launch_model_authority = canary_model_authority(
+        codex_executable_identity=ExecutableFileIdentity.attest(
+            executable, label="synthetic pinned Codex"
+        ).to_dict(),
+        serialization_witness_identity=serialization_witness_identity(),
+    )
+    (home / "config.toml").write_bytes(
+        launch_model_authority.ephemeral_config_bytes
+    )
     home_descriptor = os.open(
         home,
         os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
@@ -460,6 +483,7 @@ def test_codex_launch_uses_sealed_fd_arguments_private_namespaces_and_no_auth_pa
             session_id="synthetic-codex-launch",
             pin_fingerprint="9" * 64,
             runtime_dependency_descriptors={},
+            model_authority=launch_model_authority,
         )
         with policy.descriptor_launch() as launch:
             assert launch.argv[:2] == ("bwrap-content-attested", "--args")

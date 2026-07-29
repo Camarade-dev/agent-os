@@ -39,12 +39,17 @@ from admissible.capsule.finalizer import (
     initialize_disposable_repository,
 )
 from admissible.capsule.host_codex_backend import (
+    AppServerProtocolError,
     AppServerReceiveTimeout,
     HostCodexAppServerCapsuleBackend,
     ScriptedCodexAppServerConnection,
     ScriptedCodexConnectionFactory,
 )
 from admissible.capsule.host_control import AuthenticatedControlAuthority
+from admissible.capsule.model_authority import (
+    CANARY_CONFIGURED_MODEL,
+    CANARY_CONFIGURED_REASONING_EFFORT,
+)
 from admissible.capsule.intake import AcceptedMaterialIdentity, IntakeAuthority, validate_and_copy
 from admissible.capsule.reducer import reduce
 from admissible.capsule.session_store import (
@@ -223,7 +228,8 @@ def _protocol_prefix(session_id: str):
                 "approvalPolicy": "never",
                 "approvalsReviewer": "user",
                 "cwd": "/control/empty",
-                "model": "synthetic-provider-free",
+                "model": CANARY_CONFIGURED_MODEL,
+                "reasoningEffort": CANARY_CONFIGURED_REASONING_EFFORT,
                 "modelProvider": "synthetic-provider-free",
                 "sandbox": {"type": "readOnly", "networkAccess": False},
                 "thread": thread,
@@ -561,6 +567,73 @@ def test_malformed_lifecycle_response_fails_before_turn_effects(
     )
     assert snapshot.requests == ()
     assert output.execution_truth.protocol_terminal_classification == "PROTOCOL_REFUSED"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("model", "gpt-5.6-sol"),
+        ("model", "GPT-5.3-Codex"),
+        ("model", "auto"),
+        ("reasoningEffort", "high"),
+        ("reasoningEffort", "xhigh"),
+    ],
+)
+def test_model_configuration_mismatch_fails_before_any_capsule_effect(
+    tmp_path: Path, local_ubuntu_identity: str, field: str, value: str
+):
+    """A substituted effective model or effort terminates before effects."""
+
+    backend, workspace, connection, session_id = _backend(tmp_path, local_ubuntu_identity)
+    events = _protocol_prefix(session_id)
+    events[1]["result"][field] = value
+    connection.queue_messages([*events, *_successful_events(session_id)])
+    output = backend.run(workspace)
+    snapshot = backend.reconstruct(workspace)
+    assert (
+        snapshot.effective_terminal_classification
+        == SessionTerminalClassification.APP_SERVER_PROTOCOL_FAILED
+    )
+    assert snapshot.requests == ()
+    assert snapshot.results == ()
+    frozen = backend.frozen_output_path(workspace)
+    assert not frozen.exists() or list(frozen.iterdir()) == []
+    assert output.cleanup_result.cleanup_proven is True
+
+
+def test_omitted_effective_model_configuration_fails_before_any_capsule_effect(
+    tmp_path: Path, local_ubuntu_identity: str
+):
+    backend, workspace, connection, session_id = _backend(tmp_path, local_ubuntu_identity)
+    events = _protocol_prefix(session_id)
+    del events[1]["result"]["reasoningEffort"]
+    connection.queue_messages([*events, *_successful_events(session_id)])
+    backend.run(workspace)
+    snapshot = backend.reconstruct(workspace)
+    assert (
+        snapshot.effective_terminal_classification
+        == SessionTerminalClassification.APP_SERVER_PROTOCOL_FAILED
+    )
+    assert snapshot.requests == ()
+
+
+def test_effectful_tool_calls_are_refused_before_model_validation(
+    tmp_path: Path, local_ubuntu_identity: str
+):
+    """The guard is independent of protocol call order."""
+
+    backend, _workspace, _connection, _session_id = _backend(
+        tmp_path, local_ubuntu_identity
+    )
+    with pytest.raises(AppServerProtocolError, match="before the bound model"):
+        backend._require_validated_model_configuration()
+    backend._effective_model_binding = {
+        "model_authority_fingerprint": "0" * 64,
+        "app_server_effective_model": CANARY_CONFIGURED_MODEL,
+        "app_server_effective_reasoning_effort": CANARY_CONFIGURED_REASONING_EFFORT,
+    }
+    with pytest.raises(AppServerProtocolError, match="differs from the bound authority"):
+        backend._require_validated_model_configuration()
 
 
 def test_wrong_thread_terminal_event_is_refused(
