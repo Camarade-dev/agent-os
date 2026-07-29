@@ -30,6 +30,17 @@ from admissible.capsule.common import (
     require_strict_int,
 )
 from admissible.capsule.models import ProviderOutput
+from admissible.capsule.finalizer import (
+    DurabilityReceipt,
+    FinalizationEvidence,
+    FinalizationResult,
+)
+from admissible.capsule.intake import AcceptedMaterialIdentity
+from admissible.capsule.verification import (
+    BehaviorResult,
+    CheckpointResult,
+    require_independent_copies,
+)
 
 
 SESSION_EVENT_SCHEMA_VERSION = "admissible_host_codex_session_event_v1"
@@ -408,6 +419,12 @@ class ReconstructedCapsuleSession:
     results: tuple[DurableToolResult, ...]
     cleanup: Mapping[str, Any] | None
     provider_output: ProviderOutput | None
+    accepted_material: AcceptedMaterialIdentity | None
+    checkpoint_result: CheckpointResult | None
+    behavior_result: BehaviorResult | None
+    finalization_evidence: FinalizationEvidence | None
+    durability_receipt: DurabilityReceipt | None
+    finalization_result: FinalizationResult | None
     recorded_terminal_classification: SessionTerminalClassification | None
     terminal_detail: str | None
 
@@ -658,6 +675,93 @@ class DurableCapsuleSessionStore:
             {"classification": classification.value, "detail": detail},
         )
 
+    def record_accepted_material(
+        self,
+        session_id: str,
+        accepted_material: AcceptedMaterialIdentity,
+    ) -> None:
+        accepted_material.validated()
+        snapshot = self.reconstruct(session_id)
+        if snapshot.accepted_material is not None:
+            if snapshot.accepted_material != accepted_material:
+                raise ValueError("conflicting accepted-material identity")
+            return
+        if snapshot.provider_output is None or snapshot.recorded_terminal_classification is None:
+            raise ValueError("accepted material cannot precede frozen terminal provider evidence")
+        self._append(
+            session_id,
+            "accepted_material_bound",
+            {"accepted_material": accepted_material.to_dict()},
+        )
+
+    def record_checkpoint_result(self, session_id: str, result: CheckpointResult) -> None:
+        result.validated()
+        snapshot = self.reconstruct(session_id)
+        if snapshot.checkpoint_result is not None:
+            if snapshot.checkpoint_result != result:
+                raise ValueError("conflicting checkpoint evidence")
+            return
+        if snapshot.accepted_material is None or result.accepted_material != snapshot.accepted_material:
+            raise ValueError("checkpoint evidence is bound to different accepted material")
+        self._append(session_id, "checkpoint_verified", {"checkpoint_result": result.to_dict()})
+
+    def record_behavior_result(self, session_id: str, result: BehaviorResult) -> None:
+        result.validated()
+        snapshot = self.reconstruct(session_id)
+        if snapshot.behavior_result is not None:
+            if snapshot.behavior_result != result:
+                raise ValueError("conflicting behavior evidence")
+            return
+        if snapshot.accepted_material is None or result.accepted_material != snapshot.accepted_material:
+            raise ValueError("behavior evidence is bound to different accepted material")
+        if snapshot.checkpoint_result is None or not snapshot.checkpoint_result.passed:
+            raise ValueError("behavior evidence requires checkpoint PASS")
+        require_independent_copies(snapshot.checkpoint_result.copy, result.copy)
+        self._append(session_id, "behavior_verified", {"behavior_result": result.to_dict()})
+
+    def record_finalization_prepared(
+        self,
+        session_id: str,
+        evidence: FinalizationEvidence,
+        receipt: DurabilityReceipt,
+    ) -> None:
+        evidence.validated()
+        receipt.verify(evidence)
+        snapshot = self.reconstruct(session_id)
+        if snapshot.finalization_evidence is not None:
+            if snapshot.finalization_evidence != evidence or snapshot.durability_receipt != receipt:
+                raise ValueError("conflicting finalization preparation evidence")
+            return
+        if snapshot.accepted_material is None or evidence.accepted_material != snapshot.accepted_material:
+            raise ValueError("finalization preparation is bound to different accepted material")
+        if snapshot.behavior_result is None or not snapshot.behavior_result.passed:
+            raise ValueError("finalization preparation requires behavioral PASS")
+        self._append(
+            session_id,
+            "finalization_prepared",
+            {
+                "finalization_evidence": evidence.to_dict(),
+                "durability_receipt": receipt.to_dict(),
+            },
+        )
+
+    def record_finalization_result(self, session_id: str, result: FinalizationResult) -> None:
+        result.validated()
+        snapshot = self.reconstruct(session_id)
+        if snapshot.finalization_result is not None:
+            if snapshot.finalization_result != result:
+                raise ValueError("conflicting finalization result evidence")
+            return
+        if (
+            snapshot.finalization_evidence is None
+            or snapshot.durability_receipt is None
+            or result.durable_evidence != snapshot.finalization_evidence
+            or result.durability_receipt != snapshot.durability_receipt
+            or result.accepted_material != snapshot.accepted_material
+        ):
+            raise ValueError("finalization result differs from durable session authorization")
+        self._append(session_id, "finalization_completed", {"finalization_result": result.to_dict()})
+
     def reconstruct(self, session_id: str) -> ReconstructedCapsuleSession:
         events = self._read_events(session_id)
         if not events or events[0].kind != "session_created":
@@ -673,12 +777,24 @@ class DurableCapsuleSessionStore:
         capsule_process = None
         cleanup = None
         provider_output = None
+        accepted_material = None
+        checkpoint_result = None
+        behavior_result = None
+        finalization_evidence = None
+        durability_receipt = None
+        finalization_result = None
         terminal = None
         terminal_detail = None
         requests: list[DurableToolRequest] = []
         results: list[DurableToolResult] = []
         for event in events[1:]:
-            if terminal is not None:
+            if terminal is not None and event.kind not in {
+                "accepted_material_bound",
+                "checkpoint_verified",
+                "behavior_verified",
+                "finalization_prepared",
+                "finalization_completed",
+            }:
                 raise ValueError("durable event appears after terminal classification")
             if event.kind == "capsule_process_started":
                 if capsule_process is not None:
@@ -751,6 +867,72 @@ class DurableCapsuleSessionStore:
                 terminal_detail = require_nonempty_text(
                     event.payload["detail"], "terminal detail", max_bytes=8192
                 )
+            elif event.kind == "accepted_material_bound":
+                if accepted_material is not None:
+                    raise ValueError("duplicate accepted-material evidence event")
+                if terminal is None or provider_output is None:
+                    raise ValueError("accepted-material evidence precedes frozen terminal provider evidence")
+                require_exact_keys(event.payload, {"accepted_material"}, "accepted material event")
+                accepted_material = AcceptedMaterialIdentity.from_dict(
+                    event.payload["accepted_material"]
+                )
+            elif event.kind == "checkpoint_verified":
+                if checkpoint_result is not None:
+                    raise ValueError("duplicate checkpoint evidence event")
+                require_exact_keys(event.payload, {"checkpoint_result"}, "checkpoint event")
+                checkpoint_result = CheckpointResult.from_dict(event.payload["checkpoint_result"])
+                if accepted_material is None or checkpoint_result.accepted_material != accepted_material:
+                    raise ValueError("replayed checkpoint is bound to different accepted material")
+            elif event.kind == "behavior_verified":
+                if behavior_result is not None:
+                    raise ValueError("duplicate behavior evidence event")
+                require_exact_keys(event.payload, {"behavior_result"}, "behavior event")
+                behavior_result = BehaviorResult.from_dict(event.payload["behavior_result"])
+                if (
+                    accepted_material is None
+                    or behavior_result.accepted_material != accepted_material
+                    or checkpoint_result is None
+                    or not checkpoint_result.passed
+                ):
+                    raise ValueError("replayed behavior is not bound to accepted checkpoint material")
+                require_independent_copies(checkpoint_result.copy, behavior_result.copy)
+            elif event.kind == "finalization_prepared":
+                if finalization_evidence is not None or durability_receipt is not None:
+                    raise ValueError("duplicate finalization preparation event")
+                require_exact_keys(
+                    event.payload,
+                    {"finalization_evidence", "durability_receipt"},
+                    "finalization preparation event",
+                )
+                finalization_evidence = FinalizationEvidence.from_dict(
+                    event.payload["finalization_evidence"]
+                )
+                durability_receipt = DurabilityReceipt.from_dict(
+                    event.payload["durability_receipt"]
+                )
+                durability_receipt.verify(finalization_evidence)
+                if (
+                    accepted_material is None
+                    or finalization_evidence.accepted_material != accepted_material
+                    or behavior_result is None
+                    or not behavior_result.passed
+                ):
+                    raise ValueError("replayed finalization preparation is not authorized")
+            elif event.kind == "finalization_completed":
+                if finalization_result is not None:
+                    raise ValueError("duplicate finalization result event")
+                require_exact_keys(event.payload, {"finalization_result"}, "finalization result event")
+                finalization_result = FinalizationResult.from_dict(
+                    event.payload["finalization_result"]
+                )
+                if (
+                    finalization_evidence is None
+                    or durability_receipt is None
+                    or finalization_result.durable_evidence != finalization_evidence
+                    or finalization_result.durability_receipt != durability_receipt
+                    or finalization_result.accepted_material != accepted_material
+                ):
+                    raise ValueError("replayed finalization result differs from authorization")
             else:
                 raise ValueError(f"unknown durable session event kind: {event.kind}")
         return ReconstructedCapsuleSession(
@@ -766,6 +948,12 @@ class DurableCapsuleSessionStore:
             results=tuple(results),
             cleanup=cleanup,
             provider_output=provider_output,
+            accepted_material=accepted_material,
+            checkpoint_result=checkpoint_result,
+            behavior_result=behavior_result,
+            finalization_evidence=finalization_evidence,
+            durability_receipt=durability_receipt,
+            finalization_result=finalization_result,
             recorded_terminal_classification=terminal,
             terminal_detail=terminal_detail,
         )

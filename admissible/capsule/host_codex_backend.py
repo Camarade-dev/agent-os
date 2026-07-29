@@ -38,6 +38,12 @@ from admissible.capsule.host_control import (
     CONTROL_EMPTY_CWD,
     HostControlBwrapPolicy,
 )
+from admissible.capsule.finalizer import (
+    DurabilityReceipt,
+    FinalizationEvidence,
+    FinalizationResult,
+)
+from admissible.capsule.intake import AcceptedMaterialIdentity
 from admissible.capsule.models import (
     ByteTreeObservation,
     CleanupResult,
@@ -55,6 +61,7 @@ from admissible.capsule.session_store import (
     ToolIdDisposition,
     ToolTerminalClassification,
 )
+from admissible.capsule.verification import BehaviorResult, CheckpointResult
 
 
 CODEX_APP_SERVER_PROTOCOL_VERSION = "0.145.0"
@@ -882,3 +889,46 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
     def reconstruct(self, workspace: WorkspaceReference):
         session_id, _handle = self._session_for(workspace)
         return self.session_store.reconstruct(session_id)
+
+    def bind_accepted_material(
+        self,
+        workspace: WorkspaceReference,
+        accepted_material: AcceptedMaterialIdentity,
+    ) -> None:
+        """Durably bind downstream acceptance to this session's exact intake bytes."""
+
+        session_id, _handle = self._session_for(workspace)
+        self.session_store.record_accepted_material(session_id, accepted_material)
+
+    def record_checkpoint_verification(
+        self,
+        workspace: WorkspaceReference,
+        result: CheckpointResult,
+    ) -> None:
+        session_id, _handle = self._session_for(workspace)
+        self.session_store.record_checkpoint_result(session_id, result)
+
+    def record_behavior_verification(
+        self,
+        workspace: WorkspaceReference,
+        result: BehaviorResult,
+    ) -> None:
+        session_id, _handle = self._session_for(workspace)
+        self.session_store.record_behavior_result(session_id, result)
+
+    def record_finalization_prepared(
+        self,
+        workspace: WorkspaceReference,
+        evidence: FinalizationEvidence,
+        receipt: DurabilityReceipt,
+    ) -> None:
+        session_id, _handle = self._session_for(workspace)
+        self.session_store.record_finalization_prepared(session_id, evidence, receipt)
+
+    def record_finalization_result(
+        self,
+        workspace: WorkspaceReference,
+        result: FinalizationResult,
+    ) -> None:
+        session_id, _handle = self._session_for(workspace)
+        self.session_store.record_finalization_result(session_id, result)
