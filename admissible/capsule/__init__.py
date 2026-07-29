@@ -15,6 +15,15 @@ it, and nothing in this package reinterprets its historical run evidence.
 """
 
 from admissible.capsule.backend import CapsuleAuthority, CapsuleBackend, CapsuleTerminalClassification
+from admissible.capsule.finalizer import (
+    AcceptedBlob,
+    AdmissibleFinalizer,
+    FinalizationOutcome,
+    FinalizationResult,
+    FinalizerPreconditionError,
+    FROZEN_IDENTITY,
+    initialize_disposable_repository,
+)
 from admissible.capsule.intake import (
     NEON_RELAY_AUTHORITY,
     CanonicalIntake,
@@ -50,6 +59,8 @@ from admissible.capsule.verification import (
 )
 
 __all__ = [
+    "AcceptedBlob",
+    "AdmissibleFinalizer",
     "BehavioralVerifierIdentity",
     "BehaviorRefusalCode",
     "BehaviorResult",
@@ -64,6 +75,10 @@ __all__ = [
     "CheckpointResult",
     "CleanupResult",
     "CommandCapture",
+    "FinalizationOutcome",
+    "FinalizationResult",
+    "FinalizerPreconditionError",
+    "FROZEN_IDENTITY",
     "IndependentVerificationResult",
     "IntakeAuthority",
     "IntakeEvidence",
@@ -77,6 +92,7 @@ __all__ = [
     "TransportResult",
     "VerificationCopy",
     "WorkspaceReference",
+    "initialize_disposable_repository",
     "path_policy_reasons",
     "require_independent_copies",
     "validate_and_copy",
