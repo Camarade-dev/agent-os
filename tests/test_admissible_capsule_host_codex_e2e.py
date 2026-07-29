@@ -8,12 +8,14 @@ mission run, remote, or push is reachable from this module.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from admissible.capsule.backend import CapsuleAuthority
+from admissible.capsule.common import CrashInjected, sha256_bytes
 from admissible.capsule.docker_controller import (
     ControllerCleanupEvidence,
     DockerCapsuleController,
@@ -85,6 +87,9 @@ PARENT_IDENTITY = {
 SYNTHETIC_FINALIZATION_MESSAGE = (
     "test: synthetic provider-free capsule acceptance (not Neon Relay)\n"
 )
+SYNTHETIC_MISSION_PROMPT = (
+    "Create the two authorized synthetic witness files using capsule_effects only."
+)
 
 
 def _docker(*arguments: str) -> subprocess.CompletedProcess[str]:
@@ -119,6 +124,15 @@ class _CleanupEvidenceRefusalController(DockerCapsuleController):
         )
 
 
+class _CrashAfterEffectController(DockerCapsuleController):
+    """Synthetic crash after the capsule effect but before result durability."""
+
+    def execute(self, handle, request):
+        result = super().execute(handle, request)
+        assert result.classification == ToolTerminalClassification.SUCCEEDED
+        raise CrashInjected("synthetic crash after capsule effect")
+
+
 def _backend(
     tmp_path: Path,
     image_identity: str,
@@ -126,8 +140,9 @@ def _backend(
     connection_returncode: int = 0,
     controller_type=DockerCapsuleController,
     output_limit: int = 64 * 1024,
-    command_timeout: float = 2.0,
+    command_timeout: float = 5.0,
     event_timeout: float = 2.0,
+    force_on_close: bool = False,
 ):
     limits = DockerCapsuleLimits(
         image_identity=image_identity,
@@ -143,25 +158,28 @@ def _backend(
     connection = ScriptedCodexAppServerConnection(
         (),
         returncode=connection_returncode,
+        force_on_close=force_on_close,
     )
+    connection_factory = ScriptedCodexConnectionFactory(connection)
     store = DurableCapsuleSessionStore(tmp_path / "session-store")
     capsule_authority = CapsuleAuthority.create(
         backend_kind="host_codex_app_server_capsule_v1",
         capsule_image_identity=image_identity,
-        mission_fingerprint="b" * 64,
+        mission_fingerprint=sha256_bytes(SYNTHETIC_MISSION_PROMPT.encode("utf-8")),
     )
     control_authority = AuthenticatedControlAuthority.create(
         codex_protocol_version="0.145.0",
-        executable_identity="synthetic-codex-app-server-0.145.0",
-        policy_fingerprint="c" * 64,
+        executable_identity=connection_factory.codex_component_identity,
+        policy_fingerprint=connection_factory.host_policy_fingerprint,
+        authentication_boundary_state=connection_factory.authentication_boundary_state,
     )
     backend = HostCodexAppServerCapsuleBackend(
         authority=capsule_authority,
         control_authority=control_authority,
         controller=controller,
         session_store=store,
-        connection_factory=ScriptedCodexConnectionFactory(connection),
-        mission_prompt="Create the two authorized synthetic witness files using capsule_effects only.",
+        connection_factory=connection_factory,
+        mission_prompt=SYNTHETIC_MISSION_PROMPT,
         event_timeout_seconds=event_timeout,
     )
     workspace = backend.prepare_workspace()
@@ -170,43 +188,60 @@ def _backend(
 
 
 def _protocol_prefix(session_id: str):
+    thread = {
+        "cliVersion": "0.145.0",
+        "createdAt": 1,
+        "cwd": "/control/empty",
+        "ephemeral": True,
+        "id": THREAD_ID,
+        "modelProvider": "synthetic-provider-free",
+        "preview": "",
+        "sessionId": f"app-session-{session_id}",
+        "source": "appServer",
+        "status": {"type": "idle"},
+        "turns": [],
+        "updatedAt": 1,
+    }
+    turn = {
+        "id": TURN_ID,
+        "status": "inProgress",
+        "items": [],
+    }
     return [
         {
             "id": f"init-{session_id}",
             "result": {
-                "serverInfo": {
-                    "name": "synthetic-codex-app-server",
-                    "version": "0.145.0",
-                }
+                "codexHome": "/control/codex-home",
+                "platformFamily": "unix",
+                "platformOs": "linux",
+                "userAgent": "synthetic-codex-app-server/0.145.0",
             },
         },
         {
             "id": f"thread-{session_id}",
             "result": {
-                "thread": {
-                    "id": THREAD_ID,
-                    "modelProvider": "synthetic-provider-free",
-                }
+                "approvalPolicy": "never",
+                "approvalsReviewer": "user",
+                "cwd": "/control/empty",
+                "model": "synthetic-provider-free",
+                "modelProvider": "synthetic-provider-free",
+                "sandbox": {"type": "readOnly", "networkAccess": False},
+                "thread": thread,
             },
         },
         {
+            "method": "thread/started",
+            "params": {"thread": thread},
+        },
+        {
             "id": f"turn-{session_id}",
-            "result": {
-                "turn": {
-                    "id": TURN_ID,
-                    "status": "inProgress",
-                    "items": [],
-                }
-            },
+            "result": {"turn": turn},
         },
         {
             "method": "turn/started",
             "params": {
-                "turn": {
-                    "id": TURN_ID,
-                    "status": "inProgress",
-                    "items": [],
-                }
+                "threadId": THREAD_ID,
+                "turn": turn,
             },
         },
     ]
@@ -228,14 +263,17 @@ def _tool_call(rpc_id: int, call_id: str, tool: str, arguments):
 
 
 def _dynamic_item(method: str, call_id: str, tool: str, arguments, status: str):
+    timestamp = {"startedAtMs": 1} if method == "item/started" else {"completedAtMs": 2}
     return {
         "method": method,
         "params": {
+            **timestamp,
             "threadId": THREAD_ID,
             "turnId": TURN_ID,
             "item": {
                 "id": call_id,
                 "type": "dynamicToolCall",
+                "namespace": "capsule_effects",
                 "tool": tool,
                 "arguments": arguments,
                 "status": status,
@@ -244,14 +282,15 @@ def _dynamic_item(method: str, call_id: str, tool: str, arguments, status: str):
     }
 
 
-def _turn_completed():
+def _turn_completed(items=None):
     return {
         "method": "turn/completed",
         "params": {
+            "threadId": THREAD_ID,
             "turn": {
                 "id": TURN_ID,
                 "status": "completed",
-                "items": [],
+                "items": items or [],
             }
         },
     }
@@ -278,6 +317,34 @@ def _successful_events(session_id: str):
         "timeout_ms": 1500,
     }
     outside_arguments = {"path": "../outside.txt"}
+    completed_items = [
+        _dynamic_item(
+            "item/completed",
+            "call-write",
+            "write_file",
+            write_arguments,
+            "completed",
+        )["params"]["item"],
+        _dynamic_item(
+            "item/completed",
+            "call-shell",
+            "run_command",
+            shell_arguments,
+            "completed",
+        )["params"]["item"],
+        _dynamic_item(
+            "item/completed",
+            "call-outside",
+            "read_file",
+            outside_arguments,
+            "failed",
+        )["params"]["item"],
+        {
+            "id": "agent-message-001",
+            "type": "agentMessage",
+            "text": "Synthetic provider claims completion; downstream verification remains required.",
+        },
+    ]
     return [
         *_protocol_prefix(session_id),
         _dynamic_item("item/started", "call-write", "write_file", write_arguments, "inProgress"),
@@ -290,10 +357,24 @@ def _successful_events(session_id: str):
         _tool_call(62, "call-outside", "read_file", outside_arguments),
         _dynamic_item("item/completed", "call-outside", "read_file", outside_arguments, "failed"),
         {
+            "method": "item/started",
+            "params": {
+                "threadId": THREAD_ID,
+                "turnId": TURN_ID,
+                "startedAtMs": 1,
+                "item": {
+                    "id": "agent-message-001",
+                    "type": "agentMessage",
+                    "text": "",
+                },
+            },
+        },
+        {
             "method": "item/completed",
             "params": {
                 "threadId": THREAD_ID,
                 "turnId": TURN_ID,
+                "completedAtMs": 2,
                 "item": {
                     "id": "agent-message-001",
                     "type": "agentMessage",
@@ -301,7 +382,7 @@ def _successful_events(session_id: str):
                 },
             },
         },
-        _turn_completed(),
+        _turn_completed(completed_items),
     ]
 
 
@@ -401,6 +482,10 @@ def test_successful_synthetic_app_server_witness_has_no_provider_git_authority(
     assert not (frozen / ".git").exists()
     assert output.cleanup_result.cleanup_proven is True
     assert output.completion_claim.claimed_complete is True
+    assert output.execution_truth.capsule_process_classification == "FORCED_EXIT"
+    assert output.execution_truth.capsule_process_forced is True
+    assert output.execution_truth.capsule_process_exit_normal is False
+    assert output.execution_truth.capsule_process_exit_code is not None
     assert not any(
         "git" in field or "commit" in field
         for field in output.to_dict()
@@ -458,6 +543,131 @@ def test_app_server_protocol_failure_fails_closed(
     assert output.cleanup_result.cleanup_proven is True
 
 
+def test_malformed_lifecycle_response_fails_before_turn_effects(
+    tmp_path: Path, local_ubuntu_identity: str
+):
+    backend, workspace, connection, session_id = _backend(tmp_path, local_ubuntu_identity)
+    events = _protocol_prefix(session_id)
+    events[1] = {
+        "id": f"thread-{session_id}",
+        "result": {"cwd": "/control/empty"},
+    }
+    connection.queue_messages(events)
+    output = backend.run(workspace)
+    snapshot = backend.reconstruct(workspace)
+    assert (
+        snapshot.effective_terminal_classification
+        == SessionTerminalClassification.APP_SERVER_PROTOCOL_FAILED
+    )
+    assert snapshot.requests == ()
+    assert output.execution_truth.protocol_terminal_classification == "PROTOCOL_REFUSED"
+
+
+def test_wrong_thread_terminal_event_is_refused(
+    tmp_path: Path, local_ubuntu_identity: str
+):
+    backend, workspace, connection, session_id = _backend(tmp_path, local_ubuntu_identity)
+    terminal = _turn_completed()
+    terminal["params"]["threadId"] = "another-thread"
+    connection.queue_messages([*_protocol_prefix(session_id), terminal])
+    output = backend.run(workspace)
+    assert (
+        backend.reconstruct(workspace).effective_terminal_classification
+        == SessionTerminalClassification.APP_SERVER_PROTOCOL_FAILED
+    )
+    assert output.execution_truth.protocol_terminal_classification == "PROTOCOL_REFUSED"
+
+
+def test_duplicate_json_keys_are_refused_before_protocol_semantics(
+    tmp_path: Path, local_ubuntu_identity: str
+):
+    backend, workspace, connection, session_id = _backend(tmp_path, local_ubuntu_identity)
+    raw = (
+        '{"method":"turn/completed","method":"turn/completed","params":'
+        + json.dumps(_turn_completed()["params"], separators=(",", ":"))
+        + "}"
+    )
+    connection.queue_messages([*_protocol_prefix(session_id), raw])
+    output = backend.run(workspace)
+    assert (
+        backend.reconstruct(workspace).effective_terminal_classification
+        == SessionTerminalClassification.APP_SERVER_PROTOCOL_FAILED
+    )
+    assert output.transport_result.closed_cleanly is False
+
+
+def test_post_terminal_tool_request_fails_the_session(
+    tmp_path: Path, local_ubuntu_identity: str
+):
+    backend, workspace, connection, session_id = _backend(tmp_path, local_ubuntu_identity)
+    connection.queue_messages(
+        [
+            *_protocol_prefix(session_id),
+            _turn_completed(),
+            _tool_call(
+                60,
+                "late-call",
+                "write_file",
+                {
+                    "path": "late.txt",
+                    "content": "must not execute\n",
+                    "operation": "create",
+                },
+            ),
+        ]
+    )
+    output = backend.run(workspace)
+    assert (
+        backend.reconstruct(workspace).effective_terminal_classification
+        == SessionTerminalClassification.APP_SERVER_PROTOCOL_FAILED
+    )
+    assert not (backend.frozen_output_path(workspace) / "late.txt").exists()
+    assert output.execution_truth.protocol_terminal_classification == "PROTOCOL_REFUSED"
+
+
+def test_nonzero_app_server_exit_after_completed_turn_remains_failure(
+    tmp_path: Path, local_ubuntu_identity: str
+):
+    backend, workspace, connection, session_id = _backend(
+        tmp_path,
+        local_ubuntu_identity,
+        connection_returncode=17,
+    )
+    connection.queue_messages([*_protocol_prefix(session_id), _turn_completed()])
+    output = backend.run(workspace)
+    assert (
+        backend.reconstruct(workspace).effective_terminal_classification
+        == SessionTerminalClassification.PROVIDER_PROCESS_FAILED
+    )
+    assert output.process_result.exit_code == 17
+    assert output.execution_truth.app_server_exit_code == 17
+    assert output.execution_truth.protocol_terminal_classification == "COMPLETED"
+    assert output.transport_result.closed_cleanly is False
+
+
+def test_forced_app_server_close_remains_visible(
+    tmp_path: Path, local_ubuntu_identity: str
+):
+    backend, workspace, connection, session_id = _backend(
+        tmp_path,
+        local_ubuntu_identity,
+        connection_returncode=-9,
+        force_on_close=True,
+    )
+    connection.queue_messages([*_protocol_prefix(session_id), _turn_completed()])
+    output = backend.run(workspace)
+    assert (
+        backend.reconstruct(workspace).effective_terminal_classification
+        == SessionTerminalClassification.PROVIDER_PROCESS_FAILED
+    )
+    assert output.execution_truth.app_server_forced is True
+    assert output.execution_truth.app_server_exit_normal is False
+    assert output.execution_truth.app_server_exit_code == -9
+    assert output.process_result.exit_code is None
+    assert output.process_result.signal == "SIGKILL"
+    assert output.transport_result.closed_cleanly is False
+
+
 def test_capsule_failure_is_terminal_and_still_cleans_resources(
     tmp_path: Path, local_ubuntu_identity: str
 ):
@@ -472,6 +682,13 @@ def test_capsule_failure_is_terminal_and_still_cleans_resources(
     connection.queue_messages(
         [
             *_protocol_prefix(session_id),
+            _dynamic_item(
+                "item/started",
+                "call-dead-capsule",
+                "write_file",
+                arguments,
+                "inProgress",
+            ),
             _tool_call(60, "call-dead-capsule", "write_file", arguments),
         ]
     )
@@ -482,6 +699,47 @@ def test_capsule_failure_is_terminal_and_still_cleans_resources(
     )
     assert output.cleanup_result.cleanup_proven is True
     assert not (backend.frozen_output_path(workspace) / "never-written.txt").exists()
+
+
+def test_crash_after_effect_keeps_unpaired_truth_and_still_cleans_capsule(
+    tmp_path: Path, local_ubuntu_identity: str
+):
+    backend, workspace, connection, session_id = _backend(
+        tmp_path,
+        local_ubuntu_identity,
+        controller_type=_CrashAfterEffectController,
+    )
+    arguments = {
+        "path": "indeterminate.txt",
+        "content": "effect happened before durable result\n",
+        "operation": "create",
+    }
+    connection.queue_messages(
+        [
+            *_protocol_prefix(session_id),
+            _dynamic_item(
+                "item/started",
+                "call-crash",
+                "write_file",
+                arguments,
+                "inProgress",
+            ),
+            _tool_call(60, "call-crash", "write_file", arguments),
+        ]
+    )
+    with pytest.raises(RuntimeError, match="synthetic crash after capsule effect"):
+        backend.run(workspace)
+    snapshot = backend.reconstruct(workspace)
+    assert (
+        snapshot.effective_terminal_classification
+        == SessionTerminalClassification.CRASH_UNPAIRED_REQUEST
+    )
+    assert len(snapshot.requests) == 1
+    assert snapshot.results == ()
+    assert snapshot.cleanup["container_removed"] is True
+    assert snapshot.cleanup["volume_removed"] is True
+    assert snapshot.provider_output is None
+    assert _docker("inspect", snapshot.capsule_process_identity["container_id"]).returncode != 0
 
 
 def test_cleanup_failure_overrides_an_otherwise_successful_turn(
@@ -532,7 +790,17 @@ def test_capsule_command_timeout_kills_the_complete_container_tree(
     )
     arguments = {"argv": ["/bin/sleep", "5"], "cwd": ".", "timeout_ms": 50}
     connection.queue_messages(
-        [*_protocol_prefix(session_id), _tool_call(60, "call-timeout", "run_command", arguments)]
+        [
+            *_protocol_prefix(session_id),
+            _dynamic_item(
+                "item/started",
+                "call-timeout",
+                "run_command",
+                arguments,
+                "inProgress",
+            ),
+            _tool_call(60, "call-timeout", "run_command", arguments),
+        ]
     )
     output = backend.run(workspace)
     snapshot = backend.reconstruct(workspace)
@@ -556,7 +824,17 @@ def test_output_limit_refusal_kills_the_capsule_and_bounds_durable_result(
         "timeout_ms": 1500,
     }
     connection.queue_messages(
-        [*_protocol_prefix(session_id), _tool_call(60, "call-output", "run_command", arguments)]
+        [
+            *_protocol_prefix(session_id),
+            _dynamic_item(
+                "item/started",
+                "call-output",
+                "run_command",
+                arguments,
+                "inProgress",
+            ),
+            _tool_call(60, "call-output", "run_command", arguments),
+        ]
     )
     output = backend.run(workspace)
     snapshot = backend.reconstruct(workspace)
@@ -582,6 +860,7 @@ def test_native_file_or_command_item_fails_the_session_closed(
                 "params": {
                     "threadId": THREAD_ID,
                     "turnId": TURN_ID,
+                    "startedAtMs": 1,
                     "item": {
                         "id": "native-command-001",
                         "type": "commandExecution",
@@ -627,13 +906,36 @@ def test_duplicate_and_conflicting_tool_ids_refuse_without_a_second_effect(
         if conflicting
         else first_arguments
     )
-    connection.queue_messages(
-        [
-            *_protocol_prefix(session_id),
-            _tool_call(60, "call-replay", "write_file", first_arguments),
-            _tool_call(60, "call-replay", "write_file", repeated_arguments),
-        ]
+    events = [
+        *_protocol_prefix(session_id),
+        _dynamic_item(
+            "item/started",
+            "call-replay",
+            "write_file",
+            first_arguments,
+            "inProgress",
+        ),
+        _tool_call(60, "call-replay", "write_file", first_arguments),
+    ]
+    if conflicting:
+        events.append(
+            _dynamic_item(
+                "item/started",
+                "call-conflict",
+                "write_file",
+                repeated_arguments,
+                "inProgress",
+            )
+        )
+    events.append(
+        _tool_call(
+            60,
+            "call-conflict" if conflicting else "call-replay",
+            "write_file",
+            repeated_arguments,
+        )
     )
+    connection.queue_messages(events)
     backend.run(workspace)
     snapshot = backend.reconstruct(workspace)
     assert snapshot.effective_terminal_classification == expected
@@ -656,6 +958,32 @@ def test_evidence_only_reconstruction_recovers_frozen_provider_output(
     assert reconstructed.effective_terminal_classification == SessionTerminalClassification.COMPLETED
     assert reconstructed.unpaired_requests == ()
     assert len(reconstructed.requests) == len(reconstructed.results) == 3
+
+
+def test_frozen_output_mutation_is_refused_by_every_later_reader(
+    tmp_path: Path, local_ubuntu_identity: str
+):
+    backend, workspace, _connection, _session_id, _output = _run_success(
+        tmp_path, local_ubuntu_identity
+    )
+    frozen = backend.frozen_output_path(workspace)
+    (frozen / "index.html").write_text("tampered after freeze\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="mutated after publication"):
+        backend.frozen_output_path(workspace)
+
+
+def test_missing_terminal_journal_record_prevents_reconstruction(
+    tmp_path: Path, local_ubuntu_identity: str
+):
+    backend, workspace, _connection, session_id, _output = _run_success(
+        tmp_path, local_ubuntu_identity
+    )
+    log = backend.session_store.session_directory(session_id) / "evidence.jsonl"
+    lines = log.read_bytes().splitlines(keepends=True)
+    assert b'"kind":"session_terminal"' in lines[-1]
+    log.write_bytes(b"".join(lines[:-1]))
+    with pytest.raises(ValueError, match="externally durable tail"):
+        backend.reconstruct(workspace)
 
 
 def test_successful_intake_followed_by_checkpoint_refusal(

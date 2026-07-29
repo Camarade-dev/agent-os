@@ -268,6 +268,7 @@ def test_observation_bound_exceeded_is_rejected(tmp_path: Path):
         ("/absolute", RejectionCode.ABSOLUTE_PATH),
         ("dir\\backslash", RejectionCode.WINDOWS_SEPARATOR),
         ("a//b", RejectionCode.EMPTY_PATH_COMPONENT),
+        ("e\u0301.txt", RejectionCode.UNICODE_NORMALIZATION_ALIAS),
         ("", RejectionCode.EMPTY_PATH),
     ],
 )
