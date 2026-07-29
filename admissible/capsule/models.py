@@ -32,6 +32,7 @@ TRANSPORT_RESULT_SCHEMA_VERSION = "admissible_capsule_transport_result_v1"
 CLEANUP_RESULT_SCHEMA_VERSION = "admissible_capsule_cleanup_result_v1"
 PROVIDER_COMPLETION_CLAIM_SCHEMA_VERSION = "admissible_capsule_provider_completion_claim_v1"
 PROVIDER_OUTPUT_SCHEMA_VERSION = "admissible_capsule_provider_output_v1"
+EXECUTION_TRUTH_SCHEMA_VERSION = "admissible_capsule_execution_truth_v1"
 
 
 @dataclass(frozen=True)
@@ -395,6 +396,186 @@ class ProviderTerminalClassification(str, Enum):
 
 
 @dataclass(frozen=True)
+class ExecutionTruth:
+    """Concrete process/protocol/cleanup/snapshot truth, never acceptance."""
+
+    schema_version: str
+    backend_execution_authority_fingerprint: str
+    app_server_exit_code: int | None
+    app_server_exit_normal: bool
+    app_server_forced: bool
+    protocol_terminal_classification: str
+    capsule_process_classification: str
+    capsule_process_exit_code: int | None
+    capsule_process_exit_normal: bool
+    capsule_process_forced: bool
+    controller_classification: str
+    cleanup_fingerprint: str
+    journal_tail_fingerprint: str
+    frozen_workspace_fingerprint: str
+    frozen_binding_fingerprint: str
+    truth_fingerprint: str
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        backend_execution_authority_fingerprint: str,
+        app_server_exit_code: int | None,
+        app_server_exit_normal: bool,
+        app_server_forced: bool,
+        protocol_terminal_classification: str,
+        capsule_process_classification: str,
+        capsule_process_exit_code: int | None,
+        capsule_process_exit_normal: bool,
+        capsule_process_forced: bool,
+        controller_classification: str,
+        cleanup_fingerprint: str,
+        journal_tail_fingerprint: str,
+        frozen_workspace_fingerprint: str,
+        frozen_binding_fingerprint: str,
+    ) -> "ExecutionTruth":
+        body = {
+            "schema_version": EXECUTION_TRUTH_SCHEMA_VERSION,
+            "backend_execution_authority_fingerprint": backend_execution_authority_fingerprint,
+            "app_server_exit_code": app_server_exit_code,
+            "app_server_exit_normal": app_server_exit_normal,
+            "app_server_forced": app_server_forced,
+            "protocol_terminal_classification": protocol_terminal_classification,
+            "capsule_process_classification": capsule_process_classification,
+            "capsule_process_exit_code": capsule_process_exit_code,
+            "capsule_process_exit_normal": capsule_process_exit_normal,
+            "capsule_process_forced": capsule_process_forced,
+            "controller_classification": controller_classification,
+            "cleanup_fingerprint": cleanup_fingerprint,
+            "journal_tail_fingerprint": journal_tail_fingerprint,
+            "frozen_workspace_fingerprint": frozen_workspace_fingerprint,
+            "frozen_binding_fingerprint": frozen_binding_fingerprint,
+        }
+        return cls(**body, truth_fingerprint=fingerprint(body)).validated()
+
+    def _body(self) -> dict[str, Any]:
+        return {
+            key: value
+            for key, value in self.__dict__.items()
+            if key != "truth_fingerprint"
+        }
+
+    def validated(self) -> "ExecutionTruth":
+        if self.schema_version != EXECUTION_TRUTH_SCHEMA_VERSION:
+            raise ValueError("unsupported execution-truth schema")
+        require_sha256(
+            self.backend_execution_authority_fingerprint,
+            "backend execution authority fingerprint",
+        )
+        if self.app_server_exit_code is not None:
+            require_strict_int(
+                self.app_server_exit_code,
+                "app-server exit code",
+                minimum=-(2**31),
+                maximum=2**31 - 1,
+            )
+        require_bool(self.app_server_exit_normal, "app-server exit-normal truth")
+        require_bool(self.app_server_forced, "app-server forced-close truth")
+        if self.app_server_exit_normal and self.app_server_forced:
+            raise ValueError("app-server exit cannot be both normal and forced")
+        if self.app_server_exit_normal and self.app_server_exit_code is None:
+            raise ValueError("normal app-server exit requires an exit code")
+        if self.protocol_terminal_classification not in {
+            "COMPLETED",
+            "FAILED",
+            "INTERRUPTED",
+            "ERROR",
+            "EOF_BEFORE_TERMINAL",
+            "PROTOCOL_REFUSED",
+            "TIMED_OUT",
+        }:
+            raise ValueError("unknown protocol terminal classification")
+        if self.capsule_process_classification not in {
+            "NORMAL_EXIT",
+            "FORCED_EXIT",
+            "UNKNOWN",
+        }:
+            raise ValueError("unknown capsule process classification")
+        if self.capsule_process_exit_code is not None:
+            require_strict_int(
+                self.capsule_process_exit_code,
+                "capsule process exit code",
+                minimum=-(2**31),
+                maximum=2**31 - 1,
+            )
+        require_bool(self.capsule_process_exit_normal, "capsule exit-normal truth")
+        require_bool(self.capsule_process_forced, "capsule forced-exit truth")
+        if self.capsule_process_exit_normal and self.capsule_process_forced:
+            raise ValueError("capsule exit cannot be both normal and forced")
+        if (
+            self.capsule_process_classification == "NORMAL_EXIT"
+            and (
+                not self.capsule_process_exit_normal
+                or self.capsule_process_forced
+                or self.capsule_process_exit_code is None
+            )
+        ):
+            raise ValueError("normal capsule classification lacks exact exit truth")
+        if (
+            self.capsule_process_classification == "FORCED_EXIT"
+            and (
+                not self.capsule_process_forced
+                or self.capsule_process_exit_normal
+                or self.capsule_process_exit_code is None
+            )
+        ):
+            raise ValueError("forced capsule classification lacks exact exit truth")
+        if self.capsule_process_classification == "UNKNOWN" and (
+            self.capsule_process_exit_normal
+            or self.capsule_process_forced
+            or self.capsule_process_exit_code is not None
+        ):
+            raise ValueError("unknown capsule classification claims exit truth")
+        require_identifier(self.controller_classification, "controller classification")
+        for label, value in (
+            ("cleanup", self.cleanup_fingerprint),
+            ("journal tail", self.journal_tail_fingerprint),
+            ("frozen workspace", self.frozen_workspace_fingerprint),
+            ("frozen binding", self.frozen_binding_fingerprint),
+            ("execution truth", self.truth_fingerprint),
+        ):
+            require_sha256(value, f"{label} fingerprint")
+        if fingerprint(self._body()) != self.truth_fingerprint:
+            raise ValueError("execution-truth fingerprint mismatch")
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**self._body(), "truth_fingerprint": self.truth_fingerprint}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ExecutionTruth":
+        require_exact_keys(
+            data,
+            {
+                "schema_version",
+                "backend_execution_authority_fingerprint",
+                "app_server_exit_code",
+                "app_server_exit_normal",
+                "app_server_forced",
+                "protocol_terminal_classification",
+                "capsule_process_classification",
+                "capsule_process_exit_code",
+                "capsule_process_exit_normal",
+                "capsule_process_forced",
+                "controller_classification",
+                "cleanup_fingerprint",
+                "journal_tail_fingerprint",
+                "frozen_workspace_fingerprint",
+                "frozen_binding_fingerprint",
+                "truth_fingerprint",
+            },
+            "execution truth",
+        )
+        return cls(**dict(data)).validated()
+
+
+@dataclass(frozen=True)
 class ProviderOutput:
     """The complete, frozen, untrusted result of one capsule provider run."""
 
@@ -407,6 +588,7 @@ class ProviderOutput:
     cleanup_result: CleanupResult
     completion_claim: ProviderCompletionClaim
     output_fingerprint: str
+    execution_truth: ExecutionTruth | None = None
 
     @classmethod
     def create(
@@ -419,6 +601,7 @@ class ProviderOutput:
         transport_result: TransportResult,
         cleanup_result: CleanupResult,
         completion_claim: ProviderCompletionClaim,
+        execution_truth: ExecutionTruth | None = None,
     ) -> "ProviderOutput":
         provisional = cls(
             schema_version=PROVIDER_OUTPUT_SCHEMA_VERSION,
@@ -430,13 +613,14 @@ class ProviderOutput:
             cleanup_result=cleanup_result,
             completion_claim=completion_claim,
             output_fingerprint="0" * 64,
+            execution_truth=execution_truth,
         )
         return cls(
             **{**provisional.__dict__, "output_fingerprint": fingerprint(provisional._body())}
         ).validated()
 
     def _body(self) -> dict[str, Any]:
-        return {
+        body = {
             "schema_version": self.schema_version,
             "capsule_authority_fingerprint": self.capsule_authority_fingerprint,
             "workspace": self.workspace.to_dict(),
@@ -446,6 +630,9 @@ class ProviderOutput:
             "cleanup_result": self.cleanup_result.to_dict(),
             "completion_claim": self.completion_claim.to_dict(),
         }
+        if self.execution_truth is not None:
+            body["execution_truth"] = self.execution_truth.to_dict()
+        return body
 
     def validated(self) -> "ProviderOutput":
         if self.schema_version != PROVIDER_OUTPUT_SCHEMA_VERSION:
@@ -459,6 +646,10 @@ class ProviderOutput:
         self.transport_result.validated()
         self.cleanup_result.validated()
         self.completion_claim.validated()
+        if self.execution_truth is not None:
+            if not isinstance(self.execution_truth, ExecutionTruth):
+                raise ValueError("invalid concrete execution truth")
+            self.execution_truth.validated()
         require_sha256(self.output_fingerprint, "output_fingerprint")
         if fingerprint(self._body()) != self.output_fingerprint:
             raise ValueError("provider output fingerprint mismatch")
@@ -468,12 +659,12 @@ class ProviderOutput:
     def terminal_classification(self) -> ProviderTerminalClassification:
         if not self.cleanup_result.cleanup_proven:
             return ProviderTerminalClassification.CLEANUP_UNCONFIRMED
-        if not self.transport_result.connected or not self.transport_result.closed_cleanly:
-            return ProviderTerminalClassification.TRANSPORT_LOST
         if self.process_result.timed_out:
             return ProviderTerminalClassification.TIMED_OUT
         if self.process_result.exit_code not in (0, None):
             return ProviderTerminalClassification.EXITED_NONZERO
+        if not self.transport_result.connected or not self.transport_result.closed_cleanly:
+            return ProviderTerminalClassification.TRANSPORT_LOST
         return ProviderTerminalClassification.RAN_TO_COMPLETION_CLAIM
 
     def to_dict(self) -> dict[str, Any]:
@@ -483,9 +674,7 @@ class ProviderOutput:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "ProviderOutput":
-        require_exact_keys(
-            data,
-            {
+        expected = {
                 "schema_version",
                 "capsule_authority_fingerprint",
                 "workspace",
@@ -495,9 +684,10 @@ class ProviderOutput:
                 "cleanup_result",
                 "completion_claim",
                 "output_fingerprint",
-            },
-            "provider output",
-        )
+            }
+        if "execution_truth" in data:
+            expected.add("execution_truth")
+        require_exact_keys(data, expected, "provider output")
         return cls(
             schema_version=data["schema_version"],
             capsule_authority_fingerprint=data["capsule_authority_fingerprint"],
@@ -508,4 +698,9 @@ class ProviderOutput:
             cleanup_result=CleanupResult.from_dict(data["cleanup_result"]),
             completion_claim=ProviderCompletionClaim.from_dict(data["completion_claim"]),
             output_fingerprint=data["output_fingerprint"],
+            execution_truth=(
+                ExecutionTruth.from_dict(data["execution_truth"])
+                if "execution_truth" in data
+                else None
+            ),
         ).validated()

@@ -14,6 +14,7 @@ import re
 import stat
 import subprocess
 import time
+import unicodedata
 import uuid
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -93,12 +94,96 @@ def canonical_bytes(value: Any) -> bytes:
     ).encode("utf-8")
 
 
+def strict_json_loads(data: bytes | str, *, label: str = "JSON") -> Any:
+    """Decode JSON while refusing duplicate object keys.
+
+    CPython's normal ``json.loads`` silently keeps the last value for a
+    repeated key.  Protocol and evidence records must be rejected before
+    semantic interpretation instead.
+    """
+
+    def closed_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"{label} contains duplicate object key: {key!r}")
+            result[key] = value
+        return result
+
+    def refuse_nonfinite(value: str) -> None:
+        raise ValueError(f"{label} contains non-finite numeric token: {value}")
+
+    try:
+        return json.loads(
+            data,
+            object_pairs_hook=closed_object,
+            parse_constant=refuse_nonfinite,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid {label}") from error
+
+
 def fingerprint(value: Any) -> str:
     return hashlib.sha256(canonical_bytes(value)).hexdigest()
 
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+WINDOWS_RESERVED_BASENAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{number}" for number in range(1, 10)}
+    | {f"LPT{number}" for number in range(1, 10)}
+)
+
+
+def validate_closed_relative_path(
+    value: Any,
+    *,
+    label: str = "relative path",
+    allow_root: bool = False,
+    forbidden_components: frozenset[str] = frozenset({".git"}),
+    max_bytes: int = 4096,
+) -> str:
+    """Validate the portable, unambiguous path grammar used by execution/intake."""
+
+    require_nonempty_text(value, label, max_bytes=max_bytes)
+    if value == "." and allow_root:
+        return "."
+    if value.startswith(("/", "\\")):
+        raise ValueError(f"{label} must not be absolute")
+    if "\\" in value:
+        raise ValueError(f"{label} contains a forbidden backslash alias")
+    components = value.split("/")
+    if any(component == "" for component in components):
+        raise ValueError(f"{label} contains an empty component")
+    if any(component in {".", ".."} for component in components):
+        raise ValueError(f"{label} contains dot traversal")
+    for component in components:
+        if component in forbidden_components:
+            raise ValueError(f"{label} targets forbidden state")
+        if component.endswith((".", " ")):
+            raise ValueError(f"{label} contains a trailing-dot/space alias")
+        if ":" in component:
+            raise ValueError(f"{label} contains an ADS-style colon")
+        basename = component.split(".", 1)[0].upper()
+        if basename in WINDOWS_RESERVED_BASENAMES:
+            raise ValueError(f"{label} contains a Windows-reserved basename")
+        if unicodedata.normalize("NFC", component) != component:
+            raise ValueError(f"{label} is not Unicode NFC-normalized")
+        if any(unicodedata.category(character) == "Cc" for character in component):
+            raise ValueError(f"{label} contains a control character")
+    normalized = "/".join(components)
+    if normalized != value:
+        raise ValueError(f"{label} is not in canonical form")
+    return normalized
+
+
+def portable_path_collision_key(path: str) -> str:
+    """Return the normalization/case-fold collision key for a validated path."""
+
+    return "/".join(unicodedata.normalize("NFC", part).casefold() for part in path.split("/"))
 
 
 def fsync_directory(path: Path) -> None:

@@ -1,0 +1,21 @@
+{
+  "schema_version": "admissible_codex_app_server_schema_manifest_v1",
+  "codex_cli_version": "0.145.0",
+  "complete_v2_bundle_sha256": "05230ce1f5ccc9ad558de93cdde840a16fe3d552ef9ce90a5df03e26738f5e4e",
+  "files": {
+    "DynamicToolCallParams.json": "e36242b331ca665c74993e55abbea381b1c8a961b29a42579029cff1ad26b20d",
+    "DynamicToolCallResponse.json": "b5fd10c265be9023f038fe3e4c937a8e215906c8ab31e35d61d28bbc0b755af9",
+    "v1/InitializeParams.json": "4f576f99e285beb28f71f48a72b887c1f517dada86fee348fe2af0a35511de23",
+    "v1/InitializeResponse.json": "86dcd236d0576a82c85b933586dc45731260eab1b6edb3447b03f790277322b1",
+    "v2/ErrorNotification.json": "1ec871b02771300a26a34e41a7cfaf7484330a8c37c197d1ac133e753b083a09",
+    "v2/ItemCompletedNotification.json": "047016f3132b046cedc98b62672656f834e7561c872c06c155643a018f51eef8",
+    "v2/ItemStartedNotification.json": "35e7674f955c0661ad30f47f6e1b709425748df45d90293f03bfbf34ebfdadaa",
+    "v2/ThreadStartParams.json": "b3685411ceb8ad264a1920e8facd66301e5280948ef9c2a6871b95d4c19da639",
+    "v2/ThreadStartResponse.json": "b4ae167f12f0ed48e14d014eaa131c097dc237613081e597e08f486149312933",
+    "v2/ThreadStartedNotification.json": "ac7cbc027725d9a2612d2b3c8f234ef54eb05d3572ceb0a47d611b31d94d2a8e",
+    "v2/TurnCompletedNotification.json": "96a42581ca7053aba0d86acf7259bc1993628ff782c243f649215652c1562fbd",
+    "v2/TurnStartParams.json": "f23021c02d28b60fccb6dcaaace9ff676127065f8254537265d6622656860dca",
+    "v2/TurnStartResponse.json": "39bdaaf7c9f13fa155cd1f0f8c5f3b9d078b3e93dacb7f465a661b4864a942d9",
+    "v2/TurnStartedNotification.json": "b00ed6e0247e39da0d2944c3765011d54bb1adbb6cf255d73aadf1e706a0acac"
+  }
+}

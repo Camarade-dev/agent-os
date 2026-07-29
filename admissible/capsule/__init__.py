@@ -77,12 +77,20 @@ from admissible.capsule.host_codex_backend import (
     dynamic_tools_grammar,
 )
 from admissible.capsule.host_control import (
+    AuthenticationBoundary,
     AuthenticatedControlAuthority,
     HostControlBwrapPolicy,
+    PendingAuthenticationBoundary,
+    SyntheticAuthenticationBoundary,
+)
+from admissible.capsule.execution_authority import (
+    BackendExecutionAuthority,
+    ExecutableFileIdentity,
 )
 from admissible.capsule.models import (
     ByteTreeObservation,
     CleanupResult,
+    ExecutionTruth,
     ObservedEntry,
     ProcessResult,
     ProviderCompletionClaim,
@@ -122,7 +130,9 @@ __all__ = [
     "AdmissibleFinalizer",
     "AppServerConnection",
     "AppServerConnectionFactory",
+    "AuthenticationBoundary",
     "AuthenticatedControlAuthority",
+    "BackendExecutionAuthority",
     "BehavioralVerifierIdentity",
     "BehaviorRefusalCode",
     "BehaviorResult",
@@ -157,6 +167,8 @@ __all__ = [
     "DurableControllerAuthority",
     "DurableToolRequest",
     "DurableToolResult",
+    "ExecutionTruth",
+    "ExecutableFileIdentity",
     "FailureCode",
     "FinalizationCompleted",
     "FinalizationEvidence",
@@ -180,6 +192,7 @@ __all__ = [
     "NEON_RELAY_AUTHORITY",
     "ObservedEntry",
     "Phase",
+    "PendingAuthenticationBoundary",
     "ProcessResult",
     "ProviderCompletionClaim",
     "ProviderOutput",
@@ -193,6 +206,7 @@ __all__ = [
     "SessionTerminalClassification",
     "ScriptedCodexAppServerConnection",
     "ScriptedCodexConnectionFactory",
+    "SyntheticAuthenticationBoundary",
     "TERMINAL_PHASES",
     "TransportResult",
     "ToolIdDisposition",

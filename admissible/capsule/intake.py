@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import shutil
 import stat
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from enum import Enum
@@ -31,11 +32,13 @@ from admissible.capsule.common import (
     fingerprint,
     fsync_directory,
     mode_type,
+    portable_path_collision_key,
     require_exact_keys,
     require_nonempty_text,
     require_sha256,
     require_strict_int,
     sha256_bytes,
+    WINDOWS_RESERVED_BASENAMES,
 )
 
 
@@ -53,11 +56,7 @@ _IDENTITY_FIELDS = (
     "st_ctime_ns",
 )
 
-WINDOWS_RESERVED = frozenset(
-    {"CON", "PRN", "AUX", "NUL"}
-    | {f"COM{number}" for number in range(1, 10)}
-    | {f"LPT{number}" for number in range(1, 10)}
-)
+WINDOWS_RESERVED = WINDOWS_RESERVED_BASENAMES
 
 
 class RejectionCode(str, Enum):
@@ -71,6 +70,7 @@ class RejectionCode(str, Enum):
     TRAILING_DOT_OR_SPACE = "TRAILING_DOT_OR_SPACE"
     ADS_COLON = "ADS_COLON"
     WINDOWS_RESERVED_BASENAME = "WINDOWS_RESERVED_BASENAME"
+    UNICODE_NORMALIZATION_ALIAS = "UNICODE_NORMALIZATION_ALIAS"
     NON_UTF8_PATH = "NON_UTF8_PATH"
     SOURCE_MUTATED = "SOURCE_MUTATED"
     MOUNT_CROSSING = "MOUNT_CROSSING"
@@ -296,6 +296,14 @@ def path_policy_reasons(path: str) -> list[RejectionReason]:
         if ":" in component:
             reasons.append(
                 RejectionReason(RejectionCode.ADS_COLON, path, "ADS-shaped colon components are forbidden")
+            )
+        if unicodedata.normalize("NFC", component) != component:
+            reasons.append(
+                RejectionReason(
+                    RejectionCode.UNICODE_NORMALIZATION_ALIAS,
+                    path,
+                    "path components must use canonical Unicode NFC",
+                )
             )
         basename = component.split(".", 1)[0].upper()
         if basename in WINDOWS_RESERVED:
@@ -786,7 +794,7 @@ class CanonicalIntake:
 
         folded: dict[str, list[str]] = {}
         for path in self.observed_paths:
-            folded.setdefault(path.casefold(), []).append(path)
+            folded.setdefault(portable_path_collision_key(path), []).append(path)
         for paths in folded.values():
             unique = sorted(set(paths))
             if len(unique) > 1:
