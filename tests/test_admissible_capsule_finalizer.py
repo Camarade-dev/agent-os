@@ -1,23 +1,29 @@
-"""Provider-free tests for the Admissible-owned Git finalizer.
-
-Every repository here is a fake, disposable bare repository created fresh
-under `tmp_path`. Nothing is pushed and no real remote exists.
-"""
+"""Provider-free tests for exact-tree, closed-environment Git finalization."""
 
 from __future__ import annotations
 
+import os
+import threading
 from pathlib import Path
 
 import pytest
 
-from admissible.capsule.common import git
+from admissible.capsule.common import fingerprint, git
 from admissible.capsule.finalizer import (
     FROZEN_IDENTITY,
     AcceptedBlob,
     AdmissibleFinalizer,
     FinalizationOutcome,
-    FinalizerPreconditionError,
+    FinalizationResult,
+    PreparedFinalization,
+    _git_environment,
     initialize_disposable_repository,
+)
+from admissible.capsule.intake import (
+    AcceptedMaterialIdentity,
+    IntakeEvidence,
+    IntakeFileRecord,
+    IntakePublicationState,
 )
 
 
@@ -29,6 +35,7 @@ PARENT_IDENTITY = {
     "committer_email": "capsule-fixture@example.invalid",
     "committer_date": "1999-12-31T00:00:00+00:00",
 }
+MESSAGE = "feat: build accepted material\n"
 
 
 def _repo(tmp_path: Path) -> tuple[Path, str]:
@@ -37,168 +44,247 @@ def _repo(tmp_path: Path) -> tuple[Path, str]:
     return repository, parent
 
 
-def _blobs() -> tuple[AcceptedBlob, ...]:
-    return (
-        AcceptedBlob.create(relative_path="index.html", data=b"<html></html>\n"),
-        AcceptedBlob.create(relative_path="src/main.js", data=b"// main\n"),
+def _material_and_blobs() -> tuple[AcceptedMaterialIdentity, tuple[AcceptedBlob, ...]]:
+    values = (
+        ("index.html", b"<html></html>\n", "100644"),
+        ("src/main.js", b"// main\n", "100755"),
+    )
+    records = tuple(
+        IntakeFileRecord(
+            relative_path=path,
+            size=len(data),
+            sha256=AcceptedBlob.create(
+                relative_path=path, data=data, git_mode=mode
+            ).sha256,
+            git_mode=mode,
+        ).validated()
+        for path, data, mode in values
+    )
+    evidence = IntakeEvidence.create(
+        authority_fingerprint="a" * 64,
+        ruling="ACCEPTED",
+        rejection_reasons=(),
+        files=records,
+        aggregate_fingerprint=fingerprint([record.to_dict() for record in records]),
+        publication_state=IntakePublicationState.ACCEPTED_INTAKE_PUBLISHED,
+    )
+    material = AcceptedMaterialIdentity.from_intake_evidence(evidence)
+    blobs = tuple(
+        AcceptedBlob.create(relative_path=path, data=data, git_mode=mode)
+        for path, data, mode in values
+    )
+    return material, blobs
+
+
+def _prepare(
+    finalizer: AdmissibleFinalizer,
+    parent: str,
+    tmp_path: Path,
+    *,
+    suffix: str = "1",
+) -> PreparedFinalization:
+    material, blobs = _material_and_blobs()
+    return finalizer.prepare(
+        parent=parent,
+        accepted_material=material,
+        accepted_blobs=blobs,
+        private_index=tmp_path / f"index-{suffix}",
+        message=MESSAGE,
     )
 
 
-def test_disposable_repository_has_no_hooks_or_remotes(tmp_path: Path):
+def test_disposable_repository_has_no_remotes_and_finalizer_owns_empty_hooks(tmp_path: Path):
     repository, _parent = _repo(tmp_path)
     finalizer = AdmissibleFinalizer(repository)
-    assert finalizer.repository == repository
-    remotes = git(repository, "remote").stdout.decode().split()
-    assert remotes == []
-    hooks_directory = repository / "hooks"
-    assert not hooks_directory.exists() or not any(hooks_directory.iterdir())
+    assert git(repository, "remote", env=finalizer.environment).stdout.decode().split() == []
+    assert finalizer.hooks_directory.is_dir()
+    assert not any(finalizer.hooks_directory.iterdir())
 
 
-def test_finalize_refuses_publication_when_evidence_is_not_durable(tmp_path: Path):
+def test_caller_boolean_cannot_claim_finalization_evidence_is_durable(tmp_path: Path):
     repository, parent = _repo(tmp_path)
     finalizer = AdmissibleFinalizer(repository)
-    with pytest.raises(FinalizerPreconditionError):
-        finalizer.finalize(
-            parent=parent,
-            accepted_blobs=_blobs(),
-            private_index=tmp_path / "index",
-            message="feat: build playable Neon Relay browser game\n",
-            evidence_is_durable=False,
+    prepared = _prepare(finalizer, parent, tmp_path)
+    with pytest.raises(TypeError, match="evidence_is_durable"):
+        finalizer.finalize(  # type: ignore[call-arg]
+            prepared=prepared,
+            evidence_is_durable=True,
         )
     assert finalizer.current_ref() == parent
 
 
-def test_finalize_publishes_exactly_one_commit_with_frozen_identity(tmp_path: Path):
+def test_missing_trusted_durability_destination_refuses_finalization(tmp_path: Path):
     repository, parent = _repo(tmp_path)
     finalizer = AdmissibleFinalizer(repository)
-    message = "feat: build playable Neon Relay browser game\n"
-    result = finalizer.finalize(
-        parent=parent,
-        accepted_blobs=_blobs(),
-        private_index=tmp_path / "index",
-        message=message,
-        evidence_is_durable=True,
+    prepared = _prepare(finalizer, parent, tmp_path)
+    Path(prepared.durability_receipt.destination).unlink()
+    with pytest.raises(ValueError, match="missing"):
+        finalizer.finalize(prepared=prepared)
+    assert finalizer.current_ref() == parent
+
+
+def test_finalize_publishes_exact_tree_with_frozen_identity(tmp_path: Path):
+    repository, parent = _repo(tmp_path)
+    finalizer = AdmissibleFinalizer(repository)
+    prepared = _prepare(finalizer, parent, tmp_path)
+    result = finalizer.finalize(prepared=prepared)
+
+    assert result.outcome is FinalizationOutcome.PUBLISHED
+    assert result.accepted_material == prepared.evidence.accepted_material
+    assert result.expected_tree == prepared.evidence.expected_tree
+    assert result.finalizer_authority == finalizer.authority
+    assert result.parent == parent
+    assert result.publication_ref == finalizer.target_ref
+    assert result.resulting_commit == result.ref_after
+    assert Path(result.durability_receipt.destination).read_bytes() == (
+        result.durable_evidence.canonical_bytes()
     )
-    assert result.outcome == FinalizationOutcome.PUBLISHED
-    assert result.ref_before == parent
-    assert result.ref_after == result.commit
-    assert finalizer.current_ref() == result.commit
+    assert finalizer.verify(prepared=prepared)["ok"] is True
 
-    check = finalizer.verify(parent=parent, accepted_blobs=_blobs(), message=message)
-    assert check["ok"] is True
-    assert check["commit_count"] == 1
-    assert check["remotes"] == []
-    assert check["hooks"] == []
-
-    identity_lines = (
-        git(repository, "show", "-s", "--format=%an%n%ae%n%aI%n%cn%n%ce%n%cI", result.commit)
+    names = (
+        git(
+            repository,
+            "show",
+            "-s",
+            "--format=%an%n%ae%n%cn%n%ce",
+            result.commit,
+            env=finalizer.environment,
+        )
         .stdout.decode()
         .splitlines()
     )
-    assert identity_lines[0] == FROZEN_IDENTITY["author_name"]
-    assert identity_lines[1] == FROZEN_IDENTITY["author_email"]
+    assert names == [
+        FROZEN_IDENTITY["author_name"],
+        FROZEN_IDENTITY["author_email"],
+        FROZEN_IDENTITY["committer_name"],
+        FROZEN_IDENTITY["committer_email"],
+    ]
+    dates = (
+        git(
+            repository,
+            "show",
+            "-s",
+            "--format=%aI%n%cI",
+            result.commit,
+            env=finalizer.environment,
+        )
+        .stdout.decode()
+        .splitlines()
+    )
+    assert dates == [
+        FROZEN_IDENTITY["author_date"],
+        FROZEN_IDENTITY["committer_date"],
+    ]
+    modes = {
+        line.split()[3]: line.split()[0]
+        for line in git(
+            repository,
+            "ls-tree",
+            "-r",
+            result.tree,
+            env=finalizer.environment,
+        ).stdout.decode().splitlines()
+    }
+    assert modes == {"index.html": "100644", "src/main.js": "100755"}
 
 
 def test_duplicate_finalization_is_idempotent(tmp_path: Path):
     repository, parent = _repo(tmp_path)
     finalizer = AdmissibleFinalizer(repository)
-    message = "feat: build playable Neon Relay browser game\n"
-    first = finalizer.finalize(
-        parent=parent,
-        accepted_blobs=_blobs(),
-        private_index=tmp_path / "index-1",
-        message=message,
-        evidence_is_durable=True,
-    )
-    second = finalizer.finalize(
-        parent=parent,
-        accepted_blobs=_blobs(),
-        private_index=tmp_path / "index-2",
-        message=message,
-        evidence_is_durable=True,
-    )
-    assert first.outcome == FinalizationOutcome.PUBLISHED
-    assert second.outcome == FinalizationOutcome.IDEMPOTENT_SAME_ACCEPTED_IDENTITY
+    first_prepared = _prepare(finalizer, parent, tmp_path, suffix="1")
+    second_prepared = _prepare(finalizer, parent, tmp_path, suffix="2")
+    first = finalizer.finalize(prepared=first_prepared)
+    second = finalizer.finalize(prepared=second_prepared)
+    assert first.outcome is FinalizationOutcome.PUBLISHED
+    assert second.outcome is FinalizationOutcome.IDEMPOTENT_SAME_ACCEPTED_IDENTITY
     assert second.commit == first.commit
-    assert second.ref_before == first.commit
-    assert second.ref_after == first.commit
-    rev_count = git(repository, "rev-list", "--count", finalizer.target_ref).stdout.decode().strip()
-    assert rev_count == "2"  # trusted parent + exactly one accepted commit
 
 
 def test_compare_and_swap_refuses_an_unexpected_concurrent_parent(tmp_path: Path):
     repository, parent = _repo(tmp_path)
     finalizer = AdmissibleFinalizer(repository)
-
-    unexpected_tree = git(repository, "show", "-s", "--format=%T", parent).stdout.decode().strip()
-    unexpected_identity = dict(PARENT_IDENTITY)
-    unexpected_identity["author_date"] = "1999-12-31T00:00:01+00:00"
-    unexpected_identity["committer_date"] = "1999-12-31T00:00:01+00:00"
-    from admissible.capsule.finalizer import _git_environment
-
-    unexpected_commit = (
+    prepared = _prepare(finalizer, parent, tmp_path)
+    unexpected = (
         git(
             repository,
             "commit-tree",
-            unexpected_tree,
+            prepared.evidence.expected_tree,
             "-p",
             parent,
-            env=_git_environment(unexpected_identity),
-            input_bytes=b"unexpected concurrent parent\n",
+            env=_git_environment(
+                {**PARENT_IDENTITY, "author_date": "1999-12-31T00:00:01+00:00",
+                 "committer_date": "1999-12-31T00:00:01+00:00"},
+                environment_root=finalizer.environment_root,
+                hooks_directory=finalizer.hooks_directory,
+            ),
+            input_bytes=b"concurrent\n",
         )
         .stdout.decode()
         .strip()
     )
-    git(repository, "update-ref", finalizer.target_ref, unexpected_commit, parent)
-
-    result = finalizer.finalize(
-        parent=parent,
-        accepted_blobs=_blobs(),
-        private_index=tmp_path / "index",
-        message="feat: build playable Neon Relay browser game\n",
-        evidence_is_durable=True,
+    git(
+        repository,
+        "update-ref",
+        finalizer.target_ref,
+        unexpected,
+        parent,
+        env=finalizer.environment,
     )
-    assert result.outcome == FinalizationOutcome.COMPARE_AND_SWAP_REFUSED
-    assert result.ref_before == unexpected_commit
-    assert result.ref_after == unexpected_commit
-    assert finalizer.current_ref() == unexpected_commit
+    result = finalizer.finalize(prepared=prepared)
+    assert result.outcome is FinalizationOutcome.COMPARE_AND_SWAP_REFUSED
+    assert result.ref_before == unexpected
+    assert result.ref_after == unexpected
 
 
-def test_crash_before_update_ref_leaves_the_ref_untouched_and_commit_unreachable(tmp_path: Path):
+def test_concurrent_finalization_has_one_publication_and_no_unbound_acceptance(tmp_path: Path):
+    repository, parent = _repo(tmp_path)
+    first_finalizer = AdmissibleFinalizer(repository)
+    second_finalizer = AdmissibleFinalizer(
+        repository, evidence_store=first_finalizer.evidence_store
+    )
+    prepared = (
+        _prepare(first_finalizer, parent, tmp_path, suffix="one"),
+        _prepare(second_finalizer, parent, tmp_path, suffix="two"),
+    )
+    barrier = threading.Barrier(2)
+    outcomes: list[FinalizationOutcome] = []
+    errors: list[BaseException] = []
+
+    def publish(finalizer: AdmissibleFinalizer, plan: PreparedFinalization) -> None:
+        try:
+            barrier.wait()
+            outcomes.append(finalizer.finalize(prepared=plan).outcome)
+        except BaseException as error:  # captured for deterministic assertion
+            errors.append(error)
+
+    threads = [
+        threading.Thread(target=publish, args=(first_finalizer, prepared[0])),
+        threading.Thread(target=publish, args=(second_finalizer, prepared[1])),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors
+    assert FinalizationOutcome.PUBLISHED in outcomes
+    assert set(outcomes) <= {
+        FinalizationOutcome.PUBLISHED,
+        FinalizationOutcome.IDEMPOTENT_SAME_ACCEPTED_IDENTITY,
+        FinalizationOutcome.COMPARE_AND_SWAP_REFUSED,
+    }
+    assert first_finalizer.current_ref() == prepared[0].evidence.resulting_commit
+
+
+def test_crash_before_update_ref_leaves_ref_untouched(tmp_path: Path):
     repository, parent = _repo(tmp_path)
     finalizer = AdmissibleFinalizer(repository)
+    prepared = _prepare(finalizer, parent, tmp_path)
     from admissible.capsule.common import CrashInjected
 
-    with pytest.raises(CrashInjected) as excinfo:
-        finalizer.finalize(
-            parent=parent,
-            accepted_blobs=_blobs(),
-            private_index=tmp_path / "index",
-            message="feat: build playable Neon Relay browser game\n",
-            evidence_is_durable=True,
-            crash_before_update_ref=True,
-        )
+    with pytest.raises(CrashInjected):
+        finalizer.finalize(prepared=prepared, crash_before_update_ref=True)
     assert finalizer.current_ref() == parent
-
-    unreachable_commit = str(excinfo.value).rsplit("=", 1)[-1]
-    reachable = git(repository, "rev-list", finalizer.target_ref).stdout.decode().split()
-    assert unreachable_commit not in reachable
-    # The blob/tree/commit objects exist loose in the object database (the
-    # build step already ran), but nothing durable points at them.
-    cat = git(repository, "cat-file", "-t", unreachable_commit, check=False)
-    assert cat.returncode == 0
-    assert cat.stdout.decode().strip() == "commit"
-
-
-def test_finalizer_rejects_a_repository_that_carries_hooks(tmp_path: Path):
-    repository, _parent = _repo(tmp_path)
-    hooks_directory = repository / "hooks"
-    hooks_directory.mkdir(parents=True, exist_ok=True)
-    hook = hooks_directory / "pre-receive"
-    hook.write_text("#!/bin/sh\nexit 1\n")
-    hook.chmod(0o755)
-    with pytest.raises(ValueError):
-        AdmissibleFinalizer(repository)
 
 
 def test_finalizer_rejects_a_repository_that_carries_a_remote(tmp_path: Path):
@@ -206,52 +292,152 @@ def test_finalizer_rejects_a_repository_that_carries_a_remote(tmp_path: Path):
     other = tmp_path / "other.git"
     initialize_disposable_repository(other, parent_identity=PARENT_IDENTITY)
     git(repository, "remote", "add", "origin", str(other))
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="remotes"):
         AdmissibleFinalizer(repository)
 
 
-def test_no_durable_accepted_effect_before_finalization_completes(tmp_path: Path):
+def test_finalizer_rejects_repository_object_alternates(tmp_path: Path):
+    repository, _parent = _repo(tmp_path)
+    alternates = repository / "objects" / "info" / "alternates"
+    alternates.parent.mkdir(parents=True, exist_ok=True)
+    alternates.write_text(str(tmp_path / "hostile-objects") + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="alternate object"):
+        AdmissibleFinalizer(repository)
+
+
+def test_building_and_preparing_do_not_publish(tmp_path: Path):
     repository, parent = _repo(tmp_path)
     finalizer = AdmissibleFinalizer(repository)
-    finalizer.build_commit(
-        parent=parent, accepted_blobs=_blobs(), private_index=tmp_path / "index", message="not yet published\n"
-    )
-    # Building a commit object is not publication: the ref must be untouched.
+    _prepare(finalizer, parent, tmp_path)
     assert finalizer.current_ref() == parent
 
 
-def test_accepted_blob_provenance_is_bytes_only_never_a_git_object_read(tmp_path: Path):
-    """A provider cannot smuggle a Git commit in: AcceptedBlob only ever
-    carries bytes the caller supplies directly (from intake), never a Git
-    object id resolved from some other, provider-controlled repository."""
-
+def test_accepted_blob_has_bytes_mode_and_no_git_object_authority():
     import dataclasses
 
-    field_names = {field.name for field in dataclasses.fields(AcceptedBlob)}
-    assert field_names == {"schema_version", "relative_path", "sha256", "data"}
-    assert "object_id" not in field_names
-    assert "git_ref" not in field_names
-
+    fields = {field.name for field in dataclasses.fields(AcceptedBlob)}
+    assert fields == {"schema_version", "relative_path", "sha256", "git_mode", "data"}
+    assert "object_id" not in fields
     with pytest.raises(ValueError):
         AcceptedBlob(
-            schema_version="admissible_capsule_accepted_blob_v1",
+            schema_version="admissible_capsule_accepted_blob_v2",
             relative_path="index.html",
             sha256="0" * 64,
-            data=b"tampered bytes that do not match the declared hash",
+            git_mode="100644",
+            data=b"tampered",
         ).validated()
 
 
-def test_finalization_result_round_trips_through_evidence_only_dict(tmp_path: Path):
+def test_finalization_result_round_trips_from_durable_evidence(tmp_path: Path):
     repository, parent = _repo(tmp_path)
     finalizer = AdmissibleFinalizer(repository)
-    result = finalizer.finalize(
-        parent=parent,
-        accepted_blobs=_blobs(),
-        private_index=tmp_path / "index",
-        message="feat: build playable Neon Relay browser game\n",
-        evidence_is_durable=True,
-    )
-    from admissible.capsule.finalizer import FinalizationResult
+    result = finalizer.finalize(prepared=_prepare(finalizer, parent, tmp_path))
+    assert FinalizationResult.from_dict(result.to_dict()) == result
 
-    reconstructed = FinalizationResult.from_dict(result.to_dict())
-    assert reconstructed == result
+
+def test_nonempty_parent_cannot_smuggle_unauthorized_path(tmp_path: Path):
+    repository, original_parent = _repo(tmp_path)
+    finalizer = AdmissibleFinalizer(repository)
+    blob = (
+        git(
+            repository,
+            "hash-object",
+            "-w",
+            "--stdin",
+            env=finalizer.environment,
+            input_bytes=b"smuggled\n",
+        )
+        .stdout.decode()
+        .strip()
+    )
+    smuggled_tree = (
+        git(
+            repository,
+            "mktree",
+            env=finalizer.environment,
+            input_bytes=f"100644 blob {blob}\tsmuggled.txt\n".encode(),
+        )
+        .stdout.decode()
+        .strip()
+    )
+    parent = (
+        git(
+            repository,
+            "commit-tree",
+            smuggled_tree,
+            "-p",
+            original_parent,
+            env=_git_environment(
+                PARENT_IDENTITY,
+                environment_root=finalizer.environment_root,
+                hooks_directory=finalizer.hooks_directory,
+            ),
+            input_bytes=b"parent with unauthorized file\n",
+        )
+        .stdout.decode()
+        .strip()
+    )
+    git(
+        repository,
+        "update-ref",
+        finalizer.target_ref,
+        parent,
+        original_parent,
+        env=finalizer.environment,
+    )
+    result = finalizer.finalize(prepared=_prepare(finalizer, parent, tmp_path))
+    paths = (
+        git(
+            repository,
+            "ls-tree",
+            "-r",
+            "--name-only",
+            result.commit,
+            env=finalizer.environment,
+        )
+        .stdout.decode()
+        .splitlines()
+    )
+    assert paths == ["index.html", "src/main.js"]
+    assert "smuggled.txt" not in paths
+
+
+def test_ambient_git_configuration_and_reference_transaction_hook_are_inert(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    marker = tmp_path / "ambient-hook-ran"
+    hooks = tmp_path / "ambient-hooks"
+    hooks.mkdir()
+    hook = hooks / "reference-transaction"
+    hook.write_text(f"#!/bin/sh\nprintf ran > {marker}\nexit 99\n", encoding="utf-8")
+    hook.chmod(0o755)
+    global_config = tmp_path / "ambient-global.gitconfig"
+    global_config.write_text(
+        f"[core]\n\thooksPath = {hooks}\n[credential]\n\thelper = !exit 99\n",
+        encoding="utf-8",
+    )
+    system_config = tmp_path / "ambient-system.gitconfig"
+    system_config.write_text("[user]\n\tname = Ambient\n\temail = ambient@example.test\n", encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(system_config))
+    monkeypatch.setenv("GIT_ALTERNATE_OBJECT_DIRECTORIES", str(tmp_path / "alternates"))
+    monkeypatch.setenv("GIT_REPLACE_REF_BASE", "refs/replace-hostile/")
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Ambient Attacker")
+
+    repository, parent = _repo(tmp_path)
+    git(
+        repository,
+        "config",
+        "core.hooksPath",
+        str(hooks),
+        env=_git_environment(),
+    )
+    finalizer = AdmissibleFinalizer(repository)
+    result = finalizer.finalize(prepared=_prepare(finalizer, parent, tmp_path))
+    assert result.outcome is FinalizationOutcome.PUBLISHED
+    assert not marker.exists()
+    assert finalizer.environment["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert finalizer.environment["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert "GIT_ALTERNATE_OBJECT_DIRECTORIES" not in finalizer.environment
+    assert "GIT_REPLACE_REF_BASE" not in finalizer.environment

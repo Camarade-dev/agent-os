@@ -43,7 +43,7 @@ from admissible.capsule.host_codex_backend import (
     ScriptedCodexConnectionFactory,
 )
 from admissible.capsule.host_control import AuthenticatedControlAuthority
-from admissible.capsule.intake import IntakeAuthority, validate_and_copy
+from admissible.capsule.intake import AcceptedMaterialIdentity, IntakeAuthority, validate_and_copy
 from admissible.capsule.reducer import reduce
 from admissible.capsule.session_store import (
     DurableCapsuleSessionStore,
@@ -325,17 +325,20 @@ def _capture(*, exit_code=0, timed_out=False, truncated=False) -> CommandCapture
 
 
 def _checkpoint(output, evidence, *, passed: bool) -> CheckpointResult:
+    material = AcceptedMaterialIdentity.from_intake_evidence(evidence)
+    root = material.canonical_manifest_fingerprint
     return CheckpointResult(
-        identity=CheckpointIdentity.create(tree_hash=output.observation.tree_hash),
+        accepted_material=material,
+        identity=CheckpointIdentity.create(tree_hash=root),
         copy=VerificationCopy.create(
             copy_id="synthetic-checkpoint-copy",
             purpose="checkpoint",
-            root_fingerprint=evidence.aggregate_fingerprint,
+            root_fingerprint=root,
         ),
         capture=_capture(exit_code=0 if passed else 1),
         byte_hashes=ByteHashPair(
-            before_hash=evidence.aggregate_fingerprint,
-            after_hash=evidence.aggregate_fingerprint,
+            before_hash=root,
+            after_hash=root,
         ).validated(),
         passed=passed,
         refusal_code=None if passed else CheckpointRefusalCode.NONZERO_EXIT,
@@ -343,17 +346,20 @@ def _checkpoint(output, evidence, *, passed: bool) -> CheckpointResult:
 
 
 def _behavior(evidence, *, passed: bool) -> BehaviorResult:
+    material = AcceptedMaterialIdentity.from_intake_evidence(evidence)
+    root = material.canonical_manifest_fingerprint
     return BehaviorResult(
+        accepted_material=material,
         identity=BehavioralVerifierIdentity.create(verifier_source_sha256="1" * 64),
         copy=VerificationCopy.create(
             copy_id="synthetic-behavior-copy",
             purpose="behavior",
-            root_fingerprint=evidence.aggregate_fingerprint,
+            root_fingerprint=root,
         ),
         capture=_capture(exit_code=0 if passed else 1),
         byte_hashes=ByteHashPair(
-            before_hash=evidence.aggregate_fingerprint,
-            after_hash=evidence.aggregate_fingerprint,
+            before_hash=root,
+            after_hash=root,
         ).validated(),
         passed=passed,
         refusal_code=None if passed else BehaviorRefusalCode.ASSERTION_FAILED,
@@ -712,47 +718,66 @@ def test_complete_provider_free_acceptance_uses_only_synthetic_verification_and_
         session_id="synthetic-provider-free-finalization",
         capsule_authority=backend.authority,
     )
+    checkpoint = _checkpoint(output, evidence, passed=True)
+    behavior = _behavior(evidence, passed=True)
     for event in (
         CapsuleExecutionStarted(),
         ProviderOutputFrozen(provider_output=output),
         IntakeStarted(),
         IntakeEvaluated(intake_evidence=evidence),
         CheckpointVerificationStarted(),
-        CheckpointVerified(checkpoint_result=_checkpoint(output, evidence, passed=True)),
-        BehaviorVerified(behavior_result=_behavior(evidence, passed=True)),
+        CheckpointVerified(checkpoint_result=checkpoint),
+        BehaviorVerified(behavior_result=behavior),
     ):
         state = reduce(state, event)
     assert state.phase == Phase.FINALIZATION_READY
+    backend.bind_accepted_material(workspace, state.accepted_material)
+    backend.record_checkpoint_verification(workspace, checkpoint)
+    backend.record_behavior_verification(workspace, behavior)
 
     repository = tmp_path / "synthetic-finalizer.git"
     parent = initialize_disposable_repository(repository, parent_identity=PARENT_IDENTITY)
     finalizer = AdmissibleFinalizer(repository)
-    state = reduce(state, FinalizationStarted())
     blobs = tuple(
         AcceptedBlob.create(
             relative_path=record.relative_path,
             data=(tmp_path / "accepted-by-intake" / record.relative_path).read_bytes(),
+            git_mode=record.git_mode,
         )
         for record in evidence.files
     )
-    result = finalizer.finalize(
+    prepared = finalizer.prepare(
         parent=parent,
+        accepted_material=state.accepted_material,
         accepted_blobs=blobs,
         private_index=tmp_path / "synthetic-private-index",
         message=SYNTHETIC_FINALIZATION_MESSAGE,
-        evidence_is_durable=evidence.published and state.behavior_result.passed,
     )
+    backend.record_finalization_prepared(
+        workspace,
+        prepared.evidence,
+        prepared.durability_receipt,
+    )
+    state = reduce(
+        state,
+        FinalizationStarted(
+            finalization_evidence=prepared.evidence,
+            durability_receipt=prepared.durability_receipt,
+        ),
+    )
+    result = finalizer.finalize(prepared=prepared)
+    backend.record_finalization_result(workspace, result)
     assert result.outcome == FinalizationOutcome.PUBLISHED
     state = reduce(state, FinalizationCompleted(finalization_result=result))
     assert state.phase == Phase.ACCEPTED
-    proof = finalizer.verify(
-        parent=parent,
-        accepted_blobs=blobs,
-        message=SYNTHETIC_FINALIZATION_MESSAGE,
-    )
+    proof = finalizer.verify(prepared=prepared)
     assert proof["ok"] is True
-    assert proof["remotes"] == []
-    assert "synthetic provider-free" in proof["message"]
-    assert "Neon Relay" in proof["message"]
+    assert proof["material_fingerprint"] == state.accepted_material.material_fingerprint
     assert output.completion_claim.claimed_complete is True
     assert state.finalization_result == result
+    reconstructed = backend.reconstruct(workspace)
+    assert reconstructed.accepted_material == state.accepted_material
+    assert reconstructed.checkpoint_result == checkpoint
+    assert reconstructed.behavior_result == behavior
+    assert reconstructed.finalization_evidence == prepared.evidence
+    assert reconstructed.finalization_result == result

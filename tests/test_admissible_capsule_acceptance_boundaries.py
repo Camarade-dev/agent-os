@@ -31,9 +31,15 @@ from admissible.capsule.finalizer import (
     AcceptedBlob,
     AdmissibleFinalizer,
     FinalizationOutcome,
+    FinalizationResult,
     initialize_disposable_repository,
 )
-from admissible.capsule.intake import NEON_RELAY_AUTHORITY, RejectionCode, validate_and_copy
+from admissible.capsule.intake import (
+    NEON_RELAY_AUTHORITY,
+    AcceptedMaterialIdentity,
+    RejectionCode,
+    validate_and_copy,
+)
 from admissible.capsule.models import (
     ByteTreeObservation,
     CleanupResult,
@@ -138,41 +144,57 @@ def _capture(*, exit_code=0, timed_out=False) -> CommandCapture:
     )
 
 
-def _checkpoint(*, passed: bool, copy_id: str = "checkpoint-copy") -> CheckpointResult:
+def _checkpoint(
+    material: AcceptedMaterialIdentity,
+    *,
+    passed: bool,
+    copy_id: str = "checkpoint-copy",
+) -> CheckpointResult:
+    root = material.canonical_manifest_fingerprint
     if passed:
         return CheckpointResult(
-            identity=CheckpointIdentity.create(tree_hash=ZERO),
-            copy=VerificationCopy.create(copy_id=copy_id, purpose="checkpoint", root_fingerprint=ZERO),
+            accepted_material=material,
+            identity=CheckpointIdentity.create(tree_hash=root),
+            copy=VerificationCopy.create(copy_id=copy_id, purpose="checkpoint", root_fingerprint=root),
             capture=_capture(),
-            byte_hashes=ByteHashPair(before_hash=ZERO, after_hash=ZERO).validated(),
+            byte_hashes=ByteHashPair(before_hash=root, after_hash=root).validated(),
             passed=True,
             refusal_code=None,
         ).validated()
     return CheckpointResult(
-        identity=CheckpointIdentity.create(tree_hash=ZERO),
-        copy=VerificationCopy.create(copy_id=copy_id, purpose="checkpoint", root_fingerprint=ZERO),
+        accepted_material=material,
+        identity=CheckpointIdentity.create(tree_hash=root),
+        copy=VerificationCopy.create(copy_id=copy_id, purpose="checkpoint", root_fingerprint=root),
         capture=_capture(exit_code=1),
-        byte_hashes=ByteHashPair(before_hash=ZERO, after_hash=ZERO).validated(),
+        byte_hashes=ByteHashPair(before_hash=root, after_hash=root).validated(),
         passed=False,
         refusal_code=CheckpointRefusalCode.NONZERO_EXIT,
     ).validated()
 
 
-def _behavior(*, passed: bool, copy_id: str = "behavior-copy") -> BehaviorResult:
+def _behavior(
+    material: AcceptedMaterialIdentity,
+    *,
+    passed: bool,
+    copy_id: str = "behavior-copy",
+) -> BehaviorResult:
+    root = material.canonical_manifest_fingerprint
     if passed:
         return BehaviorResult(
+            accepted_material=material,
             identity=BehavioralVerifierIdentity.create(verifier_source_sha256=ONE),
-            copy=VerificationCopy.create(copy_id=copy_id, purpose="behavior", root_fingerprint=ZERO),
+            copy=VerificationCopy.create(copy_id=copy_id, purpose="behavior", root_fingerprint=root),
             capture=_capture(),
-            byte_hashes=ByteHashPair(before_hash=ZERO, after_hash=ZERO).validated(),
+            byte_hashes=ByteHashPair(before_hash=root, after_hash=root).validated(),
             passed=True,
             refusal_code=None,
         ).validated()
     return BehaviorResult(
+        accepted_material=material,
         identity=BehavioralVerifierIdentity.create(verifier_source_sha256=ONE),
-        copy=VerificationCopy.create(copy_id=copy_id, purpose="behavior", root_fingerprint=ZERO),
+        copy=VerificationCopy.create(copy_id=copy_id, purpose="behavior", root_fingerprint=root),
         capture=_capture(exit_code=1),
-        byte_hashes=ByteHashPair(before_hash=ZERO, after_hash=ZERO).validated(),
+        byte_hashes=ByteHashPair(before_hash=root, after_hash=root).validated(),
         passed=False,
         refusal_code=BehaviorRefusalCode.ASSERTION_FAILED,
     ).validated()
@@ -190,11 +212,30 @@ def _drive_to_finalization_ready(tmp_path: Path):
     evidence = validate_and_copy(source, NEON_RELAY_AUTHORITY, tmp_path / "accepted", tmp_path / "evidence.json")
     assert evidence.ruling == "ACCEPTED"
     state = reduce(state, IntakeEvaluated(intake_evidence=evidence))
+    material = state.accepted_material
     state = reduce(state, CheckpointVerificationStarted())
-    state = reduce(state, CheckpointVerified(checkpoint_result=_checkpoint(passed=True)))
-    state = reduce(state, BehaviorVerified(behavior_result=_behavior(passed=True)))
+    state = reduce(state, CheckpointVerified(checkpoint_result=_checkpoint(material, passed=True)))
+    state = reduce(state, BehaviorVerified(behavior_result=_behavior(material, passed=True)))
     assert state.phase == Phase.FINALIZATION_READY
     return state, evidence
+
+
+def _prepare_finalization(finalizer, state, evidence, tmp_path: Path, index_name: str):
+    blobs = tuple(
+        AcceptedBlob.create(
+            relative_path=record.relative_path,
+            data=(tmp_path / "accepted" / record.relative_path).read_bytes(),
+            git_mode=record.git_mode,
+        )
+        for record in evidence.files
+    )
+    return finalizer.prepare(
+        parent=finalizer.current_ref(),
+        accepted_material=state.accepted_material,
+        accepted_blobs=blobs,
+        private_index=tmp_path / index_name,
+        message=MESSAGE,
+    )
 
 
 def test_happy_path_reaches_accepted_and_publishes_exactly_one_commit(tmp_path: Path):
@@ -204,22 +245,19 @@ def test_happy_path_reaches_accepted_and_publishes_exactly_one_commit(tmp_path: 
     parent = initialize_disposable_repository(repository, parent_identity=PARENT_IDENTITY)
     finalizer = AdmissibleFinalizer(repository)
 
-    state = reduce(state, FinalizationStarted())
+    prepared = _prepare_finalization(finalizer, state, evidence, tmp_path, "private-index")
+    state = reduce(
+        state,
+        FinalizationStarted(
+            finalization_evidence=prepared.evidence,
+            durability_receipt=prepared.durability_receipt,
+        ),
+    )
     assert state.phase == Phase.FINALIZING
     # No durable accepted effect exists yet: the ref is still the parent.
     assert finalizer.current_ref() == parent
 
-    blobs = tuple(
-        AcceptedBlob.create(relative_path=record.relative_path, data=(tmp_path / "accepted" / record.relative_path).read_bytes())
-        for record in evidence.files
-    )
-    result = finalizer.finalize(
-        parent=parent,
-        accepted_blobs=blobs,
-        private_index=tmp_path / "private-index",
-        message=MESSAGE,
-        evidence_is_durable=evidence.published and state.behavior_result.passed,
-    )
+    result = finalizer.finalize(prepared=prepared)
     assert result.outcome == FinalizationOutcome.PUBLISHED
     state = reduce(state, FinalizationCompleted(finalization_result=result))
     assert state.phase == Phase.ACCEPTED
@@ -236,25 +274,25 @@ def test_terminal_phase_blocks_further_events(tmp_path: Path):
     repository = tmp_path / "disposable.git"
     parent = initialize_disposable_repository(repository, parent_identity=PARENT_IDENTITY)
     finalizer = AdmissibleFinalizer(repository)
-    state = reduce(state, FinalizationStarted())
-
-    blobs = tuple(
-        AcceptedBlob.create(
-            relative_path=record.relative_path, data=(tmp_path / "accepted" / record.relative_path).read_bytes()
-        )
-        for record in evidence.files
+    prepared = _prepare_finalization(finalizer, state, evidence, tmp_path, "term-index")
+    state = reduce(
+        state,
+        FinalizationStarted(
+            finalization_evidence=prepared.evidence,
+            durability_receipt=prepared.durability_receipt,
+        ),
     )
-    result = finalizer.finalize(
-        parent=parent,
-        accepted_blobs=blobs,
-        private_index=tmp_path / "term-index",
-        message=MESSAGE,
-        evidence_is_durable=True,
-    )
+    result = finalizer.finalize(prepared=prepared)
     state = reduce(state, FinalizationCompleted(finalization_result=result))
     assert state.phase == Phase.ACCEPTED
     with pytest.raises(IllegalTransition):
-        reduce(state, FinalizationStarted())
+        reduce(
+            state,
+            FinalizationStarted(
+                finalization_evidence=prepared.evidence,
+                durability_receipt=prepared.durability_receipt,
+            ),
+        )
 
 
 def test_provider_failure_reaches_failed_with_no_evidence(tmp_path: Path):
@@ -289,8 +327,9 @@ def test_checkpoint_refusal_reaches_refused(tmp_path: Path):
     _healthy_intake_tree(source)
     evidence = validate_and_copy(source, NEON_RELAY_AUTHORITY, tmp_path / "accepted", tmp_path / "evidence.json")
     state = reduce(state, IntakeEvaluated(intake_evidence=evidence))
+    material = state.accepted_material
     state = reduce(state, CheckpointVerificationStarted())
-    state = reduce(state, CheckpointVerified(checkpoint_result=_checkpoint(passed=False)))
+    state = reduce(state, CheckpointVerified(checkpoint_result=_checkpoint(material, passed=False)))
     assert state.phase == Phase.REFUSED
     assert state.refusal_reason == RefusalReason.CHECKPOINT_REFUSED
     assert state.behavior_result is None
@@ -306,10 +345,11 @@ def test_behavioral_refusal_after_checkpoint_pass_reaches_refused_not_accepted(t
     _healthy_intake_tree(source)
     evidence = validate_and_copy(source, NEON_RELAY_AUTHORITY, tmp_path / "accepted", tmp_path / "evidence.json")
     state = reduce(state, IntakeEvaluated(intake_evidence=evidence))
+    material = state.accepted_material
     state = reduce(state, CheckpointVerificationStarted())
-    state = reduce(state, CheckpointVerified(checkpoint_result=_checkpoint(passed=True)))
+    state = reduce(state, CheckpointVerified(checkpoint_result=_checkpoint(material, passed=True)))
     assert state.phase == Phase.VERIFYING_BEHAVIOR
-    state = reduce(state, BehaviorVerified(behavior_result=_behavior(passed=False)))
+    state = reduce(state, BehaviorVerified(behavior_result=_behavior(material, passed=False)))
     assert state.phase == Phase.REFUSED
     assert state.refusal_reason == RefusalReason.BEHAVIOR_REFUSED
     assert state.checkpoint_result.passed is True
@@ -356,7 +396,14 @@ def test_finalizer_cas_refusal_reaches_failed_not_accepted(tmp_path: Path):
     repository = tmp_path / "disposable.git"
     parent = initialize_disposable_repository(repository, parent_identity=PARENT_IDENTITY)
     finalizer = AdmissibleFinalizer(repository)
-    state = reduce(state, FinalizationStarted())
+    prepared = _prepare_finalization(finalizer, state, evidence, tmp_path, "private-index")
+    state = reduce(
+        state,
+        FinalizationStarted(
+            finalization_evidence=prepared.evidence,
+            durability_receipt=prepared.durability_receipt,
+        ),
+    )
 
     from admissible.capsule.common import git
     from admissible.capsule.finalizer import _git_environment
@@ -372,25 +419,25 @@ def test_finalizer_cas_refusal_reaches_failed_not_accepted(tmp_path: Path):
             unexpected_tree,
             "-p",
             parent,
-            env=_git_environment(unexpected_identity),
+            env=_git_environment(
+                unexpected_identity,
+                environment_root=finalizer.environment_root,
+                hooks_directory=finalizer.hooks_directory,
+            ),
             input_bytes=b"unexpected concurrent parent\n",
         )
         .stdout.decode()
         .strip()
     )
-    git(repository, "update-ref", finalizer.target_ref, unexpected_commit, parent)
-
-    blobs = tuple(
-        AcceptedBlob.create(relative_path=record.relative_path, data=(tmp_path / "accepted" / record.relative_path).read_bytes())
-        for record in evidence.files
+    git(
+        repository,
+        "update-ref",
+        finalizer.target_ref,
+        unexpected_commit,
+        parent,
+        env=finalizer.environment,
     )
-    result = finalizer.finalize(
-        parent=parent,
-        accepted_blobs=blobs,
-        private_index=tmp_path / "private-index",
-        message=MESSAGE,
-        evidence_is_durable=True,
-    )
+    result = finalizer.finalize(prepared=prepared)
     assert result.outcome == FinalizationOutcome.COMPARE_AND_SWAP_REFUSED
     state = reduce(state, FinalizationCompleted(finalization_result=result))
     assert state.phase == Phase.FAILED
@@ -403,23 +450,18 @@ def test_finalizer_crash_before_update_ref_reaches_failed_with_ref_untouched(tmp
     repository = tmp_path / "disposable.git"
     parent = initialize_disposable_repository(repository, parent_identity=PARENT_IDENTITY)
     finalizer = AdmissibleFinalizer(repository)
-    state = reduce(state, FinalizationStarted())
-
-    blobs = tuple(
-        AcceptedBlob.create(relative_path=record.relative_path, data=(tmp_path / "accepted" / record.relative_path).read_bytes())
-        for record in evidence.files
+    prepared = _prepare_finalization(finalizer, state, evidence, tmp_path, "private-index")
+    state = reduce(
+        state,
+        FinalizationStarted(
+            finalization_evidence=prepared.evidence,
+            durability_receipt=prepared.durability_receipt,
+        ),
     )
     from admissible.capsule.common import CrashInjected
 
     with pytest.raises(CrashInjected):
-        finalizer.finalize(
-            parent=parent,
-            accepted_blobs=blobs,
-            private_index=tmp_path / "private-index",
-            message=MESSAGE,
-            evidence_is_durable=True,
-            crash_before_update_ref=True,
-        )
+        finalizer.finalize(prepared=prepared, crash_before_update_ref=True)
     assert finalizer.current_ref() == parent
     state = reduce(
         state,
@@ -437,23 +479,149 @@ def test_idempotent_duplicate_finalization_still_reaches_accepted(tmp_path: Path
     repository = tmp_path / "disposable.git"
     parent = initialize_disposable_repository(repository, parent_identity=PARENT_IDENTITY)
     finalizer = AdmissibleFinalizer(repository)
-    state = reduce(state, FinalizationStarted())
-
-    blobs = tuple(
-        AcceptedBlob.create(relative_path=record.relative_path, data=(tmp_path / "accepted" / record.relative_path).read_bytes())
-        for record in evidence.files
+    first_prepared = _prepare_finalization(finalizer, state, evidence, tmp_path, "index-1")
+    second_prepared = _prepare_finalization(finalizer, state, evidence, tmp_path, "index-2")
+    state = reduce(
+        state,
+        FinalizationStarted(
+            finalization_evidence=first_prepared.evidence,
+            durability_receipt=first_prepared.durability_receipt,
+        ),
     )
-    first = finalizer.finalize(
-        parent=parent, accepted_blobs=blobs, private_index=tmp_path / "index-1", message=MESSAGE, evidence_is_durable=True
-    )
+    first = finalizer.finalize(prepared=first_prepared)
     state = reduce(state, FinalizationCompleted(finalization_result=first))
     assert state.phase == Phase.ACCEPTED
 
     # A second, independent finalizer call against the same repository (as
     # if the transaction were retried) is idempotent at the Git layer.
-    second = finalizer.finalize(
-        parent=parent, accepted_blobs=blobs, private_index=tmp_path / "index-2", message=MESSAGE, evidence_is_durable=True
-    )
+    second = finalizer.finalize(prepared=second_prepared)
     assert second.outcome == FinalizationOutcome.IDEMPOTENT_SAME_ACCEPTED_IDENTITY
     assert second.commit == first.commit
     assert finalizer.current_ref() == first.commit
+
+
+def test_checkpoint_bound_to_a_different_accepted_tree_is_rejected_before_behavior(
+    tmp_path: Path,
+):
+    state, _evidence = _drive_to_finalization_ready(tmp_path / "first")
+    state = new_session_state(session_id="different-tree", capsule_authority=state.capsule_authority)
+    state = reduce(state, CapsuleExecutionStarted())
+    state = reduce(state, ProviderOutputFrozen(provider_output=_provider_output(state.capsule_authority)))
+    state = reduce(state, IntakeStarted())
+    source = tmp_path / "source-a"
+    _healthy_intake_tree(source)
+    evidence_a = validate_and_copy(
+        source,
+        NEON_RELAY_AUTHORITY,
+        tmp_path / "accepted-a",
+        tmp_path / "evidence-a.json",
+    )
+    state = reduce(state, IntakeEvaluated(intake_evidence=evidence_a))
+    state = reduce(state, CheckpointVerificationStarted())
+
+    source_b = tmp_path / "source-b"
+    _healthy_intake_tree(source_b)
+    (source_b / "index.html").write_bytes(b"<html>different accepted tree</html>\n")
+    evidence_b = validate_and_copy(
+        source_b,
+        NEON_RELAY_AUTHORITY,
+        tmp_path / "accepted-b",
+        tmp_path / "evidence-b.json",
+    )
+    material_b = AcceptedMaterialIdentity.from_intake_evidence(evidence_b)
+    with pytest.raises(IllegalTransition, match="different accepted material"):
+        reduce(
+            state,
+            CheckpointVerified(checkpoint_result=_checkpoint(material_b, passed=True)),
+        )
+    assert state.phase is Phase.VERIFYING_CHECKPOINT
+
+
+def test_finalization_for_different_accepted_material_is_never_authorized(tmp_path: Path):
+    state, _evidence = _drive_to_finalization_ready(tmp_path / "first")
+    repository = tmp_path / "different-material.git"
+    parent = initialize_disposable_repository(repository, parent_identity=PARENT_IDENTITY)
+    finalizer = AdmissibleFinalizer(repository)
+
+    source = tmp_path / "other-source"
+    _healthy_intake_tree(source)
+    (source / "index.html").write_bytes(b"<html>other</html>\n")
+    other_evidence = validate_and_copy(
+        source,
+        NEON_RELAY_AUTHORITY,
+        tmp_path / "other-accepted",
+        tmp_path / "other-evidence.json",
+    )
+    other_material = AcceptedMaterialIdentity.from_intake_evidence(other_evidence)
+    other_blobs = tuple(
+        AcceptedBlob.create(
+            relative_path=record.relative_path,
+            data=(tmp_path / "other-accepted" / record.relative_path).read_bytes(),
+            git_mode=record.git_mode,
+        )
+        for record in other_evidence.files
+    )
+    prepared = finalizer.prepare(
+        parent=parent,
+        accepted_material=other_material,
+        accepted_blobs=other_blobs,
+        private_index=tmp_path / "other-index",
+        message=MESSAGE,
+    )
+    with pytest.raises(IllegalTransition, match="different accepted material"):
+        reduce(
+            state,
+            FinalizationStarted(
+                finalization_evidence=prepared.evidence,
+                durability_receipt=prepared.durability_receipt,
+            ),
+        )
+    assert finalizer.current_ref() == parent
+
+
+def test_fabricated_published_finalization_result_cannot_reach_accepted(tmp_path: Path):
+    state, evidence = _drive_to_finalization_ready(tmp_path)
+    repository = tmp_path / "fabricated.git"
+    parent = initialize_disposable_repository(repository, parent_identity=PARENT_IDENTITY)
+    finalizer = AdmissibleFinalizer(repository)
+    prepared = _prepare_finalization(finalizer, state, evidence, tmp_path, "fabricated-index")
+    state = reduce(
+        state,
+        FinalizationStarted(
+            finalization_evidence=prepared.evidence,
+            durability_receipt=prepared.durability_receipt,
+        ),
+    )
+    with pytest.raises(ValueError, match="not durable"):
+        FinalizationResult.create(
+            outcome=FinalizationOutcome.PUBLISHED,
+            prepared=prepared,
+            ref_before=parent,
+            ref_after=prepared.evidence.resulting_commit,
+        )
+    assert state.phase is Phase.FINALIZING
+    assert finalizer.current_ref() == parent
+
+
+def test_conflicting_replayed_finalization_event_fails_closed(tmp_path: Path):
+    state, evidence = _drive_to_finalization_ready(tmp_path)
+    repository = tmp_path / "replay.git"
+    parent = initialize_disposable_repository(repository, parent_identity=PARENT_IDENTITY)
+    finalizer = AdmissibleFinalizer(repository)
+    prepared = _prepare_finalization(finalizer, state, evidence, tmp_path, "replay-index")
+    state = reduce(
+        state,
+        FinalizationStarted(
+            finalization_evidence=prepared.evidence,
+            durability_receipt=prepared.durability_receipt,
+        ),
+    )
+    with pytest.raises(IllegalTransition):
+        reduce(
+            state,
+            FinalizationStarted(
+                finalization_evidence=prepared.evidence,
+                durability_receipt=prepared.durability_receipt,
+            ),
+        )
+    assert state.phase is Phase.FINALIZING

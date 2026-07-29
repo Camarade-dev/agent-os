@@ -85,13 +85,60 @@ def test_capsule_authority_is_immutable_and_fingerprinted():
     assert CapsuleAuthority.from_dict(authority.to_dict()) == authority
 
 
-def test_capsule_backend_is_an_abstract_interface_with_no_provider_coupling():
+def test_capsule_backend_is_an_abstract_interface_with_no_structural_concrete_coupling():
     assert CapsuleBackend.__abstractmethods__ >= {"authority", "prepare_workspace", "run", "cleanup"}
+    import ast
     import inspect
 
-    text = inspect.getsource(__import__("admissible.capsule.backend", fromlist=["CapsuleBackend"]))
-    for forbidden in ("docker", "neon", "cursor", "openai", "codex"):
-        assert forbidden not in text.lower(), f"backend interface must stay provider/transport-agnostic ({forbidden})"
+    module = __import__("admissible.capsule.backend", fromlist=["CapsuleBackend"])
+    tree = ast.parse(inspect.getsource(module))
+    forbidden_modules = {
+        "admissible.capsule.docker_controller",
+        "admissible.capsule.host_control",
+        "admissible.capsule.host_codex_backend",
+    }
+    forbidden_types = {
+        "DockerCapsuleController",
+        "HostCodexAppServerCapsuleBackend",
+        "AuthenticatedControlAuthority",
+        "BwrapCodexConnectionFactory",
+    }
+    forbidden_invocations = {"Popen", "run", "check_call", "check_output", "system", "execv"}
+    forbidden_authority_fields = {
+        "codex_protocol_version",
+        "docker_image",
+        "openai_api_key",
+        "provider_executable",
+    }
+    imports = {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module is not None
+    }
+    imports.update(
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    )
+    assert imports.isdisjoint(forbidden_modules)
+    assert {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}.isdisjoint(
+        forbidden_types
+    )
+    assert {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }.isdisjoint(forbidden_invocations)
+    authority = next(
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "CapsuleAuthority"
+    )
+    authority_fields = {
+        node.target.id
+        for node in authority.body
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+    }
+    assert authority_fields.isdisjoint(forbidden_authority_fields)
 
 
 def test_provider_output_has_no_git_commit_field():

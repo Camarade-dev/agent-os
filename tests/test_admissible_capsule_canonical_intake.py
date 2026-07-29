@@ -7,14 +7,18 @@ invokes a provider, Docker, or a network transport.
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 
 import pytest
 
 from admissible.capsule.intake import (
     NEON_RELAY_AUTHORITY,
+    AcceptedMaterialIdentity,
     CanonicalIntake,
     IntakeAuthority,
+    IntakeEvidence,
+    IntakePublicationState,
     RejectionCode,
     path_policy_reasons,
     validate_and_copy,
@@ -51,6 +55,13 @@ def test_healthy_baseline_is_accepted_and_bytes_are_copied(tmp_path: Path):
     assert (destination / "index.html").read_bytes() == (source / "index.html").read_bytes()
     assert len(evidence.files) == len(NEON_RELAY_AUTHORITY.authority_paths)
     assert evidence_path.exists()
+    identity = AcceptedMaterialIdentity.from_intake_evidence(evidence)
+    assert identity.intake_authority_fingerprint == NEON_RELAY_AUTHORITY.authority_fingerprint
+    assert identity.authorized_relative_paths == tuple(sorted(NEON_RELAY_AUTHORITY.authority_paths))
+    assert identity.intake_evidence_fingerprint == evidence.evidence_fingerprint
+    assert all(record.git_mode == "100644" for record in identity.files)
+    replayed_evidence = IntakeEvidence.from_dict(json.loads(evidence_path.read_bytes()))
+    assert AcceptedMaterialIdentity.from_intake_evidence(replayed_evidence) == identity
 
 
 def test_rejected_intake_never_touches_destination(tmp_path: Path):
@@ -66,6 +77,24 @@ def test_rejected_intake_never_touches_destination(tmp_path: Path):
     assert evidence.published is False
     assert not destination.exists()
     assert any(reason.code == RejectionCode.EXTRA_PATH for reason in evidence.rejection_reasons)
+
+
+def test_accepted_identity_and_copy_preserve_exact_canonical_regular_file_modes(tmp_path: Path):
+    source = tmp_path / "source"
+    _healthy_tree(source)
+    executable = source / "src" / "main.js"
+    executable.chmod(0o755)
+    destination = tmp_path / "accepted"
+    evidence = validate_and_copy(
+        source,
+        NEON_RELAY_AUTHORITY,
+        destination,
+        tmp_path / "evidence.json",
+    )
+    identity = AcceptedMaterialIdentity.from_intake_evidence(evidence)
+    modes = {record.relative_path: record.git_mode for record in identity.files}
+    assert modes["src/main.js"] == "100755"
+    assert (destination / "src" / "main.js").stat().st_mode & 0o777 == 0o755
 
 
 def test_extra_directory_is_rejected(tmp_path: Path):
@@ -276,3 +305,28 @@ def test_mount_crossing_is_detected(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     evidence = validate_and_copy(source, NEON_RELAY_AUTHORITY, tmp_path / "accepted", tmp_path / "evidence.json")
     assert evidence.ruling == "REJECTED"
     assert any(reason.code == RejectionCode.MOUNT_CROSSING for reason in evidence.rejection_reasons)
+
+
+def test_crash_after_publication_preparation_never_claims_or_creates_acceptance(tmp_path: Path):
+    source = tmp_path / "source"
+    _healthy_tree(source)
+    destination = tmp_path / "accepted"
+    evidence_path = tmp_path / "evidence.json"
+
+    from admissible.capsule.common import CrashInjected
+
+    with pytest.raises(CrashInjected, match="publication preparation"):
+        validate_and_copy(
+            source,
+            NEON_RELAY_AUTHORITY,
+            destination,
+            evidence_path,
+            crash_after_preparation=True,
+        )
+
+    durable = IntakeEvidence.from_dict(json.loads(evidence_path.read_bytes()))
+    assert durable.publication_state is IntakePublicationState.PUBLICATION_PREPARED
+    assert durable.published is False
+    assert not destination.exists()
+    with pytest.raises(ValueError, match="published accepted"):
+        AcceptedMaterialIdentity.from_intake_evidence(durable)

@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from admissible.capsule.backend import CapsuleAuthority, CapsuleBackend
+from admissible.capsule.common import fingerprint
 from admissible.capsule.docker_controller import (
     ALLOWED_DYNAMIC_TOOLS,
     CapsuleExecutionAuthority,
@@ -32,6 +33,22 @@ from admissible.capsule.host_control import (
     AuthenticatedControlAuthority,
     HostControlBwrapPolicy,
     assert_no_forbidden_launch_source,
+)
+from admissible.capsule.intake import (
+    AcceptedMaterialIdentity,
+    IntakeEvidence,
+    IntakeFileRecord,
+    IntakePublicationState,
+)
+from admissible.capsule.models import (
+    ByteTreeObservation,
+    CleanupResult,
+    ObservedEntry,
+    ProcessResult,
+    ProviderCompletionClaim,
+    ProviderOutput,
+    TransportResult,
+    WorkspaceReference,
 )
 from admissible.capsule.session_store import (
     DurableCapsuleSessionStore,
@@ -108,6 +125,75 @@ def _request(
         tool="write_file",
         arguments=arguments
         or {"path": "index.html", "content": "<html></html>\n", "operation": "create"},
+    )
+
+
+def _accepted_material(content_hash: str = "1" * 64) -> AcceptedMaterialIdentity:
+    record = IntakeFileRecord(
+        relative_path="index.html",
+        size=12,
+        sha256=content_hash,
+        git_mode="100644",
+    ).validated()
+    evidence = IntakeEvidence.create(
+        authority_fingerprint="a" * 64,
+        ruling="ACCEPTED",
+        rejection_reasons=(),
+        files=(record,),
+        aggregate_fingerprint=fingerprint([record.to_dict()]),
+        publication_state=IntakePublicationState.ACCEPTED_INTAKE_PUBLISHED,
+    )
+    return AcceptedMaterialIdentity.from_intake_evidence(evidence)
+
+
+def _freeze_terminal_provider_output(store: DurableCapsuleSessionStore) -> None:
+    authority_fingerprint = "b" * 64
+    workspace = WorkspaceReference.create(
+        workspace_id="workspace-001",
+        capsule_authority_fingerprint=authority_fingerprint,
+        host_owned=False,
+    )
+    output = ProviderOutput.create(
+        capsule_authority_fingerprint=authority_fingerprint,
+        workspace=workspace,
+        observation=ByteTreeObservation.create(
+            entries=(
+                ObservedEntry(
+                    relative_path="index.html",
+                    kind="regular",
+                    size=12,
+                    sha256="1" * 64,
+                ),
+            )
+        ),
+        process_result=ProcessResult(
+            schema_version="admissible_capsule_process_result_v1",
+            exit_code=0,
+            timed_out=False,
+            signal=None,
+        ),
+        transport_result=TransportResult(
+            schema_version="admissible_capsule_transport_result_v1",
+            transport_kind="synthetic_transport_v1",
+            connected=True,
+            closed_cleanly=True,
+        ),
+        cleanup_result=CleanupResult(
+            schema_version="admissible_capsule_cleanup_result_v1",
+            workspace_removed=True,
+            processes_reaped=True,
+        ),
+        completion_claim=ProviderCompletionClaim(
+            schema_version="admissible_capsule_provider_completion_claim_v1",
+            claimed_complete=True,
+            claim_text="synthetic completion",
+        ),
+    )
+    store.freeze_provider_output("session-001", output)
+    store.record_terminal(
+        "session-001",
+        SessionTerminalClassification.COMPLETED,
+        "synthetic terminal evidence",
     )
 
 
@@ -324,6 +410,30 @@ def test_hash_chain_tampering_is_refused(tmp_path: Path):
     lines[1] = json.dumps(event, sort_keys=True, separators=(",", ":"))
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="fingerprint mismatch"):
+        store.reconstruct("session-001")
+
+
+def test_session_store_reconstructs_one_canonical_accepted_material_identity(tmp_path: Path):
+    store = _store(tmp_path)
+    _freeze_terminal_provider_output(store)
+    material = _accepted_material()
+    store.record_accepted_material("session-001", material)
+    reconstructed = store.reconstruct("session-001")
+    assert reconstructed.accepted_material == material
+
+
+def test_conflicting_replayed_accepted_material_events_fail_closed(tmp_path: Path):
+    store = _store(tmp_path)
+    _freeze_terminal_provider_output(store)
+    first = _accepted_material()
+    second = _accepted_material("2" * 64)
+    store.record_accepted_material("session-001", first)
+    store._append(  # adversarial valid hash-chain event, bypassing the guarded writer
+        "session-001",
+        "accepted_material_bound",
+        {"accepted_material": second.to_dict()},
+    )
+    with pytest.raises(ValueError, match="duplicate accepted-material"):
         store.reconstruct("session-001")
 
 
