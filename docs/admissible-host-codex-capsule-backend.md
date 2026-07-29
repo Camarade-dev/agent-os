@@ -1,24 +1,27 @@
 # Host Codex control / Docker capsule backend v1
 
+> The provider-free OS-enforced ChatGPT authentication, service-egress and
+> rootful-Docker separation is specified in
+> [`admissible-codex-os-boundary.md`](admissible-codex-os-boundary.md).
+> Production construction now gives the general controller only the
+> app-server and closed capsule-broker channels; it cannot directly own
+> authentication state or Docker authority.
+
 ## Readiness
 
-The provider-free backend and all boundaries independent of authentication are
-implemented. Production provider use is **not ready**.
+The provider-free backend, authentication broker, namespace launcher, sealed
+egress relay and root-equivalent capsule broker are implemented. The
+provider-free witnesses do not make a real provider run ready: login refresh,
+the complete ChatGPT destination set, and service compatibility remain
+real-canary observations.
 
-`AuthenticationBoundary` is the closed integration point for the independent
-authentication and service-egress architecture. The default
-`PendingAuthenticationBoundary` mounts no authentication state, grants no
-network, and refuses launch. This branch has no architecture-approved
-`OS_ENFORCED` implementation: the policy rejects even a caller-defined
-boundary that merely asserts that state, and its evidence always reports
-`production_ready = false`. The parallel architecture result must add the
-concrete implementation and its independent OS attestations before a
-production connection can become constructible.
-
-The checked-in `SyntheticAuthenticationBoundary` is only a network-isolated,
-provider-incapable test fixture. It identifies its fixture with metadata
-without opening or hashing its contents. It cannot be substituted for the
-production result.
+`PendingAuthenticationBoundary` and the old direct
+`HostControlBwrapPolicy` remain fail-closed compatibility APIs. Production V0
+uses `BoundaryLauncher`, `AuthenticationBrokerProcess`,
+`BoundaryCodexConnectionFactory` and `CapsuleBrokerClient`; it does not turn a
+caller-asserted state string into OS evidence. The checked-in
+`SyntheticAuthenticationBoundary` remains a network-isolated,
+provider-incapable legacy test fixture.
 
 No provider output has acceptance, Git, verification, or publication
 authority. The flow remains:
@@ -55,6 +58,9 @@ Each prepared backend session creates one immutable
   handle independently bound in every durable effect request;
 - connection mode and connection-factory identity;
 - authentication-boundary state;
+- the complete V0 `OSBoundaryAuthority` and launch fingerprint, including all
+  brokers, wire schemas, FD topology, confinement, pin-manifest, auth metadata,
+  ephemeral-home and cleanup policies;
 - process, protocol, output, workspace, CPU, memory, PID, and time budgets;
 - the terminal/draining policy.
 
