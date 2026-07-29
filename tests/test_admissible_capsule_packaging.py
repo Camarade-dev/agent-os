@@ -106,6 +106,13 @@ def test_sdist_and_wheel_contain_backend_documentation_and_generated_schemas(
     wheel = next(artifacts.glob("*.whl"))
     with tarfile.open(sdist, "r:gz") as archive:
         sdist_names = set(archive.getnames())
+        sdist_regular_bytes = tuple(
+            extracted.read()
+            for member in archive.getmembers()
+            if member.isfile()
+            for extracted in (archive.extractfile(member),)
+            if extracted is not None
+        )
     with zipfile.ZipFile(wheel) as archive:
         wheel_names = set(archive.namelist())
         runtime_sources = {
@@ -150,6 +157,18 @@ def test_sdist_and_wheel_contain_backend_documentation_and_generated_schemas(
         "admissible/capsule/destination_manifests/codex-0.145.0-chatgpt.json",
     }
     assert required_schema_suffixes <= wheel_names
+    assert all("/tests/" not in name for name in sdist_names)
+    synthetic_auth_fixture = (
+        b'{"synthetic_fixture":true,"opaque_fixture":"provider-free-only"}'
+    )
+    assert all(
+        synthetic_auth_fixture not in content
+        for content in sdist_regular_bytes
+    )
+    assert all(
+        synthetic_auth_fixture not in content.encode("utf-8")
+        for content in runtime_sources.values()
+    )
     assert all(
         "_agent-runs/" not in name
         and "spike" not in name.lower()
