@@ -254,4 +254,3 @@ def test_controller_command_line_contains_every_required_security_boundary(
     assert "/var/run/docker.sock" not in joined
     assert "OPENAI_API_KEY" not in joined
     assert ".codex" not in joined
-

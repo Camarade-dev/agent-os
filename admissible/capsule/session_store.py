@@ -769,4 +769,3 @@ class DurableCapsuleSessionStore:
             recorded_terminal_classification=terminal,
             terminal_detail=terminal_detail,
         )
-
