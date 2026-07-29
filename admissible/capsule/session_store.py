@@ -519,6 +519,7 @@ class ReconstructedCapsuleSession:
     results: tuple[DurableToolResult, ...]
     control_terminal: Mapping[str, Any] | None
     cleanup: Mapping[str, Any] | None
+    boundary_terminal: Mapping[str, Any] | None
     provider_output: ProviderOutput | None
     downstream_handoff: Mapping[str, Any] | None
     accepted_material: AcceptedMaterialIdentity | None
@@ -1090,6 +1091,44 @@ class DurableCapsuleSessionStore:
                 raise ValueError("capsule cleanup cannot precede control-process terminal truth")
             self._append_locked(session_id, "cleanup_recorded", {"cleanup": dict(cleanup)})
 
+    def record_boundary_terminal(
+        self,
+        session_id: str,
+        evidence: Mapping[str, Any],
+    ) -> None:
+        require_exact_keys(
+            evidence,
+            {
+                "os_boundary_authority_fingerprint",
+                "capsule_broker_terminal_fingerprint",
+                "boundary_terminal_fingerprint",
+                "production_complete",
+            },
+            "boundary terminal evidence",
+        )
+        for key in (
+            "os_boundary_authority_fingerprint",
+            "capsule_broker_terminal_fingerprint",
+            "boundary_terminal_fingerprint",
+        ):
+            require_sha256(evidence[key], key)
+        require_bool(evidence["production_complete"], "production boundary complete")
+        with self._writer_lock(session_id):
+            snapshot = self.reconstruct(session_id)
+            if snapshot.boundary_terminal is not None:
+                if dict(snapshot.boundary_terminal) != dict(evidence):
+                    raise ValueError("conflicting boundary terminal evidence")
+                return
+            if snapshot.cleanup is None or snapshot.provider_output is not None:
+                raise ValueError(
+                    "boundary terminal must follow cleanup and precede ProviderOutput"
+                )
+            self._append_locked(
+                session_id,
+                "boundary_terminal_recorded",
+                {"evidence": dict(evidence)},
+            )
+
     def freeze_provider_output(self, session_id: str, output: ProviderOutput) -> None:
         output.validated()
         with self._writer_lock(session_id):
@@ -1326,6 +1365,7 @@ class DurableCapsuleSessionStore:
         capsule_process = None
         control_terminal = None
         cleanup = None
+        boundary_terminal = None
         provider_output = None
         downstream_handoff = None
         accepted_material = None
@@ -1467,6 +1507,42 @@ class DurableCapsuleSessionStore:
                 ):
                     raise ValueError("cleanup precedes control terminal evidence")
                 cleanup = _validate_json_object(event.payload["cleanup"], "cleanup evidence", max_bytes=8192)
+            elif event.kind == "boundary_terminal_recorded":
+                if boundary_terminal is not None:
+                    raise ValueError("duplicate boundary terminal evidence")
+                require_exact_keys(
+                    event.payload,
+                    {"evidence"},
+                    "boundary terminal event",
+                )
+                evidence = _validate_json_object(
+                    event.payload["evidence"],
+                    "boundary terminal evidence",
+                    max_bytes=8192,
+                )
+                require_exact_keys(
+                    evidence,
+                    {
+                        "os_boundary_authority_fingerprint",
+                        "capsule_broker_terminal_fingerprint",
+                        "boundary_terminal_fingerprint",
+                        "production_complete",
+                    },
+                    "boundary terminal evidence",
+                )
+                for key in (
+                    "os_boundary_authority_fingerprint",
+                    "capsule_broker_terminal_fingerprint",
+                    "boundary_terminal_fingerprint",
+                ):
+                    require_sha256(evidence[key], key)
+                require_bool(
+                    evidence["production_complete"],
+                    "production boundary complete",
+                )
+                if cleanup is None:
+                    raise ValueError("boundary terminal precedes cleanup evidence")
+                boundary_terminal = evidence
             elif event.kind == "provider_output_frozen":
                 if provider_output is not None:
                     raise ValueError("duplicate frozen provider output")
@@ -1480,8 +1556,13 @@ class DurableCapsuleSessionStore:
                 require_sha256(event.payload["output_fingerprint"], "frozen output fingerprint")
                 if cleanup is None:
                     raise ValueError("ProviderOutput was frozen before cleanup evidence")
-                if event.index == 0 or events[event.index - 1].kind != "cleanup_recorded":
-                    raise ValueError("ProviderOutput is not immediately bound to cleanup evidence")
+                if event.index == 0 or events[event.index - 1].kind not in {
+                    "cleanup_recorded",
+                    "boundary_terminal_recorded",
+                }:
+                    raise ValueError(
+                        "ProviderOutput is not immediately bound to terminal evidence"
+                    )
                 output_data = strict_json_loads(
                     self._provider_output_path(session_id).read_bytes(),
                     label="frozen ProviderOutput JSON",
@@ -1513,6 +1594,23 @@ class DurableCapsuleSessionStore:
                         != control_terminal.get("app_server_exit_normal")
                         or truth.app_server_forced
                         != control_terminal.get("app_server_forced")
+                        or (
+                            boundary_terminal is not None
+                            and (
+                                truth.os_boundary_authority_fingerprint
+                                != boundary_terminal[
+                                    "os_boundary_authority_fingerprint"
+                                ]
+                                or truth.capsule_broker_terminal_fingerprint
+                                != boundary_terminal[
+                                    "capsule_broker_terminal_fingerprint"
+                                ]
+                                or truth.boundary_terminal_fingerprint
+                                != boundary_terminal[
+                                    "boundary_terminal_fingerprint"
+                                ]
+                            )
+                        )
                     ):
                         raise ValueError(
                             "ProviderOutput truth differs from authority, process, "
@@ -1651,6 +1749,7 @@ class DurableCapsuleSessionStore:
             results=tuple(results),
             control_terminal=control_terminal,
             cleanup=cleanup,
+            boundary_terminal=boundary_terminal,
             provider_output=provider_output,
             downstream_handoff=downstream_handoff,
             accepted_material=accepted_material,

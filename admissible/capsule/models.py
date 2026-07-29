@@ -32,7 +32,7 @@ TRANSPORT_RESULT_SCHEMA_VERSION = "admissible_capsule_transport_result_v1"
 CLEANUP_RESULT_SCHEMA_VERSION = "admissible_capsule_cleanup_result_v1"
 PROVIDER_COMPLETION_CLAIM_SCHEMA_VERSION = "admissible_capsule_provider_completion_claim_v1"
 PROVIDER_OUTPUT_SCHEMA_VERSION = "admissible_capsule_provider_output_v1"
-EXECUTION_TRUTH_SCHEMA_VERSION = "admissible_capsule_execution_truth_v1"
+EXECUTION_TRUTH_SCHEMA_VERSION = "admissible_capsule_execution_truth_v2"
 
 
 @dataclass(frozen=True)
@@ -414,6 +414,9 @@ class ExecutionTruth:
     journal_tail_fingerprint: str
     frozen_workspace_fingerprint: str
     frozen_binding_fingerprint: str
+    os_boundary_authority_fingerprint: str
+    capsule_broker_terminal_fingerprint: str
+    boundary_terminal_fingerprint: str
     truth_fingerprint: str
 
     @classmethod
@@ -434,7 +437,40 @@ class ExecutionTruth:
         journal_tail_fingerprint: str,
         frozen_workspace_fingerprint: str,
         frozen_binding_fingerprint: str,
+        os_boundary_authority_fingerprint: str | None = None,
+        capsule_broker_terminal_fingerprint: str | None = None,
+        boundary_terminal_fingerprint: str | None = None,
     ) -> "ExecutionTruth":
+        os_boundary_authority_fingerprint = (
+            os_boundary_authority_fingerprint
+            or fingerprint(
+                {
+                    "kind": "legacy_no_os_boundary_authority",
+                    "backend_execution_authority_fingerprint": (
+                        backend_execution_authority_fingerprint
+                    ),
+                }
+            )
+        )
+        capsule_broker_terminal_fingerprint = (
+            capsule_broker_terminal_fingerprint
+            or fingerprint(
+                {
+                    "kind": "legacy_no_capsule_broker_terminal",
+                    "cleanup_fingerprint": cleanup_fingerprint,
+                }
+            )
+        )
+        boundary_terminal_fingerprint = (
+            boundary_terminal_fingerprint
+            or fingerprint(
+                {
+                    "kind": "legacy_no_complete_boundary_terminal",
+                    "journal_tail_fingerprint": journal_tail_fingerprint,
+                    "cleanup_fingerprint": cleanup_fingerprint,
+                }
+            )
+        )
         body = {
             "schema_version": EXECUTION_TRUTH_SCHEMA_VERSION,
             "backend_execution_authority_fingerprint": backend_execution_authority_fingerprint,
@@ -451,6 +487,13 @@ class ExecutionTruth:
             "journal_tail_fingerprint": journal_tail_fingerprint,
             "frozen_workspace_fingerprint": frozen_workspace_fingerprint,
             "frozen_binding_fingerprint": frozen_binding_fingerprint,
+            "os_boundary_authority_fingerprint": (
+                os_boundary_authority_fingerprint
+            ),
+            "capsule_broker_terminal_fingerprint": (
+                capsule_broker_terminal_fingerprint
+            ),
+            "boundary_terminal_fingerprint": boundary_terminal_fingerprint,
         }
         return cls(**body, truth_fingerprint=fingerprint(body)).validated()
 
@@ -538,6 +581,12 @@ class ExecutionTruth:
             ("journal tail", self.journal_tail_fingerprint),
             ("frozen workspace", self.frozen_workspace_fingerprint),
             ("frozen binding", self.frozen_binding_fingerprint),
+            ("OS boundary authority", self.os_boundary_authority_fingerprint),
+            (
+                "capsule broker terminal",
+                self.capsule_broker_terminal_fingerprint,
+            ),
+            ("boundary terminal", self.boundary_terminal_fingerprint),
             ("execution truth", self.truth_fingerprint),
         ):
             require_sha256(value, f"{label} fingerprint")
@@ -568,6 +617,9 @@ class ExecutionTruth:
                 "journal_tail_fingerprint",
                 "frozen_workspace_fingerprint",
                 "frozen_binding_fingerprint",
+                "os_boundary_authority_fingerprint",
+                "capsule_broker_terminal_fingerprint",
+                "boundary_terminal_fingerprint",
                 "truth_fingerprint",
             },
             "execution truth",

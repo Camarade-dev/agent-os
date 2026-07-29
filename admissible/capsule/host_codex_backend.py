@@ -14,6 +14,8 @@ import os
 import re
 import selectors
 import signal
+import socket
+import stat
 import subprocess
 import time
 import uuid
@@ -28,8 +30,10 @@ from admissible.capsule.common import (
     CrashInjected,
     canonical_bytes,
     fingerprint,
+    require_exact_keys,
     require_identifier,
     require_nonempty_text,
+    require_sha256,
     sha256_bytes,
     strict_json_loads,
 )
@@ -44,6 +48,10 @@ from admissible.capsule.docker_controller import (
     DockerCapsuleController,
     DockerWorkspaceHandle,
 )
+from admissible.capsule.capsule_broker import CapsuleBrokerClient
+from admissible.capsule.boundary_authority import OSBoundaryAuthority
+from admissible.capsule.boundary_launcher import provider_free_os_boundary_authority
+from admissible.capsule.broker_transport import receive_packet
 from admissible.capsule.host_control import (
     AuthenticatedControlAuthority,
     CONTROL_CODEX_HOME,
@@ -366,6 +374,268 @@ class BwrapCodexConnectionFactory(AppServerConnectionFactory):
         require_identifier(session_id, "app-server session_id")
         self.attest_launch()
         return BwrapCodexAppServerConnection(policy=self.policy, authority=self.authority)
+
+
+CODEX_TERMINAL_STATUS_SCHEMA_VERSION = "admissible_codex_process_terminal_status_v1"
+
+
+class BoundaryCodexAppServerConnection(AppServerConnection):
+    """Controller side of a Codex process prelaunched by the boundary TCB."""
+
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        app_server_descriptor: int,
+        terminal_status_descriptor: int,
+        os_boundary_authority_fingerprint: str,
+        control_authority_fingerprint: str,
+    ):
+        self._session_id = require_identifier(session_id, "boundary Codex session")
+        self._boundary_fingerprint = require_sha256(
+            os_boundary_authority_fingerprint,
+            "boundary Codex OS authority",
+        )
+        self._control_authority_fingerprint = require_sha256(
+            control_authority_fingerprint,
+            "boundary Codex control authority",
+        )
+        self._socket = socket.socket(fileno=os.dup(app_server_descriptor))
+        if self._socket.family != socket.AF_UNIX:
+            self._socket.close()
+            raise ValueError("boundary app-server channel is not an inherited Unix socket")
+        self._socket.setblocking(False)
+        self._status = socket.socket(fileno=os.dup(terminal_status_descriptor))
+        if self._status.family != socket.AF_UNIX:
+            self._socket.close()
+            self._status.close()
+            raise ValueError("Codex terminal-status channel is not an inherited Unix socket")
+        self._selector = selectors.DefaultSelector()
+        self._selector.register(self._socket, selectors.EVENT_READ)
+        self._receive_buffer = bytearray()
+        self._returncode: int | None = None
+        self._forced = False
+        self._eof = False
+        self._closed = False
+
+    @property
+    def process_identity(self) -> Mapping[str, Any]:
+        return {
+            "kind": "os_boundary_prelaunched_codex_app_server",
+            "codex_protocol_version": CODEX_APP_SERVER_PROTOCOL_VERSION,
+            "control_authority_fingerprint": self._control_authority_fingerprint,
+            "os_boundary_authority_fingerprint": self._boundary_fingerprint,
+            "authentication_visible_to_controller": False,
+            "provider_request_capable": True,
+        }
+
+    @property
+    def returncode(self) -> int | None:
+        return self._returncode
+
+    @property
+    def forced_close(self) -> bool:
+        return self._forced
+
+    @property
+    def eof_observed(self) -> bool:
+        return self._eof
+
+    def send(self, message: Mapping[str, Any]) -> None:
+        encoded = canonical_bytes(message) + b"\n"
+        if len(encoded) > APP_SERVER_MESSAGE_LIMIT:
+            raise AppServerProtocolError("outbound app-server message exceeds its bound")
+        self._socket.setblocking(True)
+        try:
+            self._socket.sendall(encoded)
+        finally:
+            self._socket.setblocking(False)
+
+    def receive(self, timeout: float) -> Mapping[str, Any] | None:
+        deadline = time.monotonic() + timeout
+        while True:
+            newline = self._receive_buffer.find(b"\n")
+            if newline >= 0:
+                raw = bytes(self._receive_buffer[:newline])
+                del self._receive_buffer[: newline + 1]
+                if not raw:
+                    raise AppServerProtocolError(
+                        "boundary app-server emitted an empty record"
+                    )
+                value = strict_json_loads(raw, label="boundary app-server JSON")
+                if not isinstance(value, dict):
+                    raise AppServerProtocolError(
+                        "boundary app-server record is not an object"
+                    )
+                return value
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AppServerReceiveTimeout("boundary app-server receive timed out")
+            events = self._selector.select(remaining)
+            if not events:
+                raise AppServerReceiveTimeout("boundary app-server receive timed out")
+            try:
+                chunk = self._socket.recv(64 * 1024)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                if self._receive_buffer:
+                    raise AppServerProtocolError(
+                        "boundary app-server ended with a partial record"
+                    )
+                self._eof = True
+                return None
+            self._receive_buffer.extend(chunk)
+            if len(self._receive_buffer) > APP_SERVER_MESSAGE_LIMIT:
+                raise AppServerProtocolError(
+                    "boundary app-server message exceeds its bound"
+                )
+
+    def begin_protocol_close(self) -> None:
+        try:
+            self._socket.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+    def _receive_terminal_status(self) -> None:
+        self._status.settimeout(3)
+        try:
+            value, descriptors = receive_packet(self._status)
+        except (EOFError, OSError, ValueError):
+            return
+        if descriptors:
+            for descriptor in descriptors:
+                os.close(descriptor)
+            raise AppServerProtocolError(
+                "Codex terminal status carried an unauthorized descriptor"
+            )
+        require_exact_keys(
+            value,
+            {
+                "schema_version",
+                "session_id",
+                "os_boundary_authority_fingerprint",
+                "exit_code",
+                "exit_normal",
+                "forced",
+                "process_terminal_fingerprint",
+            },
+            "Codex terminal process status",
+        )
+        body = {
+            key: value[key]
+            for key in value
+            if key != "process_terminal_fingerprint"
+        }
+        if (
+            value["schema_version"] != CODEX_TERMINAL_STATUS_SCHEMA_VERSION
+            or value["session_id"] != self._session_id
+            or value["os_boundary_authority_fingerprint"]
+            != self._boundary_fingerprint
+            or fingerprint(body) != value["process_terminal_fingerprint"]
+            or not isinstance(value["exit_normal"], bool)
+            or not isinstance(value["forced"], bool)
+        ):
+            raise AppServerProtocolError("Codex terminal process status differs")
+        exit_code = value["exit_code"]
+        if isinstance(exit_code, bool) or (
+            exit_code is not None and not isinstance(exit_code, int)
+        ):
+            raise AppServerProtocolError("Codex terminal exit code is invalid")
+        self._returncode = exit_code
+        self._forced = value["forced"]
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self.begin_protocol_close()
+        self._receive_terminal_status()
+        self._selector.close()
+        self._socket.close()
+        self._status.close()
+        self._closed = True
+
+
+class BoundaryCodexConnectionFactory(AppServerConnectionFactory):
+    """No auth/Docker authority: only inherited app-server/status channels."""
+
+    def __init__(
+        self,
+        *,
+        app_server_descriptor: int,
+        terminal_status_descriptor: int,
+        control_authority: AuthenticatedControlAuthority,
+        os_boundary_authority: OSBoundaryAuthority,
+        codex_component_identity: Mapping[str, Any],
+        bwrap_component_identity: Mapping[str, Any],
+    ):
+        self.app_server_descriptor = app_server_descriptor
+        self.terminal_status_descriptor = terminal_status_descriptor
+        self.control_authority = control_authority.validated()
+        self.os_boundary_authority = os_boundary_authority.validated()
+        self._codex_identity = dict(codex_component_identity)
+        self._bwrap_identity = dict(bwrap_component_identity)
+        self._opened = False
+        self._component_identity = source_component_identity(
+            component="os_boundary_connection_factory",
+            source_bytes=inspect.getsource(type(self)).encode("utf-8"),
+            provider_request_capable=True,
+        )
+
+    @property
+    def connection_mode(self) -> str:
+        return "production_os_boundary"
+
+    @property
+    def component_identity(self) -> Mapping[str, Any]:
+        return self._component_identity
+
+    @property
+    def codex_component_identity(self) -> Mapping[str, Any]:
+        return self._codex_identity
+
+    @property
+    def bwrap_component_identity(self) -> Mapping[str, Any]:
+        return self._bwrap_identity
+
+    @property
+    def host_policy_fingerprint(self) -> str:
+        return self.os_boundary_authority.authority_fingerprint
+
+    @property
+    def bwrap_argv_policy_fingerprint(self) -> str:
+        return self.os_boundary_authority.launch_fingerprint
+
+    @property
+    def authentication_boundary_state(self) -> str:
+        return "OS_ENFORCED"
+
+    def attest_launch(self) -> None:
+        if self._opened:
+            raise ValueError("boundary Codex connection is single-use")
+        for descriptor in (
+            self.app_server_descriptor,
+            self.terminal_status_descriptor,
+        ):
+            info = os.fstat(descriptor)
+            if not stat.S_ISSOCK(info.st_mode):
+                raise ValueError("boundary Codex channel descriptor changed")
+        self.os_boundary_authority.validated()
+
+    def open(self, session_id: str) -> AppServerConnection:
+        self.attest_launch()
+        self._opened = True
+        return BoundaryCodexAppServerConnection(
+            session_id=session_id,
+            app_server_descriptor=self.app_server_descriptor,
+            terminal_status_descriptor=self.terminal_status_descriptor,
+            os_boundary_authority_fingerprint=(
+                self.os_boundary_authority.authority_fingerprint
+            ),
+            control_authority_fingerprint=(
+                self.control_authority.authority_fingerprint
+            ),
+        )
 
 
 class ScriptedCodexAppServerConnection(AppServerConnection):
@@ -735,11 +1005,12 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
         *,
         authority: CapsuleAuthority,
         control_authority: AuthenticatedControlAuthority,
-        controller: DockerCapsuleController,
+        controller: DockerCapsuleController | CapsuleBrokerClient,
         session_store: DurableCapsuleSessionStore,
         connection_factory: AppServerConnectionFactory,
         mission_prompt: str,
         mission_bytes: bytes | None = None,
+        os_boundary_authority: OSBoundaryAuthority | None = None,
         event_timeout_seconds: float = 10.0,
         protocol_drain_timeout_seconds: float = 3.0,
         protocol_drain_record_limit: int = 64,
@@ -749,6 +1020,14 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
         self.controller = controller
         self.session_store = session_store
         self.connection_factory = connection_factory
+        if (
+            self.connection_factory.connection_mode
+            in {"production_bwrap", "production_os_boundary"}
+            and not isinstance(self.controller, CapsuleBrokerClient)
+        ):
+            raise ValueError(
+                "production controller must use the closed capsule broker"
+            )
         prompt = require_nonempty_text(
             mission_prompt, "capsule mission prompt", max_bytes=64 * 1024
         )
@@ -790,10 +1069,84 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
         self.protocol_drain_record_limit = protocol_drain_record_limit
         self._workspace_sessions: dict[str, str] = {}
         self._execution_authorities: dict[str, BackendExecutionAuthority] = {}
+        if (
+            self.connection_factory.connection_mode
+            in {"production_bwrap", "production_os_boundary"}
+            and os_boundary_authority is None
+        ):
+            raise ValueError("production backend requires explicit OS boundary authority")
+        self.os_boundary_authority = (
+            os_boundary_authority.validated()
+            if os_boundary_authority is not None
+            else provider_free_os_boundary_authority(
+                dependent_identities=(
+                    self.connection_factory.codex_component_identity,
+                    self.connection_factory.bwrap_component_identity,
+                    self._docker_component_identity(),
+                    self.connection_factory.component_identity,
+                ),
+                dependent_authorities={
+                    "capsule_image_content_id": (
+                        self.controller.execution_authority.image_identity
+                    ),
+                    "capsule_execution_authority_fingerprint": (
+                        self.controller.execution_authority.authority_fingerprint
+                    ),
+                    "capsule_broker_runtime_authority_fingerprint": (
+                        self.controller.controller_authority.controller_fingerprint
+                    ),
+                    "codex_protocol_schema_identity": protocol_schema_identity(),
+                    "dynamic_tools_schema_identity": fingerprint(
+                        dynamic_tools_grammar()
+                    ),
+                },
+            )
+        )
+        factory_boundary = getattr(
+            self.connection_factory, "os_boundary_authority", None
+        )
+        if (
+            factory_boundary is not None
+            and factory_boundary.authority_fingerprint
+            != self.os_boundary_authority.authority_fingerprint
+        ):
+            raise ValueError("connection factory OS boundary authority differs")
+        expected_dependent_authorities = {
+            "capsule_image_content_id": (
+                self.controller.execution_authority.image_identity
+            ),
+            "capsule_execution_authority_fingerprint": (
+                self.controller.execution_authority.authority_fingerprint
+            ),
+            "capsule_broker_runtime_authority_fingerprint": (
+                self.controller.controller_authority.controller_fingerprint
+            ),
+            "codex_protocol_schema_identity": protocol_schema_identity(),
+            "dynamic_tools_schema_identity": fingerprint(dynamic_tools_grammar()),
+        }
+        if (
+            dict(self.os_boundary_authority.dependent_authorities)
+            != expected_dependent_authorities
+        ):
+            raise ValueError("OS boundary dependent image/protocol authority differs")
 
     @property
     def authority(self) -> CapsuleAuthority:
         return self._authority
+
+    def _docker_component_identity(self) -> Mapping[str, Any]:
+        if isinstance(self.controller, CapsuleBrokerClient):
+            return dict(self.controller.docker_component_identity)
+        return self.controller.docker_identity.to_dict()
+
+    def _attest_capsule_authority(self) -> None:
+        if isinstance(self.controller, CapsuleBrokerClient):
+            self.controller.attest_authority()
+        else:
+            # Direct Docker authority exists only in the synthetic compatibility
+            # harness. Production construction above refuses it.
+            self.controller.docker_identity.reattest(label="Docker executable")
+            self.controller.controller_authority.validated()
 
     def _attest_control_binding(self) -> None:
         self.connection_factory.attest_launch()
@@ -814,13 +1167,12 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
         execution_authority: BackendExecutionAuthority,
     ) -> None:
         self._attest_control_binding()
-        self.controller.docker_identity.reattest(label="Docker executable")
-        self.controller.controller_authority.validated()
+        self._attest_capsule_authority()
         expected = {
             "codex": dict(self.connection_factory.codex_component_identity),
             "bwrap": dict(self.connection_factory.bwrap_component_identity),
             "factory": dict(self.connection_factory.component_identity),
-            "docker": self.controller.docker_identity.to_dict(),
+            "docker": self._docker_component_identity(),
         }
         if (
             dict(execution_authority.codex_executable_identity) != expected["codex"]
@@ -847,13 +1199,14 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
             != sha256_bytes(self._mission_bytes)
             or execution_authority.prompt_fingerprint
             != sha256_bytes(self._prompt_bytes)
+            or execution_authority.os_boundary_authority_fingerprint
+            != self.os_boundary_authority.authority_fingerprint
         ):
             raise ValueError("backend execution authority changed before launch")
 
     def prepare_workspace(self) -> WorkspaceReference:
         self._attest_control_binding()
-        self.controller.docker_identity.reattest(label="Docker executable")
-        self.controller.controller_authority.validated()
+        self._attest_capsule_authority()
         token = uuid.uuid4().hex
         session_id = f"capsule-session-{token}"
         run_id = f"capsule-run-{uuid.uuid4().hex}"
@@ -869,7 +1222,7 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
             ),
             controller_identity=self.controller.controller_authority.controller_fingerprint,
             capsule_image_content_id=self.controller.execution_authority.image_identity,
-            docker_executable_identity=self.controller.docker_identity.to_dict(),
+            docker_executable_identity=self._docker_component_identity(),
             dynamic_tools_schema_identity=fingerprint(dynamic_tools_grammar()),
             protocol_request_policy_fingerprint=(
                 protocol_request_policy_fingerprint()
@@ -883,6 +1236,7 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
             authentication_boundary_state=(
                 self.connection_factory.authentication_boundary_state
             ),
+            os_boundary_authority=self.os_boundary_authority.to_dict(),
             budgets={
                 "event_timeout_ms": int(self.event_timeout_seconds * 1000),
                 "protocol_drain_timeout_ms": int(
@@ -932,6 +1286,7 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
                     "capsule_authority": self.authority.to_dict(),
                     "authenticated_control_authority": self.control_authority.to_dict(),
                     "capsule_execution_authority": self.controller.execution_authority.to_dict(),
+                    "os_boundary_authority": self.os_boundary_authority.to_dict(),
                 },
                 controller_authority=self.controller.controller_authority.to_dict(),
                 workspace=reference.to_dict(),
@@ -1648,6 +2003,74 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
 
         cleanup_fingerprint = fingerprint(cleanup_evidence.to_dict())
         cleanup_tail = self.session_store.reconstruct(session_id).events[-1].event_fingerprint
+        broker_terminal_evidence = getattr(
+            self.controller, "broker_terminal_evidence", None
+        )
+        capsule_broker_terminal_fingerprint = (
+            broker_terminal_evidence.get("terminal_fingerprint")
+            if isinstance(broker_terminal_evidence, Mapping)
+            else None
+        )
+        if capsule_broker_terminal_fingerprint is None:
+            capsule_broker_terminal_fingerprint = fingerprint(
+                {
+                    "kind": "synthetic_direct_controller_terminal",
+                    "connection_mode": self.connection_factory.connection_mode,
+                    "cleanup_fingerprint": cleanup_fingerprint,
+                }
+            )
+        require_sha256(
+            capsule_broker_terminal_fingerprint,
+            "capsule broker terminal fingerprint",
+        )
+        boundary_terminal_fingerprint = getattr(
+            self.controller,
+            "complete_boundary_terminal_fingerprint",
+            None,
+        )
+        production_boundary_complete = boundary_terminal_fingerprint is not None
+        if boundary_terminal_fingerprint is None:
+            boundary_terminal_fingerprint = fingerprint(
+                {
+                    "kind": "provider_free_boundary_terminal",
+                    "connection_mode": self.connection_factory.connection_mode,
+                    "os_boundary_authority_fingerprint": (
+                        self.os_boundary_authority.authority_fingerprint
+                    ),
+                    "capsule_broker_terminal_fingerprint": (
+                        capsule_broker_terminal_fingerprint
+                    ),
+                    "cleanup_fingerprint": cleanup_fingerprint,
+                    "journal_tail_fingerprint": cleanup_tail,
+                }
+            )
+            if self.connection_factory.connection_mode in {
+                "production_bwrap",
+                "production_os_boundary",
+            }:
+                classification = SessionTerminalClassification.CLEANUP_FAILED
+                detail = (
+                    "complete authentication/egress/capsule boundary terminal "
+                    "evidence is missing"
+                )
+        self.session_store.record_boundary_terminal(
+            session_id,
+            {
+                "os_boundary_authority_fingerprint": (
+                    self.os_boundary_authority.authority_fingerprint
+                ),
+                "capsule_broker_terminal_fingerprint": (
+                    capsule_broker_terminal_fingerprint
+                ),
+                "boundary_terminal_fingerprint": boundary_terminal_fingerprint,
+                "production_complete": production_boundary_complete,
+            },
+        )
+        cleanup_tail = (
+            self.session_store.reconstruct(session_id)
+            .events[-1]
+            .event_fingerprint
+        )
         frozen_workspace_fingerprint = (
             handle.frozen_workspace_fingerprint
             if freeze_succeeded and handle.frozen_workspace_fingerprint is not None
@@ -1741,6 +2164,13 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
                 journal_tail_fingerprint=cleanup_tail,
                 frozen_workspace_fingerprint=frozen_workspace_fingerprint,
                 frozen_binding_fingerprint=frozen_binding_fingerprint,
+                os_boundary_authority_fingerprint=(
+                    execution_authority.os_boundary_authority_fingerprint
+                ),
+                capsule_broker_terminal_fingerprint=(
+                    capsule_broker_terminal_fingerprint
+                ),
+                boundary_terminal_fingerprint=boundary_terminal_fingerprint,
             ),
         )
         self.session_store.freeze_provider_output(session_id, output)
