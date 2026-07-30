@@ -30,6 +30,7 @@ def test_package_discovery_configuration_includes_the_capsule_package():
         "docs/admissible-host-codex-capsule-backend.md",
         "docs/admissible-codex-os-boundary.md",
         "docs/admissible-codex-model-authority.md",
+        "docs/admissible-owner-rooted-witness-trust.md",
     ]
 
 
@@ -151,6 +152,16 @@ def test_sdist_and_wheel_contain_backend_documentation_and_generated_schemas(
     assert any(
         name.endswith(
             ".data/data/share/doc/agent-os/admissible-codex-model-authority.md"
+        )
+        for name in wheel_names
+    )
+    assert any(
+        name.endswith("/docs/admissible-owner-rooted-witness-trust.md")
+        for name in sdist_names
+    )
+    assert any(
+        name.endswith(
+            ".data/data/share/doc/agent-os/admissible-owner-rooted-witness-trust.md"
         )
         for name in wheel_names
     )
