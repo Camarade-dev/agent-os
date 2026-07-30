@@ -149,6 +149,7 @@ def provider_free_os_boundary_authority(
                 "candidate_serialization_witness_receipt_identity": "6" * 64,
                 "owner_binding_state": "NON_PRODUCTION_NO_OWNER_BINDING",
                 "owner_bound_serialization_receipt_identity": "0" * 64,
+                "owner_authority_installation_identity": "0" * 64,
             }
         ),
     )

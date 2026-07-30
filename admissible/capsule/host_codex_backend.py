@@ -24,7 +24,7 @@ from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, ClassVar, Mapping, Sequence
 
 from admissible.capsule.backend import CapsuleAuthority, CapsuleBackend
 from admissible.capsule.common import (
@@ -79,14 +79,23 @@ from admissible.capsule.model_authority import (
     canary_model_authority,
     validate_effective_thread_configuration,
 )
+from admissible.capsule.owner_authority.broker import (
+    OwnerAuthorityBrokerClient,
+)
+from admissible.capsule.owner_authority.gate import (
+    LAUNCH_COMMITTED_HERE,
+    OwnerAuthorityGateError,
+    READY_FOR_SINGLE_LAUNCH,
+    revalidate_signed_owner_authority,
+)
+from admissible.capsule.owner_authority.installation import (
+    OwnerAuthorityInstallation,
+)
+from admissible.capsule.owner_authority.records import (
+    SignedOwnerAuthorizationReceipt,
+)
 from admissible.capsule.owner_authorization import (
     OwnerAuthorizationError,
-    OwnerBoundVerifiedSerializationReceipt,
-    revalidate_owner_bound_receipt,
-)
-from admissible.capsule.preflight_seal import (
-    OWNER_AUTHORIZATION_CONSUMED,
-    OWNER_BOUND_READY_FOR_SINGLE_LAUNCH,
 )
 from admissible.capsule.models import (
     ByteTreeObservation,
@@ -134,38 +143,44 @@ NON_PRODUCTION_ACKNOWLEDGEMENT = (
 
 
 @dataclass(frozen=True)
-class OwnerBoundWitnessAuthority:
-    """The production witness authority: an owner-bound receipt plus its state.
+class OwnerAuthorityWitness:
+    """The witness authority: a broker-signed receipt and its installation.
 
-    Every field is needed by the pre-effect gate: the receipt says what the owner
-    authorized, the state store says whether that authorization is still
-    unconsumed, and the preparation root plus externally retained seal identity
-    let the gate re-derive the seal rather than trust a recorded fingerprint.
+    There is deliberately no state-store parameter, no expected digest, no
+    state root, no public key and no socket path.  The receipt names the
+    installation that signed it; the installation was attested from a fixed
+    root-owned path; the broker client's socket comes from that installation.
+    A caller supplies only the preparation root and retained seal identity used
+    to *re-derive* the seal, and a mismatch against the signed payload refuses.
     """
 
-    owner_bound_receipt: OwnerBoundVerifiedSerializationReceipt
-    authorization_state: Any
+    signed_receipt: SignedOwnerAuthorizationReceipt
+    installation: OwnerAuthorityInstallation
+    broker_client: OwnerAuthorityBrokerClient
     preparation_root: Path
     retained_seal_identity: Any
 
-    def validated(self) -> "OwnerBoundWitnessAuthority":
-        if not isinstance(
-            self.owner_bound_receipt, OwnerBoundVerifiedSerializationReceipt
-        ):
-            raise ValueError(
-                "production backend requires an owner-bound serialization receipt"
-            )
-        from admissible.capsule.owner_authorization import (
-            OwnerAuthorizationStateStore,
-        )
+    #: Subclasses declare which installation classification they accept.
+    requires_production_installation: ClassVar[bool] = True
+
+    def validated(self) -> "OwnerAuthorityWitness":
         from admissible.capsule.preflight_seal import (
             RetainedPreparationSealIdentity,
         )
 
-        if not isinstance(self.authorization_state, OwnerAuthorizationStateStore):
+        if not isinstance(self.signed_receipt, SignedOwnerAuthorizationReceipt):
             raise ValueError(
-                "production backend requires the external one-time "
-                "owner authorization state"
+                "production backend requires a broker-signed owner "
+                "authorization receipt"
+            )
+        if not isinstance(self.installation, OwnerAuthorityInstallation):
+            raise ValueError(
+                "production backend requires an attested owner-authority "
+                "installation"
+            )
+        if not isinstance(self.broker_client, OwnerAuthorityBrokerClient):
+            raise ValueError(
+                "production backend requires the owner-authority broker client"
             )
         if not isinstance(
             self.retained_seal_identity, RetainedPreparationSealIdentity
@@ -180,8 +195,38 @@ class OwnerBoundWitnessAuthority:
             raise ValueError(
                 "production backend requires the absolute preparation root"
             )
-        self.owner_bound_receipt.validated()
+        if self.requires_production_installation:
+            self.installation.validated_production()
+        else:
+            self.installation.validated()
+        if self.broker_client.installation.installation_identity != (
+            self.installation.installation_identity
+        ):
+            raise ValueError(
+                "the broker client serves another owner-authority installation"
+            )
+        self.signed_receipt.structurally_validated()
         return self
+
+
+@dataclass(frozen=True)
+class ProductionOwnerAuthorityWitness(OwnerAuthorityWitness):
+    """The only witness authority a production connection mode accepts."""
+
+    requires_production_installation: ClassVar[bool] = True
+
+
+@dataclass(frozen=True)
+class SyntheticOwnerAuthorityWitness(OwnerAuthorityWitness):
+    """The provider-free privilege-witness authority.
+
+    It exercises the identical broker, signature, state-machine and gate code,
+    against a synthetic installation built inside a disposable namespace.  A
+    production connection mode refuses it, because the synthetic installation
+    is not at the fixed root-owned production path.
+    """
+
+    requires_production_installation: ClassVar[bool] = False
 
 
 @dataclass(frozen=True)
@@ -1206,7 +1251,7 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
         session_store: DurableCapsuleSessionStore,
         connection_factory: AppServerConnectionFactory,
         mission_prompt: str,
-        witness_authority: OwnerBoundWitnessAuthority | NonProductionWitnessMode,
+        witness_authority: OwnerAuthorityWitness | NonProductionWitnessMode,
         mission_bytes: bytes | None = None,
         os_boundary_authority: OSBoundaryAuthority | None = None,
         event_timeout_seconds: float = 10.0,
@@ -1224,8 +1269,13 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
             self.connection_factory.connection_mode
             in PRODUCTION_CONNECTION_MODES
         )
-        self._authorization_consumed_here = False
-        if isinstance(witness_authority, OwnerBoundWitnessAuthority):
+        self._launch_recorded_here = False
+        if isinstance(witness_authority, OwnerAuthorityWitness):
+            if production and not witness_authority.requires_production_installation:
+                raise ValueError(
+                    "a synthetic owner-authority witness is impossible under a "
+                    "production connection mode"
+                )
             self.owner_bound_witness_authority = witness_authority.validated()
             self.non_production_witness_mode = None
         elif isinstance(witness_authority, NonProductionWitnessMode):
@@ -1238,13 +1288,14 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
             self.non_production_witness_mode = witness_authority.validated()
         else:
             raise ValueError(
-                "backend construction requires either an owner-bound witness "
-                "authority or the explicit non-production witness mode"
+                "backend construction requires either a broker-signed owner "
+                "authority witness or the explicit non-production witness mode"
             )
         if production and self.owner_bound_witness_authority is None:
             raise ValueError(
-                "production backend construction requires an owner-bound "
-                "serialization receipt and its one-time authorization state"
+                "production backend construction requires a broker-signed "
+                "owner authorization receipt and its fixed installation "
+                "attestation"
             )
         if (
             self.connection_factory.connection_mode
@@ -1414,13 +1465,23 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
         authority = self.owner_bound_witness_authority
         if authority is None:
             return "0" * 64
-        return authority.owner_bound_receipt.receipt_identity
+        return authority.signed_receipt.receipt_identity
+
+    @property
+    def owner_authority_installation_identity(self) -> str:
+        authority = self.owner_bound_witness_authority
+        if authority is None:
+            return "0" * 64
+        return authority.installation.installation_identity
 
     def _owner_bound_dependent_authorities(self) -> dict[str, str]:
         return {
             "owner_binding_state": self.owner_binding_state,
             "owner_bound_serialization_receipt_identity": (
                 self.owner_bound_receipt_identity
+            ),
+            "owner_authority_installation_identity": (
+                self.owner_authority_installation_identity
             ),
         }
 
@@ -1439,31 +1500,31 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
         authority = self.owner_bound_witness_authority
         if authority is not None:
             gate = self._revalidate_owner_binding()
-            owner_receipt = authority.owner_bound_receipt
+            payload = dict(authority.signed_receipt.owner_payload)
             bundle = store.load_candidate_evidence(
-                receipt_identity=owner_receipt.candidate_receipt_identity,
-                witness_run_identity=owner_receipt.candidate_witness_run_identity,
+                receipt_identity=payload["candidate_receipt_identity"],
+                witness_run_identity=payload["candidate_witness_run_identity"],
                 expected_policy=self.model_binding_policy,
                 expected_executable_identity=expected_identity,
             )
             if (
-                bundle.receipt.to_dict() != owner_receipt.candidate_witness_receipt()
-                or bundle.pack.to_dict() != owner_receipt.candidate_witness_pack()
-                or bundle.tail_identity != gate["candidate_store_tail_identity"]
+                bundle.tail_identity != gate["candidate_store_tail_identity"]
                 or bundle.store_anchor_fingerprint
-                != owner_receipt.candidate_store_anchor_fingerprint
+                != payload["candidate_store_anchor_fingerprint"]
+                or bundle.receipt.witness_run_nonce
+                != payload["candidate_witness_run_nonce"]
             ):
-                raise OwnerAuthorizationError(
+                raise OwnerAuthorityGateError(
                     "candidate witness evidence differs from the owner binding",
-                    classification="OWNER_CANDIDATE_EVIDENCE_CHANGED",
+                    classification="OWNER_AUTHORITY_CANDIDATE_EVIDENCE_CHANGED",
                 )
             if (
-                owner_receipt.model_binding_policy_fingerprint
+                payload["model_binding_policy_fingerprint"]
                 != self.model_binding_policy.policy_fingerprint
             ):
-                raise OwnerAuthorizationError(
+                raise OwnerAuthorityGateError(
                     "owner binding targets another model policy",
-                    classification="OWNER_BINDING_TARGETS_ANOTHER_POLICY",
+                    classification="OWNER_AUTHORITY_TARGETS_ANOTHER_POLICY",
                 )
             return bundle.receipt
         mode = self.non_production_witness_mode
@@ -1487,37 +1548,44 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
                 self.connection_factory.connection_mode
                 in PRODUCTION_CONNECTION_MODES
             ):  # pragma: no cover - construction already refuses this
-                raise OwnerAuthorizationError(
+                raise OwnerAuthorityGateError(
                     "production effects require an owner binding",
-                    classification="OWNER_BINDING_ABSENT",
+                    classification="OWNER_AUTHORITY_RECEIPT_ABSENT",
                 )
             return {}
-        gate = revalidate_owner_bound_receipt(
-            owner_bound_receipt=authority.owner_bound_receipt,
+        gate = revalidate_signed_owner_authority(
+            signed_receipt=authority.signed_receipt,
+            installation=authority.installation,
+            broker_client=authority.broker_client,
             candidate_witness_store=self.session_store.candidate_witness_store,
-            authorization_state=authority.authorization_state,
             preparation_root=authority.preparation_root,
             retained_seal_identity=authority.retained_seal_identity,
             expected_model_binding_policy=self.model_binding_policy,
+            launch_recorded_here=self._launch_recorded_here,
         )
         classification = gate["classification"]
-        # An authorization consumed by *this* backend is the single launch it
-        # authorized, so later pre-effect gates in the same launch accept it.  An
-        # authorization already consumed before this backend existed is reuse.
-        acceptable = classification == OWNER_BOUND_READY_FOR_SINGLE_LAUNCH or (
-            classification == OWNER_AUTHORIZATION_CONSUMED
-            and self._authorization_consumed_here
+        # The launch this backend already committed stays acceptable for its own
+        # later pre-effect gates.  An authorization spent before this backend
+        # existed is reuse and refuses above, inside the gate.
+        acceptable = classification == READY_FOR_SINGLE_LAUNCH or (
+            classification == LAUNCH_COMMITTED_HERE and self._launch_recorded_here
         )
-        if not acceptable:
-            raise OwnerAuthorizationError(
+        if not acceptable:  # pragma: no cover - the gate already refuses
+            raise OwnerAuthorityGateError(
                 "this owner authorization is not ready for a single launch: "
                 f"{classification}",
-                classification="OWNER_AUTHORIZATION_ALREADY_CONSUMED",
+                classification="OWNER_AUTHORITY_ALREADY_CONSUMED",
             )
         return gate
 
     def consume_owner_authorization_once(self) -> Mapping[str, Any]:
-        """Atomically consume the one-time authorization before the first effect."""
+        """Commit this backend's single launch against the broker.
+
+        The authorization itself was already consumed --- durably, before the
+        receipt existed --- inside the broker's verify-and-consume transaction.
+        What happens here is the one-time *launch* commitment, which is what
+        stops a copied receipt from driving a second backend.
+        """
 
         authority = self.owner_bound_witness_authority
         if authority is None:
@@ -1525,17 +1593,27 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
                 "classification": "NON_PRODUCTION_NO_OWNER_AUTHORIZATION",
                 "consumed": False,
             }
-        if self._authorization_consumed_here:
-            raise OwnerAuthorizationError(
+        if self._launch_recorded_here:
+            raise OwnerAuthorityGateError(
                 "this owner authorization was already consumed",
-                classification="OWNER_AUTHORIZATION_ALREADY_CONSUMED",
+                classification="OWNER_AUTHORITY_ALREADY_CONSUMED",
             )
         self._revalidate_owner_binding()
-        record = authority.authorization_state.consume_once(
-            owner_bound_receipt=authority.owner_bound_receipt
+        record = authority.broker_client.record_launch_result(
+            authorization_record_id=(
+                authority.signed_receipt.authorization_record_id
+            ),
+            receipt_identity=authority.signed_receipt.receipt_identity,
+            outcome="LAUNCH_COMMITTED",
         )
-        object.__setattr__(self, "_authorization_consumed_here", True)
-        return {**dict(record), "consumed": True}
+        object.__setattr__(self, "_launch_recorded_here", True)
+        return {
+            **dict(record),
+            "authorization_consumption_identity": (
+                authority.signed_receipt.authorization_consumption_identity
+            ),
+            "consumed": True,
+        }
 
     def _attest_capsule_authority(self) -> None:
         if isinstance(self.controller, CapsuleBrokerClient):
@@ -1714,7 +1792,7 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
             owner_bound_receipt=(
                 None
                 if self.owner_bound_witness_authority is None
-                else self.owner_bound_witness_authority.owner_bound_receipt
+                else self.owner_bound_witness_authority.signed_receipt
             ),
             protocol_request_policy_fingerprint=(
                 protocol_request_policy_fingerprint(self.model_authority)

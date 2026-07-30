@@ -330,45 +330,53 @@ def _owner_binding_fields(
 ) -> dict[str, str]:
     """Derive the owner-binding fields, refusing production without a binding.
 
-    A production connection mode has exactly one admissible answer here: a real
-    ``OwnerBoundVerifiedSerializationReceipt`` naming this candidate receipt and
-    this model policy.  The explicitly non-production mode records zeroes, which
-    no production validation accepts.
+    A production connection mode has exactly one admissible answer here: a
+    broker-signed :class:`SignedOwnerAuthorizationReceipt` whose signed owner
+    payload names this candidate receipt and this model policy, together with
+    the identity of the root-owned installation that signed it.  The
+    self-rooted receipt the audit defeated is not accepted --- it is not this
+    type, and no conversion into this type exists.  The explicitly
+    non-production mode records zeroes, which no production validation accepts.
     """
 
-    from admissible.capsule.owner_authorization import (
-        OwnerBoundVerifiedSerializationReceipt,
+    from admissible.capsule.owner_authority.records import (
+        SignedOwnerAuthorizationReceipt,
     )
 
     zero = "0" * 64
     if owner_bound_receipt is None:
         if connection_mode != "synthetic_provider_free":
             raise ValueError(
-                "production execution requires an owner-bound serialization "
-                "receipt, not a candidate receipt"
+                "production execution requires a broker-signed owner "
+                "authorization receipt, not a candidate receipt"
             )
         return {
             "owner_binding_state": "NON_PRODUCTION_NO_OWNER_BINDING",
             "owner_bound_receipt_identity": zero,
             "owner_payload_fingerprint": zero,
             "owner_authorization_consumption_identity": zero,
+            "owner_authority_installation_identity": zero,
+            "owner_authority_signing_key_fingerprint": zero,
+            "owner_authorization_record_id": zero,
         }
-    if not isinstance(
-        owner_bound_receipt, OwnerBoundVerifiedSerializationReceipt
-    ):
+    if not isinstance(owner_bound_receipt, SignedOwnerAuthorizationReceipt):
         raise ValueError(
-            "backend execution creation requires a typed owner-bound receipt"
+            "backend execution creation requires a broker-signed owner "
+            "authorization receipt"
         )
-    owner = owner_bound_receipt.validated()
+    owner = owner_bound_receipt.structurally_validated()
+    payload = dict(owner.owner_payload)
     if (
-        owner.candidate_receipt_identity
+        payload.get("candidate_receipt_identity")
         != candidate_witness_receipt.receipt_identity
-        or owner.candidate_witness_run_identity
+        or payload.get("candidate_witness_run_identity")
         != candidate_witness_receipt.witness_run_identity
     ):
-        raise ValueError("owner-bound receipt names another candidate witness")
-    if owner.model_binding_policy_fingerprint != bound_policy.policy_fingerprint:
-        raise ValueError("owner-bound receipt names another model policy")
+        raise ValueError("signed owner receipt names another candidate witness")
+    if payload.get("model_binding_policy_fingerprint") != (
+        bound_policy.policy_fingerprint
+    ):
+        raise ValueError("signed owner receipt names another model policy")
     return {
         "owner_binding_state": "OWNER_BOUND",
         "owner_bound_receipt_identity": owner.receipt_identity,
@@ -376,6 +384,11 @@ def _owner_binding_fields(
         "owner_authorization_consumption_identity": (
             owner.authorization_consumption_identity
         ),
+        "owner_authority_installation_identity": owner.installation_identity,
+        "owner_authority_signing_key_fingerprint": (
+            owner.payload["signing_key_fingerprint"]
+        ),
+        "owner_authorization_record_id": owner.authorization_record_id,
     }
 
 
@@ -407,6 +420,9 @@ class BackendExecutionAuthority:
     owner_bound_receipt_identity: str
     owner_payload_fingerprint: str
     owner_authorization_consumption_identity: str
+    owner_authority_installation_identity: str
+    owner_authority_signing_key_fingerprint: str
+    owner_authorization_record_id: str
     host_control_policy_fingerprint: str
     bwrap_executable_identity: Mapping[str, Any]
     bwrap_argv_policy_fingerprint: str
@@ -552,6 +568,9 @@ class BackendExecutionAuthority:
                     "owner_bound_serialization_receipt_identity": (
                         owner_binding["owner_bound_receipt_identity"]
                     ),
+                    "owner_authority_installation_identity": (
+                        owner_binding["owner_authority_installation_identity"]
+                    ),
                 },
             )
         else:
@@ -586,6 +605,15 @@ class BackendExecutionAuthority:
             ],
             "owner_authorization_consumption_identity": owner_binding[
                 "owner_authorization_consumption_identity"
+            ],
+            "owner_authority_installation_identity": owner_binding[
+                "owner_authority_installation_identity"
+            ],
+            "owner_authority_signing_key_fingerprint": owner_binding[
+                "owner_authority_signing_key_fingerprint"
+            ],
+            "owner_authorization_record_id": owner_binding[
+                "owner_authorization_record_id"
             ],
             "host_control_policy_fingerprint": host_control_policy_fingerprint,
             "bwrap_executable_identity": dict(bwrap_executable_identity),
@@ -659,24 +687,41 @@ class BackendExecutionAuthority:
             "NON_PRODUCTION_NO_OWNER_BINDING",
         }:
             raise ValueError("backend owner-binding state is unknown")
-        for label, value in (
+        owner_identities = (
             ("owner-bound receipt", self.owner_bound_receipt_identity),
             ("owner payload", self.owner_payload_fingerprint),
             (
                 "owner authorization consumption",
                 self.owner_authorization_consumption_identity,
             ),
-        ):
+            (
+                "owner authority installation",
+                self.owner_authority_installation_identity,
+            ),
+            (
+                "owner authority signing key",
+                self.owner_authority_signing_key_fingerprint,
+            ),
+            ("owner authorization record", self.owner_authorization_record_id),
+        )
+        for label, value in owner_identities:
             require_sha256(value, f"{label} identity")
         owner_bound = self.owner_binding_state == "OWNER_BOUND"
         zero = "0" * 64
-        if owner_bound == (
-            self.owner_bound_receipt_identity == zero
-            and self.owner_payload_fingerprint == zero
-            and self.owner_authorization_consumption_identity == zero
-        ):
+        if owner_bound == all(value == zero for _label, value in owner_identities):
             raise ValueError(
                 "backend owner-binding state contradicts its owner identities"
+            )
+        # An owner-bound authority must name a real installation and signing
+        # key: a production authority cannot exist without one.
+        if owner_bound and (
+            self.owner_authority_installation_identity == zero
+            or self.owner_authority_signing_key_fingerprint == zero
+            or self.owner_authorization_record_id == zero
+        ):
+            raise ValueError(
+                "an owner-bound authority must name the root-owned "
+                "owner-authority installation that signed it"
             )
         component_validator = (
             validate_component_identity_metadata

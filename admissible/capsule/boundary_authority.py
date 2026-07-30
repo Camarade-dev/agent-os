@@ -777,6 +777,7 @@ class OSBoundaryAuthority:
                 "candidate_serialization_witness_receipt_identity",
                 "owner_binding_state",
                 "owner_bound_serialization_receipt_identity",
+                "owner_authority_installation_identity",
             },
             "boundary dependent authorities",
         )
@@ -784,18 +785,26 @@ class OSBoundaryAuthority:
         owner_receipt = self.dependent_authorities[
             "owner_bound_serialization_receipt_identity"
         ]
+        # The launch fingerprint binds *which* root-owned owner-authority
+        # installation signed the authorization, so a launch authorized under
+        # one installation can never be replayed under another.
+        installation_identity = self.dependent_authorities[
+            "owner_authority_installation_identity"
+        ]
         if owner_state not in {"OWNER_BOUND", "NON_PRODUCTION_NO_OWNER_BINDING"}:
             raise ValueError("boundary owner-binding state is unknown")
-        require_sha256(
-            owner_receipt,
-            "boundary owner-bound serialization receipt identity",
-        )
+        for label, value in (
+            ("owner-bound serialization receipt identity", owner_receipt),
+            ("owner authority installation identity", installation_identity),
+        ):
+            require_sha256(value, f"boundary {label}")
         if owner_state == "OWNER_BOUND":
-            if owner_receipt == "0" * 64:
+            if owner_receipt == "0" * 64 or installation_identity == "0" * 64:
                 raise ValueError(
-                    "an owner-bound boundary requires a real owner-bound receipt"
+                    "an owner-bound boundary requires a real owner-bound receipt "
+                    "and the installation identity that signed it"
                 )
-        elif owner_receipt != "0" * 64:
+        elif owner_receipt != "0" * 64 or installation_identity != "0" * 64:
             raise ValueError(
                 "a non-production boundary must not claim an owner-bound receipt"
             )
