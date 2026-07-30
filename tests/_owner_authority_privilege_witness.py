@@ -85,7 +85,7 @@ PHRASE = "synthetic-privilege-witness-owner-phrase"
 
 PAYLOAD = {
     "schema_version": "synthetic_privilege_witness_payload_v1",
-    "mission": "provider-free synthetic privileged-boundary witness",
+    "mission_fingerprint": "a" * 64,
     "run_id": "privilege-witness-run-1",
     "model_binding_policy": {
         "configured_model": "gpt-5.3-codex",

@@ -56,6 +56,29 @@ acceptance point exposes a path, key, socket or state-root parameter.
 | runtime root | `/run/admissible-owner-authority-v1/` | `root:root` | `0755` |
 | broker socket | `…/broker.sock` | `root:<launcher-group>` | `0660` |
 
+### Stale-socket cleanup
+
+On broker start, a pre-existing path at the fixed socket location is removed
+only when every installed-authority check passes:
+
+- the path is exactly the configured `broker.sock` under the attested runtime
+  root;
+- the parent runtime directory is opened with no-follow semantics and is the
+  expected root-owned directory mode `0755`;
+- the directory entry is obtained with no-follow `fstatat`-style semantics and
+  is a Unix socket;
+- `st_uid` is `0`, `st_gid` is the authorized launcher gid from the durable
+  installation record, and permission bits are exactly `0660`;
+- the installation record and layout agree on the socket path;
+- the socket is not live;
+- the same device/inode/type/uid/gid/mode identity still exists immediately
+  before deletion relative to the validated parent directory descriptor.
+
+Symlinks, regular files, wrong ownership, wrong group, wrong mode (including
+`0777`), live listeners, missing/malformed installation identity, parent
+mismatches, identity replacement races and ambiguous connect errors refuse
+closed. An unexpected object is never deleted merely to recover availability.
+
 A second, explicitly named `SYNTHETIC_..._LAYOUT` classification exists for the
 provider-free privilege witness. It is a different classification, not a naming
 convention, and `validated_production()` refuses it.
@@ -109,6 +132,26 @@ never satisfy the external world.
 Only the digest is retained. The phrase is read on a dedicated bounded
 descriptor, used for one comparison, and never written, logged, returned or
 fingerprinted on its own.
+
+### Closed-world owner payload
+
+Provisioning loads owner payloads as closed-world documents. The allowed
+top-level field set is exactly
+`OWNER_AUTHORIZATION_PAYLOAD_KEYS` from
+`admissible.capsule.owner_authorization` — the authoritative owner payload
+schema. Unexpected top-level fields are refused. Unexpected fields inside
+structured authority objects (model binding policy, budgets, zero-retry
+policy, preparation/store/component identities, and object-shaped destination
+or tool authorities) are refused. Duplicate JSON object keys are refused
+before ordinary mapping construction. Booleans are not accepted where
+integers are required.
+
+Refusal uses a bounded stable classification
+(`OWNER_AUTHORITY_PAYLOAD_REFUSED`) that does not echo secret or
+attacker-controlled payload contents. It occurs before an authorization
+summary is treated as valid, before the owner phrase descriptor is consumed,
+before fingerprint confirmation, and before any authorization state is
+created. Canonical fingerprints of previously valid payloads are unchanged.
 
 ## Broker protocol
 

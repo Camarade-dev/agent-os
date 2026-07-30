@@ -20,9 +20,15 @@ python3 -m admissible.capsule.owner_authority.host_readiness
 
 This workspace is WSL2 with systemd. `/run` is typically tmpfs: a WSL or
 distro restart clears runtime sockets and the broker unit must recreate them
-on start (stale-socket cleanup is implemented in the broker service). Do not
-treat a missing `/run/admissible-owner-authority-v1/broker.sock` after reboot
-as durable state loss — authorization state lives under `/var/lib`.
+on start. Stale-socket cleanup may unlink only an exact dead `0660`
+root-owned socket whose group matches the authorized launcher gid from the
+durable installation record, after validating the parent runtime directory
+without following symlinks and re-checking device/inode identity immediately
+before deletion. Unexpected sockets (including mode `0777`), symlinks,
+non-sockets, live listeners and identity mismatches refuse closed and are
+retained. Do not treat a missing
+`/run/admissible-owner-authority-v1/broker.sock` after reboot as durable state
+loss — authorization state lives under `/var/lib`.
 
 ## Exact host setup order
 
