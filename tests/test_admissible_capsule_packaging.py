@@ -31,7 +31,19 @@ def test_package_discovery_configuration_includes_the_capsule_package():
         "docs/admissible-codex-os-boundary.md",
         "docs/admissible-codex-model-authority.md",
         "docs/admissible-owner-rooted-witness-trust.md",
+        "docs/admissible-external-owner-authority.md",
+        "docs/admissible-owner-authority-installation-plan.md",
     ]
+    scripts = project["project"]["scripts"]
+    assert scripts["admissible-owner-authority-installer"] == (
+        "admissible.capsule.owner_authority.installer:main"
+    )
+    assert scripts["admissible-owner-authority-provisioner"] == (
+        "admissible.capsule.owner_authority.provisioner:main"
+    )
+    assert scripts["admissible-owner-authority-broker"] == (
+        "admissible.capsule.owner_authority.broker_service:main"
+    )
 
 
 def test_capsule_imports_from_an_isolated_package_tree(tmp_path: Path):
@@ -90,9 +102,12 @@ def test_sdist_and_wheel_contain_backend_documentation_and_generated_schemas(
     completed = subprocess.run(
         [
             sys.executable,
-            "-I",
             "-m",
             "build",
+            # The build requirements are pinned in pyproject and asserted above;
+            # this environment provides them directly rather than through a
+            # network-backed isolated environment.
+            "--no-isolation",
             "--outdir",
             str(artifacts),
             str(ROOT),
@@ -165,6 +180,17 @@ def test_sdist_and_wheel_contain_backend_documentation_and_generated_schemas(
         )
         for name in wheel_names
     )
+    for owner_authority_doc in (
+        "admissible-external-owner-authority.md",
+        "admissible-owner-authority-installation-plan.md",
+    ):
+        assert any(
+            name.endswith(f"/docs/{owner_authority_doc}") for name in sdist_names
+        ), owner_authority_doc
+        assert any(
+            name.endswith(f".data/data/share/doc/agent-os/{owner_authority_doc}")
+            for name in wheel_names
+        ), owner_authority_doc
     required_schema_suffixes = {
         "admissible/capsule/protocol_schemas/manifest.json",
         "admissible/capsule/protocol_schemas/v1/InitializeParams.json",
@@ -186,6 +212,23 @@ def test_sdist_and_wheel_contain_backend_documentation_and_generated_schemas(
         "admissible/capsule/serialization_witness_runtime.py",
     }
     assert required_model_sources <= wheel_names
+
+    # Production distributions carry the broker, the provisioner, the installer
+    # and the public installation-validation code.
+    required_owner_authority_sources = {
+        "admissible/capsule/owner_authority/__init__.py",
+        "admissible/capsule/owner_authority/broker.py",
+        "admissible/capsule/owner_authority/broker_service.py",
+        "admissible/capsule/owner_authority/gate.py",
+        "admissible/capsule/owner_authority/installation.py",
+        "admissible/capsule/owner_authority/installer.py",
+        "admissible/capsule/owner_authority/layout.py",
+        "admissible/capsule/owner_authority/provisioner.py",
+        "admissible/capsule/owner_authority/records.py",
+        "admissible/capsule/owner_authority/signing.py",
+        "admissible/capsule/owner_authority/state.py",
+    }
+    assert required_owner_authority_sources <= wheel_names
     assert all("/tests/" not in name for name in sdist_names)
 
     # Production model/configuration and trusted verifier code ships; no
@@ -201,6 +244,57 @@ def test_sdist_and_wheel_contain_backend_documentation_and_generated_schemas(
     assert "chatgpt.com" not in witness_runtime_source
     assert "getaddrinfo" not in witness_runtime_source
     assert "create_connection" not in witness_runtime_source
+    # No owner-authority secret, machine-bound state or local artifact ships.
+    forbidden_owner_authority_material = (
+        b"BEGIN OPENSSH PRIVATE KEY",
+        b"-----BEGIN PRIVATE KEY-----",
+        b"synthetic-privilege-witness-owner-phrase",
+        b"synthetic-external-owner-authority-phrase",
+        b"synthetic-provider-free-owner-phrase-not-the-real-one",
+        b"attacker-chosen-owner-phrase",
+    )
+    for marker in forbidden_owner_authority_material:
+        assert all(
+            marker not in content for content in sdist_regular_bytes
+        ), marker
+        assert all(
+            marker not in content.encode("utf-8")
+            for content in runtime_sources.values()
+        ), marker
+    forbidden_owner_authority_names = (
+        "owner-authority-signing-key.v1.pem",
+        "installation-v1.json",
+        "broker.sock",
+        "pending.json",
+        "consumed.json",
+        "authorization.lock",
+    )
+    for suffix in forbidden_owner_authority_names:
+        assert all(
+            not name.endswith(suffix) for name in sdist_names | wheel_names
+        ), suffix
+    # The field name ships as schema code; a *populated* expected digest, an
+    # installed public key or an installation identity must not.
+    populated_digest = re.compile(
+        rb'"(expected_owner_authorization_digest|signing_key_fingerprint'
+        rb'|installation_identity)"\s*:\s*"[0-9a-f]{64}"'
+    )
+    assert all(
+        populated_digest.search(content) is None
+        for content in sdist_regular_bytes
+    )
+    assert all(
+        populated_digest.search(content.encode("utf-8")) is None
+        for content in runtime_sources.values()
+    )
+    # No historical preparation, run or owner-preflight tree is packaged.
+    assert all(
+        "/preparation/" not in name
+        and "/_agent-runs/" not in name
+        and "/owner-preflight" not in name
+        for name in sdist_names | wheel_names
+    )
+
     forbidden_witness_material = (
         b"synthetic-provider-free-key",
         b"SYNTHETIC_API_KEY",

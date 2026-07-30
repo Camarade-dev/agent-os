@@ -19,6 +19,9 @@ admissible = "admissible.product_launcher.__main__:main"
 admissible-historical-pairing-tag = "admissible.operator_tools.historical_pairing_tag:main"
 admissible-historical-pairing-v4-extract = "admissible.operator_tools.historical_pairing_v4_extract:main"
 admissible-codex-namespace-bootstrap = "admissible.capsule.boundary_launcher:namespace_bootstrap_main"
+admissible-owner-authority-installer = "admissible.capsule.owner_authority.installer:main"
+admissible-owner-authority-provisioner = "admissible.capsule.owner_authority.provisioner:main"
+admissible-owner-authority-broker = "admissible.capsule.owner_authority.broker_service:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -42,6 +45,8 @@ agent_os = ["templates/*.md"]
     "docs/admissible-codex-os-boundary.md",
     "docs/admissible-codex-model-authority.md",
     "docs/admissible-owner-rooted-witness-trust.md",
+    "docs/admissible-external-owner-authority.md",
+    "docs/admissible-owner-authority-installation-plan.md",
 ]
 
 [tool.pytest.ini_options]
