@@ -82,6 +82,7 @@ from admissible.capsule.owner_authority.signing import (
     sign_message,
 )
 from admissible.capsule.owner_authority.state import AuthorizationStateDirectory
+from admissible.capsule.owner_authorization import zero_retry_policy
 from tests._candidate_canary_binding import PRIVILEGED_IDENTITY_REASON
 
 PHRASE = "synthetic-external-owner-authority-phrase"
@@ -89,6 +90,7 @@ PHRASE = "synthetic-external-owner-authority-phrase"
 PAYLOAD = {
     "schema_version": "synthetic_external_owner_authority_payload_v1",
     "repository_head": "a" * 40,
+    "repository_canonical_path_sha256": "0" * 64,
     "implementation_head": "b" * 40,
     "run_id": "external-owner-authority-run-1",
     "preparation_id": "external-owner-authority-preparation-1",
@@ -100,6 +102,7 @@ PAYLOAD = {
     "destination_manifest_identity": "d" * 64,
     "tool_authority_identity": "e" * 64,
     "budgets": {"wall_clock_seconds": 600, "capsule_pids": 64},
+    "zero_retry_policy": zero_retry_policy(),
 }
 
 privileged = pytest.mark.skipif(
@@ -757,6 +760,7 @@ def test_the_complete_fake_owner_world_produces_no_production_authority(
         "installation_id": "forgedinstallation",
         "installation_identity": fingerprint({"forged": "installation"}),
         "signing_key_fingerprint": fingerprint({"forged": "key"}),
+        "crypto_attestation_revision": "crypto-attestation-revision-v1-initial",
         "authorization_record_id": invented_record_id,
         "authorization_record_identity": fingerprint({"forged": "record"}),
         "owner_payload": dict(PAYLOAD),

@@ -278,6 +278,7 @@ def _fake_owner_world_is_refused(layout, installation, findings: dict) -> None:
             "installation_id": installation.installation_id,
             "installation_identity": installation.installation_identity,
             "signing_key_fingerprint": installation.signing_key_fingerprint,
+            "crypto_attestation_revision": installation.crypto_attestation_revision(),
             "authorization_record_id": forged_record_id,
             "authorization_record_identity": fingerprint({"forged": True}),
             "owner_payload": dict(PAYLOAD),

@@ -216,6 +216,25 @@ what they are. They are impossible under a production execution authority:
 the legacy type is not that type and cannot be converted into it. A payload
 built for one world is refused by the other, in both directions.
 
+## Operational installation surface
+
+The privileged service never executes Python from a user-writable checkout.
+The installer publishes a deterministic zipapp to
+`/opt/admissible-owner-authority-v1/broker.pyz` and the generated unit runs
+exactly that path under `Type=notify`, `Restart=on-failure`, and
+`ProtectHome=yes`. Installation is transactional with injected-failure
+rollback; `rollback-failed-install` and `uninstall` are separate commands.
+OpenSSL continuity uses an explicit key-preserving re-attestation workflow.
+Phrase entry uses FD 3 with stdin reserved for fingerprint confirmation.
+Read-only host readiness is:
+
+```
+python3 -m admissible.capsule.owner_authority.host_readiness
+```
+
+See `docs/admissible-owner-authority-installation-plan.md` for the exact
+host setup, verification, rollback and uninstall plans generated from code.
+
 ## Synthetic privilege witness
 
 `tests/_owner_authority_privilege_witness.py` runs inside a disposable user and
