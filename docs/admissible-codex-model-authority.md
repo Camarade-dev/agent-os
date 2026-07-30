@@ -13,7 +13,9 @@ future real run remains absent.
 The repair now has four narrowly coupled pieces:
 
 1. a canonical immutable mission/run **model-binding policy**;
-2. an externally anchored, durable **verified serialization-witness receipt**;
+2. a durable **candidate serialization-witness receipt** and evidence pack,
+   which are untrusted on their own (see
+   [owner-rooted witness trust](admissible-owner-rooted-witness-trust.md));
 3. a model authority derived only by reopening that receipt and its complete
    evidence pack;
 4. the already proven optional closed **exact-material policy** in
@@ -113,11 +115,17 @@ changes the dependent OS-boundary authority, protocol-request policy, backend
 execution authority and bubblewrap launch fingerprint.
 
 `HostCodexAppServerCapsuleBackend` has no optional model-authority, model, or
-effort parameter. It obtains the path-bound witness store only from the
-externally anchored session trust root, constructs the one canary policy from
-the content-attested executable, loads the current receipt, and derives the
-authority. A valid-in-isolation authority for another model or for
-`medium`/`high` is therefore irrelevant to backend construction.
+effort parameter. It obtains the path-bound candidate witness store only from
+the bound session trust root, constructs the one canary policy from the
+content-attested executable, and derives the authority. A valid-in-isolation
+authority for another model or for `medium`/`high` is therefore irrelevant to
+backend construction.
+
+The candidate receipt is not by itself sufficient. Production construction
+requires an `OwnerBoundVerifiedSerializationReceipt` that names this exact
+store, pack, receipt, tail, policy, preparation root and run, plus its one-time
+authorization state. See
+[owner-rooted witness trust](admissible-owner-rooted-witness-trust.md).
 
 ## Launch channel
 
