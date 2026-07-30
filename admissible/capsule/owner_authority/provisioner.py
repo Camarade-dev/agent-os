@@ -56,6 +56,9 @@ OWNER_PHRASE_MIN_BYTES = 8
 #: The dedicated descriptor the owner phrase may arrive on.
 OWNER_PHRASE_DESCRIPTOR_ENV = "ADMISSIBLE_OWNER_AUTHORITY_PHRASE_FD"
 
+#: The prompt ``systemd-ask-password`` shows the owner.  Never the phrase.
+ASK_PASSWORD_PROMPT = "Owner authorization phrase:"
+
 
 class OwnerAuthorityProvisioningError(OwnerAuthorityError):
     """A refusal on the privileged provisioning path."""
@@ -127,26 +130,110 @@ def read_owner_phrase_from_descriptor(descriptor: int) -> str:
     return phrase
 
 
+def phrase_fd_from_ask_password(
+    *,
+    owner_payload_path: str = "<payload.json>",
+    prompt: str = "Owner authorization phrase:",
+    phrase_fd: int = 3,
+) -> str:
+    """The exact, unexecuted shell command that reads the phrase safely.
+
+    Opens ``systemd-ask-password`` on a dedicated descriptor (default FD 3) so
+    stdin remains a terminal for fingerprint confirmation.  The phrase is never
+    echoed, never passed through ``argv``, an environment variable, a temporary
+    file, ``cat`` or ``echo``, and never appears in shell history or a process
+    listing.  This function only renders the command; it never runs it.
+    """
+
+    return (
+        f"exec 3< <(systemd-ask-password --echo=no {prompt!r})\n"
+        f"sudo python3 -m admissible.capsule.owner_authority.provisioner "
+        f"provision \\\n"
+        f"  --owner-payload {owner_payload_path} \\\n"
+        f"  --phrase-fd {phrase_fd}\n"
+        f"exec {phrase_fd}<&-"
+    )
+
+
 def owner_payload_summary(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """The bounded summary the owner must read before confirming."""
+    """The bounded summary the owner must read before confirming.
+
+    Every effect-relevant field is mandatory: the repository and
+    implementation HEADs, the run identity, the mission, the model and its
+    reasoning effort, the destination and effect authorities, explicit
+    budgets, and the exact zero-retry/zero-repair/one-launch policy.  Missing,
+    empty or malformed values refuse before any summary is displayed or any
+    authorization is provisioned --- there is no partial or best-effort
+    summary.
+    """
 
     body = dict(payload)
-    policy = dict(body.get("model_binding_policy") or {})
-    return {
-        "schema_version": "admissible_owner_authority_payload_summary_v1",
+    policy = body.get("model_binding_policy")
+    if not isinstance(policy, Mapping):
+        raise OwnerAuthorityProvisioningError(
+            "owner payload summary requires an explicit model binding policy",
+            classification="OWNER_AUTHORITY_SUMMARY_INCOMPLETE",
+        )
+    required = {
         "repository_head": body.get("repository_head"),
+        "repository_canonical_path_sha256": body.get(
+            "repository_canonical_path_sha256"
+        ),
         "implementation_head": body.get("implementation_head"),
         "run_id": body.get("run_id"),
-        "preparation_id": body.get("preparation_id"),
         "mission_fingerprint": body.get("mission_fingerprint"),
         "model": policy.get("configured_model"),
         "reasoning_effort": policy.get("configured_reasoning_effort"),
         "destination_authority": body.get("destination_manifest_identity"),
         "effect_authority": body.get("tool_authority_identity"),
-        "budgets": dict(body.get("budgets") or {}),
+        "budgets": body.get("budgets"),
+    }
+    missing = [
+        name
+        for name, value in required.items()
+        if value is None or value == "" or value == {}
+    ]
+    if missing:
+        raise OwnerAuthorityProvisioningError(
+            "owner payload summary is missing required fields: "
+            + ", ".join(missing),
+            classification="OWNER_AUTHORITY_SUMMARY_INCOMPLETE",
+        )
+    if not isinstance(required["budgets"], Mapping):
+        raise OwnerAuthorityProvisioningError(
+            "owner payload summary requires explicit budgets",
+            classification="OWNER_AUTHORITY_SUMMARY_INCOMPLETE",
+        )
+    from admissible.capsule.owner_authorization import zero_retry_policy
+
+    zero_retry = body.get("zero_retry_policy")
+    if not isinstance(zero_retry, Mapping) or dict(zero_retry) != dict(
+        zero_retry_policy()
+    ):
+        raise OwnerAuthorityProvisioningError(
+            "owner payload summary requires the exact zero-retry, "
+            "zero-repair, one-launch policy",
+            classification="OWNER_AUTHORITY_SUMMARY_INCOMPLETE",
+        )
+    return {
+        "schema_version": "admissible_owner_authority_payload_summary_v1",
+        "repository_identity": required["repository_canonical_path_sha256"],
+        "repository_head": required["repository_head"],
+        "repository_canonical_path_sha256": required[
+            "repository_canonical_path_sha256"
+        ],
+        "implementation_head": required["implementation_head"],
+        "run_id": required["run_id"],
+        "mission_fingerprint": required["mission_fingerprint"],
+        "model": required["model"],
+        "reasoning_effort": required["reasoning_effort"],
+        "destination_authority": required["destination_authority"],
+        "effect_authority": required["effect_authority"],
+        "budgets": dict(required["budgets"]),
         "retries_authorized": 0,
         "repairs_authorized": 0,
         "launches_authorized": 1,
+        "zero_retry_policy": dict(zero_retry),
         "payload_fingerprint": fingerprint(body),
     }
 
@@ -159,10 +246,10 @@ def render_owner_payload_summary(summary: Mapping[str, Any]) -> str:
         "Owner authorization request",
         "=" * 27,
         "",
+        f"  repository identity   : {summary['repository_identity']}",
         f"  repository HEAD      : {summary['repository_head']}",
         f"  implementation HEAD  : {summary['implementation_head']}",
         f"  run identity         : {summary['run_id']}",
-        f"  preparation identity : {summary['preparation_id']}",
         f"  mission              : {summary['mission_fingerprint']}",
         f"  model                : {summary['model']}",
         f"  reasoning effort     : {summary['reasoning_effort']}",

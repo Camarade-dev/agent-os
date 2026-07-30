@@ -123,10 +123,8 @@ from admissible.capsule.owner_authority import (
     SignedOwnerAuthorizationReceipt,
     attest_production_installation,
     describe_state_machine,
-    installation_plan,
     production_installation_is_present,
     production_layout,
-    render_installation_plan,
     verify_signed_receipt,
 )
 from admissible.capsule.owner_authority.gate import (
@@ -262,10 +260,8 @@ __all__ = [
     "SyntheticOwnerAuthorityWitness",
     "attest_production_installation",
     "describe_state_machine",
-    "installation_plan",
     "production_installation_is_present",
     "production_layout",
-    "render_installation_plan",
     "revalidate_signed_owner_authority",
     "verify_signed_receipt",
     "RetainedPreparationSealIdentity",

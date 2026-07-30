@@ -1,65 +1,14 @@
 """The external, privileged owner-authority boundary.
 
-The audit verdict ``CANARY_OWNER_ROOTED_WITNESS_AUDIT_FAIL`` was returned
-because one ordinary caller could choose a phrase, compute its digest, create
-the authorization state, retain the expected digest, mint a receipt and pass
-the pre-effect gate.  Every one of those steps lived on the same side of the
-trust boundary as the attacker, so reopening the state proved nothing.
-
-This package moves the root of trust outside the caller entirely, and splits it
-into two capabilities that the ordinary preparation process, controller,
-backend and coding agent all lack:
-
-``installation`` / ``provisioning``
-    Root-only.  Creates the fixed directories, the Ed25519 signing identity and
-    the immutable pending-authorization records.  No RPC surface.
-
-``runtime verify-and-consume``
-    The privileged broker.  It can verify one preprovisioned payload against
-    the owner phrase, atomically consume it, and sign exactly one receipt.  It
-    cannot provision, cannot change a payload, cannot pick a key or a state
-    root, cannot sign arbitrary caller bytes and cannot reset a consumption.
-
-An ordinary caller can still fabricate witness evidence, a preparation, a seal,
-a phrase and a digest.  None of that helps: it cannot write the root-owned
-state, cannot provision through the broker, cannot use the signing key, and
-therefore cannot produce a receipt whose Ed25519 signature verifies against the
-public key in the root-owned installation record.
+Eager imports are limited to the layout and error types so importing this
+package never triggers a RuntimeWarning from circular installer/provisioner
+loading.  Concrete subsystems are imported lazily through ``__getattr__``.
 """
 
-from admissible.capsule.owner_authority.broker import (
-    ATTEST_INSTALLATION,
-    AUTHORIZATION_STATUS,
-    BROKER_OPERATIONS,
-    FORBIDDEN_BROKER_OPERATIONS,
-    OwnerAuthorityBroker,
-    OwnerAuthorityBrokerClient,
-    OwnerAuthorityBrokerError,
-    RECORD_LAUNCH_RESULT,
-    VERIFY_AND_CONSUME,
-    broker_protocol_schema,
-    peer_credentials,
-)
-from admissible.capsule.owner_authority.installation import (
-    OwnerAuthorityInstallation,
-    OwnerAuthorityInstallationError,
-    attest_production_installation,
-    attest_synthetic_non_production_installation,
-    build_installation_record,
-    production_installation_is_present,
-)
-from admissible.capsule.owner_authority.installer import (
-    BROKER_UNIT_NAME,
-    INSTALLED_OBJECTS,
-    OwnerAuthorityInstallerError,
-    broker_unit_definition,
-    installation_plan,
-    perform_installation,
-    preinstall_conflict_checks,
-    render_installation_plan,
-    require_privileged_identity,
-    verify_installation,
-)
+from __future__ import annotations
+
+from typing import Any
+
 from admissible.capsule.owner_authority.layout import (
     AUTHORIZATION_STATES,
     BROKER_PROTOCOL_VERSION,
@@ -85,61 +34,130 @@ from admissible.capsule.owner_authority.layout import (
     require_production_layout,
     synthetic_non_production_layout,
 )
-from admissible.capsule.owner_authority.provisioner import (
-    OwnerAuthorityProvisioningError,
-    owner_payload_summary,
-    provision_authorization,
-    render_owner_payload_summary,
-)
-from admissible.capsule.owner_authority.records import (
-    OwnerAuthorityRecordError,
-    SignedOwnerAuthorizationReceipt,
-    authorization_consumption_identity,
-    external_owner_authorization_digest,
-    new_authorization_record_id,
-    verify_signed_receipt,
-)
-from admissible.capsule.owner_authority.signing import (
-    SIGNING_ALGORITHM,
-    OwnerAuthoritySigningError,
-    discover_system_openssl,
-    executable_identity,
-    verify_signature,
-)
-from admissible.capsule.owner_authority.state import (
-    AUTHORIZATION_ABSENT,
-    AuthorizationStateDirectory,
-    OwnerAuthorityStateError,
-)
+
+_LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+    "ATTEST_INSTALLATION": (".broker", "ATTEST_INSTALLATION"),
+    "AUTHORIZATION_ABSENT": (".state", "AUTHORIZATION_ABSENT"),
+    "AUTHORIZATION_STATUS": (".broker", "AUTHORIZATION_STATUS"),
+    "AuthorizationStateDirectory": (".state", "AuthorizationStateDirectory"),
+    "BROKER_OPERATIONS": (".broker", "BROKER_OPERATIONS"),
+    "BROKER_UNIT_NAME": (".installer", "BROKER_UNIT_NAME"),
+    "DEPLOYMENT_ARTIFACT_PATH": (".deployment_artifact", "DEPLOYMENT_ARTIFACT_PATH"),
+    "FORBIDDEN_BROKER_OPERATIONS": (".broker", "FORBIDDEN_BROKER_OPERATIONS"),
+    "INITIAL_CRYPTO_ATTESTATION_REVISION": (
+        ".installation",
+        "INITIAL_CRYPTO_ATTESTATION_REVISION",
+    ),
+    "INSTALLED_OBJECTS": (".installer", "INSTALLED_OBJECTS"),
+    "OwnerAuthorityBroker": (".broker", "OwnerAuthorityBroker"),
+    "OwnerAuthorityBrokerClient": (".broker", "OwnerAuthorityBrokerClient"),
+    "OwnerAuthorityBrokerError": (".broker", "OwnerAuthorityBrokerError"),
+    "OwnerAuthorityInstallation": (".installation", "OwnerAuthorityInstallation"),
+    "OwnerAuthorityInstallationError": (
+        ".installation",
+        "OwnerAuthorityInstallationError",
+    ),
+    "OwnerAuthorityInstallerError": (".installer", "OwnerAuthorityInstallerError"),
+    "OwnerAuthorityProvisioningError": (
+        ".provisioner",
+        "OwnerAuthorityProvisioningError",
+    ),
+    "OwnerAuthorityRecordError": (".records", "OwnerAuthorityRecordError"),
+    "OwnerAuthoritySigningError": (".signing", "OwnerAuthoritySigningError"),
+    "OwnerAuthorityStateError": (".state", "OwnerAuthorityStateError"),
+    "RECOMMENDED_LAUNCHER_USERNAME": (
+        ".launcher_account",
+        "RECOMMENDED_LAUNCHER_USERNAME",
+    ),
+    "RECORD_LAUNCH_RESULT": (".broker", "RECORD_LAUNCH_RESULT"),
+    "SIGNING_ALGORITHM": (".signing", "SIGNING_ALGORITHM"),
+    "SignedOwnerAuthorizationReceipt": (
+        ".records",
+        "SignedOwnerAuthorizationReceipt",
+    ),
+    "VERIFY_AND_CONSUME": (".broker", "VERIFY_AND_CONSUME"),
+    "attest_production_installation": (
+        ".installation",
+        "attest_production_installation",
+    ),
+    "attest_synthetic_non_production_installation": (
+        ".installation",
+        "attest_synthetic_non_production_installation",
+    ),
+    "auth_boundary_identity_integration_note": (
+        ".launcher_account",
+        "auth_boundary_identity_integration_note",
+    ),
+    "authorization_consumption_identity": (
+        ".records",
+        "authorization_consumption_identity",
+    ),
+    "broker_protocol_schema": (".broker", "broker_protocol_schema"),
+    "broker_unit_definition": (".installer", "broker_unit_definition"),
+    "build_broker_deployment_artifact": (
+        ".deployment_artifact",
+        "build_broker_deployment_artifact",
+    ),
+    "build_installation_record": (".installation", "build_installation_record"),
+    "discover_system_openssl": (".signing", "discover_system_openssl"),
+    "executable_identity": (".signing", "executable_identity"),
+    "external_owner_authorization_digest": (
+        ".records",
+        "external_owner_authorization_digest",
+    ),
+    "host_readiness_report": (".host_readiness", "host_readiness_report"),
+    "installation_plan": (".installer", "installation_plan"),
+    "launcher_account_creation_commands": (
+        ".launcher_account",
+        "launcher_account_creation_commands",
+    ),
+    "new_authorization_record_id": (".records", "new_authorization_record_id"),
+    "owner_payload_summary": (".provisioner", "owner_payload_summary"),
+    "peer_credentials": (".broker", "peer_credentials"),
+    "perform_installation": (".installer", "perform_installation"),
+    "perform_rollback_failed_install": (
+        ".installer",
+        "perform_rollback_failed_install",
+    ),
+    "perform_uninstall": (".installer", "perform_uninstall"),
+    "preinstall_conflict_checks": (".installer", "preinstall_conflict_checks"),
+    "production_installation_is_present": (
+        ".installation",
+        "production_installation_is_present",
+    ),
+    "provision_authorization": (".provisioner", "provision_authorization"),
+    "refuse_symlink_or_special_targets": (
+        ".installer",
+        "refuse_symlink_or_special_targets",
+    ),
+    "render_installation_plan": (".installer", "render_installation_plan"),
+    "render_owner_payload_summary": (".provisioner", "render_owner_payload_summary"),
+    "require_privileged_identity": (".installer", "require_privileged_identity"),
+    "validate_authorized_launcher": (
+        ".launcher_account",
+        "validate_authorized_launcher",
+    ),
+    "validate_launcher_username": (".launcher_account", "validate_launcher_username"),
+    "validate_service_unit_text": (".installer", "validate_service_unit_text"),
+    "verify_deployment_artifact": (
+        ".deployment_artifact",
+        "verify_deployment_artifact",
+    ),
+    "verify_installation": (".installer", "verify_installation"),
+    "verify_signature": (".signing", "verify_signature"),
+    "verify_signed_receipt": (".records", "verify_signed_receipt"),
+}
 
 __all__ = [
-    "ATTEST_INSTALLATION",
-    "AUTHORIZATION_ABSENT",
     "AUTHORIZATION_STATES",
-    "AUTHORIZATION_STATUS",
-    "AuthorizationStateDirectory",
-    "BROKER_OPERATIONS",
     "BROKER_PROTOCOL_VERSION",
-    "BROKER_UNIT_NAME",
     "COMMITTED_STATES",
     "CONSUMED_LAUNCH_COMMITTED",
     "EXTERNAL_OWNER_DIGEST_CONSTRUCTION",
-    "FORBIDDEN_BROKER_OPERATIONS",
-    "INSTALLED_OBJECTS",
-    "LAUNCHABLE_STATE",
     "LAUNCH_RESULT_RECORDED",
-    "OwnerAuthorityBroker",
-    "OwnerAuthorityBrokerClient",
-    "OwnerAuthorityBrokerError",
+    "LAUNCHABLE_STATE",
     "OwnerAuthorityError",
-    "OwnerAuthorityInstallation",
-    "OwnerAuthorityInstallationError",
-    "OwnerAuthorityInstallerError",
     "OwnerAuthorityLayout",
-    "OwnerAuthorityProvisioningError",
-    "OwnerAuthorityRecordError",
-    "OwnerAuthoritySigningError",
-    "OwnerAuthorityStateError",
     "PHRASE_VERIFIED",
     "PRODUCTION_CONFIGURATION_ROOT",
     "PRODUCTION_LAYOUT",
@@ -148,37 +166,24 @@ __all__ = [
     "PROVISIONED_PENDING",
     "RECEIPT_ISSUED",
     "RECEIPT_SIGNATURE_CONSTRUCTION",
-    "RECORD_LAUNCH_RESULT",
     "SIGNED_RECEIPT_SCHEMA_VERSION",
-    "SIGNING_ALGORITHM",
     "SYNTHETIC_LAYOUT",
-    "SignedOwnerAuthorizationReceipt",
-    "VERIFY_AND_CONSUME",
-    "attest_production_installation",
-    "attest_synthetic_non_production_installation",
-    "authorization_consumption_identity",
-    "broker_protocol_schema",
-    "broker_unit_definition",
-    "build_installation_record",
     "describe_state_machine",
-    "discover_system_openssl",
-    "executable_identity",
-    "external_owner_authorization_digest",
-    "installation_plan",
-    "new_authorization_record_id",
-    "owner_payload_summary",
-    "peer_credentials",
-    "perform_installation",
-    "preinstall_conflict_checks",
-    "production_installation_is_present",
     "production_layout",
-    "provision_authorization",
-    "render_installation_plan",
-    "render_owner_payload_summary",
-    "require_privileged_identity",
     "require_production_layout",
     "synthetic_non_production_layout",
-    "verify_installation",
-    "verify_signature",
-    "verify_signed_receipt",
+    *sorted(_LAZY_EXPORTS),
 ]
+
+
+def __getattr__(name: str) -> Any:
+    target = _LAZY_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attribute = target
+    from importlib import import_module
+
+    module = import_module(module_name, __name__)
+    value = getattr(module, attribute)
+    globals()[name] = value
+    return value

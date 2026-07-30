@@ -22,6 +22,9 @@ admissible-codex-namespace-bootstrap = "admissible.capsule.boundary_launcher:nam
 admissible-owner-authority-installer = "admissible.capsule.owner_authority.installer:main"
 admissible-owner-authority-provisioner = "admissible.capsule.owner_authority.provisioner:main"
 admissible-owner-authority-broker = "admissible.capsule.owner_authority.broker_service:main"
+admissible-owner-authority-crypto-revision = "admissible.capsule.owner_authority.crypto_revision:main"
+admissible-owner-authority-host-readiness = "admissible.capsule.owner_authority.host_readiness:main"
+admissible-owner-authority-deployment-artifact = "admissible.capsule.owner_authority.deployment_artifact:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
