@@ -177,6 +177,7 @@ class OwnerAuthorityBroker:
                 classification="OWNER_AUTHORITY_BROKER_NOT_PRIVILEGED",
             )
         self._socket: socket.socket | None = None
+        self._stop_requested = False
 
     # -- lifecycle --------------------------------------------------------
 
@@ -213,6 +214,21 @@ class OwnerAuthorityBroker:
         if path.exists() and path.is_socket():
             path.unlink()
 
+    def request_stop(self) -> None:
+        """Request a clean shutdown of :meth:`serve_forever`."""
+
+        self._stop_requested = True
+        if self._socket is not None:
+            try:
+                self._socket.close()
+            except OSError:
+                pass
+            self._socket = None
+
+    @property
+    def stop_requested(self) -> bool:
+        return self._stop_requested
+
     def serve_one(self, *, timeout: float = 30.0) -> str:
         """Accept and serve exactly one connection.  Returns the operation."""
 
@@ -227,10 +243,12 @@ class OwnerAuthorityBroker:
             connection.close()
 
     def serve_forever(self, *, connection_limit: int | None = None) -> None:
-        """Serve until the socket closes.  No single request can stop the broker."""
+        """Serve until stopped or the listening socket fails fatally."""
 
         served = 0
         while connection_limit is None or served < connection_limit:
+            if self._stop_requested:
+                return
             if self._socket is None:
                 return
             try:
@@ -239,8 +257,9 @@ class OwnerAuthorityBroker:
                 # A refused request or an idle period must never stop the broker.
                 continue
             except OSError:
-                # The listening socket was closed underneath us.
-                return
+                if self._stop_requested:
+                    return
+                raise
             served += 1
 
     # -- request handling -------------------------------------------------
