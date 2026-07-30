@@ -49,7 +49,7 @@ from admissible.capsule.model_authority import (
     validate_effective_thread_configuration,
     validate_launch_configuration_bytes,
 )
-from tests._verified_canary_binding import verified_canary_binding
+from tests._candidate_canary_binding import candidate_canary_binding
 from admissible.capsule.serialization_witness import (
     SerializationWitnessError,
     evaluate_serialization_witness,
@@ -86,7 +86,7 @@ def _serialized(model: str, effort: str | None):
 
 
 def test_canary_authority_binds_the_exact_model_and_low_effort():
-    binding = verified_canary_binding()
+    binding = candidate_canary_binding()
     authority = binding["authority"]
     assert authority.configured_model == "gpt-5.3-codex"
     assert authority.configured_reasoning_effort == "low"
@@ -100,7 +100,7 @@ def test_canary_authority_binds_the_exact_model_and_low_effort():
     assert authority.model_binding_policy_fingerprint == (
         binding["policy"].policy_fingerprint
     )
-    assert authority.verified_witness_receipt_identity == (
+    assert authority.candidate_witness_receipt_identity == (
         binding["receipt"].receipt_identity
     )
     prohibitions = authority.configuration["prohibitions"]
@@ -292,7 +292,8 @@ def test_witness_comparison_remains_explicitly_untrusted():
     assert evidence["configured_model"] == "gpt-5.3-codex"
     assert evidence["configured_reasoning_effort"] == "low"
     assert evidence["trust_state"] == "UNTRUSTED_OBSERVATION_ONLY"
-    assert evidence["verified_receipt"] is False
+    assert evidence["candidate_receipt"] is False
+    assert evidence["owner_bound_receipt"] is False
 
 
 @pytest.mark.parametrize(
@@ -462,7 +463,7 @@ def _authority_for(executable: Path, *, model, effort):
 
 
 def test_launch_fingerprint_changes_with_the_bound_model(tmp_path: Path):
-    binding = verified_canary_binding()
+    binding = candidate_canary_binding()
     authority = binding["authority"]
     policy, closers = _launch_policy(
         tmp_path,
@@ -503,7 +504,7 @@ def test_launch_fingerprint_changes_with_the_bound_model(tmp_path: Path):
 def test_launch_denies_user_and_project_configuration_discovery(tmp_path: Path):
     """No host config is visible and no override argument is ever passed."""
 
-    binding = verified_canary_binding()
+    binding = candidate_canary_binding()
     executable = binding["codex"]
     authority = binding["authority"]
     policy, closers = _launch_policy(
@@ -532,7 +533,7 @@ def test_launch_denies_user_and_project_configuration_discovery(tmp_path: Path):
 
 
 def test_launch_refuses_a_substituted_or_overriding_configuration(tmp_path: Path):
-    binding = verified_canary_binding()
+    binding = candidate_canary_binding()
     executable = binding["codex"]
     authority = binding["authority"]
     substituted = authority.ephemeral_config_bytes.replace(
@@ -562,7 +563,7 @@ def test_launch_refuses_a_substituted_or_overriding_configuration(tmp_path: Path
 
 
 def test_launch_refuses_a_model_authority_for_another_executable(tmp_path: Path):
-    binding = verified_canary_binding()
+    binding = candidate_canary_binding()
     executable = binding["codex"]
     other = tmp_path / "other-codex"
     other.write_bytes(b"#!/bin/sh\nexit 0\n")
@@ -608,7 +609,7 @@ def _execution_authority(
     *,
     receipt=None,
 ):
-    binding = verified_canary_binding()
+    binding = candidate_canary_binding()
     model_authority = model_authority or binding["authority"]
     receipt = receipt or binding["receipt"]
     codex_component = binding["identity"].to_dict()
@@ -621,8 +622,8 @@ def _execution_authority(
         generic_mission_fingerprint=sha256_bytes(b"mission"),
         codex_executable_identity=codex_component,
         model_authority=model_authority,
-        verified_witness_receipt=receipt,
-        trusted_witness_store=binding["store"],
+        candidate_witness_receipt=receipt,
+        candidate_witness_store=binding["store"],
         host_control_policy_fingerprint="2" * 64,
         bwrap_executable_identity=component,
         bwrap_argv_policy_fingerprint="3" * 64,
@@ -668,7 +669,7 @@ def _execution_authority(
 
 
 def test_model_authority_changes_the_complete_execution_authority():
-    binding = verified_canary_binding()
+    binding = candidate_canary_binding()
     bound = _execution_authority()
     assert bound.model_authority_fingerprint == (
         binding["authority"].authority_fingerprint
@@ -676,7 +677,7 @@ def test_model_authority_changes_the_complete_execution_authority():
     assert bound.model_binding_policy_fingerprint == (
         binding["policy"].policy_fingerprint
     )
-    assert bound.verified_witness_receipt_identity == (
+    assert bound.candidate_witness_receipt_identity == (
         binding["receipt"].receipt_identity
     )
     for isolated in (

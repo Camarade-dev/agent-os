@@ -66,7 +66,7 @@ from admissible.capsule.model_authority import (
     CodexModelAuthority,
 )
 from admissible.capsule.serialization_witness import serialization_witness_identity
-from tests._verified_canary_binding import verified_canary_binding
+from tests._candidate_canary_binding import candidate_canary_binding
 
 
 def _witness_model_authority():
@@ -458,7 +458,7 @@ def test_codex_launch_uses_sealed_fd_arguments_private_namespaces_and_no_auth_pa
     synthetic_source.write_bytes(SYNTHETIC_AUTHENTICATION)
     home = tmp_path / "broker-owned-home"
     home.mkdir(mode=0o700)
-    binding = verified_canary_binding()
+    binding = candidate_canary_binding()
     launch_model_authority = binding["authority"]
     (home / "config.toml").write_bytes(
         launch_model_authority.ephemeral_config_bytes

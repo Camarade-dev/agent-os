@@ -64,7 +64,7 @@ from admissible.capsule.intake import (
     IntakeFileRecord,
     IntakePublicationState,
 )
-from tests._verified_canary_binding import verified_canary_binding
+from tests._candidate_canary_binding import candidate_canary_binding
 from admissible.capsule.models import (
     ByteTreeObservation,
     CleanupResult,
@@ -100,7 +100,7 @@ def _model_authority(component=None):
 
 
 def _backend_authority() -> BackendExecutionAuthority:
-    binding = verified_canary_binding()
+    binding = candidate_canary_binding()
     component = synthetic_component_identity(
         component="contract-fixture",
         fixture_material={"source": "unit-test"},
@@ -111,8 +111,8 @@ def _backend_authority() -> BackendExecutionAuthority:
         generic_mission_fingerprint=sha256_bytes(b"mission"),
         codex_executable_identity=binding["identity"].to_dict(),
         model_authority=model_authority,
-        verified_witness_receipt=binding["receipt"],
-        trusted_witness_store=binding["store"],
+        candidate_witness_receipt=binding["receipt"],
+        candidate_witness_store=binding["store"],
         host_control_policy_fingerprint="2" * 64,
         bwrap_executable_identity=component,
         bwrap_argv_policy_fingerprint="3" * 64,
@@ -347,7 +347,7 @@ def test_backend_execution_authority_cross_binds_bytes_modes_and_schema():
     assert (
         authority.protocol_request_policy_fingerprint
         == protocol_request_policy_fingerprint(
-            verified_canary_binding()["authority"]
+            candidate_canary_binding()["authority"]
         )
     )
     assert authority.mission_fingerprint == sha256_bytes(b"mission")

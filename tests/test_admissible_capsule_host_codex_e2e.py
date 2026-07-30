@@ -42,6 +42,7 @@ from admissible.capsule.host_codex_backend import (
     AppServerProtocolError,
     AppServerReceiveTimeout,
     HostCodexAppServerCapsuleBackend,
+    NonProductionWitnessMode,
     ScriptedCodexAppServerConnection,
     ScriptedCodexConnectionFactory,
 )
@@ -69,9 +70,9 @@ from admissible.capsule.verification import (
     CommandCapture,
     VerificationCopy,
 )
-from tests._verified_canary_binding import (
-    create_verified_canary_binding,
-    verified_canary_binding,
+from tests._candidate_canary_binding import (
+    create_candidate_canary_binding,
+    candidate_canary_binding,
 )
 
 
@@ -177,14 +178,14 @@ def _backend(
         returncode=connection_returncode,
         force_on_close=force_on_close,
     )
-    binding = model_binding or verified_canary_binding()
+    binding = model_binding or candidate_canary_binding()
     connection_factory = ScriptedCodexConnectionFactory(
         connection,
         codex_component_identity=binding["identity"].to_dict(),
     )
     store = DurableCapsuleSessionStore(
         tmp_path / "session-store",
-        trusted_witness_store=binding["store"],
+        candidate_witness_store=binding["store"],
     )
     capsule_authority = CapsuleAuthority.create(
         backend_kind="host_codex_app_server_capsule_v1",
@@ -204,6 +205,7 @@ def _backend(
         session_store=store,
         connection_factory=connection_factory,
         mission_prompt=SYNTHETIC_MISSION_PROMPT,
+        witness_authority=NonProductionWitnessMode(binding["receipt"]),
         event_timeout_seconds=event_timeout,
     )
     workspace = backend.prepare_workspace()
@@ -666,7 +668,7 @@ def test_effect_guard_revalidates_durable_witness_before_any_request(
 ):
     """A changed durable pack wins over a caller-asserted effective binding."""
 
-    binding = create_verified_canary_binding(
+    binding = create_candidate_canary_binding(
         tmp_path / "independent-witness-evidence"
     )
     backend, workspace, _connection, _session_id = _backend(

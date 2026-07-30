@@ -25,35 +25,35 @@ from admissible.capsule.model_authority import (
 from admissible.capsule.serialization_witness import (
     SerializationWitnessError,
     SerializationWitnessRecord,
-    TrustedSerializationWitnessStore,
-    VerifiedSerializationWitnessReceipt,
+    CandidateSerializationWitnessStore,
+    CandidateSerializationWitnessReceipt,
     evaluate_serialization_witness,
     extract_witness_record,
     serialization_witness_identity,
-    validate_verified_receipt_metadata,
+    validate_candidate_receipt_metadata,
 )
-from tests._verified_canary_binding import verified_canary_binding
+from tests._candidate_canary_binding import candidate_canary_binding
 
 
 def _fresh(tmp_path: Path):
-    shared = verified_canary_binding()
+    shared = candidate_canary_binding()
     policy = canary_model_binding_policy(
         codex_executable_identity=shared["identity"].to_dict()
     )
-    store = TrustedSerializationWitnessStore(tmp_path / "trusted-witness")
-    receipt = store.verify_canary(
+    store = CandidateSerializationWitnessStore(tmp_path / "trusted-witness")
+    receipt = store.record_candidate_witness(
         policy=policy,
         codex_executable=shared["codex"],
     )
     authority = canary_model_authority(
         model_binding_policy=policy,
-        verified_witness_receipt=receipt,
-        trusted_witness_store=store,
+        candidate_witness_receipt=receipt,
+        candidate_witness_store=store,
     )
     return shared, store, policy, receipt, authority
 
 
-def _pack_path(store: TrustedSerializationWitnessStore, receipt):
+def _pack_path(store: CandidateSerializationWitnessStore, receipt):
     return store.root / receipt.to_dict()["evidence_pack_relative_path"]
 
 
@@ -61,7 +61,7 @@ def test_caller_created_record_is_only_an_untrusted_observation():
     isolated = CodexModelAuthority.create(
         configured_model=CANARY_CONFIGURED_MODEL,
         configured_reasoning_effort=CANARY_CONFIGURED_REASONING_EFFORT,
-        codex_executable_identity=verified_canary_binding()["identity"].to_dict(),
+        codex_executable_identity=candidate_canary_binding()["identity"].to_dict(),
     )
     record = extract_witness_record(
         request_path="/v1/responses",
@@ -72,12 +72,13 @@ def test_caller_created_record_is_only_an_untrusted_observation():
     )
     comparison = evaluate_serialization_witness([record], isolated)
     assert comparison["trust_state"] == "UNTRUSTED_OBSERVATION_ONLY"
-    assert comparison["verified_receipt"] is False
+    assert comparison["candidate_receipt"] is False
+    assert comparison["owner_bound_receipt"] is False
     with pytest.raises(ModelConfigurationError, match="opaque verified"):
-        CodexModelAuthority.from_verified_receipt(
+        CodexModelAuthority.from_candidate_receipt(
             policy=isolated.model_binding_policy,
             receipt=record,
-            trusted_witness_store=verified_canary_binding()["store"],
+            candidate_witness_store=candidate_canary_binding()["store"],
         )
 
 
@@ -89,23 +90,23 @@ def test_arbitrary_witness_fingerprint_has_no_authority():
             configured_model=CANARY_CONFIGURED_MODEL,
             configured_reasoning_effort=CANARY_CONFIGURED_REASONING_EFFORT,
             codex_executable_identity=(
-                verified_canary_binding()["identity"].to_dict()
+                candidate_canary_binding()["identity"].to_dict()
             ),
             serialization_witness_identity="0" * 64,
         )
 
 
 def test_receipt_cannot_be_constructed_from_expected_strings():
-    receipt_body = verified_canary_binding()["receipt"].to_dict()
+    receipt_body = candidate_canary_binding()["receipt"].to_dict()
     with pytest.raises(
-        SerializationWitnessError, match="only be loaded by the trusted store"
+        SerializationWitnessError, match="only be loaded by their store"
     ):
-        VerifiedSerializationWitnessReceipt(receipt_body, object())
+        CandidateSerializationWitnessReceipt(receipt_body, object())
 
 
 def test_structural_receipt_metadata_does_not_restore_live_provenance():
-    binding = verified_canary_binding()
-    metadata = validate_verified_receipt_metadata(
+    binding = candidate_canary_binding()
+    metadata = validate_candidate_receipt_metadata(
         binding["receipt"].to_dict(),
         expected_policy=binding["policy"],
         expected_executable_identity=binding["identity"].to_dict(),
@@ -116,16 +117,16 @@ def test_structural_receipt_metadata_does_not_restore_live_provenance():
     assert metadata["receipt_identity"] == binding["receipt"].receipt_identity
     assert reconstructed.receipt_revalidated is False
     with pytest.raises(ModelConfigurationError, match="no revalidated durable"):
-        reconstructed.require_verified_receipt()
+        reconstructed.require_revalidated_candidate_receipt()
 
 
 def test_self_consistent_fake_pack_without_external_anchor_is_refused(
     tmp_path: Path,
 ):
-    binding = verified_canary_binding()
-    store = TrustedSerializationWitnessStore(tmp_path / "unanchored-fake")
+    binding = candidate_canary_binding()
+    store = CandidateSerializationWitnessStore(tmp_path / "unanchored-fake")
     fake_body = {
-        "schema_version": "admissible_codex_verified_serialization_evidence_pack_v1",
+        "schema_version": "admissible_codex_candidate_serialization_evidence_pack_v2",
         "configured_model": CANARY_CONFIGURED_MODEL,
         "configured_reasoning_effort": CANARY_CONFIGURED_REASONING_EFFORT,
     }
@@ -133,8 +134,8 @@ def test_self_consistent_fake_pack_without_external_anchor_is_refused(
     (store.root / "evidence-packs" / "fabricated.json").write_bytes(
         canonical_bytes(fake)
     )
-    with pytest.raises(SerializationWitnessError, match="no verified witness"):
-        store.load_current_verified_receipt(
+    with pytest.raises(SerializationWitnessError, match="no candidate witness receipt is recorded"):
+        store.load_current_candidate_receipt(
             expected_policy=binding["policy"],
             expected_executable_identity=binding["identity"].to_dict(),
         )
@@ -144,9 +145,9 @@ def test_copied_evidence_under_an_unauthorized_store_is_refused(tmp_path: Path):
     shared, store, policy, _receipt, _authority = _fresh(tmp_path / "source")
     copied = tmp_path / "copied-store"
     shutil.copytree(store.root, copied)
-    unauthorized = TrustedSerializationWitnessStore(copied)
-    with pytest.raises(SerializationWitnessError, match="no verified witness"):
-        unauthorized.load_current_verified_receipt(
+    unauthorized = CandidateSerializationWitnessStore(copied)
+    with pytest.raises(SerializationWitnessError, match="no candidate witness receipt is recorded"):
+        unauthorized.load_current_candidate_receipt(
             expected_policy=policy,
             expected_executable_identity=shared["identity"].to_dict(),
         )
@@ -164,7 +165,7 @@ def test_substituted_witness_run_nonce_is_refused(tmp_path: Path):
     pack["evidence_pack_fingerprint"] = fingerprint(body)
     path.write_bytes(canonical_bytes(pack))
     with pytest.raises(SerializationWitnessError, match="evidence bytes changed"):
-        store.load_verified_receipt(
+        store.load_candidate_receipt(
             receipt_identity=receipt.receipt_identity,
             witness_run_identity=receipt.witness_run_identity,
             expected_policy=policy,
@@ -179,7 +180,7 @@ def test_substituted_executable_identity_is_refused(tmp_path: Path):
     with pytest.raises(
         SerializationWitnessError, match="run anchor differs"
     ):
-        store.load_verified_receipt(
+        store.load_candidate_receipt(
             receipt_identity=receipt.receipt_identity,
             witness_run_identity=receipt.witness_run_identity,
             expected_policy=policy,
@@ -201,7 +202,7 @@ def test_substituted_namespace_network_evidence_is_refused(tmp_path: Path):
     pack["evidence_pack_fingerprint"] = fingerprint(body)
     path.write_bytes(canonical_bytes(pack))
     with pytest.raises(SerializationWitnessError, match="evidence bytes changed"):
-        store.load_verified_receipt(
+        store.load_candidate_receipt(
             receipt_identity=receipt.receipt_identity,
             witness_run_identity=receipt.witness_run_identity,
             expected_policy=policy,
@@ -229,7 +230,7 @@ def test_receipt_for_another_model_policy_is_refused(
         codex_executable_identity=shared["identity"].to_dict(),
     )
     with pytest.raises(SerializationWitnessError, match="run anchor differs"):
-        store.load_verified_receipt(
+        store.load_candidate_receipt(
             receipt_identity=receipt.receipt_identity,
             witness_run_identity=receipt.witness_run_identity,
             expected_policy=other,
@@ -241,14 +242,14 @@ def test_authority_created_before_witness_replacement_is_refused(
     tmp_path: Path,
 ):
     shared, store, policy, first, first_authority = _fresh(tmp_path)
-    second = store.verify_canary(
+    second = store.record_candidate_witness(
         policy=policy,
         codex_executable=shared["codex"],
     )
     assert second.receipt_identity != first.receipt_identity
     assert first_authority.receipt_revalidated is True
     with pytest.raises(SerializationWitnessError, match="not the externally"):
-        store.load_verified_receipt(
+        store.load_candidate_receipt(
             receipt_identity=first.receipt_identity,
             witness_run_identity=first.witness_run_identity,
             expected_policy=policy,
@@ -260,7 +261,7 @@ def test_missing_durable_witness_evidence_is_refused(tmp_path: Path):
     _shared, store, policy, receipt, _authority = _fresh(tmp_path)
     _pack_path(store, receipt).unlink()
     with pytest.raises(SerializationWitnessError, match="evidence pack is missing"):
-        store.load_verified_receipt(
+        store.load_candidate_receipt(
             receipt_identity=receipt.receipt_identity,
             witness_run_identity=receipt.witness_run_identity,
             expected_policy=policy,
@@ -273,7 +274,7 @@ def test_changed_durable_witness_evidence_is_refused(tmp_path: Path):
     path = _pack_path(store, receipt)
     path.write_bytes(path.read_bytes() + b"\n")
     with pytest.raises(SerializationWitnessError, match="evidence bytes changed"):
-        store.load_verified_receipt(
+        store.load_candidate_receipt(
             receipt_identity=receipt.receipt_identity,
             witness_run_identity=receipt.witness_run_identity,
             expected_policy=policy,
@@ -290,7 +291,7 @@ def test_backend_has_no_optional_runtime_model_override():
 
 def test_receipt_excludes_prompt_credentials_headers_and_response_bodies():
     rendered = canonical_bytes(
-        verified_canary_binding()["receipt"].to_dict()
+        candidate_canary_binding()["receipt"].to_dict()
     ).lower()
     for denied in (
         b"prompt_text",

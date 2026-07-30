@@ -316,7 +316,8 @@ def test_pinned_client_serializes_the_exact_bound_model_and_effort(
     assert evidence["configured_reasoning_effort"] == "low"
     assert evidence["observed_requests"] >= 1
     assert evidence["trust_state"] == "UNTRUSTED_OBSERVATION_ONLY"
-    assert evidence["verified_receipt"] is False
+    assert evidence["candidate_receipt"] is False
+    assert evidence["owner_bound_receipt"] is False
     assert records[0].request_path.endswith("/responses")
 
 
