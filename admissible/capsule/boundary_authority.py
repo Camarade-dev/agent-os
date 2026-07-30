@@ -774,10 +774,31 @@ class OSBoundaryAuthority:
                 "codex_protocol_schema_identity",
                 "dynamic_tools_schema_identity",
                 "model_binding_policy_fingerprint",
-                "verified_serialization_witness_receipt_identity",
+                "candidate_serialization_witness_receipt_identity",
+                "owner_binding_state",
+                "owner_bound_serialization_receipt_identity",
             },
             "boundary dependent authorities",
         )
+        owner_state = self.dependent_authorities["owner_binding_state"]
+        owner_receipt = self.dependent_authorities[
+            "owner_bound_serialization_receipt_identity"
+        ]
+        if owner_state not in {"OWNER_BOUND", "NON_PRODUCTION_NO_OWNER_BINDING"}:
+            raise ValueError("boundary owner-binding state is unknown")
+        require_sha256(
+            owner_receipt,
+            "boundary owner-bound serialization receipt identity",
+        )
+        if owner_state == "OWNER_BOUND":
+            if owner_receipt == "0" * 64:
+                raise ValueError(
+                    "an owner-bound boundary requires a real owner-bound receipt"
+                )
+        elif owner_receipt != "0" * 64:
+            raise ValueError(
+                "a non-production boundary must not claim an owner-bound receipt"
+            )
         image = self.dependent_authorities["capsule_image_content_id"]
         if not image.startswith("sha256:") or len(image) != 71:
             raise ValueError("boundary capsule image is not an immutable content ID")
@@ -791,7 +812,7 @@ class OSBoundaryAuthority:
             "codex_protocol_schema_identity",
             "dynamic_tools_schema_identity",
             "model_binding_policy_fingerprint",
-            "verified_serialization_witness_receipt_identity",
+            "candidate_serialization_witness_receipt_identity",
         ):
             require_sha256(self.dependent_authorities[key], key)
         launch_body = self._body()

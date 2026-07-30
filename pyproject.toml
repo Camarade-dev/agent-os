@@ -41,6 +41,7 @@ agent_os = ["templates/*.md"]
     "docs/admissible-host-codex-capsule-backend.md",
     "docs/admissible-codex-os-boundary.md",
     "docs/admissible-codex-model-authority.md",
+    "docs/admissible-owner-rooted-witness-trust.md",
 ]
 
 [tool.pytest.ini_options]

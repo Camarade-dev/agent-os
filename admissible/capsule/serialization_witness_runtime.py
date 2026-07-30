@@ -1,7 +1,7 @@
 """Confined runtime for the trusted Codex serialization verifier.
 
 This module is never an authority by itself.  It runs only as the child of
-``TrustedSerializationWitnessStore.verify_canary`` inside a new bubblewrap
+``CandidateSerializationWitnessStore.record_candidate_witness`` inside a new bubblewrap
 network/PID/user namespace.  Its output is an untrusted, minimal observation
 that the parent validates and durably anchors before returning a verified
 receipt.

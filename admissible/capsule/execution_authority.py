@@ -321,9 +321,73 @@ def validate_component_identity_metadata(
     return dict(value)
 
 
+def _owner_binding_fields(
+    *,
+    owner_bound_receipt: Any,
+    connection_mode: str,
+    candidate_witness_receipt: Any,
+    bound_policy: Any,
+) -> dict[str, str]:
+    """Derive the owner-binding fields, refusing production without a binding.
+
+    A production connection mode has exactly one admissible answer here: a real
+    ``OwnerBoundVerifiedSerializationReceipt`` naming this candidate receipt and
+    this model policy.  The explicitly non-production mode records zeroes, which
+    no production validation accepts.
+    """
+
+    from admissible.capsule.owner_authorization import (
+        OwnerBoundVerifiedSerializationReceipt,
+    )
+
+    zero = "0" * 64
+    if owner_bound_receipt is None:
+        if connection_mode != "synthetic_provider_free":
+            raise ValueError(
+                "production execution requires an owner-bound serialization "
+                "receipt, not a candidate receipt"
+            )
+        return {
+            "owner_binding_state": "NON_PRODUCTION_NO_OWNER_BINDING",
+            "owner_bound_receipt_identity": zero,
+            "owner_payload_fingerprint": zero,
+            "owner_authorization_consumption_identity": zero,
+        }
+    if not isinstance(
+        owner_bound_receipt, OwnerBoundVerifiedSerializationReceipt
+    ):
+        raise ValueError(
+            "backend execution creation requires a typed owner-bound receipt"
+        )
+    owner = owner_bound_receipt.validated()
+    if (
+        owner.candidate_receipt_identity
+        != candidate_witness_receipt.receipt_identity
+        or owner.candidate_witness_run_identity
+        != candidate_witness_receipt.witness_run_identity
+    ):
+        raise ValueError("owner-bound receipt names another candidate witness")
+    if owner.model_binding_policy_fingerprint != bound_policy.policy_fingerprint:
+        raise ValueError("owner-bound receipt names another model policy")
+    return {
+        "owner_binding_state": "OWNER_BOUND",
+        "owner_bound_receipt_identity": owner.receipt_identity,
+        "owner_payload_fingerprint": owner.owner_payload_fingerprint,
+        "owner_authorization_consumption_identity": (
+            owner.authorization_consumption_identity
+        ),
+    }
+
+
 @dataclass(frozen=True)
 class BackendExecutionAuthority:
-    """Every authority and byte binding for one concrete backend session."""
+    """Every authority and byte binding for one concrete backend session.
+
+    In production this object cannot exist without an owner-bound serialization
+    receipt: ``create`` refuses a production connection mode when
+    ``owner_bound_receipt`` is absent, and ``validated`` refuses the same
+    combination when the authority is reloaded from durable evidence.
+    """
 
     schema_version: str
     backend_kind: str
@@ -336,9 +400,13 @@ class BackendExecutionAuthority:
     model_authority_fingerprint: str
     model_binding_policy: Mapping[str, Any]
     model_binding_policy_fingerprint: str
-    verified_witness_receipt: Mapping[str, Any]
-    verified_witness_receipt_identity: str
-    verified_witness_run_identity: str
+    candidate_witness_receipt: Mapping[str, Any]
+    candidate_witness_receipt_identity: str
+    candidate_witness_run_identity: str
+    owner_binding_state: str
+    owner_bound_receipt_identity: str
+    owner_payload_fingerprint: str
+    owner_authorization_consumption_identity: str
     host_control_policy_fingerprint: str
     bwrap_executable_identity: Mapping[str, Any]
     bwrap_argv_policy_fingerprint: str
@@ -370,8 +438,9 @@ class BackendExecutionAuthority:
         generic_mission_fingerprint: str,
         codex_executable_identity: Mapping[str, Any],
         model_authority: Any,
-        verified_witness_receipt: Any,
-        trusted_witness_store: Any,
+        candidate_witness_receipt: Any,
+        candidate_witness_store: Any,
+        owner_bound_receipt: Any = None,
         host_control_policy_fingerprint: str,
         bwrap_executable_identity: Mapping[str, Any],
         bwrap_argv_policy_fingerprint: str,
@@ -393,51 +462,57 @@ class BackendExecutionAuthority:
     ) -> "BackendExecutionAuthority":
         from admissible.capsule.model_authority import CodexModelAuthority
         from admissible.capsule.serialization_witness import (
-            TrustedSerializationWitnessStore,
-            VerifiedSerializationWitnessReceipt,
-            validate_verified_receipt_metadata,
+            CandidateSerializationWitnessStore,
+            CandidateSerializationWitnessReceipt,
+            validate_candidate_receipt_metadata,
         )
 
         if not isinstance(model_authority, CodexModelAuthority):
             raise ValueError(
                 "backend execution creation requires a live model authority"
             )
-        bound_model = model_authority.validated().require_verified_receipt()
+        bound_model = model_authority.validated().require_revalidated_candidate_receipt()
         if not isinstance(
-            verified_witness_receipt,
-            VerifiedSerializationWitnessReceipt,
+            candidate_witness_receipt,
+            CandidateSerializationWitnessReceipt,
         ):
             raise ValueError(
                 "backend execution creation requires an opaque witness receipt"
             )
-        if not isinstance(trusted_witness_store, TrustedSerializationWitnessStore):
+        if not isinstance(candidate_witness_store, CandidateSerializationWitnessStore):
             raise ValueError(
                 "backend execution creation requires the trusted witness store"
             )
         bound_policy = bound_model.model_binding_policy
-        durable_receipt = trusted_witness_store.load_verified_receipt(
-            receipt_identity=verified_witness_receipt.receipt_identity,
-            witness_run_identity=verified_witness_receipt.witness_run_identity,
+        durable_receipt = candidate_witness_store.load_candidate_receipt(
+            receipt_identity=candidate_witness_receipt.receipt_identity,
+            witness_run_identity=candidate_witness_receipt.witness_run_identity,
             expected_policy=bound_policy,
             expected_executable_identity=codex_executable_identity,
         )
-        if durable_receipt.to_dict() != verified_witness_receipt.to_dict():
+        if durable_receipt.to_dict() != candidate_witness_receipt.to_dict():
             raise ValueError(
                 "backend receipt differs from revalidated durable evidence"
             )
-        verified_witness_receipt = durable_receipt
-        receipt_metadata = validate_verified_receipt_metadata(
-            verified_witness_receipt.to_dict(),
+        candidate_witness_receipt = durable_receipt
+        receipt_metadata = validate_candidate_receipt_metadata(
+            candidate_witness_receipt.to_dict(),
             expected_policy=bound_policy,
             expected_executable_identity=codex_executable_identity,
         )
         if (
-            verified_witness_receipt.receipt_identity
-            != bound_model.verified_witness_receipt_identity
-            or verified_witness_receipt.witness_run_identity
-            != bound_model.verified_witness_run_identity
+            candidate_witness_receipt.receipt_identity
+            != bound_model.candidate_witness_receipt_identity
+            or candidate_witness_receipt.witness_run_identity
+            != bound_model.candidate_witness_run_identity
         ):
             raise ValueError("model authority and witness receipt differ")
+        owner_binding = _owner_binding_fields(
+            owner_bound_receipt=owner_bound_receipt,
+            connection_mode=connection_mode,
+            candidate_witness_receipt=candidate_witness_receipt,
+            bound_policy=bound_policy,
+        )
         if os_boundary_authority is None:
             if connection_mode != "synthetic_provider_free":
                 raise ValueError(
@@ -470,8 +545,12 @@ class BackendExecutionAuthority:
                     "model_binding_policy_fingerprint": (
                         bound_policy.policy_fingerprint
                     ),
-                    "verified_serialization_witness_receipt_identity": (
-                        verified_witness_receipt.receipt_identity
+                    "candidate_serialization_witness_receipt_identity": (
+                        candidate_witness_receipt.receipt_identity
+                    ),
+                    "owner_binding_state": owner_binding["owner_binding_state"],
+                    "owner_bound_serialization_receipt_identity": (
+                        owner_binding["owner_bound_receipt_identity"]
                     ),
                 },
             )
@@ -491,13 +570,23 @@ class BackendExecutionAuthority:
             "model_authority_fingerprint": bound_model.authority_fingerprint,
             "model_binding_policy": bound_policy.to_dict(),
             "model_binding_policy_fingerprint": bound_policy.policy_fingerprint,
-            "verified_witness_receipt": dict(receipt_metadata),
-            "verified_witness_receipt_identity": (
-                verified_witness_receipt.receipt_identity
+            "candidate_witness_receipt": dict(receipt_metadata),
+            "candidate_witness_receipt_identity": (
+                candidate_witness_receipt.receipt_identity
             ),
-            "verified_witness_run_identity": (
-                verified_witness_receipt.witness_run_identity
+            "candidate_witness_run_identity": (
+                candidate_witness_receipt.witness_run_identity
             ),
+            "owner_binding_state": owner_binding["owner_binding_state"],
+            "owner_bound_receipt_identity": owner_binding[
+                "owner_bound_receipt_identity"
+            ],
+            "owner_payload_fingerprint": owner_binding[
+                "owner_payload_fingerprint"
+            ],
+            "owner_authorization_consumption_identity": owner_binding[
+                "owner_authorization_consumption_identity"
+            ],
             "host_control_policy_fingerprint": host_control_policy_fingerprint,
             "bwrap_executable_identity": dict(bwrap_executable_identity),
             "bwrap_argv_policy_fingerprint": bwrap_argv_policy_fingerprint,
@@ -565,6 +654,30 @@ class BackendExecutionAuthority:
             "synthetic_provider_free",
         }:
             raise ValueError("connection mode substitution refused")
+        if self.owner_binding_state not in {
+            "OWNER_BOUND",
+            "NON_PRODUCTION_NO_OWNER_BINDING",
+        }:
+            raise ValueError("backend owner-binding state is unknown")
+        for label, value in (
+            ("owner-bound receipt", self.owner_bound_receipt_identity),
+            ("owner payload", self.owner_payload_fingerprint),
+            (
+                "owner authorization consumption",
+                self.owner_authorization_consumption_identity,
+            ),
+        ):
+            require_sha256(value, f"{label} identity")
+        owner_bound = self.owner_binding_state == "OWNER_BOUND"
+        zero = "0" * 64
+        if owner_bound == (
+            self.owner_bound_receipt_identity == zero
+            and self.owner_payload_fingerprint == zero
+            and self.owner_authorization_consumption_identity == zero
+        ):
+            raise ValueError(
+                "backend owner-binding state contradicts its owner identities"
+            )
         component_validator = (
             validate_component_identity_metadata
             if self.connection_mode == "production_os_boundary"
@@ -576,7 +689,7 @@ class BackendExecutionAuthority:
             ModelBindingPolicy,
         )
         from admissible.capsule.serialization_witness import (
-            validate_verified_receipt_metadata,
+            validate_candidate_receipt_metadata,
         )
 
         bound_model = CodexModelAuthority.from_dict(self.model_authority)
@@ -609,28 +722,28 @@ class BackendExecutionAuthority:
             != bound_policy.to_dict()
         ):
             raise ValueError("execution and model-binding policies differ")
-        receipt = validate_verified_receipt_metadata(
-            self.verified_witness_receipt,
+        receipt = validate_candidate_receipt_metadata(
+            self.candidate_witness_receipt,
             expected_policy=bound_policy,
             expected_executable_identity=self.codex_executable_identity,
         )
         require_sha256(
-            self.verified_witness_receipt_identity,
+            self.candidate_witness_receipt_identity,
             "verified witness receipt identity",
         )
         require_identifier(
-            self.verified_witness_run_identity,
+            self.candidate_witness_run_identity,
             "verified witness run identity",
         )
         if (
             receipt["receipt_identity"]
-            != self.verified_witness_receipt_identity
+            != self.candidate_witness_receipt_identity
             or receipt["witness_run_identity"]
-            != self.verified_witness_run_identity
-            or bound_model.verified_witness_receipt_identity
-            != self.verified_witness_receipt_identity
-            or bound_model.verified_witness_run_identity
-            != self.verified_witness_run_identity
+            != self.candidate_witness_run_identity
+            or bound_model.candidate_witness_receipt_identity
+            != self.candidate_witness_receipt_identity
+            or bound_model.candidate_witness_run_identity
+            != self.candidate_witness_run_identity
         ):
             raise ValueError("execution authority witness binding differs")
         component_validator(self.bwrap_executable_identity, "bwrap executable")
@@ -679,6 +792,11 @@ class BackendExecutionAuthority:
             and factory_identity.get("provider_request_capable") is not False
         ):
             raise ValueError("synthetic factory became provider-capable")
+        if self.connection_mode != "synthetic_provider_free" and not owner_bound:
+            raise ValueError(
+                "a production backend execution authority requires an "
+                "owner-bound serialization receipt"
+            )
         dependent_fingerprints = {
             item["identity_fingerprint"] for item in boundary.dependent_identities
         }
@@ -706,9 +824,9 @@ class BackendExecutionAuthority:
             ]
             != self.model_binding_policy_fingerprint
             or boundary.dependent_authorities[
-                "verified_serialization_witness_receipt_identity"
+                "candidate_serialization_witness_receipt_identity"
             ]
-            != self.verified_witness_receipt_identity
+            != self.candidate_witness_receipt_identity
         ):
             raise ValueError(
                 "OS boundary image, protocol, model policy, or witness differs"

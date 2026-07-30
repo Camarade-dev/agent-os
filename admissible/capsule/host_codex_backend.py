@@ -22,6 +22,7 @@ import uuid
 import inspect
 from abc import ABC, abstractmethod
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -78,6 +79,15 @@ from admissible.capsule.model_authority import (
     canary_model_authority,
     validate_effective_thread_configuration,
 )
+from admissible.capsule.owner_authorization import (
+    OwnerAuthorizationError,
+    OwnerBoundVerifiedSerializationReceipt,
+    revalidate_owner_bound_receipt,
+)
+from admissible.capsule.preflight_seal import (
+    OWNER_AUTHORIZATION_CONSUMED,
+    OWNER_BOUND_READY_FOR_SINGLE_LAUNCH,
+)
 from admissible.capsule.models import (
     ByteTreeObservation,
     CleanupResult,
@@ -110,6 +120,101 @@ PASSIVE_ITEM_TYPES = {
     "reasoning",
     "dynamicToolCall",
 }
+PRODUCTION_CONNECTION_MODES = frozenset(
+    {"production_bwrap", "production_os_boundary"}
+)
+NON_PRODUCTION_CONNECTION_MODE = "synthetic_provider_free"
+
+#: A non-production witness mode must say so in full, in a value no production
+#: path accepts.  This is the only route by which a backend may run on candidate
+#: evidence alone, and it never mints an owner-bound receipt.
+NON_PRODUCTION_ACKNOWLEDGEMENT = (
+    "NON_PRODUCTION_SYNTHETIC_DEVELOPMENT_CANDIDATE_EVIDENCE_NO_OWNER_BINDING"
+)
+
+
+@dataclass(frozen=True)
+class OwnerBoundWitnessAuthority:
+    """The production witness authority: an owner-bound receipt plus its state.
+
+    Every field is needed by the pre-effect gate: the receipt says what the owner
+    authorized, the state store says whether that authorization is still
+    unconsumed, and the preparation root plus externally retained seal identity
+    let the gate re-derive the seal rather than trust a recorded fingerprint.
+    """
+
+    owner_bound_receipt: OwnerBoundVerifiedSerializationReceipt
+    authorization_state: Any
+    preparation_root: Path
+    retained_seal_identity: Any
+
+    def validated(self) -> "OwnerBoundWitnessAuthority":
+        if not isinstance(
+            self.owner_bound_receipt, OwnerBoundVerifiedSerializationReceipt
+        ):
+            raise ValueError(
+                "production backend requires an owner-bound serialization receipt"
+            )
+        from admissible.capsule.owner_authorization import (
+            OwnerAuthorizationStateStore,
+        )
+        from admissible.capsule.preflight_seal import (
+            RetainedPreparationSealIdentity,
+        )
+
+        if not isinstance(self.authorization_state, OwnerAuthorizationStateStore):
+            raise ValueError(
+                "production backend requires the external one-time "
+                "owner authorization state"
+            )
+        if not isinstance(
+            self.retained_seal_identity, RetainedPreparationSealIdentity
+        ):
+            raise ValueError(
+                "production backend requires the externally retained seal identity"
+            )
+        if (
+            not isinstance(self.preparation_root, Path)
+            or not self.preparation_root.is_absolute()
+        ):
+            raise ValueError(
+                "production backend requires the absolute preparation root"
+            )
+        self.owner_bound_receipt.validated()
+        return self
+
+
+@dataclass(frozen=True)
+class NonProductionWitnessMode:
+    """Explicitly non-production development mode over candidate evidence only.
+
+    It is impossible under a production ``BackendExecutionAuthority``: the
+    backend refuses it whenever the connection mode is production, and
+    ``BackendExecutionAuthority.create`` refuses a production connection mode
+    without an owner-bound receipt.  It never produces an owner-bound receipt.
+    """
+
+    candidate_witness_receipt: Any
+    acknowledgement: str = NON_PRODUCTION_ACKNOWLEDGEMENT
+
+    def validated(self) -> "NonProductionWitnessMode":
+        from admissible.capsule.serialization_witness import (
+            CandidateSerializationWitnessReceipt,
+        )
+
+        if not isinstance(
+            self.candidate_witness_receipt, CandidateSerializationWitnessReceipt
+        ):
+            raise ValueError(
+                "non-production witness mode requires a candidate receipt"
+            )
+        if self.acknowledgement != NON_PRODUCTION_ACKNOWLEDGEMENT:
+            raise ValueError(
+                "non-production witness mode must acknowledge it is not production"
+            )
+        return self
+
+
 class AppServerProtocolError(RuntimeError):
     pass
 
@@ -1101,6 +1206,7 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
         session_store: DurableCapsuleSessionStore,
         connection_factory: AppServerConnectionFactory,
         mission_prompt: str,
+        witness_authority: OwnerBoundWitnessAuthority | NonProductionWitnessMode,
         mission_bytes: bytes | None = None,
         os_boundary_authority: OSBoundaryAuthority | None = None,
         event_timeout_seconds: float = 10.0,
@@ -1112,6 +1218,34 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
         self.controller = controller
         self.session_store = session_store
         self.connection_factory = connection_factory
+        # The owner binding is the outermost construction gate: a production
+        # backend refuses before it inspects anything else.
+        production = (
+            self.connection_factory.connection_mode
+            in PRODUCTION_CONNECTION_MODES
+        )
+        self._authorization_consumed_here = False
+        if isinstance(witness_authority, OwnerBoundWitnessAuthority):
+            self.owner_bound_witness_authority = witness_authority.validated()
+            self.non_production_witness_mode = None
+        elif isinstance(witness_authority, NonProductionWitnessMode):
+            if production:
+                raise ValueError(
+                    "the non-production witness mode is impossible under a "
+                    "production connection mode"
+                )
+            self.owner_bound_witness_authority = None
+            self.non_production_witness_mode = witness_authority.validated()
+        else:
+            raise ValueError(
+                "backend construction requires either an owner-bound witness "
+                "authority or the explicit non-production witness mode"
+            )
+        if production and self.owner_bound_witness_authority is None:
+            raise ValueError(
+                "production backend construction requires an owner-bound "
+                "serialization receipt and its one-time authorization state"
+            )
         if (
             self.connection_factory.connection_mode
             in {"production_bwrap", "production_os_boundary"}
@@ -1156,27 +1290,20 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
             != self.connection_factory.authentication_boundary_state
         ):
             raise ValueError("control authority/connection factory substitution refused")
-        if self.session_store.trusted_witness_store is None:
+        if self.session_store.candidate_witness_store is None:
             raise ValueError(
-                "backend requires an externally anchored witness store"
+                "backend requires a bound candidate witness store"
             )
         self.model_binding_policy = canary_model_binding_policy(
             codex_executable_identity=(
                 self.connection_factory.codex_component_identity
             )
         )
-        self.verified_witness_receipt = (
-            self.session_store.trusted_witness_store.load_current_verified_receipt(
-                expected_policy=self.model_binding_policy,
-                expected_executable_identity=(
-                    self.connection_factory.codex_component_identity
-                ),
-            )
-        )
+        self.candidate_witness_receipt = self._bind_candidate_receipt()
         self.model_authority = canary_model_authority(
             model_binding_policy=self.model_binding_policy,
-            verified_witness_receipt=self.verified_witness_receipt,
-            trusted_witness_store=self.session_store.trusted_witness_store,
+            candidate_witness_receipt=self.candidate_witness_receipt,
+            candidate_witness_store=self.session_store.candidate_witness_store,
         )
         if dict(self.model_authority.codex_executable_identity) != dict(
             self.connection_factory.codex_component_identity
@@ -1223,9 +1350,10 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
                     "model_binding_policy_fingerprint": (
                         self.model_binding_policy.policy_fingerprint
                     ),
-                    "verified_serialization_witness_receipt_identity": (
-                        self.verified_witness_receipt.receipt_identity
+                    "candidate_serialization_witness_receipt_identity": (
+                        self.candidate_witness_receipt.receipt_identity
                     ),
+                    **self._owner_bound_dependent_authorities(),
                 },
             )
         )
@@ -1253,9 +1381,10 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
             "model_binding_policy_fingerprint": (
                 self.model_binding_policy.policy_fingerprint
             ),
-            "verified_serialization_witness_receipt_identity": (
-                self.verified_witness_receipt.receipt_identity
+            "candidate_serialization_witness_receipt_identity": (
+                self.candidate_witness_receipt.receipt_identity
             ),
+            **self._owner_bound_dependent_authorities(),
         }
         if (
             dict(self.os_boundary_authority.dependent_authorities)
@@ -1271,6 +1400,142 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
         if isinstance(self.controller, CapsuleBrokerClient):
             return dict(self.controller.docker_component_identity)
         return self.controller.docker_identity.to_dict()
+
+    @property
+    def owner_binding_state(self) -> str:
+        return (
+            "OWNER_BOUND"
+            if self.owner_bound_witness_authority is not None
+            else "NON_PRODUCTION_NO_OWNER_BINDING"
+        )
+
+    @property
+    def owner_bound_receipt_identity(self) -> str:
+        authority = self.owner_bound_witness_authority
+        if authority is None:
+            return "0" * 64
+        return authority.owner_bound_receipt.receipt_identity
+
+    def _owner_bound_dependent_authorities(self) -> dict[str, str]:
+        return {
+            "owner_binding_state": self.owner_binding_state,
+            "owner_bound_serialization_receipt_identity": (
+                self.owner_bound_receipt_identity
+            ),
+        }
+
+    def _bind_candidate_receipt(self):
+        """Bind the candidate receipt this backend may use, and only that one.
+
+        In production the receipt is named by the owner-bound receipt, is
+        reloaded from the store, and must equal the copy the owner authorized:
+        no caller-selected witness path exists.  In the explicitly
+        non-production mode the caller's candidate receipt is reloaded and must
+        still be the store's own current tail.
+        """
+
+        store = self.session_store.candidate_witness_store
+        expected_identity = self.connection_factory.codex_component_identity
+        authority = self.owner_bound_witness_authority
+        if authority is not None:
+            gate = self._revalidate_owner_binding()
+            owner_receipt = authority.owner_bound_receipt
+            bundle = store.load_candidate_evidence(
+                receipt_identity=owner_receipt.candidate_receipt_identity,
+                witness_run_identity=owner_receipt.candidate_witness_run_identity,
+                expected_policy=self.model_binding_policy,
+                expected_executable_identity=expected_identity,
+            )
+            if (
+                bundle.receipt.to_dict() != owner_receipt.candidate_witness_receipt()
+                or bundle.pack.to_dict() != owner_receipt.candidate_witness_pack()
+                or bundle.tail_identity != gate["candidate_store_tail_identity"]
+                or bundle.store_anchor_fingerprint
+                != owner_receipt.candidate_store_anchor_fingerprint
+            ):
+                raise OwnerAuthorizationError(
+                    "candidate witness evidence differs from the owner binding",
+                    classification="OWNER_CANDIDATE_EVIDENCE_CHANGED",
+                )
+            if (
+                owner_receipt.model_binding_policy_fingerprint
+                != self.model_binding_policy.policy_fingerprint
+            ):
+                raise OwnerAuthorizationError(
+                    "owner binding targets another model policy",
+                    classification="OWNER_BINDING_TARGETS_ANOTHER_POLICY",
+                )
+            return bundle.receipt
+        mode = self.non_production_witness_mode
+        supplied = mode.candidate_witness_receipt
+        bundle = store.load_current_candidate_evidence(
+            expected_policy=self.model_binding_policy,
+            expected_executable_identity=expected_identity,
+        )
+        if bundle.receipt.to_dict() != supplied.to_dict():
+            raise ValueError(
+                "non-production candidate receipt is not the store's current tail"
+            )
+        return bundle.receipt
+
+    def _revalidate_owner_binding(self) -> Mapping[str, Any]:
+        """Re-derive the owner binding before construction and before effects."""
+
+        authority = self.owner_bound_witness_authority
+        if authority is None:
+            if (
+                self.connection_factory.connection_mode
+                in PRODUCTION_CONNECTION_MODES
+            ):  # pragma: no cover - construction already refuses this
+                raise OwnerAuthorizationError(
+                    "production effects require an owner binding",
+                    classification="OWNER_BINDING_ABSENT",
+                )
+            return {}
+        gate = revalidate_owner_bound_receipt(
+            owner_bound_receipt=authority.owner_bound_receipt,
+            candidate_witness_store=self.session_store.candidate_witness_store,
+            authorization_state=authority.authorization_state,
+            preparation_root=authority.preparation_root,
+            retained_seal_identity=authority.retained_seal_identity,
+            expected_model_binding_policy=self.model_binding_policy,
+        )
+        classification = gate["classification"]
+        # An authorization consumed by *this* backend is the single launch it
+        # authorized, so later pre-effect gates in the same launch accept it.  An
+        # authorization already consumed before this backend existed is reuse.
+        acceptable = classification == OWNER_BOUND_READY_FOR_SINGLE_LAUNCH or (
+            classification == OWNER_AUTHORIZATION_CONSUMED
+            and self._authorization_consumed_here
+        )
+        if not acceptable:
+            raise OwnerAuthorizationError(
+                "this owner authorization is not ready for a single launch: "
+                f"{classification}",
+                classification="OWNER_AUTHORIZATION_ALREADY_CONSUMED",
+            )
+        return gate
+
+    def consume_owner_authorization_once(self) -> Mapping[str, Any]:
+        """Atomically consume the one-time authorization before the first effect."""
+
+        authority = self.owner_bound_witness_authority
+        if authority is None:
+            return {
+                "classification": "NON_PRODUCTION_NO_OWNER_AUTHORIZATION",
+                "consumed": False,
+            }
+        if self._authorization_consumed_here:
+            raise OwnerAuthorizationError(
+                "this owner authorization was already consumed",
+                classification="OWNER_AUTHORIZATION_ALREADY_CONSUMED",
+            )
+        self._revalidate_owner_binding()
+        record = authority.authorization_state.consume_once(
+            owner_bound_receipt=authority.owner_bound_receipt
+        )
+        object.__setattr__(self, "_authorization_consumed_here", True)
+        return {**dict(record), "consumed": True}
 
     def _attest_capsule_authority(self) -> None:
         if isinstance(self.controller, CapsuleBrokerClient):
@@ -1298,14 +1563,15 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
     def _revalidate_witness_binding(self) -> None:
         """Reload the current durable evidence pack before launch or effects."""
 
-        store = self.session_store.trusted_witness_store
+        store = self.session_store.candidate_witness_store
         if store is None:
             raise AppServerProtocolError(
-                "trusted serialization witness store is unavailable"
+                "the candidate serialization witness store is unavailable"
             )
-        receipt = store.load_verified_receipt(
-            receipt_identity=self.verified_witness_receipt.receipt_identity,
-            witness_run_identity=self.verified_witness_receipt.witness_run_identity,
+        self._revalidate_owner_binding()
+        receipt = store.load_candidate_receipt(
+            receipt_identity=self.candidate_witness_receipt.receipt_identity,
+            witness_run_identity=self.candidate_witness_receipt.witness_run_identity,
             expected_policy=self.model_binding_policy,
             expected_executable_identity=(
                 self.connection_factory.codex_component_identity
@@ -1313,14 +1579,14 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
         )
         rebound = canary_model_authority(
             model_binding_policy=self.model_binding_policy,
-            verified_witness_receipt=receipt,
-            trusted_witness_store=store,
+            candidate_witness_receipt=receipt,
+            candidate_witness_store=store,
         )
         if (
             receipt.receipt_identity
-            != self.verified_witness_receipt.receipt_identity
+            != self.candidate_witness_receipt.receipt_identity
             or receipt.witness_run_identity
-            != self.verified_witness_receipt.witness_run_identity
+            != self.candidate_witness_receipt.witness_run_identity
             or rebound.authority_fingerprint
             != self.model_authority.authority_fingerprint
             or not rebound.receipt_revalidated
@@ -1339,7 +1605,7 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
 
         self._revalidate_witness_binding()
         self.model_binding_policy.validated_canary()
-        self.model_authority.require_verified_receipt()
+        self.model_authority.require_revalidated_candidate_receipt()
         binding = self._effective_model_binding
         if binding is None:
             raise AppServerProtocolError(
@@ -1401,16 +1667,20 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
             != self.model_binding_policy.policy_fingerprint
             or dict(execution_authority.model_binding_policy)
             != self.model_binding_policy.to_dict()
-            or execution_authority.verified_witness_receipt_identity
-            != self.verified_witness_receipt.receipt_identity
-            or execution_authority.verified_witness_run_identity
-            != self.verified_witness_receipt.witness_run_identity
+            or execution_authority.candidate_witness_receipt_identity
+            != self.candidate_witness_receipt.receipt_identity
+            or execution_authority.candidate_witness_run_identity
+            != self.candidate_witness_receipt.witness_run_identity
             or execution_authority.mission_fingerprint
             != sha256_bytes(self._mission_bytes)
             or execution_authority.prompt_fingerprint
             != sha256_bytes(self._prompt_bytes)
             or execution_authority.os_boundary_authority_fingerprint
             != self.os_boundary_authority.authority_fingerprint
+            or execution_authority.owner_binding_state
+            != self.owner_binding_state
+            or execution_authority.owner_bound_receipt_identity
+            != self.owner_bound_receipt_identity
         ):
             raise ValueError("backend execution authority changed before launch")
 
@@ -1418,6 +1688,9 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
         self._revalidate_witness_binding()
         self._attest_control_binding()
         self._attest_capsule_authority()
+        # Step 7 of the authorized order: consume the one-time authorization
+        # after every deterministic local check and before the first effect.
+        self._authorization_consumption = self.consume_owner_authorization_once()
         token = uuid.uuid4().hex
         session_id = f"capsule-session-{token}"
         run_id = f"capsule-run-{uuid.uuid4().hex}"
@@ -1436,8 +1709,13 @@ class HostCodexAppServerCapsuleBackend(CapsuleBackend):
             docker_executable_identity=self._docker_component_identity(),
             dynamic_tools_schema_identity=fingerprint(dynamic_tools_grammar()),
             model_authority=self.model_authority,
-            verified_witness_receipt=self.verified_witness_receipt,
-            trusted_witness_store=self.session_store.trusted_witness_store,
+            candidate_witness_receipt=self.candidate_witness_receipt,
+            candidate_witness_store=self.session_store.candidate_witness_store,
+            owner_bound_receipt=(
+                None
+                if self.owner_bound_witness_authority is None
+                else self.owner_bound_witness_authority.owner_bound_receipt
+            ),
             protocol_request_policy_fingerprint=(
                 protocol_request_policy_fingerprint(self.model_authority)
             ),

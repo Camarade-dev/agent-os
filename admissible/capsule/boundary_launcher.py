@@ -146,7 +146,9 @@ def provider_free_os_boundary_authority(
                 "codex_protocol_schema_identity": "3" * 64,
                 "dynamic_tools_schema_identity": "4" * 64,
                 "model_binding_policy_fingerprint": "5" * 64,
-                "verified_serialization_witness_receipt_identity": "6" * 64,
+                "candidate_serialization_witness_receipt_identity": "6" * 64,
+                "owner_binding_state": "NON_PRODUCTION_NO_OWNER_BINDING",
+                "owner_bound_serialization_receipt_identity": "0" * 64,
             }
         ),
     )
@@ -394,7 +396,7 @@ class CodexConfinementLaunchPolicy:
         require_sha256(self.pin_fingerprint, "Codex destination pin")
         if self.model_authority is None:
             raise ValueError("Codex confinement requires an explicit model authority")
-        self.model_authority.validated().require_verified_receipt()
+        self.model_authority.validated().require_revalidated_candidate_receipt()
         if dict(self.model_authority.codex_executable_identity) != (
             self.codex_identity.to_dict()
         ):
@@ -551,11 +553,11 @@ class CodexConfinementLaunchPolicy:
                 "model_binding_policy_fingerprint": (
                     self.model_authority.model_binding_policy_fingerprint
                 ),
-                "verified_serialization_witness_receipt_identity": (
-                    self.model_authority.verified_witness_receipt_identity
+                "candidate_serialization_witness_receipt_identity": (
+                    self.model_authority.candidate_witness_receipt_identity
                 ),
-                "verified_serialization_witness_run_identity": (
-                    self.model_authority.verified_witness_run_identity
+                "candidate_serialization_witness_run_identity": (
+                    self.model_authority.candidate_witness_run_identity
                 ),
                 "configured_model": self.model_authority.configured_model,
                 "configured_reasoning_effort": (
@@ -895,7 +897,7 @@ class BoundaryLauncher:
             authority_fingerprint=self.authority.authority_fingerprint,
             configuration_bytes=(
                 model_authority.validated()
-                .require_verified_receipt()
+                .require_revalidated_candidate_receipt()
                 .ephemeral_config_bytes
             ),
         )

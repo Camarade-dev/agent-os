@@ -489,7 +489,7 @@ class CodexModelAuthority:
     """Immutable configuration authority, trusted only with a live receipt.
 
     ``create`` intentionally produces an isolated, non-launchable authority
-    for protocol/configuration analysis.  Only ``from_verified_receipt`` sets
+    for protocol/configuration analysis.  Only ``from_candidate_receipt`` sets
     the in-memory verified provenance bit, and serialized dictionaries never
     recreate that bit.  A backend must reload the receipt from its trusted
     store before accepting a deserialized authority.
@@ -571,36 +571,36 @@ class CodexModelAuthority:
             "protocol_schema_identity": protocol_schema_identity(),
             "model_binding_policy": policy.to_dict(),
             "model_binding_policy_fingerprint": policy.policy_fingerprint,
-            "verified_witness_receipt_identity": None,
-            "verified_witness_run_identity": None,
+            "candidate_witness_receipt_identity": None,
+            "candidate_witness_run_identity": None,
         }
         return cls(body, fingerprint(body)).validated()
 
     @classmethod
-    def from_verified_receipt(
+    def from_candidate_receipt(
         cls,
         *,
         policy: ModelBindingPolicy,
         receipt: Any,
-        trusted_witness_store: Any,
+        candidate_witness_store: Any,
     ) -> "CodexModelAuthority":
         """Derive the only launchable authority after reopening durable evidence."""
 
         from admissible.capsule.serialization_witness import (
-            TrustedSerializationWitnessStore,
-            VerifiedSerializationWitnessReceipt,
+            CandidateSerializationWitnessStore,
+            CandidateSerializationWitnessReceipt,
         )
 
-        if not isinstance(receipt, VerifiedSerializationWitnessReceipt):
+        if not isinstance(receipt, CandidateSerializationWitnessReceipt):
             raise ModelConfigurationError(
                 "model authority requires an opaque verified witness receipt"
             )
-        if not isinstance(trusted_witness_store, TrustedSerializationWitnessStore):
+        if not isinstance(candidate_witness_store, CandidateSerializationWitnessStore):
             raise ModelConfigurationError(
                 "model authority requires the trusted witness store"
             )
         policy.validated()
-        durable_receipt = trusted_witness_store.load_verified_receipt(
+        durable_receipt = candidate_witness_store.load_candidate_receipt(
             receipt_identity=receipt.receipt_identity,
             witness_run_identity=receipt.witness_run_identity,
             expected_policy=policy,
@@ -636,14 +636,14 @@ class CodexModelAuthority:
             "protocol_schema_identity": protocol_schema_identity(),
             "model_binding_policy": policy.to_dict(),
             "model_binding_policy_fingerprint": policy.policy_fingerprint,
-            "verified_witness_receipt_identity": receipt.receipt_identity,
-            "verified_witness_run_identity": receipt.witness_run_identity,
+            "candidate_witness_receipt_identity": receipt.receipt_identity,
+            "candidate_witness_run_identity": receipt.witness_run_identity,
         }
         return cls(
             body,
             fingerprint(body),
             receipt_revalidated=True,
-        ).validated().require_verified_receipt()
+        ).validated().require_revalidated_candidate_receipt()
 
     # -- accessors -------------------------------------------------------
 
@@ -713,23 +713,23 @@ class CodexModelAuthority:
         return self._body["model_binding_policy_fingerprint"]
 
     @property
-    def verified_witness_receipt_identity(self) -> str | None:
-        return self._body["verified_witness_receipt_identity"]
+    def candidate_witness_receipt_identity(self) -> str | None:
+        return self._body["candidate_witness_receipt_identity"]
 
     @property
-    def verified_witness_run_identity(self) -> str | None:
-        return self._body["verified_witness_run_identity"]
+    def candidate_witness_run_identity(self) -> str | None:
+        return self._body["candidate_witness_run_identity"]
 
     @property
     def receipt_revalidated(self) -> bool:
         return self._receipt_revalidated
 
-    def require_verified_receipt(self) -> "CodexModelAuthority":
+    def require_revalidated_candidate_receipt(self) -> "CodexModelAuthority":
         if (
             self._body["trust_state"] != "VERIFIED_DURABLE_WITNESS"
             or not self._receipt_revalidated
-            or self.verified_witness_receipt_identity is None
-            or self.verified_witness_run_identity is None
+            or self.candidate_witness_receipt_identity is None
+            or self.candidate_witness_run_identity is None
         ):
             raise ModelConfigurationError(
                 "model authority has no revalidated durable witness receipt"
@@ -752,8 +752,8 @@ class CodexModelAuthority:
                 "protocol_schema_identity",
                 "model_binding_policy",
                 "model_binding_policy_fingerprint",
-                "verified_witness_receipt_identity",
-                "verified_witness_run_identity",
+                "candidate_witness_receipt_identity",
+                "candidate_witness_run_identity",
             },
             "Codex model authority",
         )
@@ -824,21 +824,21 @@ class CodexModelAuthority:
             )
         if body["trust_state"] == "ISOLATED_UNAUTHORIZED":
             if (
-                body["verified_witness_receipt_identity"] is not None
-                or body["verified_witness_run_identity"] is not None
+                body["candidate_witness_receipt_identity"] is not None
+                or body["candidate_witness_run_identity"] is not None
             ):
                 raise ModelConfigurationError(
                     "isolated model authority asserted witness evidence"
                 )
         else:
             require_sha256(
-                body["verified_witness_receipt_identity"],
+                body["candidate_witness_receipt_identity"],
                 "verified witness receipt identity",
             )
             from admissible.capsule.common import require_identifier
 
             require_identifier(
-                body["verified_witness_run_identity"],
+                body["candidate_witness_run_identity"],
                 "verified witness run identity",
             )
         require_sha256(self._fingerprint, "Codex model authority fingerprint")
@@ -880,16 +880,16 @@ class CodexModelAuthority:
 def canary_model_authority(
     *,
     model_binding_policy: ModelBindingPolicy,
-    verified_witness_receipt: Any,
-    trusted_witness_store: Any,
+    candidate_witness_receipt: Any,
+    candidate_witness_store: Any,
 ) -> CodexModelAuthority:
     """Derive the exact canary authority from durable verified evidence."""
 
     model_binding_policy.validated_canary()
-    return CodexModelAuthority.from_verified_receipt(
+    return CodexModelAuthority.from_candidate_receipt(
         policy=model_binding_policy,
-        receipt=verified_witness_receipt,
-        trusted_witness_store=trusted_witness_store,
+        receipt=candidate_witness_receipt,
+        candidate_witness_store=candidate_witness_store,
     )
 
 

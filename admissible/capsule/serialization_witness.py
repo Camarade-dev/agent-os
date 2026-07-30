@@ -1,18 +1,32 @@
-"""Untrusted Codex request observations and anchored verified receipts.
+"""Untrusted Codex request observations and *candidate* witness evidence.
+
+Everything in this module is candidate evidence.  A store, its store anchor,
+its run anchors, its evidence packs, its receipts and its tail are all
+self-produced: an ordinary caller who can write a directory can build a
+completely fabricated but internally self-consistent store.  Nothing here is
+therefore production authority, and the naming says so.
 
 ``SerializationWitnessRecord`` is deliberately only an observation.  Its
 constructor is public because parsing captured request metadata is not a trust
 operation.  No model authority or backend accepts a record, its fingerprint,
 or the result of ``evaluate_serialization_witness`` as proof.
 
-The sole receipt-producing path is
-``TrustedSerializationWitnessStore.verify_canary``.  It creates an external
-run anchor before execution, runs the content-attested Codex executable in a
+``CandidateSerializationWitnessStore.record_candidate_witness`` creates a run
+anchor before execution, runs the content-attested Codex executable in a
 private routeless bubblewrap namespace, validates the minimal child
-observation, durably publishes and rereads the evidence pack, advances an
-external tail, and finally returns an opaque
-``VerifiedSerializationWitnessReceipt``.  Loading a receipt always reopens the
-anchored pack and revalidates every identity.
+observation, durably publishes and rereads the evidence pack, advances the
+store tail, and returns an opaque ``CandidateSerializationWitnessReceipt``
+alongside its ``CandidateSerializationWitnessPack``.  Loading a receipt always
+reopens the pack and revalidates every identity.
+
+None of that creates production authority.  The store cannot be its own trust
+root: an internally generated hash or nonce is not an external anchor.  The
+only production authority over this evidence is
+``OwnerBoundVerifiedSerializationReceipt`` in
+``admissible.capsule.owner_authorization``, which exists only after an owner
+phrase delivered on its dedicated descriptor verifies an external owner payload
+that canonically binds this store, this pack, this receipt, this tail, this
+model policy, this preparation root and this run.
 """
 
 from __future__ import annotations
@@ -26,6 +40,7 @@ import subprocess
 import sys
 import tempfile
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
@@ -60,21 +75,26 @@ if TYPE_CHECKING:
 SERIALIZATION_WITNESS_SCHEMA_VERSION = (
     "admissible_codex_provider_free_serialization_observation_v2"
 )
-VERIFIED_WITNESS_EVIDENCE_SCHEMA_VERSION = (
-    "admissible_codex_verified_serialization_evidence_pack_v1"
+CANDIDATE_WITNESS_EVIDENCE_SCHEMA_VERSION = (
+    "admissible_codex_candidate_serialization_evidence_pack_v2"
 )
-VERIFIED_WITNESS_RECEIPT_SCHEMA_VERSION = (
-    "admissible_codex_verified_serialization_receipt_v1"
+CANDIDATE_WITNESS_RECEIPT_SCHEMA_VERSION = (
+    "admissible_codex_candidate_serialization_receipt_v2"
 )
 WITNESS_STORE_ANCHOR_SCHEMA_VERSION = (
-    "admissible_codex_witness_store_anchor_v1"
+    "admissible_codex_candidate_witness_store_anchor_v2"
 )
-WITNESS_RUN_ANCHOR_SCHEMA_VERSION = "admissible_codex_witness_run_anchor_v1"
-WITNESS_STORE_TAIL_SCHEMA_VERSION = "admissible_codex_witness_store_tail_v1"
+WITNESS_RUN_ANCHOR_SCHEMA_VERSION = "admissible_codex_candidate_witness_run_anchor_v2"
+WITNESS_STORE_TAIL_SCHEMA_VERSION = "admissible_codex_candidate_witness_store_tail_v2"
 WITNESS_DURABILITY_RECEIPT_SCHEMA_VERSION = (
-    "admissible_codex_witness_durability_receipt_v1"
+    "admissible_codex_candidate_witness_durability_receipt_v2"
 )
 ZERO_FINGERPRINT = "0" * 64
+
+#: Every document this module writes carries this trust state.  It is the
+#: module's own statement that its contents are candidate evidence and that no
+#: production effect may be authorized by them alone.
+CANDIDATE_WITNESS_TRUST_STATE = "UNTRUSTED_CANDIDATE_REQUIRES_OWNER_BINDING"
 
 CAPTURED_FIELDS = (
     "request_path",
@@ -128,7 +148,7 @@ def witness_capture_policy() -> dict[str, Any]:
         "endpoint_policy_identity": SYNTHETIC_ENDPOINT_POLICY_IDENTITY,
         "public_dns_or_endpoint": False,
         "real_model_or_provider_execution": False,
-        "proves": "nothing_without_anchored_verified_receipt",
+        "proves": "nothing_without_owner_bound_serialization_receipt",
     }
 
 
@@ -143,12 +163,12 @@ def trusted_witness_verifier_identity() -> str:
 
     runtime = Path(__file__).with_name("serialization_witness_runtime.py")
     body = {
-        "schema_version": "admissible_codex_trusted_witness_verifier_v1",
+        "schema_version": "admissible_codex_candidate_witness_verifier_v2",
         "parent_source_sha256": sha256_bytes(Path(__file__).read_bytes()),
         "runtime_source_sha256": sha256_bytes(runtime.read_bytes()),
         "capture_policy_identity": serialization_witness_identity(),
         "endpoint_policy_identity": SYNTHETIC_ENDPOINT_POLICY_IDENTITY,
-        "receipt_schema_version": VERIFIED_WITNESS_RECEIPT_SCHEMA_VERSION,
+        "receipt_schema_version": CANDIDATE_WITNESS_RECEIPT_SCHEMA_VERSION,
     }
     return fingerprint(body)
 
@@ -289,14 +309,16 @@ def evaluate_serialization_witness(
         "configured_reasoning_effort": configured_effort,
         "observed_requests": len(records),
         "record_fingerprints": [record.record_fingerprint for record in records],
-        "verified_receipt": False,
+        "candidate_receipt": False,
+        "owner_bound_receipt": False,
     }
 
 
-_VERIFIED_CONSTRUCTION_TOKEN = object()
+_CANDIDATE_CONSTRUCTION_TOKEN = object()
 
 _RECEIPT_KEYS = {
     "schema_version",
+    "trust_state",
     "store_anchor_fingerprint",
     "run_anchor_fingerprint",
     "witness_run_identity",
@@ -336,6 +358,7 @@ _RECEIPT_KEYS = {
 
 _EVIDENCE_PACK_KEYS = {
     "schema_version",
+    "trust_state",
     "store_anchor_fingerprint",
     "run_anchor_fingerprint",
     "witness_run_identity",
@@ -520,24 +543,34 @@ def _durability_identity_from_receipt(value: Mapping[str, Any]) -> str:
     )
 
 
-class VerifiedSerializationWitnessReceipt:
-    """Opaque receipt returned only after durable evidence-pack revalidation."""
+class CandidateSerializationWitnessReceipt:
+    """Opaque *candidate* receipt reread from its own store's durable pack.
+
+    Holding one proves only that some store on this filesystem contains a
+    self-consistent pack, receipt and tail.  It never authorizes an effect: the
+    production pre-effect gate accepts only
+    ``OwnerBoundVerifiedSerializationReceipt``.
+    """
 
     __slots__ = ("_body",)
 
     def __init__(self, body: Mapping[str, Any], token: object):
-        if token is not _VERIFIED_CONSTRUCTION_TOKEN:
+        if token is not _CANDIDATE_CONSTRUCTION_TOKEN:
             raise SerializationWitnessError(
-                "verified receipts may only be loaded by the trusted store",
+                "candidate receipts may only be loaded by their store",
                 classification="UNTRUSTED_RECEIPT_CONSTRUCTION",
             )
         object.__setattr__(self, "_body", MappingProxyType(dict(body)))
 
     def __setattr__(self, name: str, value: Any) -> None:  # pragma: no cover
-        raise AttributeError("VerifiedSerializationWitnessReceipt is immutable")
+        raise AttributeError("CandidateSerializationWitnessReceipt is immutable")
 
     def __delattr__(self, name: str) -> None:  # pragma: no cover
-        raise AttributeError("VerifiedSerializationWitnessReceipt is immutable")
+        raise AttributeError("CandidateSerializationWitnessReceipt is immutable")
+
+    @property
+    def trust_state(self) -> str:
+        return self._body["trust_state"]
 
     @property
     def receipt_identity(self) -> str:
@@ -587,20 +620,176 @@ class VerifiedSerializationWitnessReceipt:
         return dict(self._body)
 
 
-def validate_verified_receipt_metadata(
+class CandidateSerializationWitnessPack:
+    """The complete durable evidence pack behind one candidate receipt.
+
+    The pack, not the receipt, carries the real-binary witness evidence: the
+    executable attestations taken before and after the confined run, the
+    namespace/network observation, the captured request and the terminal
+    result.  ``revalidated`` re-checks that evidence independently of any
+    receipt so the trusted authorization path never has to trust a summary.
+    """
+
+    __slots__ = ("_body",)
+
+    def __init__(self, body: Mapping[str, Any], token: object):
+        if token is not _CANDIDATE_CONSTRUCTION_TOKEN:
+            raise SerializationWitnessError(
+                "candidate evidence packs may only be loaded by their store",
+                classification="UNTRUSTED_PACK_CONSTRUCTION",
+            )
+        object.__setattr__(self, "_body", MappingProxyType(dict(body)))
+
+    def __setattr__(self, name: str, value: Any) -> None:  # pragma: no cover
+        raise AttributeError("CandidateSerializationWitnessPack is immutable")
+
+    def __delattr__(self, name: str) -> None:  # pragma: no cover
+        raise AttributeError("CandidateSerializationWitnessPack is immutable")
+
+    @property
+    def trust_state(self) -> str:
+        return self._body["trust_state"]
+
+    @property
+    def evidence_pack_fingerprint(self) -> str:
+        return self._body["evidence_pack_fingerprint"]
+
+    @property
+    def store_anchor_fingerprint(self) -> str:
+        return self._body["store_anchor_fingerprint"]
+
+    @property
+    def witness_run_identity(self) -> str:
+        return self._body["witness_run_identity"]
+
+    @property
+    def witness_run_nonce(self) -> str:
+        return self._body["witness_run_nonce"]
+
+    @property
+    def executable_identity(self) -> Mapping[str, Any]:
+        return dict(self._body["codex_executable_identity"])
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(self._body)
+
+    def revalidated(
+        self,
+        *,
+        expected_policy: "ModelBindingPolicy",
+        expected_executable_identity: Mapping[str, Any],
+    ) -> "CandidateSerializationWitnessPack":
+        """Independently re-check every real-binary witness claim in the pack."""
+
+        body = dict(self._body)
+        require_exact_keys(body, _EVIDENCE_PACK_KEYS, "candidate evidence pack")
+        if (
+            body["schema_version"] != CANDIDATE_WITNESS_EVIDENCE_SCHEMA_VERSION
+            or body["trust_state"] != CANDIDATE_WITNESS_TRUST_STATE
+        ):
+            raise SerializationWitnessError(
+                "candidate evidence pack does not declare candidate trust",
+                classification="WITNESS_EVIDENCE_CHANGED",
+            )
+        namespace_evidence = _validated_namespace_evidence(
+            body["namespace_network_evidence"]
+        )
+        _validated_terminal_result(body["witness_process_terminal_result"])
+        expected_identity = dict(expected_executable_identity)
+        for label in (
+            "codex_executable_identity",
+            "executable_stat_before",
+            "executable_stat_after",
+        ):
+            validate_component_identity_metadata(body[label], f"pack {label}")
+            if dict(body[label]) != expected_identity:
+                raise SerializationWitnessError(
+                    f"candidate pack {label} binds another executable",
+                    classification="WITNESS_EXECUTABLE_SUBSTITUTED",
+                )
+        if (
+            body["codex_executable_sha256"] != expected_identity.get("sha256")
+            or body["model_binding_policy_fingerprint"]
+            != expected_policy.policy_fingerprint
+            or body["witness_policy_identity"]
+            != expected_policy.witness_policy_identity
+            or body["trusted_witness_verifier_identity"]
+            != trusted_witness_verifier_identity()
+            or body["protocol_schema_identity"]
+            != expected_policy.protocol_schema_identity
+            or body["canonical_configuration_fingerprint"]
+            != expected_policy.configuration_fingerprint
+            or body["configured_model"] != expected_policy.configured_model
+            or body["configured_reasoning_effort"]
+            != expected_policy.configured_reasoning_effort
+            or body["thread_start_allow_provider_model_fallback"] is not False
+            or body["captured_request_path"]
+            != TRUSTED_WITNESS_EXACT_REQUEST_PATH
+            or body["captured_serialized_model"]
+            != expected_policy.configured_model
+            or body["captured_serialized_reasoning_effort"]
+            != expected_policy.configured_reasoning_effort
+            or body["effective_thread_start_model"]
+            != expected_policy.configured_model
+            or body["effective_thread_start_reasoning_effort"]
+            != expected_policy.configured_reasoning_effort
+            or body["captured_request_evidence_fingerprint"]
+            != _captured_request_fingerprint(body)
+            or body["namespace_network_witness_identity"]
+            != fingerprint(namespace_evidence)
+            or body["synthetic_endpoint_policy_identity"]
+            != SYNTHETIC_ENDPOINT_POLICY_IDENTITY
+            or body["no_public_route_proven"] is not True
+            or body["no_resolver_proven"] is not True
+        ):
+            raise SerializationWitnessError(
+                "candidate pack real-binary evidence differs from its policy",
+                classification="WITNESS_EVIDENCE_CHANGED",
+            )
+        pack_body = {
+            key: item
+            for key, item in body.items()
+            if key != "evidence_pack_fingerprint"
+        }
+        if fingerprint(pack_body) != body["evidence_pack_fingerprint"]:
+            raise SerializationWitnessError(
+                "candidate pack fingerprint mismatch",
+                classification="WITNESS_EVIDENCE_CHANGED",
+            )
+        return self
+
+
+@dataclass(frozen=True)
+class CandidateEvidenceBundle:
+    """One store's revalidated receipt, pack, anchor, tail and root identity.
+
+    The trusted authorization path needs all five together: a receipt alone
+    cannot say which store produced it, and a store alone cannot say which tail
+    an owner authorized.
+    """
+
+    receipt: CandidateSerializationWitnessReceipt
+    pack: CandidateSerializationWitnessPack
+    store_anchor_fingerprint: str
+    tail_identity: str
+    store_root_identity: Mapping[str, Any]
+
+
+def validate_candidate_receipt_metadata(
     value: Mapping[str, Any],
     *,
     expected_policy: "ModelBindingPolicy",
     expected_executable_identity: Mapping[str, Any],
 ) -> Mapping[str, Any]:
-    """Structural check only; this never restores verified receipt provenance."""
+    """Structural check only; this never restores candidate receipt provenance."""
 
     if not isinstance(value, Mapping):
-        raise SerializationWitnessError("verified receipt metadata is not an object")
-    require_exact_keys(value, _RECEIPT_KEYS, "verified witness receipt")
+        raise SerializationWitnessError("candidate receipt metadata is not an object")
+    require_exact_keys(value, _RECEIPT_KEYS, "candidate witness receipt")
     body = {key: item for key, item in value.items() if key != "receipt_identity"}
     if (
-        value.get("schema_version") != VERIFIED_WITNESS_RECEIPT_SCHEMA_VERSION
+        value.get("schema_version") != CANDIDATE_WITNESS_RECEIPT_SCHEMA_VERSION
+        or value.get("trust_state") != CANDIDATE_WITNESS_TRUST_STATE
         or not isinstance(value.get("receipt_identity"), str)
         or fingerprint(body) != value.get("receipt_identity")
         or value.get("model_binding_policy_fingerprint")
@@ -643,7 +832,7 @@ def validate_verified_receipt_metadata(
         != _durability_identity_from_receipt(value)
     ):
         raise SerializationWitnessError(
-            "verified receipt metadata differs from its policy",
+            "candidate receipt metadata differs from its policy",
             classification="WITNESS_RECEIPT_INVALID",
         )
     for key in (
@@ -665,19 +854,19 @@ def validate_verified_receipt_metadata(
         "complete_witness_evidence_pack_fingerprint",
         "durable_evidence_receipt_identity",
     ):
-        require_sha256(value.get(key), f"verified receipt {key}")
+        require_sha256(value.get(key), f"candidate receipt {key}")
     require_identifier(
-        value.get("witness_run_identity"), "verified receipt witness run"
+        value.get("witness_run_identity"), "candidate receipt witness run"
     )
     require_strict_int(
         value.get("sequence"),
-        "verified receipt sequence",
+        "candidate receipt sequence",
         minimum=1,
         maximum=1_000_000,
     )
     require_strict_int(
         value.get("evidence_pack_size"),
-        "verified receipt evidence-pack size",
+        "candidate receipt evidence-pack size",
         minimum=1,
         maximum=64 * 1024 * 1024,
     )
@@ -688,12 +877,12 @@ def validate_verified_receipt_metadata(
         or "?" in path
     ):
         raise SerializationWitnessError(
-            "verified receipt captured an unauthorized request path"
+            "candidate receipt captured an unauthorized request path"
         )
     _validated_terminal_result(value["witness_process_terminal_result"])
     validate_component_identity_metadata(
         value["codex_executable_identity"],
-        "verified receipt Codex executable",
+        "candidate receipt Codex executable",
     )
     denied = {
         "prompt",
@@ -705,7 +894,7 @@ def validate_verified_receipt_metadata(
         "response_body",
     }
     if denied & set(value):
-        raise SerializationWitnessError("verified receipt contains denied material")
+        raise SerializationWitnessError("candidate receipt contains denied material")
     return dict(value)
 
 
@@ -724,8 +913,14 @@ def _reject_symlink_components(path: Path, label: str) -> None:
             )
 
 
-class TrustedSerializationWitnessStore:
-    """Externally anchored, path-bound, single-writer witness evidence store."""
+class CandidateSerializationWitnessStore:
+    """Path-bound, single-writer store of *candidate* witness evidence.
+
+    The store creates its own store anchor, so creating one -- or creating a
+    self-consistent pack, receipt and tail inside one -- proves nothing.  The
+    anchor exists to detect copying, moving and tail rewinding within a store,
+    not to establish that the store deserves trust.
+    """
 
     def __init__(
         self,
@@ -823,6 +1018,7 @@ class TrustedSerializationWitnessStore:
         if not self._store_anchor_path.exists():
             body = {
                 "schema_version": WITNESS_STORE_ANCHOR_SCHEMA_VERSION,
+                "trust_state": CANDIDATE_WITNESS_TRUST_STATE,
                 "store_root_identity": self._root_identity(),
                 "trusted_anchor_root_identity": (
                     self._anchor_root_identity()
@@ -864,6 +1060,7 @@ class TrustedSerializationWitnessStore:
             value,
             {
                 "schema_version",
+                "trust_state",
                 "store_root_identity",
                 "trusted_anchor_root_identity",
                 "store_nonce",
@@ -873,8 +1070,14 @@ class TrustedSerializationWitnessStore:
             },
             "trusted witness-store anchor",
         )
-        if value["schema_version"] != WITNESS_STORE_ANCHOR_SCHEMA_VERSION:
-            raise SerializationWitnessError("unsupported witness-store anchor")
+        if (
+            value["schema_version"] != WITNESS_STORE_ANCHOR_SCHEMA_VERSION
+            or value["trust_state"] != CANDIDATE_WITNESS_TRUST_STATE
+        ):
+            raise SerializationWitnessError(
+                "candidate witness-store anchor is unsupported or claims trust",
+                classification="WITNESS_STORE_ANCHOR_INVALID",
+            )
         if value["store_root_identity"] != self._root_identity():
             raise SerializationWitnessError(
                 "witness store was copied or moved",
@@ -902,11 +1105,15 @@ class TrustedSerializationWitnessStore:
         return value
 
     def anchor_reference(self) -> Mapping[str, Any]:
-        """Public path-bound reference suitable for a trusted session anchor."""
+        """Public path-bound reference to this candidate store.
+
+        A reference identifies which store a session is talking to.  It confers
+        no trust on that store's contents.
+        """
 
         anchor = self._read_store_anchor()
         body = {
-            "schema_version": "admissible_codex_witness_store_reference_v1",
+            "schema_version": "admissible_codex_candidate_witness_store_reference_v2",
             "canonical_root": os.fspath(self.root.resolve()),
             "canonical_trusted_anchor_root": os.fspath(
                 self.trusted_anchor_root.resolve()
@@ -938,6 +1145,7 @@ class TrustedSerializationWitnessStore:
             value,
             {
                 "schema_version",
+                "trust_state",
                 "store_anchor_fingerprint",
                 "sequence",
                 "witness_run_identity",
@@ -948,8 +1156,13 @@ class TrustedSerializationWitnessStore:
             },
             "trusted witness-store tail",
         )
-        if value["schema_version"] != WITNESS_STORE_TAIL_SCHEMA_VERSION:
-            raise SerializationWitnessError("unsupported witness-store tail")
+        if (
+            value["schema_version"] != WITNESS_STORE_TAIL_SCHEMA_VERSION
+            or value["trust_state"] != CANDIDATE_WITNESS_TRUST_STATE
+        ):
+            raise SerializationWitnessError(
+                "candidate witness-store tail is unsupported or claims trust"
+            )
         anchor = self._read_store_anchor()
         if value["store_anchor_fingerprint"] != anchor["store_anchor_fingerprint"]:
             raise SerializationWitnessError("witness tail belongs to another store")
@@ -982,6 +1195,7 @@ class TrustedSerializationWitnessStore:
         store_anchor = self._read_store_anchor()
         body = {
             "schema_version": WITNESS_RUN_ANCHOR_SCHEMA_VERSION,
+            "trust_state": CANDIDATE_WITNESS_TRUST_STATE,
             "store_anchor_fingerprint": store_anchor["store_anchor_fingerprint"],
             "witness_run_identity": run_identity,
             "witness_run_nonce": run_nonce,
@@ -1247,13 +1461,19 @@ class TrustedSerializationWitnessStore:
         _validated_terminal_result(observation["process_terminal"])
         return observation
 
-    def verify_canary(
+    def record_candidate_witness(
         self,
         *,
         policy: "ModelBindingPolicy",
         codex_executable: Path,
-    ) -> VerifiedSerializationWitnessReceipt:
-        """Execute, persist, reread, and return one current verified receipt."""
+    ) -> CandidateSerializationWitnessReceipt:
+        """Execute, persist and reread one *candidate* witness receipt.
+
+        Success here means the pinned executable really ran and really
+        serialized the sealed tuple to a routeless loopback endpoint.  It does
+        not make the result authoritative: an owner must still bind this exact
+        store, pack, receipt and tail before any production effect.
+        """
 
         policy.validated_canary()
         before = ExecutableFileIdentity.attest(
@@ -1309,7 +1529,8 @@ class TrustedSerializationWitnessStore:
             _validated_namespace_evidence(namespace_evidence)
             namespace_identity = fingerprint(namespace_evidence)
             evidence_body = {
-                "schema_version": VERIFIED_WITNESS_EVIDENCE_SCHEMA_VERSION,
+                "schema_version": CANDIDATE_WITNESS_EVIDENCE_SCHEMA_VERSION,
+                "trust_state": CANDIDATE_WITNESS_TRUST_STATE,
                 "store_anchor_fingerprint": run_anchor["store_anchor_fingerprint"],
                 "run_anchor_fingerprint": run_anchor["run_anchor_fingerprint"],
                 "witness_run_identity": run_identity,
@@ -1381,7 +1602,8 @@ class TrustedSerializationWitnessStore:
             }
             durability_identity = fingerprint(durability_body)
             receipt_body = {
-                "schema_version": VERIFIED_WITNESS_RECEIPT_SCHEMA_VERSION,
+                "schema_version": CANDIDATE_WITNESS_RECEIPT_SCHEMA_VERSION,
+                "trust_state": CANDIDATE_WITNESS_TRUST_STATE,
                 "store_anchor_fingerprint": run_anchor["store_anchor_fingerprint"],
                 "run_anchor_fingerprint": run_anchor["run_anchor_fingerprint"],
                 "witness_run_identity": run_identity,
@@ -1441,6 +1663,7 @@ class TrustedSerializationWitnessStore:
             )
             tail_body = {
                 "schema_version": WITNESS_STORE_TAIL_SCHEMA_VERSION,
+                "trust_state": CANDIDATE_WITNESS_TRUST_STATE,
                 "store_anchor_fingerprint": run_anchor["store_anchor_fingerprint"],
                 "sequence": sequence,
                 "witness_run_identity": run_identity,
@@ -1455,26 +1678,26 @@ class TrustedSerializationWitnessStore:
                 {**tail_body, "tail_identity": fingerprint(tail_body)},
                 mode=0o600,
             )
-            return self.load_verified_receipt(
+            return self.load_candidate_receipt(
                 receipt_identity=receipt["receipt_identity"],
                 witness_run_identity=run_identity,
                 expected_policy=policy,
                 expected_executable_identity=before.to_dict(),
             )
 
-    def load_verified_receipt(
+    def load_candidate_evidence(
         self,
         *,
         receipt_identity: str,
         witness_run_identity: str,
         expected_policy: "ModelBindingPolicy",
         expected_executable_identity: Mapping[str, Any],
-    ) -> VerifiedSerializationWitnessReceipt:
+    ) -> "CandidateEvidenceBundle":
         """Reopen and revalidate the current receipt and its exact durable pack."""
 
         expected_policy.validated()
-        require_sha256(receipt_identity, "verified witness receipt identity")
-        require_identifier(witness_run_identity, "verified witness run identity")
+        require_sha256(receipt_identity, "candidate witness receipt identity")
+        require_identifier(witness_run_identity, "candidate witness run identity")
         store_anchor = self._read_store_anchor()
         tail = self._read_tail()
         if tail is None:
@@ -1497,17 +1720,18 @@ class TrustedSerializationWitnessStore:
                 anchor_path.read_bytes(), label="trusted witness-run anchor"
             )
             receipt = strict_json_loads(
-                receipt_path.read_bytes(), label="verified witness receipt"
+                receipt_path.read_bytes(), label="candidate witness receipt"
             )
         except (FileNotFoundError, ValueError) as error:
             raise SerializationWitnessError(
-                "verified witness anchor or receipt is missing",
+                "candidate witness anchor or receipt is missing",
                 classification="WITNESS_EVIDENCE_MISSING",
             ) from error
         require_exact_keys(
             run_anchor,
             {
                 "schema_version",
+                "trust_state",
                 "store_anchor_fingerprint",
                 "witness_run_identity",
                 "witness_run_nonce",
@@ -1552,6 +1776,7 @@ class TrustedSerializationWitnessStore:
         )
         if (
             run_anchor["schema_version"] != WITNESS_RUN_ANCHOR_SCHEMA_VERSION
+            or run_anchor["trust_state"] != CANDIDATE_WITNESS_TRUST_STATE
             or run_anchor["store_anchor_fingerprint"]
             != store_anchor["store_anchor_fingerprint"]
             or run_anchor["witness_run_identity"] != witness_run_identity
@@ -1574,8 +1799,8 @@ class TrustedSerializationWitnessStore:
                 classification="WITNESS_RUN_ANCHOR_INVALID",
             )
         if not isinstance(receipt, Mapping):
-            raise SerializationWitnessError("verified receipt is not an object")
-        receipt = validate_verified_receipt_metadata(
+            raise SerializationWitnessError("candidate receipt is not an object")
+        receipt = validate_candidate_receipt_metadata(
             receipt,
             expected_policy=expected_policy,
             expected_executable_identity=expected_executable_identity,
@@ -1584,7 +1809,7 @@ class TrustedSerializationWitnessStore:
             key: item for key, item in receipt.items() if key != "receipt_identity"
         }
         if (
-            receipt.get("schema_version") != VERIFIED_WITNESS_RECEIPT_SCHEMA_VERSION
+            receipt.get("schema_version") != CANDIDATE_WITNESS_RECEIPT_SCHEMA_VERSION
             or receipt.get("receipt_identity") != receipt_identity
             or fingerprint(receipt_body) != receipt_identity
             or receipt.get("store_anchor_fingerprint")
@@ -1624,7 +1849,7 @@ class TrustedSerializationWitnessStore:
             != receipt.get("evidence_pack_fingerprint")
         ):
             raise SerializationWitnessError(
-                "verified receipt differs from its trusted bindings",
+                "candidate receipt differs from its recorded bindings",
                 classification="WITNESS_RECEIPT_INVALID",
             )
         relative_pack = receipt.get("evidence_pack_relative_path")
@@ -1710,7 +1935,7 @@ class TrustedSerializationWitnessStore:
             if key != "evidence_pack_fingerprint"
         }
         if (
-            pack.get("schema_version") != VERIFIED_WITNESS_EVIDENCE_SCHEMA_VERSION
+            pack.get("schema_version") != CANDIDATE_WITNESS_EVIDENCE_SCHEMA_VERSION
             or pack.get("evidence_pack_fingerprint")
             != receipt.get("evidence_pack_fingerprint")
             or fingerprint(pack_body) != pack.get("evidence_pack_fingerprint")
@@ -1781,30 +2006,87 @@ class TrustedSerializationWitnessStore:
             != pack["evidence_pack_fingerprint"]
         ):
             raise SerializationWitnessError(
-                "external tail differs from the evidence pack",
+                "store tail differs from the evidence pack",
                 classification="WITNESS_TAIL_SUBSTITUTED",
             )
-        return VerifiedSerializationWitnessReceipt(
-            receipt, _VERIFIED_CONSTRUCTION_TOKEN
+        typed_pack = CandidateSerializationWitnessPack(
+            pack, _CANDIDATE_CONSTRUCTION_TOKEN
+        ).revalidated(
+            expected_policy=expected_policy,
+            expected_executable_identity=expected_executable_identity,
+        )
+        return CandidateEvidenceBundle(
+            receipt=CandidateSerializationWitnessReceipt(
+                receipt, _CANDIDATE_CONSTRUCTION_TOKEN
+            ),
+            pack=typed_pack,
+            store_anchor_fingerprint=store_anchor["store_anchor_fingerprint"],
+            tail_identity=tail["tail_identity"],
+            store_root_identity=MappingProxyType(self._root_identity()),
         )
 
-    def load_current_verified_receipt(
+    def load_candidate_receipt(
+        self,
+        *,
+        receipt_identity: str,
+        witness_run_identity: str,
+        expected_policy: "ModelBindingPolicy",
+        expected_executable_identity: Mapping[str, Any],
+    ) -> CandidateSerializationWitnessReceipt:
+        """Return only the candidate receipt half of the revalidated bundle."""
+
+        return self.load_candidate_evidence(
+            receipt_identity=receipt_identity,
+            witness_run_identity=witness_run_identity,
+            expected_policy=expected_policy,
+            expected_executable_identity=expected_executable_identity,
+        ).receipt
+
+    def current_tail_identity(self) -> str | None:
+        """Return the current candidate tail identity, or ``None`` if absent."""
+
+        tail = self._read_tail()
+        return None if tail is None else tail["tail_identity"]
+
+    def store_root_identity(self) -> Mapping[str, Any]:
+        """Return the live path/device/inode identity of this candidate root."""
+
+        return MappingProxyType(self._root_identity())
+
+    def load_current_candidate_evidence(
         self,
         *,
         expected_policy: "ModelBindingPolicy",
         expected_executable_identity: Mapping[str, Any],
-    ) -> VerifiedSerializationWitnessReceipt:
-        """Load the externally anchored current receipt without caller IDs."""
+    ) -> "CandidateEvidenceBundle":
+        """Load the current candidate bundle named by this store's own tail."""
 
         tail = self._read_tail()
         if tail is None:
             raise SerializationWitnessError(
-                "no verified witness receipt is anchored",
+                "no candidate witness receipt is recorded",
                 classification="WITNESS_EVIDENCE_MISSING",
             )
-        return self.load_verified_receipt(
+        return self.load_candidate_evidence(
             receipt_identity=tail["receipt_identity"],
             witness_run_identity=tail["witness_run_identity"],
             expected_policy=expected_policy,
             expected_executable_identity=expected_executable_identity,
         )
+
+    def load_current_candidate_receipt(
+        self,
+        *,
+        expected_policy: "ModelBindingPolicy",
+        expected_executable_identity: Mapping[str, Any],
+    ) -> CandidateSerializationWitnessReceipt:
+        """Load the current candidate receipt named by this store's own tail.
+
+        The caller selects nothing and the store confirms nothing external.
+        This is candidate evidence, never production authority.
+        """
+
+        return self.load_current_candidate_evidence(
+            expected_policy=expected_policy,
+            expected_executable_identity=expected_executable_identity,
+        ).receipt

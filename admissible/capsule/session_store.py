@@ -567,7 +567,7 @@ class DurableCapsuleSessionStore:
         root: Path,
         *,
         trusted_anchor_root: Path | None = None,
-        trusted_witness_store: Any | None = None,
+        candidate_witness_store: Any | None = None,
     ):
         if not root.is_absolute() or ".." in root.parts:
             raise ValueError("session journal root must be absolute without '..'")
@@ -606,20 +606,20 @@ class DurableCapsuleSessionStore:
         self._witness_store_reference_path = (
             self.trusted_anchor_root / "codex-witness-store-reference.json"
         )
-        self.trusted_witness_store = self._bind_trusted_witness_store(
-            trusted_witness_store
+        self.candidate_witness_store = self._bind_trusted_witness_store(
+            candidate_witness_store
         )
 
     def _bind_trusted_witness_store(self, supplied: Any | None):
         """Seal or reload the witness-store reference outside mutable logs."""
 
         from admissible.capsule.serialization_witness import (
-            TrustedSerializationWitnessStore,
+            CandidateSerializationWitnessStore,
             trusted_witness_verifier_identity,
         )
 
         if supplied is not None and not isinstance(
-            supplied, TrustedSerializationWitnessStore
+            supplied, CandidateSerializationWitnessStore
         ):
             raise ValueError("trusted witness store has the wrong type")
         if supplied is not None:
@@ -675,13 +675,13 @@ class DurableCapsuleSessionStore:
         }
         if (
             reference["schema_version"]
-            != "admissible_codex_witness_store_reference_v1"
+            != "admissible_codex_candidate_witness_store_reference_v2"
             or fingerprint(body) != reference["reference_identity"]
             or reference["trusted_verifier_identity"]
             != trusted_witness_verifier_identity()
         ):
             raise ValueError("trusted witness-store reference is invalid")
-        candidate = TrustedSerializationWitnessStore(
+        candidate = CandidateSerializationWitnessStore(
             Path(reference["canonical_root"]),
             trusted_anchor_root=Path(
                 reference["canonical_trusted_anchor_root"]
