@@ -298,7 +298,10 @@ def owner_authorization_digest(*, phrase: str, payload_bytes: bytes) -> str:
 # The external owner payload
 # ---------------------------------------------------------------------------
 
-_PAYLOAD_KEYS = frozenset(
+#: Authoritative closed-world top-level field set for an owner payload.
+#: Provisioning and payload validation must import this frozenset rather than
+#: duplicating the allowed names in documentation or call sites.
+OWNER_AUTHORIZATION_PAYLOAD_KEYS = frozenset(
     {
         "schema_version",
         "digest_construction",
@@ -332,6 +335,7 @@ _PAYLOAD_KEYS = frozenset(
         "zero_retry_policy",
     }
 )
+_PAYLOAD_KEYS = OWNER_AUTHORIZATION_PAYLOAD_KEYS
 
 
 @dataclass(frozen=True)

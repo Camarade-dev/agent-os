@@ -65,6 +65,21 @@ from admissible.capsule.execution_authority import validate_component_identity_m
 MODEL_AUTHORITY_SCHEMA_VERSION = "admissible_codex_model_authority_v2"
 MODEL_CONFIGURATION_SCHEMA_VERSION = "admissible_codex_model_configuration_v1"
 MODEL_BINDING_POLICY_SCHEMA_VERSION = "admissible_codex_model_binding_policy_v1"
+MODEL_BINDING_POLICY_BODY_KEYS = frozenset(
+    {
+        "schema_version",
+        "policy_kind",
+        "configured_model",
+        "configured_reasoning_effort",
+        "allow_provider_model_fallback",
+        "codex_version",
+        "codex_executable_identity",
+        "protocol_schema_identity",
+        "canonical_configuration_fingerprint",
+        "serialization_witness_policy_identity",
+        "trusted_witness_verifier_identity",
+    }
+)
 CANARY_MODEL_BINDING_POLICY_KIND = "chatgpt_codex_canary_gpt_5_3_low_v1"
 ISOLATED_MODEL_BINDING_POLICY_KIND = "isolated_untrusted_model_binding_v1"
 
@@ -376,19 +391,7 @@ class ModelBindingPolicy:
 
         require_exact_keys(
             self._body,
-            {
-                "schema_version",
-                "policy_kind",
-                "configured_model",
-                "configured_reasoning_effort",
-                "allow_provider_model_fallback",
-                "codex_version",
-                "codex_executable_identity",
-                "protocol_schema_identity",
-                "canonical_configuration_fingerprint",
-                "serialization_witness_policy_identity",
-                "trusted_witness_verifier_identity",
-            },
+            set(MODEL_BINDING_POLICY_BODY_KEYS),
             "model-binding policy",
         )
         if self._body["schema_version"] != MODEL_BINDING_POLICY_SCHEMA_VERSION:

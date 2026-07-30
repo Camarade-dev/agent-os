@@ -29,8 +29,11 @@ from admissible.capsule.common import (
     canonical_bytes,
     fingerprint,
     require_identifier,
+    require_sha256,
+    require_strict_int,
     strict_json_loads,
 )
+from admissible.capsule.model_authority import MODEL_BINDING_POLICY_BODY_KEYS
 from admissible.capsule.owner_authority.installation import (
     OwnerAuthorityInstallation,
     attest_production_installation,
@@ -49,6 +52,10 @@ from admissible.capsule.owner_authority.records import (
     new_authorization_record_id,
 )
 from admissible.capsule.owner_authority.state import AuthorizationStateDirectory
+from admissible.capsule.owner_authorization import (
+    OWNER_AUTHORIZATION_PAYLOAD_KEYS,
+    zero_retry_policy,
+)
 
 OWNER_PHRASE_MAX_BYTES = 4096
 OWNER_PHRASE_MIN_BYTES = 8
@@ -58,6 +65,50 @@ OWNER_PHRASE_DESCRIPTOR_ENV = "ADMISSIBLE_OWNER_AUTHORITY_PHRASE_FD"
 
 #: The prompt ``systemd-ask-password`` shows the owner.  Never the phrase.
 ASK_PASSWORD_PROMPT = "Owner authorization phrase:"
+
+#: Nested structured authorities that may appear in an owner payload.  Allowed
+#: keys come from the authoritative schemas; unexpected keys are refused with a
+#: bounded reason that does not echo attacker-controlled contents.
+_MODEL_BINDING_POLICY_ALLOWED_KEYS = MODEL_BINDING_POLICY_BODY_KEYS | {
+    # Present when the authoritative policy is serialized via ``to_dict()``.
+    "policy_fingerprint",
+}
+_ZERO_RETRY_POLICY_KEYS = frozenset(zero_retry_policy())
+_PREPARATION_ROOT_IDENTITY_KEYS = frozenset(
+    {
+        "schema_version",
+        "canonical_path_sha256",
+        "device",
+        "inode",
+        "root_mode",
+        "root_type",
+        "preparation_id",
+        "run_id",
+    }
+)
+_STORE_ROOT_IDENTITY_KEYS = frozenset(
+    {"canonical_path_sha256", "device", "inode", "mode"}
+)
+_COMPONENT_IDENTITY_KEYS = frozenset(
+    {
+        # ExecutableFileIdentity / file-identity schema
+        "schema_version",
+        "canonical_path",
+        "sha256",
+        "device",
+        "inode",
+        "mode",
+        "size",
+        "mtime_ns",
+        "identity_fingerprint",
+        # source-attested and synthetic component identities
+        "kind",
+        "component",
+        "source_sha256",
+        "fixture_fingerprint",
+        "provider_request_capable",
+    }
+)
 
 
 class OwnerAuthorityProvisioningError(OwnerAuthorityError):
@@ -70,6 +121,154 @@ class OwnerAuthorityProvisioningError(OwnerAuthorityError):
         classification: str = "OWNER_AUTHORITY_PROVISIONING_REFUSED",
     ):
         super().__init__(detail, classification=classification)
+
+
+def _payload_error(detail: str) -> OwnerAuthorityProvisioningError:
+    return OwnerAuthorityProvisioningError(
+        detail,
+        classification="OWNER_AUTHORITY_PAYLOAD_REFUSED",
+    )
+
+
+def _refuse_payload(detail: str) -> None:
+    raise _payload_error(detail)
+
+
+def _refuse_unexpected_fields(label: str) -> None:
+    """Bounded refusal that does not echo attacker-controlled field names."""
+
+    _refuse_payload(f"{label} contains unexpected fields")
+
+
+def _require_closed_object_keys(
+    value: Any,
+    allowed: frozenset[str],
+    *,
+    label: str,
+    exact: bool = False,
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        _refuse_payload(f"{label} must be an object")
+    keys = set(value)
+    if exact:
+        if keys != set(allowed):
+            _refuse_unexpected_fields(label)
+    elif not keys.issubset(allowed):
+        _refuse_unexpected_fields(label)
+    return value
+
+
+def validate_closed_world_owner_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Reject unknown top-level and nested authority fields before any use.
+
+    Allowed top-level names are exactly
+    :data:`OWNER_AUTHORIZATION_PAYLOAD_KEYS`.  Nested structured authorities
+    (model binding, budgets, zero-retry policy, repository/store/component
+    identities) refuse unexpected keys.  Booleans are not accepted where
+    integers are required.  The refusal reason is bounded and does not echo
+    attacker-controlled payload contents.
+    """
+
+    if not isinstance(payload, Mapping):
+        _refuse_payload("owner payload is not an object")
+    body = dict(payload)
+    if "payload_fingerprint" in body:
+        # Fingerprint is a wrapper, never an authority field.
+        body.pop("payload_fingerprint")
+    unknown = set(body) - set(OWNER_AUTHORIZATION_PAYLOAD_KEYS)
+    if unknown:
+        _refuse_unexpected_fields("owner payload")
+
+    policy = body.get("model_binding_policy")
+    if policy is not None:
+        closed_policy = _require_closed_object_keys(
+            policy,
+            _MODEL_BINDING_POLICY_ALLOWED_KEYS,
+            label="owner payload model binding policy",
+        )
+        nested_executable = closed_policy.get("codex_executable_identity")
+        if nested_executable is not None:
+            _require_closed_object_keys(
+                nested_executable,
+                _COMPONENT_IDENTITY_KEYS,
+                label="owner payload model binding policy codex executable",
+                exact=False,
+            )
+
+    budgets = body.get("budgets")
+    if budgets is not None:
+        if not isinstance(budgets, Mapping) or not budgets:
+            _refuse_payload("owner payload budgets must be a non-empty object")
+        for name, limit in budgets.items():
+            try:
+                require_identifier(name, "owner payload budget name")
+                require_strict_int(
+                    limit,
+                    "owner payload budget limit",
+                    minimum=0,
+                    maximum=2**62,
+                )
+            except ValueError as error:
+                raise _payload_error(
+                    "owner payload budgets contain an invalid name or limit"
+                ) from error
+
+    zero_retry = body.get("zero_retry_policy")
+    if zero_retry is not None:
+        _require_closed_object_keys(
+            zero_retry,
+            _ZERO_RETRY_POLICY_KEYS,
+            label="owner payload zero-retry policy",
+            exact=True,
+        )
+
+    for key, allowed, exact in (
+        ("preparation_root_identity", _PREPARATION_ROOT_IDENTITY_KEYS, True),
+        ("candidate_store_root_identity", _STORE_ROOT_IDENTITY_KEYS, True),
+        ("codex_executable_identity", _COMPONENT_IDENTITY_KEYS, False),
+        ("boundary_launcher_identity", _COMPONENT_IDENTITY_KEYS, False),
+    ):
+        value = body.get(key)
+        if value is None:
+            continue
+        closed = _require_closed_object_keys(
+            value, allowed, label=f"owner payload {key}", exact=exact
+        )
+        for nested_key, nested_value in closed.items():
+            if nested_key in {
+                "device",
+                "inode",
+                "mode",
+                "root_mode",
+                "size",
+                "mtime_ns",
+            }:
+                try:
+                    require_strict_int(
+                        nested_value,
+                        f"owner payload {key} {nested_key}",
+                        minimum=0,
+                        maximum=2**63 - 1,
+                    )
+                except ValueError as error:
+                    raise _payload_error(
+                        "owner payload contains an invalid nested integer field"
+                    ) from error
+
+    for key in ("destination_manifest_identity", "tool_authority_identity"):
+        value = body.get(key)
+        if value is None:
+            continue
+        if isinstance(value, Mapping):
+            _refuse_unexpected_fields(f"owner payload {key}")
+        try:
+            require_sha256(value, f"owner payload {key}")
+        except ValueError as error:
+            raise _payload_error(
+                "owner payload contains an invalid authority identity"
+            ) from error
+
+    return body
 
 
 def read_owner_phrase_from_descriptor(descriptor: int) -> str:
@@ -164,10 +363,11 @@ def owner_payload_summary(payload: Mapping[str, Any]) -> dict[str, Any]:
     budgets, and the exact zero-retry/zero-repair/one-launch policy.  Missing,
     empty or malformed values refuse before any summary is displayed or any
     authorization is provisioned --- there is no partial or best-effort
-    summary.
+    summary.  Unexpected top-level or nested fields are refused before the
+    summary is treated as valid.
     """
 
-    body = dict(payload)
+    body = validate_closed_world_owner_payload(payload)
     policy = body.get("model_binding_policy")
     if not isinstance(policy, Mapping):
         raise OwnerAuthorityProvisioningError(
@@ -204,8 +404,6 @@ def owner_payload_summary(payload: Mapping[str, Any]) -> dict[str, Any]:
             "owner payload summary requires explicit budgets",
             classification="OWNER_AUTHORITY_SUMMARY_INCOMPLETE",
         )
-    from admissible.capsule.owner_authorization import zero_retry_policy
-
     zero_retry = body.get("zero_retry_policy")
     if not isinstance(zero_retry, Mapping) or dict(zero_retry) != dict(
         zero_retry_policy()
@@ -286,7 +484,7 @@ def provision_authorization(
 
     require_privileged_identity("owner authorization provisioning")
     attested = installation.validated()
-    payload_body = dict(owner_payload)
+    payload_body = validate_closed_world_owner_payload(owner_payload)
     payload_bytes = canonical_bytes(payload_body)
     payload_fingerprint = fingerprint(payload_body)
     record_id = authorization_record_id or new_authorization_record_id()
@@ -321,17 +519,20 @@ def provision_authorization(
 
 def _load_payload(path: Path) -> dict[str, Any]:
     raw = path.read_bytes()
-    payload = strict_json_loads(raw, label="owner payload")
+    try:
+        payload = strict_json_loads(raw, label="owner payload")
+    except ValueError as error:
+        message = str(error)
+        if "duplicate object key" in message:
+            _refuse_payload("owner payload contains duplicate object keys")
+        _refuse_payload("owner payload is not valid closed JSON")
     if not isinstance(payload, Mapping):
-        raise OwnerAuthorityProvisioningError("owner payload is not an object")
-    body = {
-        key: item for key, item in payload.items() if key != "payload_fingerprint"
-    }
+        _refuse_payload("owner payload is not an object")
+    body = validate_closed_world_owner_payload(payload)
     supplied = payload.get("payload_fingerprint")
     if supplied is not None and supplied != fingerprint(body):
-        raise OwnerAuthorityProvisioningError(
+        _refuse_payload(
             "owner payload fingerprint does not match its own bytes",
-            classification="OWNER_AUTHORITY_PAYLOAD_REFUSED",
         )
     return body
 
