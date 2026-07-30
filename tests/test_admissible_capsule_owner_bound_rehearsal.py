@@ -51,20 +51,25 @@ from admissible.capsule.finalizer import (
 )
 from admissible.capsule.host_codex_backend import (
     HostCodexAppServerCapsuleBackend,
-    OwnerBoundWitnessAuthority,
     ScriptedCodexAppServerConnection,
     ScriptedCodexConnectionFactory,
+    SyntheticOwnerAuthorityWitness,
 )
 from admissible.capsule.host_control import AuthenticatedControlAuthority
 from admissible.capsule.intake import IntakeAuthority, validate_and_copy
+from admissible.capsule.owner_authority.gate import (
+    OwnerAuthorityGateError,
+    revalidate_signed_owner_authority,
+)
+from admissible.capsule.owner_authority.layout import (
+    LAUNCH_RESULT_RECORDED,
+    PROVISIONED_PENDING,
+    RECEIPT_ISSUED,
+)
 from admissible.capsule.owner_authorization import (
-    OwnerAuthorizationError,
     classify_local_chatgpt_login,
-    revalidate_owner_bound_receipt,
 )
 from admissible.capsule.preflight_seal import (
-    OWNER_AUTHORIZATION_CONSUMED,
-    OWNER_BOUND_READY_FOR_SINGLE_LAUNCH,
     SEALED_CANDIDATE_AWAITING_OWNER_AUTHORIZATION,
     validate_future_preflight_seal,
 )
@@ -75,12 +80,15 @@ from admissible.capsule.session_store import (
 )
 from admissible.capsule.state import Phase, new_session_state
 from tests._candidate_canary_binding import (
+    PRIVILEGED_IDENTITY_REASON,
     SYNTHETIC_MISSION_BYTES,
-    authorize_synthetic_owner_binding,
     build_owner_payload,
     build_sealed_candidate_preparation,
     candidate_canary_binding,
-    retain_synthetic_authorization,
+    consume_synthetic_authorization,
+    privileged_identity_available,
+    provision_synthetic_authorization,
+    synthetic_owner_authority_world,
 )
 from tests.test_admissible_capsule_host_codex_e2e import (
     PARENT_IDENTITY,
@@ -98,6 +106,12 @@ from tests.test_admissible_capsule_host_codex_e2e import (
 REHEARSAL_MISSION_PROMPT = (
     "Create the single authorized synthetic witness file using capsule_effects only."
 )
+
+#: The capsule runs as a fixed non-root identity.  Pinning it here keeps the
+#: suite identical whether or not it runs inside the disposable privilege
+#: namespace, where the test process itself is uid 0.
+CAPSULE_UID = 1000
+CAPSULE_GID = 1000
 REHEARSAL_INTAKE_AUTHORITY = IntakeAuthority.create(
     authority_id="synthetic_owner_bound_rehearsal_v1",
     authority_paths=("index.html",),
@@ -177,8 +191,8 @@ def _owner_bound_backend(
     tmp_path: Path,
     image_identity: str,
     prepared,
-    owner_bound_receipt,
-    authorization_state,
+    signed_receipt,
+    world,
     *,
     label: str = "launch",
 ):
@@ -187,6 +201,8 @@ def _owner_bound_backend(
         command_timeout_seconds=5.0,
         session_timeout_seconds=15.0,
         output_limit_bytes=64 * 1024,
+       uid=CAPSULE_UID,
+        gid=CAPSULE_GID,
     )
     controller = DockerCapsuleController(
         workspace_root=tmp_path / f"{label}-capsules",
@@ -223,9 +239,10 @@ def _owner_bound_backend(
         connection_factory=connection_factory,
         mission_prompt=REHEARSAL_MISSION_PROMPT,
         mission_bytes=SYNTHETIC_MISSION_BYTES,
-        witness_authority=OwnerBoundWitnessAuthority(
-            owner_bound_receipt=owner_bound_receipt,
-            authorization_state=authorization_state,
+        witness_authority=SyntheticOwnerAuthorityWitness(
+            signed_receipt=signed_receipt,
+            installation=world["installation"],
+            broker_client=world["client"],
             preparation_root=prepared["preparation_root"],
             retained_seal_identity=prepared["retained_seal_identity"],
         ),
@@ -237,6 +254,8 @@ def _owner_bound_backend(
 def test_provider_free_rehearsal_of_the_complete_owner_rooted_order(
     tmp_path: Path, local_ubuntu_identity: str
 ):
+    if not privileged_identity_available():
+        pytest.skip(PRIVILEGED_IDENTITY_REASON)
     binding = candidate_canary_binding()
 
     # 1. repository and preparation identity, over real candidate evidence
@@ -269,21 +288,26 @@ def test_provider_free_rehearsal_of_the_complete_owner_rooted_order(
     )
     assert revalidated == prepared["sealed"]
 
-    # 4-5. the owner phrase arrives on its dedicated descriptor and must verify
-    #      the exact canonical payload.
+    # 4-5. the privileged owner provisions exactly this payload.  The launcher
+    #      never learns the expected digest and never sees the signing key.
     payload = build_owner_payload(prepared, mission_bytes=SYNTHETIC_MISSION_BYTES)
-    state = retain_synthetic_authorization(
-        prepared, payload, workspace=tmp_path / "preparation-workspace"
-    )
-    assert state.retained_state()["classification"] == (
-        SEALED_CANDIDATE_AWAITING_OWNER_AUTHORIZATION
-    )
+    world = synthetic_owner_authority_world(tmp_path / "preparation-workspace")
+    provisioned = provision_synthetic_authorization(world, payload)
+    assert provisioned["state"] == PROVISIONED_PENDING
+    assert provisioned["phrase_retained"] is False
+    assert world["client"].authorization_status(
+        provisioned["authorization_record_id"]
+    )["state"] == PROVISIONED_PENDING
 
-    # 6. the owner-bound receipt.
-    owner_bound = authorize_synthetic_owner_binding(prepared, payload, state)
-    consumption = owner_bound.authorization_consumption_identity
-    assert owner_bound.trust_state == "OWNER_BOUND_PRODUCTION_AUTHORITY"
-    assert state.classification(consumption) == OWNER_BOUND_READY_FOR_SINGLE_LAUNCH
+    # 6. the broker verifies the phrase, atomically consumes, and signs one
+    #    receipt.  Consumption is durable before the signature exists.
+    signed_receipt = consume_synthetic_authorization(world, provisioned)
+    consumption = signed_receipt.authorization_consumption_identity
+    status = world["client"].authorization_status(
+        provisioned["authorization_record_id"]
+    )
+    assert status["state"] == RECEIPT_ISSUED
+    assert status["receipt_identity"] == signed_receipt.receipt_identity
 
     # 7-9. the single launch: construction revalidates the binding, preparing the
     #      workspace consumes the authorization, and effects run only afterwards.
@@ -291,15 +315,19 @@ def test_provider_free_rehearsal_of_the_complete_owner_rooted_order(
         tmp_path,
         local_ubuntu_identity,
         prepared,
-        owner_bound,
-        state,
+        signed_receipt,
+        world,
     )
     assert backend.owner_binding_state == "OWNER_BOUND"
-    assert backend.owner_bound_receipt_identity == owner_bound.receipt_identity
-    assert state.classification(consumption) == OWNER_BOUND_READY_FOR_SINGLE_LAUNCH
+    assert backend.owner_bound_receipt_identity == signed_receipt.receipt_identity
+    assert backend.owner_authority_installation_identity == (
+        world["installation"].installation_identity
+    )
 
     workspace = backend.prepare_workspace()
-    assert state.classification(consumption) == OWNER_AUTHORIZATION_CONSUMED
+    assert world["client"].authorization_status(
+        provisioned["authorization_record_id"]
+    )["state"] == LAUNCH_RESULT_RECORDED
     assert backend._authorization_consumption["consumed"] is True
 
     session_id = backend.reconstruct(workspace).session_id
@@ -316,10 +344,16 @@ def test_provider_free_rehearsal_of_the_complete_owner_rooted_order(
     # The durable execution authority records the owner binding.
     authority = snapshot.authority_identity["backend_execution_authority"]
     assert authority["owner_binding_state"] == "OWNER_BOUND"
-    assert authority["owner_bound_receipt_identity"] == owner_bound.receipt_identity
+    assert authority["owner_bound_receipt_identity"] == signed_receipt.receipt_identity
     assert authority["owner_payload_fingerprint"] == payload.payload_fingerprint
     assert (
         authority["owner_authorization_consumption_identity"] == consumption
+    )
+    assert authority["owner_authority_installation_identity"] == (
+        world["installation"].installation_identity
+    )
+    assert authority["owner_authority_signing_key_fingerprint"] == (
+        world["installation"].signing_key_fingerprint
     )
 
     # intake, both verifiers and finalization over the one accepted file.
@@ -394,27 +428,30 @@ def test_provider_free_rehearsal_of_the_complete_owner_rooted_order(
     assert run_state.phase == Phase.ACCEPTED
     assert finalizer.verify(prepared=prepared_finalization)["ok"] is True
 
-    # A second launch on the same authorization refuses at construction.
-    with pytest.raises(OwnerAuthorizationError) as reuse:
+    # A second launch on the same signed receipt refuses at construction: the
+    # broker's durable state has moved past the launchable state, and no copy of
+    # the receipt can move it back.
+    with pytest.raises(OwnerAuthorityGateError) as reuse:
         _owner_bound_backend(
             tmp_path,
             local_ubuntu_identity,
             prepared,
-            owner_bound,
-            state,
+            signed_receipt,
+            world,
             label="second",
         )
-    assert reuse.value.classification == "OWNER_AUTHORIZATION_ALREADY_CONSUMED"
+    assert reuse.value.classification == "OWNER_AUTHORITY_ALREADY_CONSUMED"
 
-    # And the gate now classifies the authorization as spent, which is the
-    # classification a fresh backend refuses on.
-    gate = revalidate_owner_bound_receipt(
-        owner_bound_receipt=owner_bound,
-        candidate_witness_store=prepared["store"],
-        authorization_state=state,
-        preparation_root=prepared["preparation_root"],
-        retained_seal_identity=prepared["retained_seal_identity"],
-        expected_model_binding_policy=prepared["policy"],
-    )
-    assert gate["classification"] == OWNER_AUTHORIZATION_CONSUMED
+    # A fresh gate over the same receipt refuses for the same reason.
+    with pytest.raises(OwnerAuthorityGateError) as spent:
+        revalidate_signed_owner_authority(
+            signed_receipt=signed_receipt,
+            installation=world["installation"],
+            broker_client=world["client"],
+            candidate_witness_store=prepared["store"],
+            preparation_root=prepared["preparation_root"],
+            retained_seal_identity=prepared["retained_seal_identity"],
+            expected_model_binding_policy=prepared["policy"],
+        )
+    assert spent.value.classification == "OWNER_AUTHORITY_ALREADY_CONSUMED"
     backend.cleanup(workspace)

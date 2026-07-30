@@ -1,10 +1,15 @@
-"""Session-local provider-free candidate and owner-bound canary bindings.
+"""Session-local provider-free candidate and owner-authority canary bindings.
 
 The candidate binding runs the real pinned Codex 0.145.0 executable in a private
-routeless namespace and produces *candidate* witness evidence.  The owner-bound
-binding continues through the whole future authorization order using a synthetic
-owner phrase delivered on a dedicated descriptor, and yields the only object that
-may authorize a production effect.
+routeless namespace and produces *candidate* witness evidence, which carries no
+authority at all.
+
+The owner-authority binding continues through the whole external order: it
+installs a disposable **synthetic** owner-authority world with a real Ed25519
+signing identity, provisions one launch as the privileged owner, and then has
+the unprivileged launcher path verify the phrase and consume it through the
+broker to obtain a signed receipt.  The synthetic world is explicitly not a
+production installation and no production acceptance point accepts it.
 
 Nothing here contacts a public provider, model or API, and no real
 authentication content is read, copied, displayed or hashed.
@@ -33,11 +38,16 @@ from admissible.capsule.model_authority import (
     canary_model_authority,
     canary_model_binding_policy,
 )
+from admissible.capsule.owner_authority import (
+    OwnerAuthorityBroker,
+    OwnerAuthorityBrokerClient,
+    attest_synthetic_non_production_installation,
+    perform_installation,
+    provision_authorization,
+    synthetic_non_production_layout,
+)
 from admissible.capsule.owner_authorization import (
     OwnerAuthorizationPayload,
-    OwnerAuthorizationStateStore,
-    authorize_owner_bound_serialization_receipt,
-    owner_authorization_digest,
 )
 from admissible.capsule.preflight_seal import (
     RetainedPreparationSealIdentity,
@@ -260,28 +270,20 @@ def build_owner_payload(prepared, *, mission_bytes: bytes = SYNTHETIC_MISSION_BY
     )
 
 
-def retain_synthetic_authorization(
-    prepared,
-    payload,
-    *,
-    workspace: Path,
-    phrase: str = SYNTHETIC_OWNER_PHRASE,
-):
-    """Retain the expected synthetic owner digest outside the preparation."""
+#: The synthetic privilege witness needs a genuine uid-0 identity.  A user
+#: namespace supplies one without touching the host; see
+#: ``tests/run_capsule_suite_in_namespace.sh``.
+PRIVILEGED_IDENTITY_REASON = (
+    "the external owner-authority world requires a privileged installer "
+    "identity; run this suite inside a disposable user namespace, for example "
+    "`unshare -Urm python3 -m pytest ...`"
+)
 
-    state = OwnerAuthorizationStateStore(
-        workspace / "owner-authorization",
-        preparation_root=prepared["preparation_root"],
-    )
-    state.retain_expected_digest(
-        expected_owner_authorization_digest=owner_authorization_digest(
-            phrase=phrase,
-            payload_bytes=payload.canonical_payload_bytes(),
-        ),
-        payload_fingerprint=payload.payload_fingerprint,
-        retained_seal=prepared["retained_seal_identity"],
-    )
-    return state
+
+def privileged_identity_available() -> bool:
+    """Whether this process can act as the privileged installer identity."""
+
+    return os.geteuid() == 0
 
 
 def owner_phrase_descriptor(phrase: str = SYNTHETIC_OWNER_PHRASE) -> int:
@@ -295,29 +297,109 @@ def owner_phrase_descriptor(phrase: str = SYNTHETIC_OWNER_PHRASE) -> int:
     return read_end
 
 
-def authorize_synthetic_owner_binding(
-    prepared,
+def synthetic_owner_authority_world(
+    workspace: Path,
+    *,
+    authorized_launcher_uid: int | None = None,
+    authorized_launcher_gid: int | None = None,
+    start_broker: bool = True,
+):
+    """Install a disposable synthetic owner-authority world and start its broker.
+
+    This is *not* a production installation: the layout classification says so,
+    it lives under a temporary directory, and no production acceptance point
+    accepts what it produces.  It does exercise the real installer, the real
+    Ed25519 signing identity, the real broker protocol, the real peer-credential
+    check and the real durable state machine.
+    """
+
+    # AF_UNIX paths are capped near 108 bytes, and pytest's tmp_path is deep, so
+    # the disposable world gets a short root of its own.  It is cleaned up with
+    # the rest of the session state.
+    workspace.mkdir(parents=True, exist_ok=True)
+    layout = synthetic_non_production_layout(
+        Path(tempfile.mkdtemp(prefix="oa-"))
+    )
+    perform_installation(
+        layout=layout,
+        installation_id=f"synthetic-{uuid.uuid4().hex[:16]}",
+        authorized_launcher_uid=(
+            os.getuid() if authorized_launcher_uid is None
+            else authorized_launcher_uid
+        ),
+        authorized_launcher_gid=(
+            os.getgid() if authorized_launcher_gid is None
+            else authorized_launcher_gid
+        ),
+        install_unit=False,
+    )
+    installation = attest_synthetic_non_production_installation(layout)
+    world = {
+        "layout": layout,
+        "installation": installation,
+        "broker": None,
+        "thread": None,
+        "client": OwnerAuthorityBrokerClient(installation),
+    }
+    if start_broker:
+        broker = OwnerAuthorityBroker(installation)
+        broker.bind()
+        thread = threading.Thread(target=broker.serve_forever, daemon=True)
+        thread.start()
+        world["broker"] = broker
+        world["thread"] = thread
+        _register_world(world)
+    return world
+
+
+_started_worlds: list[dict] = []
+
+
+def _register_world(world) -> None:
+    with _lock:
+        _started_worlds.append(world)
+
+
+def stop_owner_authority_world(world) -> None:
+    """Close a synthetic broker so its socket and thread do not leak."""
+
+    broker = world.get("broker")
+    if broker is not None:
+        broker.close()
+        world["broker"] = None
+    root = world.get("layout")
+    if root is not None:
+        shutil.rmtree(root.configuration_root.parent, ignore_errors=True)
+
+
+def provision_synthetic_authorization(
+    world,
     payload,
-    state,
     *,
     phrase: str = SYNTHETIC_OWNER_PHRASE,
 ):
-    """Run the trusted authorization path with a synthetic phrase over a pipe."""
+    """Provision one launch as the privileged owner in a synthetic world."""
 
-    descriptor = owner_phrase_descriptor(phrase)
-    try:
-        return authorize_owner_bound_serialization_receipt(
-            owner_payload=payload,
-            owner_phrase_descriptor=descriptor,
-            authorization_state=state,
-            candidate_witness_store=prepared["store"],
-            candidate_witness_receipt=prepared["receipt"],
-            preparation_root=prepared["preparation_root"],
-            retained_seal_identity=prepared["retained_seal_identity"],
-            boundary_launcher_identity=boundary_launcher_component_identity(),
-        )
-    finally:
-        os.close(descriptor)
+    return provision_authorization(
+        installation=world["installation"],
+        owner_payload=dict(payload.body),
+        owner_phrase=phrase,
+    )
+
+
+def consume_synthetic_authorization(
+    world,
+    provisioned,
+    *,
+    phrase: str = SYNTHETIC_OWNER_PHRASE,
+):
+    """Verify the phrase and atomically consume, obtaining the signed receipt."""
+
+    return world["client"].verify_and_consume(
+        authorization_record_id=provisioned["authorization_record_id"],
+        owner_payload_fingerprint=provisioned["owner_payload_fingerprint"],
+        owner_phrase=phrase,
+    )
 
 
 def create_owner_bound_canary_binding(
@@ -326,8 +408,19 @@ def create_owner_bound_canary_binding(
     binding=None,
     mission_bytes: bytes = SYNTHETIC_MISSION_BYTES,
     extra_files: dict[str, bytes] | None = None,
+    phrase: str = SYNTHETIC_OWNER_PHRASE,
 ):
-    """Run the complete provider-free order up to the owner-bound receipt."""
+    """Run the complete provider-free order up to the broker-signed receipt.
+
+    The order is the production order: seal a candidate preparation, build the
+    canonical owner payload, provision it as the privileged owner, then have the
+    launcher verify the phrase and consume through the broker.  The launcher
+    never sees the expected digest and never touches the signing key.
+    """
+
+    from admissible.capsule.host_codex_backend import (
+        SyntheticOwnerAuthorityWitness,
+    )
 
     prepared = build_sealed_candidate_preparation(
         workspace,
@@ -335,20 +428,35 @@ def create_owner_bound_canary_binding(
         extra_files=extra_files,
     )
     payload = build_owner_payload(prepared, mission_bytes=mission_bytes)
-    state = retain_synthetic_authorization(
-        prepared, payload, workspace=workspace
+    world = synthetic_owner_authority_world(workspace)
+    provisioned = provision_synthetic_authorization(world, payload, phrase=phrase)
+    signed_receipt = consume_synthetic_authorization(
+        world, provisioned, phrase=phrase
     )
-    owner_bound = authorize_synthetic_owner_binding(prepared, payload, state)
+    witness = SyntheticOwnerAuthorityWitness(
+        signed_receipt=signed_receipt,
+        installation=world["installation"],
+        broker_client=world["client"],
+        preparation_root=prepared["preparation_root"],
+        retained_seal_identity=prepared["retained_seal_identity"],
+    )
     return {
         **prepared,
         "payload": payload,
-        "authorization_state": state,
-        "owner_bound_receipt": owner_bound,
+        "owner_authority_world": world,
+        "provisioned": provisioned,
+        "signed_receipt": signed_receipt,
+        "owner_authority_witness": witness,
         "mission_bytes": mission_bytes,
     }
 
 
 def _cleanup() -> None:
+    for world in list(_started_worlds):
+        try:
+            stop_owner_authority_world(world)
+        except OSError:  # pragma: no cover - best-effort teardown
+            pass
     if _owned_root is not None:
         shutil.rmtree(_owned_root, ignore_errors=True)
 

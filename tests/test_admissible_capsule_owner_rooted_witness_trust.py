@@ -1,9 +1,16 @@
-"""Adversarial tests: only an exact owner binding is production authority.
+"""Adversarial tests: only an externally rooted owner authority is production.
 
 Every candidate store here is created locally, every phrase is synthetic, and
 the only executable ever run is the pinned Codex 0.145.0 binary inside the
-private routeless witness namespace.  No public provider, model or API is
-reachable from this module, and no real authentication content is opened.
+private routeless witness namespace, plus the content-attested system OpenSSL
+the owner authority signs with.  No public provider, model or API is reachable
+from this module, and no real authentication content is opened.
+
+The trust root under test is no longer self-rooted.  A caller may still
+fabricate stores, packs, receipts, tails, preparations, seals, phrases and
+digests; the tests below show that none of it produces a signed receipt, and
+that a signed receipt still refuses the moment reality differs from what the
+owner authorized.
 """
 
 from __future__ import annotations
@@ -16,9 +23,6 @@ from pathlib import Path
 import pytest
 
 from admissible.capsule.backend import CapsuleAuthority
-from admissible.capsule.boundary_launcher import (
-    boundary_launcher_component_identity,
-)
 from admissible.capsule.common import canonical_bytes, fingerprint, sha256_bytes
 from admissible.capsule.docker_controller import (
     DockerCapsuleController,
@@ -28,9 +32,9 @@ from admissible.capsule.execution_authority import BackendExecutionAuthority
 from admissible.capsule.host_codex_backend import (
     HostCodexAppServerCapsuleBackend,
     NonProductionWitnessMode,
-    OwnerBoundWitnessAuthority,
     ScriptedCodexAppServerConnection,
     ScriptedCodexConnectionFactory,
+    SyntheticOwnerAuthorityWitness,
     dynamic_tools_grammar,
 )
 from admissible.capsule.host_control import AuthenticatedControlAuthority
@@ -38,22 +42,30 @@ from admissible.capsule.model_authority import (
     ModelBindingPolicy,
     ModelConfigurationError,
 )
+from admissible.capsule.owner_authority.broker import OwnerAuthorityBrokerError
+from admissible.capsule.owner_authority.gate import (
+    OwnerAuthorityGateError,
+    revalidate_signed_owner_authority,
+)
+from admissible.capsule.owner_authority.layout import OwnerAuthorityError
+from admissible.capsule.owner_authority.layout import (
+    EXTERNAL_OWNER_DIGEST_CONSTRUCTION,
+    LAUNCH_RESULT_RECORDED,
+    PROVISIONED_PENDING,
+    RECEIPT_ISSUED,
+)
+from admissible.capsule.owner_authority.records import (
+    SignedOwnerAuthorizationReceipt,
+    external_owner_authorization_digest,
+    new_authorization_record_id,
+)
 from admissible.capsule.owner_authorization import (
-    OWNER_DIGEST_CONSTRUCTION,
     OwnerAuthorizationError,
     OwnerAuthorizationPayload,
-    OwnerBoundVerifiedSerializationReceipt,
-    authorize_owner_bound_serialization_receipt,
     classify_local_chatgpt_login,
-    owner_authorization_digest,
     read_owner_phrase_from_descriptor,
-    revalidate_owner_bound_receipt,
 )
-from admissible.capsule.preflight_seal import (
-    OWNER_AUTHORIZATION_CONSUMED,
-    OWNER_BOUND_READY_FOR_SINGLE_LAUNCH,
-    FuturePreflightSealError,
-)
+from admissible.capsule.preflight_seal import FuturePreflightSealError
 from admissible.capsule.serialization_witness import (
     CANDIDATE_WITNESS_TRUST_STATE,
     ZERO_FINGERPRINT,
@@ -64,18 +76,27 @@ from admissible.capsule.serialization_witness import (
 )
 from admissible.capsule.session_store import DurableCapsuleSessionStore
 from tests._candidate_canary_binding import (
+    PRIVILEGED_IDENTITY_REASON,
     SYNTHETIC_OWNER_PHRASE,
-    authorize_synthetic_owner_binding,
     build_owner_payload,
     build_sealed_candidate_preparation,
+    consume_synthetic_authorization,
     create_candidate_canary_binding,
     create_owner_bound_canary_binding,
     owner_phrase_descriptor,
-    retain_synthetic_authorization,
+    privileged_identity_available,
+    provision_synthetic_authorization,
+    synthetic_owner_authority_world,
 )
 
 
 SYNTHETIC_MISSION_PROMPT = "synthetic owner-rooted witness trust mission"
+
+#: The capsule runs as a fixed non-root identity.  Pinning it here keeps the
+#: suite identical whether or not it runs inside the disposable privilege
+#: namespace, where the test process itself is uid 0.
+CAPSULE_UID = 1000
+CAPSULE_GID = 1000
 
 
 # --------------------------------------------------------------------------
@@ -97,7 +118,26 @@ def secondary(tmp_path_factory):
 
 @pytest.fixture()
 def owner_bound(tmp_path: Path, primary):
+    if not privileged_identity_available():
+        pytest.skip(PRIVILEGED_IDENTITY_REASON)
     return create_owner_bound_canary_binding(tmp_path / "run", binding=primary)
+
+
+def _gate(bound, **overrides):
+    """Run the production pre-effect gate over a synthetic owner-authority world."""
+
+    world = overrides.pop("world", None) or bound["owner_authority_world"]
+    arguments = {
+        "signed_receipt": bound["signed_receipt"],
+        "installation": world["installation"],
+        "broker_client": world["client"],
+        "candidate_witness_store": bound["store"],
+        "preparation_root": bound["preparation_root"],
+        "retained_seal_identity": bound["retained_seal_identity"],
+        "expected_model_binding_policy": bound["policy"],
+    }
+    arguments.update(overrides)
+    return revalidate_signed_owner_authority(**arguments)
 
 
 # --------------------------------------------------------------------------
@@ -213,7 +253,7 @@ def fabricate_candidate_store(root: Path, donor) -> dict:
 
 
 def test_fully_fabricated_candidate_store_yields_no_production_authority(
-    tmp_path: Path, primary, owner_bound
+    tmp_path: Path, primary
 ):
     """A complete fabrication may load as candidate evidence and still be inert."""
 
@@ -225,25 +265,9 @@ def test_fully_fabricated_candidate_store_yields_no_production_authority(
     )
     # It loads: nothing in the store can distinguish it from a genuine one.
     assert candidate.trust_state == CANDIDATE_WITNESS_TRUST_STATE
-    assert not isinstance(candidate, OwnerBoundVerifiedSerializationReceipt)
-    # It is still not authority: the owner's retained authorization does not
-    # bind this fabricated store, pack, receipt or tail.
-    payload = owner_bound["payload"]
-    with pytest.raises(OwnerAuthorizationError) as failure:
-        authorize_owner_bound_serialization_receipt(
-            owner_payload=payload,
-            owner_phrase_descriptor=owner_phrase_descriptor(),
-            authorization_state=owner_bound["authorization_state"],
-            candidate_witness_store=store,
-            candidate_witness_receipt=candidate,
-            preparation_root=owner_bound["preparation_root"],
-            retained_seal_identity=owner_bound["retained_seal_identity"],
-            boundary_launcher_identity=boundary_launcher_component_identity(),
-        )
-    assert failure.value.classification in {
-        "OWNER_PAYLOAD_TARGETS_ANOTHER_WITNESS",
-        "OWNER_CANDIDATE_EVIDENCE_CHANGED",
-    }
+    # It is still not authority: it is not a signed receipt and cannot become
+    # one, because becoming one requires a private key this process cannot read.
+    assert not isinstance(candidate, SignedOwnerAuthorizationReceipt)
 
 
 def test_fabricated_store_substituted_under_an_owner_binding_is_refused(
@@ -251,20 +275,12 @@ def test_fabricated_store_substituted_under_an_owner_binding_is_refused(
 ):
     fabricated = fabricate_candidate_store(tmp_path / "swapped", primary)
     with pytest.raises(
-        (SerializationWitnessError, OwnerAuthorizationError)
+        (SerializationWitnessError, OwnerAuthorityGateError)
     ) as failure:
-        revalidate_owner_bound_receipt(
-            owner_bound_receipt=owner_bound["owner_bound_receipt"],
-            candidate_witness_store=fabricated["store"],
-            authorization_state=owner_bound["authorization_state"],
-            preparation_root=owner_bound["preparation_root"],
-            retained_seal_identity=owner_bound["retained_seal_identity"],
-            expected_model_binding_policy=owner_bound["policy"],
-        )
+        _gate(owner_bound, candidate_witness_store=fabricated["store"])
     assert failure.value.classification in {
         "WITNESS_TAIL_SUBSTITUTED",
-        "OWNER_BINDING_TARGETS_ANOTHER_STORE",
-        "OWNER_CANDIDATE_EVIDENCE_CHANGED",
+        "OWNER_AUTHORITY_CANDIDATE_EVIDENCE_CHANGED",
     }
 
 
@@ -306,12 +322,17 @@ def _backend_inputs(tmp_path: Path, binding, image_identity: str = "sha256:" + "
         command_timeout_seconds=5.0,
         session_timeout_seconds=10.0,
         output_limit_bytes=4096,
+       uid=CAPSULE_UID,
+        gid=CAPSULE_GID,
     )
-    controller = DockerCapsuleController(
-        workspace_root=tmp_path / "capsules",
-        frozen_output_root=tmp_path / "provider-output",
-        limits=limits,
-    )
+    try:
+        controller = DockerCapsuleController(
+            workspace_root=tmp_path / "capsules",
+            frozen_output_root=tmp_path / "provider-output",
+            limits=limits,
+        )
+    except FileNotFoundError as error:  # pragma: no cover - host without Docker
+        pytest.skip(f"the capsule controller requires a local Docker runtime: {error}")
     session_store = DurableCapsuleSessionStore(
         tmp_path / "session-store",
         candidate_witness_store=binding["store"],
@@ -352,6 +373,36 @@ def test_production_backend_with_a_candidate_receipt_only_is_refused(
         )
 
 
+def test_production_backend_refuses_a_synthetic_owner_authority_witness(
+    tmp_path: Path, primary, owner_bound
+):
+    """The synthetic privilege witness can never stand in for production."""
+
+    controller, session_store, capsule_authority = _backend_inputs(
+        tmp_path / "synthetic-under-production", primary
+    )
+    factory = _ProductionModeScriptedFactory(
+        ScriptedCodexAppServerConnection(()),
+        codex_component_identity=primary["identity"].to_dict(),
+    )
+    control_authority = AuthenticatedControlAuthority.create(
+        codex_protocol_version="0.145.0",
+        executable_identity=factory.codex_component_identity,
+        policy_fingerprint=factory.host_policy_fingerprint,
+        authentication_boundary_state=factory.authentication_boundary_state,
+    )
+    with pytest.raises(ValueError, match="synthetic owner-authority witness"):
+        HostCodexAppServerCapsuleBackend(
+            authority=capsule_authority,
+            control_authority=control_authority,
+            controller=controller,
+            session_store=session_store,
+            connection_factory=factory,
+            mission_prompt=SYNTHETIC_MISSION_PROMPT,
+            witness_authority=owner_bound["owner_authority_witness"],
+        )
+
+
 def test_backend_refuses_a_raw_candidate_receipt_as_witness_authority(
     tmp_path: Path, primary
 ):
@@ -366,7 +417,7 @@ def test_backend_refuses_a_raw_candidate_receipt_as_witness_authority(
         policy_fingerprint=factory.host_policy_fingerprint,
         authentication_boundary_state=factory.authentication_boundary_state,
     )
-    with pytest.raises(ValueError, match="requires either an owner-bound"):
+    with pytest.raises(ValueError, match="requires either a broker-signed"):
         HostCodexAppServerCapsuleBackend(
             authority=capsule_authority,
             control_authority=control_authority,
@@ -378,8 +429,8 @@ def test_backend_refuses_a_raw_candidate_receipt_as_witness_authority(
         )
 
 
-def test_production_execution_authority_requires_an_owner_bound_receipt(primary):
-    with pytest.raises(ValueError, match="requires an owner-bound serialization"):
+def test_production_execution_authority_requires_a_signed_receipt(primary):
+    with pytest.raises(ValueError, match="requires a broker-signed owner"):
         BackendExecutionAuthority.create(
             capsule_authority_fingerprint=fingerprint({"synthetic": True}),
             generic_mission_fingerprint=sha256_bytes(b"mission"),
@@ -408,34 +459,30 @@ def test_production_execution_authority_requires_an_owner_bound_receipt(primary)
 
 
 # --------------------------------------------------------------------------
-# 4-8. owner receipts that target another store, pack, policy, root or run
+# 4-8. signed receipts that target another store, pack, policy, root or run
 # --------------------------------------------------------------------------
 
 
 def test_owner_receipt_for_another_store_is_refused(
-    tmp_path: Path, primary, secondary
+    tmp_path: Path, primary, secondary, owner_bound
 ):
-    first = create_owner_bound_canary_binding(tmp_path / "first", binding=primary)
     with pytest.raises(
-        (SerializationWitnessError, OwnerAuthorizationError)
+        (SerializationWitnessError, OwnerAuthorityGateError)
     ) as failure:
-        revalidate_owner_bound_receipt(
-            owner_bound_receipt=first["owner_bound_receipt"],
-            candidate_witness_store=secondary["store"],
-            authorization_state=first["authorization_state"],
-            preparation_root=first["preparation_root"],
-            retained_seal_identity=first["retained_seal_identity"],
-            expected_model_binding_policy=first["policy"],
-        )
+        _gate(owner_bound, candidate_witness_store=secondary["store"])
     assert failure.value.classification in {
         "WITNESS_TAIL_SUBSTITUTED",
-        "OWNER_BINDING_TARGETS_ANOTHER_STORE",
+        "OWNER_AUTHORITY_CANDIDATE_EVIDENCE_CHANGED",
     }
 
 
 def test_owner_payload_for_another_evidence_pack_is_refused(
     tmp_path: Path, primary
 ):
+    """The broker signs what the owner provisioned; the gate checks reality."""
+
+    if not privileged_identity_available():
+        pytest.skip(PRIVILEGED_IDENTITY_REASON)
     prepared = build_sealed_candidate_preparation(
         tmp_path / "pack-swap", binding=primary
     )
@@ -447,12 +494,22 @@ def test_owner_payload_for_another_evidence_pack_is_refused(
             "payload_fingerprint": None,
         }
     )
-    state = retain_synthetic_authorization(
-        prepared, substituted, workspace=tmp_path / "pack-swap"
+    world = synthetic_owner_authority_world(tmp_path / "pack-swap")
+    provisioned = provision_synthetic_authorization(world, substituted)
+    signed = consume_synthetic_authorization(world, provisioned)
+    with pytest.raises(OwnerAuthorityGateError) as failure:
+        revalidate_signed_owner_authority(
+            signed_receipt=signed,
+            installation=world["installation"],
+            broker_client=world["client"],
+            candidate_witness_store=prepared["store"],
+            preparation_root=prepared["preparation_root"],
+            retained_seal_identity=prepared["retained_seal_identity"],
+            expected_model_binding_policy=prepared["policy"],
+        )
+    assert failure.value.classification == (
+        "OWNER_AUTHORITY_CANDIDATE_EVIDENCE_CHANGED"
     )
-    with pytest.raises(OwnerAuthorizationError) as failure:
-        authorize_synthetic_owner_binding(prepared, substituted, state)
-    assert failure.value.classification == "OWNER_PAYLOAD_TARGETS_ANOTHER_WITNESS"
 
 
 def test_owner_payload_for_another_model_policy_is_refused(
@@ -480,7 +537,7 @@ def test_owner_payload_for_another_model_policy_is_refused(
         )
 
 
-def test_owner_bound_receipt_for_another_model_policy_is_refused(
+def test_signed_receipt_for_another_model_policy_is_refused(
     tmp_path: Path, primary, owner_bound
 ):
     other = ModelBindingPolicy.create(
@@ -491,36 +548,24 @@ def test_owner_bound_receipt_for_another_model_policy_is_refused(
         codex_executable_identity=primary["identity"].to_dict(),
     )
     with pytest.raises(ModelConfigurationError, match="not the closed canary"):
-        revalidate_owner_bound_receipt(
-            owner_bound_receipt=owner_bound["owner_bound_receipt"],
-            candidate_witness_store=owner_bound["store"],
-            authorization_state=owner_bound["authorization_state"],
-            preparation_root=owner_bound["preparation_root"],
-            retained_seal_identity=owner_bound["retained_seal_identity"],
-            expected_model_binding_policy=other,
-        )
+        _gate(owner_bound, expected_model_binding_policy=other)
 
 
-def test_owner_bound_receipt_for_another_preparation_root_is_refused(
+def test_signed_receipt_for_another_preparation_root_is_refused(
     tmp_path: Path, primary, owner_bound
 ):
-    other = create_owner_bound_canary_binding(tmp_path / "other-root", binding=primary)
+    other = create_owner_bound_canary_binding(
+        tmp_path / "other-root", binding=primary
+    )
     with pytest.raises(
-        (OwnerAuthorizationError, FuturePreflightSealError)
+        (OwnerAuthorityGateError, FuturePreflightSealError)
     ) as failure:
-        revalidate_owner_bound_receipt(
-            owner_bound_receipt=owner_bound["owner_bound_receipt"],
-            candidate_witness_store=owner_bound["store"],
-            authorization_state=owner_bound["authorization_state"],
-            preparation_root=other["preparation_root"],
-            retained_seal_identity=owner_bound["retained_seal_identity"],
-            expected_model_binding_policy=owner_bound["policy"],
-        )
+        _gate(owner_bound, preparation_root=other["preparation_root"])
     assert (
         "copied, moved or re-created" in str(failure.value)
         or "final seal differs" in str(failure.value)
         or getattr(failure.value, "classification", "")
-        == "OWNER_PREPARATION_ROOT_CHANGED"
+        == "OWNER_AUTHORITY_PREPARATION_ROOT_CHANGED"
     )
 
 
@@ -542,46 +587,42 @@ def test_owner_payload_whose_run_differs_from_its_root_identity_is_refused(
     assert failure.value.classification == "OWNER_PAYLOAD_INVALID"
 
 
-def test_owner_bound_receipt_for_another_run_is_refused(tmp_path: Path, primary):
-    first = create_owner_bound_canary_binding(
-        tmp_path / "run-one", binding=primary
-    )
-    second = create_owner_bound_canary_binding(
-        tmp_path / "run-two", binding=primary
-    )
-    assert first["owner_bound_receipt"].run_id != second["owner_bound_receipt"].run_id
-    with pytest.raises(OwnerAuthorizationError) as failure:
-        revalidate_owner_bound_receipt(
-            owner_bound_receipt=first["owner_bound_receipt"],
-            candidate_witness_store=first["store"],
-            authorization_state=second["authorization_state"],
-            preparation_root=first["preparation_root"],
-            retained_seal_identity=first["retained_seal_identity"],
-            expected_model_binding_policy=first["policy"],
-        )
-    assert failure.value.classification == "OWNER_AUTHORIZATION_STATE_REFUSED"
-    with pytest.raises(OwnerAuthorizationError) as consumed:
-        second["authorization_state"].consume_once(
-            owner_bound_receipt=first["owner_bound_receipt"]
-        )
-    assert consumed.value.classification == "OWNER_AUTHORIZATION_STATE_REFUSED"
+def test_signed_receipt_for_another_run_is_refused(tmp_path: Path, primary):
+    """A receipt from one run cannot be presented against another run's world."""
+
+    if not privileged_identity_available():
+        pytest.skip(PRIVILEGED_IDENTITY_REASON)
+    first = create_owner_bound_canary_binding(tmp_path / "run-one", binding=primary)
+    second = create_owner_bound_canary_binding(tmp_path / "run-two", binding=primary)
+    assert first["signed_receipt"].run_id != second["signed_receipt"].run_id
+    with pytest.raises(OwnerAuthorityError) as failure:
+        _gate(first, world=second["owner_authority_world"])
+    assert failure.value.classification in {
+        "OWNER_AUTHORITY_RECEIPT_FOREIGN_INSTALLATION",
+        "OWNER_AUTHORITY_ALREADY_CONSUMED",
+    }
 
 
-def test_owner_payload_not_matched_by_the_retained_digest_is_refused(
+def test_owner_phrase_not_matching_the_provisioned_digest_is_refused(
     tmp_path: Path, primary
 ):
+    if not privileged_identity_available():
+        pytest.skip(PRIVILEGED_IDENTITY_REASON)
     prepared = build_sealed_candidate_preparation(
         tmp_path / "wrong-phrase", binding=primary
     )
     payload = build_owner_payload(prepared)
-    state = retain_synthetic_authorization(
-        prepared, payload, workspace=tmp_path / "wrong-phrase"
-    )
-    with pytest.raises(OwnerAuthorizationError) as failure:
-        authorize_synthetic_owner_binding(
-            prepared, payload, state, phrase="a-different-synthetic-phrase"
+    world = synthetic_owner_authority_world(tmp_path / "wrong-phrase")
+    provisioned = provision_synthetic_authorization(world, payload)
+    with pytest.raises(OwnerAuthorityBrokerError) as failure:
+        consume_synthetic_authorization(
+            world, provisioned, phrase="a-different-synthetic-phrase"
         )
-    assert failure.value.classification == "OWNER_PHRASE_REFUSED"
+    assert failure.value.classification == "OWNER_AUTHORITY_PHRASE_REFUSED"
+    # A refused phrase does not spend the authorization.
+    assert world["client"].authorization_status(
+        provisioned["authorization_record_id"]
+    )["state"] == PROVISIONED_PENDING
 
 
 # --------------------------------------------------------------------------
@@ -595,14 +636,7 @@ def test_copied_preparation_directory_under_the_owner_gate_is_refused(
     copied = tmp_path / "copied-preparation"
     shutil.copytree(owner_bound["preparation_root"], copied)
     with pytest.raises(FuturePreflightSealError, match="copied, moved or re-created"):
-        revalidate_owner_bound_receipt(
-            owner_bound_receipt=owner_bound["owner_bound_receipt"],
-            candidate_witness_store=owner_bound["store"],
-            authorization_state=owner_bound["authorization_state"],
-            preparation_root=copied,
-            retained_seal_identity=owner_bound["retained_seal_identity"],
-            expected_model_binding_policy=owner_bound["policy"],
-        )
+        _gate(owner_bound, preparation_root=copied)
 
 
 @pytest.mark.parametrize(
@@ -620,14 +654,7 @@ def test_extended_preparation_tree_under_the_owner_gate_is_refused(
     else:
         (root / "evidence" / "empty").mkdir()
     with pytest.raises(FuturePreflightSealError, match="closed authorized entry set"):
-        revalidate_owner_bound_receipt(
-            owner_bound_receipt=owner_bound["owner_bound_receipt"],
-            candidate_witness_store=owner_bound["store"],
-            authorization_state=owner_bound["authorization_state"],
-            preparation_root=root,
-            retained_seal_identity=owner_bound["retained_seal_identity"],
-            expected_model_binding_policy=owner_bound["policy"],
-        )
+        _gate(owner_bound)
 
 
 # --------------------------------------------------------------------------
@@ -638,6 +665,8 @@ def test_extended_preparation_tree_under_the_owner_gate_is_refused(
 def test_stale_candidate_tail_after_owner_authorization_is_refused(
     tmp_path: Path, secondary
 ):
+    if not privileged_identity_available():
+        pytest.skip(PRIVILEGED_IDENTITY_REASON)
     bound = create_owner_bound_canary_binding(
         tmp_path / "tail-advance", binding=secondary
     )
@@ -647,37 +676,36 @@ def test_stale_candidate_tail_after_owner_authorization_is_refused(
         codex_executable=secondary["codex"],
     )
     with pytest.raises(SerializationWitnessError, match="not the externally"):
-        revalidate_owner_bound_receipt(
-            owner_bound_receipt=bound["owner_bound_receipt"],
-            candidate_witness_store=secondary["store"],
-            authorization_state=bound["authorization_state"],
-            preparation_root=bound["preparation_root"],
-            retained_seal_identity=bound["retained_seal_identity"],
-            expected_model_binding_policy=bound["policy"],
-        )
+        _gate(bound)
 
 
 def test_owner_authorization_is_consumable_exactly_once(owner_bound):
-    state = owner_bound["authorization_state"]
-    receipt = owner_bound["owner_bound_receipt"]
-    identity = receipt.authorization_consumption_identity
-    assert state.classification(identity) == OWNER_BOUND_READY_FOR_SINGLE_LAUNCH
-    record = state.consume_once(owner_bound_receipt=receipt)
-    assert record["classification"] == OWNER_AUTHORIZATION_CONSUMED
-    assert state.classification(identity) == OWNER_AUTHORIZATION_CONSUMED
-    with pytest.raises(OwnerAuthorizationError) as failure:
-        state.consume_once(owner_bound_receipt=receipt)
-    assert failure.value.classification == "OWNER_AUTHORIZATION_ALREADY_CONSUMED"
+    """The broker transaction is the only consumption, and it happens once."""
+
+    world = owner_bound["owner_authority_world"]
+    record_id = owner_bound["provisioned"]["authorization_record_id"]
+    assert world["client"].authorization_status(record_id)["state"] == RECEIPT_ISSUED
+    with pytest.raises(OwnerAuthorityBrokerError) as failure:
+        consume_synthetic_authorization(world, owner_bound["provisioned"])
+    assert failure.value.classification == "OWNER_AUTHORITY_ALREADY_CONSUMED"
 
 
-def test_reauthorizing_a_consumed_authorization_is_refused(owner_bound):
-    state = owner_bound["authorization_state"]
-    state.consume_once(owner_bound_receipt=owner_bound["owner_bound_receipt"])
-    with pytest.raises(OwnerAuthorizationError) as failure:
-        authorize_synthetic_owner_binding(
-            owner_bound, owner_bound["payload"], state
-        )
-    assert failure.value.classification == "OWNER_AUTHORIZATION_ALREADY_CONSUMED"
+def test_reconsuming_a_spent_authorization_is_refused(owner_bound):
+    world = owner_bound["owner_authority_world"]
+    world["client"].record_launch_result(
+        authorization_record_id=owner_bound["provisioned"][
+            "authorization_record_id"
+        ],
+        receipt_identity=owner_bound["signed_receipt"].receipt_identity,
+        outcome="SYNTHETIC_TEST_LAUNCH",
+    )
+    with pytest.raises(OwnerAuthorityBrokerError) as failure:
+        consume_synthetic_authorization(world, owner_bound["provisioned"])
+    assert failure.value.classification == "OWNER_AUTHORITY_ALREADY_CONSUMED"
+    # And the gate refuses the stale receipt afterwards.
+    with pytest.raises(OwnerAuthorityGateError) as stale:
+        _gate(owner_bound)
+    assert stale.value.classification == "OWNER_AUTHORITY_ALREADY_CONSUMED"
 
 
 # --------------------------------------------------------------------------
@@ -685,12 +713,12 @@ def test_reauthorizing_a_consumed_authorization_is_refused(owner_bound):
 # --------------------------------------------------------------------------
 
 
-def test_non_production_mode_never_produces_an_owner_bound_receipt(primary):
+def test_non_production_mode_never_produces_a_signed_receipt(primary):
     mode = NonProductionWitnessMode(primary["receipt"]).validated()
     assert not isinstance(
-        mode.candidate_witness_receipt, OwnerBoundVerifiedSerializationReceipt
+        mode.candidate_witness_receipt, SignedOwnerAuthorizationReceipt
     )
-    assert not hasattr(mode, "owner_bound_receipt")
+    assert not hasattr(mode, "signed_receipt")
     assert "NO_OWNER_BINDING" in mode.acknowledgement
 
 
@@ -701,25 +729,27 @@ def test_non_production_mode_must_acknowledge_that_it_is_not_production(primary)
         ).validated()
 
 
-def test_owner_bound_receipt_cannot_be_constructed_from_its_own_fields(owner_bound):
-    body = owner_bound["owner_bound_receipt"].to_dict()
-    with pytest.raises(
-        OwnerAuthorizationError, match="only be created by the authorization path"
-    ):
-        OwnerBoundVerifiedSerializationReceipt(body, object())
+def test_a_receipt_rebuilt_from_its_own_fields_has_no_valid_signature(owner_bound):
+    """Reconstructing every field is exactly what the audit attack did."""
+
+    world = owner_bound["owner_authority_world"]
+    body = owner_bound["signed_receipt"].to_dict()
+    forged = SignedOwnerAuthorizationReceipt.from_dict(
+        {
+            **body,
+            "signature_hex": "00" * 64,
+            "receipt_identity": body["receipt_identity"],
+        }
+    )
+    with pytest.raises(OwnerAuthorityError) as failure:
+        _gate(owner_bound, signed_receipt=forged)
+    assert failure.value.classification == "OWNER_AUTHORITY_SIGNATURE_REFUSED"
 
 
-def test_the_pre_effect_gate_refuses_without_an_owner_bound_receipt(owner_bound):
-    with pytest.raises(OwnerAuthorizationError) as failure:
-        revalidate_owner_bound_receipt(
-            owner_bound_receipt=owner_bound["receipt"],
-            candidate_witness_store=owner_bound["store"],
-            authorization_state=owner_bound["authorization_state"],
-            preparation_root=owner_bound["preparation_root"],
-            retained_seal_identity=owner_bound["retained_seal_identity"],
-            expected_model_binding_policy=owner_bound["policy"],
-        )
-    assert failure.value.classification == "OWNER_BINDING_ABSENT"
+def test_the_pre_effect_gate_refuses_without_a_signed_receipt(owner_bound):
+    with pytest.raises(OwnerAuthorityGateError) as failure:
+        _gate(owner_bound, signed_receipt=owner_bound["receipt"])
+    assert failure.value.classification == "OWNER_AUTHORITY_RECEIPT_ABSENT"
 
 
 def _owner_bound_backend(tmp_path: Path, owner_bound):
@@ -744,12 +774,7 @@ def _owner_bound_backend(tmp_path: Path, owner_bound):
         session_store=session_store,
         connection_factory=factory,
         mission_prompt=SYNTHETIC_MISSION_PROMPT,
-        witness_authority=OwnerBoundWitnessAuthority(
-            owner_bound_receipt=owner_bound["owner_bound_receipt"],
-            authorization_state=owner_bound["authorization_state"],
-            preparation_root=owner_bound["preparation_root"],
-            retained_seal_identity=owner_bound["retained_seal_identity"],
-        ),
+        witness_authority=owner_bound["owner_authority_witness"],
     )
 
 
@@ -762,33 +787,34 @@ def test_no_effect_is_prepared_after_the_preparation_tree_grows(
     (owner_bound["preparation_root"] / "late-addition.txt").write_bytes(b"late\n")
     with pytest.raises(FuturePreflightSealError, match="closed authorized entry set"):
         backend.prepare_workspace()
-    # No capsule was created and the authorization is still unspent.
+    # No capsule was created and the launch was never committed.
     assert backend._workspace_sessions == {}
-    assert (
-        owner_bound["authorization_state"].classification(
-            owner_bound["owner_bound_receipt"].authorization_consumption_identity
-        )
-        == OWNER_BOUND_READY_FOR_SINGLE_LAUNCH
-    )
+    assert owner_bound["owner_authority_world"]["client"].authorization_status(
+        owner_bound["provisioned"]["authorization_record_id"]
+    )["state"] == RECEIPT_ISSUED
 
 
-def test_a_second_backend_on_a_consumed_authorization_is_refused(
+def test_a_second_backend_on_a_committed_launch_is_refused(
     tmp_path: Path, owner_bound
 ):
     backend = _owner_bound_backend(tmp_path, owner_bound)
     consumption = backend.consume_owner_authorization_once()
     assert consumption["consumed"] is True
-    assert consumption["classification"] == OWNER_AUTHORIZATION_CONSUMED
-    with pytest.raises(OwnerAuthorizationError) as failure:
+    assert consumption["state"] == LAUNCH_RESULT_RECORDED
+    with pytest.raises(OwnerAuthorityGateError) as failure:
         _owner_bound_backend(tmp_path / "second", owner_bound)
-    assert failure.value.classification == "OWNER_AUTHORIZATION_ALREADY_CONSUMED"
+    assert failure.value.classification == "OWNER_AUTHORITY_ALREADY_CONSUMED"
 
 
-def test_owner_bound_authority_refuses_a_candidate_receipt_in_its_slot(owner_bound):
-    with pytest.raises(ValueError, match="owner-bound serialization receipt"):
-        OwnerBoundWitnessAuthority(
-            owner_bound_receipt=owner_bound["receipt"],
-            authorization_state=owner_bound["authorization_state"],
+def test_owner_authority_witness_refuses_a_candidate_receipt_in_its_slot(
+    owner_bound,
+):
+    world = owner_bound["owner_authority_world"]
+    with pytest.raises(ValueError, match="broker-signed owner"):
+        SyntheticOwnerAuthorityWitness(
+            signed_receipt=owner_bound["receipt"],
+            installation=world["installation"],
+            broker_client=world["client"],
             preparation_root=owner_bound["preparation_root"],
             retained_seal_identity=owner_bound["retained_seal_identity"],
         ).validated()
@@ -810,22 +836,35 @@ def test_the_owner_phrase_arrives_only_on_a_private_descriptor(tmp_path: Path):
     assert failure.value.classification == "OWNER_PHRASE_CHANNEL_REFUSED"
 
 
-def test_the_owner_digest_construction_is_versioned_and_payload_exact(
+def test_the_owner_digest_binds_the_payload_and_the_root_chosen_record(
     tmp_path: Path, primary
 ):
+    """The caller cannot precompute the digest: it binds a root-chosen identity."""
+
     prepared = build_sealed_candidate_preparation(
         tmp_path / "digest", binding=primary
     )
     payload = build_owner_payload(prepared)
-    exact = owner_authorization_digest(
+    record_id = new_authorization_record_id()
+    exact = external_owner_authorization_digest(
         phrase=SYNTHETIC_OWNER_PHRASE,
         payload_bytes=payload.canonical_payload_bytes(),
+        authorization_record_id=record_id,
     )
-    assert exact != owner_authorization_digest(
+    # A single byte of payload drift changes the digest.
+    assert exact != external_owner_authorization_digest(
         phrase=SYNTHETIC_OWNER_PHRASE,
         payload_bytes=payload.canonical_payload_bytes() + b" ",
+        authorization_record_id=record_id,
     )
-    assert "v2" in OWNER_DIGEST_CONSTRUCTION
+    # And so does the record identity the privileged provisioner chose.
+    assert exact != external_owner_authorization_digest(
+        phrase=SYNTHETIC_OWNER_PHRASE,
+        payload_bytes=payload.canonical_payload_bytes(),
+        authorization_record_id=new_authorization_record_id(),
+    )
+    assert "v3" in EXTERNAL_OWNER_DIGEST_CONSTRUCTION
+    assert payload.body["digest_construction"] == EXTERNAL_OWNER_DIGEST_CONSTRUCTION
 
 
 def test_local_login_classification_reads_no_credential_bytes(tmp_path: Path):
@@ -878,13 +917,18 @@ def test_owner_payload_binds_every_required_witness_and_preparation_identity(
     assert body["zero_retry_policy"]["launches_per_authorization"] == 1
 
 
-def test_no_owner_phrase_material_appears_in_the_owner_bound_receipt(owner_bound):
+def test_no_owner_phrase_material_appears_in_the_signed_receipt(owner_bound):
     rendered = canonical_bytes(
-        owner_bound["owner_bound_receipt"].to_dict()
+        owner_bound["signed_receipt"].to_dict()
     ).decode("utf-8")
     assert SYNTHETIC_OWNER_PHRASE not in rendered
     for denied in ("credential", "prompt_text", "authorization_header"):
         assert denied not in rendered.lower()
-    # The only occurrence of "phrase" is the construction label, never material.
-    assert rendered.count("phrase") == 1
-    assert OWNER_DIGEST_CONSTRUCTION in rendered
+    # Every occurrence of "phrase" belongs to the construction label, never to
+    # phrase material: removing the label leaves no occurrence behind.
+    assert EXTERNAL_OWNER_DIGEST_CONSTRUCTION in rendered
+    assert "phrase" not in rendered.replace(
+        EXTERNAL_OWNER_DIGEST_CONSTRUCTION, ""
+    )
+    # The expected digest itself never leaves the root-owned state.
+    assert "expected_owner_authorization_digest" not in rendered
