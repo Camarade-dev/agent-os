@@ -6,11 +6,12 @@ fixed path, and every runtime consumer re-derives its identity from the file it
 actually opened: path, device, inode, owner, mode and content.  Nothing here
 searches for a key, accepts a key from a caller, or falls back to another path.
 
-``installation_identity`` is the value bound into the signed receipt, into
-``BackendExecutionAuthority`` and into the launch fingerprint.  It changes if
-the record moves, is replaced, changes owner or mode, or names a different key
---- so a copied public record on another device attests to a different
-installation and cannot validate a receipt issued under the real one.
+``installation_identity`` is the *stable* installation identity bound into the
+signed receipt, into ``BackendExecutionAuthority`` and into the launch
+fingerprint.  It is deliberately independent of the cryptographic executable
+revision and of the mutable record content hash: a crypto-attestation revision
+preserves this identity so historical receipts remain verifiable.  It still
+changes if the installation id, signing key, public key or layout roots change.
 """
 
 from __future__ import annotations
@@ -39,7 +40,10 @@ from admissible.capsule.owner_authority.layout import (
     INSTALLATION_RECORD_SCHEMA_VERSION,
     OwnerAuthorityError,
     OwnerAuthorityLayout,
+    PRODUCTION_CONFIGURATION_ROOT,
     PRODUCTION_LAYOUT,
+    PRODUCTION_RUNTIME_ROOT,
+    PRODUCTION_STATE_ROOT,
     RECEIPT_SIGNATURE_CONSTRUCTION,
     SYNTHETIC_LAYOUT,
     production_layout,
@@ -67,12 +71,16 @@ _RECORD_KEYS = frozenset(
         "signing_key_fingerprint",
         "public_key_sha256",
         "cryptographic_executable_identity",
+        "crypto_attestation_revision",
         "authorized_launcher_uid",
         "authorized_launcher_gid",
         "installer_uid",
+        "deployment_artifact_identity",
         "record_identity",
     }
 )
+
+INITIAL_CRYPTO_ATTESTATION_REVISION = "crypto-attestation-revision-v1-initial"
 
 _FILE_IDENTITY_KEYS = frozenset(
     {
@@ -209,10 +217,31 @@ def build_installation_record(
     authorized_launcher_uid: int,
     authorized_launcher_gid: int,
     installer_uid: int,
+    crypto_attestation_revision: str = INITIAL_CRYPTO_ATTESTATION_REVISION,
+    deployment_artifact_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the installation record body.  Called only by the installer."""
 
     layout.validated()
+    artifact = None
+    if deployment_artifact_identity is not None:
+        if not isinstance(deployment_artifact_identity, Mapping):
+            raise OwnerAuthorityInstallationError(
+                "deployment artifact identity is not an object"
+            )
+        artifact = {
+            "path": str(deployment_artifact_identity["path"]),
+            "sha256": require_sha256(
+                deployment_artifact_identity["sha256"],
+                "deployment artifact sha256",
+            ),
+            "size": require_strict_int(
+                deployment_artifact_identity["size"],
+                "deployment artifact size",
+                minimum=1,
+                maximum=512 * 1024 * 1024,
+            ),
+        }
     body = {
         "schema_version": INSTALLATION_RECORD_SCHEMA_VERSION,
         "installation_id": require_identifier(
@@ -237,6 +266,9 @@ def build_installation_record(
         "cryptographic_executable_identity": validate_executable_identity(
             cryptographic_executable_identity
         ),
+        "crypto_attestation_revision": require_identifier(
+            crypto_attestation_revision, "crypto attestation revision"
+        ),
         "authorized_launcher_uid": require_strict_int(
             authorized_launcher_uid,
             "authorized launcher uid",
@@ -252,6 +284,7 @@ def build_installation_record(
         "installer_uid": require_strict_int(
             installer_uid, "installer uid", minimum=0, maximum=0
         ),
+        "deployment_artifact_identity": artifact,
     }
     return {**body, "record_identity": fingerprint(body)}
 
@@ -400,16 +433,37 @@ class OwnerAuthorityInstallation:
         return self
 
     def validated_production(self) -> "OwnerAuthorityInstallation":
-        """Refuse anything but a genuine production installation."""
+        """Refuse anything but a genuine fixed production installation.
 
-        if not self.is_production:
+        Production status is re-derived from the validated fixed layout paths
+        and the installation record itself.  An overridable ``is_production``
+        property, subclass assertion, caller flag or serialized classification
+        alone is never enough.
+        """
+
+        validated = self.validated()
+        fixed = production_layout().validated()
+        if (
+            validated.layout.classification != PRODUCTION_LAYOUT
+            or validated.layout.configuration_root != fixed.configuration_root
+            or validated.layout.state_root != fixed.state_root
+            or validated.layout.runtime_root != fixed.runtime_root
+            or validated.record["layout_classification"] != PRODUCTION_LAYOUT
+            or validated.record["configuration_root"]
+            != str(fixed.configuration_root)
+            or validated.record["state_root"] != str(fixed.state_root)
+            or validated.record["runtime_root"] != str(fixed.runtime_root)
+            or validated.record_file_identity["path"]
+            != str(fixed.installation_record_path)
+            or validated.public_key_file_identity["path"]
+            != str(fixed.public_key_path)
+        ):
             raise OwnerAuthorityInstallationError(
                 "a production execution authority requires the fixed "
                 "root-owned production installation, not "
-                f"{self.layout.classification}",
+                f"{validated.layout.classification}",
                 classification="OWNER_AUTHORITY_NON_PRODUCTION_INSTALLATION_REFUSED",
             )
-        validated = self.validated()
         if validated.cryptographic_executable_identity["owner_uid"] != 0:
             raise OwnerAuthorityInstallationError(
                 "the production owner authority requires a root-owned "
@@ -421,6 +475,14 @@ class OwnerAuthorityInstallation:
     def reattest_cryptographic_executable(self) -> Mapping[str, Any]:
         return reattest_executable(self.cryptographic_executable_identity)
 
+    def crypto_attestation_revision(self) -> str:
+        """The committed crypto-attestation revision used for new receipts."""
+
+        return require_identifier(
+            self.record["crypto_attestation_revision"],
+            "crypto attestation revision",
+        )
+
     def reattested(self) -> "OwnerAuthorityInstallation":
         """Re-read the installation from disk and refuse any drift.
 
@@ -429,13 +491,24 @@ class OwnerAuthorityInstallation:
         caught even though the original attestation object still exists.
         """
 
-        fresh = _attest_layout(self.layout)
+        # Re-derive production status from the fixed layout constants rather
+        # than trusting an overridable property on a possibly subclassed
+        # instance that still holds a stale ``layout`` reference.
+        must_be_production = (
+            self.layout.classification == PRODUCTION_LAYOUT
+            and self.layout.configuration_root == PRODUCTION_CONFIGURATION_ROOT
+            and self.layout.state_root == PRODUCTION_STATE_ROOT
+            and self.layout.runtime_root == PRODUCTION_RUNTIME_ROOT
+        )
+        fresh = _attest_layout(
+            production_layout() if must_be_production else self.layout
+        )
         if fresh.installation_identity != self.installation_identity:
             raise OwnerAuthorityInstallationError(
                 "the owner-authority installation changed since it was attested",
                 classification="OWNER_AUTHORITY_INSTALLATION_CHANGED",
             )
-        return fresh.validated_production() if self.is_production else fresh
+        return fresh.validated_production() if must_be_production else fresh
 
 
 def _installation_identity(
@@ -445,15 +518,29 @@ def _installation_identity(
     public_key_file_identity: Mapping[str, Any],
     layout: OwnerAuthorityLayout,
 ) -> str:
+    """Stable installation identity.
+
+    Deliberately excludes ``record_identity``, crypto-attestation revision and
+    cryptographic executable identity so an OpenSSL revision does not change
+    the installation identity bound into historical receipts.  The public key
+    path and content digest, the installation id and the layout roots remain.
+    """
+
     return fingerprint(
         {
-            "schema_version": "admissible_owner_authority_installation_identity_v1",
+            "schema_version": "admissible_owner_authority_stable_installation_identity_v1",
             "layout_classification": layout.classification,
-            "record_identity": record["record_identity"],
-            "record_file_identity": dict(record_file_identity),
-            "public_key_file_identity": dict(public_key_file_identity),
-            "signing_key_fingerprint": record["signing_key_fingerprint"],
             "installation_id": record["installation_id"],
+            "signing_key_fingerprint": record["signing_key_fingerprint"],
+            "public_key_sha256": record["public_key_sha256"],
+            "configuration_root": record["configuration_root"],
+            "state_root": record["state_root"],
+            "runtime_root": record["runtime_root"],
+            "public_key_path": record["public_key_path"],
+            "public_key_file_path": public_key_file_identity["path"],
+            "public_key_file_sha256": public_key_file_identity["sha256"],
+            # Bound to the fixed record path, not the mutable content hash.
+            "installation_record_path": record_file_identity["path"],
         }
     )
 

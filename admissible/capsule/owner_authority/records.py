@@ -77,6 +77,7 @@ _RECEIPT_PAYLOAD_KEYS = frozenset(
         "installation_id",
         "installation_identity",
         "signing_key_fingerprint",
+        "crypto_attestation_revision",
         "authorization_record_id",
         "authorization_record_identity",
         "owner_payload",
@@ -314,6 +315,7 @@ def build_receipt_payload(
         "installation_id": installation.installation_id,
         "installation_identity": installation.installation_identity,
         "signing_key_fingerprint": installation.signing_key_fingerprint,
+        "crypto_attestation_revision": installation.crypto_attestation_revision(),
         "authorization_record_id": record["authorization_record_id"],
         "authorization_record_identity": record["record_identity"],
         "owner_payload": dict(record["owner_payload"]),
@@ -525,6 +527,14 @@ def verify_signed_receipt(
     record at the fixed path --- and from nowhere else.  A caller-generated key,
     a key at another path, or a receipt signed under another installation all
     fail here.
+
+    Historical receipts remain verifiable after a crypto-attestation revision:
+    the stable installation identity and signing public key are revalidated,
+    the receipt's exact historical crypto revision is loaded from the
+    append-only history (and need not still be current), and the signature is
+    checked with that revision's OpenSSL identity.  Deleted, altered,
+    re-fingerprinted or rolled-back history refuses.  New receipts may use only
+    the exact committed current revision at issuance time.
     """
 
     if not isinstance(receipt, SignedOwnerAuthorizationReceipt):
@@ -553,8 +563,58 @@ def verify_signed_receipt(
             "the signed receipt names another signing key or installation",
             classification="OWNER_AUTHORITY_RECEIPT_FOREIGN_INSTALLATION",
         )
+
+    receipt_revision = receipt.payload.get("crypto_attestation_revision")
+    if not isinstance(receipt_revision, str) or not receipt_revision:
+        raise OwnerAuthorityRecordError(
+            "the signed receipt does not bind a crypto attestation revision",
+            classification="OWNER_AUTHORITY_RECEIPT_INVALID",
+        )
+    from admissible.capsule.owner_authority.crypto_revision import (
+        load_crypto_attestation_revision_for_verification,
+    )
+    from admissible.capsule.owner_authority.installation import (
+        INITIAL_CRYPTO_ATTESTATION_REVISION,
+    )
+
+    current_revision = attested.crypto_attestation_revision()
+    if receipt_revision == current_revision:
+        executable = attested.cryptographic_executable_identity
+    else:
+        historical = load_crypto_attestation_revision_for_verification(
+            layout=attested.layout,
+            revision_id=receipt_revision,
+            installation_identity=attested.installation_identity,
+            signing_key_fingerprint=attested.signing_key_fingerprint,
+            public_key_sha256=attested.record["public_key_sha256"],
+            allow_initial=(
+                receipt_revision == INITIAL_CRYPTO_ATTESTATION_REVISION
+            ),
+            initial_executable=(
+                dict(
+                    receipt.payload["broker_terminal_evidence"][
+                        "cryptographic_executable_identity"
+                    ]
+                )
+                if receipt_revision == INITIAL_CRYPTO_ATTESTATION_REVISION
+                else None
+            ),
+        )
+        executable = historical["cryptographic_executable_identity"]
+        terminal_exec = receipt.payload["broker_terminal_evidence"][
+            "cryptographic_executable_identity"
+        ]
+        if dict(terminal_exec) != dict(executable) and (
+            receipt_revision != INITIAL_CRYPTO_ATTESTATION_REVISION
+        ):
+            raise OwnerAuthorityRecordError(
+                "the signed receipt terminal evidence names a different "
+                "cryptographic executable than the historical revision",
+                classification="OWNER_AUTHORITY_CRYPTO_REVISION_HISTORY_TAMPERED",
+            )
+
     verified = verify_signature(
-        executable=attested.cryptographic_executable_identity,
+        executable=executable,
         public_key_pem=bytes(attested.public_key_pem),
         message=receipt.signed_bytes(),
         signature=receipt.signature,
@@ -585,6 +645,7 @@ def verify_signed_receipt(
         "classification": "OWNER_AUTHORITY_SIGNATURE_VERIFIED",
         "installation_identity": attested.installation_identity,
         "signing_key_fingerprint": attested.signing_key_fingerprint,
+        "crypto_attestation_revision": receipt_revision,
         "receipt_identity": receipt.receipt_identity,
         "authorization_record_id": receipt.authorization_record_id,
         "owner_payload_fingerprint": receipt.owner_payload_fingerprint,
