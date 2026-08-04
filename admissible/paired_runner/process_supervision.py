@@ -205,15 +205,25 @@ def _rusage_children() -> Any:
 
 _DELEGATION_LOCK = threading.Lock()
 _DELEGATION_CACHE: CgroupDelegation | None = None
+_DELEGATION_PID: int | None = None
 
 
 def cgroup_delegation(*, force: bool = False) -> CgroupDelegation:
-    """Probe cgroup v2 delegation once per process and reuse the answer."""
+    """Probe cgroup v2 delegation once per controller process and reuse the answer.
 
-    global _DELEGATION_CACHE
+    The answer describes a topology owned by one PID: the trusted manager leaf
+    holds *this* process, and the delegated parent distributes controllers only
+    because this process left it.  A cache inherited across ``fork`` therefore
+    describes somebody else's topology and is never reused; the child re-derives
+    it, which either reuses the existing manager leaf it is already a member of
+    or fails closed.
+    """
+
+    global _DELEGATION_CACHE, _DELEGATION_PID
     with _DELEGATION_LOCK:
-        if _DELEGATION_CACHE is None or force:
-            _DELEGATION_CACHE = probe_cgroup_delegation()
+        if _DELEGATION_CACHE is None or force or _DELEGATION_PID != os.getpid():
+            _DELEGATION_CACHE = probe_cgroup_delegation(force=force)
+            _DELEGATION_PID = os.getpid()
         return _DELEGATION_CACHE
 
 
@@ -241,7 +251,11 @@ def _containment_evidence(status: dict[str, Any] | None, mechanism: str, cgroup:
         }
     described = [f"{name}={value[0]}" for name, value in sorted(applied.items()) if isinstance(value, list) and value]
     if cgroup is not None and cgroup.active:
+        # ``applied`` holds values read back from the kernel after they were
+        # written, so this records the bound the kernel held rather than the one
+        # the controller asked for.
         described += [f"cgroup.{name}={value}" for name, value in sorted(cgroup.applied.items())]
+        described.append(f"cgroup.effect_path={cgroup.path}")
         described.append(f"cgroup.membership_verified={sorted(cgroup.members())}")
     return {
         "containment_mechanism": mechanism,

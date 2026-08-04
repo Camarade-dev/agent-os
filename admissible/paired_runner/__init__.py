@@ -68,8 +68,11 @@ from .git_observer import GitObservationRefused, observe_repository
 from .resource_limits import (
     CONTAINMENT_MECHANISMS,
     CgroupDelegation,
+    CgroupTopology,
     ResourceBounds,
+    initialize_cgroup_topology,
     probe_cgroup_delegation,
+    topology_lifecycle_description,
 )
 from .run_index import (
     DurableRunIndex,
@@ -166,6 +169,7 @@ __all__ = [
     "CapsuleRuntimeManifest",
     "CapsuleSpecification",
     "CgroupDelegation",
+    "CgroupTopology",
     "ConfigurationRefused",
     "DurableRunIndex",
     "EVENT_KINDS",
@@ -186,7 +190,9 @@ __all__ = [
     "observe_repository",
     "package_source_identity",
     "probe_capsule_readiness",
+    "initialize_cgroup_topology",
     "probe_cgroup_delegation",
+    "topology_lifecycle_description",
     "recover_run_index",
     "require_no_workspace_ipc_endpoints",
     "scan_workspace_ipc_endpoints",

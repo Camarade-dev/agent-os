@@ -139,3 +139,75 @@ per-process `setrlimit` layer, physically proved at readiness.
 * Child CPU and peak RSS in `ResourceObservation` remain `OBSERVED_BEST_EFFORT`
   because `getrusage(RUSAGE_CHILDREN)` aggregates every reaped child of the
   controller. The *bounds* are `OBSERVED`; the *measurements* are not.
+
+---
+
+# Addendum: cgroup topology qualification (M2-B25)
+
+Branch: `paired-runner/m2-b25-cgroup-topology-repair`
+Starting commit: `f2e766fe1ed1c3ac60f4cf542a6e5e7723e72b77`
+
+## A1. What section 6 above described, and what changed
+
+Section 6 recorded that on the qualification host no subtree is delegated and
+the mechanism in force is `RLIMIT`. That remains true of an undelegated host and
+is still reported honestly. What was *not* true is the implication that a
+delegated host would therefore have worked: on a host that genuinely delegates a
+writable subtree, the old readiness probe reported `available=true` after a bare
+`mkdir`/`rmdir`, and the first real per-effect limit write then failed with
+`EACCES`, because the delegated parent still held the controller and cgroup v2
+refuses to distribute controllers out of a populated cgroup.
+
+Readiness now performs the whole rehearsal — manager-leaf bootstrap, controller
+activation, a real probe effect with `pids.max` and `memory.max` written and read
+back — so `CGROUP_V2_AND_RLIMIT` is only ever promised by a host that has already
+delivered it. See `M2_CGROUP_LAUNCH_PRIMITIVE_SPEC.md`, addendum A2–A7, for the
+topology, the bootstrap sequence, the classified outcomes, and the lifecycle.
+
+## A2. Aggregate layer, restated
+
+When the topology is initialized, each effect runs in a sibling cgroup of the
+trusted manager leaf carrying:
+
+| Control file | Value | Source |
+| --- | --- | --- |
+| `pids.max` | `ResourceBounds.max_processes` (64) | written, then read back and compared exactly |
+| `memory.max` | `ResourceBounds.max_address_space_bytes` (2 GiB) | written, then read back and compared exactly |
+
+`max` is never accepted where a finite bound was required. The values recorded in
+the durable `resource-observation` (`cgroup.pids.max=`, `cgroup.memory.max=`,
+`cgroup.effect_path=`, `cgroup.membership_verified=`) are the values the kernel
+returned, not the values the controller intended. Descendants inherit the effect
+cgroup, so the bound is aggregate over the whole process domain rather than
+per-process as `RLIMIT` alone would be.
+
+## A3. Physical qualification rule
+
+`CGROUP_V2_AND_RLIMIT` is claimed for an effect only when membership was
+verified from a real cgroup2 `cgroup.procs` *before* the trusted gate was
+released. An attach or verification failure terminates and reaps the child, the
+proposed command executes no instruction, and the effect is refused with
+`cgroup_membership_unverified`. There is no silent downgrade to `RLIMIT` after
+readiness has promised the cgroup layer.
+
+## A4. Test matrix addendum
+
+`tests/test_admissible_paired_runner_m2_b25_cgroup_topology.py`
+
+| Requirement | Test |
+| --- | --- |
+| the old false-positive probe shape is refused | `FalsePositiveProbeRegressionTests` |
+| every bootstrap transition is classified and rolls back | `ManagerLeafBootstrapTests` |
+| one topology per process, PID-bound, no nested leaves | `TopologyIdempotenceTests` |
+| complete writes, explicit newlines, exact readback | `KernelWriteTests` |
+| creation alone is never success | `EffectCgroupTests` |
+| a filesystem fixture is never kernel evidence | `EvidenceRuleTests` |
+| lifecycle is stated, not implied | `LifecycleTests` |
+| real bootstrap and effect limits | `test_real_delegated_cgroup_bootstrap_and_effect_limits` |
+| membership before gate release, production path | `test_production_command_is_member_before_gate_release` |
+| a refused proof executes no command | `test_failed_membership_verification_executes_no_command` |
+| descendants inherit the effect cgroup | `test_descendant_inherits_effect_cgroup` |
+| repeated effects reuse one manager topology | `test_repeated_production_effects_reuse_one_manager_topology` |
+
+Under `ADMISSIBLE_REQUIRE_DELEGATED_CGROUP=1` the delegated tests fail rather
+than skip. A skipped delegated test is a closure failure, never a green run.

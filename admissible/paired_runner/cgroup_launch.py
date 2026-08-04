@@ -26,11 +26,7 @@ from pathlib import Path
 import stat
 from typing import Any
 
-from .resource_limits import EffectCgroup
-
-
-#: Linux cgroup2 filesystem magic (include/uapi/linux/magic.h).
-CGROUP2_SUPER_MAGIC = 0x63677270
+from .resource_limits import CGROUP2_SUPER_MAGIC, EffectCgroup, statfs_f_type
 
 LAUNCH_ORDER = (
     "OBTAIN_CHILD_PID",
@@ -51,42 +47,6 @@ class CgroupLaunchRefused(RuntimeError):
         self.detail = detail
 
 
-def _statvfs_f_type(path: Path) -> int | None:
-    try:
-        result = os.statvfs(path)
-    except OSError:
-        return None
-    # On Linux, f_type / f_fsid layout varies; prefer libc statfs when available.
-    try:
-        import ctypes
-        import ctypes.util
-
-        class Statfs(ctypes.Structure):
-            _fields_ = [
-                ("f_type", ctypes.c_long),
-                ("f_bsize", ctypes.c_long),
-                ("f_blocks", ctypes.c_ulong),
-                ("f_bfree", ctypes.c_ulong),
-                ("f_bavail", ctypes.c_ulong),
-                ("f_files", ctypes.c_ulong),
-                ("f_ffree", ctypes.c_ulong),
-                ("f_fsid", ctypes.c_ulong * 2),
-                ("f_namelen", ctypes.c_long),
-                ("f_frsize", ctypes.c_long),
-                ("f_flags", ctypes.c_long),
-                ("f_spare", ctypes.c_long * 4),
-            ]
-
-        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
-        buf = Statfs()
-        if libc.statfs(str(path).encode(), ctypes.byref(buf)) != 0:
-            return None
-        return int(buf.f_type)
-    except Exception:
-        # Fall back: reject obvious regular-file fakes via S_ISREG on cgroup.procs.
-        return None
-
-
 def require_real_cgroup_procs(cgroup_directory: Path) -> Path:
     """Refuse synthetic regular files presented as kernel cgroup evidence."""
 
@@ -98,7 +58,7 @@ def require_real_cgroup_procs(cgroup_directory: Path) -> Path:
     # A hand-made regular file in a temp directory is not kernel evidence.
     # Real cgroup.procs is a cgroupfs virtual file; it is not a directory and on
     # a genuine cgroup2 mount ``statfs`` reports CGROUP2_SUPER_MAGIC.
-    f_type = _statvfs_f_type(cgroup_directory)
+    f_type = statfs_f_type(cgroup_directory)
     if f_type is not None and f_type != CGROUP2_SUPER_MAGIC:
         raise CgroupLaunchRefused("cgroup_procs_not_on_cgroup2", f"f_type={f_type:#x}")
     if f_type is None:
