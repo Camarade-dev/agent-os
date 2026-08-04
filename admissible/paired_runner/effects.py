@@ -34,7 +34,13 @@ from typing import Any, Callable
 
 from .canonical import Fingerprint, fingerprint
 from .durable_store import (
+    FAULT_AFTER_EFFECT_BEFORE_AFTER_OBSERVATIONS,
     FAULT_AFTER_EFFECT_BEFORE_TERMINAL_RECEIPT,
+    FAULT_BEFORE_FINAL_RECONCILIATION,
+    FAULT_OBSERVER_FAILURE_AFTER_STARTED,
+    FAULT_SANDBOX_SUPERVISOR_DEATH,
+    STAGE_FINAL_RECONCILIATION_PUBLICATION,
+    STAGE_LEDGER_PENDING_PUBLICATION,
     FAULT_AFTER_PROPOSAL_PUBLICATION,
     FAULT_AFTER_RESERVATION_PUBLICATION,
     FAULT_AFTER_STARTED_BEFORE_EFFECT,
@@ -49,6 +55,13 @@ from .durable_store import (
     NULL_FAULT_INJECTOR,
 )
 from .effect_ledger import LEDGER_OBJECT_KIND, EffectLedgerEntry, RunEffectLedger
+from .reconciliation import (
+    FINAL_RECONCILIATION_OBJECT_KIND,
+    LEDGER_PENDING_STATE,
+    FinalReconciliation,
+    reconcile_typed_chain,
+)
+from .run_index import DurableRunIndex, RunIndexBroken
 from .identities import IdentityReference
 from .observation import (
     SCHEMA_FILESYSTEM_OBSERVATION,
@@ -63,6 +76,14 @@ from .observation import (
     StreamObservation,
 )
 from .process_supervision import CancellationToken, supervise_command
+from .sandbox import (
+    CAPSULE_WORKSPACE_PATH,
+    CapsuleReadiness,
+    CapsuleSpecification,
+    SandboxUnavailable,
+    build_capsule_specification,
+    probe_capsule_readiness,
+)
 from .schemas import TOOL_EFFECT_CLASSIFICATIONS
 from .specification import (
     CanonicalProposal,
@@ -91,6 +112,10 @@ TREE_FINGERPRINT_DOMAIN = f"{SCHEMA_FILESYSTEM_OBSERVATION}.tree"
 GIT_STATUS_FINGERPRINT_DOMAIN = f"{SCHEMA_GIT_OBSERVATION}.status"
 WORKSPACE_IDENTITY_DOMAIN = "admissible.paired_runner.m2.workspace_binding"
 MAX_OBSERVED_TREE_ENTRIES = 100_000
+#: Total regular-file bytes one observation may stream-hash.
+MAX_OBSERVED_CONTENT_BYTES = 2 * 1024 * 1024 * 1024
+#: Bound on retained output from a Git observation.
+MAX_GIT_OUTPUT_BYTES = 4 * 1024 * 1024
 GIT_OBSERVATION_TIMEOUT_SECONDS = 20.0
 WRITE_TEMPORARY_PREFIX = ".tmp-write-"
 DIRECTORY_MODE = 0o700
@@ -222,54 +247,163 @@ class _DirectoryChain:
 
 # --- physical observations ---------------------------------------------------
 
-def observe_filesystem(root_fd: int, *, phase: str) -> FilesystemObservation:
-    """Fingerprint the workspace tree without following any symlink."""
+def _hash_regular_file(directory_fd: int, name: str, *, byte_budget: int) -> tuple[str | None, int, str | None]:
+    """Stream-hash one regular file without ever following a symlink.
+
+    Returns ``(content_fingerprint_hex, bytes_read, error)``.  The file is
+    opened ``O_NOFOLLOW|O_NONBLOCK`` and re-checked with ``fstat`` on the open
+    descriptor, so a name that is swapped for a symlink, FIFO, or device between
+    the directory scan and the open cannot make the observer follow it or block
+    on it.
+    """
+
+    try:
+        handle = os.open(
+            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory_fd
+        )
+    except OSError as error:
+        return None, 0, f"open_failed:{errno.errorcode.get(error.errno, error.errno)}"
+    try:
+        info = os.fstat(handle)
+        if not stat.S_ISREG(info.st_mode):
+            # The entry changed identity after the scan; that is an observation
+            # error, never a silently skipped entry.
+            return None, 0, "entry_is_no_longer_a_regular_file"
+        digest = hashlib.sha256()
+        read_total = 0
+        while True:
+            if read_total > byte_budget:
+                return None, read_total, "content_byte_budget_exhausted"
+            try:
+                chunk = os.read(handle, 1 << 20)
+            except BlockingIOError:  # pragma: no cover - regular files never block
+                return None, read_total, "read_would_block"
+            except OSError as error:
+                return None, read_total, f"read_failed:{errno.errorcode.get(error.errno, error.errno)}"
+            if not chunk:
+                break
+            digest.update(chunk)
+            read_total += len(chunk)
+        return digest.hexdigest(), read_total, None
+    finally:
+        os.close(handle)
+
+
+def observe_filesystem(
+    root_fd: int,
+    *,
+    phase: str,
+    max_entries: int = MAX_OBSERVED_TREE_ENTRIES,
+    max_content_bytes: int = MAX_OBSERVED_CONTENT_BYTES,
+) -> FilesystemObservation:
+    """Fingerprint the workspace tree *including file contents*.
+
+    The Milestone 2 observer bound only ``(path, kind, size, mode)``, so a
+    same-size content substitution -- the single easiest way to alter a
+    workspace without being seen -- left the tree fingerprint unchanged.  This
+    observer streams the bytes of every regular file into the fingerprint and
+    records a symlink's target bytes without following the link, so the
+    fingerprint changes whenever the tree's observable content changes.
+
+    Nothing is skipped silently.  Every entry that cannot be listed, stated,
+    opened, or read is recorded as an explicit error, and any observation that
+    carries an error or hits a limit is marked incomplete so it can never serve
+    as a final repository fingerprint.
+    """
 
     entries: list[dict[str, Any]] = []
+    errors: list[str] = []
     total_bytes = 0
+    hashed_files = 0
     truncated = False
+    completeness = "COMPLETE"
+    remaining_budget = max_content_bytes
     stack: list[tuple[int, str, bool]] = [(root_fd, "", False)]
     try:
         while stack:
             directory_fd, prefix, owned = stack.pop()
             try:
                 names = sorted(os.listdir(directory_fd))
-            except OSError:
+            except OSError as error:
+                # An unreadable directory is recorded, not quietly treated as
+                # empty.  Claiming OBSERVED over an unread subtree would be a
+                # false statement about the workspace.
+                errors.append(
+                    f"{prefix or '.'}:listdir_failed:{errno.errorcode.get(error.errno, error.errno)}"
+                )
+                completeness = "INCOMPLETE_OBSERVATION_ERROR"
                 names = []
             for name in names:
                 relative = f"{prefix}{name}"
                 try:
                     info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-                except OSError:
+                except OSError as error:
+                    # The entry disappeared or became unreadable between the
+                    # listing and the stat.  That is a recorded fact.
+                    errors.append(
+                        f"{relative}:stat_failed:{errno.errorcode.get(error.errno, error.errno)}"
+                    )
+                    completeness = "INCOMPLETE_OBSERVATION_ERROR"
                     continue
-                if stat.S_ISDIR(info.st_mode):
-                    kind = "directory"
-                    size = 0
-                elif stat.S_ISLNK(info.st_mode):
-                    kind = "symlink"
-                    size = info.st_size
-                elif stat.S_ISREG(info.st_mode):
-                    kind = "regular_file"
-                    size = info.st_size
-                    total_bytes += size
-                else:
-                    kind = "other"
-                    size = 0
-                if len(entries) >= MAX_OBSERVED_TREE_ENTRIES:
+                if len(entries) >= max_entries:
                     truncated = True
+                    if completeness == "COMPLETE":
+                        completeness = "INCOMPLETE_ENTRY_LIMIT"
                     continue
-                entries.append(
-                    {
-                        "path": relative,
-                        "kind": kind,
-                        "size": size if kind == "regular_file" else 0,
-                        "mode": stat.S_IMODE(info.st_mode),
-                    }
-                )
-                if kind == "directory":
+
+                entry: dict[str, Any] = {
+                    "path": relative,
+                    "mode": stat.S_IMODE(info.st_mode),
+                    "content_fingerprint": None,
+                    "symlink_target_hex": None,
+                    "size": 0,
+                }
+                if stat.S_ISDIR(info.st_mode):
+                    entry["kind"] = "directory"
+                elif stat.S_ISLNK(info.st_mode):
+                    entry["kind"] = "symlink"
+                    try:
+                        # The target *bytes* are bound; the link is never
+                        # followed, so a retarget is visible as a change.
+                        target = os.readlink(name, dir_fd=directory_fd)
+                        entry["symlink_target_hex"] = target.encode(
+                            "utf-8", "surrogateescape"
+                        ).hex()
+                    except OSError as error:
+                        errors.append(
+                            f"{relative}:readlink_failed:{errno.errorcode.get(error.errno, error.errno)}"
+                        )
+                        completeness = "INCOMPLETE_OBSERVATION_ERROR"
+                elif stat.S_ISREG(info.st_mode):
+                    entry["kind"] = "regular_file"
+                    entry["size"] = info.st_size
+                    total_bytes += info.st_size
+                    content, read_total, error_detail = _hash_regular_file(
+                        directory_fd, name, byte_budget=remaining_budget
+                    )
+                    remaining_budget -= read_total
+                    if content is None:
+                        errors.append(f"{relative}:{error_detail}")
+                        if error_detail == "content_byte_budget_exhausted":
+                            if completeness == "COMPLETE":
+                                completeness = "INCOMPLETE_BYTE_LIMIT"
+                        else:
+                            completeness = "INCOMPLETE_OBSERVATION_ERROR"
+                    else:
+                        entry["content_fingerprint"] = content
+                        hashed_files += 1
+                else:
+                    # A FIFO, socket, or device is recorded by type.  It is never
+                    # opened, so a hostile special file cannot block the observer.
+                    entry["kind"] = "other"
+
+                entries.append(entry)
+                if entry["kind"] == "directory":
                     try:
                         child = _open_child_directory(directory_fd, name)
-                    except (WorkspaceRefusal, WorkspaceFailure):  # pragma: no cover
+                    except (WorkspaceRefusal, WorkspaceFailure) as refusal:
+                        errors.append(f"{relative}:descend_failed:{refusal.error_code}")
+                        completeness = "INCOMPLETE_OBSERVATION_ERROR"
                         continue
                     stack.append((child, f"{relative}/", True))
             if owned:
@@ -281,55 +415,134 @@ def observe_filesystem(root_fd: int, *, phase: str) -> FilesystemObservation:
                     os.close(directory_fd)
                 except OSError:  # pragma: no cover
                     pass
+
     entries.sort(key=lambda item: item["path"])
+    availability = "OBSERVED" if completeness == "COMPLETE" else "OBSERVED_BEST_EFFORT"
     return FilesystemObservation.create(
         phase=phase,
         entry_count=len(entries),
         total_regular_file_bytes=total_bytes,
         truncated=truncated,
-        tree_fingerprint=fingerprint({"entries": entries}, domain=TREE_FINGERPRINT_DOMAIN),
-        availability="OBSERVED",
+        tree_fingerprint=fingerprint(
+            {"entries": entries, "errors": sorted(errors)}, domain=TREE_FINGERPRINT_DOMAIN
+        ),
+        availability=availability,
+        completeness=completeness,
+        content_hashed_file_count=hashed_files,
+        error_count=len(errors),
+        errors=tuple(sorted(errors)),
     )
 
 
-def observe_git(root: Path, *, phase: str) -> GitObservation:
-    """Observe Git HEAD, index, and worktree state when Git is usable."""
+#: Command-line overrides that neutralise every repository-controlled setting
+#: Git would otherwise obey.  A ``-c`` override on the command line takes
+#: precedence over every configuration file, including a malicious
+#: ``.git/config`` and anything it pulls in through ``include.path``, so none of
+#: these can be re-enabled by the repository under observation.
+GIT_HARDENING_OVERRIDES: tuple[str, ...] = (
+    # The exact defect: core.fsmonitor names a program Git executes.
+    "-c", "core.fsmonitor=",
+    "-c", "core.fsmonitorHookVersion=0",
+    # Hooks are redirected to a path that holds no executable.
+    "-c", "core.hooksPath=/dev/null",
+    # No repository-selected helper program of any kind.
+    "-c", "diff.external=",
+    "-c", "core.pager=cat",
+    "-c", "pager.status=false",
+    "-c", "pager.diff=false",
+    "-c", "credential.helper=",
+    "-c", "core.sshCommand=",
+    "-c", "core.askPass=",
+    "-c", "core.editor=false",
+    "-c", "core.alternateRefsCommand=",
+    "-c", "core.attributesFile=/dev/null",
+    "-c", "uploadpack.packObjectsHook=",
+    # No submodule recursion, so a submodule cannot supply its own config.
+    "-c", "submodule.recurse=false",
+    "-c", "protocol.allow=never",
+    "-c", "safe.directory=*",
+)
+
+#: Environment for a Git observation.  No global, system, or user configuration
+#: is inherited, no terminal prompt is possible, and no lock is taken.
+GIT_OBSERVATION_ENVIRONMENT: dict[str, str] = {
+    "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_SYSTEM": "/dev/null",
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_ASKPASS": "",
+    "GIT_ALLOW_PROTOCOL": "",
+    "GIT_ATTR_NOSYSTEM": "1",
+    "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_CEILING_DIRECTORIES": CAPSULE_WORKSPACE_PATH,
+}
+
+
+def observe_git_unobserved(phase: str, availability: str) -> GitObservation:
+    """A Git record that ran no process at all."""
+
+    return GitObservation.create(phase=phase, availability=availability, repository_present=True)
+
+
+def observe_git(
+    root: Path,
+    *,
+    phase: str,
+    capsule: "CapsuleSpecification | None",
+    relative_cwd: str = ".",
+) -> GitObservation:
+    """Observe Git state without ever executing repository-controlled code.
+
+    Two independent mechanisms are applied, because either one alone would be a
+    single point of failure:
+
+    1. Every setting through which Git can be made to run a program is
+       overridden on the command line, where the repository cannot outrank it.
+       This is what stops ``core.fsmonitor`` -- the exact defect the audit
+       found -- along with hooks, external diff, textconv, credential helpers,
+       and submodule recursion.
+    2. The observation still runs inside the shared capsule, so if any of that
+       were ever bypassed, the program would execute with no network, no host
+       filesystem, and -- decisively -- no path at all to the durable evidence
+       root.
+
+    The observer never mutates the index or worktree: it takes no optional
+    lock, and it runs only ``rev-parse`` and a ``--no-lock-index`` status.
+    """
 
     if not (root / ".git").exists():
         return GitObservation.create(phase=phase, availability="REPOSITORY_ABSENT", repository_present=False)
-    git = shutil.which("git", path=SANITIZED_ENVIRONMENT_BASE["PATH"]) or shutil.which("git")
-    if git is None:
-        return GitObservation.create(
-            phase=phase, availability="GIT_EXECUTABLE_UNAVAILABLE", repository_present=True
-        )
-    environment = dict(SANITIZED_ENVIRONMENT_BASE)
-    environment["HOME"] = str(root)
-    environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
-    environment["GIT_CONFIG_SYSTEM"] = "/dev/null"
-    environment["GIT_TERMINAL_PROMPT"] = "0"
+    if capsule is None:
+        # No capsule means no confinement, so no process is started.
+        return observe_git_unobserved(phase, "GIT_SANDBOX_UNAVAILABLE")
 
     def run(arguments: list[str]) -> str | None:
-        try:
-            completed = subprocess.run(  # noqa: S603 - explicit argv, no shell
-                [git, *arguments],
-                cwd=str(root),
-                env=environment,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                timeout=GIT_OBSERVATION_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
+        supervised = supervise_command(
+            capsule=capsule,
+            argv=("/usr/bin/env", *(f"{k}={v}" for k, v in sorted(GIT_OBSERVATION_ENVIRONMENT.items())), "git", *arguments),
+            relative_cwd=relative_cwd,
+            timeout_ms=int(GIT_OBSERVATION_TIMEOUT_SECONDS * 1000),
+            max_output_bytes=MAX_GIT_OUTPUT_BYTES,
+        )
+        process = supervised.process_observation
+        if not process.process_started or process.exit_code != 0:
             return None
-        if completed.returncode != 0:
+        if supervised.refused_non_utf8:
             return None
-        try:
-            return completed.stdout.decode("utf-8", "strict")
-        except UnicodeDecodeError:
-            return None
+        return supervised.stdout_text
 
     head = run(["rev-parse", "HEAD"])
-    status = run(["status", "--porcelain=v1", "--untracked-files=all"])
+    status = run(
+        [
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=all",
+            "--no-renames",
+        ]
+    )
     if head is None or status is None:
         return GitObservation.create(phase=phase, availability="GIT_COMMAND_FAILED", repository_present=True)
     lines = [line for line in status.splitlines() if line]
@@ -349,6 +562,103 @@ def observe_git(root: Path, *, phase: str) -> GitObservation:
 
 # --- workspace binding -------------------------------------------------------
 
+class EvidenceRootIsolationError(ValueError):
+    """The workspace and the durable evidence root are not physically disjoint."""
+
+
+@dataclass(frozen=True)
+class RootIdentity:
+    """The exact inode identity of one root, recorded so it can be rechecked."""
+
+    path: str
+    device: int
+    inode: int
+    mode: int
+
+    @classmethod
+    def of_descriptor(cls, path: Path, descriptor: int) -> "RootIdentity":
+        info = os.fstat(descriptor)
+        return cls(path=str(path), device=info.st_dev, inode=info.st_ino, mode=stat.S_IMODE(info.st_mode))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"path": self.path, "device": self.device, "inode": self.inode, "mode": self.mode}
+
+    def matches_descriptor(self, descriptor: int) -> bool:
+        info = os.fstat(descriptor)
+        return info.st_dev == self.device and info.st_ino == self.inode
+
+
+def _open_root_directory(path: Path, label: str) -> int:
+    """Open a canonical, non-symlink directory root and keep the descriptor."""
+
+    if not path.is_absolute():
+        raise EvidenceRootIsolationError(f"the {label} must be an absolute physical path")
+    if path.is_symlink():
+        raise EvidenceRootIsolationError(f"the {label} itself must not be a symlink")
+    if Path(os.path.realpath(path)) != path:
+        raise EvidenceRootIsolationError(f"the {label} must equal its canonical resolved path")
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):  # pragma: no cover - O_DIRECTORY guarantees it
+            raise EvidenceRootIsolationError(f"the {label} must be a directory")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def enforce_evidence_root_isolation(workspace: Path, store_root: Path) -> tuple[RootIdentity, RootIdentity]:
+    """Prove the workspace and the evidence root are disjoint physical objects.
+
+    Path strings are not trusted.  Both roots are opened as descriptors, their
+    canonical paths are compared for containment in either direction, and their
+    ``(device, inode)`` identities are compared so that a hard link, a bind
+    alias, or a rename that makes two names refer to the same directory is
+    caught even though the strings differ.
+    """
+
+    workspace_fd = _open_root_directory(workspace, "workspace root")
+    try:
+        store_fd = _open_root_directory(store_root, "durable store root")
+    except BaseException:
+        os.close(workspace_fd)
+        raise
+    try:
+        workspace_identity = RootIdentity.of_descriptor(workspace, workspace_fd)
+        store_identity = RootIdentity.of_descriptor(store_root, store_fd)
+        if (workspace_identity.device, workspace_identity.inode) == (
+            store_identity.device,
+            store_identity.inode,
+        ):
+            raise EvidenceRootIsolationError(
+                "the workspace and the durable store are the same physical directory"
+            )
+        if workspace == store_root:
+            raise EvidenceRootIsolationError("the workspace and the durable store must be disjoint")
+        if _is_within(store_root, workspace):
+            raise EvidenceRootIsolationError("the durable store must not be inside the workspace")
+        if _is_within(workspace, store_root):
+            raise EvidenceRootIsolationError("the workspace must not be inside the durable store")
+        # The platform contract requires an owner-only evidence root, so a
+        # same-UID process elsewhere on the host cannot be invited in by mode.
+        if store_identity.mode & 0o077:
+            raise EvidenceRootIsolationError(
+                "the durable store root must not be group- or world-accessible"
+            )
+        return workspace_identity, store_identity
+    finally:
+        os.close(workspace_fd)
+        os.close(store_fd)
+
+
+def _is_within(candidate: Path, ancestor: Path) -> bool:
+    try:
+        candidate.relative_to(ancestor)
+    except ValueError:
+        return False
+    return True
+
+
 @dataclass(frozen=True)
 class WorkspaceBinding:
     """A strict runtime binding between a physical root and an experiment."""
@@ -362,27 +672,53 @@ class WorkspaceBinding:
     git_present: bool
     initial_git_observation: GitObservation
     root_fd: int
+    workspace_root_identity: RootIdentity
+    store_root_identity: RootIdentity
+    capsule: CapsuleSpecification
+    capsule_readiness: CapsuleReadiness
 
     @classmethod
-    def bind(cls, root: str | os.PathLike[str], specification: ExperimentSpecification) -> "WorkspaceBinding":
+    def bind(
+        cls,
+        root: str | os.PathLike[str],
+        specification: ExperimentSpecification,
+        *,
+        evidence_root: str | os.PathLike[str],
+        readiness: CapsuleReadiness | None = None,
+    ) -> "WorkspaceBinding":
+        """Bind a workspace without executing anything at all.
+
+        Nothing in this method starts a process.  The Milestone 2 binding ran a
+        Git observation here, which meant a repository-controlled
+        ``core.fsmonitor`` program executed before any proposal was durable --
+        an effect with no proposal, no decision, and no evidence.  Binding is
+        now pure syscalls, and the first Git observation happens only after the
+        proposal has been published.
+        """
+
         specification.validated()
         physical = Path(root)
-        if not physical.is_absolute():
-            raise ValueError("the workspace root must be an absolute physical path")
-        if physical.is_symlink():
-            raise ValueError("the workspace root itself must not be a symlink")
-        canonical = Path(os.path.realpath(physical))
-        if canonical != physical:
-            raise ValueError("the workspace root must equal its canonical resolved path")
-        root_fd = os.open(physical, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        evidence = Path(evidence_root)
+        workspace_identity, store_identity = enforce_evidence_root_isolation(physical, evidence)
+
+        capsule_readiness = (readiness or probe_capsule_readiness()).require()
+        capsule = build_capsule_specification(
+            workspace_host_path=physical,
+            evidence_root=evidence,
+            readiness=capsule_readiness,
+        )
+
+        root_fd = os.open(physical, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         try:
-            if not stat.S_ISDIR(os.fstat(root_fd).st_mode):  # pragma: no cover - O_DIRECTORY guarantees it
-                raise ValueError("the workspace root must be a directory")
             filesystem = observe_filesystem(root_fd, phase="INITIAL")
-            git = observe_git(physical, phase="INITIAL")
+            git = observe_git_unobserved(
+                "INITIAL", "NOT_OBSERVED_BEFORE_DURABLE_PROPOSAL"
+            ) if (physical / ".git").exists() else GitObservation.create(
+                phase="INITIAL", availability="REPOSITORY_ABSENT", repository_present=False
+            )
             return cls(
                 physical_root=physical,
-                canonical_root=canonical,
+                canonical_root=Path(os.path.realpath(physical)),
                 working_root_identity=specification.working_root_identity,
                 scope_identity=specification.scope_identity,
                 experiment_specification_fingerprint=specification.specification_fingerprint,
@@ -390,10 +726,27 @@ class WorkspaceBinding:
                 git_present=git.repository_present,
                 initial_git_observation=git,
                 root_fd=root_fd,
+                workspace_root_identity=workspace_identity,
+                store_root_identity=store_identity,
+                capsule=capsule,
+                capsule_readiness=capsule_readiness,
             )
         except BaseException:
             os.close(root_fd)
             raise
+
+    def recheck_root_identity(self) -> None:
+        """Re-prove the open root is still the exact directory that was bound.
+
+        A rename or replacement of the workspace root between binding and use
+        would otherwise let a later operation act on a different directory that
+        happens to carry the same path string.
+        """
+
+        if not self.workspace_root_identity.matches_descriptor(self.root_fd):
+            raise EvidenceRootIsolationError(
+                "the bound workspace root descriptor no longer matches its recorded inode identity"
+            )
 
     def validate_for_specification(self, specification: ExperimentSpecification) -> "WorkspaceBinding":
         specification.validated()
@@ -415,6 +768,9 @@ class WorkspaceBinding:
                 "initial_filesystem_observation": self.initial_filesystem_observation.to_dict(),
                 "git_present": self.git_present,
                 "initial_git_observation": self.initial_git_observation.to_dict(),
+                "workspace_root_identity": self.workspace_root_identity.to_dict(),
+                "store_root_identity": self.store_root_identity.to_dict(),
+                "capsule": self.capsule.to_dict(),
             },
             domain=WORKSPACE_IDENTITY_DOMAIN,
         )
@@ -436,57 +792,202 @@ class WorkspaceBinding:
 
 # --- the four tool implementations ------------------------------------------
 
-def _list_files(binding: WorkspaceBinding, request: ListFilesRequest) -> ListFilesResult:
-    parts, leaf = _split_relative(request.path)
-    descend = parts if leaf is None else parts + (leaf,)
-    chain = binding.chain()
+@dataclass
+class _EffectPreparation:
+    """Physical handles opened *before* STARTED, so refusal is truly pre-effect.
+
+    Milestone 2 published a durable STARTED record, crossed the boundary, and
+    only then discovered that the target was missing or was a symlink.  The
+    resulting evidence contradicted itself: the lifecycle said an effect had
+    started and the ledger said the boundary was crossed, while the receipt said
+    ``REFUSED`` with ``effect_started=false``.
+
+    Preparation resolves every physical precondition first and *retains the
+    descriptors it proved*.  A refusal therefore happens before any STARTED
+    record exists, and the execution that follows acts on the very objects that
+    were checked -- not on a path string that could have been swapped in
+    between.
+    """
+
+    chain: _DirectoryChain
+    parent_fd: int = -1
+    handle: int = -1
+    refusal: ToolResult | None = None
+
+    def close(self) -> None:
+        if self.handle >= 0:
+            try:
+                os.close(self.handle)
+            except OSError:  # pragma: no cover
+                pass
+            self.handle = -1
+        self.chain.close()
+
+
+def _refusal_result(request: ToolRequest, error: Exception) -> ToolResult:
+    outcome = "REFUSED" if isinstance(error, WorkspaceRefusal) else "FAILED"
+    code = getattr(error, "error_code", "preparation_failed")
+    kind = type(request).__name__
+    if kind == "ListFilesRequest":
+        return ListFilesResult.create(
+            request_fingerprint=request.request_fingerprint, outcome=outcome, error_code=code
+        )
+    if kind == "ReadFileRequest":
+        return ReadFileResult.create(
+            request_fingerprint=request.request_fingerprint, outcome=outcome, error_code=code
+        )
+    if kind == "WriteFileRequest":
+        return WriteFileResult.create(
+            request_fingerprint=request.request_fingerprint, outcome=outcome, error_code=code
+        )
+    return RunCommandResult.create(
+        request_fingerprint=request.request_fingerprint,
+        outcome=outcome,
+        process_started=False,
+        exit_code=None,
+        error_code=code,
+    )
+
+
+def prepare_effect(binding: WorkspaceBinding, request: ToolRequest) -> _EffectPreparation:
+    """Resolve and retain every physical precondition before STARTED exists."""
+
+    binding.recheck_root_identity()
+    preparation = _EffectPreparation(chain=binding.chain())
+    try:
+        if isinstance(request, ListFilesRequest):
+            parts, leaf = _split_relative(request.path)
+            descend = parts if leaf is None else parts + (leaf,)
+            preparation.parent_fd = preparation.chain.descend(descend)
+        elif isinstance(request, ReadFileRequest):
+            parts, leaf = _split_relative(request.path)
+            if leaf is None:
+                raise WorkspaceRefusal("path_is_directory")
+            preparation.parent_fd = preparation.chain.descend(parts)
+            preparation.handle = _open_regular_for_read(preparation.parent_fd, leaf)
+        elif isinstance(request, WriteFileRequest):
+            parts, leaf = _split_relative(request.path)
+            if leaf is None:
+                raise WorkspaceRefusal("path_is_directory")
+            try:
+                preparation.parent_fd = preparation.chain.descend(parts)
+            except WorkspaceRefusal as refusal:
+                if refusal.error_code == "path_component_absent" and not request.create_parents:
+                    raise WorkspaceRefusal("parent_directory_absent") from refusal
+                if refusal.error_code != "path_component_absent":
+                    raise
+                # The parents are absent but their creation was authorized, so
+                # this is not a refusal.  The directories are created after
+                # STARTED, because creating them is itself a mutation.
+                preparation.parent_fd = -1
+                return preparation
+            _check_write_target(preparation.parent_fd, leaf)
+        elif isinstance(request, RunCommandRequest):
+            parts, leaf = _split_relative(request.cwd)
+            descend = parts if leaf is None else parts + (leaf,)
+            preparation.parent_fd = preparation.chain.descend(descend)
+            physical_cwd = binding.physical_path_of(request.cwd)
+            if Path(os.path.realpath(physical_cwd)) != physical_cwd:
+                raise WorkspaceRefusal("cwd_is_not_physically_under_the_root")
+        else:  # pragma: no cover - the typed union is closed
+            raise TypeError("unknown typed tool request")
+    except (WorkspaceRefusal, WorkspaceFailure) as error:
+        preparation.refusal = _refusal_result(request, error)
+    return preparation
+
+
+def _open_regular_for_read(parent_fd: int, leaf: str) -> int:
+    """Open a regular file without following links and without blocking."""
+
+    try:
+        handle = os.open(
+            leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent_fd
+        )
+    except OSError as error:
+        if error.errno in {errno.ELOOP, errno.EMLINK}:
+            raise WorkspaceRefusal("final_path_is_symlink") from error
+        if error.errno == errno.ENOENT:
+            raise WorkspaceRefusal("path_absent") from error
+        if error.errno == errno.EISDIR:
+            raise WorkspaceRefusal("path_is_directory") from error
+        if error.errno == errno.EACCES:
+            raise WorkspaceRefusal("path_not_readable") from error
+        if error.errno == errno.ENXIO:
+            raise WorkspaceRefusal("path_is_not_a_regular_file") from error
+        raise WorkspaceFailure("file_open_failed") from error
+    try:
+        mode = os.fstat(handle).st_mode
+        if stat.S_ISDIR(mode):
+            raise WorkspaceRefusal("path_is_directory")
+        if not stat.S_ISREG(mode):
+            raise WorkspaceRefusal("path_is_not_a_regular_file")
+    except BaseException:
+        os.close(handle)
+        raise
+    return handle
+
+
+def _check_write_target(parent_fd: int, leaf: str) -> None:
+    try:
+        existing = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise WorkspaceFailure("target_stat_failed") from error
+    if stat.S_ISLNK(existing.st_mode):
+        raise WorkspaceRefusal("final_path_is_symlink")
+    if stat.S_ISDIR(existing.st_mode):
+        raise WorkspaceRefusal("path_is_directory")
+    if not stat.S_ISREG(existing.st_mode):
+        raise WorkspaceRefusal("path_is_not_a_regular_file")
+
+
+
+def _list_files(
+    binding: WorkspaceBinding, request: ListFilesRequest, preparation: "_EffectPreparation"
+) -> ListFilesResult:
+    """List entries under the already-proven directory descriptor."""
+
     collected: list[str] = []
     over_limit = False
+    base_fd = preparation.parent_fd
+    prefix = "" if request.path == "." else f"{request.path}/"
+    stack: list[tuple[int, str, bool]] = [(base_fd, prefix, False)]
+    limit = request.max_entries
     try:
-        base_fd = chain.descend(descend)
-        prefix = "" if request.path == "." else f"{request.path}/"
-        stack: list[tuple[int, str, bool]] = [(base_fd, prefix, False)]
-        limit = request.max_entries
-        try:
-            while stack:
-                directory_fd, current_prefix, owned = stack.pop()
-                for name in sorted(os.listdir(directory_fd), reverse=True):
-                    relative = f"{current_prefix}{name}"
+        while stack:
+            directory_fd, current_prefix, owned = stack.pop()
+            for name in sorted(os.listdir(directory_fd), reverse=True):
+                relative = f"{current_prefix}{name}"
+                try:
+                    info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                except OSError:
+                    continue
+                collected.append(relative)
+                if request.recursive and stat.S_ISDIR(info.st_mode):
+                    # lstat above means an escaping symlinked directory is
+                    # listed but never traversed.
                     try:
-                        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-                    except OSError:
+                        child = _open_child_directory(directory_fd, name)
+                    except (WorkspaceRefusal, WorkspaceFailure):
                         continue
-                    collected.append(relative)
-                    if request.recursive and stat.S_ISDIR(info.st_mode):
-                        # lstat above means an escaping symlinked directory is
-                        # listed but never traversed.
-                        try:
-                            child = _open_child_directory(directory_fd, name)
-                        except (WorkspaceRefusal, WorkspaceFailure):
-                            continue
-                        stack.append((child, f"{relative}/", True))
-                if owned:
-                    os.close(directory_fd)
-                if len(collected) > limit * 4 + 64:
-                    over_limit = True
-                    break
-        finally:
-            for directory_fd, _, owned in stack:
-                if owned:
-                    try:
-                        os.close(directory_fd)
-                    except OSError:  # pragma: no cover
-                        pass
-    except WorkspaceRefusal as refusal:
+                    stack.append((child, f"{relative}/", True))
+            if owned:
+                os.close(directory_fd)
+            if len(collected) > limit * 4 + 64:
+                over_limit = True
+                break
+    except OSError:
         return ListFilesResult.create(
-            request_fingerprint=request.request_fingerprint, outcome="REFUSED", error_code=refusal.error_code
-        )
-    except WorkspaceFailure as failure:
-        return ListFilesResult.create(
-            request_fingerprint=request.request_fingerprint, outcome="FAILED", error_code=failure.error_code
+            request_fingerprint=request.request_fingerprint, outcome="FAILED", error_code="listing_failed"
         )
     finally:
-        chain.close()
+        for directory_fd, _, owned in stack:
+            if owned:
+                try:
+                    os.close(directory_fd)
+                except OSError:  # pragma: no cover
+                    pass
 
     entries = sorted(set(collected))
     truncated = over_limit or len(entries) > request.max_entries
@@ -500,33 +1001,25 @@ def _list_files(binding: WorkspaceBinding, request: ListFilesRequest) -> ListFil
     )
 
 
-def _read_file(binding: WorkspaceBinding, request: ReadFileRequest) -> ReadFileResult:
-    parts, leaf = _split_relative(request.path)
-    if leaf is None:
-        return ReadFileResult.create(
-            request_fingerprint=request.request_fingerprint, outcome="REFUSED", error_code="path_is_directory"
-        )
-    chain = binding.chain()
-    handle = -1
+def _read_file(
+    binding: WorkspaceBinding, request: ReadFileRequest, preparation: "_EffectPreparation"
+) -> ReadFileResult:
+    """Read the already-opened regular file.
+
+    The descriptor was opened during preparation and proven to be a regular
+    file with ``fstat``, so nothing here re-resolves a path and no FIFO,
+    socket, device, or directory can be substituted between the check and the
+    read.
+    """
+
+    handle = preparation.handle
     try:
-        parent_fd = chain.descend(parts)
-        try:
-            handle = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
-        except OSError as error:
-            if error.errno in {errno.ELOOP, errno.EMLINK}:
-                raise WorkspaceRefusal("final_path_is_symlink") from error
-            if error.errno == errno.ENOENT:
-                raise WorkspaceRefusal("path_absent") from error
-            if error.errno == errno.EISDIR:
-                raise WorkspaceRefusal("path_is_directory") from error
-            if error.errno == errno.EACCES:
-                raise WorkspaceRefusal("path_not_readable") from error
-            raise WorkspaceFailure("file_open_failed") from error
-        if stat.S_ISDIR(os.fstat(handle).st_mode):
-            raise WorkspaceRefusal("path_is_directory")
         raw = b""
         while len(raw) <= MAX_CONTENT_BYTES:
-            chunk = os.read(handle, 1 << 20)
+            try:
+                chunk = os.read(handle, 1 << 20)
+            except BlockingIOError as error:  # pragma: no cover - regular files never block
+                raise WorkspaceFailure("read_would_block") from error
             if not chunk:
                 break
             raw += chunk
@@ -545,10 +1038,10 @@ def _read_file(binding: WorkspaceBinding, request: ReadFileRequest) -> ReadFileR
         return ReadFileResult.create(
             request_fingerprint=request.request_fingerprint, outcome="FAILED", error_code=failure.error_code
         )
-    finally:
-        if handle >= 0:
-            os.close(handle)
-        chain.close()
+    except OSError:
+        return ReadFileResult.create(
+            request_fingerprint=request.request_fingerprint, outcome="FAILED", error_code="read_failed"
+        )
 
     lines = text.splitlines(keepends=True)
     start = (request.start_line or 1) - 1
@@ -563,36 +1056,23 @@ def _read_file(binding: WorkspaceBinding, request: ReadFileRequest) -> ReadFileR
     )
 
 
-def _write_file(binding: WorkspaceBinding, request: WriteFileRequest) -> WriteFileResult:
+def _write_file(
+    binding: WorkspaceBinding, request: WriteFileRequest, preparation: "_EffectPreparation"
+) -> WriteFileResult:
+    """Write atomically beneath the already-proven parent descriptor."""
+
     parts, leaf = _split_relative(request.path)
-    if leaf is None:
-        return WriteFileResult.create(
-            request_fingerprint=request.request_fingerprint, outcome="REFUSED", error_code="path_is_directory"
-        )
     payload = request.content.encode("utf-8", "strict")
-    chain = binding.chain()
     temporary: str | None = None
-    parent_fd = -1
+    parent_fd = preparation.parent_fd
+    own_chain: _DirectoryChain | None = None
     try:
-        try:
-            parent_fd = chain.descend(parts, create=request.create_parents)
-        except WorkspaceRefusal as refusal:
-            if refusal.error_code == "path_component_absent" and not request.create_parents:
-                raise WorkspaceRefusal("parent_directory_absent") from refusal
-            raise
-        try:
-            existing = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            existing = None
-        except OSError as error:
-            raise WorkspaceFailure("target_stat_failed") from error
-        if existing is not None:
-            if stat.S_ISLNK(existing.st_mode):
-                raise WorkspaceRefusal("final_path_is_symlink")
-            if stat.S_ISDIR(existing.st_mode):
-                raise WorkspaceRefusal("path_is_directory")
-            if not stat.S_ISREG(existing.st_mode):
-                raise WorkspaceRefusal("path_is_not_a_regular_file")
+        if parent_fd < 0:
+            # Preparation proved the parents were absent and that creating them
+            # was authorized.  Creating them is a mutation, so it happens here,
+            # after STARTED, and never during preparation.
+            own_chain = binding.chain()
+            parent_fd = own_chain.descend(parts, create=True)
 
         temporary = f"{WRITE_TEMPORARY_PREFIX}{os.getpid()}-{time.monotonic_ns()}"
         handle = os.open(
@@ -606,8 +1086,8 @@ def _write_file(binding: WorkspaceBinding, request: WriteFileRequest) -> WriteFi
         finally:
             os.close(handle)
         # Atomic replacement.  rename() replaces the destination name itself and
-        # never writes through a symlink, so the pre-check above is a refusal
-        # policy rather than the safety mechanism.
+        # never writes through a symlink, so the preparation check above is a
+        # refusal policy rather than the safety mechanism.
         os.rename(temporary, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         temporary = None
         os.fsync(parent_fd)
@@ -630,7 +1110,8 @@ def _write_file(binding: WorkspaceBinding, request: WriteFileRequest) -> WriteFi
                 os.unlink(temporary, dir_fd=parent_fd)
             except OSError:  # pragma: no cover
                 pass
-        chain.close()
+        if own_chain is not None:
+            own_chain.close()
 
     return WriteFileResult.create(
         request_fingerprint=request.request_fingerprint,
@@ -658,57 +1139,20 @@ def _run_command(
     cancellation: CancellationToken | None,
     start_hook: Callable[[], None] | None,
 ) -> _CommandExecution:
-    parts, leaf = _split_relative(request.cwd)
-    descend = parts if leaf is None else parts + (leaf,)
-    chain = binding.chain()
-    try:
-        chain.descend(descend)
-        physical_cwd = binding.physical_path_of(request.cwd)
-        if Path(os.path.realpath(physical_cwd)) != physical_cwd:
-            raise WorkspaceRefusal("cwd_is_not_physically_under_the_root")
-    except WorkspaceRefusal as refusal:
-        return _CommandExecution(
-            result=RunCommandResult.create(
-                request_fingerprint=request.request_fingerprint,
-                outcome="REFUSED",
-                process_started=False,
-                exit_code=None,
-                error_code=refusal.error_code,
-            ),
-            process_observation=None,
-            stdout_observation=None,
-            stderr_observation=None,
-            resource_observation=None,
-            timed_out=False,
-            cancelled=False,
-        )
-    except WorkspaceFailure as failure:
-        return _CommandExecution(
-            result=RunCommandResult.create(
-                request_fingerprint=request.request_fingerprint,
-                outcome="FAILED",
-                process_started=False,
-                exit_code=None,
-                error_code=failure.error_code,
-            ),
-            process_observation=None,
-            stdout_observation=None,
-            stderr_observation=None,
-            resource_observation=None,
-            timed_out=False,
-            cancelled=False,
-        )
-    finally:
-        chain.close()
+    """Run the request inside the capsule.
 
-    environment = dict(SANITIZED_ENVIRONMENT_BASE)
-    environment["HOME"] = str(binding.physical_root)
-    environment["PWD"] = str(physical_cwd)
+    The working directory was already resolved and proven during preparation,
+    so nothing here re-resolves a path string.
+    """
 
+    # The command runs inside the capsule, never on the host.  Its cwd is the
+    # authorized workspace exposed at one fixed internal path, so the command's
+    # own view contains no host path it could name -- not the operator's home,
+    # not an arbitrary /tmp, and not the durable evidence root.
     supervised = supervise_command(
+        capsule=binding.capsule,
         argv=request.argv,
-        cwd=str(physical_cwd),
-        env=environment,
+        relative_cwd=request.cwd,
         timeout_ms=request.timeout_ms,
         max_output_bytes=request.max_output_bytes,
         cancellation=cancellation,
@@ -737,7 +1181,21 @@ def _run_command(
             error_code="non_utf8_output",
         )
     else:
-        outcome = "OK" if (process.exit_code is not None and not process.timed_out and not process.cancelled) else "FAILED"
+        # Non-empty descendant state can never produce a successful effect, and
+        # neither can a missing process-domain observation.  Both mean the
+        # substrate does not actually know that the effect finished.
+        quiescent = process.namespace_quiescent and not process.descendants_alive_at_direct_exit
+        outcome = (
+            "OK"
+            if (
+                process.exit_code is not None
+                and not process.timed_out
+                and not process.cancelled
+                and process.status_document_present
+                and quiescent
+            )
+            else "FAILED"
+        )
         result = RunCommandResult.create(
             request_fingerprint=request.request_fingerprint,
             outcome=outcome,
@@ -765,6 +1223,12 @@ def _command_failure_code(process: ProcessObservation) -> str:
         return "command_timed_out"
     if process.cancelled:
         return "command_cancelled"
+    if not process.status_document_present:
+        return "process_domain_not_observed"
+    if process.descendants_alive_at_direct_exit:
+        return "descendant_outlived_the_direct_process"
+    if not process.namespace_quiescent:
+        return "process_domain_not_quiescent"
     return "command_terminated_by_signal"
 
 
@@ -782,6 +1246,39 @@ class EffectExecutionOutcome:
     reservation: EffectReservation | None
     effect_crossed_boundary: bool
     durable_at_effect_boundary: tuple[str, ...]
+
+
+class TypedReconciliationRefused(Exception):
+    """The durable chain did not reconcile, so no outcome may be claimed."""
+
+    def __init__(self, final: FinalReconciliation) -> None:
+        super().__init__(f"typed reconciliation refused: {final.refusal_code}")
+        self.final = final
+
+
+class ConfigurationRefused(Exception):
+    """A configuration or identity error found *before* any effect was possible.
+
+    Milestone 2 discovered mismatches such as a ledger belonging to a different
+    run only when it tried to append in memory -- which happened after the
+    effect had already executed and been published.  Every such check now runs
+    during preflight, before the proposal is durable.
+    """
+
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(f"{code}: {detail}")
+        self.code = code
+        self.detail = detail
+
+
+def _index_outcome_for(receipt_status: str) -> str:
+    return {
+        "COMPLETED": "EFFECT_COMPLETED",
+        "FAILED": "EFFECT_FAILED",
+        "REFUSED": "EFFECT_REFUSED",
+        "TIMED_OUT": "EFFECT_TIMED_OUT",
+        "CANCELLED": "EFFECT_CANCELLED",
+    }.get(receipt_status, "AMBIGUOUS_REQUIRES_RECONCILIATION")
 
 
 class SharedEffectSubstrate:
@@ -808,7 +1305,101 @@ class SharedEffectSubstrate:
         self._injector = injector or store.injector or NULL_FAULT_INJECTOR
         self._effect_boundary_hook = effect_boundary_hook
         self._cancellation = cancellation
+        self._run_index = DurableRunIndex(store, ledger.run_id)
         self.effect_invocation_count = 0
+
+    @property
+    def run_index(self) -> DurableRunIndex:
+        return self._run_index
+
+    def _index_proposal(
+        self,
+        *,
+        proposal: CanonicalProposal,
+        decision: ModeDecision,
+        outcome: str,
+        effect_crossed_boundary: bool,
+        effect_receipt_fingerprint: Fingerprint | None = None,
+        ledger_entry_fingerprint: Fingerprint | None = None,
+    ) -> None:
+        """Index every proposal, including one that was refused."""
+
+        self._run_index.append(
+            condition_id=proposal.condition.condition_id,
+            session_id=proposal.session_identity.session_id,
+            turn_id=proposal.turn_id,
+            proposal_id=proposal.proposal_id,
+            proposal_fingerprint=proposal.proposal_fingerprint,
+            decision_value=decision.decision,
+            decision_permits_effect=decision.permits_effect,
+            outcome=outcome,
+            effect_crossed_boundary=effect_crossed_boundary,
+            effect_receipt_fingerprint=effect_receipt_fingerprint,
+            ledger_entry_fingerprint=ledger_entry_fingerprint,
+        )
+
+    def preflight(self, specification: ExperimentSpecification, proposal: CanonicalProposal) -> None:
+        """Validate every configuration and identity before anything is durable.
+
+        Each check below corresponds to a mismatch that Milestone 2 could only
+        discover after the effect had run and been published.  Running them here
+        means a misconfigured substrate refuses with no proposal, no reservation,
+        no effect, and no evidence of an attempt it never should have made.
+        """
+
+        specification.validated()
+        run_id = proposal.run_identity.run_id
+        if self._ledger.run_id != run_id:
+            raise ConfigurationRefused(
+                "LEDGER_RUN_IDENTITY_MISMATCH",
+                f"the ledger belongs to run {self._ledger.run_id}, not {run_id}",
+            )
+        if self._run_index.run_id != run_id:
+            raise ConfigurationRefused(
+                "RUN_INDEX_RUN_IDENTITY_MISMATCH", "the durable run index belongs to another run"
+            )
+        if specification.run_identity.run_id != run_id:
+            raise ConfigurationRefused(
+                "SPECIFICATION_RUN_IDENTITY_MISMATCH",
+                "the specification names a different run than the proposal",
+            )
+        if self._binding.experiment_specification_fingerprint != specification.specification_fingerprint:
+            raise ConfigurationRefused(
+                "WORKSPACE_SPECIFICATION_BINDING_MISMATCH",
+                "the workspace is bound to a different experiment specification",
+            )
+        if specification.effect_executor_identity != specification.effect_executor_identity.validated():
+            raise ConfigurationRefused("EXECUTOR_IDENTITY_INVALID", "the executor identity is malformed")
+        # The evidence root the store actually writes to must be the exact root
+        # this binding proved disjoint from the workspace.
+        if str(self._store.root) != self._binding.store_root_identity.path:
+            raise ConfigurationRefused(
+                "EVIDENCE_ROOT_IDENTITY_MISMATCH",
+                "the durable store root is not the evidence root this workspace was bound against",
+            )
+        store_fd = os.open(self._store.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            if not self._binding.store_root_identity.matches_descriptor(store_fd):
+                raise ConfigurationRefused(
+                    "EVIDENCE_ROOT_REPLACED",
+                    "the durable store root no longer matches its recorded inode identity",
+                )
+        finally:
+            os.close(store_fd)
+        self._binding.recheck_root_identity()
+        if specification.schema_version != specification.schema_version:  # pragma: no cover
+            raise ConfigurationRefused("SCHEMA_VERSION_MISMATCH", "unsupported specification schema")
+        if proposal.tool_name not in TOOL_EFFECT_CLASSIFICATIONS:
+            raise ConfigurationRefused("TOOL_CATALOG_MISMATCH", f"unknown tool {proposal.tool_name}")
+        # The capsule must be ready now, not at the moment of the effect.
+        try:
+            self._binding.capsule_readiness.require()
+        except SandboxUnavailable as error:
+            raise ConfigurationRefused("SANDBOX_NOT_READY", str(error)) from error
+        try:
+            self._run_index.verify()
+        except RunIndexBroken as error:
+            raise ConfigurationRefused("RUN_INDEX_BROKEN", str(error)) from error
 
     @property
     def store(self) -> DurableObjectStore:
@@ -834,6 +1425,10 @@ class SharedEffectSubstrate:
         receipt_id: str,
     ) -> EffectExecutionOutcome:
         receipts: list[PublicationReceipt] = []
+
+        # 0. every configuration and identity check happens here, before the
+        # proposal is durable and therefore before any effect is possible.
+        self.preflight(specification, proposal)
 
         # 1. validate the experiment specification and the workspace binding.
         specification.validated()
@@ -927,6 +1522,26 @@ class SharedEffectSubstrate:
         wall_start = int(time.time() * 1000)
         monotonic_start = time.monotonic_ns()
 
+        # 5b. resolve and retain the physical handles BEFORE any STARTED record
+        # exists.  A physical refusal here is genuinely pre-effect, so the
+        # receipt, the lifecycle, the ledger, and reconciliation all agree that
+        # nothing started; there is no STARTED record contradicting a REFUSED
+        # receipt.
+        preparation = prepare_effect(self._binding, proposal.tool_request)
+        if preparation.refusal is not None:
+            try:
+                return self._refuse_after_reservation(
+                    specification=specification,
+                    proposal=proposal,
+                    decision=decision,
+                    reservation=reservation,
+                    receipt_id=receipt_id,
+                    receipts=receipts,
+                    result=preparation.refusal,
+                )
+            finally:
+                preparation.close()
+
         # 6. durably publish the pre-effect STARTED lifecycle record.
         self._injector.check(FAULT_BEFORE_STARTED_PUBLICATION)
         started = LifecycleRecord.create(
@@ -947,9 +1562,12 @@ class SharedEffectSubstrate:
             )
         )
         self._injector.check(FAULT_AFTER_STARTED_BEFORE_EFFECT)
+        self._injector.check(FAULT_OBSERVER_FAILURE_AFTER_STARTED)
 
         filesystem_before = observe_filesystem(self._binding.root_fd, phase="BEFORE_EFFECT")
-        git_before = observe_git(self._binding.physical_root, phase="BEFORE_EFFECT")
+        git_before = observe_git(
+            self._binding.physical_root, phase="BEFORE_EFFECT", capsule=self._binding.capsule
+        )
         receipts.append(
             self._store.publish_record(
                 object_kind=OBJECT_KIND_FILESYSTEM_BEFORE, object_id=proposal.proposal_id, record=filesystem_before
@@ -963,11 +1581,22 @@ class SharedEffectSubstrate:
 
         # 7. cross the local effect boundary.
         durable_at_boundary = self._durable_pre_effect_state(proposal.proposal_id)
-        execution = self._cross_effect_boundary(proposal.tool_request)
+        self._injector.check(FAULT_SANDBOX_SUPERVISOR_DEATH)
+        try:
+            execution = self._cross_effect_boundary(proposal.tool_request, preparation)
+        finally:
+            preparation.close()
 
-        # 8. observe the result.
+        # 8. observe the result, strictly after process-domain quiescence.
+        self._injector.check(FAULT_AFTER_EFFECT_BEFORE_AFTER_OBSERVATIONS)
         filesystem_after = observe_filesystem(self._binding.root_fd, phase="AFTER_EFFECT")
-        git_after = observe_git(self._binding.physical_root, phase="AFTER_EFFECT")
+        # Every AFTER observation happens strictly after process-domain
+        # quiescence: supervise_command returns only once the launcher has been
+        # reaped, and the launcher exits only after the in-capsule init saw
+        # ECHILD.  No descendant can still be mutating the workspace here.
+        git_after = observe_git(
+            self._binding.physical_root, phase="AFTER_EFFECT", capsule=self._binding.capsule
+        )
         receipts.append(
             self._store.publish_record(
                 object_kind=OBJECT_KIND_FILESYSTEM_AFTER, object_id=proposal.proposal_id, record=filesystem_after
@@ -1070,26 +1699,62 @@ class SharedEffectSubstrate:
             stderr_observation_fingerprint=None if stderr_observation is None else stderr_observation.record_fingerprint,
             resource_observation_fingerprint=None if resource_observation is None else resource_observation.record_fingerprint,
             effect_crossed_boundary=True,
-            final_reconciliation_state="RECONCILED_COMPLETE",
+            # A ledger entry never asserts its own reconciliation.  The separate
+            # FinalReconciliation record below is the only place a verified
+            # verdict may appear, and it is written only after verification.
+            final_reconciliation_state=LEDGER_PENDING_STATE,
         )
         self._store.publish_record(
             object_kind=LEDGER_OBJECT_KIND,
             object_id=proposal.proposal_id,
             record=entry,
-            fault_point=STAGE_RECONCILIATION_PUBLICATION,
+            fault_point=STAGE_LEDGER_PENDING_PUBLICATION,
         )
         reconciliation = reconcile_effect(
             self._store, run_id=proposal.run_identity.run_id, proposal_id=proposal.proposal_id
         )
         self._store.publish_record(
-            object_kind=OBJECT_KIND_RECONCILIATION, object_id=proposal.proposal_id, record=reconciliation
+            object_kind=OBJECT_KIND_RECONCILIATION,
+            object_id=proposal.proposal_id,
+            record=reconciliation,
+            fault_point=STAGE_RECONCILIATION_PUBLICATION,
         )
 
-        # 11. verify the ledger from durable bytes, never from memory.
+        # 11. reconcile the complete typed chain from durable bytes and publish
+        # the separate final record.  This is the authoritative verdict; the
+        # ledger entry above only stated what happened.
+        final = reconcile_typed_chain(
+            self._store,
+            run_id=proposal.run_identity.run_id,
+            proposal_id=proposal.proposal_id,
+            specification=specification,
+        )
+        self._injector.check(FAULT_BEFORE_FINAL_RECONCILIATION)
+        self._store.publish_record(
+            object_kind=FINAL_RECONCILIATION_OBJECT_KIND,
+            object_id=proposal.proposal_id,
+            record=final,
+            fault_point=STAGE_FINAL_RECONCILIATION_PUBLICATION,
+        )
+        if not final.verified:
+            raise TypedReconciliationRefused(final)
+
+        # 12. verify the ledger by re-verifying every entry's whole typed chain.
         verified = RunEffectLedger.verify(
-            self._store, proposal.run_identity.run_id, tuple(item.proposal_id for item in self._ledger.entries) + (proposal.proposal_id,)
+            self._store,
+            proposal.run_identity.run_id,
+            tuple(item.proposal_id for item in self._ledger.entries) + (proposal.proposal_id,),
+            specification=specification,
         )
         self._ledger.append(verified.entries[-1])
+        self._index_proposal(
+            proposal=proposal,
+            decision=decision,
+            outcome=_index_outcome_for(receipt.status),
+            effect_crossed_boundary=True,
+            effect_receipt_fingerprint=receipt.receipt_fingerprint,
+            ledger_entry_fingerprint=entry.record_fingerprint,
+        )
 
         return EffectExecutionOutcome(
             receipt=receipt,
@@ -1104,18 +1769,20 @@ class SharedEffectSubstrate:
 
     # -- the physical effect boundary ----------------------------------------
 
-    def _cross_effect_boundary(self, request: ToolRequest) -> _CommandExecution:
+    def _cross_effect_boundary(
+        self, request: ToolRequest, preparation: "_EffectPreparation"
+    ) -> _CommandExecution:
         """The single point at which this process touches the workspace."""
 
         if self._effect_boundary_hook is not None:
             self._effect_boundary_hook()
         self.effect_invocation_count += 1
         if isinstance(request, ListFilesRequest):
-            result: ToolResult = _list_files(self._binding, request)
+            result: ToolResult = _list_files(self._binding, request, preparation)
         elif isinstance(request, ReadFileRequest):
-            result = _read_file(self._binding, request)
+            result = _read_file(self._binding, request, preparation)
         elif isinstance(request, WriteFileRequest):
-            result = _write_file(self._binding, request)
+            result = _write_file(self._binding, request, preparation)
         elif isinstance(request, RunCommandRequest):
             return _run_command(
                 self._binding,
@@ -1234,6 +1901,13 @@ class SharedEffectSubstrate:
                 object_kind=OBJECT_KIND_RECONCILIATION, object_id=proposal.proposal_id, record=reconciliation
             )
         )
+        self._index_proposal(
+            proposal=proposal,
+            decision=decision,
+            outcome="DECISION_REFUSED",
+            effect_crossed_boundary=False,
+            effect_receipt_fingerprint=receipt.receipt_fingerprint,
+        )
         return EffectExecutionOutcome(
             receipt=receipt,
             reconciliation=reconciliation,
@@ -1241,6 +1915,75 @@ class SharedEffectSubstrate:
             ledger_entry=None,
             tool_result=None,
             reservation=None,
+            effect_crossed_boundary=False,
+            durable_at_effect_boundary=(),
+        )
+
+    def _refuse_after_reservation(
+        self,
+        *,
+        specification: ExperimentSpecification,
+        proposal: CanonicalProposal,
+        decision: ModeDecision,
+        reservation: EffectReservation,
+        receipt_id: str,
+        receipts: list[PublicationReceipt],
+        result: ToolResult,
+    ) -> EffectExecutionOutcome:
+        """A physical refusal proven before STARTED, so nothing ever started."""
+
+        receipt = EffectReceipt.for_proposal(
+            receipt_id=receipt_id,
+            proposal=proposal,
+            status="REFUSED",
+            reservation=reservation,
+            tool_result=result,
+            outcome_reason=(
+                "the physical preconditions were refused before the effect boundary was crossed: "
+                f"{getattr(result, 'error_code', 'unknown')}"
+            ),
+        )
+        receipt.validate_for_causal_chain(
+            specification=specification, proposal=proposal, decision=decision, reservation=reservation
+        )
+        receipts.append(
+            self._store.publish_record(
+                object_kind=OBJECT_KIND_RECEIPT, object_id=proposal.proposal_id, record=receipt
+            )
+        )
+        reconciliation = reconcile_effect(
+            self._store, run_id=proposal.run_identity.run_id, proposal_id=proposal.proposal_id
+        )
+        receipts.append(
+            self._store.publish_record(
+                object_kind=OBJECT_KIND_RECONCILIATION, object_id=proposal.proposal_id, record=reconciliation
+            )
+        )
+        final = reconcile_typed_chain(
+            self._store,
+            run_id=proposal.run_identity.run_id,
+            proposal_id=proposal.proposal_id,
+            specification=specification,
+        )
+        self._store.publish_record(
+            object_kind=FINAL_RECONCILIATION_OBJECT_KIND, object_id=proposal.proposal_id, record=final
+        )
+        if not final.verified:
+            raise TypedReconciliationRefused(final)
+        self._index_proposal(
+            proposal=proposal,
+            decision=decision,
+            outcome="EFFECT_REFUSED",
+            effect_crossed_boundary=False,
+            effect_receipt_fingerprint=receipt.receipt_fingerprint,
+        )
+        return EffectExecutionOutcome(
+            receipt=receipt,
+            reconciliation=reconciliation,
+            publication_receipts=tuple(receipts),
+            ledger_entry=None,
+            tool_result=result,
+            reservation=reservation,
             effect_crossed_boundary=False,
             durable_at_effect_boundary=(),
         )

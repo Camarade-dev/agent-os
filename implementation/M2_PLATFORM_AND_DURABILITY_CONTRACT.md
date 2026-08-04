@@ -238,3 +238,50 @@ claimed on the basis of Milestone 2 evidence:
    its own `setsid`.
 6. Re-measure the controller-memory threshold on the qualification host before
    treating 64 MiB as a portable bound.
+
+---
+
+## Milestone 2 critical repairs — platform additions
+
+The platform contract gains three hard requirements. Each is checked before any
+effect is possible, and each refuses rather than degrading.
+
+### Capsule mechanism
+
+`bubblewrap` (`bwrap`) must be present **and** unprivileged user namespaces must
+actually work. `probe_capsule_readiness()` constructs a real throwaway capsule
+and requires the kernel to demonstrate: `/home` absent, `/etc/passwd` absent, a
+private `/proc`, a private and empty `/tmp` on a different device than `/usr`,
+and an outbound connect failing with `ENETUNREACH`. A present binary on a host
+with user namespaces disabled is therefore not mistaken for a working boundary.
+
+If the probe fails, `SandboxUnavailable` is raised during readiness — before any
+proposal is published. There is no unsandboxed fallback path in the code.
+
+Full contract: `implementation/M2_SANDBOX_CONTRACT.md`.
+
+### Evidence-root isolation
+
+Before proposal publication the workspace and the durable store must be proven
+physically disjoint: both absolute, non-symlink, canonical directories opened as
+descriptors; neither an ancestor of the other; distinct `(device, inode)`
+identities so a hard link, bind alias, or rename cannot make two names refer to
+one directory; and a store root that is not group- or world-accessible. The
+identities are recorded and rechecked at preflight, so a root replaced after
+binding is detected rather than silently acted upon.
+
+### Filesystem observation cost
+
+A complete observation now streams the bytes of every regular file, so its cost
+is proportional to workspace size rather than entry count. The entry limit
+(`MAX_OBSERVED_TREE_ENTRIES`) and the byte limit (`MAX_OBSERVED_CONTENT_BYTES`,
+2 GiB) both produce an explicit incomplete state that cannot serve as a final
+repository fingerprint. An observation carrying any error, or any truncation,
+can never be `COMPLETE`.
+
+### Preserved bounded-stream guarantees
+
+The bounded-stream implementation is unchanged by these repairs. The heavy soak
+was re-run through the sandboxed command path and produced byte-identical stream
+fingerprints with controller retention inside the declared bound, so the scoped
+heavy-output evidence for LONG-07 and LONG-08 is preserved.

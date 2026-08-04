@@ -31,6 +31,7 @@ from admissible.paired_runner.durable_store import (  # noqa: E402
     PublicationConflict,
 )
 from admissible.paired_runner.effect_ledger import RunEffectLedger  # noqa: E402
+from admissible.paired_runner.sandbox import CAPSULE_ENVIRONMENT  # noqa: E402
 from admissible.paired_runner.effects import (  # noqa: E402
     OBJECT_KIND_LIFECYCLE_STARTED,
     OBJECT_KIND_PROPOSAL,
@@ -67,7 +68,9 @@ class _Harness:
         self._counter = 0
 
     def bind(self) -> "_Harness":
-        self.binding = WorkspaceBinding.bind(self.workspace, self.specification)
+        self.binding = WorkspaceBinding.bind(
+            self.workspace, self.specification, evidence_root=self.disposable.store_root
+        )
         self.store = DurableObjectStore(self.disposable.store_root)
 
         def boundary_hook() -> None:
@@ -247,7 +250,10 @@ class SharedSubstrateFunctionalTests(unittest.TestCase):
         )
         names = set(outcome.tool_result.stdout.split(","))
         self.assertNotIn("ADMISSIBLE_M2_SECRET_PROBE", names)
-        self.assertLessEqual(names, set(SANITIZED_ENVIRONMENT_BASE) | {"HOME", "PWD"})
+        # The capsule builds its environment from nothing (--clearenv), so the
+        # exact capsule environment -- not a sanitised copy of the host's -- is
+        # what a command may observe.
+        self.assertLessEqual(names, set(CAPSULE_ENVIRONMENT))
 
 
 class WorkspaceConfinementTests(unittest.TestCase):
@@ -325,10 +331,11 @@ class WorkspaceConfinementTests(unittest.TestCase):
     def test_binding_refuses_a_symlinked_or_non_canonical_root(self) -> None:
         link = Path(self.harness.disposable.root) / "workspace-link"
         os.symlink(self.harness.workspace, link)
+        store_root = self.harness.disposable.store_root
         with self.assertRaises(ValueError):
-            WorkspaceBinding.bind(link, self.harness.specification)
+            WorkspaceBinding.bind(link, self.harness.specification, evidence_root=store_root)
         with self.assertRaises(ValueError):
-            WorkspaceBinding.bind("relative/path", self.harness.specification)
+            WorkspaceBinding.bind("relative/path", self.harness.specification, evidence_root=store_root)
 
     def test_binding_refuses_a_specification_it_was_not_bound_to(self) -> None:
         other = build_specification("GOVERNED", run_id="run-other")
@@ -409,10 +416,20 @@ class ProcessSupervisionTests(unittest.TestCase):
                 timeout_ms=1_500,
             )
         )
-        self.assertEqual(outcome.receipt.status, "TIMED_OUT")
+        # The direct process exits promptly while its descendant keeps running.
+        # Under pipe-EOF supervision this looked like a completed command; the
+        # capsule reports it as a descendant that outlived its parent, which can
+        # never be COMPLETED.
+        self.assertEqual(outcome.receipt.status, "FAILED")
+        self.assertEqual(
+            outcome.tool_result.error_code, "descendant_outlived_the_direct_process"
+        )
         process = self.harness.store.load("process-observation", "proposal-1")
+        self.assertTrue(process["descendants_alive_at_direct_exit"])
+        # Quiescence is verified inside the capsule from ECHILD, not asserted.
+        self.assertTrue(process["namespace_quiescent"])
         self.assertTrue(process["descendants_reaped"])
-        self.assertIn("SIGKILL_PROCESS_GROUP", process["termination_escalation"])
+        self.assertGreaterEqual(process["extra_descendants_reaped"], 1)
 
     def _flood(self, stream: str, chunk: str, repeats: int, *, max_output_bytes: int = 4096):
         return self.harness.run(
@@ -519,7 +536,9 @@ class GitAndFilesystemObservationTests(unittest.TestCase):
         self.addCleanup(harness.close)
         if not initialise_git_repository(harness.workspace):
             self.skipTest("a disposable git repository could not be created on this host")
-        clean = observe_git(harness.workspace, phase="INITIAL")
+        clean = observe_git(
+            harness.workspace, phase="INITIAL", capsule=harness.binding.capsule
+        )
         self.assertEqual(clean.availability, "OBSERVED")
         self.assertFalse(clean.worktree_dirty)
         self.assertFalse(clean.untracked_present)
@@ -534,7 +553,9 @@ class GitAndFilesystemObservationTests(unittest.TestCase):
                 tool_grammar_fingerprint=harness.grammar, path="untracked.txt", content="new\n"
             )
         )
-        after = observe_git(harness.workspace, phase="AFTER_EFFECT")
+        after = observe_git(
+            harness.workspace, phase="AFTER_EFFECT", capsule=harness.binding.capsule
+        )
         self.assertTrue(after.worktree_dirty)
         self.assertTrue(after.untracked_present)
         self.assertNotEqual(after.status_fingerprint, clean.status_fingerprint)

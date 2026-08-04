@@ -164,7 +164,11 @@ class EffectLedgerEntry(_M2Record):
             _require_text(getattr(self, name), name, max_bytes=256)
         _require_member(self.condition_id, ("DIRECT", "GOVERNED"), "condition_id")
         _require_member(self.effect_classification, EFFECT_CLASSIFICATIONS, "effect_classification")
-        _require_member(self.final_reconciliation_state, RECONCILIATION_CLASSIFICATIONS, "final_reconciliation_state")
+        # A ledger entry is a claim about what happened, never a verdict on
+        # whether that claim checks out.  Reconciliation lives in the separate
+        # FinalReconciliation record, so the only admissible state here is the
+        # pending one.
+        _require_member(self.final_reconciliation_state, ("PENDING_VERIFICATION",), "final_reconciliation_state")
         _require_bool(self.effect_crossed_boundary, "effect_crossed_boundary")
         for name in (
             "experiment_specification_fingerprint",
@@ -266,16 +270,44 @@ class RunEffectLedger:
         )
 
     @classmethod
-    def verify(cls, store: Any, run_id: str, proposal_ids: tuple[str, ...]) -> "RunEffectLedger":
-        """Rebuild and revalidate the ledger from durable bytes only.
+    def verify(
+        cls,
+        store: Any,
+        run_id: str,
+        proposal_ids: tuple[str, ...],
+        *,
+        specification: Any = None,
+        specification_fingerprint: Any = None,
+    ) -> "RunEffectLedger":
+        """Rebuild the ledger by verifying each entry's *entire* typed chain.
 
-        Nothing in-memory is trusted: each entry is re-read from the store,
-        re-parsed canonically, and re-validated as a typed record before it is
-        admitted.  A corrupt or missing entry fails closed.
+        Re-reading the ledger entry's own bytes proves only that the entry is
+        well formed.  It says nothing about whether the proposal, decision,
+        reservation, lifecycle records, receipt, and observations it cites still
+        exist, still reconstruct as their declared types, or still agree with
+        it -- which is why the Milestone 2 version succeeded even when every
+        object the entry referenced had been deleted.
+
+        Each entry is therefore admitted only after
+        :func:`~admissible.paired_runner.reconciliation.reconcile_typed_chain`
+        verifies the whole chain behind it.
         """
+
+        from .reconciliation import reconcile_typed_chain  # circular at module scope
 
         ledger = cls(run_id)
         for proposal_id in proposal_ids:
+            final = reconcile_typed_chain(
+                store,
+                run_id=run_id,
+                proposal_id=proposal_id,
+                specification=specification,
+                specification_fingerprint=specification_fingerprint,
+            )
+            if not final.verified:
+                raise ObservationError(
+                    f"the durable chain for {proposal_id} does not reconcile: {final.refusal_code}"
+                )
             payload = store.load(LEDGER_OBJECT_KIND, proposal_id)
             ledger.append(EffectLedgerEntry.from_dict(payload))
         return ledger

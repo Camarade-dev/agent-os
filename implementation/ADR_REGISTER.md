@@ -469,3 +469,107 @@ The M1 evidence closes only the statuses recorded for the 17 in-scope matrix
 records. EXEC-02 and EXEC-05 are restored to `DESIGNED` by ADR-014 rather than
 being carried at a status their whole requirements do not support. No ADR is
 reopened, weakened, or used to authorize Milestone 2.
+
+---
+
+## ADR-M2R-01 — One bubblewrap capsule is the effect boundary
+
+**Status:** Accepted (Milestone 2 critical repairs)
+
+**Context.** The Milestone 2 `run_command` path restricted only the working
+directory. A typed command could name any absolute host path, reach the
+network, read the operator's home directory, and rewrite the durable evidence
+store that was supposed to be the independent record of what it did.
+
+**Decision.** Every command executes inside one `bubblewrap` capsule, shared
+identically by the future DIRECT and GOVERNED modes. The workspace is exposed at
+the single internal path `/workspace`; only an explicit read-only toolchain list
+is exposed; `/tmp` and `/proc` are private; the network namespace is unshared;
+`--clearenv` removes every inherited credential and the host `HOME`; and the
+durable evidence root is absent from the mount namespace entirely.
+
+**Consequences.** The boundary is enforced by the kernel, not by the command's
+cooperation. A refusal is `ENOENT` — the path does not exist — rather than a
+permission decision. If the mechanism is unavailable, readiness refuses before
+any proposal is published; there is no unsandboxed fallback. Contract:
+`implementation/M2_SANDBOX_CONTRACT.md`.
+
+**Rejected alternative.** An in-process restriction (path validation, `chroot`
+without namespaces, or an allowlist checked by the controller) was rejected
+because it depends on the effect process not routing around it.
+
+## ADR-M2R-02 — Quiescence is derived from `ECHILD`, not from pipe EOF
+
+**Status:** Accepted (Milestone 2 critical repairs)
+
+**Context.** Supervision ended when both pipes reached EOF. A descendant with
+redirected output could survive a `COMPLETED` receipt and mutate the workspace
+afterwards, and a direct child that closed its pipes but kept running was killed
+after a fixed two-second grace regardless of its own requested timeout.
+
+**Decision.** The capsule runs a private PID namespace whose init
+(`_capsule_init.py`, PID 1 via `--as-pid-1`) reaps every descendant and derives
+quiescence from `ECHILD`. The controller loop ends only when the launcher is
+reaped, which happens only after that observation.
+
+**Consequences.** `descendants_reaped` is a kernel observation rather than an
+assertion, and `ProcessObservation` validation forbids claiming it independently
+of the observed quiescence. A surviving descendant or a missing process-domain
+observation can never produce `COMPLETED`. `setsid` and double-fork cannot
+evade termination, because the namespace — not the process group — is the
+boundary.
+
+## ADR-M2R-03 — A ledger entry may never certify its own reconciliation
+
+**Status:** Accepted (Milestone 2 critical repairs)
+
+**Context.** The ledger entry was written with
+`final_reconciliation_state="RECONCILED_COMPLETE"` *before* reconciliation ran,
+and `RunEffectLedger.verify` re-read only the entry's own bytes — succeeding
+even when every object the entry referenced had been deleted.
+
+**Decision.** `EffectLedgerEntry` is type-constrained to
+`PENDING_VERIFICATION` and cannot be constructed claiming success. A separate
+`FinalReconciliation` record, published only after verification, binds the exact
+pending entry and the fingerprint of every verified object. `verify` now
+verifies the entire typed chain.
+
+**Consequences.** The claim and the verdict are different records, so the
+circularity is gone. Reconciliation requires the exact experiment specification
+or an externally supplied exact fingerprint, so the chain cannot certify itself.
+Specification: `implementation/M2_TYPED_RECONCILIATION_SPEC.md`.
+
+## ADR-M2R-04 — Git observation runs no repository-controlled code
+
+**Status:** Accepted (Milestone 2 critical repairs)
+
+**Context.** `WorkspaceBinding.bind` ran a Git observation before any proposal
+was durable, and the observer honoured repository-local `core.fsmonitor` — so a
+hostile repository could execute a program with no proposal, no decision, and no
+evidence.
+
+**Decision.** Binding executes nothing; it is pure syscalls. Git observation
+happens only after the proposal is durable, runs inside the shared capsule, and
+overrides every setting through which Git can run a program on the command line,
+where a configuration file cannot outrank it.
+
+**Consequences.** Two independent mechanisms guard the same defect, because
+either alone would be a single point of failure. The observation takes no
+optional lock and mutates neither the index nor the worktree.
+
+## ADR-M2R-05 — Physical refusal is resolved before `STARTED` exists
+
+**Status:** Accepted (Milestone 2 critical repairs)
+
+**Context.** A missing or symlinked target produced a durable `STARTED` record,
+a crossed boundary, and `ledger boundary=true`, alongside a `REFUSED` receipt
+with `effect_started=false` — evidence that contradicted itself.
+
+**Decision.** `prepare_effect` resolves every physical precondition and retains
+the proven descriptors before `STARTED` is published; the tools then act on
+those descriptors rather than re-resolving a path string.
+
+**Consequences.** A refusal is genuinely pre-effect and every record agrees.
+Retaining the descriptors also closes the race between the check and the use.
+Directory creation for `create_parents` is deliberately excluded from
+preparation, because creating a directory is itself a mutation.

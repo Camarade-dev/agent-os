@@ -104,7 +104,9 @@ def run_soak(
     baseline_peak_kib = _proc_status_kib("VmHWM")
 
     with DisposableWorkspace(prefix="admissible-m2-soak-") as disposable:
-        binding = WorkspaceBinding.bind(disposable.workspace, specification)
+        binding = WorkspaceBinding.bind(
+        disposable.workspace, specification, evidence_root=disposable.store_root
+    )
         try:
             store = DurableObjectStore(disposable.store_root)
             substrate = SharedEffectSubstrate(

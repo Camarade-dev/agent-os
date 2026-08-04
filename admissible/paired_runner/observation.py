@@ -22,7 +22,7 @@ from .canonical import Fingerprint, fingerprint, require_exact_keys
 from .schemas import PACKAGE_PREFIX, SchemaDescriptor
 
 
-M2_SCHEMA_VERSION = 1
+M2_SCHEMA_VERSION = 2
 M2_PREFIX = f"{PACKAGE_PREFIX}.m2"
 
 SCHEMA_PUBLICATION_RECEIPT = f"{M2_PREFIX}.publication_receipt"
@@ -74,6 +74,12 @@ GIT_AVAILABILITY_VALUES = (
     "REPOSITORY_ABSENT",
     "GIT_EXECUTABLE_UNAVAILABLE",
     "GIT_COMMAND_FAILED",
+    # Git is process-capable, so it is never run before the proposal is durable.
+    # A pre-proposal binding records this instead of executing anything.
+    "NOT_OBSERVED_BEFORE_DURABLE_PROPOSAL",
+    # The capsule that would confine the observer is unavailable, so no Git
+    # process is started at all.
+    "GIT_SANDBOX_UNAVAILABLE",
 )
 
 TEXT_DECODE_STATUSES = (
@@ -84,6 +90,10 @@ TEXT_DECODE_STATUSES = (
 )
 
 RECONCILIATION_CLASSIFICATIONS = (
+    # The only state an immutable ledger entry may ever be published in.  A
+    # ledger entry that predeclared its own successful reconciliation would be
+    # both the claim and its own evidence.
+    "PENDING_VERIFICATION",
     "NO_DURABLE_STATE",
     "PROPOSAL_ONLY_NO_EFFECT_POSSIBLE",
     "RESERVED_NO_EFFECT_POSSIBLE",
@@ -95,6 +105,16 @@ RECONCILIATION_CLASSIFICATIONS = (
 )
 
 LIFECYCLE_RECORD_KINDS = ("STARTED", "TERMINAL")
+
+#: Whether a filesystem observation covered the whole tree with content bytes.
+#: Only ``COMPLETE`` may serve as a final repository fingerprint.
+FILESYSTEM_COMPLETENESS_VALUES = (
+    "COMPLETE",
+    "INCOMPLETE_ENTRY_LIMIT",
+    "INCOMPLETE_BYTE_LIMIT",
+    "INCOMPLETE_OBSERVATION_ERROR",
+    "UNAVAILABLE",
+)
 
 
 class ObservationError(ValueError):
@@ -353,9 +373,19 @@ class FilesystemObservation(_M2Record):
         "truncated",
         "tree_fingerprint",
         "availability",
+        "completeness",
+        "content_hashed_file_count",
+        "error_count",
+        "errors",
     )
-    ENCODERS: ClassVar[dict[str, Callable[[Any], Any]]] = {"tree_fingerprint": _encode_fp}
-    DECODERS: ClassVar[dict[str, Callable[[Any], Any]]] = {"tree_fingerprint": _decode_fp}
+    ENCODERS: ClassVar[dict[str, Callable[[Any], Any]]] = {
+        "tree_fingerprint": _encode_fp,
+        "errors": _encode_strings,
+    }
+    DECODERS: ClassVar[dict[str, Callable[[Any], Any]]] = {
+        "tree_fingerprint": _decode_fp,
+        "errors": _decode_strings,
+    }
 
     phase: str
     entry_count: int
@@ -363,6 +393,10 @@ class FilesystemObservation(_M2Record):
     truncated: bool
     tree_fingerprint: Fingerprint
     availability: str
+    completeness: str
+    content_hashed_file_count: int
+    error_count: int
+    errors: tuple[str, ...]
     record_fingerprint: Fingerprint
 
     @classmethod
@@ -375,6 +409,10 @@ class FilesystemObservation(_M2Record):
         truncated: bool,
         tree_fingerprint: Fingerprint,
         availability: str = "OBSERVED",
+        completeness: str = "COMPLETE",
+        content_hashed_file_count: int = 0,
+        error_count: int = 0,
+        errors: tuple[str, ...] = (),
     ) -> "FilesystemObservation":
         return cls._new(
             phase=phase,
@@ -383,15 +421,44 @@ class FilesystemObservation(_M2Record):
             truncated=truncated,
             tree_fingerprint=tree_fingerprint,
             availability=availability,
+            completeness=completeness,
+            content_hashed_file_count=content_hashed_file_count,
+            error_count=error_count,
+            errors=errors,
         )
+
+    @property
+    def is_final_repository_fingerprint(self) -> bool:
+        """Only a complete observation may stand as a repository fingerprint."""
+
+        return self.availability == "OBSERVED" and self.completeness == "COMPLETE"
 
     def _validate_fields(self) -> None:
         _require_member(self.phase, ("INITIAL", "BEFORE_EFFECT", "AFTER_EFFECT"), "filesystem observation phase")
         _require_int(self.entry_count, "entry_count")
         _require_int(self.total_regular_file_bytes, "total_regular_file_bytes")
+        _require_int(self.content_hashed_file_count, "content_hashed_file_count")
+        _require_int(self.error_count, "error_count")
         _require_bool(self.truncated, "truncated")
         self.tree_fingerprint.validated()
         _require_availability(self.availability, "filesystem availability")
+        _require_member(self.completeness, FILESYSTEM_COMPLETENESS_VALUES, "filesystem completeness")
+        _encode_strings(self.errors)
+        for entry in self.errors:
+            _require_text(entry, "filesystem observation error", max_bytes=1024)
+        if self.error_count != len(self.errors):
+            raise ObservationError("every observation error must be recorded, not counted only")
+        # An entry that could not be read, or a tree that had to be cut short,
+        # is never presented as a complete observation.  Silently skipping an
+        # entry and still claiming OBSERVED is exactly the defect this forbids.
+        if self.completeness == "COMPLETE" and (self.errors or self.truncated):
+            raise ObservationError(
+                "a complete filesystem observation has no errors and is not truncated"
+            )
+        if self.completeness != "COMPLETE" and self.availability == "OBSERVED":
+            raise ObservationError(
+                "an incomplete filesystem observation must not claim the OBSERVED availability"
+            )
 
 
 @dataclass(frozen=True)
@@ -490,6 +557,12 @@ class ProcessObservation(_M2Record):
         "termination_escalation",
         "descendants_reaped",
         "start_failure_class",
+        "capsule_mechanism",
+        "launcher_exit_code",
+        "status_document_present",
+        "namespace_quiescent",
+        "descendants_alive_at_direct_exit",
+        "extra_descendants_reaped",
     )
     ENCODERS: ClassVar[dict[str, Callable[[Any], Any]]] = {"termination_escalation": _encode_strings}
     DECODERS: ClassVar[dict[str, Callable[[Any], Any]]] = {"termination_escalation": _decode_strings}
@@ -509,6 +582,12 @@ class ProcessObservation(_M2Record):
     termination_escalation: tuple[str, ...]
     descendants_reaped: bool
     start_failure_class: str | None
+    capsule_mechanism: str
+    launcher_exit_code: int | None
+    status_document_present: bool
+    namespace_quiescent: bool
+    descendants_alive_at_direct_exit: bool
+    extra_descendants_reaped: int
     record_fingerprint: Fingerprint
 
     @classmethod
@@ -532,7 +611,11 @@ class ProcessObservation(_M2Record):
             _require_int(self.child_process_group_id, "child_process_group_id", minimum=1)
             if self.start_failure_class is not None:
                 raise ObservationError("a started process has no start-failure class")
-            if self.exit_code is None and self.terminating_signal is None:
+            if (
+                self.exit_code is None
+                and self.terminating_signal is None
+                and self.status_document_present
+            ):
                 raise ObservationError("a started and reaped process must record an exit code or a signal")
         else:
             for name in ("child_pid", "child_process_group_id", "exit_code", "terminating_signal"):
@@ -545,6 +628,24 @@ class ProcessObservation(_M2Record):
             _require_int(self.exit_code, "exit_code", minimum=-128, maximum=255)
         if self.terminating_signal is not None:
             _require_int(self.terminating_signal, "terminating_signal", minimum=1, maximum=64)
+        _require_text(self.capsule_mechanism, "capsule_mechanism", max_bytes=64)
+        for name in ("status_document_present", "namespace_quiescent", "descendants_alive_at_direct_exit"):
+            _require_bool(getattr(self, name), name)
+        _require_int(self.extra_descendants_reaped, "extra_descendants_reaped")
+        if self.launcher_exit_code is not None:
+            _require_int(self.launcher_exit_code, "launcher_exit_code", minimum=-128, maximum=255)
+        # ``descendants_reaped`` is the physically verified quiescence of the
+        # private PID namespace.  It may never be claimed independently of the
+        # in-capsule observation that established it.
+        if self.descendants_reaped != self.namespace_quiescent and self.process_started:
+            raise ObservationError(
+                "descendants_reaped must equal the physically observed namespace quiescence"
+            )
+        if not self.status_document_present and self.process_started:
+            if self.namespace_quiescent or self.extra_descendants_reaped:
+                raise ObservationError(
+                    "no process-domain observation exists, so quiescence must not be claimed"
+                )
 
 
 @dataclass(frozen=True)

@@ -26,7 +26,13 @@ from _paired_runner_m2_fixtures import (  # noqa: E402
     decision_for,
 )
 from admissible.paired_runner.canonical import canonical_bytes  # noqa: E402
-from admissible.paired_runner.durable_store import (  # noqa: E402
+from admissible.paired_runner.durable_store import (
+    FAULT_AFTER_EFFECT_BEFORE_AFTER_OBSERVATIONS,
+    FAULT_BEFORE_FINAL_RECONCILIATION,
+    FAULT_DURING_FINAL_RECONCILIATION_PUBLICATION,
+    FAULT_DURING_LEDGER_PENDING_PUBLICATION,
+    FAULT_OBSERVER_FAILURE_AFTER_STARTED,
+    FAULT_SANDBOX_SUPERVISOR_DEATH,  # noqa: E402
     FAULT_AFTER_EFFECT_BEFORE_TERMINAL_RECEIPT,
     FAULT_AFTER_PROPOSAL_FSYNC_BEFORE_RENAME,
     FAULT_AFTER_PROPOSAL_PUBLICATION,
@@ -147,8 +153,36 @@ CRASH_MATRIX: tuple[CrashExpectation, ...] = (
     ),
     CrashExpectation(
         FAULT_DURING_RECONCILIATION_PUBLICATION,
+        True, True, True, True, True, 1, "RECONCILED_COMPLETE", True, True, True,
+    ),
+    # --- Milestone 2 critical-repair fault points ---------------------------
+    CrashExpectation(
+        FAULT_OBSERVER_FAILURE_AFTER_STARTED,
+        True, True, True, False, False, 0,
+        "STARTED_AMBIGUOUS_EFFECT_REQUIRES_RECONCILIATION", True, False, False,
+    ),
+    CrashExpectation(
+        FAULT_SANDBOX_SUPERVISOR_DEATH,
+        True, True, True, False, False, 0,
+        "STARTED_AMBIGUOUS_EFFECT_REQUIRES_RECONCILIATION", True, False, False,
+    ),
+    CrashExpectation(
+        FAULT_AFTER_EFFECT_BEFORE_AFTER_OBSERVATIONS,
+        True, True, True, False, False, 1,
+        "STARTED_AMBIGUOUS_EFFECT_REQUIRES_RECONCILIATION", True, False, True,
+    ),
+    CrashExpectation(
+        FAULT_DURING_LEDGER_PENDING_PUBLICATION,
         True, True, True, True, False, 1,
         "TERMINAL_RECEIPT_DURABLE_RECONCILIATION_INCOMPLETE", True, True, True,
+    ),
+    CrashExpectation(
+        FAULT_BEFORE_FINAL_RECONCILIATION,
+        True, True, True, True, True, 1, "RECONCILED_COMPLETE", True, False, True,
+    ),
+    CrashExpectation(
+        FAULT_DURING_FINAL_RECONCILIATION_PUBLICATION,
+        True, True, True, True, True, 1, "RECONCILED_COMPLETE", True, True, True,
     ),
 )
 
@@ -158,7 +192,11 @@ class _CrashHarness:
         self.specification = build_specification("GOVERNED", run_id="run-crash")
         self.disposable = DisposableWorkspace()
         self.injector = FaultInjector({point})
-        self.binding = WorkspaceBinding.bind(self.disposable.workspace, self.specification)
+        self.binding = WorkspaceBinding.bind(
+            self.disposable.workspace,
+            self.specification,
+            evidence_root=self.disposable.store_root,
+        )
         self.store = DurableObjectStore(self.disposable.store_root, injector=self.injector)
         self.substrate = SharedEffectSubstrate(
             binding=self.binding,
@@ -195,7 +233,7 @@ class CrashMatrixTests(unittest.TestCase):
         declared = tuple(expectation.point for expectation in CRASH_MATRIX)
         self.assertEqual(len(set(declared)), len(declared))
         self.assertEqual(set(declared), set(FAULT_POINTS))
-        self.assertEqual(len(CRASH_MATRIX), 13)
+        self.assertEqual(len(CRASH_MATRIX), 19)
 
     def test_fault_points(self) -> None:
         for expectation in CRASH_MATRIX:
@@ -243,9 +281,17 @@ class CrashMatrixTests(unittest.TestCase):
             receipt = EffectReceipt.from_dict(store.load(OBJECT_KIND_RECEIPT, PROPOSAL_ID))
             self.assertEqual(receipt.status, "COMPLETED")
             self.assertIsNone(receipt.task_acceptance)
-            # A durable receipt is only reachable after the effect completed and
-            # the reconciliation is still explicitly incomplete.
-            self.assertEqual(report.classification, "TERMINAL_RECEIPT_DURABLE_RECONCILIATION_INCOMPLETE")
+            # A durable receipt is only reachable after the effect completed.
+            # Whether reconciliation is still incomplete depends on how far the
+            # publication sequence had progressed, which the row declares.
+            self.assertIn(
+                report.classification,
+                (
+                    "TERMINAL_RECEIPT_DURABLE_RECONCILIATION_INCOMPLETE",
+                    "RECONCILED_COMPLETE",
+                ),
+            )
+            self.assertEqual(report.classification, expectation.classification)
         else:
             self.assertEqual(store.inspect(OBJECT_KIND_RECEIPT, PROPOSAL_ID).state, "ABSENT")
 
@@ -281,7 +327,9 @@ class CrashMatrixTests(unittest.TestCase):
     def test_a_completed_effect_is_never_executed_twice(self) -> None:
         with DisposableWorkspace() as disposable:
             specification = build_specification("DIRECT", run_id="run-once")
-            binding = WorkspaceBinding.bind(disposable.workspace, specification)
+            binding = WorkspaceBinding.bind(
+            disposable.workspace, specification, evidence_root=disposable.store_root
+        )
             self.addCleanup(binding.close)
             store = DurableObjectStore(disposable.store_root)
             substrate = SharedEffectSubstrate(
@@ -318,7 +366,9 @@ class CrashMatrixTests(unittest.TestCase):
 
         with DisposableWorkspace() as disposable:
             specification = build_specification("DIRECT", run_id="run-readonly")
-            binding = WorkspaceBinding.bind(disposable.workspace, specification)
+            binding = WorkspaceBinding.bind(
+            disposable.workspace, specification, evidence_root=disposable.store_root
+        )
             self.addCleanup(binding.close)
             injector = FaultInjector({FAULT_AFTER_STARTED_BEFORE_EFFECT})
             store = DurableObjectStore(disposable.store_root, injector=injector)
@@ -363,7 +413,9 @@ class CorruptionFixtureTests(unittest.TestCase):
 
     def _completed_store(self, disposable: DisposableWorkspace) -> DurableObjectStore:
         specification = build_specification("GOVERNED", run_id="run-corrupt")
-        binding = WorkspaceBinding.bind(disposable.workspace, specification)
+        binding = WorkspaceBinding.bind(
+            disposable.workspace, specification, evidence_root=disposable.store_root
+        )
         self.addCleanup(binding.close)
         store = DurableObjectStore(disposable.store_root)
         substrate = SharedEffectSubstrate(
@@ -430,9 +482,15 @@ class CorruptionFixtureTests(unittest.TestCase):
     def test_ledger_verification_reads_only_durable_bytes(self) -> None:
         with DisposableWorkspace() as disposable:
             store = self._completed_store(disposable)
-            ledger = RunEffectLedger.verify(store, "run-corrupt", (PROPOSAL_ID,))
+            specification = build_specification("GOVERNED", run_id="run-corrupt")
+            ledger = RunEffectLedger.verify(
+                store, "run-corrupt", (PROPOSAL_ID,), specification=specification
+            )
             self.assertEqual(len(ledger.entries), 1)
-            self.assertEqual(ledger.entries[0].final_reconciliation_state, "RECONCILED_COMPLETE")
+            # A ledger entry never asserts its own reconciliation; it is durable
+            # in the pending state and the separate final record carries the
+            # verified verdict.
+            self.assertEqual(ledger.entries[0].final_reconciliation_state, "PENDING_VERIFICATION")
             self.assertTrue(ledger.proposal_ledger_fingerprint().value)
             self.assertTrue(ledger.effect_receipt_ledger_fingerprint().value)
             path = store.path_of(LEDGER_OBJECT_KIND, PROPOSAL_ID)
@@ -440,7 +498,33 @@ class CorruptionFixtureTests(unittest.TestCase):
             payload["condition_id"] = "DIRECT"
             path.write_bytes(canonical_bytes(payload))
             with self.assertRaises(Exception):
+                RunEffectLedger.verify(
+                    store, "run-corrupt", (PROPOSAL_ID,), specification=specification
+                )
+
+    def test_ledger_verification_fails_when_a_referenced_object_is_deleted(self) -> None:
+        """The Milestone 2 verifier succeeded with every referenced object gone."""
+
+        with DisposableWorkspace() as disposable:
+            store = self._completed_store(disposable)
+            specification = build_specification("GOVERNED", run_id="run-corrupt")
+            RunEffectLedger.verify(store, "run-corrupt", (PROPOSAL_ID,), specification=specification)
+            store.path_of(OBJECT_KIND_RECEIPT, PROPOSAL_ID).unlink()
+            with self.assertRaises(Exception):
+                RunEffectLedger.verify(
+                    store, "run-corrupt", (PROPOSAL_ID,), specification=specification
+                )
+
+    def test_reconciliation_requires_the_exact_specification_or_its_fingerprint(self) -> None:
+        with DisposableWorkspace() as disposable:
+            store = self._completed_store(disposable)
+            with self.assertRaises(Exception):
                 RunEffectLedger.verify(store, "run-corrupt", (PROPOSAL_ID,))
+            foreign = build_specification("GOVERNED", run_id="run-elsewhere")
+            with self.assertRaises(Exception):
+                RunEffectLedger.verify(
+                    store, "run-corrupt", (PROPOSAL_ID,), specification=foreign
+                )
 
 
 def _mutate(value: object) -> object:

@@ -24,10 +24,10 @@ and observes one local process.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import errno
 import hashlib
 import os
 import selectors
-import signal
 import subprocess
 import threading
 import time
@@ -38,6 +38,13 @@ from .observation import (
     ProcessObservation,
     ResourceObservation,
     StreamObservation,
+)
+from .sandbox import (
+    CAPSULE_TEARDOWN_TIMEOUT_SECONDS,
+    MAX_STATUS_BYTES,
+    CapsuleSpecification,
+    capsule_argv,
+    parse_capsule_status,
 )
 
 
@@ -54,8 +61,10 @@ STREAM_FINGERPRINT_DOMAINS = {
     "stdout": "admissible.paired_runner.m2.stream.stdout",
     "stderr": "admissible.paired_runner.m2.stream.stderr",
 }
-#: Ordered, documented escalation applied to the child's process group.
-TERMINATION_ESCALATION_ORDER = ("SIGTERM_PROCESS_GROUP", "SIGKILL_PROCESS_GROUP")
+#: Ordered, documented escalation applied to the whole private PID namespace.
+#: The namespace, not the process group, is the boundary, so a descendant cannot
+#: evade this by calling ``setsid`` or by double-forking.
+TERMINATION_ESCALATION_ORDER = ("SIGTERM_PID_NAMESPACE", "SIGKILL_PID_NAMESPACE")
 GRACE_PERIOD_MS = 2_000
 MAX_UTF8_TRIM_BYTES = 3
 
@@ -211,22 +220,35 @@ def _resource_observation(before: Any, after: Any, controller_peak: int) -> Reso
 
 def supervise_command(
     *,
+    capsule: CapsuleSpecification,
     argv: tuple[str, ...],
-    cwd: str,
-    env: dict[str, str],
+    relative_cwd: str,
     timeout_ms: int,
     max_output_bytes: int,
     cancellation: CancellationToken | None = None,
     start_hook: Callable[[], None] | None = None,
 ) -> SupervisedProcessResult:
-    """Run one local command in its own POSIX session and observe it fully.
+    """Run one command inside the shared capsule and observe it completely.
 
-    The child is started with ``start_new_session=True`` so it becomes both a
-    session leader and a process-group leader; every descendant that does not
-    deliberately leave the group is therefore reachable by ``killpg``.  Neither
-    the timeout nor cancellation can deadlock on a full pipe because both
-    streams are drained continuously by the same selector loop that enforces
-    them.
+    The command never runs on the host.  It runs inside the one capsule
+    :mod:`admissible.paired_runner.sandbox` constructs, as a child of an init
+    that is PID 1 of a private PID namespace.  Three facts follow physically
+    rather than by convention:
+
+    * a descendant cannot leave the namespace by calling ``setsid``, by
+      double-forking, or by being orphaned, because the namespace -- not the
+      process group -- is the boundary;
+    * quiescence is derived inside the capsule from ``ECHILD``, so
+      ``descendants_reaped`` is a kernel observation and not an assertion;
+    * pipe EOF is *not* treated as completion.  This loop ends when the
+      launcher itself is reaped, which happens only after the in-capsule init
+      has observed quiescence, so a command that closes both pipes and keeps
+      running stays supervised until it exits or until its own requested
+      timeout expires.
+
+    The process-domain observation arrives on a dedicated status descriptor the
+    effect does not hold, so a command cannot forge or suppress it by writing to
+    its own ``stdout``.
     """
 
     cancellation = cancellation or CancellationToken()
@@ -236,19 +258,33 @@ def supervise_command(
     if start_hook is not None:
         start_hook()
 
+    status_read, status_write = os.pipe()
+    control_read, control_write = os.pipe()
+    launcher_argv = capsule_argv(
+        capsule,
+        relative_cwd=relative_cwd,
+        status_fd=status_write,
+        control_fd=control_read,
+        timeout_ms=timeout_ms,
+        command=tuple(argv),
+    )
+
     try:
         process = subprocess.Popen(  # noqa: S603 - explicit argv, never a shell
-            list(argv),
-            cwd=cwd,
-            env=env,
+            launcher_argv,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             close_fds=True,
-            start_new_session=True,
+            pass_fds=(status_write, control_read),
             shell=False,
         )
     except (OSError, ValueError) as error:
+        for descriptor in (status_read, status_write, control_read, control_write):
+            try:
+                os.close(descriptor)
+            except OSError:  # pragma: no cover
+                pass
         end_wall, end_monotonic = _now()
         empty_stdout = _BoundedStream("stdout", max_output_bytes)
         empty_stderr = _BoundedStream("stderr", max_output_bytes)
@@ -271,6 +307,12 @@ def supervise_command(
                 termination_escalation=(),
                 descendants_reaped=True,
                 start_failure_class=type(error).__name__,
+                capsule_mechanism=capsule.mechanism,
+                launcher_exit_code=None,
+                status_document_present=False,
+                namespace_quiescent=True,
+                descendants_alive_at_direct_exit=False,
+                extra_descendants_reaped=0,
             ),
             stdout_observation=stdout_observation,
             stderr_observation=stderr_observation,
@@ -281,57 +323,75 @@ def supervise_command(
             stderr_decode_status=stderr_status,
         )
 
-    child_pid = process.pid
+    launcher_pid = process.pid
     try:
-        process_group = os.getpgid(child_pid)
-    except OSError:  # pragma: no cover - the child exited immediately
-        process_group = child_pid
+        launcher_group = os.getpgid(launcher_pid)
+    except OSError:  # pragma: no cover - the launcher exited immediately
+        launcher_group = launcher_pid
+
+    # The controller keeps only the read end of the status pipe and only the
+    # write end of the control pipe.  The capsule therefore cannot forge a
+    # status document and cannot hold the control pipe open on our behalf.
+    os.close(status_write)
+    os.close(control_read)
 
     stdout_stream = _BoundedStream("stdout", max_output_bytes)
     stderr_stream = _BoundedStream("stderr", max_output_bytes)
     streams = {process.stdout.fileno(): stdout_stream, process.stderr.fileno(): stderr_stream}
     controller_peak = 0
-    timed_out = False
-    cancelled = False
-    escalation: list[str] = []
-    deadline = start_monotonic + timeout_ms * 1_000_000
+    status_bytes = bytearray()
+    cancellation_signalled = False
+    launcher_returncode: int | None = None
+
+    # The in-capsule init enforces the requested timeout exactly.  The
+    # controller keeps only a strictly larger backstop so that a launcher that
+    # is itself wedged can never hang the controller, and so that the request's
+    # own timeout -- not this backstop -- is what a command observes.
+    backstop_ns = (
+        start_monotonic
+        + timeout_ms * 1_000_000
+        + (GRACE_PERIOD_MS * 2 + int(CAPSULE_TEARDOWN_TIMEOUT_SECONDS * 1000)) * 1_000_000
+    )
 
     selector = selectors.DefaultSelector()
     for pipe in (process.stdout, process.stderr):
         os.set_blocking(pipe.fileno(), False)
         selector.register(pipe, selectors.EVENT_READ)
-
-    def terminate(step: str) -> None:
-        escalation.append(step)
-        signal_number = signal.SIGTERM if step == "SIGTERM_PROCESS_GROUP" else signal.SIGKILL
-        try:
-            os.killpg(process_group, signal_number)
-        except (ProcessLookupError, PermissionError):
-            # The group is already gone; the reap below still confirms it.
-            pass
+    os.set_blocking(status_read, False)
+    selector.register(status_read, selectors.EVENT_READ)
 
     try:
-        grace_deadline: int | None = None
-        while selector.get_map():
-            now = time.monotonic_ns()
-            if grace_deadline is None:
-                if not timed_out and now >= deadline:
-                    timed_out = True
-                    terminate("SIGTERM_PROCESS_GROUP")
-                    grace_deadline = now + GRACE_PERIOD_MS * 1_000_000
-                elif not cancelled and cancellation.cancelled:
-                    cancelled = True
-                    terminate("SIGTERM_PROCESS_GROUP")
-                    grace_deadline = now + GRACE_PERIOD_MS * 1_000_000
-            elif now >= grace_deadline and "SIGKILL_PROCESS_GROUP" not in escalation:
-                terminate("SIGKILL_PROCESS_GROUP")
-                grace_deadline = None
+        # Pipe EOF is deliberately not a termination condition.  The loop ends
+        # only when the launcher has been reaped, and the launcher exits only
+        # after the in-capsule init observed ECHILD.  A command that closes both
+        # of its pipes and keeps running is therefore still supervised.
+        while True:
+            if launcher_returncode is None:
+                launcher_returncode = process.poll()
 
-            # The wait is short and bounded so timeout and cancellation stay
-            # responsive while the pipes keep draining.
-            for key, _ in selector.select(timeout=0.05):
+            now = time.monotonic_ns()
+            if not cancellation_signalled and cancellation.cancelled:
+                # Cancellation is delivered by releasing the control pipe, which
+                # the init observes as EOF.  It escalates inside the namespace.
+                cancellation_signalled = True
                 try:
-                    chunk = os.read(key.fd, READ_BLOCK_BYTES)
+                    os.close(control_write)
+                except OSError:  # pragma: no cover
+                    pass
+                control_write = -1
+            if now >= backstop_ns:
+                # The launcher outlived even the backstop.  Killing it destroys
+                # the PID namespace, which the kernel guarantees takes every
+                # descendant with it.
+                try:
+                    process.kill()
+                except OSError:  # pragma: no cover
+                    pass
+
+            for key, _ in selector.select(timeout=0.05):
+                descriptor = key.fd if isinstance(key.fileobj, int) else key.fileobj.fileno()
+                try:
+                    chunk = os.read(descriptor, READ_BLOCK_BYTES)
                 except BlockingIOError:  # pragma: no cover - selector said ready
                     continue
                 except OSError:
@@ -340,10 +400,21 @@ def supervise_command(
                 if not chunk:
                     selector.unregister(key.fileobj)
                     continue
-                streams[key.fd].feed(chunk)
+                if descriptor == status_read:
+                    if len(status_bytes) < MAX_STATUS_BYTES:
+                        status_bytes += chunk[: MAX_STATUS_BYTES - len(status_bytes)]
+                    continue
+                streams[descriptor].feed(chunk)
                 controller_peak = max(
                     controller_peak, stdout_stream.retained_bytes + stderr_stream.retained_bytes
                 )
+
+            if launcher_returncode is not None and not selector.get_map():
+                break
+            if launcher_returncode is not None:
+                # The launcher is gone, so the namespace is gone; drain whatever
+                # is still buffered in the pipes and stop.
+                launcher_returncode = launcher_returncode
     finally:
         selector.close()
         for pipe in (process.stdout, process.stderr):
@@ -351,53 +422,132 @@ def supervise_command(
                 pipe.close()
             except OSError:  # pragma: no cover
                 pass
+        try:
+            os.close(status_read)
+        except OSError:  # pragma: no cover
+            pass
+        if control_write >= 0:
+            try:
+                os.close(control_write)
+            except OSError:  # pragma: no cover
+                pass
 
-    # Both pipes are at EOF, so the direct child has exited or is about to.
-    # Escalate once more if it lingers, then reap unconditionally.
+    # Reap the launcher.  Its exit is the controller-side proof that the private
+    # PID namespace no longer exists.
     try:
-        process.wait(timeout=GRACE_PERIOD_MS / 1000)
+        launcher_returncode = process.wait(timeout=CAPSULE_TEARDOWN_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:  # pragma: no cover - defensive
-        if "SIGKILL_PROCESS_GROUP" not in escalation:
-            terminate("SIGKILL_PROCESS_GROUP")
-        process.wait()
+        process.kill()
+        launcher_returncode = process.wait()
 
-    if (timed_out or cancelled) and "SIGKILL_PROCESS_GROUP" not in escalation:
-        # Guarantee that no descendant survives an aborted effect even when the
-        # direct child answered SIGTERM promptly.
-        terminate("SIGKILL_PROCESS_GROUP")
-
-    return_code = process.returncode
-    exit_code: int | None
-    terminating_signal: int | None
-    if return_code is not None and return_code < 0:
-        exit_code = None
-        terminating_signal = -return_code
-    else:
-        exit_code = return_code
-        terminating_signal = None
-
-    descendants_reaped = _process_group_is_empty(process_group)
+    status = parse_capsule_status(bytes(status_bytes))
     end_wall, end_monotonic = _now()
     stdout_observation, stdout_text, stdout_status = stdout_stream.observation()
     stderr_observation, stderr_text, stderr_status = stderr_stream.observation()
 
+    if status is None:
+        # Without the init's status document there is no process-domain
+        # observation at all.  That is reported as an unobserved effect, never
+        # silently completed.
+        return SupervisedProcessResult(
+            process_observation=ProcessObservation.create(
+                process_started=True,
+                child_pid=launcher_pid,
+                child_process_group_id=launcher_group,
+                exit_code=None,
+                terminating_signal=None,
+                timed_out=False,
+                cancelled=cancellation.cancelled,
+                start_wall_clock_unix_ms=start_wall,
+                end_wall_clock_unix_ms=end_wall,
+                start_monotonic_ns=start_monotonic,
+                end_monotonic_ns=end_monotonic,
+                duration_ns=end_monotonic - start_monotonic,
+                termination_escalation=(),
+                descendants_reaped=False,
+                start_failure_class=None,
+                capsule_mechanism=capsule.mechanism,
+                launcher_exit_code=launcher_returncode,
+                status_document_present=False,
+                namespace_quiescent=False,
+                descendants_alive_at_direct_exit=False,
+                extra_descendants_reaped=0,
+            ),
+            stdout_observation=stdout_observation,
+            stderr_observation=stderr_observation,
+            resource_observation=_resource_observation(rusage_before, _rusage_children(), controller_peak),
+            stdout_text=stdout_text,
+            stderr_text=stderr_text,
+            stdout_decode_status=stdout_status,
+            stderr_decode_status=stderr_status,
+        )
+
+    escalation = tuple(str(item) for item in status.get("termination_escalation", ()) or ())
+    exit_code = status.get("direct_exit_code")
+    terminating_signal = status.get("direct_terminating_signal")
+    exec_failure_errno = status.get("exec_failure_errno")
+
+    if isinstance(exec_failure_errno, int):
+        # The command was never executed.  Reporting the child's 127 as though
+        # the command had run and chosen to fail would be a false statement, so
+        # this is a start failure with no process outcome at all.
+        return SupervisedProcessResult(
+            process_observation=ProcessObservation.create(
+                process_started=False,
+                child_pid=None,
+                child_process_group_id=None,
+                exit_code=None,
+                terminating_signal=None,
+                timed_out=False,
+                cancelled=False,
+                start_wall_clock_unix_ms=start_wall,
+                end_wall_clock_unix_ms=end_wall,
+                start_monotonic_ns=start_monotonic,
+                end_monotonic_ns=end_monotonic,
+                duration_ns=end_monotonic - start_monotonic,
+                termination_escalation=(),
+                descendants_reaped=True,
+                start_failure_class=f"ExecFailed:{errno.errorcode.get(exec_failure_errno, exec_failure_errno)}",
+                capsule_mechanism=capsule.mechanism,
+                launcher_exit_code=launcher_returncode,
+                status_document_present=True,
+                namespace_quiescent=True,
+                descendants_alive_at_direct_exit=False,
+                extra_descendants_reaped=0,
+            ),
+            stdout_observation=stdout_observation,
+            stderr_observation=stderr_observation,
+            resource_observation=_resource_observation(rusage_before, _rusage_children(), controller_peak),
+            stdout_text=stdout_text,
+            stderr_text=stderr_text,
+            stdout_decode_status=stdout_status,
+            stderr_decode_status=stderr_status,
+        )
+
     return SupervisedProcessResult(
         process_observation=ProcessObservation.create(
             process_started=True,
-            child_pid=child_pid,
-            child_process_group_id=process_group,
-            exit_code=exit_code,
-            terminating_signal=terminating_signal,
-            timed_out=timed_out,
-            cancelled=cancelled,
+            child_pid=launcher_pid,
+            child_process_group_id=launcher_group,
+            exit_code=exit_code if isinstance(exit_code, int) else None,
+            terminating_signal=terminating_signal if isinstance(terminating_signal, int) else None,
+            timed_out=bool(status.get("timed_out", False)),
+            cancelled=bool(status.get("cancelled", False)),
             start_wall_clock_unix_ms=start_wall,
             end_wall_clock_unix_ms=end_wall,
             start_monotonic_ns=start_monotonic,
             end_monotonic_ns=end_monotonic,
             duration_ns=end_monotonic - start_monotonic,
-            termination_escalation=tuple(escalation),
-            descendants_reaped=descendants_reaped,
+            termination_escalation=escalation,
+            # Physically verified inside the capsule from ECHILD, not assumed.
+            descendants_reaped=bool(status.get("namespace_quiescent", False)),
             start_failure_class=None,
+            capsule_mechanism=capsule.mechanism,
+            launcher_exit_code=launcher_returncode,
+            status_document_present=True,
+            namespace_quiescent=bool(status.get("namespace_quiescent", False)),
+            descendants_alive_at_direct_exit=bool(status.get("descendants_alive_at_direct_exit", False)),
+            extra_descendants_reaped=int(status.get("extra_descendants_reaped", 0) or 0),
         ),
         stdout_observation=stdout_observation,
         stderr_observation=stderr_observation,
@@ -407,18 +557,6 @@ def supervise_command(
         stdout_decode_status=stdout_status,
         stderr_decode_status=stderr_status,
     )
-
-
-def _process_group_is_empty(process_group: int) -> bool:
-    """Best-effort confirmation that nothing remains in the child's group."""
-
-    try:
-        os.killpg(process_group, 0)
-    except ProcessLookupError:
-        return True
-    except PermissionError:  # pragma: no cover - a foreign process reused the id
-        return False
-    return False
 
 
 def stream_fingerprint_of(name: str, data: bytes) -> Fingerprint:

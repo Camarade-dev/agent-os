@@ -249,3 +249,58 @@ claimed.
    here supports `VERIFIED_INSTALLED_PATH` for any requirement.
 8. TEST-03 is closed only at the provider-free shared-substrate boundary; it is
    not proof of complete future A/B runners.
+
+---
+
+## Milestone 2 critical repairs — substrate changes
+
+The execution order gains three steps, and one step changes meaning. The
+substrate still contains no policy engine, and the condition is still not an
+input to any branch after the decision is reduced to "an effect is permitted".
+
+### Revised order
+
+0. **Preflight** (new). Every configuration and identity check runs *before*
+   the proposal is durable: ledger run identity, run-index run identity,
+   specification/proposal run agreement, workspace/specification binding,
+   executor identity, evidence-root identity and inode, workspace root inode,
+   tool catalogue membership, capsule readiness, and run-index integrity. No
+   configuration error can be discovered after an effect.
+1. Validate the specification and the workspace binding. **Binding executes
+   nothing** — it is pure syscalls, so no process-capable observer runs before
+   the proposal is durable.
+2. Publish the canonical proposal.
+3. Validate the decision; publish it. A refusal is indexed in the durable run
+   index and returns.
+4. Reconcile prior durable state; refuse rather than replay.
+5. Publish the reservation.
+5b. **Prepare** (new). Resolve every physical precondition and retain the
+   proven descriptors. A refusal here is genuinely pre-effect: no `STARTED`
+   record is published and nothing contradicts the receipt.
+6. Publish `STARTED`; take the BEFORE observations.
+7. Cross the effect boundary — inside the capsule.
+8. Take the AFTER observations, **strictly after process-domain quiescence**.
+   `supervise_command` returns only once the launcher has been reaped, and the
+   launcher exits only after the in-capsule init observed `ECHILD`.
+9. Publish the terminal receipt and terminal lifecycle record.
+10. Publish the **pending** ledger entry (`PENDING_VERIFICATION`) and the
+    reconciliation report.
+11. Reconcile the complete typed chain and publish the **separate** final
+    reconciliation record. A failed verification raises
+    `TypedReconciliationRefused` rather than returning an outcome.
+12. Verify the ledger by re-verifying every entry's whole typed chain, then
+    append to the durable run index.
+
+### New modules
+
+| Module | Purpose |
+| --- | --- |
+| `sandbox.py` | the one capsule construction and its readiness probe |
+| `_capsule_init.py` | the in-capsule PID 1 init that reaps and reports |
+| `reconciliation.py` | the authoritative typed reconciliation path |
+| `run_index.py` | the durable append-only run index |
+
+### New refusal types
+
+`SandboxUnavailable`, `EvidenceRootIsolationError`, `ConfigurationRefused`,
+`TypedReconciliationRefused`, `ReconciliationRefused`, `RunIndexBroken`.

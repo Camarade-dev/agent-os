@@ -18,17 +18,21 @@ from admissible.paired_runner.canonical import canonical_bytes, parse_canonical_
 from admissible.paired_runner.durable_store import FAULT_POINTS  # noqa: E402
 from admissible.paired_runner.effect_ledger import M2_LEDGER_SCHEMAS  # noqa: E402
 from admissible.paired_runner.observation import M2_OBSERVATION_SCHEMAS  # noqa: E402
+from admissible.paired_runner.reconciliation import M2_RECONCILIATION_SCHEMAS  # noqa: E402
+from admissible.paired_runner.run_index import M2_RUN_INDEX_SCHEMAS  # noqa: E402
 from admissible.paired_runner.schemas import SCHEMA_CATALOG  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
 IMPLEMENTATION = ROOT / "implementation"
 M1_STARTING_COMMIT = "5b5c3874f1929e77dbc3e2f71aa7f26d675a2705"
+M2_STARTING_COMMIT = "096dfbeb8845aaeda4c24f19e13fd144ceea4bfb"
 M2_ARTIFACTS = (
     "M2_CUMULATIVE_SCHEMA_CATALOG.json",
     "M2_CRASH_MATRIX.json",
     "M2_OUTPUT_SOAK_REPORT.json",
     "M2_VALIDATION_REPORT.json",
+    "M2_CRITICAL_REPAIR_REPORT.json",
 )
 PRESERVED_M1_ARTIFACTS = (
     "M1_SCHEMA_CATALOG.json",
@@ -61,18 +65,22 @@ class M2ArtifactTests(unittest.TestCase):
     def test_the_cumulative_catalog_matches_the_code_catalogs(self) -> None:
         catalog = parse_canonical_json((IMPLEMENTATION / "M2_CUMULATIVE_SCHEMA_CATALOG.json").read_bytes())
         self.assertEqual(catalog["milestone_1_schemas"], [item.to_dict() for item in SCHEMA_CATALOG.values()])
-        expected_m2 = [item.to_dict() for item in M2_OBSERVATION_SCHEMAS.values()] + [
-            item.to_dict() for item in M2_LEDGER_SCHEMAS.values()
-        ]
+        expected_m2 = (
+            [item.to_dict() for item in M2_OBSERVATION_SCHEMAS.values()]
+            + [item.to_dict() for item in M2_LEDGER_SCHEMAS.values()]
+            + [item.to_dict() for item in M2_RECONCILIATION_SCHEMAS.values()]
+            + [item.to_dict() for item in M2_RUN_INDEX_SCHEMAS.values()]
+        )
         self.assertEqual(catalog["milestone_2_schemas"], expected_m2)
         self.assertEqual(catalog["milestone_1_schema_count"], 29)
-        self.assertEqual(catalog["milestone_2_schema_count"], 9)
-        self.assertEqual(catalog["cumulative_schema_count"], 38)
+        self.assertEqual(catalog["milestone_2_schema_count"], 11)
+        self.assertEqual(catalog["cumulative_schema_count"], 40)
+        self.assertEqual(catalog["milestone_2_schema_version"], 2)
         self.assertIn("preserved unchanged", catalog["migration_note"])
 
     def test_the_crash_matrix_artifact_matches_the_declared_test_table(self) -> None:
         matrix = parse_canonical_json((IMPLEMENTATION / "M2_CRASH_MATRIX.json").read_bytes())
-        self.assertEqual(matrix["fault_point_count"], 13)
+        self.assertEqual(matrix["fault_point_count"], 19)
         self.assertEqual(len(matrix["rows"]), len(CRASH_MATRIX))
         self.assertEqual(
             [row["fault_point"] for row in matrix["rows"]],
@@ -91,16 +99,37 @@ class M2ArtifactTests(unittest.TestCase):
 
     def test_the_validation_report_records_the_exact_counts_and_verdict(self) -> None:
         report = parse_canonical_json((IMPLEMENTATION / "M2_VALIDATION_REPORT.json").read_bytes())
-        self.assertEqual(report["starting_commit"], M1_STARTING_COMMIT)
-        self.assertEqual(report["branch"], "paired-runner/m2-shared-effect-substrate")
-        self.assertEqual(report["terminal_verdict"], "SHARED_EFFECT_SUBSTRATE_VERIFIED")
-        self.assertEqual(report["crash_point_count"], 13)
+        self.assertEqual(report["starting_commit"], M2_STARTING_COMMIT)
+        self.assertEqual(report["branch"], "paired-runner/m2-critical-repairs")
+        self.assertEqual(report["terminal_verdict"], "M2_CRITICAL_REPAIRS_VERIFIED")
+        self.assertEqual(report["crash_point_count"], 19)
         self.assertEqual(report["corruption_fixture_count"], 24)
         self.assertFalse(report["boundary_audit"]["milestone_3_started"])
         for boundary, crossed in report["boundary_audit"].items():
             self.assertFalse(crossed, boundary)
         for record in report["requirement_dispositions"]:
             self.assertNotEqual(record["status"], "VERIFIED_INSTALLED_PATH")
+        self.assertTrue(report["known_limitations"])
+
+    def test_the_repair_report_closes_every_audit_finding(self) -> None:
+        report = parse_canonical_json((IMPLEMENTATION / "M2_CRITICAL_REPAIR_REPORT.json").read_bytes())
+        self.assertEqual(report["starting_commit"], M2_STARTING_COMMIT)
+        self.assertEqual(report["branch"], "paired-runner/m2-critical-repairs")
+        self.assertEqual(report["terminal_verdict"], "M2_CRITICAL_REPAIRS_VERIFIED")
+        findings = {row["finding"]: row for row in report["findings"]}
+        self.assertEqual(
+            sorted(findings), [f"M2-R{index:02d}" for index in range(1, 12)]
+        )
+        for name, row in findings.items():
+            with self.subTest(finding=name):
+                self.assertEqual(row["status"], "CLOSED")
+                self.assertTrue(row["closure"])
+                self.assertTrue(row["evidence"])
+        self.assertFalse(report["boundary_audit"]["milestone_3_started"])
+        for boundary, crossed in report["boundary_audit"].items():
+            self.assertFalse(crossed, boundary)
+        self.assertEqual(report["sandbox"]["mechanism"], "bubblewrap")
+        self.assertFalse(report["sandbox"]["evidence_root_exposed"])
         self.assertTrue(report["known_limitations"])
 
     def test_the_milestone_1_artifacts_are_preserved_byte_for_byte(self) -> None:
@@ -123,6 +152,7 @@ class M2ArtifactTests(unittest.TestCase):
             present,
             {
                 "__init__.py",
+                "_capsule_init.py",
                 "canonical.py",
                 "comparison.py",
                 "durable_store.py",
@@ -131,6 +161,9 @@ class M2ArtifactTests(unittest.TestCase):
                 "identities.py",
                 "observation.py",
                 "process_supervision.py",
+                "reconciliation.py",
+                "run_index.py",
+                "sandbox.py",
                 "schemas.py",
                 "specification.py",
                 "tool_schemas.py",
