@@ -38,6 +38,21 @@ from .specification import (
     canonical_object_bytes,
     validate_unique_proposal_ids,
 )
+from .schemas import RECEIPT_STATE_MATRIX, TERMINAL_STATE_MATRIX
+from .tool_schemas import (
+    ListFilesRequest,
+    ListFilesResult,
+    ReadFileRequest,
+    ReadFileResult,
+    RunCommandRequest,
+    RunCommandResult,
+    ToolRequest,
+    ToolResult,
+    WriteFileRequest,
+    WriteFileResult,
+    tool_request_from_dict,
+    tool_result_from_dict,
+)
 
 __all__ = [
     "AllowedConditionDifferences",
@@ -62,8 +77,20 @@ __all__ = [
     "ParityRefused",
     "ParityReport",
     "RunIdentity",
+    "RunCommandRequest",
+    "RunCommandResult",
     "SessionIdentity",
     "TerminalManifest",
+    "ToolRequest",
+    "ToolResult",
+    "ListFilesRequest",
+    "ListFilesResult",
+    "ReadFileRequest",
+    "ReadFileResult",
+    "WriteFileRequest",
+    "WriteFileResult",
+    "RECEIPT_STATE_MATRIX",
+    "TERMINAL_STATE_MATRIX",
     "canonical_bytes",
     "canonical_object_bytes",
     "check_parity",
@@ -72,5 +99,7 @@ __all__ = [
     "parse_canonical_json",
     "require_parity",
     "strict_json_loads",
+    "tool_request_from_dict",
+    "tool_result_from_dict",
     "validate_unique_proposal_ids",
 ]

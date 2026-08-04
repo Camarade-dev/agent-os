@@ -1,8 +1,9 @@
 # Paired Runner ADR Register
 
 This register records the twelve architecture decisions fixed by the governing
-implementation plan. Every decision below is FROZEN_BY_GOVERNING_PLAN. A later
-change requires a new ADR, an impact analysis for A/B fairness, and a
+implementation plan plus ADR-013, which records the bounded M1 repair boundary.
+Every decision below is FROZEN_BY_GOVERNING_PLAN or explicitly bounded by its
+status. A later change requires a new ADR, an impact analysis for A/B fairness, and a
 requirement-matrix revision. No ADR is reopened or weakened by Milestone 0.
 
 ## ADR-001 — Un seul transport modèle
@@ -52,8 +53,8 @@ requirement-matrix revision. No ADR is reopened or weakened by Milestone 0.
 - Status: FROZEN_BY_GOVERNING_PLAN
 - Governing decision: Every model tool request becomes a canonical proposal
   before any effect. The proposal carries run/condition/session/turn/proposal
-  identity, canonical arguments, scope, causal predecessor, timestamps,
-  transport, prompt, model, and grammar identities.
+  identity, one typed canonical tool request, scope, causal predecessor,
+  timestamps, transport, prompt, model, and grammar identities.
 - Evidence supporting it: The canary dynamic-tool request path and pre-effect
   effect ledger record authoritative attempts/outcomes. The audit finds that
   the modern product package-bin path lacks equivalent per-tool receipts.
@@ -244,33 +245,68 @@ requirement-matrix revision. No ADR is reopened or weakened by Milestone 0.
   negative check for unexpected historical modules.
 - Milestone responsible for closure: M0 freeze; revalidated in M1/M8.
 
+## ADR-013 — Réparations bornées de la spécification M1
+
+- Status: `M1_BOUNDED_REPAIR_BOUNDARY`
+- Governing basis: the independent M1 closure findings M1-R01 through
+  M1-R05 and the governing plan's M1 schema/round-trip requirements.
+- Decision: keep all affected schema versions at `1` because M1 has no
+  external or runtime persistence contract yet. Replace generic proposal
+  arguments with four closed typed request/result pairs; bind proposals and
+  reservations to the exact experiment specification; enforce exhaustive
+  receipt and terminal matrices; and require typed terminal manifests for
+  comparative closure.
+- Validation boundary: pure standard-library construction, exact-key
+  deserialization, canonical fingerprints, table-driven state tests, and
+  typed comparative reconciliation only. No effect, policy, broker,
+  authority, transport, evaluator execution, installation, or provider path
+  is introduced.
+- Consequences: the schema catalog grows from 19 to 27 descriptors; the
+  version-1 catalog is regenerated canonically; old generic M1 fixture shapes
+  are intentionally refused. A future runtime persistence implementation must
+  adopt these exact definitions or issue a new versioned ADR before use.
+- Forbidden alternatives: accepting arbitrary tool dictionaries, relying on
+  caller-side specification comparisons, treating timeout/ambiguity as
+  completion, accepting unreconciled terminals, or presenting terminal
+  fingerprints without typed reconciliation.
+- Requirements affected: ARCH-02, ARCH-04, ARCH-05, EXEC-01 through EXEC-05,
+  BASE-01, BASE-02, and FAIR-01 through FAIR-07. No out-of-scope requirement
+  record is changed.
+
 ## Register closure
 
 The decisions above are the governing architecture boundary for the next
 milestone. Any implementation that conflicts with one of them is not a
-permitted continuation of this freeze.
+permitted continuation of this freeze. ADR-013 closes only the bounded M1
+repair boundary and does not authorize Milestone 2.
 
 ## Milestone 1 evidence and clarifications
 
 Milestone 1 adds the pure package `admissible.paired_runner` and the artifacts
 `M1_EXECUTABLE_ARCHITECTURE_SPEC.md`, `M1_SCHEMA_CATALOG.json`,
-`M1_ALLOWED_CONDITION_DIFFERENCES.json`, and `M1_VALIDATION_REPORT.json`.
+`M1_ALLOWED_CONDITION_DIFFERENCES.json`, `M1_VALIDATION_REPORT.json`, and
+`M1_BOUNDED_REPAIR_REPORT.json`.
 The package is a fresh standard-library implementation; it imports none of
 the historical runner, long-run, high-autonomy, Cursor, broker, witness, or
 effect paths listed by the foundation freeze.
 
 - ADR-001/004 are represented by common transport, proposal, and future
   effect-executor identities plus a single `ModeDecision` boundary. This is a
-  pure equality invariant, not physical runtime integration.
-- ADR-003/005/009 are represented by strict proposal, receipt, terminal,
-  run, session, clock, causal, and budget records. Durable publication,
-  restart, and observation remain later milestones.
+  pure equality invariant, not physical runtime integration. The proposal
+  now carries a typed tool request and the reservation derives the executor
+  from the exact specification.
+- ADR-003/005/009 are represented by strict proposal, typed tool request and
+  result, receipt-state, terminal-state, run, session, clock, causal, and
+  budget records. Durable publication, restart, and observation remain later
+  milestones.
 - ADR-006 is clarified: run identity fields are instance bindings, not causal
   A/B inputs. They are explicitly named as `instance_binding_exceptions` in
   the allowlist so parity has no implicit ignored fields.
 - ADR-010 is clarified: effect receipts cannot contain task acceptance;
   `TerminalManifest` records independent evaluator basis and keeps process
-  completion separate from task acceptance.
+  completion separate from task acceptance. Comparative closure requires the
+  typed DIRECT and GOVERNED terminal objects and a separate typed
+  reconciliation path after deserialization.
 - ADR-011/012 remain absolute exclusions. No V14–V18 object, production root,
   historical module, or Cursor `--force --trust` path is a fixture or import.
 

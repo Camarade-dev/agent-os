@@ -36,8 +36,11 @@ from .schemas import (
     SCHEMA_SESSION_IDENTITY,
     SCHEMA_TERMINAL,
     SCHEMA_VERSION,
+    RECEIPT_STATE_MATRIX,
+    TERMINAL_STATE_MATRIX,
     TOOL_NAMES,
 )
+from .tool_schemas import ToolRequest, tool_request_from_dict
 
 
 MAX_COUNTER = 2**63 - 1
@@ -107,6 +110,12 @@ def _run(value: Any, label: str = "run_identity") -> RunIdentity:
 def _session(value: Any, label: str = "session_identity") -> SessionIdentity:
     if not isinstance(value, SessionIdentity):
         raise ValueError(f"{label} must be a SessionIdentity")
+    return value.validated()
+
+
+def _tool_request(value: Any, label: str = "tool_request") -> ToolRequest:
+    if not isinstance(value, ToolRequest):
+        raise ValueError(f"{label} must be one of the four typed tool request records")
     return value.validated()
 
 
@@ -667,6 +676,8 @@ class ExperimentSpecification:
     environment_identity: IdentityReference
     dependency_toolchain_identity: IdentityReference
     common_filesystem_network_process_policy_identity: IdentityReference
+    working_root_identity: IdentityReference
+    scope_identity: IdentityReference
     effect_executor_identity: IdentityReference
     evaluator_identity: IdentityReference
     common_budgets: BudgetState
@@ -690,6 +701,8 @@ class ExperimentSpecification:
         environment_identity: IdentityReference,
         dependency_toolchain_identity: IdentityReference,
         common_filesystem_network_process_policy_identity: IdentityReference,
+        working_root_identity: IdentityReference,
+        scope_identity: IdentityReference,
         effect_executor_identity: IdentityReference,
         evaluator_identity: IdentityReference,
         common_budgets: BudgetState,
@@ -711,6 +724,8 @@ class ExperimentSpecification:
             "environment_identity": environment_identity.to_dict(),
             "dependency_toolchain_identity": dependency_toolchain_identity.to_dict(),
             "common_filesystem_network_process_policy_identity": common_filesystem_network_process_policy_identity.to_dict(),
+            "working_root_identity": working_root_identity.to_dict(),
+            "scope_identity": scope_identity.to_dict(),
             "effect_executor_identity": effect_executor_identity.to_dict(),
             "evaluator_identity": evaluator_identity.to_dict(),
             "common_budgets": common_budgets.to_dict(),
@@ -732,6 +747,8 @@ class ExperimentSpecification:
             environment_identity=environment_identity,
             dependency_toolchain_identity=dependency_toolchain_identity,
             common_filesystem_network_process_policy_identity=common_filesystem_network_process_policy_identity,
+            working_root_identity=working_root_identity,
+            scope_identity=scope_identity,
             effect_executor_identity=effect_executor_identity,
             evaluator_identity=evaluator_identity,
             common_budgets=common_budgets,
@@ -756,6 +773,8 @@ class ExperimentSpecification:
             "environment_identity": self.environment_identity.to_dict(),
             "dependency_toolchain_identity": self.dependency_toolchain_identity.to_dict(),
             "common_filesystem_network_process_policy_identity": self.common_filesystem_network_process_policy_identity.to_dict(),
+            "working_root_identity": self.working_root_identity.to_dict(),
+            "scope_identity": self.scope_identity.to_dict(),
             "effect_executor_identity": self.effect_executor_identity.to_dict(),
             "evaluator_identity": self.evaluator_identity.to_dict(),
             "common_budgets": self.common_budgets.to_dict(),
@@ -797,6 +816,8 @@ class ExperimentSpecification:
             "environment_identity": identities["environment_identity"],
             "dependency_toolchain_identity": identities["dependency_toolchain_identity"],
             "common_filesystem_network_process_policy_identity": identities["common_filesystem_network_process_policy_identity"],
+            "working_root_identity": self.working_root_identity.normative_dict(),
+            "scope_identity": self.scope_identity.normative_dict(),
             "effect_executor_identity": identities["effect_executor_identity"],
             "evaluator_identity": identities["evaluator_identity"],
             "common_budgets": {
@@ -837,6 +858,8 @@ class ExperimentSpecification:
             ("environment_identity", "environment"),
             ("dependency_toolchain_identity", "dependency_toolchain"),
             ("common_filesystem_network_process_policy_identity", "filesystem_network_process_policy"),
+            ("working_root_identity", "working_root"),
+            ("scope_identity", "scope"),
             ("effect_executor_identity", "effect_executor"),
             ("evaluator_identity", "evaluator"),
         ):
@@ -867,6 +890,7 @@ class ExperimentSpecification:
             "schema_id", "schema_version", "experiment_id", "task_prompt_fingerprint", "initial_state_fingerprint",
             "model_identity", "executable_identity", "executable_digest", "transport_identity", "tool_grammar_identity",
             "environment_identity", "dependency_toolchain_identity", "common_filesystem_network_process_policy_identity",
+            "working_root_identity", "scope_identity",
             "effect_executor_identity", "evaluator_identity", "common_budgets", "allowed_condition_differences", "condition", "run_identity",
             "specification_fingerprint",
         }
@@ -883,6 +907,8 @@ class ExperimentSpecification:
             environment_identity=IdentityReference.from_dict(data["environment_identity"]),
             dependency_toolchain_identity=IdentityReference.from_dict(data["dependency_toolchain_identity"]),
             common_filesystem_network_process_policy_identity=IdentityReference.from_dict(data["common_filesystem_network_process_policy_identity"]),
+            working_root_identity=IdentityReference.from_dict(data["working_root_identity"]),
+            scope_identity=IdentityReference.from_dict(data["scope_identity"]),
             effect_executor_identity=IdentityReference.from_dict(data["effect_executor_identity"]),
             evaluator_identity=IdentityReference.from_dict(data["evaluator_identity"]),
             common_budgets=BudgetState.from_dict(data["common_budgets"]),
@@ -897,13 +923,14 @@ class ExperimentSpecification:
 class CanonicalProposal:
     schema_id: str
     schema_version: int
+    experiment_specification_fingerprint: Fingerprint
     run_identity: RunIdentity
     condition: ConditionConfiguration
     session_identity: SessionIdentity
     turn_id: str
     proposal_id: str
     tool_name: str
-    canonical_arguments: dict[str, Any]
+    tool_request: ToolRequest
     working_root_identity: IdentityReference
     scope_identity: IdentityReference
     causal_predecessor: CausalPredecessor
@@ -920,78 +947,82 @@ class CanonicalProposal:
     def create(
         cls,
         *,
-        run_identity: RunIdentity,
-        condition: ConditionConfiguration,
+        specification: ExperimentSpecification,
         session_identity: SessionIdentity,
         turn_id: str,
         proposal_id: str,
-        tool_name: str,
-        canonical_arguments: dict[str, Any],
-        working_root_identity: IdentityReference,
-        scope_identity: IdentityReference,
+        prompt_identity: IdentityReference,
+        tool_request: ToolRequest,
         causal_predecessor: CausalPredecessor,
         wall_clock_observation: ClockObservation,
         monotonic_observation: ClockObservation,
-        model_identity: IdentityReference,
-        transport_identity: IdentityReference,
-        prompt_identity: IdentityReference,
-        tool_grammar_identity: IdentityReference,
     ) -> "CanonicalProposal":
+        specification.validated()
+        session_identity.validate_for_run(specification.run_identity)
+        prompt_identity = _identity_of_kind(prompt_identity, "prompt_identity", "prompt")
+        tool_request = _tool_request(tool_request)
+        if tool_request.tool_grammar_fingerprint != specification.tool_grammar_identity.content_fingerprint:
+            raise ValueError("tool request is not permitted by the specification's exact tool grammar")
+        if prompt_identity.content_fingerprint != specification.task_prompt_fingerprint:
+            raise ValueError("prompt identity is not bound to the specification task prompt")
         body = {
             "schema_id": SCHEMA_PROPOSAL,
             "schema_version": SCHEMA_VERSION,
-            "run_identity": run_identity.to_dict(),
-            "condition": condition.to_dict(),
+            "experiment_specification_fingerprint": specification.specification_fingerprint.to_dict(),
+            "run_identity": specification.run_identity.to_dict(),
+            "condition": specification.condition.to_dict(),
             "session_identity": session_identity.to_dict(),
             "turn_id": turn_id,
             "proposal_id": proposal_id,
-            "tool_name": tool_name,
-            "canonical_arguments": canonical_arguments,
-            "working_root_identity": working_root_identity.to_dict(),
-            "scope_identity": scope_identity.to_dict(),
+            "tool_name": tool_request.tool_name,
+            "tool_request": tool_request.to_dict(),
+            "working_root_identity": specification.working_root_identity.to_dict(),
+            "scope_identity": specification.scope_identity.to_dict(),
             "causal_predecessor": causal_predecessor.to_dict(),
             "wall_clock_observation": wall_clock_observation.to_dict(),
             "monotonic_observation": monotonic_observation.to_dict(),
-            "model_identity": model_identity.to_dict(),
-            "transport_identity": transport_identity.to_dict(),
+            "model_identity": specification.model_identity.to_dict(),
+            "transport_identity": specification.transport_identity.to_dict(),
             "prompt_identity": prompt_identity.to_dict(),
-            "tool_grammar_identity": tool_grammar_identity.to_dict(),
+            "tool_grammar_identity": specification.tool_grammar_identity.to_dict(),
             "effect_precondition": "PROPOSAL_BEFORE_EFFECT",
         }
         return cls(
             schema_id=SCHEMA_PROPOSAL,
             schema_version=SCHEMA_VERSION,
-            run_identity=run_identity,
-            condition=condition,
+            experiment_specification_fingerprint=specification.specification_fingerprint,
+            run_identity=specification.run_identity,
+            condition=specification.condition,
             session_identity=session_identity,
             turn_id=turn_id,
             proposal_id=proposal_id,
-            tool_name=tool_name,
-            canonical_arguments=canonical_arguments,
-            working_root_identity=working_root_identity,
-            scope_identity=scope_identity,
+            tool_name=tool_request.tool_name,
+            tool_request=tool_request,
+            working_root_identity=specification.working_root_identity,
+            scope_identity=specification.scope_identity,
             causal_predecessor=causal_predecessor,
             wall_clock_observation=wall_clock_observation,
             monotonic_observation=monotonic_observation,
-            model_identity=model_identity,
-            transport_identity=transport_identity,
+            model_identity=specification.model_identity,
+            transport_identity=specification.transport_identity,
             prompt_identity=prompt_identity,
-            tool_grammar_identity=tool_grammar_identity,
+            tool_grammar_identity=specification.tool_grammar_identity,
             effect_precondition="PROPOSAL_BEFORE_EFFECT",
             proposal_fingerprint=_object_fp(body, SCHEMA_PROPOSAL),
-        ).validated()
+        ).validate_for_specification(specification)
 
     def _body(self) -> dict[str, Any]:
         return {
             "schema_id": self.schema_id,
             "schema_version": self.schema_version,
+            "experiment_specification_fingerprint": self.experiment_specification_fingerprint.to_dict(),
             "run_identity": self.run_identity.to_dict(),
             "condition": self.condition.to_dict(),
             "session_identity": self.session_identity.to_dict(),
             "turn_id": self.turn_id,
             "proposal_id": self.proposal_id,
             "tool_name": self.tool_name,
-            "canonical_arguments": self.canonical_arguments,
+            "tool_request": self.tool_request.to_dict(),
             "working_root_identity": self.working_root_identity.to_dict(),
             "scope_identity": self.scope_identity.to_dict(),
             "causal_predecessor": self.causal_predecessor.to_dict(),
@@ -1008,18 +1039,16 @@ class CanonicalProposal:
         if self.schema_id != SCHEMA_PROPOSAL or self.schema_version != SCHEMA_VERSION:
             raise ValueError("unsupported canonical proposal schema")
         self.run_identity.validated()
+        _fp(self.experiment_specification_fingerprint, "experiment_specification_fingerprint")
         self.condition.validated()
         self.session_identity.validate_for_run(self.run_identity)
         if self.condition.condition_id != self.run_identity.condition_id:
             raise ValueError("proposal condition and run identity differ")
         _identifier(self.turn_id, "turn_id")
         _identifier(self.proposal_id, "proposal_id")
-        if self.tool_name not in TOOL_NAMES:
+        _tool_request(self.tool_request)
+        if self.tool_name not in TOOL_NAMES or self.tool_request.tool_name != self.tool_name:
             raise ValueError("unknown tool name")
-        if not isinstance(self.canonical_arguments, dict):
-            raise ValueError("canonical_arguments must be an object")
-        # canonical_bytes rejects floats, non-string keys, and unsupported values.
-        canonical_bytes(self.canonical_arguments)
         for name, expected_kind in (
             ("working_root_identity", "working_root"),
             ("scope_identity", "scope"),
@@ -1045,6 +1074,33 @@ class CanonicalProposal:
             raise ValueError("proposal fingerprint mismatch")
         return self
 
+    def validate_for_specification(self, specification: ExperimentSpecification) -> "CanonicalProposal":
+        """Fail-closed validation of every proposal/specification binding."""
+
+        specification.validated()
+        self.validated()
+        if self.experiment_specification_fingerprint != specification.specification_fingerprint:
+            raise ValueError("proposal is bound to a different experiment specification")
+        if self.run_identity != specification.run_identity:
+            raise ValueError("proposal run identity does not equal the specification run identity")
+        if self.condition != specification.condition:
+            raise ValueError("proposal condition does not equal the specification condition")
+        if self.model_identity != specification.model_identity:
+            raise ValueError("proposal model identity does not equal the specification model")
+        if self.transport_identity != specification.transport_identity:
+            raise ValueError("proposal transport identity does not equal the specification transport")
+        if self.prompt_identity.content_fingerprint != specification.task_prompt_fingerprint:
+            raise ValueError("proposal prompt identity does not bind the task prompt specification")
+        if self.tool_grammar_identity != specification.tool_grammar_identity:
+            raise ValueError("proposal tool grammar identity does not equal the specification grammar")
+        if self.tool_request.tool_grammar_fingerprint != specification.tool_grammar_identity.content_fingerprint:
+            raise ValueError("proposal tool request is not permitted by the exact grammar identity")
+        if self.working_root_identity != specification.working_root_identity:
+            raise ValueError("proposal working root is not authorized by the specification")
+        if self.scope_identity != specification.scope_identity:
+            raise ValueError("proposal scope is not authorized by the specification")
+        return self
+
     def to_dict(self) -> dict[str, Any]:
         self.validated()
         return {**self._body(), "proposal_fingerprint": self.proposal_fingerprint.to_dict()}
@@ -1052,19 +1108,20 @@ class CanonicalProposal:
     @classmethod
     def from_dict(cls, data: Any) -> "CanonicalProposal":
         fields = {
-            "schema_id", "schema_version", "run_identity", "condition", "session_identity", "turn_id", "proposal_id",
-            "tool_name", "canonical_arguments", "working_root_identity", "scope_identity", "causal_predecessor",
+            "schema_id", "schema_version", "experiment_specification_fingerprint", "run_identity", "condition", "session_identity", "turn_id", "proposal_id",
+            "tool_name", "tool_request", "working_root_identity", "scope_identity", "causal_predecessor",
             "wall_clock_observation", "monotonic_observation", "model_identity", "transport_identity", "prompt_identity",
             "tool_grammar_identity", "effect_precondition", "proposal_fingerprint",
         }
         _schema(data, SCHEMA_PROPOSAL, "canonical proposal", fields)
         return cls(
             schema_id=data["schema_id"], schema_version=data["schema_version"],
+            experiment_specification_fingerprint=_fp_from_dict(data["experiment_specification_fingerprint"], "experiment_specification_fingerprint"),
             run_identity=RunIdentity.from_dict(data["run_identity"]),
             condition=ConditionConfiguration.from_dict(data["condition"]),
             session_identity=SessionIdentity.from_dict(data["session_identity"]),
             turn_id=data["turn_id"], proposal_id=data["proposal_id"], tool_name=data["tool_name"],
-            canonical_arguments=data["canonical_arguments"],
+            tool_request=tool_request_from_dict(data["tool_request"]),
             working_root_identity=IdentityReference.from_dict(data["working_root_identity"]),
             scope_identity=IdentityReference.from_dict(data["scope_identity"]),
             causal_predecessor=CausalPredecessor.from_dict(data["causal_predecessor"]),
@@ -1198,6 +1255,7 @@ class ModeDecision:
 class EffectReservation:
     schema_id: str
     schema_version: int
+    experiment_specification_fingerprint: Fingerprint
     reservation_id: str
     proposal_id: str
     proposal_fingerprint: Fingerprint
@@ -1210,37 +1268,39 @@ class EffectReservation:
     def for_decision(
         cls,
         *,
+        specification: ExperimentSpecification,
         reservation_id: str,
         proposal: CanonicalProposal,
         decision: ModeDecision,
-        effect_executor_identity: IdentityReference,
     ) -> "EffectReservation":
-        proposal.validated()
+        specification.validated()
+        proposal.validate_for_specification(specification)
         decision.validated()
         if proposal.proposal_id != decision.proposal_id or proposal.proposal_fingerprint != decision.proposal_fingerprint:
             raise ValueError("reservation proposal and mode decision are not causally bound")
         if not decision.permits_effect:
             raise ValueError("a refused, terminated, or continuation decision cannot reserve an effect")
         _identifier(reservation_id, "reservation_id")
-        _identity_of_kind(effect_executor_identity, "effect_executor_identity", "effect_executor")
         body = {
             "schema_id": SCHEMA_RESERVATION,
             "schema_version": SCHEMA_VERSION,
+            "experiment_specification_fingerprint": specification.specification_fingerprint.to_dict(),
             "reservation_id": reservation_id,
             "proposal_id": proposal.proposal_id,
             "proposal_fingerprint": proposal.proposal_fingerprint.to_dict(),
             "mode_decision_fingerprint": decision.decision_fingerprint.to_dict(),
-            "effect_executor_identity": effect_executor_identity.to_dict(),
+            "effect_executor_identity": specification.effect_executor_identity.to_dict(),
             "reservation_state": "RESERVED_NOT_STARTED",
         }
         return cls(
             schema_id=SCHEMA_RESERVATION,
             schema_version=SCHEMA_VERSION,
+            experiment_specification_fingerprint=specification.specification_fingerprint,
             reservation_id=reservation_id,
             proposal_id=proposal.proposal_id,
             proposal_fingerprint=proposal.proposal_fingerprint,
             mode_decision_fingerprint=decision.decision_fingerprint,
-            effect_executor_identity=effect_executor_identity,
+            effect_executor_identity=specification.effect_executor_identity,
             reservation_state="RESERVED_NOT_STARTED",
             reservation_fingerprint=_object_fp(body, SCHEMA_RESERVATION),
         ).validated()
@@ -1249,6 +1309,7 @@ class EffectReservation:
         return {
             "schema_id": self.schema_id,
             "schema_version": self.schema_version,
+            "experiment_specification_fingerprint": self.experiment_specification_fingerprint.to_dict(),
             "reservation_id": self.reservation_id,
             "proposal_id": self.proposal_id,
             "proposal_fingerprint": self.proposal_fingerprint.to_dict(),
@@ -1260,6 +1321,7 @@ class EffectReservation:
     def validated(self) -> "EffectReservation":
         if self.schema_id != SCHEMA_RESERVATION or self.schema_version != SCHEMA_VERSION:
             raise ValueError("unsupported effect reservation schema")
+        _fp(self.experiment_specification_fingerprint, "experiment_specification_fingerprint")
         _identifier(self.reservation_id, "reservation_id")
         _identifier(self.proposal_id, "proposal_id")
         _fp(self.proposal_fingerprint, "proposal_fingerprint")
@@ -1272,6 +1334,17 @@ class EffectReservation:
             raise ValueError("effect reservation fingerprint mismatch")
         return self
 
+    def validate_for_specification(self, specification: ExperimentSpecification) -> "EffectReservation":
+        """Prove that this reservation is for the exact experiment executor."""
+
+        specification.validated()
+        self.validated()
+        if self.experiment_specification_fingerprint != specification.specification_fingerprint:
+            raise ValueError("effect reservation is bound to a different experiment specification")
+        if self.effect_executor_identity != specification.effect_executor_identity:
+            raise ValueError("effect reservation executor identity differs from the specification")
+        return self
+
     def to_dict(self) -> dict[str, Any]:
         self.validated()
         return {**self._body(), "reservation_fingerprint": self.reservation_fingerprint.to_dict()}
@@ -1279,12 +1352,13 @@ class EffectReservation:
     @classmethod
     def from_dict(cls, data: Any) -> "EffectReservation":
         fields = {
-            "schema_id", "schema_version", "reservation_id", "proposal_id", "proposal_fingerprint",
+            "schema_id", "schema_version", "experiment_specification_fingerprint", "reservation_id", "proposal_id", "proposal_fingerprint",
             "mode_decision_fingerprint", "effect_executor_identity", "reservation_state", "reservation_fingerprint",
         }
         _schema(data, SCHEMA_RESERVATION, "effect reservation", fields)
         return cls(
             schema_id=data["schema_id"], schema_version=data["schema_version"], reservation_id=data["reservation_id"],
+            experiment_specification_fingerprint=_fp_from_dict(data["experiment_specification_fingerprint"], "experiment_specification_fingerprint"),
             proposal_id=data["proposal_id"], proposal_fingerprint=_fp_from_dict(data["proposal_fingerprint"], "proposal_fingerprint"),
             mode_decision_fingerprint=_fp_from_dict(data["mode_decision_fingerprint"], "mode_decision_fingerprint"),
             effect_executor_identity=IdentityReference.from_dict(data["effect_executor_identity"]),
@@ -1305,6 +1379,9 @@ class EffectReceipt:
     effect_completed: bool
     executed_effect: bool
     process_exit_code: int | None
+    outcome_known: bool
+    replay_forbidden: bool
+    reconciliation_required: bool
     task_acceptance: None
     outcome_reason: str
     receipt_fingerprint: Fingerprint
@@ -1321,8 +1398,20 @@ class EffectReceipt:
         effect_completed: bool = False,
         executed_effect: bool = False,
         process_exit_code: int | None = None,
+        outcome_known: bool | None = None,
+        replay_forbidden: bool | None = None,
+        reconciliation_required: bool | None = None,
         outcome_reason: str,
     ) -> "EffectReceipt":
+        if status not in RECEIPT_STATE_MATRIX:
+            raise ValueError("unknown effect receipt status")
+        rule = RECEIPT_STATE_MATRIX[status]
+        if outcome_known is None:
+            outcome_known = rule.outcome_known
+        if replay_forbidden is None:
+            replay_forbidden = rule.replay_forbidden
+        if reconciliation_required is None:
+            reconciliation_required = rule.reconciliation_required
         body = {
             "schema_id": SCHEMA_RECEIPT,
             "schema_version": SCHEMA_VERSION,
@@ -1334,6 +1423,9 @@ class EffectReceipt:
             "effect_completed": effect_completed,
             "executed_effect": executed_effect,
             "process_exit_code": process_exit_code,
+            "outcome_known": outcome_known,
+            "replay_forbidden": replay_forbidden,
+            "reconciliation_required": reconciliation_required,
             "task_acceptance": None,
             "outcome_reason": outcome_reason,
         }
@@ -1348,6 +1440,9 @@ class EffectReceipt:
             effect_completed=effect_completed,
             executed_effect=executed_effect,
             process_exit_code=process_exit_code,
+            outcome_known=outcome_known,
+            replay_forbidden=replay_forbidden,
+            reconciliation_required=reconciliation_required,
             task_acceptance=None,
             outcome_reason=outcome_reason,
             receipt_fingerprint=_object_fp(body, SCHEMA_RECEIPT),
@@ -1365,6 +1460,9 @@ class EffectReceipt:
             "effect_completed": self.effect_completed,
             "executed_effect": self.executed_effect,
             "process_exit_code": self.process_exit_code,
+            "outcome_known": self.outcome_known,
+            "replay_forbidden": self.replay_forbidden,
+            "reconciliation_required": self.reconciliation_required,
             "task_acceptance": self.task_acceptance,
             "outcome_reason": self.outcome_reason,
         }
@@ -1378,10 +1476,31 @@ class EffectReceipt:
             _fp(self.reservation_fingerprint, "reservation_fingerprint")
         if self.status not in RECEIPT_STATUSES:
             raise ValueError("unknown effect receipt status")
+        rule = RECEIPT_STATE_MATRIX[self.status]
         for name in ("effect_started", "effect_completed", "executed_effect"):
             _strict_bool(getattr(self, name), name)
-        if self.effect_completed and not self.effect_started:
-            raise ValueError("an effect cannot complete before it starts")
+        for name in ("outcome_known", "replay_forbidden", "reconciliation_required"):
+            _strict_bool(getattr(self, name), name)
+        if (
+            self.effect_started,
+            self.effect_completed,
+            self.executed_effect,
+        ) != (rule.effect_started, rule.effect_completed, rule.executed_effect):
+            raise ValueError(f"{self.status} receipt flags do not match the exhaustive receipt state matrix")
+        if self.outcome_known != rule.outcome_known:
+            raise ValueError(f"{self.status} receipt outcome_known flag is inconsistent")
+        if self.replay_forbidden != rule.replay_forbidden:
+            raise ValueError(f"{self.status} receipt replay policy is inconsistent")
+        if self.reconciliation_required != rule.reconciliation_required:
+            raise ValueError(f"{self.status} receipt reconciliation policy is inconsistent")
+        if rule.reservation == "REQUIRED" and self.reservation_fingerprint is None:
+            raise ValueError(f"{self.status} receipt must bind a reservation")
+        if rule.reservation == "FORBIDDEN" and self.reservation_fingerprint is not None:
+            raise ValueError(f"{self.status} receipt cannot bind a reservation")
+        if rule.process_exit_code == "FORBIDDEN" and self.process_exit_code is not None:
+            raise ValueError(f"{self.status} receipt cannot contain a process exit code")
+        if rule.process_exit_code == "REQUIRED" and self.process_exit_code is None:
+            raise ValueError(f"{self.status} receipt requires a process exit code")
         if self.process_exit_code is not None and (
             isinstance(self.process_exit_code, bool)
             or not isinstance(self.process_exit_code, int)
@@ -1391,19 +1510,6 @@ class EffectReceipt:
         if self.task_acceptance is not None:
             raise ValueError("effect receipts never carry task acceptance")
         _text(self.outcome_reason, "outcome_reason", max_bytes=4096)
-        if self.status in {"PROPOSED", "REFUSED"}:
-            if self.effect_started or self.effect_completed or self.executed_effect or self.reservation_fingerprint is not None:
-                raise ValueError("proposed/refused receipt cannot represent an executed effect")
-        if self.status == "RESERVED" and (self.reservation_fingerprint is None or self.effect_started or self.executed_effect):
-            raise ValueError("reserved receipt must be pre-start and reservation-bound")
-        if self.status in {"STARTED", "FAILED", "COMPLETED", "AMBIGUOUS", "TIMED_OUT", "CANCELLED"} and self.reservation_fingerprint is None:
-            raise ValueError("post-reservation receipt must bind an effect reservation")
-        if self.status == "COMPLETED" and not (self.effect_started and self.effect_completed and self.executed_effect):
-            raise ValueError("completed receipt flags are inconsistent")
-        if self.status == "AMBIGUOUS" and not self.effect_started:
-            raise ValueError("ambiguous outcome requires an attempted start")
-        if self.status == "REFUSED" and self.executed_effect:
-            raise ValueError("refusal cannot simultaneously represent an executed effect")
         _fp(self.receipt_fingerprint, "receipt_fingerprint")
         if _object_fp(self._body(), SCHEMA_RECEIPT) != self.receipt_fingerprint:
             raise ValueError("effect receipt fingerprint mismatch")
@@ -1417,7 +1523,7 @@ class EffectReceipt:
     def from_dict(cls, data: Any) -> "EffectReceipt":
         fields = {
             "schema_id", "schema_version", "receipt_id", "proposal_fingerprint", "reservation_fingerprint", "status",
-            "effect_started", "effect_completed", "executed_effect", "process_exit_code", "task_acceptance",
+            "effect_started", "effect_completed", "executed_effect", "process_exit_code", "outcome_known", "replay_forbidden", "reconciliation_required", "task_acceptance",
             "outcome_reason", "receipt_fingerprint",
         }
         _schema(data, SCHEMA_RECEIPT, "effect receipt", fields)
@@ -1427,6 +1533,7 @@ class EffectReceipt:
             reservation_fingerprint=(None if data["reservation_fingerprint"] is None else _fp_from_dict(data["reservation_fingerprint"], "reservation_fingerprint")),
             status=data["status"], effect_started=data["effect_started"], effect_completed=data["effect_completed"],
             executed_effect=data["executed_effect"], process_exit_code=data["process_exit_code"],
+            outcome_known=data["outcome_known"], replay_forbidden=data["replay_forbidden"], reconciliation_required=data["reconciliation_required"],
             task_acceptance=data["task_acceptance"], outcome_reason=data["outcome_reason"],
             receipt_fingerprint=_fp_from_dict(data["receipt_fingerprint"], "receipt_fingerprint"),
         ).validated()
@@ -1679,7 +1786,9 @@ class TerminalManifest:
         task_acceptance: str,
         reconciliation_complete: bool,
     ) -> "TerminalManifest":
-        acceptance_basis = "INDEPENDENT_EVALUATOR" if task_acceptance != "NOT_EVALUATED" else "NONE"
+        if task_acceptance not in TERMINAL_STATE_MATRIX:
+            raise ValueError("unknown task acceptance disposition")
+        acceptance_basis = TERMINAL_STATE_MATRIX[task_acceptance].acceptance_basis
         body = {
             "schema_id": SCHEMA_TERMINAL, "schema_version": SCHEMA_VERSION, "run_identity": run_identity.to_dict(),
             "experiment_specification_fingerprint": experiment_specification_fingerprint.to_dict(), "repository_state_fingerprint": repository_state_fingerprint.to_dict(),
@@ -1729,17 +1838,28 @@ class TerminalManifest:
             raise ValueError("unknown model completion claim")
         if self.process_result not in {"SUCCESS", "FAILURE", "TIMEOUT", "CANCELLED", "UNKNOWN"}:
             raise ValueError("unknown process result")
-        if self.task_acceptance not in {"ACCEPTED", "REJECTED", "INCONCLUSIVE", "NOT_EVALUATED"}:
+        if self.task_acceptance not in TERMINAL_STATE_MATRIX:
             raise ValueError("unknown task acceptance")
-        expected_basis = "INDEPENDENT_EVALUATOR" if self.task_acceptance != "NOT_EVALUATED" else "NONE"
-        if self.acceptance_basis != expected_basis:
+        rule = TERMINAL_STATE_MATRIX[self.task_acceptance]
+        if self.acceptance_basis != rule.acceptance_basis:
             raise ValueError("task acceptance must be separately attributed to the evaluator")
         _strict_bool(self.reconciliation_complete, "reconciliation_complete")
-        if self.reconciliation_complete and self.task_acceptance == "NOT_EVALUATED":
-            raise ValueError("a reconciled terminal manifest requires an evaluator disposition")
+        if self.reconciliation_complete != rule.reconciliation_complete:
+            raise ValueError(f"{self.task_acceptance} reconciliation state contradicts the terminal-state matrix")
         _fp(self.terminal_manifest_fingerprint, "terminal_manifest_fingerprint")
         if _object_fp(self._body(), SCHEMA_TERMINAL) != self.terminal_manifest_fingerprint:
             raise ValueError("terminal manifest fingerprint mismatch")
+        return self
+
+    def validate_for_specification(self, specification: ExperimentSpecification) -> "TerminalManifest":
+        """Bind a typed terminal to the exact run and specification."""
+
+        specification.validated()
+        self.validated()
+        if self.run_identity != specification.run_identity:
+            raise ValueError("terminal run identity does not equal the specification run identity")
+        if self.experiment_specification_fingerprint != specification.specification_fingerprint:
+            raise ValueError("terminal is bound to a different experiment specification")
         return self
 
     def to_dict(self) -> dict[str, Any]:
@@ -1774,11 +1894,13 @@ class ComparativeManifest:
     schema_version: int
     experiment_id: str
     experiment_specification_fingerprint: Fingerprint
+    direct_specification_fingerprint: Fingerprint
+    governed_specification_fingerprint: Fingerprint
     direct_run_identity: RunIdentity
     governed_run_identity: RunIdentity
     parity_report_fingerprint: Fingerprint
-    direct_terminal_manifest_fingerprint: Fingerprint
-    governed_terminal_manifest_fingerprint: Fingerprint
+    direct_terminal_manifest: TerminalManifest
+    governed_terminal_manifest: TerminalManifest
     comparative_manifest_fingerprint: Fingerprint
 
     @classmethod
@@ -1788,8 +1910,8 @@ class ComparativeManifest:
         direct_specification: ExperimentSpecification,
         governed_specification: ExperimentSpecification,
         parity_report: Any,
-        direct_terminal_manifest_fingerprint: Fingerprint,
-        governed_terminal_manifest_fingerprint: Fingerprint,
+        direct_terminal_manifest: TerminalManifest,
+        governed_terminal_manifest: TerminalManifest,
     ) -> "ComparativeManifest":
         """Create only from two validated specs and a passing parity report."""
 
@@ -1799,13 +1921,24 @@ class ComparativeManifest:
 
         if not isinstance(parity_report, ParityReport):
             raise ValueError("comparative manifest requires a typed parity report")
-        computed_report = check_parity(direct_specification, governed_specification)
+        if not isinstance(direct_terminal_manifest, TerminalManifest) or not isinstance(governed_terminal_manifest, TerminalManifest):
+            raise ValueError("comparative manifest requires typed DIRECT and GOVERNED terminal manifests")
+        computed_report = check_parity(
+            direct_specification,
+            governed_specification,
+            allowed_differences=direct_specification.allowed_condition_differences,
+        )
         if not computed_report.passed:
             raise ValueError(
                 f"comparative manifest requires parity-compatible specs: {computed_report.refusal_code}"
             )
         if parity_report.report_fingerprint != computed_report.report_fingerprint:
             raise ValueError("comparative manifest parity report does not match its specifications")
+        direct_terminal_manifest.validate_for_specification(direct_specification)
+        governed_terminal_manifest.validate_for_specification(governed_specification)
+        for label, terminal in (("DIRECT", direct_terminal_manifest), ("GOVERNED", governed_terminal_manifest)):
+            if not terminal.reconciliation_complete or terminal.task_acceptance not in {"ACCEPTED", "REJECTED"}:
+                raise ValueError(f"{label} terminal is not reconciled to a final evaluator disposition")
         experiment_specification_fingerprint = fingerprint(
             direct_specification.common_normative_dict(),
             domain=COMMON_EXPERIMENT_FINGERPRINT_DOMAIN,
@@ -1814,22 +1947,26 @@ class ComparativeManifest:
             "schema_id": SCHEMA_COMPARATIVE, "schema_version": SCHEMA_VERSION,
             "experiment_id": direct_specification.experiment_id,
             "experiment_specification_fingerprint": experiment_specification_fingerprint.to_dict(),
+            "direct_specification_fingerprint": direct_specification.specification_fingerprint.to_dict(),
+            "governed_specification_fingerprint": governed_specification.specification_fingerprint.to_dict(),
             "direct_run_identity": direct_specification.run_identity.to_dict(),
             "governed_run_identity": governed_specification.run_identity.to_dict(),
             "parity_report_fingerprint": parity_report.report_fingerprint.to_dict(),
-            "direct_terminal_manifest_fingerprint": direct_terminal_manifest_fingerprint.to_dict(),
-            "governed_terminal_manifest_fingerprint": governed_terminal_manifest_fingerprint.to_dict(),
+            "direct_terminal_manifest": direct_terminal_manifest.to_dict(),
+            "governed_terminal_manifest": governed_terminal_manifest.to_dict(),
         }
         return cls(
             schema_id=SCHEMA_COMPARATIVE,
             schema_version=SCHEMA_VERSION,
             experiment_id=direct_specification.experiment_id,
             experiment_specification_fingerprint=experiment_specification_fingerprint,
+            direct_specification_fingerprint=direct_specification.specification_fingerprint,
+            governed_specification_fingerprint=governed_specification.specification_fingerprint,
             direct_run_identity=direct_specification.run_identity,
             governed_run_identity=governed_specification.run_identity,
             parity_report_fingerprint=parity_report.report_fingerprint,
-            direct_terminal_manifest_fingerprint=direct_terminal_manifest_fingerprint,
-            governed_terminal_manifest_fingerprint=governed_terminal_manifest_fingerprint,
+            direct_terminal_manifest=direct_terminal_manifest,
+            governed_terminal_manifest=governed_terminal_manifest,
             comparative_manifest_fingerprint=_object_fp(body, SCHEMA_COMPARATIVE),
         ).validated()
 
@@ -1837,10 +1974,12 @@ class ComparativeManifest:
         return {
             "schema_id": self.schema_id, "schema_version": self.schema_version, "experiment_id": self.experiment_id,
             "experiment_specification_fingerprint": self.experiment_specification_fingerprint.to_dict(),
+            "direct_specification_fingerprint": self.direct_specification_fingerprint.to_dict(),
+            "governed_specification_fingerprint": self.governed_specification_fingerprint.to_dict(),
             "direct_run_identity": self.direct_run_identity.to_dict(), "governed_run_identity": self.governed_run_identity.to_dict(),
             "parity_report_fingerprint": self.parity_report_fingerprint.to_dict(),
-            "direct_terminal_manifest_fingerprint": self.direct_terminal_manifest_fingerprint.to_dict(),
-            "governed_terminal_manifest_fingerprint": self.governed_terminal_manifest_fingerprint.to_dict(),
+            "direct_terminal_manifest": self.direct_terminal_manifest.to_dict(),
+            "governed_terminal_manifest": self.governed_terminal_manifest.to_dict(),
         }
 
     def validated(self) -> "ComparativeManifest":
@@ -1856,14 +1995,68 @@ class ComparativeManifest:
         if self.direct_run_identity.run_id == self.governed_run_identity.run_id:
             raise ValueError("comparative manifest requires two distinct run identities")
         for name in (
-            "experiment_specification_fingerprint", "parity_report_fingerprint", "direct_terminal_manifest_fingerprint", "governed_terminal_manifest_fingerprint",
+            "experiment_specification_fingerprint", "direct_specification_fingerprint", "governed_specification_fingerprint", "parity_report_fingerprint",
         ):
             _fp(getattr(self, name), name)
         if self.experiment_specification_fingerprint.domain != COMMON_EXPERIMENT_FINGERPRINT_DOMAIN:
             raise ValueError("comparative manifest must bind the common experiment specification")
+        self.direct_terminal_manifest.validated()
+        self.governed_terminal_manifest.validated()
+        if self.direct_terminal_manifest.run_identity != self.direct_run_identity:
+            raise ValueError("DIRECT terminal does not belong to the declared DIRECT run")
+        if self.governed_terminal_manifest.run_identity != self.governed_run_identity:
+            raise ValueError("GOVERNED terminal does not belong to the declared GOVERNED run")
+        if self.direct_terminal_manifest.run_identity.condition_id != DIRECT or self.governed_terminal_manifest.run_identity.condition_id != GOVERNED:
+            raise ValueError("terminal manifests are assigned to the wrong conditions")
+        if self.direct_terminal_manifest.experiment_specification_fingerprint != self.direct_specification_fingerprint:
+            raise ValueError("DIRECT terminal is not bound to the declared DIRECT specification")
+        if self.governed_terminal_manifest.experiment_specification_fingerprint != self.governed_specification_fingerprint:
+            raise ValueError("GOVERNED terminal is not bound to the declared GOVERNED specification")
+        if self.direct_terminal_manifest.terminal_manifest_fingerprint == self.governed_terminal_manifest.terminal_manifest_fingerprint:
+            raise ValueError("DIRECT and GOVERNED terminal manifests must be distinct")
+        for label, terminal in (("DIRECT", self.direct_terminal_manifest), ("GOVERNED", self.governed_terminal_manifest)):
+            if not terminal.reconciliation_complete or terminal.task_acceptance not in {"ACCEPTED", "REJECTED"}:
+                raise ValueError(f"{label} terminal is not reconciled to a final evaluator disposition")
         _fp(self.comparative_manifest_fingerprint, "comparative_manifest_fingerprint")
         if _object_fp(self._body(), SCHEMA_COMPARATIVE) != self.comparative_manifest_fingerprint:
             raise ValueError("comparative manifest fingerprint mismatch")
+        return self
+
+    def validate_for_specifications(
+        self,
+        *,
+        direct_specification: ExperimentSpecification,
+        governed_specification: ExperimentSpecification,
+        parity_report: Any,
+    ) -> "ComparativeManifest":
+        """Reconcile a deserialized manifest with typed specs and parity evidence."""
+
+        direct_specification.validated()
+        governed_specification.validated()
+        self.validated()
+        if self.direct_specification_fingerprint != direct_specification.specification_fingerprint:
+            raise ValueError("DIRECT terminal/specification fingerprint mismatch")
+        if self.governed_specification_fingerprint != governed_specification.specification_fingerprint:
+            raise ValueError("GOVERNED terminal/specification fingerprint mismatch")
+        self.direct_terminal_manifest.validate_for_specification(direct_specification)
+        self.governed_terminal_manifest.validate_for_specification(governed_specification)
+        from .comparison import ParityReport, check_parity
+
+        if not isinstance(parity_report, ParityReport):
+            raise ValueError("comparative reconciliation requires a typed parity report")
+        expected = check_parity(
+            direct_specification,
+            governed_specification,
+            allowed_differences=direct_specification.allowed_condition_differences,
+        )
+        if not expected.passed or parity_report.report_fingerprint != expected.report_fingerprint:
+            raise ValueError("comparative parity evidence does not correspond exactly to the typed specifications")
+        expected_common = fingerprint(
+            direct_specification.common_normative_dict(),
+            domain=COMMON_EXPERIMENT_FINGERPRINT_DOMAIN,
+        )
+        if self.experiment_specification_fingerprint != expected_common:
+            raise ValueError("comparative common experiment fingerprint mismatch")
         return self
 
     def to_dict(self) -> dict[str, Any]:
@@ -1873,17 +2066,19 @@ class ComparativeManifest:
     @classmethod
     def from_dict(cls, data: Any) -> "ComparativeManifest":
         fields = {
-            "schema_id", "schema_version", "experiment_id", "experiment_specification_fingerprint", "direct_run_identity", "governed_run_identity",
-            "parity_report_fingerprint", "direct_terminal_manifest_fingerprint", "governed_terminal_manifest_fingerprint", "comparative_manifest_fingerprint",
+            "schema_id", "schema_version", "experiment_id", "experiment_specification_fingerprint", "direct_specification_fingerprint", "governed_specification_fingerprint", "direct_run_identity", "governed_run_identity",
+            "parity_report_fingerprint", "direct_terminal_manifest", "governed_terminal_manifest", "comparative_manifest_fingerprint",
         }
         _schema(data, SCHEMA_COMPARATIVE, "comparative manifest", fields)
         return cls(
             schema_id=data["schema_id"], schema_version=data["schema_version"], experiment_id=data["experiment_id"],
             experiment_specification_fingerprint=_fp_from_dict(data["experiment_specification_fingerprint"], "experiment_specification_fingerprint"),
+            direct_specification_fingerprint=_fp_from_dict(data["direct_specification_fingerprint"], "direct_specification_fingerprint"),
+            governed_specification_fingerprint=_fp_from_dict(data["governed_specification_fingerprint"], "governed_specification_fingerprint"),
             direct_run_identity=RunIdentity.from_dict(data["direct_run_identity"]), governed_run_identity=RunIdentity.from_dict(data["governed_run_identity"]),
             parity_report_fingerprint=_fp_from_dict(data["parity_report_fingerprint"], "parity_report_fingerprint"),
-            direct_terminal_manifest_fingerprint=_fp_from_dict(data["direct_terminal_manifest_fingerprint"], "direct_terminal_manifest_fingerprint"),
-            governed_terminal_manifest_fingerprint=_fp_from_dict(data["governed_terminal_manifest_fingerprint"], "governed_terminal_manifest_fingerprint"),
+            direct_terminal_manifest=TerminalManifest.from_dict(data["direct_terminal_manifest"]),
+            governed_terminal_manifest=TerminalManifest.from_dict(data["governed_terminal_manifest"]),
             comparative_manifest_fingerprint=_fp_from_dict(data["comparative_manifest_fingerprint"], "comparative_manifest_fingerprint"),
         ).validated()
 

@@ -8,7 +8,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 MATRIX = ROOT / "implementation" / "PAIRED_RUNNER_REQUIREMENT_MATRIX.json"
-STARTING_COMMIT = "148f12cfa349243e81e180257b359f97cef63218"
+STARTING_COMMIT = "d480c5eeff848fac1075d861d352228d6e65712f"
 SCOPE = {
     "ARCH-02",
     "ARCH-04",
