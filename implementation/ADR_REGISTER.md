@@ -574,9 +574,47 @@ Retaining the descriptors also closes the race between the check and the use.
 Directory creation for `create_parents` is deliberately excluded from
 preparation, because creating a directory is itself a mutation.
 
+## ADR-M2T-01 — Effects run on a private view; trusted export mutates the source
+
+**Status:** Accepted (Milestone 2 third critical repairs), supersedes the
+shared-workspace half of ADR-M2S-01
+
+**Context.** ADR-M2S-01 closed endpoint *creation* inside the capsule and refused
+pre-existing specials at admission. A live writable bind of the authorized
+workspace still allowed a host to create a FIFO after admission; `open` of that
+FIFO is not distinguishable from `open` of a regular file under seccomp.
+
+**Decision.** Materialise a private per-effect copy before `STARTED`, bind it by
+descriptor, run the effect only against that view, and after quiescence export
+only a closed regular-file/directory/symlink change set. Source mutation or
+unsupported private inodes refuse export. Seccomp remains defence in depth.
+
+**Consequences.** The second-repair "known limitation" about mid-execution host
+FIFOs is withdrawn as an accepted limitation — it was the defect. Export is a
+new trusted surface with an explicit grammar and crash-classifiable partial
+states.
+
+## ADR-M2T-02 — Runtime inputs are descriptor-bound; cgroup membership is verified before exec
+
+**Status:** Accepted (Milestone 2 third critical repairs), extends ADR-M2S-05
+
+**Context.** Pathname recheck then pathname `Popen` left a replacement window.
+Cgroup `attach()` return values were ignored and mechanism was derived from
+directory existence.
+
+**Decision.** Open and verify launcher/interpreter/init/private-view descriptors
+at the effect boundary; execute/mount through `/proc/self/fd/N` and
+`--ro-bind-fd`/`--bind-fd`. Create the launcher stopped, attach, verify
+`cgroup.procs` membership, then release; attachment failure refuses before
+command execution; promised cgroup enforcement never silently degrades.
+
+**Consequences.** Evidence binds the inode that actually ran. Aggregate cgroup
+claims require verified membership. RLIMIT remains mandatory defence in depth.
+
 ## ADR-M2S-01 — Filesystem IPC is closed at the syscall, not by the network namespace
 
-**Status:** Accepted (Milestone 2 second critical repairs)
+**Status:** Partially superseded by ADR-M2T-01 (Milestone 2 third critical repairs).
+The seccomp half remains accepted; the shared live-workspace half does not.
 
 **Context.** The sandbox contract stated that an unshared network namespace plus
 an absent evidence path left no host capability reachable. That statement is
@@ -598,11 +636,9 @@ record exists.
 **Consequences.** `SCM_RIGHTS` needs no rule of its own, because it travels only
 over an `AF_UNIX` socket and none can be created or inherited. A command needing
 local socket IPC or a FIFO now fails with `EPERM`; that is the documented
-contract of the capsule. The private-materialisation alternative was rejected for
-this milestone: it depends on unprivileged overlayfs being available and its
-diff-and-apply step would insert a large new correctness surface between an
-untrusted effect and the workspace, in exchange for a property the kernel already
-enforces at the syscall.
+contract of the capsule. The second repair rejected private materialisation; the
+third repair reinstates it (without requiring overlayfs) because admission plus
+seccomp cannot close a host-injected FIFO on a live writable bind. See ADR-M2T-01.
 
 ## ADR-M2S-02 — The Git observer executes nothing, and fails closed instead
 

@@ -45,16 +45,21 @@ secrecy of any path.  The evidence root is unreachable because it is absent from
 the mount namespace, which no amount of path construction inside the capsule can
 undo.
 
-Correction recorded by the independent audit
---------------------------------------------
+Correction recorded by the independent audits
+---------------------------------------------
 The earlier statement that "an unshared network namespace plus an absent
 evidence path means no host capability is reachable" was **false**.  A pathname
 ``AF_UNIX`` socket is a filesystem object that crosses an unshared network
 namespace and can transfer an open file descriptor with ``SCM_RIGHTS``; a FIFO
-in the writable workspace is the same bridge.  The capsule now enforces, by two
-independent mechanisms, that the command sees no host-backed IPC endpoint and
-cannot create one: workspace admission refuses a workspace containing a socket,
-FIFO, or device, and the seccomp filter denies their creation and use.
+in the writable workspace is the same bridge.
+
+The second repair closed creation of endpoints inside the capsule and refused
+pre-existing ones at admission.  That is not enough: a host can create a FIFO
+in a live writable bind after admission, and ``open`` of that FIFO is not
+distinguishable from ``open`` of a regular file under seccomp.  The third
+repair therefore runs every effect against a **private** execution view bound
+by descriptor, and a trusted controller exports only a closed change set into
+the authorized workspace after process-domain quiescence.
 """
 
 from __future__ import annotations
@@ -135,14 +140,19 @@ CAPSULE_NAMESPACE_CONTRACT: tuple[str, ...] = (
 )
 
 #: The mount construction, in the same durable form.
+#: The effect never receives a live writable bind of the authorized host
+#: workspace.  Writes land in a private per-effect view bound by descriptor;
+#: a trusted controller exports only a closed change set afterwards.
 CAPSULE_MOUNT_CONTRACT: tuple[str, ...] = (
     "proc:/proc",
     "tmpfs:/tmp",
     "dev:/dev",
     f"ro-bind-try:{':'.join(CAPSULE_TOOLCHAIN_INPUTS)}",
-    f"bind:<authorized workspace>->{CAPSULE_WORKSPACE_PATH}",
-    f"ro-bind:<in-capsule init>->{CAPSULE_INIT_PATH}",
+    f"bind-fd:<private execution view>->{CAPSULE_WORKSPACE_PATH}",
+    f"ro-bind-fd:<verified interpreter>->/proc/self/fd interpreter path",
+    f"ro-bind-fd:<verified in-capsule init>->{CAPSULE_INIT_PATH}",
     "absent:<durable evidence root>",
+    "absent:<live authorized host workspace>",
 )
 
 #: Bound on the status document the in-capsule init may write.
@@ -667,16 +677,30 @@ def capsule_argv(
     timeout_ms: int,
     bounds: ResourceBounds,
     command: tuple[str, ...],
+    launcher_proc_path: str,
+    interpreter_fd: int,
+    init_fd: int,
+    workspace_fd: int,
 ) -> list[str]:
-    """The exact launcher argv for one capsuled effect."""
+    """The exact launcher argv for one capsuled effect.
+
+    Every runtime input is named by an open descriptor: the launcher itself is
+    invoked through ``/proc/self/fd/N``, and the interpreter, init, and private
+    execution view are mounted with ``--ro-bind-fd`` / ``--bind-fd``.  Pathname
+    replacement after the descriptors were verified cannot redirect the launch.
+    """
 
     internal_cwd = (
         CAPSULE_WORKSPACE_PATH
         if relative_cwd in {"", "."}
         else f"{CAPSULE_WORKSPACE_PATH}/{relative_cwd}"
     )
+    # The launcher is invoked through /proc/self/fd/N of an already-verified
+    # descriptor.  The interpreter and init are mounted through --ro-bind-fd of
+    # their verified descriptors.  The workspace is the private execution view,
+    # never the live authorized host directory.
     argv = [
-        specification.mechanism_path,
+        launcher_proc_path,
         # Isolation.  Every namespace is unshared; nothing is inherited that the
         # contract does not name.
         "--unshare-user",
@@ -707,17 +731,19 @@ def capsule_argv(
     ]
     for source in specification.toolchain_inputs:
         argv += ["--ro-bind-try", source, source]
-    # The one writable host object in the capsule, at one fixed internal path.
-    argv += ["--bind", specification.workspace_host_path, CAPSULE_WORKSPACE_PATH]
-    # The init is read-only and lives outside the workspace, so the effect can
-    # neither rewrite it nor make the controller execute something else.
-    argv += ["--ro-bind", _init_source_path(), CAPSULE_INIT_PATH]
+    # Private execution view: not the live authorized host workspace.
+    argv += ["--bind-fd", str(workspace_fd), CAPSULE_WORKSPACE_PATH]
+    # Verified in-capsule init, bound by descriptor so a pathname replacement
+    # cannot redirect the mount.
+    argv += ["--ro-bind-fd", str(init_fd), CAPSULE_INIT_PATH]
+    # Verified interpreter, mounted at a fixed internal path.
+    argv += ["--ro-bind-fd", str(interpreter_fd), "/.admissible-interpreter"]
     for name, value in specification.environment:
         argv += ["--setenv", name, value]
     argv += ["--chdir", internal_cwd]
     argv += [
         "--",
-        os.path.realpath(os.sys.executable),
+        "/.admissible-interpreter",
         CAPSULE_INIT_PATH,
         str(status_fd),
         str(control_fd),

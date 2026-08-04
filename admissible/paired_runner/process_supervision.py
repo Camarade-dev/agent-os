@@ -33,6 +33,8 @@ import threading
 import time
 from typing import Any, Callable
 
+import signal
+
 from .canonical import Fingerprint
 from .observation import (
     ProcessObservation,
@@ -41,14 +43,17 @@ from .observation import (
 )
 from .capsule_seccomp import open_program_descriptor
 from .resource_limits import (
+    MECHANISM_CGROUP_AND_RLIMIT,
     MECHANISM_NONE,
     CgroupDelegation,
     EffectCgroup,
     ResourceBounds,
+    ResourceContainmentUnavailable,
     containment_semantics,
     effective_mechanism,
     probe_cgroup_delegation,
 )
+from .runtime_binding import BoundRuntime
 from .sandbox import (
     CAPSULE_TEARDOWN_TIMEOUT_SECONDS,
     MAX_STATUS_BYTES,
@@ -220,6 +225,8 @@ def _containment_evidence(status: dict[str, Any] | None, mechanism: str, cgroup:
     applied the bounds, so this is an observation of enforcement rather than a
     restatement of the request.  When the status document is absent the bounds
     are recorded as unobserved, never as the values that were asked for.
+    Cgroup membership is claimed only when ``cgroup.active`` records a verified
+    ``cgroup.procs`` membership, never from directory creation alone.
     """
 
     applied = None if status is None else status.get("resource_limits")
@@ -236,12 +243,25 @@ def _containment_evidence(status: dict[str, Any] | None, mechanism: str, cgroup:
     described = [f"{name}={value[0]}" for name, value in sorted(applied.items()) if isinstance(value, list) and value]
     if cgroup is not None and cgroup.active:
         described += [f"cgroup.{name}={value}" for name, value in sorted(cgroup.applied.items())]
+        described.append(f"cgroup.membership_verified={sorted(cgroup.members())}")
     return {
         "containment_mechanism": mechanism,
         "containment_availability": "OBSERVED",
         "containment_bounds": tuple(described),
         "containment_semantics": containment_semantics(mechanism),
     }
+
+
+def _stop_for_cgroup_attach() -> None:
+    """Stop the child after fork and before exec so membership can be verified.
+
+    ``preexec_fn`` runs in the child after fork and before the launcher image is
+    executed.  Stopping here means the untrusted command — and even bubblewrap
+    itself — cannot run until the controller has attached the PID to the target
+    cgroup and read membership back from the kernel.
+    """
+
+    os.kill(os.getpid(), signal.SIGSTOP)
 
 
 def _resource_observation(
@@ -289,30 +309,34 @@ def _resource_observation(
 def supervise_command(
     *,
     capsule: CapsuleSpecification,
+    runtime: BoundRuntime,
     argv: tuple[str, ...],
     relative_cwd: str,
     timeout_ms: int,
     max_output_bytes: int,
     cancellation: CancellationToken | None = None,
     start_hook: Callable[[], None] | None = None,
+    required_containment_mechanism: str | None = None,
 ) -> SupervisedProcessResult:
     """Run one command inside the shared capsule and observe it completely.
 
     The command never runs on the host.  It runs inside the one capsule
     :mod:`admissible.paired_runner.sandbox` constructs, as a child of an init
-    that is PID 1 of a private PID namespace.  Three facts follow physically
-    rather than by convention:
+    that is PID 1 of a private PID namespace, against a private execution view
+    bound by descriptor.  Facts that follow physically rather than by
+    convention:
 
     * a descendant cannot leave the namespace by calling ``setsid``, by
       double-forking, or by being orphaned, because the namespace -- not the
       process group -- is the boundary;
     * quiescence is derived inside the capsule from ``ECHILD``, so
       ``descendants_reaped`` is a kernel observation and not an assertion;
+    * when cgroup enforcement is required, the launcher is created stopped,
+      attached, and membership-verified before it is allowed to exec, so the
+      untrusted command cannot run outside the claimed process domain;
     * pipe EOF is *not* treated as completion.  This loop ends when the
       launcher itself is reaped, which happens only after the in-capsule init
-      has observed quiescence, so a command that closes both pipes and keeps
-      running stays supervised until it exits or until its own requested
-      timeout expires.
+      has observed quiescence.
 
     The process-domain observation arrives on a dedicated status descriptor the
     effect does not hold, so a command cannot forge or suppress it by writing to
@@ -335,7 +359,16 @@ def supervise_command(
     bounds = ResourceBounds.for_timeout(timeout_ms)
     delegation = cgroup_delegation()
     cgroup = EffectCgroup(delegation, bounds, f"{os.getpid()}-{start_monotonic}")
-    cgroup.create()
+    created = cgroup.create()
+    if required_containment_mechanism == MECHANISM_CGROUP_AND_RLIMIT and not created:
+        for descriptor in (status_read, status_write, control_read, control_write, seccomp_fd):
+            try:
+                os.close(descriptor)
+            except OSError:  # pragma: no cover
+                pass
+        raise ResourceContainmentUnavailable(
+            f"cgroup subtree creation failed while readiness promised CGROUP_V2_AND_RLIMIT: {cgroup.create_error}"
+        )
     launcher_argv = capsule_argv(
         capsule,
         relative_cwd=relative_cwd,
@@ -345,7 +378,24 @@ def supervise_command(
         timeout_ms=timeout_ms,
         bounds=bounds,
         command=tuple(argv),
+        launcher_proc_path=runtime.launcher_proc_path,
+        interpreter_fd=runtime.interpreter_fd,
+        init_fd=runtime.init_fd,
+        workspace_fd=runtime.workspace_fd,
     )
+    pass_fds = (
+        status_write,
+        control_read,
+        seccomp_fd,
+        runtime.launcher_fd,
+        runtime.interpreter_fd,
+        runtime.init_fd,
+        runtime.workspace_fd,
+    )
+    # When a cgroup subtree exists, the child is created stopped so membership
+    # can be verified before bubblewrap — and therefore before the command —
+    # executes.  Without a cgroup the stop is unnecessary and omitted.
+    preexec = _stop_for_cgroup_attach if cgroup.directory_present else None
 
     try:
         process = subprocess.Popen(  # noqa: S603 - explicit argv, never a shell
@@ -354,8 +404,9 @@ def supervise_command(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             close_fds=True,
-            pass_fds=(status_write, control_read, seccomp_fd),
+            pass_fds=pass_fds,
             shell=False,
+            preexec_fn=preexec,
         )
     except (OSError, ValueError) as error:
         for descriptor in (status_read, status_write, control_read, control_write, seccomp_fd):
@@ -407,10 +458,59 @@ def supervise_command(
         launcher_group = os.getpgid(launcher_pid)
     except OSError:  # pragma: no cover - the launcher exited immediately
         launcher_group = launcher_pid
-    # When the host delegates a cgroup, the launcher joins it and every
-    # descendant inherits it, so the aggregate bound covers the whole domain.
-    cgroup.attach(launcher_pid)
-    mechanism = effective_mechanism(delegation, cgroup.active)
+
+    if cgroup.directory_present:
+        # The child is stopped in preexec.  Attach, prove membership from the
+        # kernel, and only then release it.  Failure refuses before the
+        # launcher image runs and therefore before the untrusted command exists.
+        attached = cgroup.attach_and_verify(launcher_pid)
+        if not attached:
+            try:
+                os.kill(launcher_pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=CAPSULE_TEARDOWN_TIMEOUT_SECONDS)
+            except Exception:
+                pass
+            for descriptor in (status_read, status_write, control_read, control_write, seccomp_fd):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            cgroup.close()
+            if required_containment_mechanism == MECHANISM_CGROUP_AND_RLIMIT or delegation.available:
+                raise ResourceContainmentUnavailable(
+                    f"cgroup membership was not verified before exec: {cgroup.attach_error}"
+                )
+        else:
+            try:
+                os.kill(launcher_pid, signal.SIGCONT)
+            except OSError as error:
+                raise ResourceContainmentUnavailable(
+                    f"failed to release the stopped launcher after cgroup attach: {error}"
+                ) from error
+
+    mechanism = effective_mechanism(
+        delegation,
+        membership_verified=cgroup.active,
+        required_mechanism=required_containment_mechanism,
+    )
+    if mechanism == MECHANISM_NONE and required_containment_mechanism == MECHANISM_CGROUP_AND_RLIMIT:
+        try:
+            process.kill()
+            process.wait(timeout=CAPSULE_TEARDOWN_TIMEOUT_SECONDS)
+        except Exception:
+            pass
+        for descriptor in (status_read, status_write, control_read, control_write, seccomp_fd):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        cgroup.close()
+        raise ResourceContainmentUnavailable(
+            "readiness promised CGROUP_V2_AND_RLIMIT but membership was not verified"
+        )
 
     # The controller keeps only the read end of the status pipe and only the
     # write end of the control pipe.  The capsule therefore cannot forge a
@@ -529,9 +629,16 @@ def supervise_command(
     stdout_observation, stdout_text, stdout_status = stdout_stream.observation()
     stderr_observation, stderr_text, stderr_status = stderr_stream.observation()
     containment = _containment_evidence(status, mechanism, cgroup)
-    # The namespace is gone, so the per-effect cgroup has no members left and is
-    # removed here rather than accumulating one empty subtree per effect.
-    cgroup.close()
+    # The namespace is gone, so the per-effect cgroup should have no members.
+    # Removing a cgroup that still has live members is not reported as success.
+    if not cgroup.close() and cgroup.directory_present:
+        containment = {
+            **containment,
+            "containment_availability": "NOT_MEASURED",
+            "containment_semantics": (
+                "cgroup cleanup found live members; aggregate containment is not claimed after this effect"
+            ),
+        }
 
     if status is None:
         # Without the init's status document there is no process-domain

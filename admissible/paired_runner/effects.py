@@ -83,7 +83,15 @@ from .observation import (
     ResourceObservation,
     StreamObservation,
 )
+from .private_workspace import (
+    PrivateExecutionView,
+    PrivateWorkspaceError,
+    apply_export,
+    compute_change_set,
+)
 from .process_supervision import CancellationToken, supervise_command
+from .resource_limits import MECHANISM_CGROUP_AND_RLIMIT, ResourceContainmentUnavailable
+from .runtime_binding import BoundRuntime, RuntimeBindingRefused
 from .sandbox import (
     CAPSULE_WORKSPACE_PATH,
     CapsuleReadiness,
@@ -861,12 +869,17 @@ class _EffectPreparation:
     record exists, and the execution that follows acts on the very objects that
     were checked -- not on a path string that could have been swapped in
     between.
+
+    For ``run_command``, preparation also materialises the private execution
+    view from the authorized source.  The effect therefore never depends on a
+    live writable bind of the host workspace.
     """
 
     chain: _DirectoryChain
     parent_fd: int = -1
     handle: int = -1
     refusal: ToolResult | None = None
+    private_view: PrivateExecutionView | None = None
 
     def close(self) -> None:
         if self.handle >= 0:
@@ -875,6 +888,9 @@ class _EffectPreparation:
             except OSError:  # pragma: no cover
                 pass
             self.handle = -1
+        if self.private_view is not None:
+            self.private_view.close()
+            self.private_view = None
         self.chain.close()
 
 
@@ -943,14 +959,24 @@ def prepare_effect(binding: WorkspaceBinding, request: ToolRequest) -> _EffectPr
             physical_cwd = binding.physical_path_of(request.cwd)
             if Path(os.path.realpath(physical_cwd)) != physical_cwd:
                 raise WorkspaceRefusal("cwd_is_not_physically_under_the_root")
-            # Nothing may run inside the capsule over a workspace that already
-            # contains a host-backed IPC endpoint.  This is the admission half of
-            # the two-mechanism repair; the seccomp filter is the other half, and
-            # neither depends on the other being correct.
+            # Refuse a source that already holds an IPC endpoint, then materialise
+            # the private execution view the effect will actually see.  A host
+            # FIFO created after this point lands in the authorized workspace,
+            # not in the private view.
             try:
                 require_no_workspace_ipc_endpoints(binding.root_fd)
             except WorkspaceIpcEndpointRefused as refusal:
                 raise WorkspaceRefusal("workspace_contains_a_host_ipc_endpoint") from refusal
+            try:
+                preparation.private_view = PrivateExecutionView.materialize(
+                    binding.physical_root, binding.root_fd
+                )
+            except PrivateWorkspaceError as error:
+                raise WorkspaceRefusal(f"private_workspace_{error.code}") from error
+            try:
+                require_no_workspace_ipc_endpoints(preparation.private_view.view_fd)
+            except WorkspaceIpcEndpointRefused as refusal:
+                raise WorkspaceRefusal("private_view_contains_an_ipc_endpoint") from refusal
         else:  # pragma: no cover - the typed union is closed
             raise TypeError("unknown typed tool request")
     except (WorkspaceRefusal, WorkspaceFailure) as error:
@@ -1198,85 +1224,235 @@ def _run_command(
     binding: WorkspaceBinding,
     request: RunCommandRequest,
     *,
+    preparation: _EffectPreparation,
     cancellation: CancellationToken | None,
     start_hook: Callable[[], None] | None,
 ) -> _CommandExecution:
-    """Run the request inside the capsule.
+    """Run the request inside the capsule against a private execution view.
 
-    The working directory was already resolved and proven during preparation,
-    so nothing here re-resolves a path string.
+    The private view was materialised during preparation, before STARTED.  The
+    effect never sees the live authorized host workspace: only a trusted export
+    of a closed change set mutates that workspace after quiescence.
     """
 
-    # The command runs inside the capsule, never on the host.  Its cwd is the
-    # authorized workspace exposed at one fixed internal path, so the command's
-    # own view contains no host path it could name -- not the operator's home,
-    # not an arbitrary /tmp, and not the durable evidence root.
-    supervised = supervise_command(
-        capsule=binding.capsule,
-        argv=request.argv,
-        relative_cwd=request.cwd,
-        timeout_ms=request.timeout_ms,
-        max_output_bytes=request.max_output_bytes,
-        cancellation=cancellation,
-        start_hook=start_hook,
-    )
-    process = supervised.process_observation
-
-    if not process.process_started:
-        result = RunCommandResult.create(
-            request_fingerprint=request.request_fingerprint,
-            outcome="FAILED",
-            process_started=False,
-            exit_code=None,
-            error_code="executor_start_failure",
-        )
-    elif supervised.refused_non_utf8:
-        # Every byte is counted and fingerprinted in the stream observations;
-        # only the retained *text* is refused.
-        result = RunCommandResult.create(
-            request_fingerprint=request.request_fingerprint,
-            outcome="FAILED",
-            process_started=True,
-            stdout="",
-            stderr="",
-            exit_code=process.exit_code,
-            error_code="non_utf8_output",
-        )
-    else:
-        # Non-empty descendant state can never produce a successful effect, and
-        # neither can a missing process-domain observation.  Both mean the
-        # substrate does not actually know that the effect finished.
-        quiescent = process.namespace_quiescent and not process.descendants_alive_at_direct_exit
-        outcome = (
-            "OK"
-            if (
-                process.exit_code is not None
-                and not process.timed_out
-                and not process.cancelled
-                and process.status_document_present
-                and quiescent
+    binding.recheck_root_identity()
+    private_view = preparation.private_view
+    if private_view is None:
+        return _command_start_failure(request, "private_workspace_absent")
+    # The preparation close must not destroy the view while we still hold it;
+    # ownership transfers to the bound runtime for the duration of the launch.
+    preparation.private_view = None
+    runtime: BoundRuntime | None = None
+    try:
+        try:
+            runtime = BoundRuntime.bind(
+                manifest=binding.capsule_runtime_manifest,
+                private_view=private_view,
+                resolver=lambda: shutil.which("bwrap") or "",
             )
-            else "FAILED"
+        except RuntimeBindingRefused:
+            private_view.close()
+            return _command_start_failure(request, "runtime_identity_bind_refused")
+
+        required_mechanism = binding.capsule_readiness.containment_mechanism
+        try:
+            supervised = supervise_command(
+                capsule=binding.capsule,
+                runtime=runtime,
+                argv=request.argv,
+                relative_cwd=request.cwd,
+                timeout_ms=request.timeout_ms,
+                max_output_bytes=request.max_output_bytes,
+                cancellation=cancellation,
+                start_hook=start_hook,
+                required_containment_mechanism=required_mechanism,
+            )
+        except ResourceContainmentUnavailable:
+            return _command_start_failure(request, "cgroup_membership_unverified")
+
+        process = supervised.process_observation
+        export_error: str | None = None
+        if (
+            process.process_started
+            and process.namespace_quiescent
+            and not process.descendants_alive_at_direct_exit
+            and not process.timed_out
+            and not process.cancelled
+            and process.status_document_present
+            and process.exit_code is not None
+        ):
+            try:
+                if private_view.source_mutated(binding.root_fd):
+                    export_error = "source_mutated_during_effect"
+                else:
+                    change_set = compute_change_set(
+                        baseline_fd=binding.root_fd,
+                        private_fd=private_view.view_fd,
+                    )
+                    _reservation, receipt, _reconciliation = apply_export(
+                        source_root_fd=binding.root_fd,
+                        private_fd=private_view.view_fd,
+                        change_set=change_set,
+                        reservation_id=f"export-{process.start_monotonic_ns}",
+                        source_snapshot=private_view.source_snapshot,
+                        view_identity=private_view.view_identity,
+                    )
+                    if receipt.state != "APPLIED":
+                        export_error = receipt.refusal_code or receipt.state
+            except PrivateWorkspaceError as error:
+                export_error = error.code
+
+        if not process.process_started:
+            result = RunCommandResult.create(
+                request_fingerprint=request.request_fingerprint,
+                outcome="FAILED",
+                process_started=False,
+                exit_code=None,
+                error_code="executor_start_failure",
+            )
+        elif supervised.refused_non_utf8:
+            result = RunCommandResult.create(
+                request_fingerprint=request.request_fingerprint,
+                outcome="FAILED",
+                process_started=True,
+                stdout="",
+                stderr="",
+                exit_code=process.exit_code,
+                error_code="non_utf8_output",
+            )
+        elif export_error is not None:
+            result = RunCommandResult.create(
+                request_fingerprint=request.request_fingerprint,
+                outcome="FAILED",
+                process_started=True,
+                stdout=supervised.stdout_text,
+                stderr=supervised.stderr_text,
+                stdout_truncated=supervised.stdout_observation.retained_truncated,
+                stderr_truncated=supervised.stderr_observation.retained_truncated,
+                exit_code=process.exit_code,
+                error_code=f"trusted_export_{export_error}",
+            )
+        else:
+            quiescent = process.namespace_quiescent and not process.descendants_alive_at_direct_exit
+            outcome = (
+                "OK"
+                if (
+                    process.exit_code is not None
+                    and not process.timed_out
+                    and not process.cancelled
+                    and process.status_document_present
+                    and quiescent
+                )
+                else "FAILED"
+            )
+            result = RunCommandResult.create(
+                request_fingerprint=request.request_fingerprint,
+                outcome=outcome,
+                process_started=True,
+                stdout=supervised.stdout_text,
+                stderr=supervised.stderr_text,
+                stdout_truncated=supervised.stdout_observation.retained_truncated,
+                stderr_truncated=supervised.stderr_observation.retained_truncated,
+                exit_code=process.exit_code,
+                error_code=None if outcome == "OK" else _command_failure_code(process),
+            )
+        return _CommandExecution(
+            result=result,
+            process_observation=process,
+            stdout_observation=supervised.stdout_observation,
+            stderr_observation=supervised.stderr_observation,
+            resource_observation=supervised.resource_observation,
+            timed_out=process.timed_out,
+            cancelled=process.cancelled,
         )
-        result = RunCommandResult.create(
-            request_fingerprint=request.request_fingerprint,
-            outcome=outcome,
-            process_started=True,
-            stdout=supervised.stdout_text,
-            stderr=supervised.stderr_text,
-            stdout_truncated=supervised.stdout_observation.retained_truncated,
-            stderr_truncated=supervised.stderr_observation.retained_truncated,
-            exit_code=process.exit_code,
-            error_code=None if outcome == "OK" else _command_failure_code(process),
-        )
+    finally:
+        if runtime is not None:
+            runtime.close()
+        else:
+            private_view.close()
+
+
+def _command_start_failure(request: RunCommandRequest, error_code: str) -> _CommandExecution:
+    """A launch that failed after STARTED still owes process-domain observations."""
+
+    from .canonical import Fingerprint
+    from .observation import ProcessObservation, ResourceObservation, StreamObservation
+    from .process_supervision import STREAM_FINGERPRINT_DOMAINS
+    import hashlib
+
+    now_wall = int(time.time() * 1000)
+    now_mono = time.monotonic_ns()
+    empty_fp = Fingerprint("sha256", STREAM_FINGERPRINT_DOMAINS["stdout"], hashlib.sha256(b"").hexdigest()).validated()
+    empty_fp_err = Fingerprint("sha256", STREAM_FINGERPRINT_DOMAINS["stderr"], hashlib.sha256(b"").hexdigest()).validated()
+    process = ProcessObservation.create(
+        process_started=False,
+        child_pid=None,
+        child_process_group_id=None,
+        exit_code=None,
+        terminating_signal=None,
+        timed_out=False,
+        cancelled=False,
+        start_wall_clock_unix_ms=now_wall,
+        end_wall_clock_unix_ms=now_wall,
+        start_monotonic_ns=now_mono,
+        end_monotonic_ns=now_mono,
+        duration_ns=0,
+        termination_escalation=(),
+        descendants_reaped=True,
+        start_failure_class=error_code,
+        capsule_mechanism="bubblewrap",
+        launcher_exit_code=None,
+        status_document_present=False,
+        namespace_quiescent=True,
+        descendants_alive_at_direct_exit=False,
+        extra_descendants_reaped=0,
+    )
+    stdout = StreamObservation.create(
+        stream_name="stdout",
+        total_bytes=0,
+        retained_bytes=0,
+        retained_truncated=False,
+        stream_fingerprint=empty_fp,
+        text_decode_status="UTF8_DECODED",
+    )
+    stderr = StreamObservation.create(
+        stream_name="stderr",
+        total_bytes=0,
+        retained_bytes=0,
+        retained_truncated=False,
+        stream_fingerprint=empty_fp_err,
+        text_decode_status="UTF8_DECODED",
+    )
+    resource = ResourceObservation.create(
+        child_cpu_user_ms=None,
+        child_cpu_user_availability="NOT_MEASURED",
+        child_cpu_system_ms=None,
+        child_cpu_system_availability="NOT_MEASURED",
+        child_max_rss_kib=None,
+        child_max_rss_availability="NOT_MEASURED",
+        controller_peak_retained_output_bytes=0,
+        controller_peak_retained_availability="OBSERVED",
+        measurement_semantics="no process was started; containment was not observed",
+        containment_mechanism="NONE",
+        containment_availability="NOT_MEASURED",
+        containment_bounds=(),
+        containment_semantics="no resource containment was recorded for this effect",
+    )
+    result = RunCommandResult.create(
+        request_fingerprint=request.request_fingerprint,
+        outcome="FAILED",
+        process_started=False,
+        exit_code=None,
+        error_code=error_code,
+    )
     return _CommandExecution(
         result=result,
         process_observation=process,
-        stdout_observation=supervised.stdout_observation,
-        stderr_observation=supervised.stderr_observation,
-        resource_observation=supervised.resource_observation,
-        timed_out=process.timed_out,
-        cancelled=process.cancelled,
+        stdout_observation=stdout,
+        stderr_observation=stderr,
+        resource_observation=resource,
+        timed_out=False,
+        cancelled=False,
     )
 
 
@@ -1992,6 +2168,7 @@ class SharedEffectSubstrate:
             return _run_command(
                 self._binding,
                 request,
+                preparation=preparation,
                 cancellation=self._cancellation,
                 start_hook=None,
             )

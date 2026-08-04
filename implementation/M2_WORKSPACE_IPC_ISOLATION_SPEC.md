@@ -153,14 +153,16 @@ silently failed to load is a readiness refusal, not a degraded capsule.
 | ordinary regular-file effects remain correct | `test_ordinary_regular_file_effects_remain_correct` |
 | the filter itself is well formed and fails closed | `SeccompProgramTests` |
 
-## 7. Accepted, stated limitations
+## 7. Third-repair correction
 
-* The workspace remains a **bidirectionally shared** host directory by contract:
-  it is the one authorised writable surface. Admission proves no IPC endpoint
-  exists when a process starts, and the syscall boundary proves the command
-  cannot create one; a *host* process that creates a FIFO in the workspace mid-
-  execution is outside both mechanisms. That is a property of the workspace being
-  shared at all, and it is stated rather than hidden.
+The limitation previously stated here — that a host FIFO created mid-execution
+is outside both mechanisms — is **withdrawn as an accepted limitation**. It was
+the defect tracked as **M2-B21**. The third repair replaces the live writable
+bind with a private per-effect execution view and a trusted export. See
+`implementation/M2_PRIVATE_WORKSPACE_EXPORT_SPEC.md` and ADR-M2T-01.
+
+Remaining deliberate capability reductions:
+
 * Denying every `AF_UNIX` socket is a deliberate capability reduction. A command
   that needs local socket IPC will fail with `EPERM`. Milestone 2 is provider-free
   and this is the documented contract of the capsule, not a defect.

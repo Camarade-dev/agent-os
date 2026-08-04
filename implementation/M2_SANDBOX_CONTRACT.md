@@ -74,26 +74,32 @@ Exact launcher flags, from `capsule_argv`:
 --unshare-user --unshare-pid --unshare-net --unshare-ipc --unshare-uts
 --unshare-cgroup-try
 --clearenv --die-with-parent --new-session --as-pid-1
+--seccomp <memfd>
 --proc /proc  --tmpfs /tmp  --dev /dev
 --ro-bind-try <each toolchain input> <same path>
---bind  <workspace host path>  /workspace
---ro-bind <capsule init source> /.admissible-capsule-init
+--bind-fd <private execution view fd>  /workspace
+--ro-bind-fd <verified init fd> /.admissible-capsule-init
+--ro-bind-fd <verified interpreter fd> /.admissible-interpreter
 --setenv <name> <value>   (for each entry of CAPSULE_ENVIRONMENT)
 --chdir /workspace[/<relative cwd>]
--- <interpreter> /.admissible-capsule-init <status fd> <control fd> <timeout ms> <argv...>
+-- /.admissible-interpreter /.admissible-capsule-init <status fd> <control fd> <timeout ms> <bounds> <argv...>
 ```
+
+The launcher itself is invoked as `/proc/self/fd/N` of a verified descriptor, not
+as a pathname looked up at exec time.
 
 ### 4.1 Filesystem
 
 | Requirement | How it is met |
 | --- | --- |
-| Workspace at one fixed internal path | `--bind <host> /workspace`; `CAPSULE_WORKSPACE_PATH` is the only writable host object |
+| Workspace at one fixed internal path | `--bind-fd` of a **private** per-effect view at `/workspace`; never a live writable bind of the authorized host workspace |
 | Only explicitly required runtime/toolchain inputs | `CAPSULE_TOOLCHAIN_INPUTS` = `/usr`, `/bin`, `/sbin`, `/lib`, `/lib32`, `/lib64`, `/libx32`, each read-only |
 | Evidence root never exposed | It is absent from the mount namespace; `build_capsule_specification` refuses any construction where the evidence root is the workspace, inside it, or inside an exposed toolchain input |
 | Private `/tmp` | `--tmpfs /tmp` |
 | Private `/proc` | `--proc /proc` over a private PID namespace |
 | No host `/home`, no arbitrary `/tmp`, no parent paths | none of them are bound, so no name for them exists |
 | No host credentials | `/etc` is deliberately **not** in the toolchain list, so `/etc/passwd`, `/etc/shadow`, and resolver configuration are absent |
+| Trusted export | after quiescence, only a closed regular-file/directory/symlink change set is applied to the authorized workspace |
 
 `/etc` and `/home` are excluded by omission. This matters: the refusal a
 command observes is `ENOENT`, not `EACCES`. The path does not exist in its
@@ -255,13 +261,13 @@ as the capsule that was probed.
 
 - It does not claim protection against a kernel vulnerability in namespace,
   seccomp, or cgroup isolation itself.
-- It does not claim that the workspace stops being a shared host directory. It is
-  the one authorised writable surface; admission proves no IPC endpoint exists
-  when a process starts and the syscall boundary proves the command cannot create
-  one, but a host process acting on the workspace mid-execution is outside both.
+- It does not claim that the authorized host workspace is frozen against host
+  writers during an effect. Host mutation of that workspace during execution
+  refuses trusted export rather than merging. The effect itself does not see
+  those host-injected IPC endpoints because it runs on a private view.
 - It does not claim aggregate process-domain accounting on a host that delegates
   no cgroup v2 subtree. The mechanism actually in force is recorded in every
-  resource observation.
+  resource observation, and membership is verified before any cgroup claim.
 - It does not claim a disk-space quota; `RLIMIT_FSIZE` bounds any single file.
 - It does not claim any installed-path or production behaviour. Every effect in
   this milestone happens under a disposable test root.

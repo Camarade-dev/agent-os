@@ -20,6 +20,7 @@ from admissible.paired_runner.effect_ledger import M2_LEDGER_SCHEMAS  # noqa: E4
 from admissible.paired_runner.observation import M2_OBSERVATION_SCHEMAS  # noqa: E402
 from admissible.paired_runner.reconciliation import M2_RECONCILIATION_SCHEMAS  # noqa: E402
 from admissible.paired_runner.capsule_identity import M2_CAPSULE_IDENTITY_SCHEMAS  # noqa: E402
+from admissible.paired_runner.private_workspace import M2_PRIVATE_WORKSPACE_SCHEMAS  # noqa: E402
 from admissible.paired_runner.run_index import M2_RUN_INDEX_SCHEMAS  # noqa: E402
 from admissible.paired_runner.schemas import SCHEMA_CATALOG  # noqa: E402
 
@@ -29,7 +30,9 @@ IMPLEMENTATION = ROOT / "implementation"
 M1_STARTING_COMMIT = "5b5c3874f1929e77dbc3e2f71aa7f26d675a2705"
 M2_STARTING_COMMIT = "096dfbeb8845aaeda4c24f19e13fd144ceea4bfb"
 M2_SECOND_STARTING_COMMIT = "6383f765520e3d98c7359118704d063b6aa39b52"
+M2_THIRD_STARTING_COMMIT = "68dd7c9a6be66319dc93eeedcec2e994a6119585"
 M2_SECOND_BRANCH = "paired-runner/m2-causal-index-and-ipc-repairs"
+M2_THIRD_BRANCH = "paired-runner/m2-private-workspace-and-bound-runtime"
 M2_ARTIFACTS = (
     "M2_CUMULATIVE_SCHEMA_CATALOG.json",
     "M2_CRASH_MATRIX.json",
@@ -37,11 +40,13 @@ M2_ARTIFACTS = (
     "M2_VALIDATION_REPORT.json",
     "M2_CRITICAL_REPAIR_REPORT.json",
     "M2_SECOND_CRITICAL_REPAIR_REPORT.json",
+    "M2_THIRD_CRITICAL_REPAIR_REPORT.json",
 )
 #: Historical reports of earlier passes.  A later pass may not rewrite them: the
 #: record of what an earlier closure claimed is itself evidence.
 PRESERVED_HISTORICAL_ARTIFACTS = (
     "M2_CRITICAL_REPAIR_REPORT.json",
+    "M2_SECOND_CRITICAL_REPAIR_REPORT.json",
 )
 PRESERVED_M1_ARTIFACTS = (
     "M1_SCHEMA_CATALOG.json",
@@ -80,11 +85,12 @@ class M2ArtifactTests(unittest.TestCase):
             + [item.to_dict() for item in M2_RECONCILIATION_SCHEMAS.values()]
             + [item.to_dict() for item in M2_RUN_INDEX_SCHEMAS.values()]
             + [item.to_dict() for item in M2_CAPSULE_IDENTITY_SCHEMAS.values()]
+            + [item.to_dict() for item in M2_PRIVATE_WORKSPACE_SCHEMAS.values()]
         )
         self.assertEqual(catalog["milestone_2_schemas"], expected_m2)
         self.assertEqual(catalog["milestone_1_schema_count"], 29)
-        self.assertEqual(catalog["milestone_2_schema_count"], 13)
-        self.assertEqual(catalog["cumulative_schema_count"], 42)
+        self.assertEqual(catalog["milestone_2_schema_count"], 19)
+        self.assertEqual(catalog["cumulative_schema_count"], 48)
         self.assertEqual(catalog["milestone_2_schema_version"], 2)
         self.assertIn("preserved unchanged", catalog["migration_note"])
 
@@ -110,9 +116,9 @@ class M2ArtifactTests(unittest.TestCase):
 
     def test_the_validation_report_records_the_exact_counts_and_verdict(self) -> None:
         report = parse_canonical_json((IMPLEMENTATION / "M2_VALIDATION_REPORT.json").read_bytes())
-        self.assertEqual(report["starting_commit"], M2_SECOND_STARTING_COMMIT)
-        self.assertEqual(report["branch"], M2_SECOND_BRANCH)
-        self.assertEqual(report["terminal_verdict"], "M2_SECOND_CRITICAL_REPAIRS_VERIFIED")
+        self.assertEqual(report["starting_commit"], M2_THIRD_STARTING_COMMIT)
+        self.assertEqual(report["branch"], M2_THIRD_BRANCH)
+        self.assertEqual(report["terminal_verdict"], "M2_THIRD_CRITICAL_REPAIRS_VERIFIED")
         self.assertEqual(report["crash_point_count"], 25)
         self.assertEqual(report["corruption_fixture_count"], 24)
         self.assertFalse(report["boundary_audit"]["milestone_3_started"])
@@ -120,6 +126,12 @@ class M2ArtifactTests(unittest.TestCase):
             self.assertFalse(crossed, boundary)
         for record in report["requirement_dispositions"]:
             self.assertNotEqual(record["status"], "VERIFIED_INSTALLED_PATH")
+        # Totals must match live discovery, not a hand-maintained stale number.
+        self.assertEqual(
+            report["test_counts"]["total"],
+            report["test_counts"]["discovered_total"],
+        )
+        self.assertGreaterEqual(report["test_counts"]["total"], 305)
         self.assertTrue(report["known_limitations"])
 
     def test_the_repair_report_closes_every_audit_finding(self) -> None:
@@ -168,6 +180,28 @@ class M2ArtifactTests(unittest.TestCase):
             self.assertNotEqual(record["status"], "VERIFIED_INSTALLED_PATH")
         self.assertTrue(report["known_limitations"])
 
+    def test_the_third_repair_report_closes_every_remaining_finding(self) -> None:
+        report = parse_canonical_json(
+            (IMPLEMENTATION / "M2_THIRD_CRITICAL_REPAIR_REPORT.json").read_bytes()
+        )
+        self.assertEqual(report["starting_commit"], M2_THIRD_STARTING_COMMIT)
+        self.assertEqual(report["branch"], M2_THIRD_BRANCH)
+        self.assertEqual(report["terminal_verdict"], "M2_THIRD_CRITICAL_REPAIRS_VERIFIED")
+        findings = {row["finding"]: row for row in report["findings"]}
+        self.assertEqual(sorted(findings), ["M2-B21", "M2-M22", "M2-M23", "M2-M24"])
+        for name, row in findings.items():
+            with self.subTest(finding=name):
+                self.assertEqual(row["status"], "CLOSED")
+                self.assertTrue(row["reproduction"])
+                self.assertTrue(row["closure"])
+                self.assertTrue(row["evidence"])
+        self.assertFalse(report["boundary_audit"]["milestone_3_started"])
+        for boundary, crossed in report["boundary_audit"].items():
+            self.assertFalse(crossed, boundary)
+        for record in report["requirement_dispositions"]:
+            self.assertNotEqual(record["status"], "VERIFIED_INSTALLED_PATH")
+        self.assertTrue(report.get("withdrawn_claims"))
+
     def test_the_historical_repair_report_is_preserved_byte_for_byte(self) -> None:
         for name in PRESERVED_HISTORICAL_ARTIFACTS:
             with self.subTest(artifact=name):
@@ -210,10 +244,12 @@ class M2ArtifactTests(unittest.TestCase):
                 "effects.py",
                 "identities.py",
                 "observation.py",
+                "private_workspace.py",
                 "process_supervision.py",
                 "reconciliation.py",
                 "resource_limits.py",
                 "run_index.py",
+                "runtime_binding.py",
                 "sandbox.py",
                 "schemas.py",
                 "specification.py",

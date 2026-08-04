@@ -7,7 +7,10 @@ implementations, bounded process supervision, typed observations, and the
 run/effect ledger with crash-safe reconciliation.  The second critical-repair
 pass adds the capsule's syscall boundary and byte identity, per-command resource
 containment, a non-executing Git observer, and a crash-classifiable durable event
-index the effect ledger is derived from.
+index the effect ledger is derived from.  The third critical-repair pass replaces
+the live writable workspace bind with a private execution view and trusted
+export, verifies cgroup membership before command execution, and binds capsule
+runtime identity through open descriptors.
 
 The namespace still has no model transport, multi-session orchestration, policy
 implementation, owner broker, authority, evaluator engine, or provider

@@ -225,70 +225,130 @@ def probe_cgroup_delegation() -> CgroupDelegation:
 
 
 class EffectCgroup:
-    """One per-effect cgroup v2 subtree, or an inert object when undelegated."""
+    """One per-effect cgroup v2 subtree, or an inert object when undelegated.
+
+    ``active`` means the subtree exists *and* at least one verified member has
+    been attached.  Directory creation alone is not membership.
+    """
 
     def __init__(self, delegation: CgroupDelegation, bounds: ResourceBounds, label: str) -> None:
         self._delegation = delegation
         self._bounds = bounds
         self._path: Path | None = None
         self._label = label
+        self._membership_verified = False
         self.applied: dict[str, Any] = {}
+        self.create_error: str | None = None
+        self.attach_error: str | None = None
 
     @property
     def active(self) -> bool:
+        return self._path is not None and self._membership_verified
+
+    @property
+    def directory_present(self) -> bool:
         return self._path is not None
 
     @property
     def path(self) -> str | None:
         return None if self._path is None else str(self._path)
 
-    def create(self) -> None:
+    def create(self) -> bool:
+        """Create the subtree.  Returns False when delegation promised one but creation failed."""
+
         if not self._delegation.available or self._delegation.delegated_path is None:
-            return
+            return True
         candidate = Path(self._delegation.delegated_path) / f".admissible-effect-{self._label}"
         try:
             candidate.mkdir(mode=0o700)
             (candidate / "pids.max").write_text(str(self._bounds.max_processes), encoding="utf-8")
             (candidate / "memory.max").write_text(str(self._bounds.max_address_space_bytes), encoding="utf-8")
-        except OSError:
-            # Delegation was probed, but this exact subtree could not be built.
-            # The rlimit layer still applies, so this degrades the *additional*
-            # layer only; it never produces an unbounded process domain.
+        except OSError as error:
+            self.create_error = errno.errorcode.get(error.errno, str(error.errno))
             self._remove(candidate)
-            return
+            return False
         self._path = candidate
         self.applied = {
             "pids.max": self._bounds.max_processes,
             "memory.max": self._bounds.max_address_space_bytes,
         }
+        return True
+
+    def members(self) -> set[int]:
+        if self._path is None:
+            return set()
+        try:
+            raw = (self._path / "cgroup.procs").read_text(encoding="utf-8")
+        except OSError:
+            return set()
+        return {int(token) for token in raw.split() if token.isdigit()}
 
     def attach(self, pid: int) -> bool:
         if self._path is None:
             return False
         try:
             (self._path / "cgroup.procs").write_text(str(pid), encoding="utf-8")
-        except OSError:
+        except OSError as error:
+            self.attach_error = errno.errorcode.get(error.errno, str(error.errno))
             return False
         return True
 
-    def close(self) -> None:
-        if self._path is not None:
-            self._remove(self._path)
+    def attach_and_verify(self, pid: int) -> bool:
+        """Move ``pid`` into the cgroup and prove kernel membership before release."""
+
+        if self._path is None:
+            return False
+        if not self.attach(pid):
+            return False
+        if pid not in self.members():
+            self.attach_error = "membership_not_observed"
+            return False
+        self._membership_verified = True
+        return True
+
+    def close(self) -> bool:
+        """Remove the subtree.  Returns False if live members prevent removal."""
+
+        if self._path is None:
+            return True
+        live = self.members()
+        if live:
+            self.attach_error = f"live_members:{sorted(live)}"
+            return False
+        removed = self._remove(self._path)
+        if removed:
             self._path = None
+            self._membership_verified = False
+        return removed
 
     @staticmethod
-    def _remove(path: Path) -> None:
+    def _remove(path: Path) -> bool:
         try:
             path.rmdir()
-        except OSError:  # pragma: no cover - a live subtree is removed on the next attempt
-            pass
+            return True
+        except OSError:
+            return False
 
 
 # --- the mechanism actually in force ----------------------------------------
 
-def effective_mechanism(delegation: CgroupDelegation, cgroup_active: bool) -> str:
-    if delegation.available and cgroup_active:
+def effective_mechanism(
+    delegation: CgroupDelegation,
+    *,
+    membership_verified: bool,
+    required_mechanism: str | None = None,
+) -> str:
+    """Return the mechanism that was physically proven for this effect.
+
+    Directory existence is not membership.  When readiness promised
+    ``CGROUP_V2_AND_RLIMIT``, callers must refuse rather than silently report
+    ``RLIMIT`` after an attach failure.
+    """
+
+    if delegation.available and membership_verified:
         return MECHANISM_CGROUP_AND_RLIMIT
+    if required_mechanism == MECHANISM_CGROUP_AND_RLIMIT and not membership_verified:
+        return MECHANISM_NONE
     return MECHANISM_RLIMIT
 
 
