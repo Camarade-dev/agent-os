@@ -36,9 +36,17 @@ from .specification import (
     ModeDecision,
     TerminalManifest,
     canonical_object_bytes,
+    derive_evaluator_identity,
+    derive_tool_grammar_identity,
     validate_unique_proposal_ids,
 )
-from .schemas import RECEIPT_STATE_MATRIX, TERMINAL_STATE_MATRIX
+from .schemas import (
+    RECEIPT_STATE_MATRIX,
+    TERMINAL_STATE_MATRIX,
+    receipt_process_exit_policy,
+    receipt_reconciliation_required,
+    receipt_state_rule,
+)
 from .tool_schemas import (
     ListFilesRequest,
     ListFilesResult,
@@ -46,12 +54,15 @@ from .tool_schemas import (
     ReadFileResult,
     RunCommandRequest,
     RunCommandResult,
+    ToolGrammarEntry,
+    ToolGrammarSpecification,
     ToolRequest,
     ToolResult,
     WriteFileRequest,
     WriteFileResult,
     tool_request_from_dict,
     tool_result_from_dict,
+    written_content_fingerprint,
 )
 
 __all__ = [
@@ -81,6 +92,8 @@ __all__ = [
     "RunCommandResult",
     "SessionIdentity",
     "TerminalManifest",
+    "ToolGrammarEntry",
+    "ToolGrammarSpecification",
     "ToolRequest",
     "ToolResult",
     "ListFilesRequest",
@@ -94,12 +107,18 @@ __all__ = [
     "canonical_bytes",
     "canonical_object_bytes",
     "check_parity",
+    "derive_evaluator_identity",
+    "derive_tool_grammar_identity",
     "fingerprint",
     "fingerprint_bytes",
     "parse_canonical_json",
+    "receipt_process_exit_policy",
+    "receipt_reconciliation_required",
+    "receipt_state_rule",
     "require_parity",
     "strict_json_loads",
     "tool_request_from_dict",
     "tool_result_from_dict",
     "validate_unique_proposal_ids",
+    "written_content_fingerprint",
 ]

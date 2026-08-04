@@ -18,6 +18,8 @@ from .schemas import (
     CONDITIONS,
     DECISIONS,
     DIRECT,
+    EFFECT_APPLICATIONS,
+    EXECUTION_FAILURE_CLASSES,
     GOVERNED,
     RECEIPT_STATUSES,
     SCHEMA_ALLOWED_DIFFERENCES,
@@ -38,9 +40,20 @@ from .schemas import (
     SCHEMA_VERSION,
     RECEIPT_STATE_MATRIX,
     TERMINAL_STATE_MATRIX,
+    TOOL_EFFECT_CLASSIFICATIONS,
     TOOL_NAMES,
+    receipt_process_exit_policy,
+    receipt_reconciliation_required,
+    receipt_state_rule,
 )
-from .tool_schemas import ToolRequest, tool_request_from_dict
+from .tool_schemas import (
+    REQUEST_FINGERPRINT_DOMAINS,
+    ToolGrammarSpecification,
+    ToolRequest,
+    ToolResult,
+    tool_request_from_dict,
+    tool_result_from_dict,
+)
 
 
 MAX_COUNTER = 2**63 - 1
@@ -117,6 +130,61 @@ def _tool_request(value: Any, label: str = "tool_request") -> ToolRequest:
     if not isinstance(value, ToolRequest):
         raise ValueError(f"{label} must be one of the four typed tool request records")
     return value.validated()
+
+
+def _tool_result(value: Any, label: str = "tool_result") -> ToolResult:
+    if not isinstance(value, ToolResult):
+        raise ValueError(f"{label} must be one of the four typed tool result records")
+    return value.validated()
+
+
+def _tool_grammar(value: Any, label: str = "tool_grammar") -> ToolGrammarSpecification:
+    if not isinstance(value, ToolGrammarSpecification):
+        raise ValueError(f"{label} must be a ToolGrammarSpecification")
+    return value.validated()
+
+
+def _evaluator_specification(value: Any, label: str = "evaluator_specification") -> "EvaluatorSpecification":
+    if not isinstance(value, EvaluatorSpecification):
+        raise ValueError(f"{label} must be an EvaluatorSpecification")
+    return value.validated()
+
+
+def _derived_identity(kind: str, name: str, version: str, material: Any) -> IdentityReference:
+    return IdentityReference.create(kind=kind, name=name, version=version, material=material.to_dict())
+
+
+def derive_tool_grammar_identity(
+    grammar: ToolGrammarSpecification,
+    *,
+    name: str = "tool_grammar-paired-runner",
+) -> IdentityReference:
+    """Name a grammar without hiding it: the identity is a function of contents."""
+
+    grammar = _tool_grammar(grammar)
+    return _derived_identity("tool_grammar", name, grammar.grammar_version, grammar)
+
+
+def derive_evaluator_identity(
+    evaluator: "EvaluatorSpecification",
+    *,
+    name: str = "evaluator-paired-runner",
+) -> IdentityReference:
+    """Name an evaluator specification by its exact contents."""
+
+    evaluator = _evaluator_specification(evaluator)
+    return _derived_identity("evaluator", name, evaluator.evaluator_version, evaluator)
+
+
+def _require_derived_identity(identity: IdentityReference, *, kind: str, material: Any, label: str) -> IdentityReference:
+    """Prove a label identity was constructed from this exact typed object."""
+
+    identity = _identity_of_kind(identity, label, kind)
+    if identity.identity_semantics != "CONTENT":
+        raise ValueError(f"{label} must be a CONTENT identity derived from its typed object")
+    if _derived_identity(kind, identity.name, identity.version, material) != identity:
+        raise ValueError(f"{label} is not derived from the exact typed object it names")
+    return identity
 
 
 def _tuple_strings(value: Any, label: str, *, allowed: frozenset[str] | None = None) -> tuple[str, ...]:
@@ -673,6 +741,7 @@ class ExperimentSpecification:
     executable_digest: Fingerprint
     transport_identity: IdentityReference
     tool_grammar_identity: IdentityReference
+    tool_grammar: ToolGrammarSpecification
     environment_identity: IdentityReference
     dependency_toolchain_identity: IdentityReference
     common_filesystem_network_process_policy_identity: IdentityReference
@@ -680,6 +749,7 @@ class ExperimentSpecification:
     scope_identity: IdentityReference
     effect_executor_identity: IdentityReference
     evaluator_identity: IdentityReference
+    evaluator_specification: "EvaluatorSpecification"
     common_budgets: BudgetState
     allowed_condition_differences: AllowedConditionDifferences
     condition: ConditionConfiguration
@@ -697,19 +767,27 @@ class ExperimentSpecification:
         executable_identity: IdentityReference,
         executable_digest: Fingerprint,
         transport_identity: IdentityReference,
-        tool_grammar_identity: IdentityReference,
+        tool_grammar: ToolGrammarSpecification,
         environment_identity: IdentityReference,
         dependency_toolchain_identity: IdentityReference,
         common_filesystem_network_process_policy_identity: IdentityReference,
         working_root_identity: IdentityReference,
         scope_identity: IdentityReference,
         effect_executor_identity: IdentityReference,
-        evaluator_identity: IdentityReference,
+        evaluator_specification: "EvaluatorSpecification",
         common_budgets: BudgetState,
         allowed_condition_differences: AllowedConditionDifferences,
         condition: ConditionConfiguration,
         run_identity: RunIdentity,
+        tool_grammar_identity: IdentityReference | None = None,
+        evaluator_identity: IdentityReference | None = None,
     ) -> "ExperimentSpecification":
+        tool_grammar = _tool_grammar(tool_grammar)
+        evaluator_specification = _evaluator_specification(evaluator_specification)
+        if tool_grammar_identity is None:
+            tool_grammar_identity = derive_tool_grammar_identity(tool_grammar)
+        if evaluator_identity is None:
+            evaluator_identity = derive_evaluator_identity(evaluator_specification)
         body = {
             "schema_id": SCHEMA_EXPERIMENT,
             "schema_version": SCHEMA_VERSION,
@@ -721,6 +799,7 @@ class ExperimentSpecification:
             "executable_digest": executable_digest.to_dict(),
             "transport_identity": transport_identity.to_dict(),
             "tool_grammar_identity": tool_grammar_identity.to_dict(),
+            "tool_grammar": tool_grammar.to_dict(),
             "environment_identity": environment_identity.to_dict(),
             "dependency_toolchain_identity": dependency_toolchain_identity.to_dict(),
             "common_filesystem_network_process_policy_identity": common_filesystem_network_process_policy_identity.to_dict(),
@@ -728,6 +807,7 @@ class ExperimentSpecification:
             "scope_identity": scope_identity.to_dict(),
             "effect_executor_identity": effect_executor_identity.to_dict(),
             "evaluator_identity": evaluator_identity.to_dict(),
+            "evaluator_specification": evaluator_specification.to_dict(),
             "common_budgets": common_budgets.to_dict(),
             "allowed_condition_differences": allowed_condition_differences.to_dict(),
             "condition": condition.to_dict(),
@@ -744,6 +824,7 @@ class ExperimentSpecification:
             executable_digest=executable_digest,
             transport_identity=transport_identity,
             tool_grammar_identity=tool_grammar_identity,
+            tool_grammar=tool_grammar,
             environment_identity=environment_identity,
             dependency_toolchain_identity=dependency_toolchain_identity,
             common_filesystem_network_process_policy_identity=common_filesystem_network_process_policy_identity,
@@ -751,6 +832,7 @@ class ExperimentSpecification:
             scope_identity=scope_identity,
             effect_executor_identity=effect_executor_identity,
             evaluator_identity=evaluator_identity,
+            evaluator_specification=evaluator_specification,
             common_budgets=common_budgets,
             allowed_condition_differences=allowed_condition_differences,
             condition=condition,
@@ -770,6 +852,7 @@ class ExperimentSpecification:
             "executable_digest": self.executable_digest.to_dict(),
             "transport_identity": self.transport_identity.to_dict(),
             "tool_grammar_identity": self.tool_grammar_identity.to_dict(),
+            "tool_grammar": self.tool_grammar.to_dict(),
             "environment_identity": self.environment_identity.to_dict(),
             "dependency_toolchain_identity": self.dependency_toolchain_identity.to_dict(),
             "common_filesystem_network_process_policy_identity": self.common_filesystem_network_process_policy_identity.to_dict(),
@@ -777,6 +860,7 @@ class ExperimentSpecification:
             "scope_identity": self.scope_identity.to_dict(),
             "effect_executor_identity": self.effect_executor_identity.to_dict(),
             "evaluator_identity": self.evaluator_identity.to_dict(),
+            "evaluator_specification": self.evaluator_specification.to_dict(),
             "common_budgets": self.common_budgets.to_dict(),
             "allowed_condition_differences": self.allowed_condition_differences.to_dict(),
             "condition": self.condition.to_dict(),
@@ -813,6 +897,7 @@ class ExperimentSpecification:
             "executable_digest": self.executable_digest.to_dict(),
             "transport_identity": identities["transport_identity"],
             "tool_grammar_identity": identities["tool_grammar_identity"],
+            "tool_grammar": self.tool_grammar.normative_dict(),
             "environment_identity": identities["environment_identity"],
             "dependency_toolchain_identity": identities["dependency_toolchain_identity"],
             "common_filesystem_network_process_policy_identity": identities["common_filesystem_network_process_policy_identity"],
@@ -820,6 +905,7 @@ class ExperimentSpecification:
             "scope_identity": self.scope_identity.normative_dict(),
             "effect_executor_identity": identities["effect_executor_identity"],
             "evaluator_identity": identities["evaluator_identity"],
+            "evaluator_specification": self.evaluator_specification.normative_dict(),
             "common_budgets": {
                 "schema_id": self.common_budgets.schema_id,
                 "schema_version": self.common_budgets.schema_version,
@@ -865,6 +951,18 @@ class ExperimentSpecification:
         ):
             _identity_of_kind(getattr(self, name), name, expected_kind)
         _fp(self.executable_digest, "executable_digest")
+        # The grammar and the evaluator are typed objects, not labels: their
+        # named identities must be reconstructible from their exact contents.
+        _tool_grammar(self.tool_grammar)
+        _evaluator_specification(self.evaluator_specification)
+        _require_derived_identity(
+            self.tool_grammar_identity, kind="tool_grammar", material=self.tool_grammar, label="tool_grammar_identity"
+        )
+        _require_derived_identity(
+            self.evaluator_identity, kind="evaluator", material=self.evaluator_specification, label="evaluator_identity"
+        )
+        if self.evaluator_specification.environment_identity != self.environment_identity:
+            raise ValueError("the evaluator specification does not run in the experiment environment")
         self.common_budgets.validated()
         if any(getattr(self.common_budgets.used, name) != 0 for name in BUDGET_FIELDS):
             raise ValueError("experiment common_budgets must start with zero usage")
@@ -889,9 +987,11 @@ class ExperimentSpecification:
         fields = {
             "schema_id", "schema_version", "experiment_id", "task_prompt_fingerprint", "initial_state_fingerprint",
             "model_identity", "executable_identity", "executable_digest", "transport_identity", "tool_grammar_identity",
+            "tool_grammar",
             "environment_identity", "dependency_toolchain_identity", "common_filesystem_network_process_policy_identity",
             "working_root_identity", "scope_identity",
-            "effect_executor_identity", "evaluator_identity", "common_budgets", "allowed_condition_differences", "condition", "run_identity",
+            "effect_executor_identity", "evaluator_identity", "evaluator_specification", "common_budgets",
+            "allowed_condition_differences", "condition", "run_identity",
             "specification_fingerprint",
         }
         _schema(data, SCHEMA_EXPERIMENT, "experiment specification", fields)
@@ -904,6 +1004,7 @@ class ExperimentSpecification:
             executable_digest=_fp_from_dict(data["executable_digest"], "executable_digest"),
             transport_identity=IdentityReference.from_dict(data["transport_identity"]),
             tool_grammar_identity=IdentityReference.from_dict(data["tool_grammar_identity"]),
+            tool_grammar=ToolGrammarSpecification.from_dict(data["tool_grammar"]),
             environment_identity=IdentityReference.from_dict(data["environment_identity"]),
             dependency_toolchain_identity=IdentityReference.from_dict(data["dependency_toolchain_identity"]),
             common_filesystem_network_process_policy_identity=IdentityReference.from_dict(data["common_filesystem_network_process_policy_identity"]),
@@ -911,6 +1012,7 @@ class ExperimentSpecification:
             scope_identity=IdentityReference.from_dict(data["scope_identity"]),
             effect_executor_identity=IdentityReference.from_dict(data["effect_executor_identity"]),
             evaluator_identity=IdentityReference.from_dict(data["evaluator_identity"]),
+            evaluator_specification=EvaluatorSpecification.from_dict(data["evaluator_specification"]),
             common_budgets=BudgetState.from_dict(data["common_budgets"]),
             allowed_condition_differences=AllowedConditionDifferences.from_dict(data["allowed_condition_differences"]),
             condition=ConditionConfiguration.from_dict(data["condition"]),
@@ -961,8 +1063,7 @@ class CanonicalProposal:
         session_identity.validate_for_run(specification.run_identity)
         prompt_identity = _identity_of_kind(prompt_identity, "prompt_identity", "prompt")
         tool_request = _tool_request(tool_request)
-        if tool_request.tool_grammar_fingerprint != specification.tool_grammar_identity.content_fingerprint:
-            raise ValueError("tool request is not permitted by the specification's exact tool grammar")
+        specification.tool_grammar.validate_request(tool_request)
         if prompt_identity.content_fingerprint != specification.task_prompt_fingerprint:
             raise ValueError("prompt identity is not bound to the specification task prompt")
         body = {
@@ -1093,8 +1194,11 @@ class CanonicalProposal:
             raise ValueError("proposal prompt identity does not bind the task prompt specification")
         if self.tool_grammar_identity != specification.tool_grammar_identity:
             raise ValueError("proposal tool grammar identity does not equal the specification grammar")
-        if self.tool_request.tool_grammar_fingerprint != specification.tool_grammar_identity.content_fingerprint:
-            raise ValueError("proposal tool request is not permitted by the exact grammar identity")
+        # The grammar is a typed manifest, so membership, schema version, effect
+        # classification, and the cited grammar fingerprint are all recomputed.
+        specification.tool_grammar.validate_request(self.tool_request)
+        if TOOL_EFFECT_CLASSIFICATIONS[self.tool_name] != self.tool_request.effect_classification:
+            raise ValueError("proposal tool name and request effect classification disagree")
         if self.working_root_identity != specification.working_root_identity:
             raise ValueError("proposal working root is not authorized by the specification")
         if self.scope_identity != specification.scope_identity:
@@ -1226,6 +1330,19 @@ class ModeDecision:
             raise ValueError("mode decision fingerprint mismatch")
         return self
 
+    def validate_for_proposal(self, proposal: CanonicalProposal) -> "ModeDecision":
+        """Prove this decision was taken on exactly *proposal*."""
+
+        proposal.validated()
+        self.validated()
+        if self.proposal_id != proposal.proposal_id:
+            raise ValueError("mode decision names a different proposal")
+        if self.proposal_fingerprint != proposal.proposal_fingerprint:
+            raise ValueError("mode decision is bound to a different proposal fingerprint")
+        if self.condition_id != proposal.condition.condition_id:
+            raise ValueError("mode decision condition differs from the proposal condition")
+        return self
+
     @property
     def permits_effect(self) -> bool:
         return self.decision in {"DIRECT_EXECUTION", "ALLOW"}
@@ -1275,9 +1392,7 @@ class EffectReservation:
     ) -> "EffectReservation":
         specification.validated()
         proposal.validate_for_specification(specification)
-        decision.validated()
-        if proposal.proposal_id != decision.proposal_id or proposal.proposal_fingerprint != decision.proposal_fingerprint:
-            raise ValueError("reservation proposal and mode decision are not causally bound")
+        decision.validate_for_proposal(proposal)
         if not decision.permits_effect:
             raise ValueError("a refused, terminated, or continuation decision cannot reserve an effect")
         _identifier(reservation_id, "reservation_id")
@@ -1335,7 +1450,13 @@ class EffectReservation:
         return self
 
     def validate_for_specification(self, specification: ExperimentSpecification) -> "EffectReservation":
-        """Prove that this reservation is for the exact experiment executor."""
+        """Structural validation only: exact experiment and executor identity.
+
+        This proves nothing about the proposal and decision the reservation
+        names.  A reservation restored from bytes is not authoritative for
+        execution until :meth:`validate_for_decision` reconciles it with the
+        typed proposal and the typed mode decision.
+        """
 
         specification.validated()
         self.validated()
@@ -1343,6 +1464,36 @@ class EffectReservation:
             raise ValueError("effect reservation is bound to a different experiment specification")
         if self.effect_executor_identity != specification.effect_executor_identity:
             raise ValueError("effect reservation executor identity differs from the specification")
+        return self
+
+    def validate_for_decision(
+        self,
+        specification: ExperimentSpecification,
+        proposal: CanonicalProposal,
+        decision: ModeDecision,
+    ) -> "EffectReservation":
+        """Authoritative typed reconciliation of a restored reservation.
+
+        Structural validation only re-derives the reservation's own fingerprint
+        from its own fields, so a self-consistent forgery can replace the
+        proposal identity, the proposal fingerprint, and the mode-decision
+        fingerprint together.  This path instead reconstructs every causal link
+        from the typed objects themselves and fails closed on any difference.
+        """
+
+        self.validate_for_specification(specification)
+        proposal.validate_for_specification(specification)
+        decision.validate_for_proposal(proposal)
+        if self.proposal_id != proposal.proposal_id:
+            raise ValueError("reservation names a different proposal")
+        if self.proposal_fingerprint != proposal.proposal_fingerprint:
+            raise ValueError("reservation is bound to a different proposal fingerprint")
+        if self.mode_decision_fingerprint != decision.decision_fingerprint:
+            raise ValueError("reservation is bound to a different mode decision")
+        if not decision.permits_effect:
+            raise ValueError("a refused, terminated, or continuation decision cannot reserve an effect")
+        if self.reservation_state != "RESERVED_NOT_STARTED":
+            raise ValueError("an authoritative reservation must still be pre-start")
         return self
 
     def to_dict(self) -> dict[str, Any]:
@@ -1369,15 +1520,29 @@ class EffectReservation:
 
 @dataclass(frozen=True)
 class EffectReceipt:
+    """An effect-aware receipt bound to one exact typed request.
+
+    The receipt names the tool, its effect classification, and the exact typed
+    request fingerprint, and it binds a typed result only in the lifecycle
+    states that have one.  Process-exit data belongs to a process-executing tool
+    alone: a completed ``read_file`` neither requires nor accepts one.
+    """
+
     schema_id: str
     schema_version: int
     receipt_id: str
     proposal_fingerprint: Fingerprint
     reservation_fingerprint: Fingerprint | None
+    tool_name: str
+    effect_classification: str
+    tool_request_fingerprint: Fingerprint
+    tool_result: ToolResult | None
+    execution_failure: str | None
     status: str
     effect_started: bool
     effect_completed: bool
     executed_effect: bool
+    effect_application: str
     process_exit_code: int | None
     outcome_known: bool
     replay_forbidden: bool
@@ -1392,36 +1557,52 @@ class EffectReceipt:
         *,
         receipt_id: str,
         proposal_fingerprint: Fingerprint,
+        tool_name: str,
+        tool_request_fingerprint: Fingerprint,
         status: str,
+        effect_classification: str | None = None,
         reservation_fingerprint: Fingerprint | None = None,
+        tool_result: ToolResult | None = None,
+        execution_failure: str | None = None,
         effect_started: bool = False,
         effect_completed: bool = False,
         executed_effect: bool = False,
+        effect_application: str | None = None,
         process_exit_code: int | None = None,
         outcome_known: bool | None = None,
         replay_forbidden: bool | None = None,
         reconciliation_required: bool | None = None,
         outcome_reason: str,
     ) -> "EffectReceipt":
-        if status not in RECEIPT_STATE_MATRIX:
-            raise ValueError("unknown effect receipt status")
-        rule = RECEIPT_STATE_MATRIX[status]
+        rule = receipt_state_rule(status)
+        if tool_name not in TOOL_NAMES:
+            raise ValueError("unknown tool name")
+        if effect_classification is None:
+            effect_classification = TOOL_EFFECT_CLASSIFICATIONS[tool_name]
         if outcome_known is None:
             outcome_known = rule.outcome_known
         if replay_forbidden is None:
             replay_forbidden = rule.replay_forbidden
         if reconciliation_required is None:
-            reconciliation_required = rule.reconciliation_required
+            reconciliation_required = receipt_reconciliation_required(status, effect_classification)
+        if effect_application is None:
+            effect_application = rule.effect_application
         body = {
             "schema_id": SCHEMA_RECEIPT,
             "schema_version": SCHEMA_VERSION,
             "receipt_id": receipt_id,
             "proposal_fingerprint": proposal_fingerprint.to_dict(),
             "reservation_fingerprint": reservation_fingerprint.to_dict() if reservation_fingerprint else None,
+            "tool_name": tool_name,
+            "effect_classification": effect_classification,
+            "tool_request_fingerprint": tool_request_fingerprint.to_dict(),
+            "tool_result": tool_result.to_dict() if tool_result is not None else None,
+            "execution_failure": execution_failure,
             "status": status,
             "effect_started": effect_started,
             "effect_completed": effect_completed,
             "executed_effect": executed_effect,
+            "effect_application": effect_application,
             "process_exit_code": process_exit_code,
             "outcome_known": outcome_known,
             "replay_forbidden": replay_forbidden,
@@ -1435,10 +1616,16 @@ class EffectReceipt:
             receipt_id=receipt_id,
             proposal_fingerprint=proposal_fingerprint,
             reservation_fingerprint=reservation_fingerprint,
+            tool_name=tool_name,
+            effect_classification=effect_classification,
+            tool_request_fingerprint=tool_request_fingerprint,
+            tool_result=tool_result,
+            execution_failure=execution_failure,
             status=status,
             effect_started=effect_started,
             effect_completed=effect_completed,
             executed_effect=executed_effect,
+            effect_application=effect_application,
             process_exit_code=process_exit_code,
             outcome_known=outcome_known,
             replay_forbidden=replay_forbidden,
@@ -1448,6 +1635,39 @@ class EffectReceipt:
             receipt_fingerprint=_object_fp(body, SCHEMA_RECEIPT),
         ).validated()
 
+    @classmethod
+    def for_proposal(
+        cls,
+        *,
+        receipt_id: str,
+        proposal: "CanonicalProposal",
+        status: str,
+        outcome_reason: str,
+        reservation: "EffectReservation | None" = None,
+        tool_result: ToolResult | None = None,
+        execution_failure: str | None = None,
+        process_exit_code: int | None = None,
+    ) -> "EffectReceipt":
+        """Derive the tool binding and the matrix-implied flags from a proposal."""
+
+        proposal.validated()
+        rule = receipt_state_rule(status)
+        return cls.create(
+            receipt_id=receipt_id,
+            proposal_fingerprint=proposal.proposal_fingerprint,
+            tool_name=proposal.tool_name,
+            tool_request_fingerprint=proposal.tool_request.request_fingerprint,
+            status=status,
+            reservation_fingerprint=None if reservation is None else reservation.reservation_fingerprint,
+            tool_result=tool_result,
+            execution_failure=execution_failure,
+            effect_started=rule.effect_started,
+            effect_completed=rule.effect_completed,
+            executed_effect=rule.executed_effect,
+            process_exit_code=process_exit_code,
+            outcome_reason=outcome_reason,
+        )
+
     def _body(self) -> dict[str, Any]:
         return {
             "schema_id": self.schema_id,
@@ -1455,10 +1675,16 @@ class EffectReceipt:
             "receipt_id": self.receipt_id,
             "proposal_fingerprint": self.proposal_fingerprint.to_dict(),
             "reservation_fingerprint": self.reservation_fingerprint.to_dict() if self.reservation_fingerprint else None,
+            "tool_name": self.tool_name,
+            "effect_classification": self.effect_classification,
+            "tool_request_fingerprint": self.tool_request_fingerprint.to_dict(),
+            "tool_result": self.tool_result.to_dict() if self.tool_result is not None else None,
+            "execution_failure": self.execution_failure,
             "status": self.status,
             "effect_started": self.effect_started,
             "effect_completed": self.effect_completed,
             "executed_effect": self.executed_effect,
+            "effect_application": self.effect_application,
             "process_exit_code": self.process_exit_code,
             "outcome_known": self.outcome_known,
             "replay_forbidden": self.replay_forbidden,
@@ -1466,6 +1692,16 @@ class EffectReceipt:
             "task_acceptance": self.task_acceptance,
             "outcome_reason": self.outcome_reason,
         }
+
+    @property
+    def result_binding(self) -> str:
+        """The lifecycle token this receipt claims for its result channel."""
+
+        if self.tool_result is not None:
+            return self.tool_result.outcome
+        if self.execution_failure is not None:
+            return "EXECUTION_FAILURE"
+        return "NONE"
 
     def validated(self) -> "EffectReceipt":
         if self.schema_id != SCHEMA_RECEIPT or self.schema_version != SCHEMA_VERSION:
@@ -1477,6 +1713,13 @@ class EffectReceipt:
         if self.status not in RECEIPT_STATUSES:
             raise ValueError("unknown effect receipt status")
         rule = RECEIPT_STATE_MATRIX[self.status]
+        if self.tool_name not in TOOL_NAMES:
+            raise ValueError("unknown tool name")
+        if self.effect_classification != TOOL_EFFECT_CLASSIFICATIONS[self.tool_name]:
+            raise ValueError("receipt effect classification does not match its tool")
+        _fp(self.tool_request_fingerprint, "tool_request_fingerprint")
+        if self.tool_request_fingerprint.domain != REQUEST_FINGERPRINT_DOMAINS[self.tool_name]:
+            raise ValueError("receipt tool request fingerprint belongs to another tool schema")
         for name in ("effect_started", "effect_completed", "executed_effect"):
             _strict_bool(getattr(self, name), name)
         for name in ("outcome_known", "replay_forbidden", "reconciliation_required"):
@@ -1487,19 +1730,36 @@ class EffectReceipt:
             self.executed_effect,
         ) != (rule.effect_started, rule.effect_completed, rule.executed_effect):
             raise ValueError(f"{self.status} receipt flags do not match the exhaustive receipt state matrix")
-        if self.outcome_known != rule.outcome_known:
-            raise ValueError(f"{self.status} receipt outcome_known flag is inconsistent")
-        if self.replay_forbidden != rule.replay_forbidden:
-            raise ValueError(f"{self.status} receipt replay policy is inconsistent")
-        if self.reconciliation_required != rule.reconciliation_required:
-            raise ValueError(f"{self.status} receipt reconciliation policy is inconsistent")
+        if self.effect_application not in EFFECT_APPLICATIONS:
+            raise ValueError("unknown effect application state")
+        if self.effect_application != rule.effect_application:
+            raise ValueError(f"{self.status} receipt effect application contradicts the receipt state matrix")
+        if self.tool_result is not None:
+            _tool_result(self.tool_result)
+            if self.execution_failure is not None:
+                raise ValueError("a receipt cannot bind both a typed result and a typed execution failure")
+            if self.tool_result.tool_name != self.tool_name:
+                raise ValueError("receipt binds a tool result from another tool")
+            if self.tool_result.request_fingerprint != self.tool_request_fingerprint:
+                raise ValueError("receipt binds a tool result from another request")
+            if self.reservation_fingerprint is None:
+                raise ValueError("a typed tool result requires the reservation that authorized the effect")
+        elif self.execution_failure is not None and self.execution_failure not in EXECUTION_FAILURE_CLASSES:
+            raise ValueError("unknown typed execution failure class")
+        if self.result_binding not in rule.result_binding:
+            raise ValueError(
+                f"{self.status} receipt cannot bind result state {self.result_binding}"
+            )
         if rule.reservation == "REQUIRED" and self.reservation_fingerprint is None:
             raise ValueError(f"{self.status} receipt must bind a reservation")
         if rule.reservation == "FORBIDDEN" and self.reservation_fingerprint is not None:
             raise ValueError(f"{self.status} receipt cannot bind a reservation")
-        if rule.process_exit_code == "FORBIDDEN" and self.process_exit_code is not None:
-            raise ValueError(f"{self.status} receipt cannot contain a process exit code")
-        if rule.process_exit_code == "REQUIRED" and self.process_exit_code is None:
+        process_policy = receipt_process_exit_policy(self.status, self.effect_classification)
+        if process_policy == "FORBIDDEN" and self.process_exit_code is not None:
+            raise ValueError(
+                f"{self.status} receipt for a {self.effect_classification} tool cannot contain process-exit data"
+            )
+        if process_policy == "REQUIRED" and self.process_exit_code is None:
             raise ValueError(f"{self.status} receipt requires a process exit code")
         if self.process_exit_code is not None and (
             isinstance(self.process_exit_code, bool)
@@ -1507,12 +1767,69 @@ class EffectReceipt:
             or not -128 <= self.process_exit_code <= 255
         ):
             raise ValueError("process_exit_code is outside the explicit signed byte range")
+        if (
+            self.tool_name == "run_command"
+            and self.tool_result is not None
+            and self.process_exit_code is not None
+            and getattr(self.tool_result, "exit_code", None) != self.process_exit_code
+        ):
+            raise ValueError("receipt process exit code disagrees with its typed run_command result")
+        if self.outcome_known != rule.outcome_known:
+            raise ValueError(f"{self.status} receipt outcome_known flag is inconsistent")
+        if self.replay_forbidden != rule.replay_forbidden:
+            raise ValueError(f"{self.status} receipt replay policy is inconsistent")
+        if self.reconciliation_required != receipt_reconciliation_required(self.status, self.effect_classification):
+            raise ValueError(f"{self.status} receipt reconciliation policy is inconsistent")
         if self.task_acceptance is not None:
             raise ValueError("effect receipts never carry task acceptance")
         _text(self.outcome_reason, "outcome_reason", max_bytes=4096)
         _fp(self.receipt_fingerprint, "receipt_fingerprint")
         if _object_fp(self._body(), SCHEMA_RECEIPT) != self.receipt_fingerprint:
             raise ValueError("effect receipt fingerprint mismatch")
+        return self
+
+    def validate_for_causal_chain(
+        self,
+        *,
+        specification: ExperimentSpecification,
+        proposal: CanonicalProposal,
+        decision: ModeDecision,
+        reservation: "EffectReservation | None" = None,
+    ) -> "EffectReceipt":
+        """Authoritative reconciliation of a receipt with its exact causal chain.
+
+        Structural validation proves internal consistency only.  This path
+        proves the receipt belongs to the exact specification, proposal,
+        decision, reservation, typed request, and typed result, and it calls the
+        exact request/result validation of the bound result.
+        """
+
+        self.validated()
+        proposal.validate_for_specification(specification)
+        decision.validate_for_proposal(proposal)
+        rule = receipt_state_rule(self.status)
+        if rule.reservation == "FORBIDDEN":
+            if reservation is not None or self.reservation_fingerprint is not None:
+                raise ValueError(f"{self.status} receipt cannot reconcile against a reservation")
+        elif rule.reservation == "REQUIRED" or self.reservation_fingerprint is not None:
+            if reservation is None:
+                raise ValueError(f"{self.status} receipt requires its typed reservation for reconciliation")
+            reservation.validate_for_decision(specification, proposal, decision)
+            if self.reservation_fingerprint != reservation.reservation_fingerprint:
+                raise ValueError("receipt is bound to a different reservation")
+        if self.proposal_fingerprint != proposal.proposal_fingerprint:
+            raise ValueError("receipt is bound to a different proposal")
+        if self.tool_name != proposal.tool_name:
+            raise ValueError("receipt names a different tool than its proposal")
+        if self.effect_classification != TOOL_EFFECT_CLASSIFICATIONS[proposal.tool_name]:
+            raise ValueError("receipt effect classification differs from the proposed tool")
+        if self.tool_request_fingerprint != proposal.tool_request.request_fingerprint:
+            raise ValueError("receipt is bound to a different typed tool request")
+        if self.tool_result is not None:
+            specification.tool_grammar.validate_result(self.tool_result)
+            self.tool_result.validate_for_request(proposal.tool_request)
+        if self.effect_started and not decision.permits_effect:
+            raise ValueError("a receipt cannot claim a started effect under a decision that refuses it")
         return self
 
     def to_dict(self) -> dict[str, Any]:
@@ -1522,8 +1839,10 @@ class EffectReceipt:
     @classmethod
     def from_dict(cls, data: Any) -> "EffectReceipt":
         fields = {
-            "schema_id", "schema_version", "receipt_id", "proposal_fingerprint", "reservation_fingerprint", "status",
-            "effect_started", "effect_completed", "executed_effect", "process_exit_code", "outcome_known", "replay_forbidden", "reconciliation_required", "task_acceptance",
+            "schema_id", "schema_version", "receipt_id", "proposal_fingerprint", "reservation_fingerprint",
+            "tool_name", "effect_classification", "tool_request_fingerprint", "tool_result", "execution_failure",
+            "status", "effect_started", "effect_completed", "executed_effect", "effect_application",
+            "process_exit_code", "outcome_known", "replay_forbidden", "reconciliation_required", "task_acceptance",
             "outcome_reason", "receipt_fingerprint",
         }
         _schema(data, SCHEMA_RECEIPT, "effect receipt", fields)
@@ -1531,8 +1850,13 @@ class EffectReceipt:
             schema_id=data["schema_id"], schema_version=data["schema_version"], receipt_id=data["receipt_id"],
             proposal_fingerprint=_fp_from_dict(data["proposal_fingerprint"], "proposal_fingerprint"),
             reservation_fingerprint=(None if data["reservation_fingerprint"] is None else _fp_from_dict(data["reservation_fingerprint"], "reservation_fingerprint")),
+            tool_name=data["tool_name"], effect_classification=data["effect_classification"],
+            tool_request_fingerprint=_fp_from_dict(data["tool_request_fingerprint"], "tool_request_fingerprint"),
+            tool_result=(None if data["tool_result"] is None else tool_result_from_dict(data["tool_result"])),
+            execution_failure=data["execution_failure"],
             status=data["status"], effect_started=data["effect_started"], effect_completed=data["effect_completed"],
-            executed_effect=data["executed_effect"], process_exit_code=data["process_exit_code"],
+            executed_effect=data["executed_effect"], effect_application=data["effect_application"],
+            process_exit_code=data["process_exit_code"],
             outcome_known=data["outcome_known"], replay_forbidden=data["replay_forbidden"], reconciliation_required=data["reconciliation_required"],
             task_acceptance=data["task_acceptance"], outcome_reason=data["outcome_reason"],
             receipt_fingerprint=_fp_from_dict(data["receipt_fingerprint"], "receipt_fingerprint"),
@@ -1734,6 +2058,11 @@ class EvaluatorSpecification:
         self.validated()
         return {**self._body(), "evaluator_fingerprint": self.evaluator_fingerprint.to_dict()}
 
+    def normative_dict(self) -> dict[str, Any]:
+        """Evaluator inputs compared by parity, without the derived digest."""
+
+        return self._body()
+
     @classmethod
     def from_dict(cls, data: Any) -> "EvaluatorSpecification":
         fields = {
@@ -1852,7 +2181,13 @@ class TerminalManifest:
         return self
 
     def validate_for_specification(self, specification: ExperimentSpecification) -> "TerminalManifest":
-        """Bind a typed terminal to the exact run and specification."""
+        """Bind a typed terminal to the exact run, specification, and evaluator.
+
+        The evaluator that issued ACCEPTED or REJECTED must be the exact
+        evaluator specification the experiment authorized.  Both sides are
+        ``evaluator_specification`` fingerprints, so no unrelated fingerprint
+        domain is compared.
+        """
 
         specification.validated()
         self.validated()
@@ -1860,6 +2195,8 @@ class TerminalManifest:
             raise ValueError("terminal run identity does not equal the specification run identity")
         if self.experiment_specification_fingerprint != specification.specification_fingerprint:
             raise ValueError("terminal is bound to a different experiment specification")
+        if self.evaluator_specification_fingerprint != specification.evaluator_specification.evaluator_fingerprint:
+            raise ValueError("terminal evaluator is not the exact evaluator authorized by the experiment")
         return self
 
     def to_dict(self) -> dict[str, Any]:

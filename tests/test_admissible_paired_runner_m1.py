@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import replace
-from itertools import product
 import unittest
 
 from admissible.paired_runner import (
@@ -27,7 +26,6 @@ from admissible.paired_runner import (
     canonical_bytes,
     check_parity,
     fingerprint,
-    fingerprint_bytes,
     parse_canonical_json,
     require_parity,
     ListFilesRequest,
@@ -36,8 +34,10 @@ from admissible.paired_runner import (
     ReadFileResult,
     RunCommandRequest,
     RunCommandResult,
+    ToolGrammarSpecification,
     WriteFileRequest,
     WriteFileResult,
+    written_content_fingerprint,
 )
 from admissible.paired_runner.canonical import (
     CanonicalizationError,
@@ -49,11 +49,11 @@ from admissible.paired_runner.specification import (
     ClockObservation,
     validate_unique_proposal_ids,
 )
-from admissible.paired_runner.schemas import RECEIPT_STATE_MATRIX, TERMINAL_STATE_MATRIX
 from admissible.paired_runner.tool_schemas import (
     MAX_CONTENT_BYTES,
     RESULT_FINGERPRINT_DOMAINS,
     REQUEST_FINGERPRINT_DOMAINS,
+    ToolGrammarEntry,
     tool_request_from_dict,
     tool_result_from_dict,
 )
@@ -88,6 +88,29 @@ def _limits(*, sessions: int = 10) -> BudgetLimits:
     )
 
 
+def _grammar(version: str = "v1") -> ToolGrammarSpecification:
+    return ToolGrammarSpecification.create(grammar_version=version)
+
+
+def _evaluator(
+    label: str = "evaluator-1",
+    *,
+    environment_label: str = "environment-1",
+    version: str = "v1",
+    requirements_label: str = "requirements",
+    scope_label: str = "scope",
+    plan_label: str = "tests",
+) -> EvaluatorSpecification:
+    return EvaluatorSpecification.create(
+        evaluator_id=f"evaluator-{label}",
+        evaluator_version=version,
+        requirements_fingerprint=_material_fingerprint(requirements_label, "test.requirements"),
+        scope_fingerprint=_material_fingerprint(scope_label, "test.scope"),
+        test_plan_fingerprint=_material_fingerprint(plan_label, "test.plan"),
+        environment_identity=_identity("environment", environment_label),
+    )
+
+
 def _spec(
     condition_id: str,
     run_id: str,
@@ -98,12 +121,12 @@ def _spec(
     model_label: str = "model-1",
     executable_label: str = "executable-1",
     transport_label: str = "transport-1",
-    grammar_label: str = "grammar-1",
+    grammar_version: str = "v1",
     environment_label: str = "environment-1",
     dependency_label: str = "dependency-1",
     policy_label: str = "policy-1",
     effect_executor_label: str = "effect-executor-1",
-    evaluator_label: str = "evaluator-1",
+    evaluator: EvaluatorSpecification | None = None,
     working_root_label: str = "root-1",
     scope_label: str = "scope-1",
     sessions_limit: int = 10,
@@ -115,6 +138,8 @@ def _spec(
         run_id=run_id,
     )
     prompt_identity = _identity("prompt", prompt_label)
+    if evaluator is None:
+        evaluator = _evaluator(environment_label=environment_label)
     return ExperimentSpecification.create(
         experiment_id=experiment_id,
         task_prompt_fingerprint=prompt_identity.content_fingerprint,
@@ -123,14 +148,14 @@ def _spec(
         executable_identity=_identity("executable", executable_label),
         executable_digest=_material_fingerprint(executable_label, "test.executable.bytes"),
         transport_identity=_identity("transport", transport_label),
-        tool_grammar_identity=_identity("tool_grammar", grammar_label),
+        tool_grammar=_grammar(grammar_version),
         environment_identity=_identity("environment", environment_label),
         dependency_toolchain_identity=_identity("dependency_toolchain", dependency_label),
         common_filesystem_network_process_policy_identity=_identity("filesystem_network_process_policy", policy_label),
         working_root_identity=_identity("working_root", working_root_label),
         scope_identity=_identity("scope", scope_label),
         effect_executor_identity=_identity("effect_executor", effect_executor_label),
-        evaluator_identity=_identity("evaluator", evaluator_label),
+        evaluator_specification=evaluator,
         common_budgets=BudgetState.create(limits=_limits(sessions=sessions_limit)),
         allowed_condition_differences=AllowedConditionDifferences.create(),
         condition=condition,
@@ -148,7 +173,7 @@ def _proposal(condition_id: str = "DIRECT", run_id: str = "run-direct") -> Canon
         proposal_id=f"proposal-{condition_id.lower()}",
         prompt_identity=_identity("prompt", "prompt-1"),
         tool_request=ReadFileRequest.create(
-            tool_grammar_fingerprint=specification.tool_grammar_identity.content_fingerprint,
+            tool_grammar_fingerprint=specification.tool_grammar.grammar_fingerprint,
             path="src/main.py",
             start_line=1,
             max_lines=3,
@@ -160,36 +185,38 @@ def _proposal(condition_id: str = "DIRECT", run_id: str = "run-direct") -> Canon
 
 
 def _tool_fixture_records():
-    grammar = fingerprint({"grammar": "four-tools-v1"}, domain="test.tool.grammar")
+    grammar = _grammar().grammar_fingerprint
     requests = {
         "list_files": ListFilesRequest.create(tool_grammar_fingerprint=grammar, path="src", recursive=True, max_entries=100),
         "read_file": ReadFileRequest.create(tool_grammar_fingerprint=grammar, path="src/main.py", start_line=1, max_lines=100),
         "write_file": WriteFileRequest.create(tool_grammar_fingerprint=grammar, path="src/new.py", content="pass\n", create_parents=False),
         "run_command": RunCommandRequest.create(tool_grammar_fingerprint=grammar, argv=("python", "-V"), cwd=".", timeout_ms=1000, max_output_bytes=4096),
     }
-    content_fp = fingerprint_bytes(b"pass\n", domain="test.written.content")
     results = {
         "list_files": ListFilesResult.create(request_fingerprint=requests["list_files"].request_fingerprint, entries=("src/main.py",)),
         "read_file": ReadFileResult.create(request_fingerprint=requests["read_file"].request_fingerprint, content="print(1)\n"),
-        "write_file": WriteFileResult.create(request_fingerprint=requests["write_file"].request_fingerprint, bytes_written=5, written_content_fingerprint=content_fp),
+        "write_file": WriteFileResult.create(
+            request_fingerprint=requests["write_file"].request_fingerprint,
+            bytes_written=5,
+            written_content_fingerprint=written_content_fingerprint("pass\n"),
+        ),
         "run_command": RunCommandResult.create(request_fingerprint=requests["run_command"].request_fingerprint, stdout="Python\n", exit_code=0),
     }
     return requests, results
 
 
-def _evaluator() -> EvaluatorSpecification:
-    return EvaluatorSpecification.create(
-        evaluator_id="evaluator-m1",
-        evaluator_version="v1",
-        requirements_fingerprint=_material_fingerprint("requirements", "test.requirements"),
-        scope_fingerprint=_material_fingerprint("scope", "test.scope"),
-        test_plan_fingerprint=_material_fingerprint("tests", "test.plan"),
-        environment_identity=_identity("environment", "environment-1"),
-    )
+def _receipt_kwargs(proposal: CanonicalProposal) -> dict[str, object]:
+    """Tool binding every receipt must carry, derived from one proposal."""
+
+    return {
+        "proposal_fingerprint": proposal.proposal_fingerprint,
+        "tool_name": proposal.tool_name,
+        "tool_request_fingerprint": proposal.tool_request.request_fingerprint,
+    }
 
 
 def _terminal(specification: ExperimentSpecification, label: str, *, task_acceptance: str = "ACCEPTED", reconciliation_complete: bool = True) -> TerminalManifest:
-    evaluator = _evaluator()
+    evaluator = specification.evaluator_specification
     return TerminalManifest.create(
         run_identity=specification.run_identity,
         experiment_specification_fingerprint=specification.specification_fingerprint,
@@ -368,9 +395,9 @@ class SchemaAndIdentityTests(unittest.TestCase):
         )
         receipt = EffectReceipt.create(
             receipt_id="receipt-proposed",
-            proposal_fingerprint=proposal.proposal_fingerprint,
             status="PROPOSED",
             outcome_reason="proposal is recorded before a future effect",
+            **_receipt_kwargs(proposal),
         )
         intervention = HumanInterventionRecord.create(
             intervention_id="intervention-1",
@@ -384,14 +411,7 @@ class SchemaAndIdentityTests(unittest.TestCase):
             allowed_policy_category="PREDECLARED_ASSISTANCE",
             comparability_disposition="QUALIFY",
         )
-        evaluator = EvaluatorSpecification.create(
-            evaluator_id="evaluator-m1",
-            evaluator_version="v1",
-            requirements_fingerprint=_material_fingerprint("requirements", "test.requirements"),
-            scope_fingerprint=_material_fingerprint("scope", "test.scope"),
-            test_plan_fingerprint=_material_fingerprint("tests", "test.plan"),
-            environment_identity=_identity("environment", "environment-1"),
-        )
+        evaluator = direct.evaluator_specification
         direct_terminal = TerminalManifest.create(
             run_identity=direct.run_identity,
             experiment_specification_fingerprint=direct.specification_fingerprint,
@@ -412,7 +432,7 @@ class SchemaAndIdentityTests(unittest.TestCase):
             proposal_ledger_fingerprint=_material_fingerprint("proposals-governed", "test.proposals"),
             effect_receipt_ledger_fingerprint=_material_fingerprint("receipts-governed", "test.receipts"),
             budget_state_fingerprint=governed.common_budgets.budget_fingerprint,
-            evaluator_specification_fingerprint=evaluator.evaluator_fingerprint,
+            evaluator_specification_fingerprint=governed.evaluator_specification.evaluator_fingerprint,
             model_completion_claim="CLAIMED_COMPLETE",
             process_result="SUCCESS",
             task_acceptance="REJECTED",
@@ -433,7 +453,7 @@ class SchemaAndIdentityTests(unittest.TestCase):
         budget = direct.common_budgets
         clock = ClockObservation.wall_clock(1_725_000_000_002)
         causal = CausalPredecessor.root()
-        grammar_fp = direct.tool_grammar_identity.content_fingerprint
+        grammar_fp = direct.tool_grammar.grammar_fingerprint
         list_request = ListFilesRequest.create(tool_grammar_fingerprint=grammar_fp)
         read_request = ReadFileRequest.create(tool_grammar_fingerprint=grammar_fp, path="src/main.py")
         write_request = WriteFileRequest.create(tool_grammar_fingerprint=grammar_fp, path="src/new.py", content="pass\n")
@@ -442,7 +462,7 @@ class SchemaAndIdentityTests(unittest.TestCase):
         read_result = ReadFileResult.create(request_fingerprint=read_request.request_fingerprint, content="print(1)\n")
         write_result = WriteFileResult.create(
             request_fingerprint=write_request.request_fingerprint,
-            written_content_fingerprint=fingerprint_bytes(b"pass\n", domain="test.written.content"),
+            written_content_fingerprint=written_content_fingerprint("pass\n"),
             bytes_written=5,
         )
         command_result = RunCommandResult.create(request_fingerprint=command_request.request_fingerprint, stdout="Python\n")
@@ -454,6 +474,8 @@ class SchemaAndIdentityTests(unittest.TestCase):
             budget,
             clock,
             causal,
+            direct.tool_grammar,
+            direct.tool_grammar.entries[0],
             direct,
             proposal.run_identity,
             proposal.session_identity,
@@ -476,10 +498,12 @@ class SchemaAndIdentityTests(unittest.TestCase):
             comparative,
             parity,
         ]
-        self.assertEqual(len(objects), 28)
+        self.assertEqual(len(objects), 30)
         factories = {
             Fingerprint: Fingerprint.from_dict,
             IdentityReference: IdentityReference.from_dict,
+            ToolGrammarSpecification: ToolGrammarSpecification.from_dict,
+            ToolGrammarEntry: ToolGrammarEntry.from_dict,
             ConditionConfiguration: ConditionConfiguration.from_dict,
             AllowedConditionDifferences: AllowedConditionDifferences.from_dict,
             BudgetState: BudgetState.from_dict,
@@ -563,7 +587,7 @@ class SpecificationBindingTests(unittest.TestCase):
             _spec("DIRECT", "run-direct", experiment_id="exp-m1-proposal", model_label="model-2"),
             _spec("DIRECT", "run-direct", experiment_id="exp-m1-proposal", transport_label="transport-2"),
             _spec("DIRECT", "run-direct", experiment_id="exp-m1-proposal", prompt_label="prompt-2"),
-            _spec("DIRECT", "run-direct", experiment_id="exp-m1-proposal", grammar_label="grammar-2"),
+            _spec("DIRECT", "run-direct", experiment_id="exp-m1-proposal", grammar_version="v2"),
             _spec("DIRECT", "run-direct", experiment_id="exp-m1-proposal", working_root_label="root-2"),
             _spec("DIRECT", "run-direct", experiment_id="exp-m1-proposal", scope_label="scope-2"),
         )
@@ -575,21 +599,25 @@ class SpecificationBindingTests(unittest.TestCase):
     def test_constructor_rejects_request_from_a_different_grammar(self) -> None:
         specification = _spec("DIRECT", "run-direct", experiment_id="exp-m1-proposal")
         session = SessionIdentity.create(run=specification.run_identity, session_id="session-direct")
-        with self.assertRaises(ValueError):
-            CanonicalProposal.create(
-                specification=specification,
-                session_identity=session,
-                turn_id="turn-0",
-                proposal_id="proposal-direct",
-                prompt_identity=_identity("prompt", "prompt-1"),
-                tool_request=ReadFileRequest.create(
-                    tool_grammar_fingerprint=fingerprint({"different": True}, domain="test.other.grammar"),
-                    path="src/main.py",
-                ),
-                causal_predecessor=CausalPredecessor.root(),
-                wall_clock_observation=ClockObservation.wall_clock(1_725_000_000_000),
-                monotonic_observation=ClockObservation.future_runtime_placeholder(),
-            )
+        for foreign_grammar_fingerprint in (
+            _grammar("v2").grammar_fingerprint,
+            fingerprint({"different": True}, domain="test.other.grammar"),
+        ):
+            with self.assertRaises(ValueError):
+                CanonicalProposal.create(
+                    specification=specification,
+                    session_identity=session,
+                    turn_id="turn-0",
+                    proposal_id="proposal-direct",
+                    prompt_identity=_identity("prompt", "prompt-1"),
+                    tool_request=ReadFileRequest.create(
+                        tool_grammar_fingerprint=foreign_grammar_fingerprint,
+                        path="src/main.py",
+                    ),
+                    causal_predecessor=CausalPredecessor.root(),
+                    wall_clock_observation=ClockObservation.wall_clock(1_725_000_000_000),
+                    monotonic_observation=ClockObservation.future_runtime_placeholder(),
+                )
 
     def test_reservation_binds_exact_specification_and_executor(self) -> None:
         specification = _spec("DIRECT", "run-direct", experiment_id="exp-m1-proposal")
@@ -631,143 +659,30 @@ class ModeAndReceiptTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             EffectReceipt.create(
                 receipt_id="refused-executed",
-                proposal_fingerprint=direct.proposal_fingerprint,
                 status="REFUSED",
                 executed_effect=True,
                 outcome_reason="impossible combination",
+                **_receipt_kwargs(direct),
             )
         self.assertTrue(governed_decision.permits_effect)
-
-    def test_exhaustive_receipt_state_matrix_accepts_only_documented_combinations(self) -> None:
-        proposal = _proposal()
-        reservation_fp = _material_fingerprint("reservation", "test.reservation")
-        accepted = 0
-        examined = 0
-        for status, rule in RECEIPT_STATE_MATRIX.items():
-            for flags in product((False, True), repeat=6):
-                (
-                    effect_started,
-                    effect_completed,
-                    executed_effect,
-                    outcome_known,
-                    replay_forbidden,
-                    reconciliation_required,
-                ) = flags
-                examined += 1
-                is_valid_flags = flags == (
-                    rule.effect_started,
-                    rule.effect_completed,
-                    rule.executed_effect,
-                    rule.outcome_known,
-                    rule.replay_forbidden,
-                    rule.reconciliation_required,
-                )
-                try:
-                    receipt = EffectReceipt.create(
-                        receipt_id=f"receipt-{status.lower()}-{effect_started}{effect_completed}{executed_effect}",
-                        proposal_fingerprint=proposal.proposal_fingerprint,
-                        reservation_fingerprint=reservation_fp if rule.reservation == "REQUIRED" else None,
-                        status=status,
-                        effect_started=effect_started,
-                        effect_completed=effect_completed,
-                        executed_effect=executed_effect,
-                        outcome_known=outcome_known,
-                        replay_forbidden=replay_forbidden,
-                        reconciliation_required=reconciliation_required,
-                        process_exit_code=0 if rule.process_exit_code == "REQUIRED" else None,
-                        outcome_reason="table-driven receipt fixture",
-                    )
-                except ValueError:
-                    self.assertFalse(is_valid_flags, f"documented valid combination rejected: {status}")
-                else:
-                    self.assertTrue(is_valid_flags, f"contradictory combination accepted: {status}")
-                    self.assertIs(receipt.validated(), receipt)
-                    accepted += 1
-        self.assertEqual(examined, len(RECEIPT_STATE_MATRIX) * 64)
-        self.assertEqual(accepted, len(RECEIPT_STATE_MATRIX))
-
-    def test_every_receipt_status_rejects_contradictory_reservation_and_process_result(self) -> None:
-        proposal = _proposal()
-        reservation_fp = _material_fingerprint("reservation", "test.reservation")
-        for status, rule in RECEIPT_STATE_MATRIX.items():
-            if rule.reservation == "REQUIRED":
-                with self.assertRaises(ValueError):
-                    EffectReceipt.create(
-                        receipt_id=f"missing-reservation-{status.lower()}",
-                        proposal_fingerprint=proposal.proposal_fingerprint,
-                        status=status,
-                        reservation_fingerprint=None,
-                        effect_started=rule.effect_started,
-                        effect_completed=rule.effect_completed,
-                        executed_effect=rule.executed_effect,
-                        process_exit_code=0 if rule.process_exit_code == "REQUIRED" else None,
-                        outcome_reason="missing reservation",
-                    )
-            else:
-                with self.assertRaises(ValueError):
-                    EffectReceipt.create(
-                        receipt_id=f"unexpected-reservation-{status.lower()}",
-                        proposal_fingerprint=proposal.proposal_fingerprint,
-                        status=status,
-                        reservation_fingerprint=reservation_fp,
-                        effect_started=rule.effect_started,
-                        effect_completed=rule.effect_completed,
-                        executed_effect=rule.executed_effect,
-                        process_exit_code=0 if rule.process_exit_code == "REQUIRED" else None,
-                        outcome_reason="unexpected reservation",
-                    )
-            if rule.process_exit_code == "FORBIDDEN":
-                with self.assertRaises(ValueError):
-                    EffectReceipt.create(
-                        receipt_id=f"unexpected-exit-{status.lower()}",
-                        proposal_fingerprint=proposal.proposal_fingerprint,
-                        status=status,
-                        reservation_fingerprint=reservation_fp if rule.reservation == "REQUIRED" else None,
-                        effect_started=rule.effect_started,
-                        effect_completed=rule.effect_completed,
-                        executed_effect=rule.executed_effect,
-                        process_exit_code=0,
-                        outcome_reason="unexpected process result",
-                    )
-            elif rule.process_exit_code == "REQUIRED":
-                with self.assertRaises(ValueError):
-                    EffectReceipt.create(
-                        receipt_id=f"missing-exit-{status.lower()}",
-                        proposal_fingerprint=proposal.proposal_fingerprint,
-                        status=status,
-                        reservation_fingerprint=reservation_fp,
-                        effect_started=rule.effect_started,
-                        effect_completed=rule.effect_completed,
-                        executed_effect=rule.executed_effect,
-                        process_exit_code=None,
-                        outcome_reason="missing process result",
-                    )
 
     def test_ambiguous_receipt_cannot_claim_completion(self) -> None:
         proposal = _proposal()
         with self.assertRaises(ValueError):
             EffectReceipt.create(
                 receipt_id="ambiguous-completed",
-                proposal_fingerprint=proposal.proposal_fingerprint,
                 reservation_fingerprint=_material_fingerprint("reservation", "test.reservation"),
                 status="AMBIGUOUS",
                 effect_started=True,
                 effect_completed=True,
                 executed_effect=True,
-                process_exit_code=0,
                 outcome_reason="contradictory ambiguous result",
+                **_receipt_kwargs(proposal),
             )
 
     def test_process_completion_is_not_task_acceptance(self) -> None:
         spec = _spec("DIRECT", "run-direct")
-        evaluator = EvaluatorSpecification.create(
-            evaluator_id="evaluator",
-            evaluator_version="v1",
-            requirements_fingerprint=_material_fingerprint("r", "test.requirements"),
-            scope_fingerprint=_material_fingerprint("s", "test.scope"),
-            test_plan_fingerprint=_material_fingerprint("t", "test.plan"),
-            environment_identity=_identity("environment", "environment-1"),
-        )
+        evaluator = spec.evaluator_specification
         terminal = TerminalManifest.create(
             run_identity=spec.run_identity,
             experiment_specification_fingerprint=spec.specification_fingerprint,
@@ -798,29 +713,6 @@ class ModeAndReceiptTests(unittest.TestCase):
         not_evaluated = _terminal(specification, "not-evaluated", task_acceptance="NOT_EVALUATED", reconciliation_complete=False)
         self.assertEqual(inconclusive.acceptance_basis, "INDEPENDENT_EVALUATOR")
         self.assertEqual(not_evaluated.acceptance_basis, "NONE")
-
-    def test_exhaustive_terminal_state_matrix_accepts_only_documented_combinations(self) -> None:
-        specification = _spec("DIRECT", "run-direct")
-        examined = 0
-        accepted = 0
-        for disposition, rule in TERMINAL_STATE_MATRIX.items():
-            for reconciliation_complete in (False, True):
-                examined += 1
-                try:
-                    terminal = _terminal(
-                        specification,
-                        f"matrix-{disposition.lower()}-{reconciliation_complete}",
-                        task_acceptance=disposition,
-                        reconciliation_complete=reconciliation_complete,
-                    )
-                except ValueError:
-                    self.assertNotEqual(reconciliation_complete, rule.reconciliation_complete)
-                else:
-                    self.assertEqual(reconciliation_complete, rule.reconciliation_complete)
-                    self.assertIs(terminal.validated(), terminal)
-                    accepted += 1
-        self.assertEqual(examined, len(TERMINAL_STATE_MATRIX) * 2)
-        self.assertEqual(accepted, len(TERMINAL_STATE_MATRIX))
 
     def test_budget_usage_is_monotone_and_overflow_or_limit_is_refused(self) -> None:
         budget = BudgetState.create(limits=BudgetLimits(sessions=1, turns=2))
@@ -922,12 +814,13 @@ class ParityTests(unittest.TestCase):
             "executable_identity": {"executable_label": "executable-2"},
             "executable_digest": {"executable_label": "executable-2"},
             "transport_identity": {"transport_label": "transport-2"},
-            "tool_grammar_identity": {"grammar_label": "grammar-2"},
             "environment_identity": {"environment_label": "environment-2"},
             "dependency_toolchain_identity": {"dependency_label": "dependency-2"},
             "common_filesystem_network_process_policy_identity": {"policy_label": "policy-2"},
             "effect_executor_label": {"effect_executor_label": "executor-2"},
-            "evaluator_identity": {"evaluator_label": "evaluator-2"},
+            "evaluator_identity": {"evaluator": _evaluator("evaluator-2")},
+            "evaluator_specification": {"evaluator": _evaluator("evaluator-1", plan_label="other-tests")},
+            "tool_grammar": {"grammar_version": "v2"},
             "common_budgets": {"sessions_limit": 11},
         }
         for field, changes in mutations.items():

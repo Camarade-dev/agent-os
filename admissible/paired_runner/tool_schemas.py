@@ -10,17 +10,24 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
-from .canonical import Fingerprint, fingerprint
+from .canonical import Fingerprint, fingerprint, fingerprint_bytes
 from .schemas import (
+    SCHEMA_CATALOG,
     SCHEMA_LIST_FILES_REQUEST,
     SCHEMA_LIST_FILES_RESULT,
     SCHEMA_READ_FILE_REQUEST,
     SCHEMA_READ_FILE_RESULT,
     SCHEMA_RUN_COMMAND_REQUEST,
     SCHEMA_RUN_COMMAND_RESULT,
+    SCHEMA_TOOL_GRAMMAR,
+    SCHEMA_TOOL_GRAMMAR_ENTRY,
     SCHEMA_VERSION,
     SCHEMA_WRITE_FILE_REQUEST,
     SCHEMA_WRITE_FILE_RESULT,
+    TOOL_EFFECT_CLASSIFICATIONS,
+    TOOL_NAMES,
+    TOOL_REQUEST_SCHEMA_IDS,
+    TOOL_RESULT_SCHEMA_IDS,
 )
 
 
@@ -50,6 +57,27 @@ RESULT_FINGERPRINT_DOMAINS = {
     "write_file": f"{SCHEMA_WRITE_FILE_RESULT}.fingerprint",
     "run_command": f"{SCHEMA_RUN_COMMAND_RESULT}.fingerprint",
 }
+WRITTEN_CONTENT_FINGERPRINT_DOMAIN = f"{SCHEMA_WRITE_FILE_REQUEST[: -len('.request')]}.written_content"
+GRAMMAR_DESCRIPTOR_FINGERPRINT_DOMAIN = f"{SCHEMA_TOOL_GRAMMAR_ENTRY}.descriptor"
+# One incomplete UTF-8 sequence (at most four bytes) may be dropped when a
+# bounded stream is cut, so a truncated retention lands inside this window.
+MAX_UTF8_SEQUENCE_BYTES = 4
+
+
+def retained_line_count(content: str) -> int:
+    """Count retained lines without inventing a trailing empty line."""
+
+    if not content:
+        return 0
+    return content.count("\n") + (0 if content.endswith("\n") else 1)
+
+
+def written_content_fingerprint(content: str) -> Fingerprint:
+    """The only permitted fingerprint of exact written bytes."""
+
+    if not isinstance(content, str):
+        raise ValueError("written content must be a string")
+    return fingerprint_bytes(content.encode("utf-8", "strict"), domain=WRITTEN_CONTENT_FINGERPRINT_DOMAIN)
 
 
 def _strict_int(value: Any, label: str, *, minimum: int, maximum: int) -> int:
@@ -101,6 +129,15 @@ def _fingerprint(value: Any, label: str) -> Fingerprint:
     if not isinstance(value, Fingerprint):
         raise ValueError(f"{label} must be a Fingerprint")
     return value.validated()
+
+
+def _grammar_fingerprint(value: Any, label: str = "tool_grammar_fingerprint") -> Fingerprint:
+    """A request may only cite a fingerprint from the grammar-specification domain."""
+
+    value = _fingerprint(value, label)
+    if value.domain != f"{SCHEMA_TOOL_GRAMMAR}.fingerprint":
+        raise ValueError(f"{label} must be an exact tool-grammar specification fingerprint")
+    return value
 
 
 def _optional_fingerprint(value: Any, label: str) -> Fingerprint | None:
@@ -203,6 +240,24 @@ class ToolResult:
     def validated(self) -> "ToolResult":
         raise NotImplementedError
 
+    def _bind_exact_request(self, request: Any) -> "ToolRequest":
+        """Prove that this result answers exactly *request* and nothing else."""
+
+        if not isinstance(request, ToolRequest):
+            raise ValueError("exact result validation requires a typed tool request")
+        request.validated()
+        self.validated()
+        if request.tool_name != self.tool_name:
+            raise ValueError("tool result and tool request belong to different tools")
+        if request.request_fingerprint != self.request_fingerprint:
+            raise ValueError("tool result is not bound to this exact request")
+        return request
+
+    def validate_for_request(self, request: "ToolRequest") -> "ToolResult":
+        """Pure exact-request validation implemented by every result type."""
+
+        raise NotImplementedError
+
 
 @dataclass(frozen=True)
 class ListFilesRequest(ToolRequest):
@@ -242,7 +297,7 @@ class ListFilesRequest(ToolRequest):
     def validated(self) -> "ListFilesRequest":
         if self.schema_id != SCHEMA_LIST_FILES_REQUEST or self.schema_version != SCHEMA_VERSION:
             raise ValueError("unsupported list_files request schema")
-        _fingerprint(self.tool_grammar_fingerprint, "tool_grammar_fingerprint")
+        _grammar_fingerprint(self.tool_grammar_fingerprint)
         _relative_posix_path(self.path)
         _strict_bool(self.recursive, "recursive")
         _strict_int(self.max_entries, "max_entries", minimum=1, maximum=MAX_ENTRIES)
@@ -298,7 +353,7 @@ class ReadFileRequest(ToolRequest):
     def validated(self) -> "ReadFileRequest":
         if self.schema_id != SCHEMA_READ_FILE_REQUEST or self.schema_version != SCHEMA_VERSION:
             raise ValueError("unsupported read_file request schema")
-        _fingerprint(self.tool_grammar_fingerprint, "tool_grammar_fingerprint")
+        _grammar_fingerprint(self.tool_grammar_fingerprint)
         _relative_posix_path(self.path)
         if self.start_line is not None:
             _strict_int(self.start_line, "start_line", minimum=1, maximum=MAX_START_LINE)
@@ -355,7 +410,7 @@ class WriteFileRequest(ToolRequest):
     def validated(self) -> "WriteFileRequest":
         if self.schema_id != SCHEMA_WRITE_FILE_REQUEST or self.schema_version != SCHEMA_VERSION:
             raise ValueError("unsupported write_file request schema")
-        _fingerprint(self.tool_grammar_fingerprint, "tool_grammar_fingerprint")
+        _grammar_fingerprint(self.tool_grammar_fingerprint)
         _relative_posix_path(self.path)
         _bounded_text(self.content, "content", maximum_bytes=MAX_CONTENT_BYTES)
         _strict_bool(self.create_parents, "create_parents")
@@ -391,6 +446,8 @@ class RunCommandRequest(ToolRequest):
 
     @classmethod
     def create(cls, *, tool_grammar_fingerprint: Fingerprint, argv: tuple[str, ...] | list[str], cwd: str = ".", timeout_ms: int = MAX_COMMAND_TIMEOUT_MS, max_output_bytes: int = MAX_OUTPUT_BYTES) -> "RunCommandRequest":
+        if isinstance(argv, str):
+            raise ValueError("argv is an explicit argument array; an implicit shell string is refused")
         argv_tuple = tuple(argv) if isinstance(argv, (tuple, list)) else argv
         body = {
             "schema_id": SCHEMA_RUN_COMMAND_REQUEST, "schema_version": SCHEMA_VERSION,
@@ -414,13 +471,15 @@ class RunCommandRequest(ToolRequest):
     def validated(self) -> "RunCommandRequest":
         if self.schema_id != SCHEMA_RUN_COMMAND_REQUEST or self.schema_version != SCHEMA_VERSION:
             raise ValueError("unsupported run_command request schema")
-        _fingerprint(self.tool_grammar_fingerprint, "tool_grammar_fingerprint")
+        _grammar_fingerprint(self.tool_grammar_fingerprint)
         if not isinstance(self.argv, tuple) or not 1 <= len(self.argv) <= MAX_ARGV_ITEMS:
             raise ValueError("argv must be a tuple with 1 to 128 items")
         total = 0
         for item in self.argv:
             _bounded_text(item, "argv item", maximum_bytes=MAX_ARG_BYTES)
             total += len(item.encode("utf-8"))
+        if not self.argv[0]:
+            raise ValueError("argv[0] must be a non-empty executable token")
         if total > MAX_ARGV_TOTAL_BYTES:
             raise ValueError("argv exceeds its total byte bound")
         _relative_posix_path(self.cwd, "cwd")
@@ -492,6 +551,25 @@ class ListFilesResult(ToolResult):
             raise ValueError("list_files result fingerprint mismatch")
         return self
 
+    def validate_for_request(self, request: Any) -> "ListFilesResult":
+        """Bind the exact ListFilesRequest, its entry bound, and its scope."""
+
+        request = self._bind_exact_request(request)
+        if len(self.entries) > request.max_entries:
+            raise ValueError("list_files result exceeds the entry limit of its originating request")
+        if self.truncated and len(self.entries) != request.max_entries:
+            raise ValueError("list_files truncation is only reached at the request entry limit")
+        for entry in self.entries:
+            if request.path == ".":
+                relative = entry
+            elif entry.startswith(request.path + "/"):
+                relative = entry[len(request.path) + 1 :]
+            else:
+                raise ValueError("list_files entry lies outside the exact requested path")
+            if not request.recursive and "/" in relative:
+                raise ValueError("a non-recursive list_files result cannot contain nested entries")
+        return self
+
     @classmethod
     def from_dict(cls, data: Any) -> "ListFilesResult":
         required = {"schema_id", "schema_version", "request_fingerprint", "outcome", "entries", "truncated", "result_fingerprint"}
@@ -555,6 +633,17 @@ class ReadFileResult(ToolResult):
             raise ValueError("read_file result fingerprint mismatch")
         return self
 
+    def validate_for_request(self, request: Any) -> "ReadFileResult":
+        """Bind the exact ReadFileRequest, its line bound, and truncation."""
+
+        request = self._bind_exact_request(request)
+        lines = retained_line_count(self.content)
+        if lines > request.max_lines:
+            raise ValueError("read_file result retains more lines than its originating request allows")
+        if self.truncated and lines != request.max_lines and self.bytes_read != MAX_CONTENT_BYTES:
+            raise ValueError("read_file truncation is only reached at the request line bound or the content cap")
+        return self
+
     @classmethod
     def from_dict(cls, data: Any) -> "ReadFileResult":
         required = {"schema_id", "schema_version", "request_fingerprint", "outcome", "content", "bytes_read", "truncated", "result_fingerprint"}
@@ -607,6 +696,8 @@ class WriteFileResult(ToolResult):
         self._validate_common(SCHEMA_WRITE_FILE_RESULT)
         _strict_int(self.bytes_written, "bytes_written", minimum=0, maximum=MAX_CONTENT_BYTES)
         _optional_fingerprint(self.written_content_fingerprint, "written_content_fingerprint")
+        if self.written_content_fingerprint is not None and self.written_content_fingerprint.domain != WRITTEN_CONTENT_FINGERPRINT_DOMAIN:
+            raise ValueError("written content fingerprint must use the fixed written-content domain")
         if self.outcome == "OK":
             if self.written_content_fingerprint is None:
                 raise ValueError("successful write_file result requires written content fingerprint")
@@ -614,6 +705,19 @@ class WriteFileResult(ToolResult):
             raise ValueError("refused or failed write_file result cannot claim written bytes")
         if RESULT_FINGERPRINT_DOMAINS[self.tool_name] != self.result_fingerprint.domain or fingerprint(_result_body(self), domain=self.result_fingerprint.domain) != self.result_fingerprint:
             raise ValueError("write_file result fingerprint mismatch")
+        return self
+
+    def validate_for_request(self, request: Any) -> "WriteFileResult":
+        """Bind the exact WriteFileRequest bytes and their exact fingerprint."""
+
+        request = self._bind_exact_request(request)
+        if self.outcome != "OK":
+            return self
+        expected_bytes = len(request.content.encode("utf-8", "strict"))
+        if self.bytes_written != expected_bytes:
+            raise ValueError("successful write_file result must report the exact requested byte length")
+        if self.written_content_fingerprint != written_content_fingerprint(request.content):
+            raise ValueError("successful write_file result must fingerprint the exact requested bytes")
         return self
 
     @classmethod
@@ -635,6 +739,7 @@ class RunCommandResult(ToolResult):
     schema_version: int
     request_fingerprint: Fingerprint
     outcome: str
+    process_started: bool
     stdout: str
     stderr: str
     stdout_truncated: bool
@@ -644,16 +749,17 @@ class RunCommandResult(ToolResult):
     result_fingerprint: Fingerprint
 
     @classmethod
-    def create(cls, *, request_fingerprint: Fingerprint, outcome: str = "OK", stdout: str = "", stderr: str = "", stdout_truncated: bool = False, stderr_truncated: bool = False, exit_code: int | None = 0, error_code: str | None = None) -> "RunCommandResult":
+    def create(cls, *, request_fingerprint: Fingerprint, outcome: str = "OK", process_started: bool = True, stdout: str = "", stderr: str = "", stdout_truncated: bool = False, stderr_truncated: bool = False, exit_code: int | None = 0, error_code: str | None = None) -> "RunCommandResult":
         body = {
             "schema_id": SCHEMA_RUN_COMMAND_RESULT, "schema_version": SCHEMA_VERSION,
             "request_fingerprint": request_fingerprint.to_dict(), "outcome": outcome,
+            "process_started": process_started,
             "stdout": stdout, "stderr": stderr, "stdout_truncated": stdout_truncated,
             "stderr_truncated": stderr_truncated, "exit_code": exit_code, "error_code": error_code,
         }
         return cls(
             schema_id=body["schema_id"], schema_version=body["schema_version"], request_fingerprint=request_fingerprint,
-            outcome=outcome, stdout=stdout, stderr=stderr, stdout_truncated=stdout_truncated,
+            outcome=outcome, process_started=process_started, stdout=stdout, stderr=stderr, stdout_truncated=stdout_truncated,
             stderr_truncated=stderr_truncated, exit_code=exit_code, error_code=error_code,
             result_fingerprint=fingerprint(body, domain=RESULT_FINGERPRINT_DOMAINS[cls.tool_name]),
         ).validated()
@@ -662,6 +768,7 @@ class RunCommandResult(ToolResult):
         return {
             "schema_id": self.schema_id, "schema_version": self.schema_version,
             "request_fingerprint": self.request_fingerprint.to_dict(), "outcome": self.outcome,
+            "process_started": self.process_started,
             "stdout": self.stdout, "stderr": self.stderr, "stdout_truncated": self.stdout_truncated,
             "stderr_truncated": self.stderr_truncated, "exit_code": self.exit_code, "error_code": self.error_code,
         }
@@ -670,25 +777,51 @@ class RunCommandResult(ToolResult):
         self._validate_common(SCHEMA_RUN_COMMAND_RESULT)
         _bounded_text(self.stdout, "stdout", maximum_bytes=MAX_OUTPUT_BYTES, allow_nul=True)
         _bounded_text(self.stderr, "stderr", maximum_bytes=MAX_OUTPUT_BYTES, allow_nul=True)
+        _strict_bool(self.process_started, "process_started")
         _strict_bool(self.stdout_truncated, "stdout_truncated")
         _strict_bool(self.stderr_truncated, "stderr_truncated")
         if self.exit_code is not None:
             _strict_int(self.exit_code, "exit_code", minimum=PROCESS_EXIT_MIN, maximum=PROCESS_EXIT_MAX)
+        # Tool execution success and command exit status are separate facts: an
+        # OK outcome means the tool ran the exact command, not that the command
+        # exited zero.  Process observations exist only for a started process.
+        if self.outcome == "OK" and not self.process_started:
+            raise ValueError("a successful run_command result must have started the command")
         if self.outcome == "OK" and self.exit_code is None:
             raise ValueError("successful run_command result requires an exit code")
-        if self.outcome == "REFUSED" and (self.stdout or self.stderr or self.stdout_truncated or self.stderr_truncated or self.exit_code is not None):
-            raise ValueError("refused run_command result cannot contain process output")
+        if self.outcome == "REFUSED" and self.process_started:
+            raise ValueError("a refused run_command result cannot have started a process")
+        if not self.process_started and (
+            self.stdout or self.stderr or self.stdout_truncated or self.stderr_truncated or self.exit_code is not None
+        ):
+            raise ValueError("a run_command result that never started the command cannot contain process observations")
         if RESULT_FINGERPRINT_DOMAINS[self.tool_name] != self.result_fingerprint.domain or fingerprint(_result_body(self), domain=self.result_fingerprint.domain) != self.result_fingerprint:
             raise ValueError("run_command result fingerprint mismatch")
         return self
 
+    def validate_for_request(self, request: Any) -> "RunCommandResult":
+        """Bind the exact RunCommandRequest and its output bound."""
+
+        request = self._bind_exact_request(request)
+        for label, text, truncated in (
+            ("stdout", self.stdout, self.stdout_truncated),
+            ("stderr", self.stderr, self.stderr_truncated),
+        ):
+            size = len(text.encode("utf-8", "strict"))
+            if size > request.max_output_bytes:
+                raise ValueError(f"run_command {label} exceeds the output bound of its originating request")
+            if truncated and size <= request.max_output_bytes - MAX_UTF8_SEQUENCE_BYTES:
+                raise ValueError(f"run_command {label} claims truncation below the request output bound")
+        return self
+
     @classmethod
     def from_dict(cls, data: Any) -> "RunCommandResult":
-        required = {"schema_id", "schema_version", "request_fingerprint", "outcome", "stdout", "stderr", "stdout_truncated", "stderr_truncated", "result_fingerprint"}
+        required = {"schema_id", "schema_version", "request_fingerprint", "outcome", "process_started", "stdout", "stderr", "stdout_truncated", "stderr_truncated", "result_fingerprint"}
         _schema_fields(data, SCHEMA_RUN_COMMAND_RESULT, required, {"exit_code", "error_code"}, "run_command result")
         return cls(
             schema_id=data["schema_id"], schema_version=data["schema_version"],
             request_fingerprint=_fingerprint_from_dict(data["request_fingerprint"], "request_fingerprint"), outcome=data["outcome"],
+            process_started=data["process_started"],
             stdout=data["stdout"], stderr=data["stderr"], stdout_truncated=data["stdout_truncated"], stderr_truncated=data["stderr_truncated"],
             exit_code=data.get("exit_code"), error_code=data.get("error_code"), result_fingerprint=_fingerprint_from_dict(data["result_fingerprint"], "result_fingerprint"),
         ).validated()
@@ -702,6 +835,290 @@ def _optional_fingerprint_from_dict(value: Any, label: str) -> Fingerprint | Non
     if value is None:
         return None
     return _fingerprint_from_dict(value, label)
+
+
+def _descriptor_fingerprint(schema_id: str) -> Fingerprint:
+    """Fingerprint the exact machine-readable descriptor of one tool schema."""
+
+    try:
+        descriptor = SCHEMA_CATALOG[schema_id]
+    except KeyError as error:
+        raise ValueError(f"unknown tool schema {schema_id!r}") from error
+    return fingerprint(descriptor.to_dict(), domain=GRAMMAR_DESCRIPTOR_FINGERPRINT_DOMAIN)
+
+
+@dataclass(frozen=True)
+class ToolGrammarEntry:
+    """One machine-verifiable tool selection inside a grammar specification."""
+
+    schema_id: str
+    schema_version: int
+    tool_name: str
+    request_schema_id: str
+    request_schema_version: int
+    result_schema_id: str
+    result_schema_version: int
+    effect_classification: str
+    request_descriptor_fingerprint: Fingerprint
+    result_descriptor_fingerprint: Fingerprint
+    entry_fingerprint: Fingerprint
+
+    @classmethod
+    def for_tool(cls, tool_name: str) -> "ToolGrammarEntry":
+        if tool_name not in TOOL_NAMES:
+            raise ValueError(f"unknown tool name {tool_name!r}")
+        request_schema_id = TOOL_REQUEST_SCHEMA_IDS[tool_name]
+        result_schema_id = TOOL_RESULT_SCHEMA_IDS[tool_name]
+        request_descriptor = _descriptor_fingerprint(request_schema_id)
+        result_descriptor = _descriptor_fingerprint(result_schema_id)
+        return cls(
+            schema_id=SCHEMA_TOOL_GRAMMAR_ENTRY,
+            schema_version=SCHEMA_VERSION,
+            tool_name=tool_name,
+            request_schema_id=request_schema_id,
+            request_schema_version=SCHEMA_CATALOG[request_schema_id].version,
+            result_schema_id=result_schema_id,
+            result_schema_version=SCHEMA_CATALOG[result_schema_id].version,
+            effect_classification=TOOL_EFFECT_CLASSIFICATIONS[tool_name],
+            request_descriptor_fingerprint=request_descriptor,
+            result_descriptor_fingerprint=result_descriptor,
+            entry_fingerprint=fingerprint(
+                cls._body_of(
+                    tool_name,
+                    request_schema_id,
+                    SCHEMA_CATALOG[request_schema_id].version,
+                    result_schema_id,
+                    SCHEMA_CATALOG[result_schema_id].version,
+                    TOOL_EFFECT_CLASSIFICATIONS[tool_name],
+                    request_descriptor,
+                    result_descriptor,
+                ),
+                domain=f"{SCHEMA_TOOL_GRAMMAR_ENTRY}.fingerprint",
+            ),
+        ).validated()
+
+    @staticmethod
+    def _body_of(
+        tool_name: str,
+        request_schema_id: str,
+        request_schema_version: int,
+        result_schema_id: str,
+        result_schema_version: int,
+        effect_classification: str,
+        request_descriptor_fingerprint: Fingerprint,
+        result_descriptor_fingerprint: Fingerprint,
+    ) -> dict[str, Any]:
+        return {
+            "schema_id": SCHEMA_TOOL_GRAMMAR_ENTRY,
+            "schema_version": SCHEMA_VERSION,
+            "tool_name": tool_name,
+            "request_schema_id": request_schema_id,
+            "request_schema_version": request_schema_version,
+            "result_schema_id": result_schema_id,
+            "result_schema_version": result_schema_version,
+            "effect_classification": effect_classification,
+            "request_descriptor_fingerprint": request_descriptor_fingerprint.to_dict(),
+            "result_descriptor_fingerprint": result_descriptor_fingerprint.to_dict(),
+        }
+
+    def _body(self) -> dict[str, Any]:
+        return self._body_of(
+            self.tool_name,
+            self.request_schema_id,
+            self.request_schema_version,
+            self.result_schema_id,
+            self.result_schema_version,
+            self.effect_classification,
+            self.request_descriptor_fingerprint,
+            self.result_descriptor_fingerprint,
+        )
+
+    def validated(self) -> "ToolGrammarEntry":
+        if self.schema_id != SCHEMA_TOOL_GRAMMAR_ENTRY or self.schema_version != SCHEMA_VERSION:
+            raise ValueError("unsupported tool grammar entry schema")
+        if self.tool_name not in TOOL_NAMES:
+            raise ValueError("tool grammar entry names an unknown tool")
+        if self.request_schema_id != TOOL_REQUEST_SCHEMA_IDS[self.tool_name]:
+            raise ValueError("tool grammar entry binds the wrong request schema")
+        if self.result_schema_id != TOOL_RESULT_SCHEMA_IDS[self.tool_name]:
+            raise ValueError("tool grammar entry binds the wrong result schema")
+        if self.request_schema_version != SCHEMA_CATALOG[self.request_schema_id].version:
+            raise ValueError("tool grammar entry binds an unavailable request schema version")
+        if self.result_schema_version != SCHEMA_CATALOG[self.result_schema_id].version:
+            raise ValueError("tool grammar entry binds an unavailable result schema version")
+        if self.effect_classification != TOOL_EFFECT_CLASSIFICATIONS[self.tool_name]:
+            raise ValueError("tool grammar entry declares the wrong effect classification")
+        _fingerprint(self.request_descriptor_fingerprint, "request_descriptor_fingerprint")
+        _fingerprint(self.result_descriptor_fingerprint, "result_descriptor_fingerprint")
+        if self.request_descriptor_fingerprint != _descriptor_fingerprint(self.request_schema_id):
+            raise ValueError("tool grammar entry request descriptor fingerprint does not match the exact schema")
+        if self.result_descriptor_fingerprint != _descriptor_fingerprint(self.result_schema_id):
+            raise ValueError("tool grammar entry result descriptor fingerprint does not match the exact schema")
+        _fingerprint(self.entry_fingerprint, "entry_fingerprint")
+        if fingerprint(self._body(), domain=f"{SCHEMA_TOOL_GRAMMAR_ENTRY}.fingerprint") != self.entry_fingerprint:
+            raise ValueError("tool grammar entry fingerprint mismatch")
+        return self
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validated()
+        return {**self._body(), "entry_fingerprint": self.entry_fingerprint.to_dict()}
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "ToolGrammarEntry":
+        required = {
+            "schema_id", "schema_version", "tool_name", "request_schema_id", "request_schema_version",
+            "result_schema_id", "result_schema_version", "effect_classification",
+            "request_descriptor_fingerprint", "result_descriptor_fingerprint", "entry_fingerprint",
+        }
+        _schema_fields(data, SCHEMA_TOOL_GRAMMAR_ENTRY, required, set(), "tool grammar entry")
+        return cls(
+            schema_id=data["schema_id"], schema_version=data["schema_version"], tool_name=data["tool_name"],
+            request_schema_id=data["request_schema_id"], request_schema_version=data["request_schema_version"],
+            result_schema_id=data["result_schema_id"], result_schema_version=data["result_schema_version"],
+            effect_classification=data["effect_classification"],
+            request_descriptor_fingerprint=_fingerprint_from_dict(data["request_descriptor_fingerprint"], "request_descriptor_fingerprint"),
+            result_descriptor_fingerprint=_fingerprint_from_dict(data["result_descriptor_fingerprint"], "result_descriptor_fingerprint"),
+            entry_fingerprint=_fingerprint_from_dict(data["entry_fingerprint"], "entry_fingerprint"),
+        ).validated()
+
+
+@dataclass(frozen=True)
+class ToolGrammarSpecification:
+    """The exact grammar an experiment selects, not a label for one.
+
+    The grammar names the four tools and binds, per tool, the exact request and
+    result schema identity, schema version, effect classification, and the
+    fingerprint of the machine-readable descriptor that carries that schema's
+    fields and bounds.  Its canonical fingerprint is therefore a function of the
+    selected schemas rather than an opaque identifier a request can invent.
+    """
+
+    schema_id: str
+    schema_version: int
+    grammar_id: str
+    grammar_version: str
+    tool_names: tuple[str, ...]
+    entries: tuple[ToolGrammarEntry, ...]
+    grammar_fingerprint: Fingerprint
+
+    @classmethod
+    def create(cls, *, grammar_id: str = "paired-runner-four-tool-grammar", grammar_version: str = "v1") -> "ToolGrammarSpecification":
+        tool_names = tuple(sorted(TOOL_NAMES))
+        entries = tuple(ToolGrammarEntry.for_tool(name) for name in tool_names)
+        body = cls._body_of(grammar_id, grammar_version, tool_names, entries)
+        return cls(
+            schema_id=SCHEMA_TOOL_GRAMMAR,
+            schema_version=SCHEMA_VERSION,
+            grammar_id=grammar_id,
+            grammar_version=grammar_version,
+            tool_names=tool_names,
+            entries=entries,
+            grammar_fingerprint=fingerprint(body, domain=f"{SCHEMA_TOOL_GRAMMAR}.fingerprint"),
+        ).validated()
+
+    @staticmethod
+    def _body_of(
+        grammar_id: str,
+        grammar_version: str,
+        tool_names: tuple[str, ...],
+        entries: tuple[ToolGrammarEntry, ...],
+    ) -> dict[str, Any]:
+        return {
+            "schema_id": SCHEMA_TOOL_GRAMMAR,
+            "schema_version": SCHEMA_VERSION,
+            "grammar_id": grammar_id,
+            "grammar_version": grammar_version,
+            "tool_names": list(tool_names),
+            "entries": [entry.to_dict() for entry in entries],
+        }
+
+    def _body(self) -> dict[str, Any]:
+        return self._body_of(self.grammar_id, self.grammar_version, self.tool_names, self.entries)
+
+    def validated(self) -> "ToolGrammarSpecification":
+        if self.schema_id != SCHEMA_TOOL_GRAMMAR or self.schema_version != SCHEMA_VERSION:
+            raise ValueError("unsupported tool grammar specification schema")
+        _bounded_text(self.grammar_id, "grammar_id", maximum_bytes=128)
+        _bounded_text(self.grammar_version, "grammar_version", maximum_bytes=128)
+        if not self.grammar_id or not self.grammar_version:
+            raise ValueError("grammar identity and version must be non-empty")
+        if not isinstance(self.tool_names, tuple) or self.tool_names != tuple(sorted(TOOL_NAMES)):
+            raise ValueError("the grammar must select exactly the four frozen tool names in canonical order")
+        if not isinstance(self.entries, tuple) or len(self.entries) != len(self.tool_names):
+            raise ValueError("the grammar must contain exactly one entry per selected tool")
+        for name, entry in zip(self.tool_names, self.entries):
+            if not isinstance(entry, ToolGrammarEntry):
+                raise ValueError("grammar entries must be typed tool grammar entries")
+            entry.validated()
+            if entry.tool_name != name:
+                raise ValueError("grammar entries are not in canonical tool-name order")
+        _fingerprint(self.grammar_fingerprint, "grammar_fingerprint")
+        if self.grammar_fingerprint.domain != f"{SCHEMA_TOOL_GRAMMAR}.fingerprint":
+            raise ValueError("grammar fingerprint has the wrong domain")
+        if fingerprint(self._body(), domain=f"{SCHEMA_TOOL_GRAMMAR}.fingerprint") != self.grammar_fingerprint:
+            raise ValueError("tool grammar specification fingerprint mismatch")
+        return self
+
+    def entry_for(self, tool_name: str) -> ToolGrammarEntry:
+        for entry in self.entries:
+            if entry.tool_name == tool_name:
+                return entry
+        raise ValueError(f"tool {tool_name!r} is absent from this exact grammar")
+
+    def validate_request(self, request: Any) -> "ToolRequest":
+        """Prove that *request* is exactly one of this grammar's selections."""
+
+        if not isinstance(request, ToolRequest):
+            raise ValueError("grammar validation requires a typed tool request")
+        request.validated()
+        self.validated()
+        entry = self.entry_for(request.tool_name)
+        if request.schema_id != entry.request_schema_id:
+            raise ValueError("the request schema is absent from this exact grammar")
+        if request.schema_version != entry.request_schema_version:
+            raise ValueError("the request schema version is not permitted by this exact grammar")
+        if request.effect_classification != entry.effect_classification:
+            raise ValueError("the request effect classification differs from its grammar entry")
+        if request.tool_grammar_fingerprint != self.grammar_fingerprint:
+            raise ValueError("the request cites a different tool grammar specification")
+        return request
+
+    def validate_result(self, result: Any) -> "ToolResult":
+        """Prove that *result* uses exactly this grammar's result schema."""
+
+        if not isinstance(result, ToolResult):
+            raise ValueError("grammar validation requires a typed tool result")
+        result.validated()
+        self.validated()
+        entry = self.entry_for(result.tool_name)
+        if result.schema_id != entry.result_schema_id:
+            raise ValueError("the result schema is absent from this exact grammar")
+        if result.schema_version != entry.result_schema_version:
+            raise ValueError("the result schema version is not permitted by this exact grammar")
+        return result
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validated()
+        return {**self._body(), "grammar_fingerprint": self.grammar_fingerprint.to_dict()}
+
+    def normative_dict(self) -> dict[str, Any]:
+        return self._body()
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "ToolGrammarSpecification":
+        required = {
+            "schema_id", "schema_version", "grammar_id", "grammar_version", "tool_names", "entries",
+            "grammar_fingerprint",
+        }
+        _schema_fields(data, SCHEMA_TOOL_GRAMMAR, required, set(), "tool grammar specification")
+        if not isinstance(data["tool_names"], list) or not isinstance(data["entries"], list):
+            raise ValueError("grammar tool names and entries must be arrays")
+        return cls(
+            schema_id=data["schema_id"], schema_version=data["schema_version"], grammar_id=data["grammar_id"],
+            grammar_version=data["grammar_version"], tool_names=tuple(data["tool_names"]),
+            entries=tuple(ToolGrammarEntry.from_dict(item) for item in data["entries"]),
+            grammar_fingerprint=_fingerprint_from_dict(data["grammar_fingerprint"], "grammar_fingerprint"),
+        ).validated()
 
 
 REQUEST_TYPES = {
@@ -751,8 +1168,11 @@ def tool_result_from_dict(data: Any) -> ToolResult:
 
 __all__ = [
     "ListFilesRequest", "ListFilesResult", "ReadFileRequest", "ReadFileResult",
-    "RunCommandRequest", "RunCommandResult", "ToolRequest", "ToolResult",
+    "RunCommandRequest", "RunCommandResult", "ToolGrammarEntry", "ToolGrammarSpecification",
+    "ToolRequest", "ToolResult",
     "WriteFileRequest", "WriteFileResult", "tool_request_from_dict", "tool_result_from_dict",
     "MAX_ARGV_ITEMS", "MAX_ARGV_TOTAL_BYTES", "MAX_CONTENT_BYTES", "MAX_ENTRIES",
     "MAX_LINES", "MAX_OUTPUT_BYTES", "MAX_PATH_BYTES", "MAX_START_LINE",
+    "MAX_UTF8_SEQUENCE_BYTES", "WRITTEN_CONTENT_FINGERPRINT_DOMAIN",
+    "retained_line_count", "written_content_fingerprint",
 ]

@@ -8,7 +8,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 MATRIX = ROOT / "implementation" / "PAIRED_RUNNER_REQUIREMENT_MATRIX.json"
-STARTING_COMMIT = "d480c5eeff848fac1075d861d352228d6e65712f"
+STARTING_COMMIT = "41942a3ed3a85d4f47b38a29b9d86368523555cd"
 SCOPE = {
     "ARCH-02",
     "ARCH-04",
@@ -39,6 +39,29 @@ ALLOWED_STATUSES = {
     "DEFERRED_EXPLICITLY",
     "NOT_APPLICABLE_WITH_RATIONALE",
 }
+# Declared here, not read from the matrix: the second bounded repair restores
+# EXEC-02 and EXEC-05 to DESIGNED and keeps every requirement whose subject does
+# not exist yet no stronger than DESIGNED.
+EXPECTED_STATUS = {
+    "ARCH-02": "DESIGNED",
+    "ARCH-04": "DESIGNED",
+    "ARCH-05": "VERIFIED_UNIT",
+    "EXEC-01": "VERIFIED_UNIT",
+    "EXEC-02": "DESIGNED",
+    "EXEC-03": "DESIGNED",
+    "EXEC-04": "DESIGNED",
+    "EXEC-05": "DESIGNED",
+    "BASE-01": "DESIGNED",
+    "BASE-02": "VERIFIED_UNIT",
+    "FAIR-01": "VERIFIED_UNIT",
+    "FAIR-02": "VERIFIED_UNIT",
+    "FAIR-03": "VERIFIED_UNIT",
+    "FAIR-04": "VERIFIED_UNIT",
+    "FAIR-05": "VERIFIED_UNIT",
+    "FAIR-06": "VERIFIED_UNIT",
+    "FAIR-07": "VERIFIED_UNIT",
+}
+FORBIDDEN_STATUSES = {"VERIFIED_INTEGRATION", "VERIFIED_INSTALLED_PATH"}
 
 
 class RequirementCompletenessTests(unittest.TestCase):
@@ -63,7 +86,13 @@ class RequirementCompletenessTests(unittest.TestCase):
         self.assertEqual(set(current_ids) - SCOPE, set(baseline_ids) - SCOPE)
         for record in current_records:
             self.assertIn(record["current_status"], ALLOWED_STATUSES, record["requirement_id"])
+            self.assertNotIn(record["current_status"], FORBIDDEN_STATUSES, record["requirement_id"])
             if record["requirement_id"] in SCOPE:
+                self.assertEqual(
+                    record["current_status"],
+                    EXPECTED_STATUS[record["requirement_id"]],
+                    record["requirement_id"],
+                )
                 self.assertNotEqual(record["current_status"], "UNASSESSED")
                 self.assertTrue(record["implementation_evidence"], record["requirement_id"])
                 self.assertTrue(record["validation_evidence"], record["requirement_id"])

@@ -1,9 +1,9 @@
 # Paired Runner ADR Register
 
 This register records the twelve architecture decisions fixed by the governing
-implementation plan plus ADR-013, which records the bounded M1 repair boundary.
-Every decision below is FROZEN_BY_GOVERNING_PLAN or explicitly bounded by its
-status. A later change requires a new ADR, an impact analysis for A/B fairness, and a
+implementation plan plus ADR-013 and ADR-014, which record the two bounded M1
+repair boundaries. Every decision below is FROZEN_BY_GOVERNING_PLAN or
+explicitly bounded by its status. A later change requires a new ADR, an impact analysis for A/B fairness, and a
 requirement-matrix revision. No ADR is reopened or weakened by Milestone 0.
 
 ## ADR-001 — Un seul transport modèle
@@ -273,19 +273,61 @@ requirement-matrix revision. No ADR is reopened or weakened by Milestone 0.
   BASE-01, BASE-02, and FAIR-01 through FAIR-07. No out-of-scope requirement
   record is changed.
 
+## ADR-014 — Deuxièmes réparations bornées de la spécification M1
+
+- Status: `M1_SECOND_BOUNDED_REPAIR_BOUNDARY`
+- Governing basis: the independent M1 closure findings M1-R06 through
+  M1-R11, reproduced against commit
+  `41942a3ed3a85d4f47b38a29b9d86368523555cd` before any repair.
+- Decision: keep all affected schema versions at `1` because M1 still has no
+  runtime or external persistence contract, and record explicitly that no
+  pre-repair M1 object is accepted as authoritative. Introduce a typed
+  `ToolGrammarSpecification` and `ToolGrammarEntry` so the experiment's tool
+  grammar is machine-verifiable rather than an opaque label; bind the exact
+  typed `EvaluatorSpecification` into `ExperimentSpecification` and require
+  every terminal to be issued by it; add typed fail-closed reconciliation for
+  reservations (`validate_for_decision`) and receipts
+  (`validate_for_causal_chain`); make the receipt contract effect-aware so
+  process-exit data exists only for `run_command`; and require every tool
+  result to validate against its exact request.
+- Validation boundary: pure standard-library construction, exact-key
+  deserialization, canonical fingerprints, independently declared normative
+  state tables, and typed causal reconciliation only. No effect, process,
+  policy, broker, authority, transport, evaluator execution, installation, or
+  provider path is introduced.
+- Consequences: the schema catalog grows from 27 to 29 descriptors; the
+  version-1 catalog is regenerated canonically; every pre-repair
+  specification, receipt, run-command result, and self-declared grammar
+  fingerprint is refused. Structural validation and authoritative typed
+  reconciliation are now documented as different guarantees, and a restored
+  reservation or receipt is not authoritative until the typed reconciliation
+  succeeds.
+- Forbidden alternatives: comparing unrelated fingerprint domains to claim an
+  evaluator binding; treating a label `IdentityReference` as proof of grammar
+  contents; requiring or accepting a process exit code for a non-process
+  tool; accepting a tool result that does not answer its exact request;
+  accepting an argv whose executable token is empty; deriving an exhaustive
+  state-matrix test's expected answers from the matrix under test.
+- Requirements affected: ARCH-02, ARCH-04, ARCH-05, EXEC-01 through EXEC-05,
+  BASE-01, BASE-02, and FAIR-01 through FAIR-07. EXEC-02 and EXEC-05 are
+  restored to `DESIGNED` because their whole requirements depend on durable
+  pre-effect publication and on an effect executor that does not yet exist.
+  No out-of-scope requirement record is changed.
+
 ## Register closure
 
 The decisions above are the governing architecture boundary for the next
 milestone. Any implementation that conflicts with one of them is not a
-permitted continuation of this freeze. ADR-013 closes only the bounded M1
-repair boundary and does not authorize Milestone 2.
+permitted continuation of this freeze. ADR-013 and ADR-014 close only the two
+bounded M1 repair boundaries and do not authorize Milestone 2.
 
 ## Milestone 1 evidence and clarifications
 
 Milestone 1 adds the pure package `admissible.paired_runner` and the artifacts
 `M1_EXECUTABLE_ARCHITECTURE_SPEC.md`, `M1_SCHEMA_CATALOG.json`,
-`M1_ALLOWED_CONDITION_DIFFERENCES.json`, `M1_VALIDATION_REPORT.json`, and
-`M1_BOUNDED_REPAIR_REPORT.json`.
+`M1_ALLOWED_CONDITION_DIFFERENCES.json`, `M1_VALIDATION_REPORT.json`,
+`M1_BOUNDED_REPAIR_REPORT.json`, and
+`M1_SECOND_BOUNDED_REPAIR_REPORT.json`.
 The package is a fresh standard-library implementation; it imports none of
 the historical runner, long-run, high-autonomy, Cursor, broker, witness, or
 effect paths listed by the foundation freeze.
@@ -309,6 +351,19 @@ effect paths listed by the foundation freeze.
   reconciliation path after deserialization.
 - ADR-011/012 remain absolute exclusions. No V14–V18 object, production root,
   historical module, or Cursor `--force --trust` path is a fixture or import.
+- ADR-002 is strengthened by ADR-014: the grammar is a typed manifest binding
+  the four tool names, exact request/result schema IDs and versions, effect
+  classifications, and descriptor fingerprints, and a proposal must prove
+  membership in that exact grammar.
+- ADR-010 is strengthened by ADR-014: the experiment binds one exact
+  `EvaluatorSpecification` whose environment equals the experiment
+  environment, and a terminal issued by any other evaluator is refused in both
+  runs of a comparative closure.
+- ADR-003/004 are strengthened by ADR-014: structural validation is explicitly
+  non-authoritative, and reservations and receipts require typed causal
+  reconciliation before they may be treated as authoritative for execution.
 
 The M1 evidence closes only the statuses recorded for the 17 in-scope matrix
-records. No ADR is reopened, weakened, or used to authorize Milestone 2.
+records. EXEC-02 and EXEC-05 are restored to `DESIGNED` by ADR-014 rather than
+being carried at a status their whole requirements do not support. No ADR is
+reopened, weakened, or used to authorize Milestone 2.

@@ -36,6 +36,8 @@ SCHEMA_WRITE_FILE_REQUEST = f"{PACKAGE_PREFIX}.tool.write_file.request"
 SCHEMA_WRITE_FILE_RESULT = f"{PACKAGE_PREFIX}.tool.write_file.result"
 SCHEMA_RUN_COMMAND_REQUEST = f"{PACKAGE_PREFIX}.tool.run_command.request"
 SCHEMA_RUN_COMMAND_RESULT = f"{PACKAGE_PREFIX}.tool.run_command.result"
+SCHEMA_TOOL_GRAMMAR_ENTRY = f"{PACKAGE_PREFIX}.tool_grammar_entry"
+SCHEMA_TOOL_GRAMMAR = f"{PACKAGE_PREFIX}.tool_grammar_specification"
 
 DIRECT = "DIRECT"
 GOVERNED = "GOVERNED"
@@ -66,6 +68,9 @@ TOOL_EFFECT_CLASSIFICATIONS = {
     "write_file": "FILE_MUTATION",
     "run_command": "PROCESS_EXECUTION",
 }
+EFFECT_CLASSIFICATIONS = ("READ_ONLY", "FILE_MUTATION", "PROCESS_EXECUTION")
+PROCESS_EFFECT_CLASSIFICATION = "PROCESS_EXECUTION"
+MUTATING_EFFECT_CLASSIFICATIONS = frozenset({"FILE_MUTATION", "PROCESS_EXECUTION"})
 RECEIPT_STATUSES = (
     "PROPOSED",
     "RESERVED",
@@ -77,33 +82,84 @@ RECEIPT_STATUSES = (
     "TIMED_OUT",
     "AMBIGUOUS",
 )
+RESULT_BINDING_TOKENS = ("NONE", "OK", "REFUSED", "FAILED", "EXECUTION_FAILURE")
+EXECUTION_FAILURE_CLASSES = (
+    "EXECUTOR_START_FAILURE",
+    "EXECUTOR_CRASHED",
+    "RESULT_NOT_PRODUCED",
+)
+EFFECT_APPLICATIONS = ("NOT_APPLIED", "APPLIED", "PARTIAL_OR_UNKNOWN")
 
 
 @dataclass(frozen=True)
 class ReceiptStateRule:
-    """Exhaustive lifecycle contract for one effect receipt status."""
+    """Exhaustive lifecycle contract for one effect receipt status.
+
+    ``process_exit_code`` states the policy for a ``PROCESS_EXECUTION`` tool
+    only.  Every other effect classification forbids process-exit data in every
+    status; see :func:`receipt_process_exit_policy`.  ``reconciliation_required``
+    is the status floor: :func:`receipt_reconciliation_required` raises it when a
+    mutating effect is left in a partial or unknown application state.
+    """
 
     reservation: str
     effect_started: bool
     effect_completed: bool
     executed_effect: bool
+    result_binding: tuple[str, ...]
     process_exit_code: str
     outcome_known: bool
     replay_forbidden: bool
     reconciliation_required: bool
+    effect_application: str
 
 
 RECEIPT_STATE_MATRIX = {
-    "PROPOSED": ReceiptStateRule("FORBIDDEN", False, False, False, "FORBIDDEN", False, True, False),
-    "RESERVED": ReceiptStateRule("REQUIRED", False, False, False, "FORBIDDEN", False, True, False),
-    "STARTED": ReceiptStateRule("REQUIRED", True, False, False, "FORBIDDEN", False, True, False),
-    "COMPLETED": ReceiptStateRule("REQUIRED", True, True, True, "REQUIRED", True, True, False),
-    "REFUSED": ReceiptStateRule("FORBIDDEN", False, False, False, "FORBIDDEN", True, True, False),
-    "FAILED": ReceiptStateRule("REQUIRED", True, True, False, "REQUIRED", True, True, False),
-    "CANCELLED": ReceiptStateRule("REQUIRED", True, True, False, "REQUIRED", True, True, False),
-    "TIMED_OUT": ReceiptStateRule("REQUIRED", True, False, False, "REQUIRED", False, True, True),
-    "AMBIGUOUS": ReceiptStateRule("REQUIRED", True, False, False, "ALLOWED", False, True, True),
+    "PROPOSED": ReceiptStateRule("FORBIDDEN", False, False, False, ("NONE",), "FORBIDDEN", False, True, False, "NOT_APPLIED"),
+    "RESERVED": ReceiptStateRule("REQUIRED", False, False, False, ("NONE",), "FORBIDDEN", False, True, False, "NOT_APPLIED"),
+    "STARTED": ReceiptStateRule("REQUIRED", True, False, False, ("NONE",), "FORBIDDEN", False, True, False, "PARTIAL_OR_UNKNOWN"),
+    "COMPLETED": ReceiptStateRule("REQUIRED", True, True, True, ("OK",), "REQUIRED", True, True, False, "APPLIED"),
+    "REFUSED": ReceiptStateRule("ALLOWED", False, False, False, ("NONE", "REFUSED"), "FORBIDDEN", True, True, False, "NOT_APPLIED"),
+    "FAILED": ReceiptStateRule("REQUIRED", True, True, False, ("FAILED", "EXECUTION_FAILURE"), "ALLOWED", True, True, False, "PARTIAL_OR_UNKNOWN"),
+    "CANCELLED": ReceiptStateRule("REQUIRED", True, True, False, ("NONE", "EXECUTION_FAILURE"), "ALLOWED", True, True, False, "PARTIAL_OR_UNKNOWN"),
+    "TIMED_OUT": ReceiptStateRule("REQUIRED", True, False, False, ("NONE", "EXECUTION_FAILURE"), "ALLOWED", False, True, True, "PARTIAL_OR_UNKNOWN"),
+    "AMBIGUOUS": ReceiptStateRule("REQUIRED", True, False, False, ("NONE",), "FORBIDDEN", False, True, True, "PARTIAL_OR_UNKNOWN"),
 }
+
+
+def receipt_state_rule(status: str) -> ReceiptStateRule:
+    try:
+        return RECEIPT_STATE_MATRIX[status]
+    except KeyError as error:
+        raise ValueError(f"unknown effect receipt status {status!r}") from error
+
+
+def receipt_process_exit_policy(status: str, effect_classification: str) -> str:
+    """Process-exit data exists only for a process-executing tool.
+
+    ``list_files``, ``read_file``, and ``write_file`` never carry a process exit
+    code, so no lifecycle state may require or accept one for them.
+    """
+
+    if effect_classification not in EFFECT_CLASSIFICATIONS:
+        raise ValueError(f"unknown effect classification {effect_classification!r}")
+    if effect_classification != PROCESS_EFFECT_CLASSIFICATION:
+        return "FORBIDDEN"
+    return receipt_state_rule(status).process_exit_code
+
+
+def receipt_reconciliation_required(status: str, effect_classification: str) -> bool:
+    """A partially applied or unknown mutation always requires reconciliation."""
+
+    if effect_classification not in EFFECT_CLASSIFICATIONS:
+        raise ValueError(f"unknown effect classification {effect_classification!r}")
+    rule = receipt_state_rule(status)
+    if rule.reconciliation_required:
+        return True
+    return (
+        rule.effect_application == "PARTIAL_OR_UNKNOWN"
+        and effect_classification in MUTATING_EFFECT_CLASSIFICATIONS
+    )
 
 
 @dataclass(frozen=True)
@@ -168,6 +224,7 @@ class ToolSchemaDescriptor(SchemaDescriptor):
     bounds: tuple[str, ...]
     effect_classification: str
     result_representation: str
+    exact_request_binding: str
 
     def to_dict(self) -> dict[str, object]:
         value = super().to_dict()
@@ -182,6 +239,7 @@ class ToolSchemaDescriptor(SchemaDescriptor):
                 "bounds": list(self.bounds),
                 "effect_classification": self.effect_classification,
                 "result_representation": self.result_representation,
+                "exact_request_binding": self.exact_request_binding,
             }
         )
         return value
@@ -215,6 +273,7 @@ def _tool_descriptor(
     bounds: tuple[str, ...],
     effect_classification: str,
     result_representation: str,
+    exact_request_binding: str,
     owning_module: str = "admissible.paired_runner.tool_schemas",
 ) -> ToolSchemaDescriptor:
     return ToolSchemaDescriptor(
@@ -231,6 +290,7 @@ def _tool_descriptor(
         bounds=bounds,
         effect_classification=effect_classification,
         result_representation=result_representation,
+        exact_request_binding=exact_request_binding,
     )
 
 
@@ -294,7 +354,7 @@ SCHEMA_CATALOG = {
         _descriptor(
             SCHEMA_EXPERIMENT,
             "ExperimentSpecification",
-            ("schema_id", "schema_version", "experiment_id", "task_prompt_fingerprint", "initial_state_fingerprint", "model_identity", "executable_identity", "executable_digest", "transport_identity", "tool_grammar_identity", "environment_identity", "dependency_toolchain_identity", "common_filesystem_network_process_policy_identity", "working_root_identity", "scope_identity", "effect_executor_identity", "evaluator_identity", "common_budgets", "allowed_condition_differences", "condition", "run_identity", "specification_fingerprint"),
+            ("schema_id", "schema_version", "experiment_id", "task_prompt_fingerprint", "initial_state_fingerprint", "model_identity", "executable_identity", "executable_digest", "transport_identity", "tool_grammar_identity", "tool_grammar", "environment_identity", "dependency_toolchain_identity", "common_filesystem_network_process_policy_identity", "working_root_identity", "scope_identity", "effect_executor_identity", "evaluator_identity", "evaluator_specification", "common_budgets", "allowed_condition_differences", "condition", "run_identity", "specification_fingerprint"),
             "admissible.paired_runner.specification",
         ),
         _descriptor(
@@ -318,7 +378,7 @@ SCHEMA_CATALOG = {
         _descriptor(
             SCHEMA_RECEIPT,
             "EffectReceipt",
-            ("schema_id", "schema_version", "receipt_id", "proposal_fingerprint", "reservation_fingerprint", "status", "effect_started", "effect_completed", "executed_effect", "process_exit_code", "outcome_known", "replay_forbidden", "reconciliation_required", "task_acceptance", "outcome_reason", "receipt_fingerprint"),
+            ("schema_id", "schema_version", "receipt_id", "proposal_fingerprint", "reservation_fingerprint", "tool_name", "effect_classification", "tool_request_fingerprint", "tool_result", "execution_failure", "status", "effect_started", "effect_completed", "executed_effect", "effect_application", "process_exit_code", "outcome_known", "replay_forbidden", "reconciliation_required", "task_acceptance", "outcome_reason", "receipt_fingerprint"),
             "admissible.paired_runner.specification",
         ),
         _descriptor(
@@ -346,6 +406,18 @@ SCHEMA_CATALOG = {
             "admissible.paired_runner.specification",
         ),
         _descriptor(
+            SCHEMA_TOOL_GRAMMAR_ENTRY,
+            "ToolGrammarEntry",
+            ("schema_id", "schema_version", "tool_name", "request_schema_id", "request_schema_version", "result_schema_id", "result_schema_version", "effect_classification", "request_descriptor_fingerprint", "result_descriptor_fingerprint", "entry_fingerprint"),
+            "admissible.paired_runner.tool_schemas",
+        ),
+        _descriptor(
+            SCHEMA_TOOL_GRAMMAR,
+            "ToolGrammarSpecification",
+            ("schema_id", "schema_version", "grammar_id", "grammar_version", "tool_names", "entries", "grammar_fingerprint"),
+            "admissible.paired_runner.tool_schemas",
+        ),
+        _descriptor(
             SCHEMA_PARITY_REPORT,
             "ParityReport",
             ("schema_id", "schema_version", "passed", "refusal_code", "experiment_id", "condition_ids", "mismatches", "normalization_paths", "report_fingerprint"),
@@ -366,9 +438,10 @@ SCHEMA_CATALOG = {
                 ("request_fingerprint", "Fingerprint", True),
             ),
             path_representation="UTF-8 relative POSIX path; '.' is the only root form; no '..', backslash, NUL, or absolute path",
-            bounds=("path <= 4096 UTF-8 bytes", "max_entries in [1, 10000]"),
+            bounds=("path <= 4096 UTF-8 bytes", "max_entries in [1, 10000]", "tool_grammar_fingerprint domain is exactly admissible.paired_runner.tool_grammar_specification.fingerprint"),
             effect_classification="READ_ONLY",
             result_representation="ListFilesResult: sorted unique relative paths plus truncation/outcome",
+            exact_request_binding="ListFilesResult.validate_for_request refuses any result whose request fingerprint, entry count, entry scope, or truncation state does not match this exact request",
         ),
         _tool_descriptor(
             SCHEMA_LIST_FILES_RESULT,
@@ -385,9 +458,10 @@ SCHEMA_CATALOG = {
                 ("error_code", "string|null", False), ("result_fingerprint", "Fingerprint", True),
             ),
             path_representation="Result entries use the same relative POSIX path representation as the request",
-            bounds=("entries <= 10000", "entry <= 4096 UTF-8 bytes"),
+            bounds=("entries <= 10000", "entry <= 4096 UTF-8 bytes", "entries <= the originating request max_entries", "truncated only when entries == request max_entries"),
             effect_classification="READ_ONLY",
             result_representation="Canonical sorted entry list; refusal/failure has no entries",
+            exact_request_binding="Every entry must lie inside the exact requested path, a non-recursive request admits direct children only, and truncation is true only at the request entry bound",
         ),
         _tool_descriptor(
             SCHEMA_READ_FILE_REQUEST,
@@ -404,9 +478,10 @@ SCHEMA_CATALOG = {
                 ("request_fingerprint", "Fingerprint", True),
             ),
             path_representation="UTF-8 relative POSIX path; '.' is the only root form; no '..', backslash, NUL, or absolute path",
-            bounds=("path <= 4096 UTF-8 bytes", "start_line null or in [1, 1000000]", "max_lines in [1, 10000]"),
+            bounds=("path <= 4096 UTF-8 bytes", "start_line null or in [1, 1000000]", "max_lines in [1, 10000]", "tool_grammar_fingerprint domain is exactly admissible.paired_runner.tool_grammar_specification.fingerprint"),
             effect_classification="READ_ONLY",
             result_representation="ReadFileResult: bounded UTF-8 content, byte count, truncation, and outcome",
+            exact_request_binding="ReadFileResult.validate_for_request refuses any result whose request fingerprint, retained line count, byte count, or truncation state does not match this exact request",
         ),
         _tool_descriptor(
             SCHEMA_READ_FILE_RESULT,
@@ -424,9 +499,10 @@ SCHEMA_CATALOG = {
                 ("result_fingerprint", "Fingerprint", True),
             ),
             path_representation="The request path is retained by request_fingerprint; content has no path metadata",
-            bounds=("content <= 1048576 UTF-8 bytes", "bytes_read <= 1048576"),
+            bounds=("content <= 1048576 UTF-8 bytes", "bytes_read <= 1048576", "retained lines <= the originating request max_lines"),
             effect_classification="READ_ONLY",
             result_representation="Bounded UTF-8 content with exact encoded byte count",
+            exact_request_binding="Retained content must respect the exact request line bound; truncation is true only at that line bound or at the 1048576-byte content cap; refused or failed outcomes retain no content",
         ),
         _tool_descriptor(
             SCHEMA_WRITE_FILE_REQUEST,
@@ -443,9 +519,10 @@ SCHEMA_CATALOG = {
                 ("request_fingerprint", "Fingerprint", True),
             ),
             path_representation="UTF-8 relative POSIX path; '.' is the only root form; no '..', backslash, NUL, or absolute path",
-            bounds=("path <= 4096 UTF-8 bytes", "content <= 1048576 UTF-8 bytes"),
+            bounds=("path <= 4096 UTF-8 bytes", "content <= 1048576 UTF-8 bytes", "tool_grammar_fingerprint domain is exactly admissible.paired_runner.tool_grammar_specification.fingerprint"),
             effect_classification="FILE_MUTATION",
             result_representation="WriteFileResult: applied byte count and written-content fingerprint",
+            exact_request_binding="A successful WriteFileResult must report exactly the UTF-8 byte length of this request's content and the fixed-domain fingerprint of those exact bytes",
         ),
         _tool_descriptor(
             SCHEMA_WRITE_FILE_RESULT,
@@ -463,9 +540,10 @@ SCHEMA_CATALOG = {
                 ("error_code", "string|null", False), ("result_fingerprint", "Fingerprint", True),
             ),
             path_representation="The request path is retained by request_fingerprint; no path is echoed in the result",
-            bounds=("bytes_written <= 1048576", "written content fingerprint is present only for OK"),
+            bounds=("bytes_written <= 1048576", "written content fingerprint is present only for OK", "written content fingerprint domain is exactly admissible.paired_runner.tool.write_file.written_content"),
             effect_classification="FILE_MUTATION",
             result_representation="Applied byte count and exact content fingerprint; refusal/failure writes zero bytes",
+            exact_request_binding="WriteFileResult.validate_for_request requires bytes_written to equal the UTF-8 byte length of the exact requested content and the written-content fingerprint to equal the fixed-domain fingerprint of those bytes; refused or failed outcomes claim no mutation",
         ),
         _tool_descriptor(
             SCHEMA_RUN_COMMAND_REQUEST,
@@ -481,31 +559,34 @@ SCHEMA_CATALOG = {
                 ("cwd", "relative-posix-path", True), ("timeout_ms", "integer[1..60000]", True),
                 ("max_output_bytes", "integer[1..1048576]", True), ("request_fingerprint", "Fingerprint", True),
             ),
-            path_representation="cwd is a UTF-8 relative POSIX path; argv is passed without shell interpolation",
-            bounds=("argv length in [1, 128]", "argv total <= 65536 UTF-8 bytes", "each argv item <= 4096 UTF-8 bytes", "cwd <= 4096 UTF-8 bytes", "timeout_ms in [1, 60000]", "max_output_bytes in [1, 1048576]"),
+            path_representation="cwd is a UTF-8 relative POSIX path; argv is an explicit argument array passed without shell interpolation, and a bare command string is refused",
+            bounds=("argv length in [1, 128]", "argv[0] is a non-empty executable token", "argv total <= 65536 UTF-8 bytes", "each argv item <= 4096 UTF-8 bytes and NUL-free", "cwd <= 4096 UTF-8 bytes", "timeout_ms in [1, 60000]", "max_output_bytes in [1, 1048576]", "tool_grammar_fingerprint domain is exactly admissible.paired_runner.tool_grammar_specification.fingerprint"),
             effect_classification="PROCESS_EXECUTION",
             result_representation="RunCommandResult: bounded stdout/stderr, exit code, timeout/truncation, and outcome",
+            exact_request_binding="RunCommandResult.validate_for_request refuses any result whose request fingerprint, retained output bound, truncation state, or process-start semantics do not match this exact request",
         ),
         _tool_descriptor(
             SCHEMA_RUN_COMMAND_RESULT,
             "RunCommandResult",
             (
-                "schema_id", "schema_version", "request_fingerprint", "outcome", "stdout", "stderr",
-                "stdout_truncated", "stderr_truncated", "result_fingerprint",
+                "schema_id", "schema_version", "request_fingerprint", "outcome", "process_started",
+                "stdout", "stderr", "stdout_truncated", "stderr_truncated", "result_fingerprint",
             ),
             ("exit_code", "error_code"),
             (
                 ("schema_id", "string", True), ("schema_version", "integer", True),
                 ("request_fingerprint", "Fingerprint", True), ("outcome", "enum[OK,REFUSED,FAILED]", True),
+                ("process_started", "boolean", True),
                 ("stdout", "UTF-8 string", True), ("stderr", "UTF-8 string", True),
                 ("stdout_truncated", "boolean", True), ("stderr_truncated", "boolean", True),
                 ("exit_code", "integer[-128..255]|null", False), ("error_code", "string|null", False),
                 ("result_fingerprint", "Fingerprint", True),
             ),
             path_representation="The request cwd/argv are retained by request_fingerprint; result contains no host path",
-            bounds=("stdout <= 1048576 UTF-8 bytes", "stderr <= 1048576 UTF-8 bytes", "exit_code in [-128, 255]"),
+            bounds=("stdout <= 1048576 UTF-8 bytes", "stderr <= 1048576 UTF-8 bytes", "stdout and stderr <= the originating request max_output_bytes", "exit_code in [-128, 255]"),
             effect_classification="PROCESS_EXECUTION",
-            result_representation="Bounded process result; exit code is nullable only when no process result exists",
+            result_representation="Bounded process result; process_started separates tool execution success from the command exit code, and exit-code semantics exist only for a started command",
+            exact_request_binding="Retained stdout and stderr must respect the exact request output bound, truncation is true only at that bound, a result that never started the process carries no process observation, and outcome OK means the tool executed rather than that the command exited zero",
         ),
     )
 }
