@@ -249,3 +249,30 @@ requirement-matrix revision. No ADR is reopened or weakened by Milestone 0.
 The decisions above are the governing architecture boundary for the next
 milestone. Any implementation that conflicts with one of them is not a
 permitted continuation of this freeze.
+
+## Milestone 1 evidence and clarifications
+
+Milestone 1 adds the pure package `admissible.paired_runner` and the artifacts
+`M1_EXECUTABLE_ARCHITECTURE_SPEC.md`, `M1_SCHEMA_CATALOG.json`,
+`M1_ALLOWED_CONDITION_DIFFERENCES.json`, and `M1_VALIDATION_REPORT.json`.
+The package is a fresh standard-library implementation; it imports none of
+the historical runner, long-run, high-autonomy, Cursor, broker, witness, or
+effect paths listed by the foundation freeze.
+
+- ADR-001/004 are represented by common transport, proposal, and future
+  effect-executor identities plus a single `ModeDecision` boundary. This is a
+  pure equality invariant, not physical runtime integration.
+- ADR-003/005/009 are represented by strict proposal, receipt, terminal,
+  run, session, clock, causal, and budget records. Durable publication,
+  restart, and observation remain later milestones.
+- ADR-006 is clarified: run identity fields are instance bindings, not causal
+  A/B inputs. They are explicitly named as `instance_binding_exceptions` in
+  the allowlist so parity has no implicit ignored fields.
+- ADR-010 is clarified: effect receipts cannot contain task acceptance;
+  `TerminalManifest` records independent evaluator basis and keeps process
+  completion separate from task acceptance.
+- ADR-011/012 remain absolute exclusions. No V14–V18 object, production root,
+  historical module, or Cursor `--force --trust` path is a fixture or import.
+
+The M1 evidence closes only the statuses recorded for the 17 in-scope matrix
+records. No ADR is reopened, weakened, or used to authorize Milestone 2.
