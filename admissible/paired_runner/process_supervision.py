@@ -39,6 +39,16 @@ from .observation import (
     ResourceObservation,
     StreamObservation,
 )
+from .capsule_seccomp import open_program_descriptor
+from .resource_limits import (
+    MECHANISM_NONE,
+    CgroupDelegation,
+    EffectCgroup,
+    ResourceBounds,
+    containment_semantics,
+    effective_mechanism,
+    probe_cgroup_delegation,
+)
 from .sandbox import (
     CAPSULE_TEARDOWN_TIMEOUT_SECONDS,
     MAX_STATUS_BYTES,
@@ -189,7 +199,63 @@ def _rusage_children() -> Any:
     return _resource.getrusage(_resource.RUSAGE_CHILDREN)
 
 
-def _resource_observation(before: Any, after: Any, controller_peak: int) -> ResourceObservation:
+_DELEGATION_LOCK = threading.Lock()
+_DELEGATION_CACHE: CgroupDelegation | None = None
+
+
+def cgroup_delegation(*, force: bool = False) -> CgroupDelegation:
+    """Probe cgroup v2 delegation once per process and reuse the answer."""
+
+    global _DELEGATION_CACHE
+    with _DELEGATION_LOCK:
+        if _DELEGATION_CACHE is None or force:
+            _DELEGATION_CACHE = probe_cgroup_delegation()
+        return _DELEGATION_CACHE
+
+
+def _containment_evidence(status: dict[str, Any] | None, mechanism: str, cgroup: EffectCgroup | None) -> dict[str, Any]:
+    """What the kernel actually held, as reported from inside the capsule.
+
+    The values come from ``getrlimit`` calls made by the bounded child after it
+    applied the bounds, so this is an observation of enforcement rather than a
+    restatement of the request.  When the status document is absent the bounds
+    are recorded as unobserved, never as the values that were asked for.
+    """
+
+    applied = None if status is None else status.get("resource_limits")
+    if not isinstance(applied, dict) or not status or not status.get("resource_limits_applied"):
+        return {
+            "containment_mechanism": mechanism if mechanism != MECHANISM_NONE else "NONE",
+            "containment_availability": "NOT_MEASURED",
+            "containment_bounds": (),
+            "containment_semantics": (
+                "The in-capsule init did not report enforced bounds, so no containment is claimed "
+                "for this effect."
+            ),
+        }
+    described = [f"{name}={value[0]}" for name, value in sorted(applied.items()) if isinstance(value, list) and value]
+    if cgroup is not None and cgroup.active:
+        described += [f"cgroup.{name}={value}" for name, value in sorted(cgroup.applied.items())]
+    return {
+        "containment_mechanism": mechanism,
+        "containment_availability": "OBSERVED",
+        "containment_bounds": tuple(described),
+        "containment_semantics": containment_semantics(mechanism),
+    }
+
+
+def _resource_observation(
+    before: Any,
+    after: Any,
+    controller_peak: int,
+    containment: dict[str, Any] | None = None,
+) -> ResourceObservation:
+    containment = containment or {
+        "containment_mechanism": "NONE",
+        "containment_availability": "NOT_MEASURED",
+        "containment_bounds": (),
+        "containment_semantics": "no resource containment was recorded for this effect",
+    }
     if before is None or after is None:  # pragma: no cover - non-POSIX host
         return ResourceObservation.create(
             child_cpu_user_ms=None,
@@ -201,6 +267,7 @@ def _resource_observation(before: Any, after: Any, controller_peak: int) -> Reso
             controller_peak_retained_output_bytes=controller_peak,
             controller_peak_retained_availability="OBSERVED",
             measurement_semantics=RESOURCE_MEASUREMENT_SEMANTICS,
+            **containment,
         )
     user_ms = max(0, int(round((after.ru_utime - before.ru_utime) * 1000)))
     system_ms = max(0, int(round((after.ru_stime - before.ru_stime) * 1000)))
@@ -215,6 +282,7 @@ def _resource_observation(before: Any, after: Any, controller_peak: int) -> Reso
         controller_peak_retained_output_bytes=controller_peak,
         controller_peak_retained_availability="OBSERVED",
         measurement_semantics=RESOURCE_MEASUREMENT_SEMANTICS,
+        **containment,
     )
 
 
@@ -260,12 +328,22 @@ def supervise_command(
 
     status_read, status_write = os.pipe()
     control_read, control_write = os.pipe()
+    # The syscall boundary travels as an anonymous in-memory descriptor, so the
+    # filter the launcher loads has no host pathname anything could replace
+    # between assembling it and loading it.
+    seccomp_fd = open_program_descriptor()
+    bounds = ResourceBounds.for_timeout(timeout_ms)
+    delegation = cgroup_delegation()
+    cgroup = EffectCgroup(delegation, bounds, f"{os.getpid()}-{start_monotonic}")
+    cgroup.create()
     launcher_argv = capsule_argv(
         capsule,
         relative_cwd=relative_cwd,
         status_fd=status_write,
         control_fd=control_read,
+        seccomp_fd=seccomp_fd,
         timeout_ms=timeout_ms,
+        bounds=bounds,
         command=tuple(argv),
     )
 
@@ -276,15 +354,16 @@ def supervise_command(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             close_fds=True,
-            pass_fds=(status_write, control_read),
+            pass_fds=(status_write, control_read, seccomp_fd),
             shell=False,
         )
     except (OSError, ValueError) as error:
-        for descriptor in (status_read, status_write, control_read, control_write):
+        for descriptor in (status_read, status_write, control_read, control_write, seccomp_fd):
             try:
                 os.close(descriptor)
             except OSError:  # pragma: no cover
                 pass
+        cgroup.close()
         end_wall, end_monotonic = _now()
         empty_stdout = _BoundedStream("stdout", max_output_bytes)
         empty_stderr = _BoundedStream("stderr", max_output_bytes)
@@ -316,7 +395,7 @@ def supervise_command(
             ),
             stdout_observation=stdout_observation,
             stderr_observation=stderr_observation,
-            resource_observation=_resource_observation(rusage_before, _rusage_children(), 0),
+            resource_observation=_resource_observation(rusage_before, _rusage_children(), 0, None),
             stdout_text=stdout_text,
             stderr_text=stderr_text,
             stdout_decode_status=stdout_status,
@@ -328,12 +407,17 @@ def supervise_command(
         launcher_group = os.getpgid(launcher_pid)
     except OSError:  # pragma: no cover - the launcher exited immediately
         launcher_group = launcher_pid
+    # When the host delegates a cgroup, the launcher joins it and every
+    # descendant inherits it, so the aggregate bound covers the whole domain.
+    cgroup.attach(launcher_pid)
+    mechanism = effective_mechanism(delegation, cgroup.active)
 
     # The controller keeps only the read end of the status pipe and only the
     # write end of the control pipe.  The capsule therefore cannot forge a
     # status document and cannot hold the control pipe open on our behalf.
     os.close(status_write)
     os.close(control_read)
+    os.close(seccomp_fd)
 
     stdout_stream = _BoundedStream("stdout", max_output_bytes)
     stderr_stream = _BoundedStream("stderr", max_output_bytes)
@@ -444,6 +528,10 @@ def supervise_command(
     end_wall, end_monotonic = _now()
     stdout_observation, stdout_text, stdout_status = stdout_stream.observation()
     stderr_observation, stderr_text, stderr_status = stderr_stream.observation()
+    containment = _containment_evidence(status, mechanism, cgroup)
+    # The namespace is gone, so the per-effect cgroup has no members left and is
+    # removed here rather than accumulating one empty subtree per effect.
+    cgroup.close()
 
     if status is None:
         # Without the init's status document there is no process-domain
@@ -475,7 +563,9 @@ def supervise_command(
             ),
             stdout_observation=stdout_observation,
             stderr_observation=stderr_observation,
-            resource_observation=_resource_observation(rusage_before, _rusage_children(), controller_peak),
+            resource_observation=_resource_observation(
+                rusage_before, _rusage_children(), controller_peak, containment
+            ),
             stdout_text=stdout_text,
             stderr_text=stderr_text,
             stdout_decode_status=stdout_status,
@@ -517,7 +607,9 @@ def supervise_command(
             ),
             stdout_observation=stdout_observation,
             stderr_observation=stderr_observation,
-            resource_observation=_resource_observation(rusage_before, _rusage_children(), controller_peak),
+            resource_observation=_resource_observation(
+                rusage_before, _rusage_children(), controller_peak, containment
+            ),
             stdout_text=stdout_text,
             stderr_text=stderr_text,
             stdout_decode_status=stdout_status,
@@ -551,7 +643,9 @@ def supervise_command(
         ),
         stdout_observation=stdout_observation,
         stderr_observation=stderr_observation,
-        resource_observation=_resource_observation(rusage_before, _rusage_children(), controller_peak),
+        resource_observation=_resource_observation(
+                rusage_before, _rusage_children(), controller_peak, containment
+            ),
         stdout_text=stdout_text,
         stderr_text=stderr_text,
         stdout_decode_status=stdout_status,

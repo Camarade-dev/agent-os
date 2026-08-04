@@ -13,6 +13,15 @@ The controller learns the outcome through one dedicated status descriptor
 a hostile effect that closes, floods, or forges its own output streams cannot
 forge, suppress, or race the process-domain observation.
 
+This init also installs the per-command resource bounds.  They are applied in
+the forked child immediately before ``execv``, which is the only point at which
+they can bound the command without also bounding this supervisor: an address
+space or process limit imposed on init itself would stop init from reaping.  The
+bounds arrive as one canonical JSON argument because this package is not mounted
+inside the capsule and cannot be imported here, and the exact values that were
+applied -- read back from the kernel, not from the request -- are reported in the
+status document so the durable observation records what was enforced.
+
 Nothing here interprets policy, contacts a provider, or touches evidence.  The
 durable evidence root is never mounted into the capsule, so this process cannot
 name it.
@@ -23,6 +32,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import resource
 import signal
 import sys
 import time
@@ -39,6 +49,8 @@ ESCALATION_KILL = "SIGKILL_PID_NAMESPACE"
 GRACE_PERIOD_MS = 2_000
 #: Bound on the post-escalation reap wait so init can never hang forever.
 FINAL_REAP_TIMEOUT_MS = 10_000
+#: Bound on what the pre-exec child may report back through the exec pipe.
+MAX_CHILD_REPORT_BYTES = 4096
 
 
 def _monotonic_ms() -> int:
@@ -73,13 +85,58 @@ def _cancelled(control_fd: int) -> bool:
     return chunk == b""
 
 
+#: The bounds this init applies, mapped to their kernel resources.  Every one is
+#: enforced by the kernel against the command, not by the command's cooperation.
+_LIMIT_RESOURCES: tuple[tuple[str, int], ...] = (
+    ("max_processes", resource.RLIMIT_NPROC),
+    ("max_address_space_bytes", resource.RLIMIT_AS),
+    ("max_cpu_seconds", resource.RLIMIT_CPU),
+    ("max_open_files", resource.RLIMIT_NOFILE),
+    ("max_file_size_bytes", resource.RLIMIT_FSIZE),
+    ("core_dump_bytes", resource.RLIMIT_CORE),
+)
+
+
+def _report(descriptor: int, record: dict[str, object]) -> None:
+    """Write one newline-terminated JSON line to the pre-exec report pipe."""
+
+    payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+    try:
+        written = 0
+        while written < len(payload):
+            written += os.write(descriptor, payload[written:])
+    except OSError:  # pragma: no cover - the parent observes the absence
+        pass
+
+
+def _apply_resource_bounds(bounds: dict[str, int]) -> dict[str, object]:
+    """Apply every bound in the forked child and read back what the kernel holds.
+
+    A bound that cannot be set is fatal to the child: running the command with
+    one limit silently missing would make the durable observation a false
+    statement about what contained it.
+    """
+
+    applied: dict[str, object] = {}
+    for name, which in _LIMIT_RESOURCES:
+        value = int(bounds[name])
+        # RLIMIT_CPU's soft limit raises SIGXCPU and its hard limit SIGKILLs, so
+        # the hard limit is deliberately one second later; every other bound is
+        # set hard and soft alike so nothing can raise it back.
+        hard = value + 1 if which == resource.RLIMIT_CPU else value
+        resource.setrlimit(which, (value, hard))
+        applied[name] = list(resource.getrlimit(which))
+    return applied
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) < 5:
+    if len(argv) < 6:
         return 2
     status_fd = int(argv[1])
     control_fd = int(argv[2])
     timeout_ms = int(argv[3])
-    command = argv[4:]
+    bounds = json.loads(argv[4])
+    command = argv[5:]
 
     global STATUS_FD
     STATUS_FD = status_fd
@@ -94,6 +151,11 @@ def main(argv: list[str]) -> int:
     # child writes its errno first.  Without this the two cases are
     # indistinguishable, and a missing executable would be reported as a
     # command that ran and chose to fail.
+    #
+    # The same pipe carries the resource bounds the kernel actually holds.  The
+    # child reads them back with getrlimit after setting them and writes them
+    # here before exec, so the durable observation reports an enforced limit
+    # rather than a requested one.
     exec_read, exec_write = os.pipe()
     os.set_inheritable(exec_write, True)
 
@@ -113,24 +175,50 @@ def main(argv: list[str]) -> int:
             except OSError:
                 pass
         os.set_blocking(exec_write, True)
+        bounded = False
         try:
             os.set_inheritable(exec_write, False)  # close-on-exec
+            # The bounds are applied here, in the child, so this supervisor keeps
+            # the address space and process budget it needs to reap.  A bound
+            # that cannot be set stops the command before it exists.
+            _report(exec_write, {"limits": _apply_resource_bounds(bounds)})
+            bounded = True
             os.execv(command[0], command)
         except OSError as error:
-            try:
-                os.write(exec_write, str(error.errno).encode("ascii")[:16])
-            except OSError:
-                pass
+            _report(exec_write, {"exec_errno" if bounded else "limit_errno": error.errno})
+            if not bounded:
+                os._exit(125)
             os._exit(126 if error.errno == errno.EACCES else 127)
+        except (KeyError, TypeError, ValueError) as error:  # malformed bounds
+            _report(exec_write, {"limit_error": type(error).__name__})
+            os._exit(125)
         os._exit(127)  # pragma: no cover - execv either replaces or raises
 
     # Read the exec status before supervising.  EOF means execv succeeded.
     os.close(exec_write)
     exec_errno: int | None = None
+    limit_errno: int | None = None
+    applied_limits: object | None = None
     try:
-        raw = os.read(exec_read, 16)
-        if raw:
-            exec_errno = int(raw.decode("ascii", "replace") or 0)
+        chunks: list[bytes] = []
+        while len(b"".join(chunks)) < MAX_CHILD_REPORT_BYTES:
+            chunk = os.read(exec_read, 512)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+        for line in raw.decode("utf-8", "replace").splitlines():
+            if not line:
+                continue
+            record = json.loads(line)
+            if "limits" in record:
+                applied_limits = record["limits"]
+            if "exec_errno" in record:
+                exec_errno = int(record["exec_errno"])
+            if "limit_errno" in record:
+                limit_errno = int(record["limit_errno"])
+            if "limit_error" in record:
+                limit_errno = -1
     except (OSError, ValueError):
         exec_errno = None
     finally:
@@ -227,6 +315,11 @@ def main(argv: list[str]) -> int:
             "cancelled": cancelled,
             "termination_escalation": escalation,
             "init_duration_ns": end_ns - start_ns,
+            # What the kernel actually held, read back with getrlimit inside the
+            # bounded child rather than echoed from the request.
+            "resource_limits_applied": applied_limits is not None and limit_errno is None,
+            "resource_limits": applied_limits,
+            "resource_limit_failure_errno": limit_errno,
         }
     )
     return 0

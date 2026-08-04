@@ -57,6 +57,21 @@ FAULT_DURING_RECONCILIATION_PUBLICATION = f"{STAGE_RECONCILIATION_PUBLICATION}:T
 # --- Milestone 2 critical-repair fault points --------------------------------
 STAGE_LEDGER_PENDING_PUBLICATION = "LEDGER_PENDING_ENTRY_PUBLICATION"
 STAGE_FINAL_RECONCILIATION_PUBLICATION = "FINAL_RECONCILIATION_PUBLICATION"
+STAGE_INDEX_EVENT_PUBLICATION = "RUN_INDEX_EVENT_PUBLICATION"
+STAGE_INDEX_ANCHOR_UPDATE = "RUN_INDEX_ANCHOR_UPDATE"
+
+#: The run-index event is about to be committed; nothing of this transition is
+#: durable yet.
+FAULT_BEFORE_INDEX_EVENT_PUBLICATION = "BEFORE_INDEX_EVENT_PUBLICATION"
+FAULT_DURING_INDEX_EVENT_PUBLICATION = f"{STAGE_INDEX_EVENT_PUBLICATION}:TEMP_WRITE"
+#: The exact window the committed head exists to make classifiable: the event is
+#: durable and the anchor still names its predecessor.
+FAULT_AFTER_INDEX_EVENT_BEFORE_ANCHOR = "AFTER_INDEX_EVENT_BEFORE_ANCHOR_UPDATE"
+FAULT_DURING_INDEX_ANCHOR_WRITE = f"{STAGE_INDEX_ANCHOR_UPDATE}:TEMP_WRITE"
+FAULT_AFTER_INDEX_ANCHOR_FSYNC_BEFORE_COMMIT = f"{STAGE_INDEX_ANCHOR_UPDATE}:AFTER_FILE_FSYNC_BEFORE_COMMIT"
+FAULT_AFTER_INDEX_ANCHOR_COMMIT_BEFORE_DIR_FSYNC = (
+    f"{STAGE_INDEX_ANCHOR_UPDATE}:AFTER_COMMIT_BEFORE_DIRECTORY_FSYNC"
+)
 
 #: The effect has returned but no AFTER observation has been taken yet.
 FAULT_AFTER_EFFECT_BEFORE_AFTER_OBSERVATIONS = "AFTER_EFFECT_BEFORE_AFTER_OBSERVATIONS"
@@ -88,6 +103,12 @@ FAULT_POINTS: tuple[str, ...] = (
     FAULT_DURING_LEDGER_PENDING_PUBLICATION,
     FAULT_BEFORE_FINAL_RECONCILIATION,
     FAULT_DURING_FINAL_RECONCILIATION_PUBLICATION,
+    FAULT_BEFORE_INDEX_EVENT_PUBLICATION,
+    FAULT_DURING_INDEX_EVENT_PUBLICATION,
+    FAULT_AFTER_INDEX_EVENT_BEFORE_ANCHOR,
+    FAULT_DURING_INDEX_ANCHOR_WRITE,
+    FAULT_AFTER_INDEX_ANCHOR_FSYNC_BEFORE_COMMIT,
+    FAULT_AFTER_INDEX_ANCHOR_COMMIT_BEFORE_DIR_FSYNC,
 )
 
 # The publication-internal points are parameterised by the object kind, so a
@@ -164,6 +185,11 @@ IDEMPOTENCY_RULE = (
     "An immutable object identity may be published once.  Re-publishing byte-identical "
     "canonical content is DUPLICATE_IDENTICAL and succeeds without rewriting; any other "
     "content for the same identity is CONFLICT_DIFFERENT and fails closed."
+)
+ANCHOR_RULE = (
+    "The run index committed head is the one replaceable object in this store.  It advances "
+    "only forward, by atomic rename, after the event it commits is already durable; the window "
+    "between those two steps is the named HEAD_UPDATE_PENDING crash state."
 )
 
 
@@ -418,6 +444,78 @@ class DurableObjectStore:
             idempotency_rule=IDEMPOTENCY_RULE,
         )
 
+    # -- the one replaceable object -------------------------------------------
+
+    def publish_anchor(
+        self,
+        *,
+        object_kind: str,
+        object_id: str,
+        payload: dict[str, Any],
+        fault_point: str | None = None,
+    ) -> PublicationReceipt:
+        """Atomically replace one *mutable* object: the run index's committed head.
+
+        Every other object in this store is immutable and published with
+        no-replace semantics, and that is deliberate.  A committed head cannot
+        be immutable, though: without a single name that always states how far
+        the run got, deleting the newest event *and* its head record leaves a
+        shorter chain that is internally consistent and therefore undetectable.
+
+        Exactly one object kind is allowed to move, it moves only forward, and
+        it moves by ``rename`` -- which replaces the name atomically, so a reader
+        sees either the previous committed head or the new one and never a
+        partial document.  The window between an event's commit and this
+        replacement is a named, classifiable crash state, not an ambiguity.
+        """
+
+        raw = canonical_bytes(payload)
+        name = self.object_name(object_kind, object_id)
+        content_fp = self.content_fingerprint(raw)
+
+        self._sequence += 1
+        temporary = f"{TEMPORARY_PREFIX}{os.getpid()}-{self._sequence}-{object_kind}.{object_id}"
+        temporary_path = self._root / temporary
+        handle = os.open(temporary_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, FILE_MODE)
+        try:
+            self._check(fault_point, PUBLICATION_PHASE_TEMP_WRITE)
+            written = 0
+            while written < len(raw):
+                written += os.write(handle, raw[written:])
+            os.fsync(handle)
+            os.close(handle)
+            handle = -1
+            self._check(fault_point, PUBLICATION_PHASE_AFTER_FILE_FSYNC)
+            # rename() replaces the destination name atomically, so no reader
+            # ever observes a torn or absent anchor during the update.
+            os.rename(temporary_path, self._root / name)
+            self._check(fault_point, PUBLICATION_PHASE_AFTER_COMMIT_BEFORE_DIR_FSYNC)
+            _fsync_directory(self._root)
+            self._check(fault_point, PUBLICATION_PHASE_AFTER_COMMIT)
+        except InjectedFault:
+            if handle >= 0:
+                os.close(handle)
+            raise
+        except BaseException:
+            if handle >= 0:
+                os.close(handle)
+            self._discard_temporary(temporary_path)
+            raise
+
+        readback = self._read_committed(name)
+        if readback != raw:
+            raise CorruptDurableObject(f"{name} committed bytes differ from the published anchor")
+        return PublicationReceipt.create(
+            object_kind=object_kind,
+            object_id=object_id,
+            relative_path=name,
+            state="PUBLISHED",
+            byte_count=len(raw),
+            content_fingerprint=content_fp,
+            verified_bytes=True,
+            idempotency_rule=ANCHOR_RULE,
+        )
+
     def publish_record(self, *, object_kind: str, object_id: str, record: Any, fault_point: str | None = None) -> PublicationReceipt:
         """Publish any typed record that exposes a canonical ``to_dict``."""
 
@@ -431,8 +529,17 @@ class DurableObjectStore:
 
 
 __all__ = [
+    "ANCHOR_RULE",
     "CorruptDurableObject",
     "DurableObjectStore",
+    "FAULT_AFTER_INDEX_ANCHOR_COMMIT_BEFORE_DIR_FSYNC",
+    "FAULT_AFTER_INDEX_ANCHOR_FSYNC_BEFORE_COMMIT",
+    "FAULT_AFTER_INDEX_EVENT_BEFORE_ANCHOR",
+    "FAULT_BEFORE_INDEX_EVENT_PUBLICATION",
+    "FAULT_DURING_INDEX_ANCHOR_WRITE",
+    "FAULT_DURING_INDEX_EVENT_PUBLICATION",
+    "STAGE_INDEX_ANCHOR_UPDATE",
+    "STAGE_INDEX_EVENT_PUBLICATION",
     "FAULT_POINTS",
     "FaultInjector",
     "IDEMPOTENCY_RULE",

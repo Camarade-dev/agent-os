@@ -26,6 +26,12 @@ in ``implementation/M2_SANDBOX_CONTRACT.md``:
   (:mod:`admissible.paired_runner._capsule_init`);
 * network isolation by unshared network namespace, never by a filter the
   command could route around;
+* a seccomp syscall boundary that denies every Unix-domain socket and every
+  ``mknod``, because a network namespace does *not* isolate filesystem IPC
+  (:mod:`admissible.paired_runner.capsule_seccomp`);
+* per-command resource bounds applied inside the capsule, because a PID
+  namespace is a naming boundary and not a quota
+  (:mod:`admissible.paired_runner.resource_limits`);
 * descriptor and evidence-root separation, so the process-domain observation
   travels on a descriptor the effect does not hold and the evidence root is
   never mounted at all.
@@ -34,9 +40,21 @@ Governing principle
 -------------------
 The effect process is untrusted.  Nothing here depends on the command choosing
 to behave: not on relative paths, not on staying in its process group, not on
-declining to call ``setsid``, and not on the secrecy of any path.  The evidence
-root is unreachable because it is absent from the mount namespace, which no
-amount of path construction inside the capsule can undo.
+declining to call ``setsid``, not on declining to open a socket, and not on the
+secrecy of any path.  The evidence root is unreachable because it is absent from
+the mount namespace, which no amount of path construction inside the capsule can
+undo.
+
+Correction recorded by the independent audit
+--------------------------------------------
+The earlier statement that "an unshared network namespace plus an absent
+evidence path means no host capability is reachable" was **false**.  A pathname
+``AF_UNIX`` socket is a filesystem object that crosses an unshared network
+namespace and can transfer an open file descriptor with ``SCM_RIGHTS``; a FIFO
+in the writable workspace is the same bridge.  The capsule now enforces, by two
+independent mechanisms, that the command sees no host-backed IPC endpoint and
+cannot create one: workspace admission refuses a workspace containing a socket,
+FIFO, or device, and the seccomp filter denies their creation and use.
 """
 
 from __future__ import annotations
@@ -48,11 +66,20 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 import threading
-import time
 from typing import Any
 
 from .canonical import Fingerprint, fingerprint
+from .capsule_identity import CapsuleIdentityRefused, CapsuleRuntimeManifest, build_runtime_manifest
+from .capsule_seccomp import SeccompUnavailable, describe as describe_seccomp, open_program_descriptor
+from .resource_limits import (
+    MECHANISM_CGROUP_AND_RLIMIT,
+    MECHANISM_RLIMIT,
+    CgroupDelegation,
+    ResourceBounds,
+    probe_cgroup_delegation,
+)
 
 
 #: The single internal path at which the authorized workspace is exposed.
@@ -91,10 +118,46 @@ CAPSULE_ENVIRONMENT: dict[str, str] = {
 
 CAPSULE_DESCRIPTOR_DOMAIN = "admissible.paired_runner.m2.capsule.descriptor"
 
+#: The isolation flags every capsule is launched with, recorded in the runtime
+#: manifest so the contract is durable evidence rather than a code comment.
+CAPSULE_NAMESPACE_CONTRACT: tuple[str, ...] = (
+    "--unshare-user",
+    "--unshare-pid",
+    "--unshare-net",
+    "--unshare-ipc",
+    "--unshare-uts",
+    "--unshare-cgroup-try",
+    "--clearenv",
+    "--die-with-parent",
+    "--new-session",
+    "--as-pid-1",
+    "--seccomp",
+)
+
+#: The mount construction, in the same durable form.
+CAPSULE_MOUNT_CONTRACT: tuple[str, ...] = (
+    "proc:/proc",
+    "tmpfs:/tmp",
+    "dev:/dev",
+    f"ro-bind-try:{':'.join(CAPSULE_TOOLCHAIN_INPUTS)}",
+    f"bind:<authorized workspace>->{CAPSULE_WORKSPACE_PATH}",
+    f"ro-bind:<in-capsule init>->{CAPSULE_INIT_PATH}",
+    "absent:<durable evidence root>",
+)
+
 #: Bound on the status document the in-capsule init may write.
 MAX_STATUS_BYTES = 4096
 #: How long the controller waits for the capsule to disappear after it kills it.
 CAPSULE_TEARDOWN_TIMEOUT_SECONDS = 30.0
+#: The bounds the readiness probe demands the kernel actually enforce.
+PROBE_BOUNDS = ResourceBounds(
+    max_processes=16,
+    max_address_space_bytes=512 * 1024 * 1024,
+    max_cpu_seconds=30,
+    max_open_files=64,
+    max_file_size_bytes=1024 * 1024,
+    core_dump_bytes=0,
+)
 
 
 class SandboxUnavailable(RuntimeError):
@@ -121,6 +184,12 @@ class CapsuleReadiness:
     unshare_net: bool
     private_tmp: bool
     private_proc: bool
+    unix_domain_sockets_denied: bool = False
+    special_file_creation_denied: bool = False
+    resource_bounds_enforced: bool = False
+    containment_mechanism: str = "NONE"
+    cgroup_delegation: CgroupDelegation | None = None
+    runtime_manifest: CapsuleRuntimeManifest | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -134,6 +203,14 @@ class CapsuleReadiness:
             "unshare_net": self.unshare_net,
             "private_tmp": self.private_tmp,
             "private_proc": self.private_proc,
+            "unix_domain_sockets_denied": self.unix_domain_sockets_denied,
+            "special_file_creation_denied": self.special_file_creation_denied,
+            "resource_bounds_enforced": self.resource_bounds_enforced,
+            "containment_mechanism": self.containment_mechanism,
+            "cgroup_delegation": None if self.cgroup_delegation is None else self.cgroup_delegation.to_dict(),
+            "runtime_manifest_fingerprint": (
+                None if self.runtime_manifest is None else self.runtime_manifest.record_fingerprint.to_dict()
+            ),
         }
 
     def require(self) -> "CapsuleReadiness":
@@ -163,9 +240,7 @@ class CapsuleProcessStatus:
     start_failure_class: str | None
 
 
-def _probe_command(mechanism_path: str, script: str) -> tuple[bool, str]:
-    """Run one throwaway capsule and report whether it behaved as required."""
-
+def _base_argv(mechanism_path: str, *, seccomp_fd: int | None) -> list[str]:
     argv = [
         mechanism_path,
         "--unshare-user",
@@ -181,19 +256,38 @@ def _probe_command(mechanism_path: str, script: str) -> tuple[bool, str]:
         "--tmpfs",
         "/tmp",
     ]
+    if seccomp_fd is not None:
+        argv += ["--seccomp", str(seccomp_fd)]
     for source in CAPSULE_TOOLCHAIN_INPUTS:
         argv += ["--ro-bind-try", source, source]
-    argv += ["--", os.path.realpath(os.sys.executable), "-c", script]
+    return argv
+
+
+def _probe_command(mechanism_path: str, script: str, *, seccomp: bool) -> tuple[bool, str]:
+    """Run one throwaway capsule and report whether it behaved as required."""
+
+    descriptor = None
     try:
-        completed = subprocess.run(  # noqa: S603 - explicit argv, never a shell
-            argv,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=30,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as error:
-        return False, f"probe_failed:{type(error).__name__}"
+        descriptor = open_program_descriptor() if seccomp else None
+    except (SeccompUnavailable, OSError) as error:
+        return False, f"seccomp_unavailable:{error}"
+    try:
+        argv = _base_argv(mechanism_path, seccomp_fd=descriptor)
+        argv += ["--", os.path.realpath(os.sys.executable), "-c", script]
+        try:
+            completed = subprocess.run(  # noqa: S603 - explicit argv, never a shell
+                argv,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=60,
+                check=False,
+                pass_fds=() if descriptor is None else (descriptor,),
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            return False, f"probe_failed:{type(error).__name__}"
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
     if completed.returncode != 0:
         detail = completed.stderr.decode("utf-8", "replace").strip()[:200]
         return False, f"probe_exit_{completed.returncode}:{detail}"
@@ -210,7 +304,10 @@ def probe_capsule_readiness(*, force: bool = False) -> CapsuleReadiness:
     The probe is not a version check.  It constructs a real capsule and requires
     the kernel to demonstrate each isolation the contract depends on, because a
     present ``bwrap`` binary on a host whose unprivileged user namespaces are
-    disabled would otherwise be mistaken for a working boundary.
+    disabled would otherwise be mistaken for a working boundary.  The same
+    applies to the two mechanisms this repair adds: a seccomp program the kernel
+    silently failed to load, and a resource bound the kernel did not honour, are
+    each a readiness refusal rather than an unbounded capsule.
     """
 
     global _READINESS_CACHE
@@ -237,11 +334,149 @@ def _unavailable(detail: str, path: str | None = None) -> CapsuleReadiness:
     )
 
 
+#: The isolation probe.  It resolves its modules through ``__import__`` rather
+#: than an import statement because the package is asserted elsewhere to contain
+#: no network import, and a probe string is not an exception worth carving out.
+_ISOLATION_PROBE = (
+    "os = __import__('os'); sys = __import__('sys')\n"
+    "sock = __import__('socket')\n"
+    "assert not os.path.exists('/home'), 'host /home is visible'\n"
+    "assert not os.path.exists('/etc/passwd'), 'host /etc is visible'\n"
+    "assert os.path.isdir('/proc/self'), 'private /proc is absent'\n"
+    "assert os.stat('/tmp').st_dev != os.stat('/usr').st_dev, 'private /tmp is absent'\n"
+    "assert not os.listdir('/tmp'), 'private /tmp is not empty'\n"
+    "s=sock.socket()\n"
+    "s.settimeout(2)\n"
+    "try:\n"
+    "    s.connect(('192.0.2.1',80))\n"
+    "    sys.exit('network reachable')\n"
+    "except OSError as error:\n"
+    "    assert error.errno == %d, 'network not unshared: %%r' %% (error,)\n"
+    # The seccomp boundary, proven from inside: a Unix-domain socket of either
+    # flavour and a FIFO must all be refused by the kernel.
+    "try:\n"
+    "    sock.socket(sock.AF_UNIX, sock.SOCK_STREAM)\n"
+    "    sys.exit('AF_UNIX socket creation was permitted')\n"
+    "except OSError as error:\n"
+    "    assert error.errno == %d, 'AF_UNIX not denied: %%r' %% (error,)\n"
+    "try:\n"
+    "    sock.socketpair()\n"
+    "    sys.exit('AF_UNIX socketpair was permitted')\n"
+    "except OSError as error:\n"
+    "    assert error.errno == %d, 'socketpair not denied: %%r' %% (error,)\n"
+    "try:\n"
+    "    os.mkfifo('/tmp/probe-fifo')\n"
+    "    sys.exit('FIFO creation was permitted')\n"
+    "except OSError as error:\n"
+    "    assert error.errno == %d, 'mknod not denied: %%r' %% (error,)\n"
+    "print('capsule-isolations-verified')\n"
+    % (errno.ENETUNREACH, errno.EPERM, errno.EPERM, errno.EPERM)
+)
+
+#: The containment probe.  It runs through the real init, with the real bounds
+#: argument, and requires the kernel to stop an unbounded consumer.
+_CONTAINMENT_PROBE = (
+    "os = __import__('os'); sys = __import__('sys')\n"
+    "errno_module = __import__('errno')\n"
+    "forked = 0\n"
+    "try:\n"
+    "    while forked < 200:\n"
+    "        pid = os.fork()\n"
+    "        if pid == 0:\n"
+    "            os._exit(0)\n"
+    "        forked += 1\n"
+    "except OSError as error:\n"
+    "    assert error.errno == errno_module.EAGAIN, 'fork failed for the wrong reason'\n"
+    "else:\n"
+    "    sys.exit('the process bound was not enforced')\n"
+    "try:\n"
+    "    bytearray(1024 * 1024 * 1024)\n"
+    "    sys.exit('the address-space bound was not enforced')\n"
+    "except MemoryError:\n"
+    "    pass\n"
+    "descriptors = []\n"
+    "try:\n"
+    "    while len(descriptors) < 4096:\n"
+    "        descriptors.append(os.open('/dev/null', os.O_RDONLY))\n"
+    "    sys.exit('the descriptor bound was not enforced')\n"
+    "except OSError as error:\n"
+    "    assert error.errno == errno_module.EMFILE, 'descriptors failed for the wrong reason'\n"
+    "print('capsule-containment-verified')\n"
+)
+
+
+def _probe_containment(mechanism_path: str) -> tuple[bool, str]:
+    """Run the real init, with real bounds, and require enforcement."""
+
+    workspace = tempfile.mkdtemp(prefix="admissible-capsule-probe-")
+    status_read, status_write = os.pipe()
+    control_read, control_write = os.pipe()
+    descriptor = None
+    try:
+        descriptor = open_program_descriptor()
+        argv = _base_argv(mechanism_path, seccomp_fd=descriptor)
+        argv += ["--dev", "/dev", "--new-session", "--as-pid-1"]
+        argv += ["--bind", workspace, CAPSULE_WORKSPACE_PATH]
+        argv += ["--ro-bind", _init_source_path(), CAPSULE_INIT_PATH]
+        argv += ["--chdir", CAPSULE_WORKSPACE_PATH]
+        argv += [
+            "--",
+            os.path.realpath(os.sys.executable),
+            CAPSULE_INIT_PATH,
+            str(status_write),
+            str(control_read),
+            "60000",
+            PROBE_BOUNDS.encode(),
+            os.path.realpath(os.sys.executable),
+            "-c",
+            _CONTAINMENT_PROBE,
+        ]
+        completed = subprocess.run(  # noqa: S603 - explicit argv, never a shell
+            argv,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=120,
+            check=False,
+            pass_fds=(status_write, control_read, descriptor),
+        )
+        os.close(status_write)
+        status_write = -1
+        raw = b""
+        while len(raw) < MAX_STATUS_BYTES:
+            chunk = os.read(status_read, 512)
+            if not chunk:
+                break
+            raw += chunk
+        status = parse_capsule_status(raw)
+        if completed.returncode != 0:
+            return False, f"containment_probe_exit_{completed.returncode}"
+        if b"capsule-containment-verified" not in completed.stdout:
+            return False, f"containment_probe_output:{completed.stdout.decode('utf-8', 'replace')[:120]}"
+        if status is None:
+            return False, "containment_probe_status_document_absent"
+        if not status.get("resource_limits_applied"):
+            return False, f"containment_probe_limits_not_applied:{status.get('resource_limit_failure_errno')}"
+        if status.get("direct_exit_code") != 0:
+            return False, f"containment_probe_direct_exit:{status.get('direct_exit_code')}"
+        return True, "capsule-containment-verified"
+    except (OSError, subprocess.SubprocessError, SeccompUnavailable) as error:
+        return False, f"containment_probe_failed:{type(error).__name__}:{error}"
+    finally:
+        for handle in (status_read, status_write, control_read, control_write, descriptor):
+            if handle is None or handle < 0:
+                continue
+            try:
+                os.close(handle)
+            except OSError:  # pragma: no cover
+                pass
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
 def _probe_capsule_readiness_uncached() -> CapsuleReadiness:
-    mechanism_path = shutil.which("bwrap")
-    if mechanism_path is None:
+    resolved = shutil.which("bwrap")
+    if resolved is None:
         return _unavailable("the bwrap executable is not on PATH")
-    mechanism_path = os.path.realpath(mechanism_path)
+    mechanism_path = os.path.realpath(resolved)
 
     try:
         version = subprocess.run(  # noqa: S603 - explicit argv, never a shell
@@ -254,43 +489,50 @@ def _probe_capsule_readiness_uncached() -> CapsuleReadiness:
     except (OSError, subprocess.SubprocessError) as error:
         return _unavailable(f"bwrap --version failed:{type(error).__name__}", mechanism_path)
 
-    # The probe asserts, from inside a real capsule, every isolation the
-    # contract promises.  Any failure is a readiness refusal, never a downgrade.
-    # The probe body deliberately resolves its modules through __import__ rather
-    # than an import statement: the package is asserted elsewhere to contain no
-    # network import, and a probe string is not an exception worth carving out.
-    script = (
-        "os = __import__('os'); sys = __import__('sys')\n"
-        "sock = __import__('socket')\n"
-        "assert not os.path.exists('/home'), 'host /home is visible'\n"
-        "assert not os.path.exists('/etc/passwd'), 'host /etc is visible'\n"
-        "assert os.path.isdir('/proc/self'), 'private /proc is absent'\n"
-        "assert os.stat('/tmp').st_dev != os.stat('/usr').st_dev, 'private /tmp is absent'\n"
-        "assert not os.listdir('/tmp'), 'private /tmp is not empty'\n"
-        "s=sock.socket()\n"
-        "s.settimeout(2)\n"
-        "try:\n"
-        "    s.connect(('192.0.2.1',80))\n"
-        "    sys.exit('network reachable')\n"
-        "except OSError as error:\n"
-        "    assert error.errno == %d, 'network not unshared: %%r' %% (error,)\n"
-        "print('capsule-isolations-verified')\n" % errno.ENETUNREACH
-    )
-    ok, detail = _probe_command(mechanism_path, script)
+    ok, detail = _probe_command(mechanism_path, _ISOLATION_PROBE, seccomp=True)
     if not ok:
         return _unavailable(detail, mechanism_path)
+
+    contained, containment_detail = _probe_containment(mechanism_path)
+    if not contained:
+        return _unavailable(containment_detail, mechanism_path)
+
+    delegation = probe_cgroup_delegation()
+    mechanism_in_force = MECHANISM_CGROUP_AND_RLIMIT if delegation.available else MECHANISM_RLIMIT
+
+    try:
+        manifest = build_runtime_manifest(
+            mechanism=CAPSULE_MECHANISM,
+            mechanism_version=version,
+            mechanism_path=mechanism_path,
+            interpreter_path=os.path.realpath(os.sys.executable),
+            capsule_init_path=_init_source_path(),
+            toolchain_inputs=CAPSULE_TOOLCHAIN_INPUTS,
+            namespace_contract=CAPSULE_NAMESPACE_CONTRACT,
+            mount_contract=CAPSULE_MOUNT_CONTRACT,
+            containment_mechanism=mechanism_in_force,
+            containment_bounds=ResourceBounds.for_timeout(0).to_dict(),
+        )
+    except (CapsuleIdentityRefused, SeccompUnavailable) as error:
+        return _unavailable(f"capsule_runtime_identity_refused:{error}", mechanism_path)
 
     return CapsuleReadiness(
         available=True,
         mechanism=CAPSULE_MECHANISM,
         mechanism_path=mechanism_path,
         mechanism_version=version,
-        probe_detail=detail,
+        probe_detail=f"{detail};{containment_detail}",
         unshare_user=True,
         unshare_pid=True,
         unshare_net=True,
         private_tmp=True,
         private_proc=True,
+        unix_domain_sockets_denied=True,
+        special_file_creation_denied=True,
+        resource_bounds_enforced=True,
+        containment_mechanism=mechanism_in_force,
+        cgroup_delegation=delegation,
+        runtime_manifest=manifest,
     )
 
 
@@ -314,6 +556,12 @@ class CapsuleSpecification:
     private_pid_namespace: bool
     dies_with_supervisor: bool
     evidence_root_exposed: bool
+    seccomp_program_sha256: str
+    unix_domain_sockets_denied: bool
+    special_file_creation_denied: bool
+    containment_mechanism: str
+    resource_bounds: tuple[tuple[str, int], ...]
+    runtime_manifest_fingerprint: Fingerprint
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -329,6 +577,12 @@ class CapsuleSpecification:
             "private_pid_namespace": self.private_pid_namespace,
             "dies_with_supervisor": self.dies_with_supervisor,
             "evidence_root_exposed": self.evidence_root_exposed,
+            "seccomp_program_sha256": self.seccomp_program_sha256,
+            "unix_domain_sockets_denied": self.unix_domain_sockets_denied,
+            "special_file_creation_denied": self.special_file_creation_denied,
+            "containment_mechanism": self.containment_mechanism,
+            "resource_bounds": [list(pair) for pair in self.resource_bounds],
+            "runtime_manifest_fingerprint": self.runtime_manifest_fingerprint.to_dict(),
         }
 
     def descriptor_fingerprint(self) -> Fingerprint:
@@ -363,6 +617,8 @@ def build_capsule_specification(
         raise SandboxUnavailable(
             "network access requires an explicit future policy field that Milestone 2 does not implement"
         )
+    if readiness.runtime_manifest is None:
+        raise SandboxUnavailable("the capsule runtime manifest is absent, so no capsule identity is bound")
 
     workspace = Path(os.path.realpath(workspace_host_path))
     evidence = Path(os.path.realpath(evidence_root))
@@ -392,6 +648,12 @@ def build_capsule_specification(
         private_pid_namespace=True,
         dies_with_supervisor=True,
         evidence_root_exposed=False,
+        seccomp_program_sha256=str(describe_seccomp()["program_sha256"]),
+        unix_domain_sockets_denied=True,
+        special_file_creation_denied=True,
+        containment_mechanism=readiness.containment_mechanism,
+        resource_bounds=tuple(sorted(ResourceBounds.for_timeout(0).to_dict().items())),
+        runtime_manifest_fingerprint=readiness.runtime_manifest.record_fingerprint,
     )
 
 
@@ -401,7 +663,9 @@ def capsule_argv(
     relative_cwd: str,
     status_fd: int,
     control_fd: int,
+    seccomp_fd: int,
     timeout_ms: int,
+    bounds: ResourceBounds,
     command: tuple[str, ...],
 ) -> list[str]:
     """The exact launcher argv for one capsuled effect."""
@@ -430,6 +694,10 @@ def capsule_argv(
         # Our init is PID 1 of the private namespace, so every orphan reparents
         # to it and quiescence is derived from ECHILD rather than assumed.
         "--as-pid-1",
+        # The syscall boundary.  An unshared network namespace does not isolate
+        # filesystem IPC, so Unix-domain sockets and mknod are denied here.
+        "--seccomp",
+        str(seccomp_fd),
         "--proc",
         "/proc",
         "--tmpfs",
@@ -454,6 +722,7 @@ def capsule_argv(
         str(status_fd),
         str(control_fd),
         str(timeout_ms),
+        bounds.encode(),
         *command,
     ]
     return argv
@@ -478,6 +747,8 @@ __all__ = [
     "CAPSULE_ENVIRONMENT",
     "CAPSULE_INIT_PATH",
     "CAPSULE_MECHANISM",
+    "CAPSULE_MOUNT_CONTRACT",
+    "CAPSULE_NAMESPACE_CONTRACT",
     "CAPSULE_TOOLCHAIN_INPUTS",
     "CAPSULE_WORKSPACE_PATH",
     "CAPSULE_TEARDOWN_TIMEOUT_SECONDS",
@@ -485,6 +756,7 @@ __all__ = [
     "CapsuleReadiness",
     "CapsuleSpecification",
     "MAX_STATUS_BYTES",
+    "PROBE_BOUNDS",
     "SandboxUnavailable",
     "build_capsule_specification",
     "capsule_argv",

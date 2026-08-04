@@ -304,3 +304,36 @@ input to any branch after the decision is reduced to "an effect is permitted".
 
 `SandboxUnavailable`, `EvidenceRootIsolationError`, `ConfigurationRefused`,
 `TypedReconciliationRefused`, `ReconciliationRefused`, `RunIndexBroken`.
+
+
+## Addendum — Milestone 2 second critical repairs
+
+The single physical execution path is unchanged in shape: validate, publish the
+proposal, validate the decision, reserve, publish `STARTED`, cross the boundary.
+Four obligations were added to it, and one order changed.
+
+**The order that changed.** Every transition is indexed as it happens, and the
+proposal's index event is durable before the decision is even validated. The
+previous design appended one summary per proposal after the typed reconciliation,
+which meant a crash in that window left a real, completed, fully reconciled
+effect that the run's causal order did not mention.
+
+**Added obligations, all in `preflight`, all before anything is durable:**
+
+1. the capsule's byte identity is re-derived and compared, including re-resolving
+   the launcher through `PATH`;
+2. a pending committed head is recovered before any new event is appended;
+3. the in-memory effect ledger is rebuilt from the durable event index, and a
+   ledger that contradicts that history is refused;
+4. the specification's schema version is compared against the constant this
+   substrate implements, first, before anything else is inspected on the strength
+   of it.
+
+**Added obligation at the effect boundary.** No capsuled process starts over a
+workspace containing a socket, FIFO, or device node. The refusal is resolved in
+`prepare_effect`, so it is genuinely pre-`STARTED`: the receipt is `REFUSED`, the
+boundary is not crossed, and no lifecycle record exists.
+
+The condition is still not an input to any function on this path. `_index`,
+`prepare_effect`, the capsule, the seccomp program, and the resource bounds are
+identical for a future DIRECT run and a future GOVERNED `ALLOW`.

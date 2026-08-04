@@ -536,9 +536,7 @@ class GitAndFilesystemObservationTests(unittest.TestCase):
         self.addCleanup(harness.close)
         if not initialise_git_repository(harness.workspace):
             self.skipTest("a disposable git repository could not be created on this host")
-        clean = observe_git(
-            harness.workspace, phase="INITIAL", capsule=harness.binding.capsule
-        )
+        clean = observe_git(harness.workspace, harness.binding.root_fd, phase="INITIAL")
         self.assertEqual(clean.availability, "OBSERVED")
         self.assertFalse(clean.worktree_dirty)
         self.assertFalse(clean.untracked_present)
@@ -553,9 +551,7 @@ class GitAndFilesystemObservationTests(unittest.TestCase):
                 tool_grammar_fingerprint=harness.grammar, path="untracked.txt", content="new\n"
             )
         )
-        after = observe_git(
-            harness.workspace, phase="AFTER_EFFECT", capsule=harness.binding.capsule
-        )
+        after = observe_git(harness.workspace, harness.binding.root_fd, phase="AFTER_EFFECT")
         self.assertTrue(after.worktree_dirty)
         self.assertTrue(after.untracked_present)
         self.assertNotEqual(after.status_fingerprint, clean.status_fingerprint)

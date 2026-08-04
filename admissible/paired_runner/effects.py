@@ -51,10 +51,17 @@ from .durable_store import (
     STAGE_PROPOSAL_PUBLICATION,
     STAGE_RECONCILIATION_PUBLICATION,
     STAGE_TERMINAL_RECEIPT_PUBLICATION,
+    CorruptDurableObject,
     DurableObjectStore,
     NULL_FAULT_INJECTOR,
 )
+from .capsule_identity import (
+    CAPSULE_RUNTIME_MANIFEST_OBJECT_KIND,
+    CapsuleIdentityRefused,
+    CapsuleRuntimeManifest,
+)
 from .effect_ledger import LEDGER_OBJECT_KIND, EffectLedgerEntry, RunEffectLedger
+from .git_observer import observe_git_unobserved, observe_repository
 from .reconciliation import (
     FINAL_RECONCILIATION_OBJECT_KIND,
     LEDGER_PENDING_STATE,
@@ -70,6 +77,7 @@ from .observation import (
     FilesystemObservation,
     GitObservation,
     LifecycleRecord,
+    ObservationError,
     ProcessObservation,
     PublicationReceipt,
     ResourceObservation,
@@ -84,7 +92,7 @@ from .sandbox import (
     build_capsule_specification,
     probe_capsule_readiness,
 )
-from .schemas import TOOL_EFFECT_CLASSIFICATIONS
+from .schemas import SCHEMA_VERSION as SPECIFICATION_SCHEMA_VERSION, TOOL_EFFECT_CLASSIFICATIONS
 from .specification import (
     CanonicalProposal,
     EffectReceipt,
@@ -114,9 +122,6 @@ WORKSPACE_IDENTITY_DOMAIN = "admissible.paired_runner.m2.workspace_binding"
 MAX_OBSERVED_TREE_ENTRIES = 100_000
 #: Total regular-file bytes one observation may stream-hash.
 MAX_OBSERVED_CONTENT_BYTES = 2 * 1024 * 1024 * 1024
-#: Bound on retained output from a Git observation.
-MAX_GIT_OUTPUT_BYTES = 4 * 1024 * 1024
-GIT_OBSERVATION_TIMEOUT_SECONDS = 20.0
 WRITE_TEMPORARY_PREFIX = ".tmp-write-"
 DIRECTORY_MODE = 0o700
 FILE_MODE = 0o600
@@ -152,6 +157,9 @@ PRE_EFFECT_OBJECT_KINDS = (
     OBJECT_KIND_RESERVATION,
     OBJECT_KIND_LIFECYCLE_STARTED,
 )
+
+#: The exact experiment specification schema this substrate executes.
+SUPPORTED_SPECIFICATION_SCHEMA_VERSION = SPECIFICATION_SCHEMA_VERSION
 
 
 class AmbiguousEffectRefused(Exception):
@@ -247,6 +255,24 @@ class _DirectoryChain:
 
 # --- physical observations ---------------------------------------------------
 
+def stable_identity(info: os.stat_result) -> tuple[int, ...]:
+    """The inode facts that must not move while a file is being hashed.
+
+    Size, modification time, and change time together detect a rewrite even when
+    the replacement is exactly the same length; device, inode, and link count
+    detect the file being swapped for a different object under the same name.
+    """
+
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+        info.st_nlink,
+    )
+
+
 def _hash_regular_file(directory_fd: int, name: str, *, byte_budget: int) -> tuple[str | None, int, str | None]:
     """Stream-hash one regular file without ever following a symlink.
 
@@ -255,6 +281,12 @@ def _hash_regular_file(directory_fd: int, name: str, *, byte_budget: int) -> tup
     descriptor, so a name that is swapped for a symlink, FIFO, or device between
     the directory scan and the open cannot make the observer follow it or block
     on it.
+
+    The descriptor is ``fstat``-ed again *after* the last byte is read and the
+    two identities are compared.  Without that, a writer that changed the file
+    while it was being read produced a digest of a mixture of two versions --
+    bytes that never existed together on disk -- and the observation reported it
+    as complete.  A moved identity is an explicit observation error instead.
     """
 
     try:
@@ -269,6 +301,7 @@ def _hash_regular_file(directory_fd: int, name: str, *, byte_budget: int) -> tup
             # The entry changed identity after the scan; that is an observation
             # error, never a silently skipped entry.
             return None, 0, "entry_is_no_longer_a_regular_file"
+        before = stable_identity(info)
         digest = hashlib.sha256()
         read_total = 0
         while True:
@@ -284,6 +317,12 @@ def _hash_regular_file(directory_fd: int, name: str, *, byte_budget: int) -> tup
                 break
             digest.update(chunk)
             read_total += len(chunk)
+        try:
+            after = stable_identity(os.fstat(handle))
+        except OSError as error:  # pragma: no cover - the descriptor is ours
+            return None, read_total, f"restat_failed:{errno.errorcode.get(error.errno, error.errno)}"
+        if after != before:
+            return None, read_total, "entry_changed_while_it_was_being_hashed"
         return digest.hexdigest(), read_total, None
     finally:
         os.close(handle)
@@ -313,6 +352,7 @@ def observe_filesystem(
 
     entries: list[dict[str, Any]] = []
     errors: list[str] = []
+    endpoints: list[str] = []
     total_bytes = 0
     hashed_files = 0
     truncated = False
@@ -393,9 +433,14 @@ def observe_filesystem(
                         entry["content_fingerprint"] = content
                         hashed_files += 1
                 else:
-                    # A FIFO, socket, or device is recorded by type.  It is never
-                    # opened, so a hostile special file cannot block the observer.
-                    entry["kind"] = "other"
+                    # A FIFO, socket, or device is recorded by its exact type and
+                    # never opened, so a hostile special file cannot block the
+                    # observer.  The type matters: each of these is a host-backed
+                    # IPC endpoint or device node, and lumping them together as
+                    # "other" is what let a pathname Unix socket look like an
+                    # ordinary anomaly rather than a bridge across the capsule.
+                    entry["kind"] = _special_entry_kind(info.st_mode)
+                    endpoints.append(f"{relative}:{entry['kind']}")
 
                 entries.append(entry)
                 if entry["kind"] == "directory":
@@ -431,133 +476,123 @@ def observe_filesystem(
         content_hashed_file_count=hashed_files,
         error_count=len(errors),
         errors=tuple(sorted(errors)),
+        ipc_endpoint_count=len(endpoints),
+        ipc_endpoints=tuple(sorted(endpoints)),
     )
 
 
-#: Command-line overrides that neutralise every repository-controlled setting
-#: Git would otherwise obey.  A ``-c`` override on the command line takes
-#: precedence over every configuration file, including a malicious
-#: ``.git/config`` and anything it pulls in through ``include.path``, so none of
-#: these can be re-enabled by the repository under observation.
-GIT_HARDENING_OVERRIDES: tuple[str, ...] = (
-    # The exact defect: core.fsmonitor names a program Git executes.
-    "-c", "core.fsmonitor=",
-    "-c", "core.fsmonitorHookVersion=0",
-    # Hooks are redirected to a path that holds no executable.
-    "-c", "core.hooksPath=/dev/null",
-    # No repository-selected helper program of any kind.
-    "-c", "diff.external=",
-    "-c", "core.pager=cat",
-    "-c", "pager.status=false",
-    "-c", "pager.diff=false",
-    "-c", "credential.helper=",
-    "-c", "core.sshCommand=",
-    "-c", "core.askPass=",
-    "-c", "core.editor=false",
-    "-c", "core.alternateRefsCommand=",
-    "-c", "core.attributesFile=/dev/null",
-    "-c", "uploadpack.packObjectsHook=",
-    # No submodule recursion, so a submodule cannot supply its own config.
-    "-c", "submodule.recurse=false",
-    "-c", "protocol.allow=never",
-    "-c", "safe.directory=*",
-)
-
-#: Environment for a Git observation.  No global, system, or user configuration
-#: is inherited, no terminal prompt is possible, and no lock is taken.
-GIT_OBSERVATION_ENVIRONMENT: dict[str, str] = {
-    "GIT_OPTIONAL_LOCKS": "0",
-    "GIT_CONFIG_NOSYSTEM": "1",
-    "GIT_CONFIG_GLOBAL": "/dev/null",
-    "GIT_CONFIG_SYSTEM": "/dev/null",
-    "GIT_TERMINAL_PROMPT": "0",
-    "GIT_ASKPASS": "",
-    "GIT_ALLOW_PROTOCOL": "",
-    "GIT_ATTR_NOSYSTEM": "1",
-    "GIT_NO_REPLACE_OBJECTS": "1",
-    "GIT_CEILING_DIRECTORIES": CAPSULE_WORKSPACE_PATH,
-}
+def _special_entry_kind(mode: int) -> str:
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISFIFO(mode):
+        return "fifo"
+    if stat.S_ISBLK(mode):
+        return "block_device"
+    if stat.S_ISCHR(mode):
+        return "character_device"
+    return "other"
 
 
-def observe_git_unobserved(phase: str, availability: str) -> GitObservation:
-    """A Git record that ran no process at all."""
+class WorkspaceIpcEndpointRefused(Exception):
+    """The workspace holds a host-backed IPC endpoint, so no process may start.
 
-    return GitObservation.create(phase=phase, availability=availability, repository_present=True)
+    A pathname ``AF_UNIX`` socket in the workspace is reachable from inside the
+    capsule *despite* the unshared network namespace, and a peer on the host side
+    of it can hand the capsuled process an open descriptor with ``SCM_RIGHTS``
+    for any file that peer can open -- including one the capsule's mount
+    namespace does not contain.  A FIFO is the same bridge without the
+    descriptor passing, and a device node is a direct host object.
 
-
-def observe_git(
-    root: Path,
-    *,
-    phase: str,
-    capsule: "CapsuleSpecification | None",
-    relative_cwd: str = ".",
-) -> GitObservation:
-    """Observe Git state without ever executing repository-controlled code.
-
-    Two independent mechanisms are applied, because either one alone would be a
-    single point of failure:
-
-    1. Every setting through which Git can be made to run a program is
-       overridden on the command line, where the repository cannot outrank it.
-       This is what stops ``core.fsmonitor`` -- the exact defect the audit
-       found -- along with hooks, external diff, textconv, credential helpers,
-       and submodule recursion.
-    2. The observation still runs inside the shared capsule, so if any of that
-       were ever bypassed, the program would execute with no network, no host
-       filesystem, and -- decisively -- no path at all to the durable evidence
-       root.
-
-    The observer never mutates the index or worktree: it takes no optional
-    lock, and it runs only ``rev-parse`` and a ``--no-lock-index`` status.
+    None of these may exist in a workspace at the moment a process is started
+    inside it.  This refusal happens before the effect boundary is crossed, so a
+    workspace carrying an endpoint produces no effect at all.
     """
 
-    if not (root / ".git").exists():
-        return GitObservation.create(phase=phase, availability="REPOSITORY_ABSENT", repository_present=False)
-    if capsule is None:
-        # No capsule means no confinement, so no process is started.
-        return observe_git_unobserved(phase, "GIT_SANDBOX_UNAVAILABLE")
+    def __init__(self, endpoints: tuple[str, ...]) -> None:
+        super().__init__(f"the workspace contains host-backed IPC endpoints: {list(endpoints)}")
+        self.endpoints = endpoints
 
-    def run(arguments: list[str]) -> str | None:
-        supervised = supervise_command(
-            capsule=capsule,
-            argv=("/usr/bin/env", *(f"{k}={v}" for k, v in sorted(GIT_OBSERVATION_ENVIRONMENT.items())), "git", *arguments),
-            relative_cwd=relative_cwd,
-            timeout_ms=int(GIT_OBSERVATION_TIMEOUT_SECONDS * 1000),
-            max_output_bytes=MAX_GIT_OUTPUT_BYTES,
-        )
-        process = supervised.process_observation
-        if not process.process_started or process.exit_code != 0:
-            return None
-        if supervised.refused_non_utf8:
-            return None
-        return supervised.stdout_text
 
-    head = run(["rev-parse", "HEAD"])
-    status = run(
-        [
-            "--no-optional-locks",
-            "status",
-            "--porcelain=v1",
-            "--untracked-files=all",
-            "--ignore-submodules=all",
-            "--no-renames",
-        ]
-    )
-    if head is None or status is None:
-        return GitObservation.create(phase=phase, availability="GIT_COMMAND_FAILED", repository_present=True)
-    lines = [line for line in status.splitlines() if line]
-    return GitObservation.create(
-        phase=phase,
-        availability="OBSERVED",
-        repository_present=True,
-        head_commit=head.strip(),
-        index_dirty=any(line[0] not in {" ", "?"} for line in lines),
-        worktree_dirty=any(len(line) > 1 and line[1] not in {" ", "?"} for line in lines),
-        untracked_present=any(line.startswith("??") for line in lines),
-        status_fingerprint=fingerprint(
-            {"head": head.strip(), "status": sorted(lines)}, domain=GIT_STATUS_FINGERPRINT_DOMAIN
-        ),
-    )
+def scan_workspace_ipc_endpoints(root_fd: int, *, max_entries: int = MAX_OBSERVED_TREE_ENTRIES) -> tuple[str, ...]:
+    """List every socket, FIFO, and device node in the workspace tree.
+
+    This is the cheap admission scan: it stats, it never opens, and it never
+    hashes, so it can run immediately before a capsuled process starts without
+    re-reading the workspace's content.
+    """
+
+    found: list[str] = []
+    scanned = 0
+    stack: list[tuple[int, str, bool]] = [(root_fd, "", False)]
+    try:
+        while stack:
+            directory_fd, prefix, owned = stack.pop()
+            try:
+                names = sorted(os.listdir(directory_fd))
+            except OSError:
+                names = []
+            for name in names:
+                relative = f"{prefix}{name}"
+                try:
+                    info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                except OSError:
+                    continue
+                scanned += 1
+                if scanned > max_entries:
+                    # A tree this large cannot be admitted on a partial scan: an
+                    # unscanned subtree could hold the exact endpoint this exists
+                    # to find, so the limit itself is reported as an endpoint.
+                    found.append(f"{relative}:scan_limit_reached")
+                    return tuple(sorted(found))
+                if stat.S_ISDIR(info.st_mode):
+                    try:
+                        child = _open_child_directory(directory_fd, name)
+                    except (WorkspaceRefusal, WorkspaceFailure):
+                        continue
+                    stack.append((child, f"{relative}/", True))
+                    continue
+                if stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                    continue
+                found.append(f"{relative}:{_special_entry_kind(info.st_mode)}")
+            if owned:
+                os.close(directory_fd)
+    finally:
+        for directory_fd, _, owned in stack:
+            if owned:
+                try:
+                    os.close(directory_fd)
+                except OSError:  # pragma: no cover
+                    pass
+    return tuple(sorted(found))
+
+
+def require_no_workspace_ipc_endpoints(root_fd: int) -> None:
+    """Refuse to start a capsuled process over a workspace holding an endpoint."""
+
+    endpoints = scan_workspace_ipc_endpoints(root_fd)
+    if endpoints:
+        raise WorkspaceIpcEndpointRefused(endpoints)
+
+
+def observe_git(root: Path, root_fd: int, *, phase: str) -> GitObservation:
+    """Observe Git state by reading it, never by running it.
+
+    The Milestone 2 observer executed ``git status`` behind a list of ``-c``
+    overrides that disabled every *known* way a repository could name a program.
+    The independent audit showed that list is unclosable: a repository selects an
+    arbitrary filter driver by name through ``.gitattributes`` and defines it in
+    its own configuration, and ``git status`` must run that driver to decide
+    whether a working-tree file matches the index.  The observation therefore
+    executed repository-chosen code -- after the durable STARTED record, during
+    what the evidence called an observation, with no proposal covering it.
+
+    There is no denylist here and no ``git`` process.  The repaired observer in
+    :mod:`admissible.paired_runner.git_observer` parses refs, the index, and the
+    object store directly, and fails closed with an explicit availability
+    whenever the answer would require running something.
+    """
+
+    return observe_repository(root, root_fd, phase=phase)
 
 
 # --- workspace binding -------------------------------------------------------
@@ -748,6 +783,25 @@ class WorkspaceBinding:
                 "the bound workspace root descriptor no longer matches its recorded inode identity"
             )
 
+    @property
+    def capsule_runtime_manifest(self) -> CapsuleRuntimeManifest:
+        manifest = self.capsule_readiness.runtime_manifest
+        if manifest is None:  # pragma: no cover - readiness refuses without one
+            raise CapsuleIdentityRefused("this binding carries no capsule runtime manifest")
+        return manifest
+
+    def recheck_capsule_runtime_identity(self) -> CapsuleRuntimeManifest:
+        """Re-derive the capsule's byte identity and refuse any substitution.
+
+        The launcher is resolved through ``PATH`` again as part of this, so a
+        shadowing entry that would be found *now* is caught even when the
+        recorded absolute path still holds the original bytes.
+        """
+
+        manifest = self.capsule_runtime_manifest
+        manifest.recheck(resolver=lambda: shutil.which("bwrap") or "")
+        return manifest
+
     def validate_for_specification(self, specification: ExperimentSpecification) -> "WorkspaceBinding":
         specification.validated()
         if self.experiment_specification_fingerprint != specification.specification_fingerprint:
@@ -889,6 +943,14 @@ def prepare_effect(binding: WorkspaceBinding, request: ToolRequest) -> _EffectPr
             physical_cwd = binding.physical_path_of(request.cwd)
             if Path(os.path.realpath(physical_cwd)) != physical_cwd:
                 raise WorkspaceRefusal("cwd_is_not_physically_under_the_root")
+            # Nothing may run inside the capsule over a workspace that already
+            # contains a host-backed IPC endpoint.  This is the admission half of
+            # the two-mechanism repair; the seccomp filter is the other half, and
+            # neither depends on the other being correct.
+            try:
+                require_no_workspace_ipc_endpoints(binding.root_fd)
+            except WorkspaceIpcEndpointRefused as refusal:
+                raise WorkspaceRefusal("workspace_contains_a_host_ipc_endpoint") from refusal
         else:  # pragma: no cover - the typed union is closed
             raise TypeError("unknown typed tool request")
     except (WorkspaceRefusal, WorkspaceFailure) as error:
@@ -1312,31 +1374,79 @@ class SharedEffectSubstrate:
     def run_index(self) -> DurableRunIndex:
         return self._run_index
 
-    def _index_proposal(
+    def _index(
         self,
         *,
+        event_kind: str,
         proposal: CanonicalProposal,
-        decision: ModeDecision,
-        outcome: str,
-        effect_crossed_boundary: bool,
+        decision: ModeDecision | None = None,
+        outcome: str | None = None,
+        effect_crossed_boundary: bool = False,
         effect_receipt_fingerprint: Fingerprint | None = None,
         ledger_entry_fingerprint: Fingerprint | None = None,
+        final_reconciliation_fingerprint: Fingerprint | None = None,
+        bind_capsule_identity: bool = False,
     ) -> None:
-        """Index every proposal, including one that was refused."""
+        """Record one transition in the run's durable causal order.
 
-        self._run_index.append(
+        Every transition is indexed as it happens rather than summarised once at
+        the end.  That is what makes a crash classifiable: a process that dies
+        between a durable final reconciliation and its index event leaves a
+        proposal whose earlier events are all present, which recovery can close
+        from durable bytes.  The previous one-entry-per-proposal design could not
+        express that state at all, so the completed effect simply vanished from
+        the run's order.
+        """
+
+        # A transition that is already durable is not appended again.  This is
+        # what lets a resumed attempt on a partially indexed proposal reach the
+        # ambiguity check below instead of colliding with its own earlier event:
+        # the causal order already records this transition, and the chain forbids
+        # recording it twice.
+        if self._run_index.has_event(proposal.proposal_id, event_kind):
+            return
+        if outcome is not None and self._run_index.is_closed(proposal.proposal_id):
+            # The proposal already has a terminal event.  A second one would
+            # claim the run closed it twice.
+            return
+
+        manifest = None
+        if bind_capsule_identity:
+            manifest = self._binding.capsule_runtime_manifest.record_fingerprint
+        self._run_index.append_event(
+            event_kind=event_kind,
             condition_id=proposal.condition.condition_id,
             session_id=proposal.session_identity.session_id,
             turn_id=proposal.turn_id,
             proposal_id=proposal.proposal_id,
             proposal_fingerprint=proposal.proposal_fingerprint,
-            decision_value=decision.decision,
-            decision_permits_effect=decision.permits_effect,
+            decision_value=None if decision is None else decision.decision,
+            decision_permits_effect=None if decision is None else decision.permits_effect,
             outcome=outcome,
             effect_crossed_boundary=effect_crossed_boundary,
             effect_receipt_fingerprint=effect_receipt_fingerprint,
             ledger_entry_fingerprint=ledger_entry_fingerprint,
+            final_reconciliation_fingerprint=final_reconciliation_fingerprint,
+            capsule_runtime_manifest_fingerprint=manifest,
         )
+
+    def _publish_capsule_runtime_manifest(self) -> CapsuleRuntimeManifest:
+        """Publish this run's capsule identity once, under the run's identity.
+
+        The manifest is durable evidence of what the capsule was made of.  It is
+        published per run rather than per proposal because it is a property of
+        the substrate, not of any one effect; every ``EFFECT_STARTED`` index
+        event binds its fingerprint, so each effect names the exact capsule that
+        carried it.
+        """
+
+        manifest = self._binding.capsule_runtime_manifest
+        self._store.publish_record(
+            object_kind=CAPSULE_RUNTIME_MANIFEST_OBJECT_KIND,
+            object_id=self._ledger.run_id,
+            record=manifest,
+        )
+        return manifest
 
     def preflight(self, specification: ExperimentSpecification, proposal: CanonicalProposal) -> None:
         """Validate every configuration and identity before anything is durable.
@@ -1347,6 +1457,17 @@ class SharedEffectSubstrate:
         no effect, and no evidence of an attempt it never should have made.
         """
 
+        # The supported schema is a constant of this substrate, so the check is
+        # against that constant.  The shipped check compared a field with itself
+        # and could never fire.  It runs first because a specification this
+        # substrate does not implement should be refused before anything else is
+        # inspected on the strength of it.
+        if specification.schema_version != SUPPORTED_SPECIFICATION_SCHEMA_VERSION:
+            raise ConfigurationRefused(
+                "SCHEMA_VERSION_MISMATCH",
+                f"specification schema version {specification.schema_version} is not the supported "
+                f"{SUPPORTED_SPECIFICATION_SCHEMA_VERSION}",
+            )
         specification.validated()
         run_id = proposal.run_identity.run_id
         if self._ledger.run_id != run_id:
@@ -1387,8 +1508,6 @@ class SharedEffectSubstrate:
         finally:
             os.close(store_fd)
         self._binding.recheck_root_identity()
-        if specification.schema_version != specification.schema_version:  # pragma: no cover
-            raise ConfigurationRefused("SCHEMA_VERSION_MISMATCH", "unsupported specification schema")
         if proposal.tool_name not in TOOL_EFFECT_CLASSIFICATIONS:
             raise ConfigurationRefused("TOOL_CATALOG_MISMATCH", f"unknown tool {proposal.tool_name}")
         # The capsule must be ready now, not at the moment of the effect.
@@ -1396,10 +1515,52 @@ class SharedEffectSubstrate:
             self._binding.capsule_readiness.require()
         except SandboxUnavailable as error:
             raise ConfigurationRefused("SANDBOX_NOT_READY", str(error)) from error
+        # The capsule's byte identity is re-derived here, before the proposal is
+        # durable.  Readiness proved what the launcher, interpreter, init, and
+        # seccomp program were at probe time; this proves they still are, so a
+        # replacement between readiness and the effect refuses instead of being
+        # silently recorded as the capsule that was probed.
         try:
-            self._run_index.verify()
+            self._binding.recheck_capsule_runtime_identity()
+        except CapsuleIdentityRefused as error:
+            raise ConfigurationRefused("CAPSULE_RUNTIME_IDENTITY_REFUSED", str(error)) from error
+        try:
+            state = self._run_index.state()
         except RunIndexBroken as error:
             raise ConfigurationRefused("RUN_INDEX_BROKEN", str(error)) from error
+        if state.state == "HEAD_UPDATE_PENDING":
+            # A crash between an event's commit and the head update is a
+            # bookkeeping gap over an already-durable event, so it is repaired
+            # here rather than blocking the run.  Nothing is replayed.
+            self._run_index.recover_head()
+            state = self._run_index.state()
+        # The in-memory ledger is not the authority on what this run has done.
+        # A restarted process starts empty, so the complete history is derived
+        # from the durable index and adopted; an in-memory ledger that
+        # contradicts that history is a refusal, never something to overwrite.
+        if state.events:
+            try:
+                # A proposal a crash left open is expected here: this is exactly
+                # the path a restarted controller takes to *refuse* replaying it.
+                # Every closed proposal is still verified in full.
+                durable = RunEffectLedger.verify(
+                    self._store,
+                    run_id,
+                    specification=specification,
+                    index=self._run_index,
+                    require_closed=False,
+                )
+            except (ObservationError, CorruptDurableObject, RunIndexBroken) as error:
+                raise ConfigurationRefused("RUN_HISTORY_UNVERIFIABLE", str(error)) from error
+            try:
+                self._ledger.adopt(durable.entries)
+            except ObservationError as error:
+                raise ConfigurationRefused("LEDGER_CONTRADICTS_DURABLE_HISTORY", str(error)) from error
+        elif self._ledger.entries:
+            raise ConfigurationRefused(
+                "LEDGER_CONTRADICTS_DURABLE_HISTORY",
+                "the in-memory ledger records effects that the durable run index does not",
+            )
 
     @property
     def store(self) -> DurableObjectStore:
@@ -1436,8 +1597,13 @@ class SharedEffectSubstrate:
         # 2. validate the proposal for that exact specification.
         proposal.validate_for_specification(specification)
 
-        # 3. durably publish the canonical proposal before anything else.
+        # 3. durably publish the canonical proposal before anything else, and
+        # index it immediately.  The proposal event is durable before any effect
+        # is possible, so an effect can never exist outside the run's causal
+        # order -- which is exactly what a crash between the effect and a
+        # single end-of-proposal summary used to produce.
         self._injector.check(FAULT_BEFORE_PROPOSAL_PUBLICATION)
+        self._publish_capsule_runtime_manifest()
         receipts.append(
             self._store.publish_record(
                 object_kind=OBJECT_KIND_PROPOSAL,
@@ -1446,6 +1612,7 @@ class SharedEffectSubstrate:
                 fault_point=STAGE_PROPOSAL_PUBLICATION,
             )
         )
+        self._index(event_kind="PROPOSAL_PUBLISHED", proposal=proposal)
         self._injector.check(FAULT_AFTER_PROPOSAL_PUBLICATION)
 
         # 4. validate the decision for that exact proposal.
@@ -1455,6 +1622,8 @@ class SharedEffectSubstrate:
                 object_kind=OBJECT_KIND_DECISION, object_id=proposal.proposal_id, record=decision
             )
         )
+        if decision.permits_effect:
+            self._index(event_kind="DECISION_PUBLISHED", proposal=proposal, decision=decision)
         if not decision.permits_effect:
             return self._refuse_before_effect(
                 specification=specification,
@@ -1473,6 +1642,16 @@ class SharedEffectSubstrate:
         )
         if prior.effect_may_have_occurred or prior.corrupt_objects:
             self._publish_recovery_report(proposal.proposal_id, prior)
+            # The ambiguity is indexed, so the run's order records that this
+            # proposal was attempted and closed without replay rather than
+            # leaving it open forever.
+            self._index(
+                event_kind="EFFECT_AMBIGUOUS",
+                proposal=proposal,
+                decision=decision,
+                outcome="AMBIGUOUS_REQUIRES_RECONCILIATION",
+                effect_crossed_boundary=prior.effect_may_have_occurred,
+            )
             raise AmbiguousEffectRefused(prior)
 
         # 5. construct and durably publish the exact reservation.
@@ -1489,6 +1668,7 @@ class SharedEffectSubstrate:
                 object_kind=OBJECT_KIND_RESERVATION, object_id=proposal.proposal_id, record=reservation
             )
         )
+        self._index(event_kind="RESERVATION_PUBLISHED", proposal=proposal, decision=decision)
         self._injector.check(FAULT_AFTER_RESERVATION_PUBLICATION)
 
         return self._execute_permitted_effect(
@@ -1561,12 +1741,20 @@ class SharedEffectSubstrate:
                 object_kind=OBJECT_KIND_LIFECYCLE_STARTED, object_id=proposal.proposal_id, record=started
             )
         )
+        # The started event binds the exact capsule identity that is about to
+        # carry this effect, so the run's order names which capsule ran what.
+        self._index(
+            event_kind="EFFECT_STARTED",
+            proposal=proposal,
+            decision=decision,
+            bind_capsule_identity=True,
+        )
         self._injector.check(FAULT_AFTER_STARTED_BEFORE_EFFECT)
         self._injector.check(FAULT_OBSERVER_FAILURE_AFTER_STARTED)
 
         filesystem_before = observe_filesystem(self._binding.root_fd, phase="BEFORE_EFFECT")
         git_before = observe_git(
-            self._binding.physical_root, phase="BEFORE_EFFECT", capsule=self._binding.capsule
+            self._binding.physical_root, self._binding.root_fd, phase="BEFORE_EFFECT"
         )
         receipts.append(
             self._store.publish_record(
@@ -1595,7 +1783,7 @@ class SharedEffectSubstrate:
         # reaped, and the launcher exits only after the in-capsule init saw
         # ECHILD.  No descendant can still be mutating the workspace here.
         git_after = observe_git(
-            self._binding.physical_root, phase="AFTER_EFFECT", capsule=self._binding.capsule
+            self._binding.physical_root, self._binding.root_fd, phase="AFTER_EFFECT"
         )
         receipts.append(
             self._store.publish_record(
@@ -1641,6 +1829,13 @@ class SharedEffectSubstrate:
                 record=receipt,
                 fault_point=STAGE_TERMINAL_RECEIPT_PUBLICATION,
             )
+        )
+        self._index(
+            event_kind="TERMINAL_RECEIPT_PUBLISHED",
+            proposal=proposal,
+            decision=decision,
+            effect_crossed_boundary=True,
+            effect_receipt_fingerprint=receipt.receipt_fingerprint,
         )
         monotonic_end = time.monotonic_ns()
         wall_end = int(time.time() * 1000)
@@ -1739,22 +1934,32 @@ class SharedEffectSubstrate:
         if not final.verified:
             raise TypedReconciliationRefused(final)
 
-        # 12. verify the ledger by re-verifying every entry's whole typed chain.
-        verified = RunEffectLedger.verify(
-            self._store,
-            proposal.run_identity.run_id,
-            tuple(item.proposal_id for item in self._ledger.entries) + (proposal.proposal_id,),
-            specification=specification,
-        )
-        self._ledger.append(verified.entries[-1])
-        self._index_proposal(
+        # 12. close the proposal in the durable order.  This event is what makes
+        # the window between a durable final reconciliation and the run's order
+        # recoverable: every earlier transition is already indexed, so recovery
+        # can append exactly this event from durable bytes without replaying.
+        self._index(
+            event_kind="RECONCILIATION_PUBLISHED",
             proposal=proposal,
             decision=decision,
             outcome=_index_outcome_for(receipt.status),
             effect_crossed_boundary=True,
             effect_receipt_fingerprint=receipt.receipt_fingerprint,
             ledger_entry_fingerprint=entry.record_fingerprint,
+            final_reconciliation_fingerprint=final.record_fingerprint,
         )
+
+        # 13. verify the ledger against the *durable index*, not against a list
+        # of proposal identities the caller chose.  The history being checked is
+        # therefore the run's whole history, including everything a restarted
+        # process has no memory of.
+        verified = RunEffectLedger.verify(
+            self._store,
+            proposal.run_identity.run_id,
+            specification=specification,
+            index=self._run_index,
+        )
+        self._ledger.adopt(verified.entries)
 
         return EffectExecutionOutcome(
             receipt=receipt,
@@ -1901,11 +2106,13 @@ class SharedEffectSubstrate:
                 object_kind=OBJECT_KIND_RECONCILIATION, object_id=proposal.proposal_id, record=reconciliation
             )
         )
-        self._index_proposal(
+        # A refused proposal is a proposal the run attempted, so it is indexed
+        # with the same care as one that produced an effect.
+        self._index(
+            event_kind="DECISION_REFUSED",
             proposal=proposal,
             decision=decision,
             outcome="DECISION_REFUSED",
-            effect_crossed_boundary=False,
             effect_receipt_fingerprint=receipt.receipt_fingerprint,
         )
         return EffectExecutionOutcome(
@@ -1970,11 +2177,11 @@ class SharedEffectSubstrate:
         )
         if not final.verified:
             raise TypedReconciliationRefused(final)
-        self._index_proposal(
+        self._index(
+            event_kind="EFFECT_REFUSED_BEFORE_START",
             proposal=proposal,
             decision=decision,
             outcome="EFFECT_REFUSED",
-            effect_crossed_boundary=False,
             effect_receipt_fingerprint=receipt.receipt_fingerprint,
         )
         return EffectExecutionOutcome(
@@ -2097,6 +2304,160 @@ def reconcile_effect(store: DurableObjectStore, *, run_id: str, proposal_id: str
     )
 
 
+# --- run-index recovery ------------------------------------------------------
+
+#: The durable object each transition is indexed against, in the exact order the
+#: substrate produces them.  Recovery walks this list and appends only the events
+#: whose objects are already durable, so the recovered event set is exactly the
+#: one the normal path would have written.
+_RECOVERY_STEPS: tuple[tuple[str, str], ...] = (
+    (OBJECT_KIND_DECISION, "DECISION_PUBLISHED"),
+    (OBJECT_KIND_RESERVATION, "RESERVATION_PUBLISHED"),
+    (OBJECT_KIND_LIFECYCLE_STARTED, "EFFECT_STARTED"),
+    (OBJECT_KIND_RECEIPT, "TERMINAL_RECEIPT_PUBLISHED"),
+    (FINAL_RECONCILIATION_OBJECT_KIND, "RECONCILIATION_PUBLISHED"),
+)
+
+#: Transitions a refusing decision never produces, so recovery never invents them.
+_EFFECT_ONLY_EVENTS = frozenset({"DECISION_PUBLISHED", "RESERVATION_PUBLISHED", "EFFECT_STARTED", "TERMINAL_RECEIPT_PUBLISHED"})
+
+
+@dataclass(frozen=True)
+class RunIndexRecovery:
+    """What a recovery pass found and what it appended, if anything."""
+
+    index_state: str
+    appended_events: tuple[str, ...]
+    still_open_proposal_ids: tuple[str, ...]
+    replayed_any_effect: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "index_state": self.index_state,
+            "appended_events": list(self.appended_events),
+            "still_open_proposal_ids": list(self.still_open_proposal_ids),
+            "replayed_any_effect": self.replayed_any_effect,
+        }
+
+
+def recover_run_index(store: DurableObjectStore, run_id: str) -> RunIndexRecovery:
+    """Close index events whose durable objects already exist.  Never replay.
+
+    The failure this exists for is exact: a process that dies after publishing a
+    verified final reconciliation but before appending the event that records it
+    leaves a real, completed, fully reconciled effect that the run's causal order
+    does not mention.  Recovery reads the durable objects, works out which of the
+    proposal's transitions were never indexed, and appends exactly those.
+
+    It writes no proposal, no reservation, no lifecycle record, no receipt, and
+    no reconciliation.  It cannot cause an effect: every event it appends
+    describes an object that was already on disk before this function was
+    called.
+    """
+
+    index = DurableRunIndex(store, run_id)
+    state = index.state()
+    if state.state == "HEAD_UPDATE_PENDING":
+        index.recover_head()
+        state = index.state()
+
+    appended: list[str] = []
+    for proposal_id in index.open_proposal_ids():
+        events = {event.event_kind for event in index.events_for(proposal_id)}
+        proposal_payload = store.load(OBJECT_KIND_PROPOSAL, proposal_id)
+        proposal = CanonicalProposal.from_dict(proposal_payload)
+        decision_state = store.inspect(OBJECT_KIND_DECISION, proposal_id)
+        if decision_state.state != "PUBLISHED":
+            # Without a durable decision nothing further can be asserted about
+            # this proposal, and inventing one would be a fabrication.
+            continue
+        decision = ModeDecision.from_dict(store.load(OBJECT_KIND_DECISION, proposal_id))
+
+        # An effect crossed the boundary exactly when a STARTED record is durable.
+        started = store.inspect(OBJECT_KIND_LIFECYCLE_STARTED, proposal_id).state == "PUBLISHED"
+        receipt_fingerprint = (
+            EffectReceipt.from_dict(store.load(OBJECT_KIND_RECEIPT, proposal_id)).receipt_fingerprint
+            if store.inspect(OBJECT_KIND_RECEIPT, proposal_id).state == "PUBLISHED"
+            else None
+        )
+
+        for object_kind, event_kind in _RECOVERY_STEPS:
+            if not decision.permits_effect and event_kind in _EFFECT_ONLY_EVENTS:
+                continue
+            if store.inspect(object_kind, proposal_id).state != "PUBLISHED":
+                # The transitions are ordered, so the first absent object is
+                # where this proposal actually stopped.
+                break
+            if event_kind in events:
+                continue
+
+            if event_kind != "RECONCILIATION_PUBLISHED":
+                index.append_event(
+                    event_kind=event_kind,
+                    condition_id=proposal.condition.condition_id,
+                    session_id=proposal.session_identity.session_id,
+                    turn_id=proposal.turn_id,
+                    proposal_id=proposal_id,
+                    proposal_fingerprint=proposal.proposal_fingerprint,
+                    decision_value=decision.decision,
+                    decision_permits_effect=decision.permits_effect,
+                    effect_crossed_boundary=started and event_kind == "TERMINAL_RECEIPT_PUBLISHED",
+                    effect_receipt_fingerprint=receipt_fingerprint,
+                )
+                appended.append(f"{proposal_id}:{event_kind}")
+                continue
+
+            final = FinalReconciliation.from_dict(
+                store.load(FINAL_RECONCILIATION_OBJECT_KIND, proposal_id)
+            )
+            if not final.verified:
+                # An unverified reconciliation closes nothing; the proposal stays
+                # open and a human decides what happened.
+                break
+            closing = _closing_event_kind(decision, started=started)
+            index.append_event(
+                event_kind=closing,
+                condition_id=proposal.condition.condition_id,
+                session_id=proposal.session_identity.session_id,
+                turn_id=proposal.turn_id,
+                proposal_id=proposal_id,
+                proposal_fingerprint=proposal.proposal_fingerprint,
+                decision_value=decision.decision,
+                decision_permits_effect=decision.permits_effect,
+                outcome=(
+                    _index_outcome_for(final.receipt_status)
+                    if closing == "RECONCILIATION_PUBLISHED"
+                    else ("EFFECT_REFUSED" if decision.permits_effect else "DECISION_REFUSED")
+                ),
+                effect_crossed_boundary=started,
+                effect_receipt_fingerprint=receipt_fingerprint,
+                ledger_entry_fingerprint=(
+                    EffectLedgerEntry.from_dict(
+                        store.load(LEDGER_OBJECT_KIND, proposal_id)
+                    ).record_fingerprint
+                    if started
+                    else None
+                ),
+                final_reconciliation_fingerprint=final.record_fingerprint,
+            )
+            appended.append(f"{proposal_id}:{closing}")
+
+    return RunIndexRecovery(
+        index_state=index.state().state,
+        appended_events=tuple(appended),
+        still_open_proposal_ids=index.open_proposal_ids(),
+        replayed_any_effect=False,
+    )
+
+
+def _closing_event_kind(decision: ModeDecision, *, started: bool) -> str:
+    """The terminal event the normal path would have written for this proposal."""
+
+    if not decision.permits_effect:
+        return "DECISION_REFUSED"
+    return "RECONCILIATION_PUBLISHED" if started else "EFFECT_REFUSED_BEFORE_START"
+
+
 def workspace_content_digest(root: Path) -> str:
     """A convenience digest used by tests to prove exact written bytes."""
 
@@ -2110,7 +2471,10 @@ def workspace_content_digest(root: Path) -> str:
 
 __all__ = [
     "AmbiguousEffectRefused",
+    "ConfigurationRefused",
     "EffectExecutionOutcome",
+    "EvidenceRootIsolationError",
+    "OBJECT_KIND_DECISION",
     "OBJECT_KIND_LIFECYCLE_STARTED",
     "OBJECT_KIND_PROPOSAL",
     "OBJECT_KIND_RECEIPT",
@@ -2118,12 +2482,20 @@ __all__ = [
     "OBJECT_KIND_RESERVATION",
     "PRE_EFFECT_OBJECT_KINDS",
     "SANITIZED_ENVIRONMENT_BASE",
+    "SUPPORTED_SPECIFICATION_SCHEMA_VERSION",
+    "RunIndexRecovery",
     "SharedEffectSubstrate",
+    "TypedReconciliationRefused",
     "WorkspaceBinding",
     "WorkspaceFailure",
+    "WorkspaceIpcEndpointRefused",
     "WorkspaceRefusal",
     "observe_filesystem",
     "observe_git",
+    "recover_run_index",
     "reconcile_effect",
+    "require_no_workspace_ipc_endpoints",
+    "scan_workspace_ipc_endpoints",
+    "stable_identity",
     "workspace_content_digest",
 ]

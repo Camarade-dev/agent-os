@@ -285,3 +285,52 @@ The bounded-stream implementation is unchanged by these repairs. The heavy soak
 was re-run through the sandboxed command path and produced byte-identical stream
 fingerprints with controller retention inside the declared bound, so the scoped
 heavy-output evidence for LONG-07 and LONG-08 is preserved.
+
+
+## Addendum — Milestone 2 second critical repairs
+
+### The one replaceable durable object
+
+Every object in the durable store is immutable and published with no-replace
+semantics, with exactly one exception: `run-index-anchor.<run_id>.json`, the run
+index's committed head. It is written by temporary file → `fsync` → atomic
+`rename` → directory `fsync`, so a reader observes the previous committed head or
+the new one and never a partial document.
+
+The exception is necessary rather than convenient. Without a single name that
+always states how far a run got, deleting the newest event together with its head
+record leaves a shorter chain that is internally consistent and therefore
+undetectable. The anchor moves only forward, and only after the event it commits
+is already durable; the window between those two steps is the named
+`HEAD_UPDATE_PENDING` crash state.
+
+### Durability of the head update
+
+The anchor's `rename` is atomic with respect to the directory entry. The
+guarantee this contract makes is the same one it makes for `os.link`: after the
+directory `fsync` returns, the name resolves to the new bytes on a conforming
+Linux filesystem. No claim is made beyond what `fsync` on the selected platform
+provides, and this is not a power-loss or device-level fault model.
+
+### Crash classification
+
+Six fault points were added, covering every boundary of the run-index event and
+committed-head publication. Their declared durable consequences, including the
+resulting index state, are in `implementation/M2_CRASH_MATRIX.json`; the
+classification rules are in `implementation/M2_DURABLE_EVENT_INDEX_SPEC.md`.
+
+### Rollback
+
+Deleting the newest event *and* rewinding the committed head to a still-valid
+earlier head is undetectable by any purely local record. This contract does not
+claim otherwise. `DurableRunIndex.head_anchor()` returns exactly the value an
+external anti-rollback anchor would pin; Milestone 2 implements no such anchor,
+and any future multi-session design must supply one.
+
+### Resource containment on the qualification host
+
+`Linux 6.18.33.2-microsoft-standard-WSL2` delegates no writable cgroup v2 subtree
+to the running user, so the containment mechanism in force is `RLIMIT` and
+aggregate process-domain accounting is unavailable. This is recorded in every
+resource observation rather than assumed away. WSL2 remains explicitly not a
+clean-host qualification.

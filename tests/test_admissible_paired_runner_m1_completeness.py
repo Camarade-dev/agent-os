@@ -81,6 +81,15 @@ M2_SCOPE = {
 }
 # EXEC-02 and EXEC-05 belong to both scopes: M1 restored them to DESIGNED and M2
 # closes them with a physical executor and physical durable publication.
+#
+# The second critical-repair pass raises exactly one of these: EVID-05 moves from
+# IMPLEMENTED to VERIFIED_INTEGRATION because a file that moves while it is being
+# hashed is now detected, which is the property the independent audit found
+# missing.  EVID-06 deliberately stays IMPLEMENTED even though the capsule's own
+# byte identity is now bound, because the model, executable, and transport
+# identities in the experiment specification are still Milestone 1 placeholders.
+# EVID-08 stays IMPLEMENTED because retries remain deferred.  Every value here is
+# declared literally, never read back from the matrix under test.
 M2_EXPECTED_STATUS = {
     "EXEC-02": "VERIFIED_INTEGRATION",
     "EXEC-05": "VERIFIED_INTEGRATION",
@@ -89,7 +98,7 @@ M2_EXPECTED_STATUS = {
     "EVID-02": "VERIFIED_INTEGRATION",
     "EVID-03": "VERIFIED_INTEGRATION",
     "EVID-04": "DESIGNED",
-    "EVID-05": "IMPLEMENTED",
+    "EVID-05": "VERIFIED_INTEGRATION",
     "EVID-06": "IMPLEMENTED",
     "EVID-07": "VERIFIED_INTEGRATION",
     "EVID-08": "IMPLEMENTED",

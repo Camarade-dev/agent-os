@@ -214,3 +214,40 @@ were checked — not on a path string that could have been swapped in between.
 Directory creation for `create_parents` is deliberately excluded from
 preparation, because creating a directory is itself a mutation and must happen
 after `STARTED`.
+
+
+## Addendum — Milestone 2 second critical repairs
+
+### Reconciliation is no longer the last word on the run
+
+A verified `FinalReconciliation` proves that one proposal's typed chain
+reconstructs and agrees with itself. It says nothing about whether the *run*
+records that proposal. Those are now separate obligations:
+
+* the durable event chain records every transition, and the `PROPOSAL_PUBLISHED`
+  event is durable before any effect is possible;
+* the closing `RECONCILIATION_PUBLISHED` event binds the verified final
+  reconciliation's fingerprint, the terminal receipt's, and the ledger entry's.
+
+A crash between a durable verified reconciliation and its closing event is
+therefore recoverable: `effects.recover_run_index` reads the durable objects and
+appends only the missing events. It writes no proposal, reservation, lifecycle
+record, receipt, or reconciliation, so it cannot cause an effect. An *unverified*
+final reconciliation closes nothing — the proposal stays open.
+
+### The ledger is derived from the index
+
+`RunEffectLedger.verify` no longer accepts the proposal identities to check. It
+derives them from the durable index, which is itself chain-verified against its
+committed head first. For every indexed proposal the whole typed chain is
+reconciled through `reconcile_typed_chain` exactly as before; what changed is
+that no caller can decide which proposals that applies to.
+
+See `implementation/M2_DURABLE_EVENT_INDEX_SPEC.md` §4.
+
+### §7 is superseded
+
+The Git observation section of this specification described running `git` inside
+the capsule behind command-line overrides. That construction is withdrawn: it
+executed repository-selected filter drivers. The observer now executes nothing.
+See ADR-M2S-02 and `implementation/M2_SECOND_CRITICAL_REPAIR_REPORT.json`.

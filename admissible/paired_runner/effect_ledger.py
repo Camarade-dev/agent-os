@@ -220,6 +220,10 @@ class RunEffectLedger:
         _require_text(run_id, "run_id", max_bytes=256)
         self._run_id = run_id
         self._entries: list[EffectLedgerEntry] = []
+        #: Proposals the durable index opened but never closed.  A crash between
+        #: an effect and the event that closes it produces exactly one of these,
+        #: and it is reported rather than hidden.
+        self.open_proposal_ids: tuple[str, ...] = ()
 
     @property
     def run_id(self) -> str:
@@ -238,10 +242,43 @@ class RunEffectLedger:
         self._entries.append(entry)
         return entry
 
-    def proposal_ledger_fingerprint(self) -> Fingerprint:
+    def adopt(self, entries: tuple[EffectLedgerEntry, ...]) -> "RunEffectLedger":
+        """Take the durable history as this ledger's contents.
+
+        A restarted process legitimately begins with nothing in memory, and the
+        durable event index is the authority on what the run actually did, so an
+        empty ledger is refilled from bytes.  A ledger that already holds entries
+        may only be *extended* by the durable history: whatever it recorded must
+        still be there, in the same order, at the same positions.  Anything else
+        -- a different proposal, a different order, a shorter history than this
+        object already witnessed -- is a contradiction rather than something to
+        overwrite, because it would mean this ledger has been recording a run the
+        durable evidence does not describe.
+        """
+
+        current = tuple(entry.proposal_id for entry in self._entries)
+        derived = tuple(entry.proposal_id for entry in entries)
+        if current != derived[: len(current)]:
+            raise ObservationError(
+                "the in-memory effect ledger contradicts the durable run index; it records "
+                f"{list(current)} where the durable history records {list(derived)}"
+            )
+        for existing, replacement in zip(self._entries, entries):
+            if existing.record_fingerprint != replacement.record_fingerprint:
+                raise ObservationError(
+                    f"the durable ledger entry for {existing.proposal_id} differs from the one this ledger holds"
+                )
+        self._entries = list(entries)
+        return self
+
+    def proposal_ledger_fingerprint(self, *, index_head: str | None = None) -> Fingerprint:
         return fingerprint(
             {
                 "run_id": self._run_id,
+                # The durable index head binds this fingerprint to the *complete*
+                # history rather than to whatever subset happens to be in memory.
+                "run_index_head_event_fingerprint": index_head,
+                "entry_count": len(self._entries),
                 "proposals": [
                     {
                         "proposal_id": entry.proposal_id,
@@ -253,10 +290,12 @@ class RunEffectLedger:
             domain=PROPOSAL_LEDGER_FINGERPRINT_DOMAIN,
         )
 
-    def effect_receipt_ledger_fingerprint(self) -> Fingerprint:
+    def effect_receipt_ledger_fingerprint(self, *, index_head: str | None = None) -> Fingerprint:
         return fingerprint(
             {
                 "run_id": self._run_id,
+                "run_index_head_event_fingerprint": index_head,
+                "entry_count": len(self._entries),
                 "receipts": [
                     {
                         "proposal_id": entry.proposal_id,
@@ -274,29 +313,59 @@ class RunEffectLedger:
         cls,
         store: Any,
         run_id: str,
-        proposal_ids: tuple[str, ...],
         *,
         specification: Any = None,
         specification_fingerprint: Any = None,
+        index: Any = None,
+        require_closed: bool = True,
     ) -> "RunEffectLedger":
-        """Rebuild the ledger by verifying each entry's *entire* typed chain.
+        """Rebuild the ledger from the durable event index and verify every chain.
 
-        Re-reading the ledger entry's own bytes proves only that the entry is
-        well formed.  It says nothing about whether the proposal, decision,
-        reservation, lifecycle records, receipt, and observations it cites still
-        exist, still reconstruct as their declared types, or still agree with
-        it -- which is why the Milestone 2 version succeeded even when every
-        object the entry referenced had been deleted.
+        The Milestone 2 signature took the proposal identities to verify *from
+        the caller*.  A restarted process could therefore hand in an empty tuple
+        -- or any convenient subset -- and receive a ledger that verified
+        perfectly while omitting every effect the run had already performed.
+        History was a parameter.
 
-        Each entry is therefore admitted only after
-        :func:`~admissible.paired_runner.reconciliation.reconcile_typed_chain`
-        verifies the whole chain behind it.
+        It is now derived.  The ordered set of proposals comes from the durable
+        run index, which is itself chain-verified against its committed head, so
+        no caller can choose what is checked.  For every indexed proposal the
+        whole typed chain is reconciled; an effect-bearing one must have a ledger
+        entry whose fingerprint the index already recorded, and a refused one
+        must have none.  A ledger entry in the store that the index never
+        recorded is a surplus record and fails closed.
+
+        ``require_closed`` is the one dial, and it does *not* select history: it
+        decides what happens to a proposal the index opened and never closed.
+        A crash between an effect and the event that closes it leaves exactly
+        that state, and a restarted controller must still be able to look at the
+        run in order to refuse replaying it.  With ``require_closed=False`` such
+        a proposal is excluded from the ledger and named in
+        :attr:`open_proposal_ids` instead of failing the whole derivation; every
+        *closed* proposal is verified exactly as strictly either way.
         """
 
         from .reconciliation import reconcile_typed_chain  # circular at module scope
+        from .run_index import DurableRunIndex
+
+        run_index = index if index is not None else DurableRunIndex(store, run_id)
+        # verify() re-derives the chain from bytes and refuses a gap, a surplus
+        # position, a reordering, a foreign record, or an uncommitted head.
+        events = run_index.verify()
 
         ledger = cls(run_id)
-        for proposal_id in proposal_ids:
+        indexed: set[str] = set()
+        still_open: list[str] = []
+        for proposal_id in run_index.indexed_proposal_ids():
+            indexed.add(proposal_id)
+            terminal = run_index.terminal_event_for(proposal_id)
+            if terminal is None:
+                if require_closed:
+                    raise ObservationError(
+                        f"proposal {proposal_id} is indexed but never closed; the run's history is incomplete"
+                    )
+                still_open.append(proposal_id)
+                continue
             final = reconcile_typed_chain(
                 store,
                 run_id=run_id,
@@ -308,9 +377,59 @@ class RunEffectLedger:
                 raise ObservationError(
                     f"the durable chain for {proposal_id} does not reconcile: {final.refusal_code}"
                 )
-            payload = store.load(LEDGER_OBJECT_KIND, proposal_id)
-            ledger.append(EffectLedgerEntry.from_dict(payload))
+            if not terminal.effect_crossed_boundary:
+                # A refusal is represented by the absence of a ledger entry, and
+                # that absence is checked rather than assumed.
+                if store.inspect(LEDGER_OBJECT_KIND, proposal_id).state != "ABSENT":
+                    raise ObservationError(
+                        f"proposal {proposal_id} was indexed as refused but carries a ledger entry"
+                    )
+                continue
+            entry = EffectLedgerEntry.from_dict(store.load(LEDGER_OBJECT_KIND, proposal_id))
+            if terminal.ledger_entry_fingerprint != entry.record_fingerprint:
+                raise ObservationError(
+                    f"the run index records a different ledger entry for {proposal_id} than the store holds"
+                )
+            if terminal.effect_receipt_fingerprint != entry.effect_receipt_fingerprint:
+                raise ObservationError(
+                    f"the run index records a different effect receipt for {proposal_id} than the ledger entry"
+                )
+            ledger.append(entry)
+
+        surplus = sorted(
+            name[len(f"{LEDGER_OBJECT_KIND}.") : -len(".json")]
+            for name in store.committed_names()
+            if name.startswith(f"{LEDGER_OBJECT_KIND}.") and name.endswith(".json")
+        )
+        unindexed = [proposal_id for proposal_id in surplus if proposal_id not in indexed]
+        if unindexed:
+            raise ObservationError(
+                f"the durable store holds ledger entries the run index never recorded: {unindexed}"
+            )
+        if len(events) and not indexed:  # pragma: no cover - a chain always starts with a proposal
+            raise ObservationError("the run index holds events but records no proposal")
+        ledger.open_proposal_ids = tuple(still_open)
         return ledger
+
+    @classmethod
+    def restore(
+        cls,
+        store: Any,
+        run_id: str,
+        *,
+        specification: Any = None,
+        specification_fingerprint: Any = None,
+        index: Any = None,
+    ) -> "RunEffectLedger":
+        """Reconstruct a run's complete effect ledger from durable bytes alone."""
+
+        return cls.verify(
+            store,
+            run_id,
+            specification=specification,
+            specification_fingerprint=specification_fingerprint,
+            index=index,
+        )
 
 
 M2_LEDGER_SCHEMAS = {

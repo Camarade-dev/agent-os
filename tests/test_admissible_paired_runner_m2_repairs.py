@@ -52,6 +52,7 @@ from admissible.paired_runner.reconciliation import (  # noqa: E402
     reconcile_typed_chain,
 )
 from admissible.paired_runner.run_index import (  # noqa: E402
+    RUN_INDEX_ANCHOR_KIND,
     RUN_INDEX_OBJECT_KIND,
     DurableRunIndex,
     RunIndexBroken,
@@ -190,7 +191,9 @@ class SandboxEscapeMatrixTests(unittest.TestCase):
         durable_before = {
             name: (self.harness.store_root / name).read_bytes()
             for name in self.harness.store.committed_names()
+            if not name.startswith(f"{RUN_INDEX_ANCHOR_KIND}.")
         }
+        anchor_before = self.harness.substrate.run_index.head_anchor()
         target = str(self.harness.store_root)
         out = self._stdout(
             "os = __import__('os')\n"
@@ -206,6 +209,10 @@ class SandboxEscapeMatrixTests(unittest.TestCase):
         self.assertEqual(out.strip(), "NONE")
         for name, payload in durable_before.items():
             self.assertEqual((self.harness.store_root / name).read_bytes(), payload, name)
+        # The committed head is the one replaceable object in the store, and only
+        # the controller advances it.  It must have moved forward, never back.
+        anchor_after = self.harness.substrate.run_index.head_anchor()
+        self.assertGreaterEqual(anchor_after["head_sequence"], anchor_before["head_sequence"])
 
     def test_host_home_is_not_reachable_and_is_not_inherited(self) -> None:
         out = self._stdout(
@@ -275,7 +282,9 @@ class SandboxEscapeMatrixTests(unittest.TestCase):
         before = {
             name: (self.harness.store_root / name).read_bytes()
             for name in self.harness.store.committed_names()
+            if not name.startswith(f"{RUN_INDEX_ANCHOR_KIND}.")
         }
+        anchor_before = self.harness.substrate.run_index.head_anchor()
         self.harness.command(
             "os = __import__('os')\n"
             "for root, dirs, files in os.walk('/'):\n"
@@ -289,6 +298,8 @@ class SandboxEscapeMatrixTests(unittest.TestCase):
         )
         for name, payload in before.items():
             self.assertEqual((self.harness.store_root / name).read_bytes(), payload, name)
+        anchor_after = self.harness.substrate.run_index.head_anchor()
+        self.assertGreaterEqual(anchor_after["head_sequence"], anchor_before["head_sequence"])
 
     def test_readiness_refuses_before_any_effect_when_the_capsule_is_unavailable(self) -> None:
         # An unavailable capsule must refuse during readiness, never silently
@@ -356,7 +367,7 @@ class MaliciousGitConfigurationTests(unittest.TestCase):
 
     def _observe(self):
         return observe_git(
-            self.harness.workspace, phase="BEFORE_EFFECT", capsule=self.harness.binding.capsule
+            self.harness.workspace, self.harness.binding.root_fd, phase="BEFORE_EFFECT"
         )
 
     def test_a_repository_fsmonitor_program_is_never_executed(self) -> None:
@@ -410,7 +421,9 @@ class MaliciousGitConfigurationTests(unittest.TestCase):
         )
         observation = self._observe()
         self.assertFalse(self.marker.exists())
-        self.assertIn(observation.availability, ("OBSERVED", "GIT_COMMAND_FAILED"))
+        # There is no command to recurse with: the observer reads the repository.
+        self.assertEqual(observation.availability, "OBSERVED")
+        self.assertEqual(observation.observation_method, "NON_EXECUTING_REFS_INDEX_AND_OBJECTS")
 
     def test_the_observation_does_not_mutate_the_index_or_worktree(self) -> None:
         index = self.harness.workspace / ".git" / "index"
@@ -1244,7 +1257,7 @@ class DurableRunIndexTests(unittest.TestCase):
         self.harness = _Harness(condition="GOVERNED", run_id="run-index")
         self.addCleanup(self.harness.close)
 
-    def test_refused_proposals_are_indexed_alongside_effects(self) -> None:
+    def test_every_transition_of_every_proposal_is_indexed(self) -> None:
         grammar = self.harness.grammar
         self.harness.run(
             WriteFileRequest.create(tool_grammar_fingerprint=grammar, path="a.txt", content="a")
@@ -1256,14 +1269,46 @@ class DurableRunIndexTests(unittest.TestCase):
         self.harness.run(
             WriteFileRequest.create(tool_grammar_fingerprint=grammar, path="c.txt", content="c")
         )
-        entries = self.harness.substrate.run_index.load_all()
-        self.assertEqual([e.sequence for e in entries], [0, 1, 2])
+        index = self.harness.substrate.run_index
+        events = index.load_all()
+        self.assertEqual([event.sequence for event in events], list(range(len(events))))
+        # An effect-bearing proposal records every transition it made, and the
+        # proposal event is durable before the effect could have happened.
         self.assertEqual(
-            [e.outcome for e in entries],
+            [event.event_kind for event in index.events_for("proposal-1")],
+            [
+                "PROPOSAL_PUBLISHED",
+                "DECISION_PUBLISHED",
+                "RESERVATION_PUBLISHED",
+                "EFFECT_STARTED",
+                "TERMINAL_RECEIPT_PUBLISHED",
+                "RECONCILIATION_PUBLISHED",
+            ],
+        )
+        # A refused proposal is indexed too: the run attempted it.
+        self.assertEqual(
+            [event.event_kind for event in index.events_for("proposal-2")],
+            ["PROPOSAL_PUBLISHED", "DECISION_REFUSED"],
+        )
+        self.assertEqual(
+            [index.terminal_event_for(f"proposal-{n}").outcome for n in (1, 2, 3)],
             ["EFFECT_COMPLETED", "DECISION_REFUSED", "EFFECT_COMPLETED"],
         )
-        # The Milestone 2 index omitted refusals entirely.
-        self.assertFalse(entries[1].effect_crossed_boundary)
+        self.assertFalse(index.terminal_event_for("proposal-2").effect_crossed_boundary)
+        self.assertEqual(index.indexed_proposal_ids(), ("proposal-1", "proposal-2", "proposal-3"))
+        self.assertEqual(index.open_proposal_ids(), ())
+
+    def test_the_proposal_is_indexed_before_any_effect_is_possible(self) -> None:
+        # The ordering that makes a completed-but-unindexed effect impossible.
+        self.harness.run(
+            WriteFileRequest.create(
+                tool_grammar_fingerprint=self.harness.grammar, path="a.txt", content="a"
+            )
+        )
+        events = self.harness.substrate.run_index.events_for("proposal-1")
+        kinds = [event.event_kind for event in events]
+        self.assertLess(kinds.index("PROPOSAL_PUBLISHED"), kinds.index("EFFECT_STARTED"))
+        self.assertEqual(kinds[0], "PROPOSAL_PUBLISHED")
 
     def test_the_index_reconstructs_from_bytes_without_memory(self) -> None:
         grammar = self.harness.grammar
@@ -1274,9 +1319,9 @@ class DurableRunIndexTests(unittest.TestCase):
                 )
             )
         fresh = DurableRunIndex(DurableObjectStore(self.harness.store_root), "run-index")
-        entries = fresh.load_all()
-        self.assertEqual(len(entries), 2)
-        self.assertEqual(fresh.head_sequence(), 2)
+        self.assertEqual(fresh.indexed_proposal_ids(), ("proposal-1", "proposal-2"))
+        self.assertEqual(fresh.head_sequence(), len(fresh.load_all()))
+        self.assertEqual(fresh.state().state, "COMMITTED")
 
     def test_a_restart_cannot_silently_begin_with_an_empty_history(self) -> None:
         self.harness.run(
@@ -1285,7 +1330,7 @@ class DurableRunIndexTests(unittest.TestCase):
             )
         )
         restarted = DurableRunIndex(DurableObjectStore(self.harness.store_root), "run-index")
-        self.assertEqual(restarted.head_sequence(), 1)
+        self.assertEqual(restarted.indexed_proposal_ids(), ("proposal-1",))
         self.assertNotEqual(
             restarted.head_fingerprint().value,
             DurableRunIndex(
@@ -1293,7 +1338,10 @@ class DurableRunIndexTests(unittest.TestCase):
             ).head_fingerprint().value,
         )
 
-    def test_an_omitted_entry_is_detected(self) -> None:
+    def test_an_omitted_interior_entry_raises_instead_of_truncating(self) -> None:
+        # The audited defect and its shipped test: deleting entry 1 of [0, 1, 2]
+        # returned [0] and the test asserted that truncated length as success.
+        # The whole set of durable names is scanned now, so the gap is fatal.
         grammar = self.harness.grammar
         for name in ("a", "b", "c"):
             self.harness.run(
@@ -1301,14 +1349,87 @@ class DurableRunIndexTests(unittest.TestCase):
                     tool_grammar_fingerprint=grammar, path=f"{name}.txt", content=name
                 )
             )
+        index = DurableRunIndex(DurableObjectStore(self.harness.store_root), "run-index")
+        complete = len(index.load_all())
+        self.assertGreater(complete, 3)
         middle = self.harness.store_root / f"{RUN_INDEX_OBJECT_KIND}.run-index-00000001.json"
         payload = middle.read_bytes()
         middle.unlink()
-        index = DurableRunIndex(DurableObjectStore(self.harness.store_root), "run-index")
-        # A gap truncates the chain, so the omission cannot pass as a shorter run.
-        self.assertEqual(len(index.load_all()), 1)
+        with self.assertRaises(RunIndexBroken) as caught:
+            index.load_all()
+        self.assertIn("not contiguous", str(caught.exception))
         middle.write_bytes(payload)
-        self.assertEqual(len(index.load_all()), 3)
+        self.assertEqual(len(index.load_all()), complete)
+
+    def test_a_deleted_tail_entry_is_detected_against_the_committed_head(self) -> None:
+        self.harness.run(
+            WriteFileRequest.create(
+                tool_grammar_fingerprint=self.harness.grammar, path="a.txt", content="a"
+            )
+        )
+        index = DurableRunIndex(DurableObjectStore(self.harness.store_root), "run-index")
+        top = index.load_all()[-1]
+        tail = (
+            self.harness.store_root
+            / f"{RUN_INDEX_OBJECT_KIND}.run-index-{top.sequence:08d}.json"
+        )
+        payload = tail.read_bytes()
+        tail.unlink()
+        # Without a committed head this is indistinguishable from a shorter run.
+        with self.assertRaises(RunIndexBroken) as caught:
+            index.load_all()
+        self.assertIn("committed head", str(caught.exception))
+        tail.write_bytes(payload)
+        index.load_all()
+
+    def test_a_surplus_entry_beyond_the_head_is_detected(self) -> None:
+        self.harness.run(
+            WriteFileRequest.create(
+                tool_grammar_fingerprint=self.harness.grammar, path="a.txt", content="a"
+            )
+        )
+        index = DurableRunIndex(DurableObjectStore(self.harness.store_root), "run-index")
+        top = index.load_all()[-1]
+        source = (
+            self.harness.store_root
+            / f"{RUN_INDEX_OBJECT_KIND}.run-index-{top.sequence:08d}.json"
+        )
+        surplus = (
+            self.harness.store_root
+            / f"{RUN_INDEX_OBJECT_KIND}.run-index-{top.sequence + 4:08d}.json"
+        )
+        surplus.write_bytes(source.read_bytes())
+        with self.assertRaises(RunIndexBroken):
+            index.load_all()
+
+    def test_a_missing_committed_head_fails_closed(self) -> None:
+        self.harness.run(
+            WriteFileRequest.create(
+                tool_grammar_fingerprint=self.harness.grammar, path="a.txt", content="a"
+            )
+        )
+        anchor = self.harness.store_root / f"{RUN_INDEX_ANCHOR_KIND}.run-index.json"
+        anchor.unlink()
+        index = DurableRunIndex(DurableObjectStore(self.harness.store_root), "run-index")
+        with self.assertRaises(RunIndexBroken):
+            index.load_all()
+
+    def test_a_head_that_outruns_its_events_fails_closed(self) -> None:
+        self.harness.run(
+            WriteFileRequest.create(
+                tool_grammar_fingerprint=self.harness.grammar, path="a.txt", content="a"
+            )
+        )
+        index = DurableRunIndex(DurableObjectStore(self.harness.store_root), "run-index")
+        events = index.load_all()
+        # Remove the two newest events but leave the head where it was.
+        for event in events[-2:]:
+            (
+                self.harness.store_root
+                / f"{RUN_INDEX_OBJECT_KIND}.run-index-{event.sequence:08d}.json"
+            ).unlink()
+        with self.assertRaises(RunIndexBroken):
+            index.load_all()
 
     def test_a_reordered_entry_breaks_the_chain(self) -> None:
         grammar = self.harness.grammar
@@ -1348,18 +1469,35 @@ class DurableRunIndexTests(unittest.TestCase):
                 tool_grammar_fingerprint=self.harness.grammar, path="a.txt", content="a"
             )
         )
-        entry = index.load_all()[0]
+        event = index.load_all()[0]
         with self.assertRaises(RunIndexBroken):
-            index.append(
-                condition_id=entry.condition_id,
-                session_id=entry.session_id,
-                turn_id=entry.turn_id,
-                proposal_id=entry.proposal_id,
-                proposal_fingerprint=entry.proposal_fingerprint,
-                decision_value=entry.decision_value,
-                decision_permits_effect=entry.decision_permits_effect,
-                outcome=entry.outcome,
-                effect_crossed_boundary=entry.effect_crossed_boundary,
+            index.append_event(
+                event_kind="PROPOSAL_PUBLISHED",
+                condition_id=event.condition_id,
+                session_id=event.session_id,
+                turn_id=event.turn_id,
+                proposal_id=event.proposal_id,
+                proposal_fingerprint=event.proposal_fingerprint,
+            )
+
+    def test_an_event_for_an_unindexed_proposal_is_refused(self) -> None:
+        index = self.harness.substrate.run_index
+        self.harness.run(
+            WriteFileRequest.create(
+                tool_grammar_fingerprint=self.harness.grammar, path="a.txt", content="a"
+            )
+        )
+        event = index.load_all()[0]
+        with self.assertRaises(RunIndexBroken):
+            index.append_event(
+                event_kind="DECISION_PUBLISHED",
+                condition_id=event.condition_id,
+                session_id=event.session_id,
+                turn_id=event.turn_id,
+                proposal_id="proposal-never-indexed",
+                proposal_fingerprint=event.proposal_fingerprint,
+                decision_value="DIRECT_EXECUTION",
+                decision_permits_effect=True,
             )
 
     def test_the_index_is_provider_free_and_single_session(self) -> None:

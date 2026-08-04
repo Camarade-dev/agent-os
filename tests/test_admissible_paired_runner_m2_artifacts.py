@@ -19,6 +19,7 @@ from admissible.paired_runner.durable_store import FAULT_POINTS  # noqa: E402
 from admissible.paired_runner.effect_ledger import M2_LEDGER_SCHEMAS  # noqa: E402
 from admissible.paired_runner.observation import M2_OBSERVATION_SCHEMAS  # noqa: E402
 from admissible.paired_runner.reconciliation import M2_RECONCILIATION_SCHEMAS  # noqa: E402
+from admissible.paired_runner.capsule_identity import M2_CAPSULE_IDENTITY_SCHEMAS  # noqa: E402
 from admissible.paired_runner.run_index import M2_RUN_INDEX_SCHEMAS  # noqa: E402
 from admissible.paired_runner.schemas import SCHEMA_CATALOG  # noqa: E402
 
@@ -27,11 +28,19 @@ ROOT = Path(__file__).resolve().parents[1]
 IMPLEMENTATION = ROOT / "implementation"
 M1_STARTING_COMMIT = "5b5c3874f1929e77dbc3e2f71aa7f26d675a2705"
 M2_STARTING_COMMIT = "096dfbeb8845aaeda4c24f19e13fd144ceea4bfb"
+M2_SECOND_STARTING_COMMIT = "6383f765520e3d98c7359118704d063b6aa39b52"
+M2_SECOND_BRANCH = "paired-runner/m2-causal-index-and-ipc-repairs"
 M2_ARTIFACTS = (
     "M2_CUMULATIVE_SCHEMA_CATALOG.json",
     "M2_CRASH_MATRIX.json",
     "M2_OUTPUT_SOAK_REPORT.json",
     "M2_VALIDATION_REPORT.json",
+    "M2_CRITICAL_REPAIR_REPORT.json",
+    "M2_SECOND_CRITICAL_REPAIR_REPORT.json",
+)
+#: Historical reports of earlier passes.  A later pass may not rewrite them: the
+#: record of what an earlier closure claimed is itself evidence.
+PRESERVED_HISTORICAL_ARTIFACTS = (
     "M2_CRITICAL_REPAIR_REPORT.json",
 )
 PRESERVED_M1_ARTIFACTS = (
@@ -70,17 +79,18 @@ class M2ArtifactTests(unittest.TestCase):
             + [item.to_dict() for item in M2_LEDGER_SCHEMAS.values()]
             + [item.to_dict() for item in M2_RECONCILIATION_SCHEMAS.values()]
             + [item.to_dict() for item in M2_RUN_INDEX_SCHEMAS.values()]
+            + [item.to_dict() for item in M2_CAPSULE_IDENTITY_SCHEMAS.values()]
         )
         self.assertEqual(catalog["milestone_2_schemas"], expected_m2)
         self.assertEqual(catalog["milestone_1_schema_count"], 29)
-        self.assertEqual(catalog["milestone_2_schema_count"], 11)
-        self.assertEqual(catalog["cumulative_schema_count"], 40)
+        self.assertEqual(catalog["milestone_2_schema_count"], 13)
+        self.assertEqual(catalog["cumulative_schema_count"], 42)
         self.assertEqual(catalog["milestone_2_schema_version"], 2)
         self.assertIn("preserved unchanged", catalog["migration_note"])
 
     def test_the_crash_matrix_artifact_matches_the_declared_test_table(self) -> None:
         matrix = parse_canonical_json((IMPLEMENTATION / "M2_CRASH_MATRIX.json").read_bytes())
-        self.assertEqual(matrix["fault_point_count"], 19)
+        self.assertEqual(matrix["fault_point_count"], 25)
         self.assertEqual(len(matrix["rows"]), len(CRASH_MATRIX))
         self.assertEqual(
             [row["fault_point"] for row in matrix["rows"]],
@@ -94,15 +104,16 @@ class M2ArtifactTests(unittest.TestCase):
             self.assertFalse(row["replay_permitted"])
             self.assertFalse(row["duplicate_effect"])
             self.assertFalse(row["false_completed_state"])
+            self.assertEqual(row["run_index_state"], expectation.index_state)
         self.assertEqual(matrix["corruption_fixture_count"], len(CORRUPTION_TARGETS) * 2)
         self.assertEqual(matrix["corruption_fixture_count"], 24)
 
     def test_the_validation_report_records_the_exact_counts_and_verdict(self) -> None:
         report = parse_canonical_json((IMPLEMENTATION / "M2_VALIDATION_REPORT.json").read_bytes())
-        self.assertEqual(report["starting_commit"], M2_STARTING_COMMIT)
-        self.assertEqual(report["branch"], "paired-runner/m2-critical-repairs")
-        self.assertEqual(report["terminal_verdict"], "M2_CRITICAL_REPAIRS_VERIFIED")
-        self.assertEqual(report["crash_point_count"], 19)
+        self.assertEqual(report["starting_commit"], M2_SECOND_STARTING_COMMIT)
+        self.assertEqual(report["branch"], M2_SECOND_BRANCH)
+        self.assertEqual(report["terminal_verdict"], "M2_SECOND_CRITICAL_REPAIRS_VERIFIED")
+        self.assertEqual(report["crash_point_count"], 25)
         self.assertEqual(report["corruption_fixture_count"], 24)
         self.assertFalse(report["boundary_audit"]["milestone_3_started"])
         for boundary, crossed in report["boundary_audit"].items():
@@ -132,6 +143,42 @@ class M2ArtifactTests(unittest.TestCase):
         self.assertFalse(report["sandbox"]["evidence_root_exposed"])
         self.assertTrue(report["known_limitations"])
 
+    def test_the_second_repair_report_closes_every_remaining_finding(self) -> None:
+        report = parse_canonical_json(
+            (IMPLEMENTATION / "M2_SECOND_CRITICAL_REPAIR_REPORT.json").read_bytes()
+        )
+        self.assertEqual(report["starting_commit"], M2_SECOND_STARTING_COMMIT)
+        self.assertEqual(report["branch"], M2_SECOND_BRANCH)
+        self.assertEqual(report["terminal_verdict"], "M2_SECOND_CRITICAL_REPAIRS_VERIFIED")
+        findings = {row["finding"]: row for row in report["findings"]}
+        self.assertEqual(
+            sorted(findings),
+            ["M2-B12", "M2-B13", "M2-B14", "M2-B15", "M2-B16", "M2-M17", "M2-M18", "M2-M19", "M2-M20"],
+        )
+        for name, row in findings.items():
+            with self.subTest(finding=name):
+                self.assertEqual(row["status"], "CLOSED")
+                self.assertTrue(row["reproduction"])
+                self.assertTrue(row["closure"])
+                self.assertTrue(row["evidence"])
+        self.assertFalse(report["boundary_audit"]["milestone_3_started"])
+        for boundary, crossed in report["boundary_audit"].items():
+            self.assertFalse(crossed, boundary)
+        for record in report["requirement_dispositions"]:
+            self.assertNotEqual(record["status"], "VERIFIED_INSTALLED_PATH")
+        self.assertTrue(report["known_limitations"])
+
+    def test_the_historical_repair_report_is_preserved_byte_for_byte(self) -> None:
+        for name in PRESERVED_HISTORICAL_ARTIFACTS:
+            with self.subTest(artifact=name):
+                committed = subprocess.run(
+                    ["git", "show", f"HEAD:implementation/{name}"],
+                    cwd=ROOT,
+                    check=True,
+                    capture_output=True,
+                ).stdout
+                self.assertEqual((IMPLEMENTATION / name).read_bytes(), committed)
+
     def test_the_milestone_1_artifacts_are_preserved_byte_for_byte(self) -> None:
         for name in PRESERVED_M1_ARTIFACTS:
             with self.subTest(artifact=name):
@@ -154,14 +201,18 @@ class M2ArtifactTests(unittest.TestCase):
                 "__init__.py",
                 "_capsule_init.py",
                 "canonical.py",
+                "capsule_identity.py",
+                "capsule_seccomp.py",
                 "comparison.py",
                 "durable_store.py",
+                "git_observer.py",
                 "effect_ledger.py",
                 "effects.py",
                 "identities.py",
                 "observation.py",
                 "process_supervision.py",
                 "reconciliation.py",
+                "resource_limits.py",
                 "run_index.py",
                 "sandbox.py",
                 "schemas.py",

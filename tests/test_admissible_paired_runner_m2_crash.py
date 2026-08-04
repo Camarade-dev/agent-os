@@ -46,6 +46,12 @@ from admissible.paired_runner.durable_store import (
     FAULT_DURING_PROPOSAL_TEMP_WRITE,
     FAULT_DURING_RECONCILIATION_PUBLICATION,
     FAULT_DURING_TERMINAL_RECEIPT_PUBLICATION,
+    FAULT_AFTER_INDEX_ANCHOR_COMMIT_BEFORE_DIR_FSYNC,
+    FAULT_AFTER_INDEX_ANCHOR_FSYNC_BEFORE_COMMIT,
+    FAULT_AFTER_INDEX_EVENT_BEFORE_ANCHOR,
+    FAULT_BEFORE_INDEX_EVENT_PUBLICATION,
+    FAULT_DURING_INDEX_ANCHOR_WRITE,
+    FAULT_DURING_INDEX_EVENT_PUBLICATION,
     FAULT_POINTS,
     DurableObjectStore,
     FaultInjector,
@@ -65,7 +71,9 @@ from admissible.paired_runner.effects import (  # noqa: E402
     SharedEffectSubstrate,
     WorkspaceBinding,
     reconcile_effect,
+    recover_run_index,
 )
+from admissible.paired_runner.run_index import DurableRunIndex  # noqa: E402
 from admissible.paired_runner.observation import observation_from_dict  # noqa: E402
 from admissible.paired_runner.specification import (  # noqa: E402
     CanonicalProposal,
@@ -96,93 +104,129 @@ class CrashExpectation:
     effect_may_have_occurred: bool
     partial_publication_expected: bool
     workspace_mutated: bool
+    #: The declared state of the durable run index after this crash.  It is
+    #: stated literally here, never read back from the implementation.
+    index_state: str
 
 
 CRASH_MATRIX: tuple[CrashExpectation, ...] = (
     CrashExpectation(
         FAULT_BEFORE_PROPOSAL_PUBLICATION,
-        False, False, False, False, False, 0, "NO_DURABLE_STATE", False, False, False,
+        False, False, False, False, False, 0, "NO_DURABLE_STATE", False, False, False, "EMPTY",
     ),
     CrashExpectation(
         FAULT_DURING_PROPOSAL_TEMP_WRITE,
-        False, False, False, False, False, 0, "NO_DURABLE_STATE", False, True, False,
+        False, False, False, False, False, 0, "NO_DURABLE_STATE", False, True, False, "EMPTY",
     ),
     CrashExpectation(
         FAULT_AFTER_PROPOSAL_FSYNC_BEFORE_RENAME,
-        False, False, False, False, False, 0, "NO_DURABLE_STATE", False, True, False,
+        False, False, False, False, False, 0, "NO_DURABLE_STATE", False, True, False, "EMPTY",
     ),
     CrashExpectation(
         FAULT_AFTER_PROPOSAL_RENAME_BEFORE_DIR_FSYNC,
-        True, False, False, False, False, 0, "PROPOSAL_ONLY_NO_EFFECT_POSSIBLE", False, True, False,
+        True, False, False, False, False, 0, "PROPOSAL_ONLY_NO_EFFECT_POSSIBLE", False, True, False, "EMPTY",
     ),
     CrashExpectation(
         FAULT_AFTER_PROPOSAL_PUBLICATION,
-        True, False, False, False, False, 0, "PROPOSAL_ONLY_NO_EFFECT_POSSIBLE", False, False, False,
+        True, False, False, False, False, 0, "PROPOSAL_ONLY_NO_EFFECT_POSSIBLE", False, False, False, "COMMITTED",
     ),
     CrashExpectation(
         FAULT_BEFORE_RESERVATION_PUBLICATION,
-        True, False, False, False, False, 0, "PROPOSAL_ONLY_NO_EFFECT_POSSIBLE", False, False, False,
+        True, False, False, False, False, 0, "PROPOSAL_ONLY_NO_EFFECT_POSSIBLE", False, False, False, "COMMITTED",
     ),
     CrashExpectation(
         FAULT_AFTER_RESERVATION_PUBLICATION,
-        True, True, False, False, False, 0, "RESERVED_NO_EFFECT_POSSIBLE", False, False, False,
+        True, True, False, False, False, 0, "RESERVED_NO_EFFECT_POSSIBLE", False, False, False, "COMMITTED",
     ),
     CrashExpectation(
         FAULT_BEFORE_STARTED_PUBLICATION,
-        True, True, False, False, False, 0, "RESERVED_NO_EFFECT_POSSIBLE", False, False, False,
+        True, True, False, False, False, 0, "RESERVED_NO_EFFECT_POSSIBLE", False, False, False, "COMMITTED",
     ),
     CrashExpectation(
         FAULT_AFTER_STARTED_BEFORE_EFFECT,
         True, True, True, False, False, 0,
-        "STARTED_AMBIGUOUS_EFFECT_REQUIRES_RECONCILIATION", True, False, False,
+        "STARTED_AMBIGUOUS_EFFECT_REQUIRES_RECONCILIATION", True, False, False, "COMMITTED",
     ),
     CrashExpectation(
         FAULT_AFTER_EFFECT_BEFORE_TERMINAL_RECEIPT,
         True, True, True, False, False, 1,
-        "STARTED_AMBIGUOUS_EFFECT_REQUIRES_RECONCILIATION", True, False, True,
+        "STARTED_AMBIGUOUS_EFFECT_REQUIRES_RECONCILIATION", True, False, True, "COMMITTED",
     ),
     CrashExpectation(
         FAULT_DURING_TERMINAL_RECEIPT_PUBLICATION,
         True, True, True, False, False, 1,
-        "STARTED_AMBIGUOUS_EFFECT_REQUIRES_RECONCILIATION", True, True, True,
+        "STARTED_AMBIGUOUS_EFFECT_REQUIRES_RECONCILIATION", True, True, True, "COMMITTED",
     ),
     CrashExpectation(
         FAULT_AFTER_TERMINAL_RECEIPT_BEFORE_RECONCILIATION,
         True, True, True, True, False, 1,
-        "TERMINAL_RECEIPT_DURABLE_RECONCILIATION_INCOMPLETE", True, False, True,
+        "TERMINAL_RECEIPT_DURABLE_RECONCILIATION_INCOMPLETE", True, False, True, "COMMITTED",
     ),
     CrashExpectation(
         FAULT_DURING_RECONCILIATION_PUBLICATION,
-        True, True, True, True, True, 1, "RECONCILED_COMPLETE", True, True, True,
+        True, True, True, True, True, 1, "RECONCILED_COMPLETE", True, True, True, "COMMITTED",
     ),
     # --- Milestone 2 critical-repair fault points ---------------------------
     CrashExpectation(
         FAULT_OBSERVER_FAILURE_AFTER_STARTED,
         True, True, True, False, False, 0,
-        "STARTED_AMBIGUOUS_EFFECT_REQUIRES_RECONCILIATION", True, False, False,
+        "STARTED_AMBIGUOUS_EFFECT_REQUIRES_RECONCILIATION", True, False, False, "COMMITTED",
     ),
     CrashExpectation(
         FAULT_SANDBOX_SUPERVISOR_DEATH,
         True, True, True, False, False, 0,
-        "STARTED_AMBIGUOUS_EFFECT_REQUIRES_RECONCILIATION", True, False, False,
+        "STARTED_AMBIGUOUS_EFFECT_REQUIRES_RECONCILIATION", True, False, False, "COMMITTED",
     ),
     CrashExpectation(
         FAULT_AFTER_EFFECT_BEFORE_AFTER_OBSERVATIONS,
         True, True, True, False, False, 1,
-        "STARTED_AMBIGUOUS_EFFECT_REQUIRES_RECONCILIATION", True, False, True,
+        "STARTED_AMBIGUOUS_EFFECT_REQUIRES_RECONCILIATION", True, False, True, "COMMITTED",
     ),
     CrashExpectation(
         FAULT_DURING_LEDGER_PENDING_PUBLICATION,
         True, True, True, True, False, 1,
-        "TERMINAL_RECEIPT_DURABLE_RECONCILIATION_INCOMPLETE", True, True, True,
+        "TERMINAL_RECEIPT_DURABLE_RECONCILIATION_INCOMPLETE", True, True, True, "COMMITTED",
     ),
     CrashExpectation(
         FAULT_BEFORE_FINAL_RECONCILIATION,
-        True, True, True, True, True, 1, "RECONCILED_COMPLETE", True, False, True,
+        True, True, True, True, True, 1, "RECONCILED_COMPLETE", True, False, True, "COMMITTED",
     ),
     CrashExpectation(
         FAULT_DURING_FINAL_RECONCILIATION_PUBLICATION,
-        True, True, True, True, True, 1, "RECONCILED_COMPLETE", True, True, True,
+        True, True, True, True, True, 1, "RECONCILED_COMPLETE", True, True, True, "COMMITTED",
+    ),
+    # --- run-index event and committed-head publication boundaries -----------
+    # Each of these fires on the very first index append, which is the proposal
+    # event.  The proposal object is already durable at that point, so these rows
+    # also demonstrate that a durable proposal with no index event is a state the
+    # substrate can be *in*, and one recovery closes without replaying anything.
+    CrashExpectation(
+        FAULT_BEFORE_INDEX_EVENT_PUBLICATION,
+        True, False, False, False, False, 0, "PROPOSAL_ONLY_NO_EFFECT_POSSIBLE", False, False, False, "EMPTY",
+    ),
+    CrashExpectation(
+        FAULT_DURING_INDEX_EVENT_PUBLICATION,
+        True, False, False, False, False, 0, "PROPOSAL_ONLY_NO_EFFECT_POSSIBLE", False, True, False, "EMPTY",
+    ),
+    CrashExpectation(
+        FAULT_AFTER_INDEX_EVENT_BEFORE_ANCHOR,
+        True, False, False, False, False, 0,
+        "PROPOSAL_ONLY_NO_EFFECT_POSSIBLE", False, False, False, "HEAD_UPDATE_PENDING",
+    ),
+    CrashExpectation(
+        FAULT_DURING_INDEX_ANCHOR_WRITE,
+        True, False, False, False, False, 0,
+        "PROPOSAL_ONLY_NO_EFFECT_POSSIBLE", False, True, False, "HEAD_UPDATE_PENDING",
+    ),
+    CrashExpectation(
+        FAULT_AFTER_INDEX_ANCHOR_FSYNC_BEFORE_COMMIT,
+        True, False, False, False, False, 0,
+        "PROPOSAL_ONLY_NO_EFFECT_POSSIBLE", False, True, False, "HEAD_UPDATE_PENDING",
+    ),
+    CrashExpectation(
+        FAULT_AFTER_INDEX_ANCHOR_COMMIT_BEFORE_DIR_FSYNC,
+        True, False, False, False, False, 0,
+        "PROPOSAL_ONLY_NO_EFFECT_POSSIBLE", False, False, False, "COMMITTED",
     ),
 )
 
@@ -233,7 +277,7 @@ class CrashMatrixTests(unittest.TestCase):
         declared = tuple(expectation.point for expectation in CRASH_MATRIX)
         self.assertEqual(len(set(declared)), len(declared))
         self.assertEqual(set(declared), set(FAULT_POINTS))
-        self.assertEqual(len(CRASH_MATRIX), 19)
+        self.assertEqual(len(CRASH_MATRIX), 25)
 
     def test_fault_points(self) -> None:
         for expectation in CRASH_MATRIX:
@@ -263,6 +307,23 @@ class CrashMatrixTests(unittest.TestCase):
         self.assertEqual(
             (harness.disposable.workspace / TARGET_FILE).exists(), expectation.workspace_mutated
         )
+
+        # The durable index has an explicit, declared state after every crash;
+        # a state this table does not name is a failure, not a detail.
+        index = DurableRunIndex(DurableObjectStore(harness.disposable.store_root), "run-crash")
+        self.assertEqual(index.state().state, expectation.index_state)
+        if expectation.index_state == "HEAD_UPDATE_PENDING":
+            # The pending head is over an already-durable, already-chained event,
+            # so recovery advances the head and replays nothing at all.
+            recovery = recover_run_index(
+                DurableObjectStore(harness.disposable.store_root), "run-crash"
+            )
+            self.assertFalse(recovery.replayed_any_effect)
+            self.assertEqual(index.state().state, "COMMITTED")
+            self.assertEqual(harness.substrate.effect_invocation_count, expectation.effect_invocations)
+            self.assertEqual(
+                (harness.disposable.workspace / TARGET_FILE).exists(), expectation.workspace_mutated
+            )
 
         report = reconcile_effect(store, run_id="run-crash", proposal_id=PROPOSAL_ID)
         self.assertEqual(report.classification, expectation.classification)
@@ -484,7 +545,7 @@ class CorruptionFixtureTests(unittest.TestCase):
             store = self._completed_store(disposable)
             specification = build_specification("GOVERNED", run_id="run-corrupt")
             ledger = RunEffectLedger.verify(
-                store, "run-corrupt", (PROPOSAL_ID,), specification=specification
+                store, "run-corrupt", specification=specification
             )
             self.assertEqual(len(ledger.entries), 1)
             # A ledger entry never asserts its own reconciliation; it is durable
@@ -499,7 +560,7 @@ class CorruptionFixtureTests(unittest.TestCase):
             path.write_bytes(canonical_bytes(payload))
             with self.assertRaises(Exception):
                 RunEffectLedger.verify(
-                    store, "run-corrupt", (PROPOSAL_ID,), specification=specification
+                    store, "run-corrupt", specification=specification
                 )
 
     def test_ledger_verification_fails_when_a_referenced_object_is_deleted(self) -> None:
@@ -508,22 +569,22 @@ class CorruptionFixtureTests(unittest.TestCase):
         with DisposableWorkspace() as disposable:
             store = self._completed_store(disposable)
             specification = build_specification("GOVERNED", run_id="run-corrupt")
-            RunEffectLedger.verify(store, "run-corrupt", (PROPOSAL_ID,), specification=specification)
+            RunEffectLedger.verify(store, "run-corrupt", specification=specification)
             store.path_of(OBJECT_KIND_RECEIPT, PROPOSAL_ID).unlink()
             with self.assertRaises(Exception):
                 RunEffectLedger.verify(
-                    store, "run-corrupt", (PROPOSAL_ID,), specification=specification
+                    store, "run-corrupt", specification=specification
                 )
 
     def test_reconciliation_requires_the_exact_specification_or_its_fingerprint(self) -> None:
         with DisposableWorkspace() as disposable:
             store = self._completed_store(disposable)
             with self.assertRaises(Exception):
-                RunEffectLedger.verify(store, "run-corrupt", (PROPOSAL_ID,))
+                RunEffectLedger.verify(store, "run-corrupt")
             foreign = build_specification("GOVERNED", run_id="run-elsewhere")
             with self.assertRaises(Exception):
                 RunEffectLedger.verify(
-                    store, "run-corrupt", (PROPOSAL_ID,), specification=foreign
+                    store, "run-corrupt", specification=foreign
                 )
 
 

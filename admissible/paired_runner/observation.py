@@ -69,17 +69,35 @@ AVAILABILITY_VALUES = (
     "NOT_MEASURED",
 )
 
+#: Git availability.  Every value here is reachable *without executing any
+#: program*: the repaired observer parses refs, the index, and object storage
+#: directly, so there is no "command failed" state to report.  A repository this
+#: observer cannot fully determine fails closed into an explicit named state
+#: rather than falling back to running ``git``.
 GIT_AVAILABILITY_VALUES = (
     "OBSERVED",
     "REPOSITORY_ABSENT",
-    "GIT_EXECUTABLE_UNAVAILABLE",
-    "GIT_COMMAND_FAILED",
     # Git is process-capable, so it is never run before the proposal is durable.
     # A pre-proposal binding records this instead of executing anything.
     "NOT_OBSERVED_BEFORE_DURABLE_PROPOSAL",
-    # The capsule that would confine the observer is unavailable, so no Git
-    # process is started at all.
-    "GIT_SANDBOX_UNAVAILABLE",
+    # The repository declares a content conversion (a clean/smudge/process
+    # filter, text/eol normalisation, ident, or a working-tree encoding).  The
+    # worktree-to-blob mapping is then defined by a repository-selected program,
+    # which this observer will not execute, so the comparison fails closed.
+    "GIT_CONVERSION_REQUIRED",
+    # A layout this observer does not parse: a ``.git`` file rather than a
+    # directory, or an index version whose entries are not exactly decodable.
+    "GIT_REPOSITORY_UNSUPPORTED_LAYOUT",
+    # Refs, the index, or an object store entry could not be read or did not
+    # verify.  Nothing is guessed.
+    "GIT_METADATA_UNREADABLE",
+)
+
+#: How a Git observation was produced.  There is exactly one producing method
+#: and it starts no process.
+GIT_OBSERVATION_METHODS = (
+    "NON_EXECUTING_REFS_INDEX_AND_OBJECTS",
+    "NOT_OBSERVED",
 )
 
 TEXT_DECODE_STATUSES = (
@@ -115,6 +133,34 @@ FILESYSTEM_COMPLETENESS_VALUES = (
     "INCOMPLETE_OBSERVATION_ERROR",
     "UNAVAILABLE",
 )
+
+#: The mechanism that actually bounded the untrusted process domain.  A PID
+#: namespace is a naming boundary, not a quota, so this is recorded separately
+#: from the isolation contract.
+CONTAINMENT_MECHANISM_VALUES = (
+    "CGROUP_V2_AND_RLIMIT",
+    "RLIMIT",
+    "NONE",
+)
+
+#: Inode kinds a workspace scan distinguishes.  The three IPC-capable kinds are
+#: named individually because "other" is exactly the ambiguity that let a
+#: pathname Unix socket be recorded as an ordinary anomaly.
+FILESYSTEM_ENTRY_KINDS = (
+    "directory",
+    "regular_file",
+    "symlink",
+    "socket",
+    "fifo",
+    "block_device",
+    "character_device",
+    "other",
+)
+
+#: Entry kinds that are host-backed IPC endpoints or device nodes.  None may be
+#: present in a workspace when a process is started inside the capsule, and none
+#: may appear as a result of an effect.
+IPC_ENDPOINT_KINDS = ("socket", "fifo", "block_device", "character_device", "other")
 
 
 class ObservationError(ValueError):
@@ -377,14 +423,18 @@ class FilesystemObservation(_M2Record):
         "content_hashed_file_count",
         "error_count",
         "errors",
+        "ipc_endpoint_count",
+        "ipc_endpoints",
     )
     ENCODERS: ClassVar[dict[str, Callable[[Any], Any]]] = {
         "tree_fingerprint": _encode_fp,
         "errors": _encode_strings,
+        "ipc_endpoints": _encode_strings,
     }
     DECODERS: ClassVar[dict[str, Callable[[Any], Any]]] = {
         "tree_fingerprint": _decode_fp,
         "errors": _decode_strings,
+        "ipc_endpoints": _decode_strings,
     }
 
     phase: str
@@ -397,6 +447,8 @@ class FilesystemObservation(_M2Record):
     content_hashed_file_count: int
     error_count: int
     errors: tuple[str, ...]
+    ipc_endpoint_count: int
+    ipc_endpoints: tuple[str, ...]
     record_fingerprint: Fingerprint
 
     @classmethod
@@ -413,6 +465,8 @@ class FilesystemObservation(_M2Record):
         content_hashed_file_count: int = 0,
         error_count: int = 0,
         errors: tuple[str, ...] = (),
+        ipc_endpoint_count: int = 0,
+        ipc_endpoints: tuple[str, ...] = (),
     ) -> "FilesystemObservation":
         return cls._new(
             phase=phase,
@@ -425,6 +479,8 @@ class FilesystemObservation(_M2Record):
             content_hashed_file_count=content_hashed_file_count,
             error_count=error_count,
             errors=errors,
+            ipc_endpoint_count=ipc_endpoint_count,
+            ipc_endpoints=ipc_endpoints,
         )
 
     @property
@@ -459,6 +515,15 @@ class FilesystemObservation(_M2Record):
             raise ObservationError(
                 "an incomplete filesystem observation must not claim the OBSERVED availability"
             )
+        _require_int(self.ipc_endpoint_count, "ipc_endpoint_count")
+        _encode_strings(self.ipc_endpoints)
+        for entry in self.ipc_endpoints:
+            _require_text(entry, "workspace ipc endpoint", max_bytes=1024)
+        # Every IPC endpoint is named, never merely counted: a pathname Unix
+        # socket, a FIFO, and a device node are each a host-backed bridge across
+        # the capsule boundary, so the durable record identifies which.
+        if self.ipc_endpoint_count != len(self.ipc_endpoints):
+            raise ObservationError("every workspace IPC endpoint must be recorded, not counted only")
 
 
 @dataclass(frozen=True)
@@ -476,6 +541,16 @@ class GitObservation(_M2Record):
         "worktree_dirty",
         "untracked_present",
         "status_fingerprint",
+        "observation_method",
+        "head_reference",
+        "index_entry_count",
+        "staged_change_count",
+        "modified_entry_count",
+        "missing_entry_count",
+        "untracked_entry_count",
+        "unmerged_entry_count",
+        "untracked_semantics",
+        "refusal_reason",
     )
     ENCODERS: ClassVar[dict[str, Callable[[Any], Any]]] = {"status_fingerprint": _encode_optional_fp}
     DECODERS: ClassVar[dict[str, Callable[[Any], Any]]] = {"status_fingerprint": _decode_optional_fp}
@@ -488,6 +563,16 @@ class GitObservation(_M2Record):
     worktree_dirty: bool | None
     untracked_present: bool | None
     status_fingerprint: Fingerprint | None
+    observation_method: str
+    head_reference: str | None
+    index_entry_count: int | None
+    staged_change_count: int | None
+    modified_entry_count: int | None
+    missing_entry_count: int | None
+    untracked_entry_count: int | None
+    unmerged_entry_count: int | None
+    untracked_semantics: str | None
+    refusal_reason: str | None
     record_fingerprint: Fingerprint
 
     @classmethod
@@ -502,6 +587,16 @@ class GitObservation(_M2Record):
         worktree_dirty: bool | None = None,
         untracked_present: bool | None = None,
         status_fingerprint: Fingerprint | None = None,
+        observation_method: str = "NOT_OBSERVED",
+        head_reference: str | None = None,
+        index_entry_count: int | None = None,
+        staged_change_count: int | None = None,
+        modified_entry_count: int | None = None,
+        missing_entry_count: int | None = None,
+        untracked_entry_count: int | None = None,
+        unmerged_entry_count: int | None = None,
+        untracked_semantics: str | None = None,
+        refusal_reason: str | None = None,
     ) -> "GitObservation":
         return cls._new(
             phase=phase,
@@ -512,27 +607,69 @@ class GitObservation(_M2Record):
             worktree_dirty=worktree_dirty,
             untracked_present=untracked_present,
             status_fingerprint=status_fingerprint,
+            observation_method=observation_method,
+            head_reference=head_reference,
+            index_entry_count=index_entry_count,
+            staged_change_count=staged_change_count,
+            modified_entry_count=modified_entry_count,
+            missing_entry_count=missing_entry_count,
+            untracked_entry_count=untracked_entry_count,
+            unmerged_entry_count=unmerged_entry_count,
+            untracked_semantics=untracked_semantics,
+            refusal_reason=refusal_reason,
         )
 
     def _validate_fields(self) -> None:
         _require_member(self.phase, ("INITIAL", "BEFORE_EFFECT", "AFTER_EFFECT"), "git observation phase")
         _require_member(self.availability, GIT_AVAILABILITY_VALUES, "git availability")
+        _require_member(self.observation_method, GIT_OBSERVATION_METHODS, "git observation method")
         _require_bool(self.repository_present, "repository_present")
+        counted = (
+            "index_entry_count",
+            "staged_change_count",
+            "modified_entry_count",
+            "missing_entry_count",
+            "untracked_entry_count",
+            "unmerged_entry_count",
+        )
         if self.availability == "OBSERVED":
             if not self.repository_present:
                 raise ObservationError("an observed git status requires a present repository")
+            if self.observation_method != "NON_EXECUTING_REFS_INDEX_AND_OBJECTS":
+                raise ObservationError("an observed git status is produced only by the non-executing observer")
             _require_text(self.head_commit, "head_commit", max_bytes=128)
             for name in ("index_dirty", "worktree_dirty", "untracked_present"):
                 _require_bool(getattr(self, name), name)
+            for name in counted:
+                _require_int(getattr(self, name), name)
+            _require_text(self.untracked_semantics, "untracked_semantics", max_bytes=512)
+            if self.refusal_reason is not None:
+                raise ObservationError("an observed git status carries no refusal reason")
             if self.status_fingerprint is None:
                 raise ObservationError("an observed git status requires its status fingerprint")
             self.status_fingerprint.validated()
+            # The booleans are derived facts, so they must agree with the counts
+            # they summarise; a summary that contradicts its own detail is not a
+            # weaker observation, it is a false one.
+            if self.worktree_dirty != bool(self.modified_entry_count or self.missing_entry_count):
+                raise ObservationError("worktree_dirty contradicts the modified and missing counts")
+            if self.untracked_present != bool(self.untracked_entry_count):
+                raise ObservationError("untracked_present contradicts the untracked count")
+            if self.index_dirty != bool(self.staged_change_count or self.unmerged_entry_count):
+                raise ObservationError("index_dirty contradicts the staged and unmerged counts")
         else:
             if self.repository_present and self.availability == "REPOSITORY_ABSENT":
                 raise ObservationError("git availability contradicts repository presence")
+            if self.observation_method != "NOT_OBSERVED":
+                raise ObservationError("an unobserved git record names no producing method")
             for name in ("head_commit", "index_dirty", "worktree_dirty", "untracked_present", "status_fingerprint"):
                 if getattr(self, name) is not None:
                     raise ObservationError(f"{name} must be absent when git was not observed")
+            for name in counted + ("head_reference", "untracked_semantics"):
+                if getattr(self, name) is not None:
+                    raise ObservationError(f"{name} must be absent when git was not observed")
+            if self.availability not in {"REPOSITORY_ABSENT", "NOT_OBSERVED_BEFORE_DURABLE_PROPOSAL"}:
+                _require_text(self.refusal_reason, "refusal_reason", max_bytes=1024)
 
 
 @dataclass(frozen=True)
@@ -708,7 +845,13 @@ class ResourceObservation(_M2Record):
         "controller_peak_retained_output_bytes",
         "controller_peak_retained_availability",
         "measurement_semantics",
+        "containment_mechanism",
+        "containment_availability",
+        "containment_bounds",
+        "containment_semantics",
     )
+    ENCODERS: ClassVar[dict[str, Callable[[Any], Any]]] = {"containment_bounds": _encode_strings}
+    DECODERS: ClassVar[dict[str, Callable[[Any], Any]]] = {"containment_bounds": _decode_strings}
 
     child_cpu_user_ms: int | None
     child_cpu_user_availability: str
@@ -719,10 +862,18 @@ class ResourceObservation(_M2Record):
     controller_peak_retained_output_bytes: int | None
     controller_peak_retained_availability: str
     measurement_semantics: str
+    containment_mechanism: str
+    containment_availability: str
+    containment_bounds: tuple[str, ...]
+    containment_semantics: str
     record_fingerprint: Fingerprint
 
     @classmethod
     def create(cls, **values: Any) -> "ResourceObservation":
+        values.setdefault("containment_mechanism", "NONE")
+        values.setdefault("containment_availability", "NOT_MEASURED")
+        values.setdefault("containment_bounds", ())
+        values.setdefault("containment_semantics", "no resource containment was recorded for this effect")
         return cls._new(**values)
 
     def _validate_fields(self) -> None:
@@ -735,6 +886,16 @@ class ResourceObservation(_M2Record):
             availability = _require_availability(getattr(self, availability_name), availability_name)
             _require_measurement(getattr(self, value_name), availability, value_name)
         _require_text(self.measurement_semantics, "measurement_semantics", max_bytes=2048)
+        _require_member(self.containment_mechanism, CONTAINMENT_MECHANISM_VALUES, "containment_mechanism")
+        _require_availability(self.containment_availability, "containment_availability")
+        _encode_strings(self.containment_bounds)
+        _require_text(self.containment_semantics, "containment_semantics", max_bytes=2048)
+        # A bound that was observed must say what it was; a mechanism that was
+        # not in force may not carry bounds it did not enforce.
+        if self.containment_availability == "OBSERVED" and not self.containment_bounds:
+            raise ObservationError("an observed containment mechanism must record the bounds it enforced")
+        if self.containment_mechanism == "NONE" and self.containment_bounds:
+            raise ObservationError("an absent containment mechanism enforced no bounds")
 
 
 @dataclass(frozen=True)
@@ -913,11 +1074,16 @@ def observation_from_dict(data: Any) -> _M2Record:
 __all__ = [
     "AVAILABILITY_VALUES",
     "BUDGET_RESOURCE_OBSERVATION_FINGERPRINT_DOMAIN",
+    "CONTAINMENT_MECHANISM_VALUES",
     "EFFECT_RECEIPT_LEDGER_FINGERPRINT_DOMAIN",
     "EffectReconciliationReport",
+    "FILESYSTEM_COMPLETENESS_VALUES",
+    "FILESYSTEM_ENTRY_KINDS",
     "FilesystemObservation",
     "GIT_AVAILABILITY_VALUES",
+    "GIT_OBSERVATION_METHODS",
     "GitObservation",
+    "IPC_ENDPOINT_KINDS",
     "LIFECYCLE_RECORD_KINDS",
     "LifecycleRecord",
     "M2_OBSERVATION_SCHEMAS",

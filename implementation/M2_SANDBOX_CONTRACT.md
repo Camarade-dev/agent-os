@@ -193,21 +193,75 @@ Every row is exercised by `tests/test_admissible_paired_runner_m2_repairs.py`
 | `setsid` | contained; the namespace is the boundary, not the group |
 | evidence corruption from inside | every pre-existing object is byte-identical afterwards |
 
-## 7. Git observation inside the capsule
+## 7. Git observation runs no process at all
 
-`observe_git` runs the Git observer inside this same capsule **and** neutralises
-every repository-controlled setting on the command line, where a repository
-cannot outrank it. See `M2_TYPED_RECONCILIATION_SPEC.md` §7 and
-`MaliciousGitConfigurationTests`. Two independent mechanisms are used because
-either alone would be a single point of failure.
+Superseded. `observe_git` no longer executes anything: the observer parses refs,
+the index, and object storage directly. See
+`implementation/M2_SECOND_CRITICAL_REPAIR_REPORT.md`, ADR-M2S-02, and
+`NonExecutingGitObserverTests`. The previous construction — running `git` inside
+this capsule behind a list of `-c` overrides — was shown to be unclosable,
+because a repository names an arbitrary filter driver that `git status` must run.
 
-## 8. What this contract does not claim
+## 8. Filesystem IPC is closed at the syscall
 
-- It does not claim a seccomp syscall filter; the boundary is namespaces and
-  mounts.
-- It does not claim protection against a kernel vulnerability in namespace
-  isolation itself.
-- It does not claim resource limits (CPU, memory, PIDs) beyond the request
-  timeout; cgroup limits are not applied at Milestone 2.
+**Correction.** This contract previously stated that an unshared network
+namespace plus an absent evidence path meant no host capability was reachable.
+**That statement was false and is withdrawn.** A pathname `AF_UNIX` socket is a
+filesystem object: it crosses an unshared network namespace, and `SCM_RIGHTS`
+over it transfers an open descriptor for any file the peer can open. A FIFO in
+the writable workspace is the same bridge.
+
+The enforced property is now:
+
+> The command sees no host-backed IPC endpoint, and cannot create an IPC endpoint
+> visible to a host process during execution.
+
+Two independent mechanisms, neither depending on the other:
+
+1. **A seccomp-BPF syscall boundary** (`--seccomp`), denying `socket(AF_UNIX)`,
+   `socketpair(AF_UNIX)`, `mknod`, and `mknodat` with `EPERM`. `SCM_RIGHTS` needs
+   no rule of its own: it travels only over an `AF_UNIX` socket, and none can be
+   created or inherited. A mismatched `seccomp_data.arch`, and on x86-64 any x32
+   syscall number, kills the process.
+2. **Workspace admission**: no capsuled process starts over a workspace holding a
+   socket, FIFO, or device node, refused before the durable `STARTED` record.
+
+Full detail: `implementation/M2_WORKSPACE_IPC_ISOLATION_SPEC.md`.
+
+## 9. The process domain is bounded, not merely timed
+
+A PID namespace is a naming boundary, not a quota. Every command runs under
+kernel-enforced bounds on processes, address space, CPU seconds, open files, and
+file size, with core dumps prohibited, applied inside the capsule immediately
+before `execv`; a per-effect cgroup v2 subtree is added where the host delegates
+one. The effective bounds are read back with `getrlimit` from inside the bounded
+child and recorded in the durable resource observation. Readiness physically
+proves the bounds before any effect is permitted.
+
+Full detail: `implementation/M2_RESOURCE_CONTAINMENT_SPEC.md`.
+
+## 10. The capsule is identified by its bytes
+
+`CapsuleRuntimeManifest` binds the launcher's path, SHA-256, device, inode,
+owner, mode, size, and version; the interpreter's and the in-capsule init's
+identities; the seccomp program's digest and architecture; a source identity over
+every module of this package; the declared toolchain roots; and the namespace,
+mount, and containment contract. It is rechecked before the proposal that
+authorises an effect is published, including re-resolving the launcher through
+`PATH`, so a replacement or a shadowing entry refuses rather than being recorded
+as the capsule that was probed.
+
+## 11. What this contract does not claim
+
+- It does not claim protection against a kernel vulnerability in namespace,
+  seccomp, or cgroup isolation itself.
+- It does not claim that the workspace stops being a shared host directory. It is
+  the one authorised writable surface; admission proves no IPC endpoint exists
+  when a process starts and the syscall boundary proves the command cannot create
+  one, but a host process acting on the workspace mid-execution is outside both.
+- It does not claim aggregate process-domain accounting on a host that delegates
+  no cgroup v2 subtree. The mechanism actually in force is recorded in every
+  resource observation.
+- It does not claim a disk-space quota; `RLIMIT_FSIZE` bounds any single file.
 - It does not claim any installed-path or production behaviour. Every effect in
   this milestone happens under a disposable test root.

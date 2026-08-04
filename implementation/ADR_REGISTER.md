@@ -541,7 +541,7 @@ Specification: `implementation/M2_TYPED_RECONCILIATION_SPEC.md`.
 
 ## ADR-M2R-04 — Git observation runs no repository-controlled code
 
-**Status:** Accepted (Milestone 2 critical repairs)
+**Status:** Superseded by ADR-M2S-02 (Milestone 2 second critical repairs)
 
 **Context.** `WorkspaceBinding.bind` ran a Git observation before any proposal
 was durable, and the observer honoured repository-local `core.fsmonitor` — so a
@@ -573,3 +573,126 @@ those descriptors rather than re-resolving a path string.
 Retaining the descriptors also closes the race between the check and the use.
 Directory creation for `create_parents` is deliberately excluded from
 preparation, because creating a directory is itself a mutation.
+
+## ADR-M2S-01 — Filesystem IPC is closed at the syscall, not by the network namespace
+
+**Status:** Accepted (Milestone 2 second critical repairs)
+
+**Context.** The sandbox contract stated that an unshared network namespace plus
+an absent evidence path left no host capability reachable. That statement is
+false. A pathname `AF_UNIX` socket is a filesystem object: it crosses an unshared
+network namespace, and `SCM_RIGHTS` over it transfers an open descriptor for any
+file the peer can open, including one absent from the capsule's mount namespace.
+A FIFO in the writable workspace is the same bridge. The independent audit
+reproduced both.
+
+**Decision.** Two independent kernel-enforced mechanisms. A seccomp-BPF program,
+assembled in-tree and loaded by `bwrap --seccomp` immediately before `execv`,
+denies `socket(AF_UNIX)`, `socketpair(AF_UNIX)`, `mknod`, and `mknodat`; a
+mismatched `seccomp_data.arch`, and on x86-64 any x32 syscall number, kills the
+process, and an architecture with no recorded numbering is a readiness refusal.
+Independently, no capsuled process starts over a workspace containing a socket,
+FIFO, or device node, and that refusal happens before the durable `STARTED`
+record exists.
+
+**Consequences.** `SCM_RIGHTS` needs no rule of its own, because it travels only
+over an `AF_UNIX` socket and none can be created or inherited. A command needing
+local socket IPC or a FIFO now fails with `EPERM`; that is the documented
+contract of the capsule. The private-materialisation alternative was rejected for
+this milestone: it depends on unprivileged overlayfs being available and its
+diff-and-apply step would insert a large new correctness surface between an
+untrusted effect and the workspace, in exchange for a property the kernel already
+enforces at the syscall.
+
+## ADR-M2S-02 — The Git observer executes nothing, and fails closed instead
+
+**Status:** Accepted (Milestone 2 second critical repairs), supersedes ADR-M2R-04
+
+**Context.** ADR-M2R-04 neutralised every *known* setting through which Git runs
+a program. That is a denylist, and the audit showed it is unclosable: a
+repository names an arbitrary filter driver through `.gitattributes` and defines
+it in its own configuration, and `git status` must run that driver to decide
+whether a working-tree file matches the index. The shipped override list still
+executed a repository-chosen program, after the durable `STARTED` record, during
+what the evidence called an observation.
+
+**Decision.** No `git` process. The observer parses `HEAD` and refs including
+`packed-refs`, the binary index with its trailing SHA-1 verified, and objects
+from loose storage and packfiles with delta resolution, and hashes working-tree
+files into Git blob identities directly. Where the answer would require running a
+program — any declared content conversion — the observation records
+`GIT_CONVERSION_REQUIRED` and determines nothing further. The
+`GIT_COMMAND_FAILED`, `GIT_EXECUTABLE_UNAVAILABLE`, and `GIT_SANDBOX_UNAVAILABLE`
+availabilities were removed from the schema.
+
+**Consequences.** There is no fallback to executing `git` anywhere in the module,
+so the schema itself testifies that no command is run. The cost is that some
+repositories are observed as explicitly undetermined rather than compared, and
+that untracked counting does not evaluate ignore rules — both recorded in the
+observation rather than silently approximated.
+
+## ADR-M2S-03 — The run index is an event chain with one replaceable committed head
+
+**Status:** Accepted (Milestone 2 second critical repairs)
+
+**Context.** A one-summary-per-proposal index that discovers its extent by
+counting until a name is absent cannot see past a gap, cannot distinguish a
+truncated run from a shorter one, and cannot represent a crash between the
+proposal and its outcome at all. All three were demonstrated.
+
+**Decision.** One immutable hash-chained event per transition, with the proposal
+event durable before any effect is possible; reconstruction scans every durable
+name belonging to the run; and one `run-index-anchor` — the single replaceable
+object in an otherwise no-replace store — records the committed head, advanced by
+atomic rename only after the event it commits is durable.
+
+**Consequences.** Gaps, surplus positions, reordering, duplication, foreign
+records, a missing tail, and an anchor that outruns or lags its chain all fail
+closed. The window between an event's commit and the head update is the named
+`HEAD_UPDATE_PENDING` state, recovered by advancing the head onto an
+already-durable, already-chained event. Rollback — deleting the newest event and
+rewinding the head together — remains undetectable locally and is stated as
+requiring an external anti-rollback anchor that Milestone 2 does not implement.
+
+## ADR-M2S-04 — Run history is derived from durable bytes, never supplied
+
+**Status:** Accepted (Milestone 2 second critical repairs)
+
+**Context.** `RunEffectLedger.verify` took the proposal identities to verify from
+its caller, so a restarted process could hand in an empty tuple and receive a
+ledger that verified perfectly while omitting every effect already performed.
+
+**Decision.** The ordered proposal set comes from the durable run index, which is
+chain-verified against its committed head first. Refusals are verified by the
+checked *absence* of a ledger entry, surplus entries fail closed, and the
+substrate rebuilds its in-memory ledger from that derived history before
+publishing any new proposal.
+
+**Consequences.** History is no longer a parameter. The one remaining dial,
+`require_closed`, decides only what happens to a proposal a crash left open — it
+is what lets a restarted controller inspect a run in order to *refuse* replaying
+it — and every closed proposal is verified equally strictly either way.
+
+## ADR-M2S-05 — A capsule is identified by its bytes, and bounded by the kernel
+
+**Status:** Accepted (Milestone 2 second critical repairs)
+
+**Context.** The capsule descriptor bound a mechanism *name* and a resolved path,
+so a replaced launcher, a substituted interpreter, an edited init, or a shadowing
+`PATH` entry produced identical evidence for a different boundary. Separately, the
+capsule applied no CPU, memory, process, descriptor, or file-size limit: a PID
+namespace is a naming boundary, not a quota.
+
+**Decision.** A typed `CapsuleRuntimeManifest` binds the launcher, interpreter,
+in-capsule init, seccomp program, package source identity, declared toolchain
+roots, and the namespace, mount, and containment contract, and is rechecked
+before the proposal that authorises an effect is published. Per-command bounds
+are applied by the init in the forked child immediately before `execv`, with a
+per-effect cgroup v2 subtree added where the host delegates one, and the child
+reads the limits back with `getrlimit` so the observation records enforcement
+rather than intent.
+
+**Consequences.** Readiness refuses rather than degrading: a filter the kernel did
+not load, or a bound it did not honour, stops the run before any proposal. On a
+host that delegates no cgroup subtree the recorded mechanism is `RLIMIT` and the
+absence of aggregate accounting is stated in every resource observation.

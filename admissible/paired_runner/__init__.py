@@ -4,7 +4,10 @@ Milestone 1 contributes immutable data models, canonicalization, identity
 binding, and parity checking.  Milestone 2 adds one provider-free physical
 substrate: durable publication, workspace confinement, the four tool
 implementations, bounded process supervision, typed observations, and the
-run/effect ledger with crash-safe reconciliation.
+run/effect ledger with crash-safe reconciliation.  The second critical-repair
+pass adds the capsule's syscall boundary and byte identity, per-command resource
+containment, a non-executing Git observer, and a crash-classifiable durable event
+index the effect ledger is derived from.
 
 The namespace still has no model transport, multi-session orchestration, policy
 implementation, owner broker, authority, evaluator engine, or provider
@@ -30,17 +33,52 @@ from .durable_store import (
     InjectedFault,
     PublicationConflict,
 )
+from .capsule_identity import (
+    CapsuleIdentityRefused,
+    CapsuleRuntimeManifest,
+    build_runtime_manifest,
+    package_source_identity,
+)
+from .capsule_seccomp import SeccompUnavailable, build_program, describe as describe_seccomp
 from .effect_ledger import EffectLedgerEntry, RunEffectLedger
 from .effects import (
     AmbiguousEffectRefused,
+    ConfigurationRefused,
     EffectExecutionOutcome,
+    RunIndexRecovery,
     SharedEffectSubstrate,
     WorkspaceBinding,
     WorkspaceFailure,
+    WorkspaceIpcEndpointRefused,
     WorkspaceRefusal,
     observe_filesystem,
     observe_git,
     reconcile_effect,
+    recover_run_index,
+    require_no_workspace_ipc_endpoints,
+    scan_workspace_ipc_endpoints,
+)
+from .git_observer import GitObservationRefused, observe_repository
+from .resource_limits import (
+    CONTAINMENT_MECHANISMS,
+    CgroupDelegation,
+    ResourceBounds,
+    probe_cgroup_delegation,
+)
+from .run_index import (
+    DurableRunIndex,
+    EVENT_KINDS,
+    INDEX_OUTCOMES,
+    RunIndexAnchor,
+    RunIndexBroken,
+    RunIndexEvent,
+    RunIndexState,
+)
+from .sandbox import (
+    CapsuleReadiness,
+    CapsuleSpecification,
+    SandboxUnavailable,
+    probe_capsule_readiness,
 )
 from .observation import (
     M2_OBSERVATION_SCHEMAS,
@@ -115,7 +153,37 @@ from .tool_schemas import (
 __all__ = [
     "AllowedConditionDifferences",
     "AmbiguousEffectRefused",
+    "CONTAINMENT_MECHANISMS",
     "CancellationToken",
+    "CapsuleIdentityRefused",
+    "CapsuleReadiness",
+    "CapsuleRuntimeManifest",
+    "CapsuleSpecification",
+    "CgroupDelegation",
+    "ConfigurationRefused",
+    "DurableRunIndex",
+    "EVENT_KINDS",
+    "GitObservationRefused",
+    "INDEX_OUTCOMES",
+    "ResourceBounds",
+    "RunIndexAnchor",
+    "RunIndexBroken",
+    "RunIndexEvent",
+    "RunIndexRecovery",
+    "RunIndexState",
+    "SandboxUnavailable",
+    "SeccompUnavailable",
+    "WorkspaceIpcEndpointRefused",
+    "build_program",
+    "build_runtime_manifest",
+    "describe_seccomp",
+    "observe_repository",
+    "package_source_identity",
+    "probe_capsule_readiness",
+    "probe_cgroup_delegation",
+    "recover_run_index",
+    "require_no_workspace_ipc_endpoints",
+    "scan_workspace_ipc_endpoints",
     "CorruptDurableObject",
     "DurableObjectStore",
     "EffectExecutionOutcome",
