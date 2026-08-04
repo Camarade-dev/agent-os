@@ -1,8 +1,9 @@
 # Paired Runner ADR Register
 
 This register records the twelve architecture decisions fixed by the governing
-implementation plan plus ADR-013 and ADR-014, which record the two bounded M1
-repair boundaries. Every decision below is FROZEN_BY_GOVERNING_PLAN or
+implementation plan, plus ADR-013 and ADR-014, which record the two bounded M1
+repair boundaries, plus ADR-015 through ADR-017, which record the Milestone 2
+platform, shared-executor, and durability boundaries. Every decision below is FROZEN_BY_GOVERNING_PLAN or
 explicitly bounded by its status. A later change requires a new ADR, an impact analysis for A/B fairness, and a
 requirement-matrix revision. No ADR is reopened or weakened by Milestone 0.
 
@@ -314,12 +315,113 @@ requirement-matrix revision. No ADR is reopened or weakened by Milestone 0.
   pre-effect publication and on an effect executor that does not yet exist.
   No out-of-scope requirement record is changed.
 
+## ADR-015 — Plateforme et durabilité de qualification initiale du Milestone 2
+
+- Status: `M2_PLATFORM_CONTRACT_SELECTED`
+- Governing basis: the governing plan's Milestone 2 requirements and the
+  Milestone 0 record that no physical host had yet been selected. Milestone 2 is
+  the first platform-dependent runtime milestone, so the platform is decided
+  before any runtime code is trusted.
+- Decision: the initial M2 qualification platform is **Linux POSIX process,
+  signal, and filesystem semantics with the CPython standard library only**.
+  The current development/qualification host may be WSL2, and it was
+  (Linux 6.18.33.2-microsoft-standard-WSL2, CPython 3.12.3). **WSL2 success is
+  explicitly not clean-host Linux qualification.** There is no Windows Cursor
+  path, no Node dependency, no provider dependency, and no production authority
+  dependency. This is the default expected decision of the assignment; no
+  alternative platform was chosen.
+- Consequences: the substrate may rely on POSIX sessions and process groups,
+  `killpg`, `O_NOFOLLOW`/`O_DIRECTORY` descriptor-relative opens, `fsync`,
+  `os.link` no-replace commits, and `selectors`. It may not rely on Windows,
+  macOS, Node.js, npm, a network filesystem, or an installed production root.
+  Every M2 measurement is a WSL2 measurement and is labelled as such.
+- Durability boundary: `publish` claims only that the file contents and the
+  parent directory entry were handed to `fsync` and that the committed bytes
+  were read back and compared. It claims nothing about device write caches,
+  virtualised block devices, or power loss. The thirteen fault-injection points
+  are deterministic in-process simulations, not power cuts.
+- Measurement boundary: child CPU time and peak RSS come from
+  `getrusage(RUSAGE_CHILDREN)` deltas, which aggregate every reaped child of the
+  controller, so they are recorded as `OBSERVED_BEST_EFFORT` upper bounds. An
+  unavailable metric is recorded with an explicit availability value and a
+  `None` measurement; it is never recorded as zero. No token or model cost
+  metric exists in M2.
+- Controller-memory threshold, declared before the heavy soak was run:
+  analytic retention bound `2 * max_output_bytes + 262144` bytes, and measured
+  controller RSS growth no greater than 64 MiB above the pre-soak baseline for
+  the 1 GiB / 1 000 000-line workload.
+- Forbidden alternatives: implementing platform-specific behaviour without this
+  ADR; combining the Windows Cursor product assumptions with the Linux Codex
+  canary assumptions; claiming clean-host, installed-path, or power-loss
+  durability from WSL2 evidence; recording an unavailable metric as zero.
+- Full contract: `implementation/M2_PLATFORM_AND_DURABILITY_CONTRACT.md`.
+- Requirements affected: EXEC-02, EXEC-05, EXEC-06, EVID-01 through EVID-08,
+  LONG-07, LONG-08, TEST-03, TEST-08. No out-of-scope requirement record is
+  changed.
+
+## ADR-016 — Un seul exécuteur d'effets physique partagé
+
+- Status: `M2_SHARED_EFFECT_SUBSTRATE_BOUNDARY`
+- Governing basis: ADR-004 and ADR-005, which require A and B to share the
+  physical observer, validator, effect launcher, process supervisor, output
+  collector, mutation observer, receipt publisher, and run-state update.
+- Decision: `admissible.paired_runner.effects.SharedEffectSubstrate.execute` is
+  the single physical execution entry point for both future conditions. It takes
+  typed M1 objects — `ExperimentSpecification`, `CanonicalProposal`,
+  `ModeDecision`, `EffectReservation` — and never a mode-specific command path.
+  `decision.permits_effect` is the only place the decision is consulted; after
+  that point no code inspects the condition, the decision value, or any
+  governance field. The executor is not duplicated.
+- Enforcement: the substrate refuses `REFUSE`, `TERMINATE_RUN`, and
+  `REQUIRE_CONTINUATION` before any reservation or effect exists, and physically
+  enforces validate → publish proposal → validate decision → reserve → publish
+  STARTED → effect. The effect boundary is instrumented, and the tests read the
+  filesystem at that instant rather than memory.
+- Evidence: a `sys.settrace` capture proves the set of executed
+  `(function, line)` pairs after the decision boundary is identical for a DIRECT
+  `DIRECT_EXECUTION` fixture and a GOVERNED `ALLOW` fixture.
+- Boundary: M2 contains **no policy engine**. `ModeDecision` is an input the
+  substrate obeys and reconciles; nothing in M2 decides whether a proposal
+  should be allowed, and no M2 test claims that a policy engine exists. Owner
+  authorization, the broker, and the policy gate remain Milestone 4.
+- Forbidden alternatives: a second executor for the baseline; a governed-only
+  observer; any post-mutation decision; a mode-specific effect implementation;
+  an automatic replay of an ambiguous effect.
+- Requirements affected: as ADR-015.
+
+## ADR-017 — Publication durable sans remplacement et rapprochement fail-closed
+
+- Status: `M2_DURABILITY_BOUNDARY`
+- Governing basis: ADR-003 (no mutation before durable proposal publication) and
+  ADR-009 (durable, replay-resistant state).
+- Decision: one primitive publishes every immutable object, committing with
+  `os.link()` so an existing name is never replaced. Re-publishing byte-identical
+  canonical content is `DUPLICATE_IDENTICAL` and succeeds; different content for
+  the same identity is `CONFLICT_DIFFERENT` and fails closed. Temporary files
+  carry a reserved prefix, are reported explicitly, and are never counted as
+  committed objects. A committed object that is not canonical is `CORRUPT` and
+  fails closed.
+- Recovery decision: recovery reconstructs only from durable bytes. Once a
+  `STARTED` record is durable the effect may have occurred, so a fresh
+  controller raises `AmbiguousEffectRefused` and never replays. `replay_permitted`
+  is false in every reconciliation classification. A mutating ambiguity is
+  classified separately from a read-only ambiguity.
+- Boundary: M2 implements deterministic single-effect recovery only. Full
+  multi-session restart, checkpoints, and cumulative budgets remain Milestone 3.
+- Forbidden alternatives: overwriting a different object under the same
+  identity; treating a temporary file as committed; interpreting a corrupt
+  object; any automatic retry after a potentially consumed effect.
+- Requirements affected: as ADR-015.
+
 ## Register closure
 
 The decisions above are the governing architecture boundary for the next
 milestone. Any implementation that conflicts with one of them is not a
 permitted continuation of this freeze. ADR-013 and ADR-014 close only the two
-bounded M1 repair boundaries and do not authorize Milestone 2.
+bounded M1 repair boundaries and did not authorize Milestone 2. ADR-015 through
+ADR-017 close only the Milestone 2 shared-substrate boundary and do **not**
+authorize Milestone 3, a model transport, a policy engine, an owner authority,
+or any provider contact.
 
 ## Milestone 1 evidence and clarifications
 

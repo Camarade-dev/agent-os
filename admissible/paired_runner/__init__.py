@@ -1,9 +1,14 @@
-"""Pure Milestone 1 executable architecture specification.
+"""The paired-runner specification (M1) and shared effect substrate (M2).
 
-This namespace contains immutable data models, canonicalization, identity
-binding, and parity checking only.  It deliberately has no model transport,
-filesystem tool, subprocess executor, policy implementation, owner broker,
-or provider integration.
+Milestone 1 contributes immutable data models, canonicalization, identity
+binding, and parity checking.  Milestone 2 adds one provider-free physical
+substrate: durable publication, workspace confinement, the four tool
+implementations, bounded process supervision, typed observations, and the
+run/effect ledger with crash-safe reconciliation.
+
+The namespace still has no model transport, multi-session orchestration, policy
+implementation, owner broker, authority, evaluator engine, or provider
+integration.
 """
 
 from .canonical import (
@@ -17,6 +22,48 @@ from .canonical import (
     strict_json_loads,
 )
 from .comparison import ParityRefused, ParityReport, check_parity, require_parity
+from .durable_store import (
+    FAULT_POINTS,
+    CorruptDurableObject,
+    DurableObjectStore,
+    FaultInjector,
+    InjectedFault,
+    PublicationConflict,
+)
+from .effect_ledger import EffectLedgerEntry, RunEffectLedger
+from .effects import (
+    AmbiguousEffectRefused,
+    EffectExecutionOutcome,
+    SharedEffectSubstrate,
+    WorkspaceBinding,
+    WorkspaceFailure,
+    WorkspaceRefusal,
+    observe_filesystem,
+    observe_git,
+    reconcile_effect,
+)
+from .observation import (
+    M2_OBSERVATION_SCHEMAS,
+    PUBLICATION_STATES,
+    RECONCILIATION_CLASSIFICATIONS,
+    TERMINAL_LEDGER_FINGERPRINT_DOMAINS,
+    EffectReconciliationReport,
+    FilesystemObservation,
+    GitObservation,
+    LifecycleRecord,
+    ObservationError,
+    ProcessObservation,
+    PublicationReceipt,
+    ResourceObservation,
+    StreamObservation,
+    observation_from_dict,
+)
+from .process_supervision import (
+    CancellationToken,
+    SupervisedProcessResult,
+    controller_memory_bound,
+    supervise_command,
+)
 from .identities import IdentityReference, RunIdentity, SessionIdentity
 from .specification import (
     AllowedConditionDifferences,
@@ -67,6 +114,41 @@ from .tool_schemas import (
 
 __all__ = [
     "AllowedConditionDifferences",
+    "AmbiguousEffectRefused",
+    "CancellationToken",
+    "CorruptDurableObject",
+    "DurableObjectStore",
+    "EffectExecutionOutcome",
+    "EffectLedgerEntry",
+    "EffectReconciliationReport",
+    "FAULT_POINTS",
+    "FaultInjector",
+    "FilesystemObservation",
+    "GitObservation",
+    "InjectedFault",
+    "LifecycleRecord",
+    "M2_OBSERVATION_SCHEMAS",
+    "ObservationError",
+    "PUBLICATION_STATES",
+    "ProcessObservation",
+    "PublicationConflict",
+    "PublicationReceipt",
+    "RECONCILIATION_CLASSIFICATIONS",
+    "ResourceObservation",
+    "RunEffectLedger",
+    "SharedEffectSubstrate",
+    "StreamObservation",
+    "SupervisedProcessResult",
+    "TERMINAL_LEDGER_FINGERPRINT_DOMAINS",
+    "WorkspaceBinding",
+    "WorkspaceFailure",
+    "WorkspaceRefusal",
+    "controller_memory_bound",
+    "observation_from_dict",
+    "observe_filesystem",
+    "observe_git",
+    "reconcile_effect",
+    "supervise_command",
     "BudgetLimits",
     "BudgetState",
     "BudgetUsage",
