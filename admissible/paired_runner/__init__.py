@@ -10,7 +10,10 @@ containment, a non-executing Git observer, and a crash-classifiable durable even
 index the effect ledger is derived from.  The third critical-repair pass replaces
 the live writable workspace bind with a private execution view and trusted
 export, verifies cgroup membership before command execution, and binds capsule
-runtime identity through open descriptors.
+runtime identity through open descriptors.  The fourth critical-repair pass
+replaces child-side stop-before-exec hooks with a trusted pipe launch gate,
+moves the writable view into a private mount-namespace tmpfs, and makes export
+a durable transactional protocol.
 
 The namespace still has no model transport, multi-session orchestration, policy
 implementation, owner broker, authority, evaluator engine, or provider

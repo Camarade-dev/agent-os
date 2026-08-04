@@ -285,20 +285,22 @@ class PrivateLayerAndExportTests(unittest.TestCase):
             source_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
             view = PrivateExecutionView.materialize(root, source_fd)
             try:
-                os.mkfifo(view.view_root / "x.fifo")
-                # Re-open after the special was planted in the private layer.
-                os.close(view.view_fd)
-                view.view_fd = os.open(view.view_root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+                view.mkfifo("x.fifo")
                 change_set = compute_change_set(baseline_fd=source_fd, private_fd=view.view_fd)
                 self.assertGreater(change_set.unsupported_inode_count, 0)
-                _reservation, receipt, reconciliation = apply_export(
-                    source_root_fd=source_fd,
-                    private_fd=view.view_fd,
-                    change_set=change_set,
-                    reservation_id="export-oracle-1",
-                    source_snapshot=view.source_snapshot,
-                    view_identity=view.view_identity,
-                )
+                durable = Path(tempfile.mkdtemp(prefix="admissible-export-dur-"))
+                try:
+                    _reservation, receipt, reconciliation = apply_export(
+                        source_root_fd=source_fd,
+                        private_fd=view.view_fd,
+                        change_set=change_set,
+                        reservation_id="export-oracle-1",
+                        source_snapshot=view.source_snapshot,
+                        view_identity=view.view_identity,
+                        durable_root=durable,
+                    )
+                finally:
+                    shutil.rmtree(durable, ignore_errors=True)
                 self.assertEqual(receipt.state, "REFUSED_UNSUPPORTED_INODE")
                 self.assertFalse(reconciliation.verified)
                 self.assertFalse(reconciliation.private_ipc_exported)
@@ -318,7 +320,7 @@ class PrivateLayerAndExportTests(unittest.TestCase):
             source_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
             view = PrivateExecutionView.materialize(root, source_fd)
             try:
-                (view.view_root / "b.txt").write_text("b", encoding="utf-8")
+                view.write_file("b.txt", b"b")
                 # Before export: source unchanged, private differs, nothing applied.
                 self.assertFalse(view.source_mutated(source_fd))
                 self.assertFalse((root / "b.txt").exists())
@@ -326,36 +328,42 @@ class PrivateLayerAndExportTests(unittest.TestCase):
                 self.assertEqual(change_set.change_count, 1)
                 # During export refusal path: force source mutation first.
                 (root / "a.txt").write_text("mutated", encoding="utf-8")
-                _reservation, receipt, reconciliation = apply_export(
-                    source_root_fd=source_fd,
-                    private_fd=view.view_fd,
-                    change_set=change_set,
-                    reservation_id="export-crash-1",
-                    source_snapshot=view.source_snapshot,
-                    view_identity=view.view_identity,
-                )
-                self.assertEqual(receipt.state, "REFUSED_SOURCE_MUTATED")
-                self.assertTrue(reconciliation.source_mutated)
-                self.assertFalse(reconciliation.partial_export)
-                self.assertFalse((root / "b.txt").exists())
-                # After a clean export: applied and verified.
-                os.close(source_fd)
-                shutil.rmtree(root)
-                root.mkdir()
-                (root / "a.txt").write_text("a", encoding="utf-8")
-                source_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-                view.close()
-                view = PrivateExecutionView.materialize(root, source_fd)
-                (view.view_root / "b.txt").write_text("b", encoding="utf-8")
-                change_set = compute_change_set(baseline_fd=source_fd, private_fd=view.view_fd)
-                _reservation, receipt, reconciliation = apply_export(
-                    source_root_fd=source_fd,
-                    private_fd=view.view_fd,
-                    change_set=change_set,
-                    reservation_id="export-crash-2",
-                    source_snapshot=view.source_snapshot,
-                    view_identity=view.view_identity,
-                )
+                durable = Path(tempfile.mkdtemp(prefix="admissible-export-dur-"))
+                try:
+                    _reservation, receipt, reconciliation = apply_export(
+                        source_root_fd=source_fd,
+                        private_fd=view.view_fd,
+                        change_set=change_set,
+                        reservation_id="export-crash-1",
+                        source_snapshot=view.source_snapshot,
+                        view_identity=view.view_identity,
+                        durable_root=durable,
+                    )
+                    self.assertEqual(receipt.state, "REFUSED_SOURCE_MUTATED")
+                    self.assertTrue(reconciliation.source_mutated)
+                    self.assertFalse(reconciliation.partial_export)
+                    self.assertFalse((root / "b.txt").exists())
+                    # After a clean export: applied and verified.
+                    os.close(source_fd)
+                    shutil.rmtree(root)
+                    root.mkdir()
+                    (root / "a.txt").write_text("a", encoding="utf-8")
+                    source_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+                    view.close()
+                    view = PrivateExecutionView.materialize(root, source_fd)
+                    view.write_file("b.txt", b"b")
+                    change_set = compute_change_set(baseline_fd=source_fd, private_fd=view.view_fd)
+                    _reservation, receipt, reconciliation = apply_export(
+                        source_root_fd=source_fd,
+                        private_fd=view.view_fd,
+                        change_set=change_set,
+                        reservation_id="export-crash-2",
+                        source_snapshot=view.source_snapshot,
+                        view_identity=view.view_identity,
+                        durable_root=durable,
+                    )
+                finally:
+                    shutil.rmtree(durable, ignore_errors=True)
                 self.assertEqual(receipt.state, "APPLIED")
                 self.assertTrue(reconciliation.verified)
                 self.assertEqual((root / "b.txt").read_text(encoding="utf-8"), "b")
@@ -374,9 +382,7 @@ class PrivateLayerAndExportTests(unittest.TestCase):
             source_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
             view = PrivateExecutionView.materialize(root, source_fd)
             try:
-                os.mkfifo(view.view_root / "only-private.fifo")
-                os.close(view.view_fd)
-                view.view_fd = os.open(view.view_root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+                view.mkfifo("only-private.fifo")
                 visible = private_ipc_host_visible(root, view)
                 self.assertEqual(visible, ())
                 self.assertFalse((root / "only-private.fifo").exists())

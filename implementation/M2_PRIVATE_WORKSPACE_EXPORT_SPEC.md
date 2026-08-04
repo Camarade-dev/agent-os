@@ -43,6 +43,20 @@ Every `run_command` effect uses this exact path (DIRECT and GOVERNED ALLOW):
 Seccomp denial of endpoint creation remains defence in depth inside the capsule.
 It is not the isolation claim.
 
+## 3a. Fourth-repair supersession (M2-B26 / M2-B27)
+
+The host-named `PRIVATE_MATERIALIZED_COPY` construction and any export path that
+publishes a reservation only in memory are superseded by:
+
+- `implementation/M2_PRIVATE_MOUNT_NAMESPACE_SPEC.md` —
+  `PRIVATE_MOUNTNS_TMPFS` descriptor-bound private mount;
+- `implementation/M2_TRANSACTIONAL_EXPORT_SPEC.md` — durable no-replace
+  reservation, operation journal, and separate-process crash/recovery
+  classification.
+
+The export grammar and typed records in this document remain normative; the
+materialization substrate and durability ordering do not.
+
 ## 4. Typed records
 
 | Record | Schema |

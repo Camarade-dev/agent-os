@@ -61,6 +61,15 @@ could claim `CGROUP_V2_AND_RLIMIT` without kernel membership.
 
 `active` now means directory present **and** membership verified.
 
+### Fourth-repair supersession (M2-B25)
+
+The child-side `subprocess.Popen(preexec_fn=SIGSTOP)` construction above is
+superseded by `implementation/M2_CGROUP_LAUNCH_PRIMITIVE_SPEC.md`: a trusted
+controller pipe gate obtains the child identity, attaches and verifies real
+`cgroup.procs` membership, then releases the gate so the launcher may exec.
+Synthetic regular files are refused as cgroup evidence. Descriptor binding of
+launcher, interpreter, init, and private view remains as specified in §1.
+
 ### Tests
 
 | Requirement | Test |

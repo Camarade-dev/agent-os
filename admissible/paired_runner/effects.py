@@ -1227,6 +1227,8 @@ def _run_command(
     preparation: _EffectPreparation,
     cancellation: CancellationToken | None,
     start_hook: Callable[[], None] | None,
+    durable_root: Path | None = None,
+    causal: dict[str, str] | None = None,
 ) -> _CommandExecution:
     """Run the request inside the capsule against a private execution view.
 
@@ -1289,6 +1291,8 @@ def _run_command(
                         baseline_fd=binding.root_fd,
                         private_fd=private_view.view_fd,
                     )
+                    if durable_root is None:
+                        raise PrivateWorkspaceError("export_durable_root_required", "missing")
                     _reservation, receipt, _reconciliation = apply_export(
                         source_root_fd=binding.root_fd,
                         private_fd=private_view.view_fd,
@@ -1296,6 +1300,8 @@ def _run_command(
                         reservation_id=f"export-{process.start_monotonic_ns}",
                         source_snapshot=private_view.source_snapshot,
                         view_identity=private_view.view_identity,
+                        durable_root=durable_root,
+                        causal=causal,
                     )
                     if receipt.state != "APPLIED":
                         export_error = receipt.refusal_code or receipt.state
@@ -1947,7 +1953,18 @@ class SharedEffectSubstrate:
         durable_at_boundary = self._durable_pre_effect_state(proposal.proposal_id)
         self._injector.check(FAULT_SANDBOX_SUPERVISOR_DEATH)
         try:
-            execution = self._cross_effect_boundary(proposal.tool_request, preparation)
+            execution = self._cross_effect_boundary(
+                proposal.tool_request,
+                preparation,
+                causal={
+                    "run_id": proposal.run_identity.run_id,
+                    "session_id": proposal.session_identity.session_id,
+                    "proposal_id": proposal.proposal_id,
+                    "decision_id": decision.decision_fingerprint.value,
+                    "reservation_id": reservation.reservation_id,
+                    "effect_id": proposal.proposal_id,
+                },
+            )
         finally:
             preparation.close()
 
@@ -2151,7 +2168,11 @@ class SharedEffectSubstrate:
     # -- the physical effect boundary ----------------------------------------
 
     def _cross_effect_boundary(
-        self, request: ToolRequest, preparation: "_EffectPreparation"
+        self,
+        request: ToolRequest,
+        preparation: "_EffectPreparation",
+        *,
+        causal: dict[str, str] | None = None,
     ) -> _CommandExecution:
         """The single point at which this process touches the workspace."""
 
@@ -2171,6 +2192,8 @@ class SharedEffectSubstrate:
                 preparation=preparation,
                 cancellation=self._cancellation,
                 start_hook=None,
+                durable_root=self._store.root,
+                causal=causal,
             )
         else:  # pragma: no cover - the typed union is closed
             raise TypeError("unknown typed tool request")

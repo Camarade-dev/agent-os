@@ -25,11 +25,14 @@ is recorded in the durable observation.
 When the host delegates a writable cgroup v2 subtree, a per-effect cgroup bounds
 the **whole process domain in aggregate**: `pids.max` and `memory.max` apply to
 every descendant together rather than to each process individually. The launcher
-is created stopped, attached, and membership-verified from `cgroup.procs` before
-it is released to exec, so the untrusted command cannot run outside the claimed
-domain. Directory creation alone is not membership. Attachment failure refuses
-the effect; when readiness promised this mechanism, silent degradation to RLIMIT
-is forbidden. The subtree is removed only when it has no live members.
+is held behind a trusted controller launch gate, attached, and
+membership-verified from real `cgroup.procs` before the gate is released so the
+launcher and untrusted command may exec (see
+`implementation/M2_CGROUP_LAUNCH_PRIMITIVE_SPEC.md`; the third-repair
+`preexec_fn`/`SIGSTOP` construction is withdrawn). Directory creation alone is
+not membership. Attachment failure refuses the effect; when readiness promised
+this mechanism, silent degradation to RLIMIT is forbidden. The subtree is
+removed only when it has no live members.
 
 `probe_cgroup_delegation()` does not infer delegation from the presence of
 `/sys/fs/cgroup`. It resolves this process's own unified path, requires the

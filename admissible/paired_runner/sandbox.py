@@ -732,6 +732,9 @@ def capsule_argv(
     for source in specification.toolchain_inputs:
         argv += ["--ro-bind-try", source, source]
     # Private execution view: not the live authorized host workspace.
+    # The mount-namespace helper rewrites this ``--bind-fd`` into ``--bind`` of
+    # the helper-local staging path because bubblewrap cannot bind a detached
+    # private tmpfs through a host-side ``/proc/self/fd/N`` path.
     argv += ["--bind-fd", str(workspace_fd), CAPSULE_WORKSPACE_PATH]
     # Verified in-capsule init, bound by descriptor so a pathname replacement
     # cannot redirect the mount.

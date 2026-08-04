@@ -33,8 +33,6 @@ import threading
 import time
 from typing import Any, Callable
 
-import signal
-
 from .canonical import Fingerprint
 from .observation import (
     ProcessObservation,
@@ -42,6 +40,7 @@ from .observation import (
     StreamObservation,
 )
 from .capsule_seccomp import open_program_descriptor
+from .cgroup_launch import attach_and_verify_real
 from .resource_limits import (
     MECHANISM_CGROUP_AND_RLIMIT,
     MECHANISM_NONE,
@@ -252,18 +251,6 @@ def _containment_evidence(status: dict[str, Any] | None, mechanism: str, cgroup:
     }
 
 
-def _stop_for_cgroup_attach() -> None:
-    """Stop the child after fork and before exec so membership can be verified.
-
-    ``preexec_fn`` runs in the child after fork and before the launcher image is
-    executed.  Stopping here means the untrusted command — and even bubblewrap
-    itself — cannot run until the controller has attached the PID to the target
-    cgroup and read membership back from the kernel.
-    """
-
-    os.kill(os.getpid(), signal.SIGSTOP)
-
-
 def _resource_observation(
     before: Any,
     after: Any,
@@ -331,9 +318,11 @@ def supervise_command(
       process group -- is the boundary;
     * quiescence is derived inside the capsule from ``ECHILD``, so
       ``descendants_reaped`` is a kernel observation and not an assertion;
-    * when cgroup enforcement is required, the launcher is created stopped,
-      attached, and membership-verified before it is allowed to exec, so the
-      untrusted command cannot run outside the claimed process domain;
+    * when cgroup enforcement is required, the launcher child is created behind
+      a trusted pipe gate (never a Python child-side stop hook), attached, and
+      membership-verified from a real cgroup2 ``cgroup.procs`` before the gate
+      is released, so the untrusted command cannot run outside the claimed
+      process domain;
     * pipe EOF is *not* treated as completion.  This loop ends when the
       launcher itself is reaped, which happens only after the in-capsule init
       has observed quiescence.
@@ -392,23 +381,17 @@ def supervise_command(
         runtime.init_fd,
         runtime.workspace_fd,
     )
-    # When a cgroup subtree exists, the child is created stopped so membership
-    # can be verified before bubblewrap — and therefore before the command —
-    # executes.  Without a cgroup the stop is unnecessary and omitted.
-    preexec = _stop_for_cgroup_attach if cgroup.directory_present else None
-
+    # Launch inside the private mount-namespace helper so the private tmpfs is
+    # bind-mounted by a helper-local pathname.  When a cgroup subtree exists the
+    # child remains behind a trusted pipe gate until membership is verified —
+    # never via a Python child-side stop-before-exec hook.
     try:
-        process = subprocess.Popen(  # noqa: S603 - explicit argv, never a shell
+        process = runtime.private_view.spawn_launcher(
             launcher_argv,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            close_fds=True,
             pass_fds=pass_fds,
-            shell=False,
-            preexec_fn=preexec,
+            await_release=cgroup.directory_present,
         )
-    except (OSError, ValueError) as error:
+    except Exception as error:
         for descriptor in (status_read, status_write, control_read, control_write, seccomp_fd):
             try:
                 os.close(descriptor)
@@ -454,20 +437,22 @@ def supervise_command(
         )
 
     launcher_pid = process.pid
+    stdout_pipe = open(process.stdout_fd, "rb", buffering=0, closefd=True)
+    stderr_pipe = open(process.stderr_fd, "rb", buffering=0, closefd=True)
     try:
         launcher_group = os.getpgid(launcher_pid)
     except OSError:  # pragma: no cover - the launcher exited immediately
         launcher_group = launcher_pid
 
     if cgroup.directory_present:
-        # The child is stopped in preexec.  Attach, prove membership from the
-        # kernel, and only then release it.  Failure refuses before the
+        # Child is behind the trusted pipe gate.  Attach, prove membership from
+        # a real cgroup2 procs file, then release.  Failure refuses before the
         # launcher image runs and therefore before the untrusted command exists.
-        attached = cgroup.attach_and_verify(launcher_pid)
+        attached = attach_and_verify_real(cgroup, launcher_pid)
         if not attached:
             try:
-                os.kill(launcher_pid, signal.SIGKILL)
-            except OSError:
+                process.kill()
+            except Exception:
                 pass
             try:
                 process.wait(timeout=CAPSULE_TEARDOWN_TIMEOUT_SECONDS)
@@ -478,6 +463,8 @@ def supervise_command(
                     os.close(descriptor)
                 except OSError:
                     pass
+            stdout_pipe.close()
+            stderr_pipe.close()
             cgroup.close()
             if required_containment_mechanism == MECHANISM_CGROUP_AND_RLIMIT or delegation.available:
                 raise ResourceContainmentUnavailable(
@@ -485,10 +472,10 @@ def supervise_command(
                 )
         else:
             try:
-                os.kill(launcher_pid, signal.SIGCONT)
-            except OSError as error:
+                process.release()
+            except Exception as error:
                 raise ResourceContainmentUnavailable(
-                    f"failed to release the stopped launcher after cgroup attach: {error}"
+                    f"failed to release the gated launcher after cgroup attach: {error}"
                 ) from error
 
     mechanism = effective_mechanism(
@@ -507,6 +494,8 @@ def supervise_command(
                 os.close(descriptor)
             except OSError:
                 pass
+        stdout_pipe.close()
+        stderr_pipe.close()
         cgroup.close()
         raise ResourceContainmentUnavailable(
             "readiness promised CGROUP_V2_AND_RLIMIT but membership was not verified"
@@ -521,7 +510,7 @@ def supervise_command(
 
     stdout_stream = _BoundedStream("stdout", max_output_bytes)
     stderr_stream = _BoundedStream("stderr", max_output_bytes)
-    streams = {process.stdout.fileno(): stdout_stream, process.stderr.fileno(): stderr_stream}
+    streams = {stdout_pipe.fileno(): stdout_stream, stderr_pipe.fileno(): stderr_stream}
     controller_peak = 0
     status_bytes = bytearray()
     cancellation_signalled = False
@@ -538,7 +527,7 @@ def supervise_command(
     )
 
     selector = selectors.DefaultSelector()
-    for pipe in (process.stdout, process.stderr):
+    for pipe in (stdout_pipe, stderr_pipe):
         os.set_blocking(pipe.fileno(), False)
         selector.register(pipe, selectors.EVENT_READ)
     os.set_blocking(status_read, False)
@@ -601,7 +590,7 @@ def supervise_command(
                 launcher_returncode = launcher_returncode
     finally:
         selector.close()
-        for pipe in (process.stdout, process.stderr):
+        for pipe in (stdout_pipe, stderr_pipe):
             try:
                 pipe.close()
             except OSError:  # pragma: no cover
@@ -620,7 +609,7 @@ def supervise_command(
     # PID namespace no longer exists.
     try:
         launcher_returncode = process.wait(timeout=CAPSULE_TEARDOWN_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:  # pragma: no cover - defensive
+    except TimeoutError:  # pragma: no cover - defensive
         process.kill()
         launcher_returncode = process.wait()
 

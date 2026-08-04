@@ -576,8 +576,9 @@ preparation, because creating a directory is itself a mutation.
 
 ## ADR-M2T-01 — Effects run on a private view; trusted export mutates the source
 
-**Status:** Accepted (Milestone 2 third critical repairs), supersedes the
-shared-workspace half of ADR-M2S-01
+**Status:** Superseded in part by ADR-M2F-01 and ADR-M2F-03 (Milestone 2 fourth
+critical repairs). The private-view + trusted-export grammar remains; host-named
+materialization and in-memory-only export reservation do not.
 
 **Context.** ADR-M2S-01 closed endpoint *creation* inside the capsule and refused
 pre-existing specials at admission. A live writable bind of the authorized
@@ -596,7 +597,9 @@ states.
 
 ## ADR-M2T-02 — Runtime inputs are descriptor-bound; cgroup membership is verified before exec
 
-**Status:** Accepted (Milestone 2 third critical repairs), extends ADR-M2S-05
+**Status:** Superseded in part by ADR-M2F-02 (Milestone 2 fourth critical
+repairs). Descriptor binding remains; the child-side `preexec_fn` / `SIGSTOP`
+launch construction does not.
 
 **Context.** Pathname recheck then pathname `Popen` left a replacement window.
 Cgroup `attach()` return values were ignored and mechanism was derived from
@@ -610,6 +613,70 @@ command execution; promised cgroup enforcement never silently degrades.
 
 **Consequences.** Evidence binds the inode that actually ran. Aggregate cgroup
 claims require verified membership. RLIMIT remains mandatory defence in depth.
+
+## ADR-M2F-01 — The writable execution view is a private mount, not a host path
+
+**Status:** Accepted (Milestone 2 fourth critical repairs), supersedes the
+host-named materialization half of ADR-M2T-01. Closes **M2-B26**.
+
+**Context.** A private directory under a host-visible temporary path remains
+reachable by another same-UID process in the controller's mount namespace. That
+peer can plant FIFOs or mutate the effect view before or during execution even
+when the authorized source itself is protected.
+
+**Decision.** Materialise onto a tmpfs that exists only inside a private
+user+mount namespace helper (`PRIVATE_MOUNTNS_TMPFS`), retain the view by
+directory descriptor (SCM_RIGHTS), rewrite capsule binds so the launcher runs
+inside that helper, and never expose a stable host pathname for the writable
+view while execution is active.
+
+**Consequences.** Same-UID host peers cannot pathname-reach the effect view.
+Cleanup must reap the helper and leave no reachable mount. Export remains the
+only trusted mutation path into the authorized source.
+
+## ADR-M2F-02 — Resource membership uses a trusted launch gate, not `preexec_fn`
+
+**Status:** Accepted (Milestone 2 fourth critical repairs), supersedes the
+stopped-`Popen` construction of ADR-M2T-02. Addresses **M2-B25**.
+
+**Context.** `subprocess.Popen(preexec_fn=...)` that raises `SIGSTOP` is a
+child-side hook after the launcher image has already begun execution. It is not
+a trusted controller gate, and synthetic regular files can be mistaken for
+`cgroup.procs` evidence.
+
+**Decision.** The production path obtains a child identity behind a trusted pipe
+gate inside the private-mount helper, the controller attaches and verifies real
+cgroup membership from the kernel, then releases the gate so launcher and
+command may exec. Failed attach or failed verification executes no command.
+Synthetic non-cgroup2 `cgroup.procs` files are refused.
+
+**Consequences.** Aggregate cgroup claims still require verified membership.
+When the host provides no writable delegated cgroup v2 subtree, the mechanism
+remains honestly `RLIMIT` and physical cgroup-before-exec qualification is
+recorded as unavailable rather than claimed.
+
+## ADR-M2F-03 — Export reservations are durable before the first source mutation
+
+**Status:** Accepted (Milestone 2 fourth critical repairs), extends the export
+grammar of ADR-M2T-01. Closes **M2-B27**.
+
+**Context.** An export protocol that keeps its reservation only in memory, or
+that mutates the authorized source before a recoverable journal exists, cannot
+classify concurrent mutation or crash/restart from durable state alone and may
+return `APPLIED` while losing an independent change.
+
+**Decision.** Before the first authorized-source mutation, durably publish a
+no-replace reservation binding causal identities, snapshot and private-view
+identities, the ordered change set, expected pre/post state, fingerprints, and
+protocol version. Journal each operation with immediate pre-state revalidation,
+apply durability barriers in documented order, verify final tree identity, and
+publish receipt/reconciliation only after the committed state is durable.
+Recovery reads only durable records and filesystem state; ambiguous or partial
+exports are never automatically replayed as if they had not happened.
+
+**Consequences.** Concurrent independent mutation cannot finish as silent
+`APPLIED`. Restart classification is an evidence property, not an in-process
+callback.
 
 ## ADR-M2S-01 — Filesystem IPC is closed at the syscall, not by the network namespace
 
