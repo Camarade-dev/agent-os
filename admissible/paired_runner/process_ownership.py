@@ -492,6 +492,57 @@ SUBREAPER_STATES = (
 SUBREAPER_DEBT_STATES = (SUBREAPER_STATE_RESTORATION_OWED, SUBREAPER_STATE_POISONED)
 
 
+# --- M2-B45: one process-wide active ownership domain -------------------------
+#
+# ``PR_SET_CHILD_SUBREAPER`` is a single flag on a single process.  The debt that
+# a failed restoration leaves was already process-wide (M2-B42), but the *active*
+# ownership -- the depth, the baseline, the owner PID, the applied bit, and the
+# lock that serialises them -- was instance-local, so two
+# :class:`ChildSubreaperOwnership` objects could each believe they owned the one
+# flag.  The second acquisition read the *first one's* activation as its own
+# baseline, and the first one's release then put the flag back underneath an
+# object that went on reporting active ownership, depth 1, a valid reference and
+# state APPLIED over a flag the kernel had already cleared.
+#
+# There is therefore exactly one active ownership record per process and every
+# ownership object is a handle onto it.  Nothing here relies on only one object
+# being constructed: an import discipline is not an invariant.
+
+
+@dataclass
+class _ActiveOwnership:
+    """The one process-wide active child-subreaper ownership, per PID.
+
+    ``generation`` is incremented by each *fresh* activation and by the discard
+    of an inherited one.  It is what makes a reference handed out by an earlier
+    activation detectably stale: the handle remembers the generation it was cut
+    from, so a replacement of the ownership state invalidates it rather than
+    leaving it describing an activation that no longer exists.
+    """
+
+    owner_pid: int | None = None
+    #: The one original baseline.  A nested acquisition never redefines it.
+    baseline: int | None = None
+    depth: int = 0
+    applied: bool = False
+    generation: int = 0
+    code: str = SUBREAPER_ALREADY_RELEASED
+    detail: str = "no acquisition has been made"
+    restore_intended: int | None = None
+    restore_observed: int | None = None
+    restoration_verified: bool = False
+    cleanup_complete: bool = True
+    released_nothing: bool = True
+    state: str = SUBREAPER_STATE_CLEAN
+
+
+#: The single serialization primitive for the whole domain -- active ownership
+#: and debt alike.  Two objects that took two locks would not be serialised
+#: against each other, which is precisely how two acquisitions could split one
+#: process-wide flag between them.
+_OWNERSHIP_LOCK = threading.RLock()
+_PROCESS_ACTIVE_OWNERSHIP = _ActiveOwnership()
+
 #: M2-B42.  The debt is a fact about *this process's* flag, not about one
 #: object's bookkeeping, so it lives beside the flag rather than inside whichever
 #: :class:`ChildSubreaperOwnership` happened to incur it.  Replacing the
@@ -499,8 +550,30 @@ SUBREAPER_DEBT_STATES = (SUBREAPER_STATE_RESTORATION_OWED, SUBREAPER_STATE_POISO
 #: be a way to forget what the process still owes.  The entry records the PID
 #: that incurred it, so a ``fork`` child (which inherits this module's memory but
 #: not the flag) neither owes it nor can settle it.
-_DEBT_LOCK = threading.RLock()
+#:
+#: M2-B45.  It is guarded by the same lock as the active ownership, because they
+#: are two facts about one flag and a decision that reads both must not see them
+#: change underneath it.
+_DEBT_LOCK = _OWNERSHIP_LOCK
 _PROCESS_RESTORATION_DEBT: dict[str, Any] | None = None
+
+
+def _shared_field(name: str) -> property:
+    """One field of the process-wide ownership record, addressed by name.
+
+    Deliberately not an instance attribute: an object that kept its own copy is
+    an object that can report ownership this process no longer holds (M2-B45).
+    The module global is resolved at every access, so the record can be restored
+    in place without leaving a handle bound to a stale one.
+    """
+
+    def read(_self: Any) -> Any:
+        return getattr(_PROCESS_ACTIVE_OWNERSHIP, name)
+
+    def write(_self: Any, value: Any) -> None:
+        setattr(_PROCESS_ACTIVE_OWNERSHIP, name, value)
+
+    return property(read, write)
 
 
 def process_restoration_debt() -> dict[str, Any] | None:
@@ -511,6 +584,61 @@ def process_restoration_debt() -> dict[str, Any] | None:
         if debt is None or int(debt.get("owner_pid") or 0) != os.getpid():
             return None
         return dict(debt)
+
+
+def ownership_generation() -> int:
+    """The generation of the current process-wide activation (M2-B45)."""
+
+    with _OWNERSHIP_LOCK:
+        return int(_PROCESS_ACTIVE_OWNERSHIP.generation)
+
+
+def process_active_ownership() -> dict[str, Any]:
+    """A read-only view of the one process-wide active ownership record."""
+
+    with _OWNERSHIP_LOCK:
+        record = _PROCESS_ACTIVE_OWNERSHIP
+        owned_here = record.owner_pid is None or record.owner_pid == os.getpid()
+        return {
+            "owner_pid": record.owner_pid,
+            "original_baseline": record.baseline,
+            "depth": record.depth,
+            "applied": record.applied and owned_here,
+            "generation": record.generation,
+            "ownership_state": record.state,
+            "owned_by_this_pid": owned_here,
+            "reading_pid": os.getpid(),
+        }
+
+
+def capture_process_ownership() -> dict[str, Any]:
+    """Every process-wide ownership fact, for a caller that must put it back.
+
+    The active record and the debt latch are the two process-wide facts this
+    module owns.  A test that injects a kernel failure changes both, and both
+    are restored together or neither is.
+    """
+
+    with _OWNERSHIP_LOCK:
+        return {
+            "active": dict(_PROCESS_ACTIVE_OWNERSHIP.__dict__),
+            "debt": None if _PROCESS_RESTORATION_DEBT is None else dict(_PROCESS_RESTORATION_DEBT),
+        }
+
+
+def restore_process_ownership(snapshot: dict[str, Any]) -> None:
+    """Put back what :func:`capture_process_ownership` recorded.
+
+    The record itself is mutated rather than replaced, so handles that already
+    exist keep addressing the one live domain.
+    """
+
+    global _PROCESS_RESTORATION_DEBT
+    with _OWNERSHIP_LOCK:
+        for name, value in dict(snapshot["active"]).items():
+            setattr(_PROCESS_ACTIVE_OWNERSHIP, name, value)
+        debt = snapshot["debt"]
+        _PROCESS_RESTORATION_DEBT = None if debt is None else dict(debt)
 
 
 class ChildSubreaperUnavailable(RuntimeError):
@@ -555,32 +683,51 @@ def set_child_subreaper(value: int) -> str | None:
 
 
 class ChildSubreaperOwnership:
-    """Process-wide subreaper state with an explicitly owned lifetime.
+    """A handle onto the one process-wide subreaper ownership domain.
 
     The flag is genuinely process-wide, so it is never set as a side effect and
     never left set after the last trusted helper is gone.  Acquisition is
     reference-counted so concurrent effects -- which each fork their own helper
     before and after other launchers exist -- share one activation and one
     restoration.
+
+    M2-B45.  Every instance addresses the same active record and takes the same
+    lock, so constructing a second object is constructing a second *handle*, not
+    a second owner.  The fields below are shared properties rather than instance
+    attributes for exactly that reason: an object holding its own depth,
+    baseline, owner PID and applied bit is an object that can report ownership
+    the process has already given back.
     """
 
+    _depth = _shared_field("depth")
+    #: The one original baseline, kept under its historical name.
+    _previous = _shared_field("baseline")
+    _owner_pid = _shared_field("owner_pid")
+    _code = _shared_field("code")
+    _detail = _shared_field("detail")
+    _applied = _shared_field("applied")
+    # M2-B39.  What a restoration intended, what the kernel actually read back,
+    # and whether the two agreed.  A restoration is claimed from the readback
+    # alone.
+    _restore_intended = _shared_field("restore_intended")
+    _restore_observed = _shared_field("restore_observed")
+    _restoration_verified = _shared_field("restoration_verified")
+    _cleanup_complete = _shared_field("cleanup_complete")
+    _released_nothing = _shared_field("released_nothing")
+    _state = _shared_field("state")
+
     def __init__(self) -> None:
-        self._lock = threading.RLock()
-        self._depth = 0
-        self._previous: int | None = None
-        self._owner_pid: int | None = None
-        self._code: str = SUBREAPER_ALREADY_RELEASED
-        self._detail: str = "no acquisition has been made"
-        self._applied = False
-        # M2-B39.  What a restoration intended, what the kernel actually read
-        # back, and whether the two agreed.  A restoration is claimed from the
-        # readback alone.
-        self._restore_intended: int | None = None
-        self._restore_observed: int | None = None
-        self._restoration_verified = False
-        self._cleanup_complete = True
-        self._released_nothing = True
-        self._state: str = SUBREAPER_STATE_CLEAN
+        self._lock = _OWNERSHIP_LOCK
+
+    @property
+    def generation(self) -> int:
+        """The generation of the activation this handle currently addresses."""
+
+        with self._lock:
+            return int(_PROCESS_ACTIVE_OWNERSHIP.generation)
+
+    def _new_generation_locked(self) -> None:
+        _PROCESS_ACTIVE_OWNERSHIP.generation += 1
 
     # M2-B42.  The one explicit latch for unresolved process-wide ownership
     # debt.  While it exists no acquisition is granted, the baseline it records
@@ -636,6 +783,10 @@ class ChildSubreaperOwnership:
             self._cleanup_complete = True
             self._released_nothing = True
             self._debt = None
+            # M2-B45.  The inherited activation is gone, so every reference cut
+            # from it is stale rather than merely unreleased: a handle carried
+            # across the fork addresses a generation this process does not have.
+            self._new_generation_locked()
             self._state = SUBREAPER_STATE_INHERITED_DISCARDED
             self._code = SUBREAPER_INHERITED_DISCARDED
             self._detail = (
@@ -843,6 +994,12 @@ class ChildSubreaperOwnership:
                 # M2-B41.  An outer acquisition proved the kernel state at some
                 # earlier instant; this one shares that single activation only
                 # if the kernel still agrees, asked now.
+                #
+                # M2-B45.  "Outer" is a fact about the process, not about this
+                # object: an acquisition taken through any other handle reaches
+                # this branch, so a second ownership object shares the one
+                # activation and the one original baseline instead of reading
+                # the first one's activation back as a baseline of its own.
                 self._revalidate_nested_locked()
                 self._depth += 1
                 self._code = SUBREAPER_APPLIED
@@ -884,6 +1041,10 @@ class ChildSubreaperOwnership:
             self._applied = True
             self._depth = 1
             self._owner_pid = os.getpid()
+            # M2-B45.  A fresh activation replaces whatever the process-wide
+            # domain held before it, so every reference cut from the previous
+            # one is stale from here on.
+            self._new_generation_locked()
             self._code = SUBREAPER_APPLIED
             self._detail = (
                 f"this controller (pid {os.getpid()}) is a child subreaper; the previous value "
@@ -1151,6 +1312,8 @@ class ChildSubreaperOwnership:
             owed = self._owed()
             debt = None if owed is None else dict(owed)
             return {
+                "generation": int(_PROCESS_ACTIVE_OWNERSHIP.generation),
+                "process_wide": True,
                 "code": self._code,
                 "detail": self._detail,
                 "applied": self._applied,
@@ -1187,6 +1350,11 @@ class SubreaperReference:
         self._owner = owner
         self._state = dict(state)
         self._holder_pid = os.getpid()
+        # M2-B45.  The generation this handle was cut from.  A handle is a claim
+        # about one activation of the process-wide flag, so it stops being valid
+        # when that activation is replaced -- not merely when somebody releases
+        # it through this object.
+        self._generation = int(state.get("generation", ownership_generation()))
         self._released = False
         self._release_state: dict[str, Any] = {}
 
@@ -1203,8 +1371,20 @@ class SubreaperReference:
         return self._holder_pid
 
     @property
+    def generation(self) -> int:
+        return self._generation
+
+    @property
     def valid(self) -> bool:
-        """Whether this handle describes ownership positively held by this PID."""
+        """Whether this handle describes ownership positively held by this PID.
+
+        M2-B45.  The stored acquisition document is necessary and not
+        sufficient: it records what was true when the handle was cut.  The live
+        process-wide domain decides whether that is still true, so a handle
+        whose activation has been replaced, released to zero, contradicted by
+        the kernel or left owing a restoration is not valid however green its
+        snapshot reads.
+        """
 
         return (
             not self._released
@@ -1213,7 +1393,20 @@ class SubreaperReference:
             and bool(self._state.get("applied"))
             and int(self._state.get("depth") or 0) > 0
             and self._state.get("owner_pid") == os.getpid()
+            and self._generation == ownership_generation()
+            and self._owner.active
         )
+
+    def settle_restoration_debt(self) -> dict[str, Any]:
+        """Settle the process-wide restoration this handle's release may owe.
+
+        M2-B46 / M2-B47.  A caller that advertises its cleanup as retryable must
+        be able to reach the operation that makes it terminal.  Release ends
+        this handle; settlement ends what the release could not, and it is the
+        same process-wide operation whichever handle asks for it.
+        """
+
+        return self._owner.settle_restoration_debt()
 
     def release(self) -> dict[str, Any]:
         """Release this acquisition once.  Idempotent, and never cross-process."""
@@ -1605,6 +1798,24 @@ def ownership_architecture_description() -> dict[str, Any]:
             "release() nor replacing the object clears it.  settle_restoration_debt() is the only "
             "operation that can, and only when the kernel reads back the owed baseline exactly."
         ),
+        "process_wide_active_ownership": (
+            "M2-B45.  The active ownership -- baseline, depth, owner PID, applied bit, generation "
+            "and the lock that serialises them -- is one record per process, and every "
+            "ChildSubreaperOwnership is a handle onto it.  A second object therefore shares the "
+            "one activation and the one original baseline instead of reading the first object's "
+            "activation back as a baseline of its own, no object can restore the flag while any "
+            "process-wide reference remains, and a SubreaperReference is valid only while the "
+            "generation it was cut from is still the live one."
+        ),
+        "process_wide_facts": [
+            "original baseline",
+            "reference depth",
+            "active owner pid",
+            "kernel-readback truth",
+            "activation generation",
+            "restoration debt",
+            "serialization lock",
+        ],
         "ownership_states": list(SUBREAPER_STATES),
         "release_results": list(SUBREAPER_RELEASE_RESULTS),
         "acquisition_refusals": list(SUBREAPER_ACQUISITION_REFUSALS),
@@ -1681,14 +1892,18 @@ __all__ = [
     "SUBREAPER_UNAVAILABLE",
     "SUBREAPER_UNSETTLED_RESULTS",
     "SubreaperReference",
+    "capture_process_ownership",
     "get_child_subreaper",
     "is_addressable_pid",
     "observe_process_exit",
     "open_process_descriptor",
     "ownership_architecture_description",
+    "ownership_generation",
+    "process_active_ownership",
     "process_is_zombie",
     "process_restoration_debt",
     "process_present",
+    "restore_process_ownership",
     "reap_owned_child",
     "set_child_subreaper",
     "signal_process",

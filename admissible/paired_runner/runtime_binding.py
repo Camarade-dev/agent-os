@@ -158,6 +158,18 @@ class BoundRuntime:
             os.close(launcher[0])
             raise
 
+    @property
+    def cleanup_complete(self) -> bool:
+        """Whether the private view this runtime holds has finished cleaning up."""
+
+        return self.private_view.cleanup_complete
+
+    @property
+    def cleanup_registry_id(self) -> str | None:
+        """The process registry entry retaining this view's cleanup (M2-B48)."""
+
+        return self.private_view.registry_id
+
     def close(self) -> dict[str, Any]:
         """Close the bound descriptors and the private view it holds.
 
@@ -166,6 +178,12 @@ class BoundRuntime:
         its evidence is returned rather than discarded, so a caller is never
         told a shutdown finished when a helper of this controller is still an
         unreaped child.
+
+        M2-B48.  Returning the evidence was never sufficient on its own: the
+        caller dropped it, and with it the only handle to the retry.  The
+        evidence now names the process-level registry entry that retains that
+        handle, so what this method returns is a fact the caller may propagate
+        and not the last copy of it.
         """
 
         if not self._closed:

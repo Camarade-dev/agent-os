@@ -78,11 +78,14 @@ from .process_ownership import (
     is_addressable_pid,
     observe_process_exit,
     open_process_descriptor,
+    ownership_generation,
     process_is_zombie,
     process_present,
+    process_restoration_debt,
     reap_owned_child,
     signal_process,
 )
+from .resource_limits import set_cleanup_registrar as _set_cleanup_registrar
 from .observation import (
     M2_PREFIX,
     M2_SCHEMA_VERSION,
@@ -347,7 +350,18 @@ _UNSETTLED_FAILED_STARTS: list["_UnsettledFailedStart"] = []
 
 
 class _UnsettledFailedStart:
-    """One partially created helper whose cleanup is incomplete but retryable."""
+    """One partially created helper whose cleanup is incomplete but retryable.
+
+    M2-B46.  A cleanup that reaped its child and called release exactly once has
+    done everything it *can* do and not necessarily everything it *owes*: a
+    release whose restoration the kernel did not read back leaves the
+    process-wide flag away from the baseline this start was responsible for.
+    Completion therefore requires four facts, not two -- the exact child reaped,
+    the exact reference released once, the restoration positively settled, and
+    no process-wide restoration debt standing -- and the entry survives until
+    all four hold, because deleting it is deleting the only handle that can
+    settle the fourth.
+    """
 
     def __init__(self, *, helper_pid: int, subreaper: SubreaperReference) -> None:
         self.helper_pid = helper_pid
@@ -355,15 +369,58 @@ class _UnsettledFailedStart:
         self.owner_pid = os.getpid()
         self.reaped = False
         self.reap: ReapOutcome | None = None
+        #: Whether the single release has been performed.  Named for what it is:
+        #: a release that returned RESTORE_MISMATCH *was* attempted and must
+        #: never be attempted again.
         self.released = False
         self.release_state: dict[str, Any] = {}
+        #: What the single release actually returned, kept immutably beside
+        #: whatever a later settlement changes.
+        self.release_result: str | None = None
+        #: The activation this failed start's acquisition was cut from, and the
+        #: baseline that acquisition owes.
+        self.ownership_generation = int(subreaper.generation)
+        self.owed_baseline = subreaper.state.get("previous_value")
+        self.settlements: list[dict[str, Any]] = []
+        self.retries = 0
+        self.last_retry: dict[str, Any] = {}
+
+    @property
+    def restoration_settled(self) -> bool:
+        """Whether this start's release left the process-wide flag settled."""
+
+        if not self.released:
+            return False
+        if self.release_state.get("code") in SUBREAPER_UNSETTLED_RESULTS:
+            return False
+        return not bool(self.release_state.get("debt_outstanding"))
+
+    @property
+    def debt_outstanding(self) -> bool:
+        return process_restoration_debt() is not None
 
     @property
     def cleanup_complete(self) -> bool:
-        return self.reaped and self.released
+        return (
+            self.reaped
+            and self.released
+            and self.restoration_settled
+            and not self.debt_outstanding
+        )
+
+    def _settle_locked(self) -> dict[str, Any]:
+        settlement = self.subreaper.settle_restoration_debt()
+        self.settlements.append(settlement)
+        if settlement.get("settled"):
+            # The debt this release left is gone, so the release result stops
+            # being the outstanding fact and the settled ownership document
+            # replaces it.  Both remain visible: the release code is kept in the
+            # evidence beside the settlement that ended it.
+            self.release_state = dict(settlement["state"])
+        return settlement
 
     def retry(self, *, deadline: Deadline | None = None) -> dict[str, Any]:
-        """Reap the exact child, then release the acquisition exactly once."""
+        """Reap the exact child, release once, then settle what the release owes."""
 
         bound = deadline or Deadline.after_ms(HELPER_REAP_DEADLINE_MS, "failed_start_retry")
         if self.owner_pid != os.getpid():  # pragma: no cover - defensive
@@ -378,29 +435,56 @@ class _UnsettledFailedStart:
                 "subreaper_released": self.released,
                 "cleanup_complete": False,
             }
+        self.retries += 1
         if not self.reaped:
             outcome = _kill_and_reap_owned(self.helper_pid, bound)
             self.reap = outcome
             self.reaped = outcome.reaped
+        released_here = False
         if self.reaped and not self.released:
-            # Reap first, release second.  Never the other way round.
+            # Reap first, release second.  Never the other way round, and never
+            # a second time: `released` records the attempt, not its outcome.
             self.released = True
+            released_here = True
             self.release_state = self.subreaper.release()
-            if self in _UNSETTLED_FAILED_STARTS:
-                _UNSETTLED_FAILED_STARTS.remove(self)
-        return {
+            self.release_result = self.release_state.get("code")
+        settlement: dict[str, Any] = {}
+        if self.released and not self.restoration_settled:
+            # M2-B46.  The operation that makes this entry terminal.  ``prctl``
+            # does not block, so it costs the caller's budget nothing and is
+            # attempted on the same call that discovered the debt as well as on
+            # every later one.
+            settlement = self._settle_locked()
+        evidence = {
             "helper_pid": self.helper_pid,
             "performed": True,
             "reason": "",
+            "retries": self.retries,
             "helper_reaped": self.reaped,
             "helper_exit_code": None if self.reap is None else self.reap.exit_code,
             "helper_zombie": process_is_zombie(self.helper_pid),
             "helper_present": process_present(self.helper_pid),
             "subreaper_released": self.released,
+            "subreaper_released_by_this_call": released_here,
+            "subreaper_release_result": self.release_result,
             "subreaper": dict(self.release_state),
+            "owed_baseline": self.owed_baseline,
+            "ownership_generation": self.ownership_generation,
+            "restoration_settled": self.restoration_settled,
+            "restoration_settlement": dict(settlement),
+            "settlement_attempts": len(self.settlements),
+            "debt_outstanding": self.debt_outstanding,
             "cleanup_complete": self.cleanup_complete,
+            "cleanup_retryable": not self.cleanup_complete,
             "deadline": bound.to_dict(),
         }
+        if self.cleanup_complete and self in _UNSETTLED_FAILED_STARTS:
+            # Removed only now: while anything above is false this entry is the
+            # only reachable handle to the reap, the release, or the settlement.
+            _UNSETTLED_FAILED_STARTS.remove(self)
+        evidence["registry_retained"] = self in _UNSETTLED_FAILED_STARTS
+        self.last_retry = dict(evidence)
+        return evidence
 
 
 def unsettled_failed_starts() -> tuple["_UnsettledFailedStart", ...]:
@@ -410,9 +494,285 @@ def unsettled_failed_starts() -> tuple["_UnsettledFailedStart", ...]:
 
 
 def retry_unsettled_failed_starts(*, deadline: Deadline | None = None) -> list[dict[str, Any]]:
-    """Retry every incomplete failed-start cleanup with a fresh bounded budget."""
+    """Retry every incomplete failed-start cleanup with a fresh bounded budget.
+
+    M2-B46.  A retry reaps what is unreaped, releases what is unreleased exactly
+    once, and settles the process-wide restoration its own release left owing.
+    An entry is removed only when all three are terminal.
+    """
 
     return [pending.retry(deadline=deadline) for pending in tuple(_UNSETTLED_FAILED_STARTS)]
+
+
+# --- M2-B48: incomplete cleanup outlives the frame that detected it -----------
+#
+# Every object on the private-execution path could already *return* incomplete
+# cleanup evidence.  The production call chain then dropped it: BoundRuntime.
+# close() returned evidence into a `finally` that ignored it, _EffectPreparation.
+# close() returned None, _execute_permitted_effect() never looked, the execution
+# outcome had nowhere to carry it, and PrivateExecutionView.materialize()
+# discarded its helper's closure on the exception path.  Once those local
+# wrappers left scope the retry handle was unreachable, so an incomplete cleanup
+# was retryable only in the sense that nothing could reach the retry.
+#
+# The registry below is the smallest thing that makes the retry survive: it is
+# PID-bound, it retains only incomplete objects, it names each one deterministic-
+# ally, it exposes a bounded drain, and it refuses new effects rather than
+# growing without limit.
+
+#: How many incomplete cleanups this process will hold before it refuses to
+#: start another private execution view.  A registry that grew without limit
+#: would convert a leak of processes into a leak of memory; refusing is the
+#: fail-closed answer and is disclosed rather than silently capped.
+CLEANUP_REGISTRY_CAPACITY = 64
+
+CLEANUP_KIND_HELPER = "PRIVATE_MOUNT_HELPER"
+CLEANUP_KIND_VIEW = "PRIVATE_EXECUTION_VIEW"
+#: M2-B48.  The third obligation an unfinished effect can leave: a per-effect
+#: cgroup whose members outlived the effect, which ``close()`` truthfully
+#: refuses to remove and which nothing retained once the supervision frame
+#: returned.  Process ownership being settled does not settle this.
+CLEANUP_KIND_EFFECT_CGROUP = "EFFECT_CGROUP"
+
+#: What a retryable cleanup would do next.  A cleanup that advertises a retry
+#: and cannot name the operation is the defect M2-B47 closes, so the name is
+#: derived from the evidence rather than asserted.
+CLEANUP_RETRY_REAP = "REAP_THE_EXACT_HELPER_PID"
+CLEANUP_RETRY_RELEASE = "RELEASE_THE_ACQUISITION_ONCE"
+CLEANUP_RETRY_SETTLE = "SETTLE_THE_PROCESS_WIDE_RESTORATION_DEBT"
+#: M2-B48.  The obligation process ownership being settled does not settle.
+CLEANUP_RETRY_REMOVE_CGROUP = "REMOVE_THE_EXACT_OWNED_EFFECT_CGROUP"
+CLEANUP_RETRY_NONE = "NOTHING_REMAINS"
+
+
+def _cleanup_retry_operation(evidence: dict[str, Any]) -> str:
+    if evidence.get("cleanup_complete"):
+        return CLEANUP_RETRY_NONE
+    if not evidence.get("reaped"):
+        return CLEANUP_RETRY_REAP
+    if evidence.get("ownership_retained"):
+        return CLEANUP_RETRY_RELEASE
+    return CLEANUP_RETRY_SETTLE
+
+
+#: The kind a retained handle is, decided by its type rather than guessed.
+_CLEANUP_KINDS = {
+    "PrivateExecutionView": CLEANUP_KIND_VIEW,
+    "PrivateMountHelper": CLEANUP_KIND_HELPER,
+    "EffectCgroup": CLEANUP_KIND_EFFECT_CGROUP,
+}
+
+
+class CleanupRegistrySaturated(PrivateWorkspaceError):
+    """This process holds as many unresolved cleanups as it will hold."""
+
+    def __init__(self, detail: str = "") -> None:
+        super().__init__("cleanup_registry_saturated", detail)
+
+
+class _IncompleteCleanup:
+    """One retained handle to a cleanup this process has not finished."""
+
+    def __init__(self, entry_id: str, kind: str, handle: Any, evidence: dict[str, Any]) -> None:
+        self.entry_id = entry_id
+        self.kind = kind
+        self.handle = handle
+        self.owner_pid = os.getpid()
+        self.helper_pid = int(evidence.get("helper_pid") or 0)
+        self.registered_generation = int(evidence.get("ownership_generation") or 0)
+        #: M2-B48.  The exact cgroup this entry owes a removal for, when it owes
+        #: one.  It is the containment path this controller created, never a
+        #: workspace or repository path, and it is retained because a removal
+        #: that cannot name its target cannot be retried.
+        self.effect_path = evidence.get("effect_path")
+        self.owned_identity = evidence.get("owned_identity")
+        self.cleanup = dict(evidence)
+        self.drains = 0
+
+    @property
+    def terminal(self) -> bool:
+        return bool(self.cleanup.get("cleanup_complete"))
+
+    def retry(self, *, deadline: Deadline | None = None) -> dict[str, Any]:
+        """Retry the exact operation this entry retains, boundedly.
+
+        Every retained handle answers one protocol -- ``settle_cleanup`` -- so a
+        drain discharges a helper, a view and a cgroup obligation the same way
+        and cannot silently skip a kind it does not recognise.
+        """
+
+        self.drains += 1
+        self.handle.settle_cleanup(deadline=deadline)
+        self.cleanup = dict(self.handle.cleanup_evidence())
+        return dict(self.cleanup)
+
+    def evidence(self) -> dict[str, Any]:
+        """What this entry retains.  No workspace or repository path is in it."""
+
+        return {
+            "entry_id": self.entry_id,
+            "kind": self.kind,
+            "owner_pid": self.owner_pid,
+            "helper_pid": self.helper_pid,
+            "ownership_generation": self.registered_generation,
+            "effect_cgroup_path": self.cleanup.get("effect_path"),
+            "owned_identity": self.cleanup.get("owned_identity"),
+            "drain_attempts": self.drains,
+            "cleanup_complete": bool(self.cleanup.get("cleanup_complete")),
+            "cleanup_retryable": bool(self.cleanup.get("cleanup_retryable")),
+            "cleanup_retry_operation": self.cleanup.get("cleanup_retry_operation"),
+            "reaped": bool(self.cleanup.get("reaped")),
+            "ownership_retained": bool(self.cleanup.get("ownership_retained")),
+            "restoration_settled": bool(self.cleanup.get("restoration_settled")),
+            "debt_outstanding": bool(self.cleanup.get("debt_outstanding")),
+            "settlement_attempts": int(self.cleanup.get("settlement_attempts") or 0),
+        }
+
+
+class _IncompleteCleanupRegistry:
+    """The process-level owner of every unresolved private-execution cleanup.
+
+    PID-bound by construction: a ``fork`` child inherits this module's memory but
+    owns none of the processes, descriptors, or acquisitions the entries
+    describe, so it discards them rather than retrying a parent's cleanup.
+    """
+
+    def __init__(self) -> None:
+        self._owner_pid = os.getpid()
+        self._entries: dict[str, _IncompleteCleanup] = {}
+        self._counter = 0
+
+    def _reset_after_fork(self) -> None:
+        if self._owner_pid != os.getpid():
+            self._owner_pid = os.getpid()
+            self._entries = {}
+            self._counter = 0
+
+    @property
+    def owner_pid(self) -> int:
+        self._reset_after_fork()
+        return self._owner_pid
+
+    def saturated(self) -> bool:
+        self._reset_after_fork()
+        return len(self._entries) >= CLEANUP_REGISTRY_CAPACITY
+
+    def require_capacity(self) -> None:
+        """Refuse a new private execution view fail-closed at capacity."""
+
+        if self.saturated():
+            raise CleanupRegistrySaturated(
+                f"pid {os.getpid()} holds {len(self._entries)} unresolved private-execution "
+                f"cleanups, which is the capacity of {CLEANUP_REGISTRY_CAPACITY}; no further "
+                "helper is started until they are drained"
+            )
+
+    def record(self, handle: Any, evidence: dict[str, Any]) -> str | None:
+        """Retain an incomplete cleanup, or release a completed one.
+
+        Registration is driven by the evidence rather than by the caller, so a
+        completed cleanup is never registered and an incomplete one is retained
+        wherever it is detected.
+        """
+
+        self._reset_after_fork()
+        existing = getattr(handle, "_registry_id", None)
+        if evidence.get("cleanup_complete"):
+            if existing is not None:
+                self._entries.pop(existing, None)
+                handle._registry_id = None
+            return None
+        if existing is not None and existing in self._entries:
+            self._entries[existing].cleanup = dict(evidence)
+            return existing
+        kind = _CLEANUP_KINDS.get(type(handle).__name__, CLEANUP_KIND_HELPER)
+        self._counter += 1
+        entry_id = f"cleanup-{self._owner_pid}-{self._counter:06d}"
+        self._entries[entry_id] = _IncompleteCleanup(entry_id, kind, handle, evidence)
+        handle._registry_id = entry_id
+        return entry_id
+
+    def entry(self, entry_id: str) -> _IncompleteCleanup | None:
+        self._reset_after_fork()
+        return self._entries.get(entry_id)
+
+    def entries(self) -> tuple[_IncompleteCleanup, ...]:
+        self._reset_after_fork()
+        return tuple(self._entries.values())
+
+    def evidence(self) -> dict[str, Any]:
+        self._reset_after_fork()
+        return {
+            "owner_pid": self._owner_pid,
+            "reading_pid": os.getpid(),
+            "capacity": CLEANUP_REGISTRY_CAPACITY,
+            "retained": len(self._entries),
+            "saturated": self.saturated(),
+            "entries": [entry.evidence() for entry in self._entries.values()],
+        }
+
+    def drain(self, *, deadline: Deadline | None = None) -> list[dict[str, Any]]:
+        """Retry every retained cleanup once, boundedly.  Idempotent."""
+
+        self._reset_after_fork()
+        results: list[dict[str, Any]] = []
+        for entry in tuple(self._entries.values()):
+            bound = deadline or Deadline.after_ms(HELPER_SHUTDOWN_DEADLINE_MS, "cleanup_drain")
+            cleanup = entry.retry(deadline=bound)
+            results.append(
+                {
+                    "entry_id": entry.entry_id,
+                    "kind": entry.kind,
+                    "helper_pid": entry.helper_pid,
+                    "drain_attempts": entry.drains,
+                    "cleanup_complete": bool(cleanup.get("cleanup_complete")),
+                    "cleanup_retryable": bool(cleanup.get("cleanup_retryable")),
+                    "cleanup_retry_operation": cleanup.get("cleanup_retry_operation"),
+                    "effect_cgroup_path": cleanup.get("effect_path"),
+                    "removed": entry.entry_id not in self._entries,
+                }
+            )
+        return results
+
+
+_CLEANUP_REGISTRY = _IncompleteCleanupRegistry()
+
+
+def _record_cleanup(handle: Any, evidence: dict[str, Any]) -> str | None:
+    """The registrar the containment layer calls, resolved at call time.
+
+    A function rather than a bound method: the registry object is the process's,
+    and a caller that replaced it must not find an old one still being written
+    to through a captured reference.
+    """
+
+    return _CLEANUP_REGISTRY.record(handle, evidence)
+
+
+# M2-B48.  The containment layer discovers unremoved per-effect cgroups and this
+# layer owns the process registry that keeps them reachable.  The dependency is
+# a hook rather than an import so containment keeps no knowledge of private
+# execution, and installing it here means every unresolved removal in this
+# process is retained wherever it is discovered.
+_set_cleanup_registrar(_record_cleanup)
+
+
+def incomplete_cleanups() -> tuple[_IncompleteCleanup, ...]:
+    """Every unresolved private-execution cleanup this process still owns."""
+
+    return _CLEANUP_REGISTRY.entries()
+
+
+def cleanup_registry_evidence() -> dict[str, Any]:
+    """The registry's durable evidence.  It names no filesystem path."""
+
+    return _CLEANUP_REGISTRY.evidence()
+
+
+def drain_incomplete_cleanups(*, deadline: Deadline | None = None) -> list[dict[str, Any]]:
+    """Retry every retained incomplete cleanup within one bounded budget."""
+
+    return _CLEANUP_REGISTRY.drain(deadline=deadline)
 
 
 def _roll_back_failed_start(
@@ -478,12 +838,39 @@ def _roll_back_failed_start(
         evidence["ownership_retained"] = True
         evidence["cleanup_complete"] = False
         evidence["cleanup_retryable"] = True
+        evidence["restoration_settled"] = False
+        evidence["debt_outstanding"] = process_restoration_debt() is not None
         return evidence
     # Nothing was forked, the pid never named a process this controller owns, or
     # the child is positively reaped.  Only now may the acquisition end.
-    evidence["subreaper"] = subreaper.release()
+    release_state = subreaper.release()
+    evidence["subreaper"] = dict(release_state)
     evidence["subreaper_released"] = True
     evidence["ownership_retained"] = False
+    unsettled = (
+        release_state.get("code") in SUBREAPER_UNSETTLED_RESULTS
+        or bool(release_state.get("debt_outstanding"))
+        or process_restoration_debt() is not None
+    )
+    evidence["restoration_settled"] = not unsettled
+    evidence["debt_outstanding"] = process_restoration_debt() is not None
+    if unsettled:
+        # M2-B46.  The child is reaped and the reference is spent, and the
+        # process-wide flag is still not back at the baseline this start owes.
+        # That is an incomplete cleanup with exactly one remaining operation, so
+        # the entry that can perform it is retained rather than the rollback
+        # reporting a completion nobody performed.
+        pending = _UnsettledFailedStart(
+            helper_pid=int(pid) if owned_child else 0, subreaper=subreaper
+        )
+        pending.reaped = bool(evidence["helper_reaped"]) or not owned_child
+        pending.released = True
+        pending.release_state = dict(release_state)
+        pending.release_result = release_state.get("code")
+        _UNSETTLED_FAILED_STARTS.append(pending)
+        evidence["cleanup_complete"] = False
+        evidence["cleanup_retryable"] = True
+        return evidence
     evidence["cleanup_complete"] = True
     evidence["cleanup_retryable"] = False
     return evidence
@@ -1132,6 +1519,18 @@ class PrivateMountHelper:
         self._subreaper: SubreaperReference | None = None
         self._subreaper_state: dict[str, Any] = {}
         self._subreaper_released = False
+        # M2-B47.  The reference is spent by the release, so the handle that can
+        # still make an unsettled restoration terminal is kept separately, and
+        # what the single release actually returned is kept immutably beside
+        # whatever a later settlement changes.
+        self._subreaper_settler: SubreaperReference | None = None
+        self._subreaper_release_result: str | None = None
+        self._settlements: list[dict[str, Any]] = []
+        # M2-B48.  The registry entry that holds this helper's retry handle
+        # while its cleanup is incomplete, so the handle outlives every local
+        # wrapper that could have dropped it.
+        self._registry_id: str | None = None
+        self._last_closure: dict[str, Any] = {}
 
     # --- protocol health ------------------------------------------------------
 
@@ -1169,10 +1568,28 @@ class PrivateMountHelper:
 
     @property
     def restoration_settled(self) -> bool:
-        """Whether the release this helper performed left nothing owed."""
+        """Whether the release this helper performed left nothing owed.
 
-        code = self._subreaper_state.get("code")
-        return code not in SUBREAPER_UNSETTLED_RESULTS
+        M2-B47.  Two facts, not one: the release result itself, and whether the
+        process-wide debt that result latched is still standing.  A settlement
+        that read the owed baseline back replaces the first and clears the
+        second; nothing else does.
+        """
+
+        state = self._subreaper_state
+        if state.get("code") in SUBREAPER_UNSETTLED_RESULTS:
+            return False
+        return not bool(state.get("debt_outstanding"))
+
+    @property
+    def settlement_attempts(self) -> int:
+        return len(self._settlements)
+
+    @property
+    def registry_id(self) -> str | None:
+        """The process cleanup-registry entry retaining this helper (M2-B48)."""
+
+        return self._registry_id
 
     @property
     def cleanup_complete(self) -> bool:
@@ -1216,7 +1633,9 @@ class PrivateMountHelper:
             "ownership_retained": self._subreaper_acquired,
             "ownership_released": self._subreaper_released,
             "restoration_settled": self.restoration_settled,
+            "restoration_settlement_attempts": len(self._settlements),
             "cleanup_complete": self._cleanup_complete,
+            "cleanup_registry_id": self._registry_id,
             "close_calls": self._closes,
         }
 
@@ -1279,6 +1698,11 @@ class PrivateMountHelper:
 
         if not hasattr(os, "unshare"):
             raise PrivateWorkspaceError("private_mountns_unavailable", "os.unshare is absent")
+        # M2-B48.  A process already holding its capacity of unresolved cleanups
+        # forks nothing further.  Refusing here is fail-closed and pre-effect:
+        # no acquisition, no socket pair, no child, and no descriptor exists on
+        # this path, exactly as an unavailable acquisition leaves none.
+        _CLEANUP_REGISTRY.require_capacity()
         try:
             subreaper = CHILD_SUBREAPER.acquire_reference()
         except ChildSubreaperUnavailable as error:
@@ -1541,10 +1965,39 @@ class PrivateMountHelper:
         self._subreaper_acquired = False
         reference = self._subreaper
         self._subreaper = None
+        # M2-B47.  The reference may be released exactly once, and is; the
+        # handle is retained separately because settling what that release could
+        # not observe is a different operation on the same process-wide domain,
+        # and a cleanup advertised as retryable must be able to reach it.
+        self._subreaper_settler = reference
         self._subreaper_state = reference.release() if reference is not None else CHILD_SUBREAPER.release()
+        self._subreaper_release_result = self._subreaper_state.get("code")
         self._subreaper_released = True
         self._recompute_cleanup_locked()
         return dict(self._subreaper_state)
+
+    def _settle_restoration_debt(self) -> dict[str, Any]:
+        """Make an unsettled restoration terminal, or leave it standing (M2-B47).
+
+        ``prctl`` does not block, so this costs a bounded cleanup nothing and is
+        attempted on the call that discovers the debt as well as on every later
+        one.  It claims nothing it did not read back: the ownership document it
+        records is the one the settlement returned.
+        """
+
+        if not self._subreaper_released or self.restoration_settled:
+            return {}
+        settler = self._subreaper_settler
+        settlement = (
+            settler.settle_restoration_debt()
+            if settler is not None
+            else CHILD_SUBREAPER.settle_restoration_debt()
+        )
+        self._settlements.append(settlement)
+        if settlement.get("settled"):
+            self._subreaper_state = dict(settlement["state"])
+        self._recompute_cleanup_locked()
+        return settlement
 
     def release_subreaper_if_reaped(self, *, deadline: Deadline | None = None) -> dict[str, Any]:
         """Release ownership for a helper this controller has already reaped.
@@ -1709,15 +2162,37 @@ class PrivateMountHelper:
         if self._reaped:
             released_here = self._subreaper_acquired
             self._release_subreaper()
+        # M2-B47.  The release is spent; what it could not observe is settled
+        # here.  This is what makes the advertised retry a retry: without it a
+        # repeated close reaped nothing, released nothing, and returned
+        # cleanup_retryable=true for ever.
+        settlement = self._settle_restoration_debt()
         self._recompute_cleanup_locked()
-        return self._closure_evidence(whole, already_closed=False, released_here=released_here)
+        return self._closure_evidence(
+            whole, already_closed=False, released_here=released_here, settlement=settlement
+        )
+
+    def settle_cleanup(self, *, deadline: Deadline | None = None) -> dict[str, Any]:
+        """The one retry protocol every retained cleanup handle answers (M2-B48)."""
+
+        return self.close(deadline=deadline)
+
+    def cleanup_evidence(self) -> dict[str, Any]:
+        """The last closure document, without performing another closure."""
+
+        return dict(self._last_closure)
 
     def _closure_evidence(
-        self, whole: Deadline, *, already_closed: bool, released_here: bool
+        self,
+        whole: Deadline,
+        *,
+        already_closed: bool,
+        released_here: bool,
+        settlement: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """What this shutdown did, and what it left undone (M2-B43)."""
+        """What this shutdown did, and what it left undone (M2-B43, M2-B47)."""
 
-        return {
+        evidence = {
             "helper_pid": self.pid,
             "already_closed": already_closed,
             "graceful_shutdown": self._graceful,
@@ -1729,6 +2204,11 @@ class PrivateMountHelper:
             "reap_detail": "" if self._reap is None else self._reap.detail,
             "subreaper": dict(self._subreaper_state),
             "subreaper_released_by_this_call": released_here,
+            "subreaper_release_result": self._subreaper_release_result,
+            "restoration_settlement": dict(settlement or {}),
+            "settlement_attempts": len(self._settlements),
+            "debt_outstanding": process_restoration_debt() is not None,
+            "ownership_generation": ownership_generation(),
             "ownership_retained": self._subreaper_acquired,
             "restoration_settled": self.restoration_settled,
             "cleanup_complete": self._cleanup_complete,
@@ -1738,6 +2218,14 @@ class PrivateMountHelper:
             "lifecycle": self.lifecycle(),
             "deadline": whole.to_dict(),
         }
+        # M2-B47.  A retryable cleanup names the operation that can make it
+        # terminal, so "retryable" is a reachable statement rather than a hope.
+        evidence["cleanup_retry_operation"] = _cleanup_retry_operation(evidence)
+        # M2-B48.  Registration is the last step, so the entry it creates
+        # carries the evidence this call produced.
+        self._last_closure = evidence
+        evidence["cleanup_registry_id"] = _CLEANUP_REGISTRY.record(self, evidence)
+        return evidence
 
 
 def _kill_and_reap_owned(pid: int, deadline: Deadline) -> ReapOutcome:
@@ -2294,8 +2782,22 @@ class PrivateExecutionView:
                 materialization_kind=MATERIALIZATION_KIND,
             )
             return cls(helper=helper, source_snapshot=snapshot, view_identity=identity)
-        except BaseException:
-            helper.close()
+        except BaseException as error:
+            # M2-B48.  The closure evidence of a materialisation that failed is
+            # the only record of a helper this controller forked and may not
+            # have reaped.  Discarding it here -- which is what this path did --
+            # dropped the retry handle at the exact moment it was needed, so the
+            # evidence is carried on the refusal and the handle is retained by
+            # the process registry rather than by this frame.
+            closure = helper.close()
+            if not closure.get("cleanup_complete"):
+                try:
+                    error.cleanup_evidence = dict(closure)  # type: ignore[attr-defined]
+                    error.cleanup_registry_id = closure.get(  # type: ignore[attr-defined]
+                        "cleanup_registry_id"
+                    )
+                except Exception:  # pragma: no cover - an exception that refuses attributes
+                    pass
             raise
 
     def write_file(self, relative: str, data: bytes) -> None:
@@ -2337,9 +2839,25 @@ class PrivateExecutionView:
 
     @property
     def cleanup_complete(self) -> bool:
-        """Whether this view's helper is reaped and its ownership ended."""
+        """Whether this view's helper is reaped, released, and settled."""
 
         return self.helper.cleanup_complete
+
+    @property
+    def registry_id(self) -> str | None:
+        """The process cleanup-registry entry retaining this view (M2-B48)."""
+
+        return self.helper.registry_id
+
+    def settle_cleanup(self, *, deadline: Deadline | None = None) -> dict[str, Any]:
+        """The one retry protocol every retained cleanup handle answers (M2-B48)."""
+
+        return self.close(deadline=deadline)
+
+    def cleanup_evidence(self) -> dict[str, Any]:
+        """The last closure document, without performing another closure."""
+
+        return self.helper.cleanup_evidence()
 
     def close(self, *, deadline: Deadline | None = None) -> dict[str, Any]:
         """Close the view and report what the shutdown left undone (M2-B43).
@@ -2348,6 +2866,10 @@ class PrivateExecutionView:
         view whose helper survived its deadline still owns a process this
         controller must reap, and a ``_closed`` flag that swallowed the retry is
         what made that unreachable.
+
+        M2-B48.  The evidence returned here names the process registry entry
+        that retains the retry handle, so a caller that lets this object go out
+        of scope has not thereby lost the cleanup.
         """
 
         self._closed = True
@@ -3012,6 +3534,16 @@ def private_ipc_host_visible(source_root: Path, private_view: PrivateExecutionVi
 
 
 __all__ = [
+    "CLEANUP_KIND_EFFECT_CGROUP",
+    "CLEANUP_KIND_HELPER",
+    "CLEANUP_KIND_VIEW",
+    "CLEANUP_REGISTRY_CAPACITY",
+    "CLEANUP_RETRY_NONE",
+    "CLEANUP_RETRY_REAP",
+    "CLEANUP_RETRY_REMOVE_CGROUP",
+    "CLEANUP_RETRY_RELEASE",
+    "CLEANUP_RETRY_SETTLE",
+    "CleanupRegistrySaturated",
     "EXPORT_OPERATIONS",
     "EXPORT_PROTOCOL_VERSION",
     "EXPORT_STATES",
@@ -3035,9 +3567,14 @@ __all__ = [
     "SourceSnapshotIdentity",
     "SpawnedLauncher",
     "apply_export",
+    "cleanup_registry_evidence",
     "compute_change_set",
+    "drain_incomplete_cleanups",
     "host_can_pathname_reach",
+    "incomplete_cleanups",
     "private_ipc_host_visible",
     "recover_export",
+    "retry_unsettled_failed_starts",
     "snapshot_tree_identity",
+    "unsettled_failed_starts",
 ]

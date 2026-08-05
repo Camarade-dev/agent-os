@@ -104,7 +104,9 @@ from _paired_runner_m2_fixtures import (  # noqa: E402
     build_specification,
     decision_for,
     guard_process_wide_cgroup_caches,
+    guard_process_wide_cleanup_registry,
     guard_process_wide_restoration_debt,
+    guard_process_wide_subreaper_ownership,
 )
 from admissible.paired_runner.durable_store import DurableObjectStore  # noqa: E402
 from admissible.paired_runner.effect_ledger import RunEffectLedger  # noqa: E402
@@ -159,6 +161,12 @@ class _FlagGuard:
     acquisition may step over and no replacement object may forget.  A test that
     can produce one restores the latch it found, for exactly the reason it
     restores the flag it found.
+
+    M2-B45 adds the third: the active ownership -- depth, baseline, owner PID,
+    applied bit and activation generation -- is one record per process addressed
+    by every handle, so a test that acquires or discards ownership through any
+    object changes what every later test finds.  It is captured and put back
+    with the same care, together with the process cleanup registry M2-B48 adds.
     """
 
     @staticmethod
@@ -166,6 +174,8 @@ class _FlagGuard:
         before, error = po.get_child_subreaper()
         test.assertIsNone(error, "this kernel does not expose PR_GET_CHILD_SUBREAPER")
         guard_process_wide_restoration_debt(test)
+        guard_process_wide_subreaper_ownership(test)
+        guard_process_wide_cleanup_registry(test)
 
         def restore() -> None:
             po.set_child_subreaper(int(before or 0))
@@ -845,11 +855,37 @@ class SubreaperRestorationStateMachineTests(unittest.TestCase):
                 po.set_child_subreaper(self.before)
 
     def test_a_release_with_nothing_held_is_already_released(self) -> None:
+        # M2-B45.  A handle onto a domain that has never released reports
+        # ALREADY_RELEASED; a handle onto one that has reports that terminal
+        # result unchanged.  Both are releases that released nothing, and
+        # neither writes the process-wide flag.  The domain is put into each
+        # state explicitly rather than the test depending on what ran before it.
+        po.restore_process_ownership({"active": po._ActiveOwnership().__dict__, "debt": None})
+        writes: list[int] = []
+        real_set = po.set_child_subreaper
+
+        def recording(value):
+            writes.append(int(value))
+            return real_set(value)
+
         ownership = ChildSubreaperOwnership()
-        result = ownership.release()
+        with mock.patch.object(po, "set_child_subreaper", recording):
+            result = ownership.release()
         self.assertEqual(result["code"], po.SUBREAPER_ALREADY_RELEASED)
         self.assertTrue(result["released_nothing"])
         self.assertEqual(result["depth"], 0)
+        self.assertEqual(writes, [], "a release that held nothing wrote the process-wide flag")
+
+        # And over a domain whose terminal release really happened, the repeat
+        # preserves that result rather than overwriting it with this no-op.
+        held = self._acquired()
+        self.assertEqual(held.release()["code"], po.SUBREAPER_RESTORED)
+        with mock.patch.object(po, "set_child_subreaper", recording):
+            repeat = ChildSubreaperOwnership().release()
+        self.assertEqual(repeat["code"], po.SUBREAPER_RESTORED, "the terminal result was overwritten")
+        self.assertTrue(repeat["released_nothing"])
+        self.assertEqual(repeat["depth"], 0)
+        self.assertEqual(writes, [], "a release that held nothing wrote the process-wide flag")
 
     def test_every_release_result_is_declared(self) -> None:
         self.assertEqual(
@@ -1469,19 +1505,32 @@ class ClosureArtifactCoherenceTests(unittest.TestCase):
 
     @classmethod
     def _accompanying_report(cls) -> dict:
-        if cls.live.get("current_closure_key") == "m2_subreaper_deadline_closure":
-            return cls.live
-        superseded = cls.live["supersedes_prior_current_report"]
-        raw = subprocess.run(
-            ["git", "show", f"{superseded['commit']}:{superseded['path']}"],
-            cwd=REPOSITORY_ROOT,
-            check=True,
-            capture_output=True,
-        ).stdout
+        """Walk the superseded-report chain back to this closure's own report.
+
+        Each link names the commit and path of the report it replaced together
+        with that blob's sha256, so the walk verifies every hop rather than
+        trusting the first one.  A later pass adds a link; it never invalidates
+        the assertions below, which are about this closure.
+        """
+
         import hashlib
 
-        assert hashlib.sha256(raw).hexdigest() == superseded["sha256"], superseded["path"]
-        return json.loads(raw.decode("utf-8"))
+        report = cls.live
+        seen: set[tuple[str, str]] = set()
+        while report.get("current_closure_key") != "m2_subreaper_deadline_closure":
+            superseded = report["supersedes_prior_current_report"]
+            link = (superseded["commit"], superseded["path"])
+            assert link not in seen, "the superseded-report chain loops"
+            seen.add(link)
+            raw = subprocess.run(
+                ["git", "show", f"{superseded['commit']}:{superseded['path']}"],
+                cwd=REPOSITORY_ROOT,
+                check=True,
+                capture_output=True,
+            ).stdout
+            assert hashlib.sha256(raw).hexdigest() == superseded["sha256"], superseded["path"]
+            report = json.loads(raw.decode("utf-8"))
+        return report
 
     def test_the_closure_report_declares_the_bounded_findings(self) -> None:
         self.assertEqual(
@@ -1612,6 +1661,10 @@ class ClosureArtifactCoherenceTests(unittest.TestCase):
                 "tests.test_admissible_paired_runner_m2_ownership_debt_reap_closure",
                 "m2_ownership_debt_reap_closure_module",
             ),
+            (
+                "tests.test_admissible_paired_runner_m2_process_owner_cleanup_propagation_closure",
+                "m2_process_owner_cleanup_propagation_closure_module",
+            ),
         ):
             loader = unittest.defaultTestLoader.loadTestsFromName(module)
             self.assertEqual(loader.countTestCases(), counts[field], module)
@@ -1622,7 +1675,8 @@ class ClosureArtifactCoherenceTests(unittest.TestCase):
             + counts["m2_b25_final_failclosed_module"]
             + counts["m2_final_protocol_lifecycle_module"]
             + counts["m2_subreaper_deadline_closure_module"]
-            + counts["m2_ownership_debt_reap_closure_module"],
+            + counts["m2_ownership_debt_reap_closure_module"]
+            + counts["m2_process_owner_cleanup_propagation_closure_module"],
         )
 
     def test_the_closure_report_records_every_declared_deadline(self) -> None:
@@ -1889,6 +1943,10 @@ class InjectedTopologyFailureIsolationTests(unittest.TestCase):
             (
                 "tests.test_admissible_paired_runner_m2_ownership_debt_reap_closure",
                 "DelegatedOwnershipDebtReapTests",
+            ),
+            (
+                "tests.test_admissible_paired_runner_m2_process_owner_cleanup_propagation_closure",
+                "DelegatedProcessOwnerCleanupPropagationTests",
             ),
         ):
             with self.subTest(cls=f"{module_name}.{class_name}"):

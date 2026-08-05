@@ -21,7 +21,7 @@ different object.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import errno
 import hashlib
 import os
@@ -87,7 +87,10 @@ from .private_workspace import (
     PrivateExecutionView,
     PrivateWorkspaceError,
     apply_export,
+    cleanup_registry_evidence,
     compute_change_set,
+    drain_incomplete_cleanups,
+    incomplete_cleanups,
 )
 from .process_supervision import CancellationToken, supervise_command
 from .cgroup_launch import RELEASE_OUTCOME_UNKNOWN
@@ -883,8 +886,29 @@ class _EffectPreparation:
     private_view: PrivateExecutionView | None = None
     #: M2-B43.  The private view's last closure evidence.
     private_view_cleanup: dict[str, Any] | None = None
+    #: M2-B48.  The process registry entry retaining the retry handle, if this
+    #: preparation's cleanup did not finish.  It is a fact about the process,
+    #: not about this object, so it survives this object.
+    cleanup_registry_id: str | None = None
 
-    def close(self) -> None:
+    @property
+    def cleanup_complete(self) -> bool:
+        """Whether every physical handle this preparation opened is settled."""
+
+        if self.private_view_cleanup is None:
+            return True
+        return bool(self.private_view_cleanup.get("cleanup_complete"))
+
+    def close(self) -> dict[str, Any] | None:
+        """Close what was opened and *return* what the closure left undone.
+
+        M2-B48.  This returned ``None`` and was called from a ``finally`` that
+        would have ignored it either way, so a preparation whose view could not
+        be cleaned up reported nothing to the substrate that owned it.  It now
+        returns the evidence, and the retry handle is retained by the process
+        registry rather than by this frame.
+        """
+
         if self.handle >= 0:
             try:
                 os.close(self.handle)
@@ -897,9 +921,11 @@ class _EffectPreparation:
             # incomplete cleanup would make the retry unreachable and leave an
             # unreaped child of this controller with nobody holding its handle.
             self.private_view_cleanup = self.private_view.close()
+            self.cleanup_registry_id = self.private_view_cleanup.get("cleanup_registry_id")
             if self.private_view_cleanup.get("cleanup_complete"):
                 self.private_view = None
         self.chain.close()
+        return None if self.private_view_cleanup is None else dict(self.private_view_cleanup)
 
 
 def _refusal_result(request: ToolRequest, error: Exception) -> ToolResult:
@@ -980,6 +1006,12 @@ def prepare_effect(binding: WorkspaceBinding, request: ToolRequest) -> _EffectPr
                     binding.physical_root, binding.root_fd
                 )
             except PrivateWorkspaceError as error:
+                # M2-B48.  A materialisation that refused may still have forked a
+                # helper whose cleanup did not finish.  The retry handle is held
+                # by the process registry; the evidence naming it is carried on
+                # the preparation so the refusal outcome can state it.
+                preparation.private_view_cleanup = getattr(error, "cleanup_evidence", None)
+                preparation.cleanup_registry_id = getattr(error, "cleanup_registry_id", None)
                 raise WorkspaceRefusal(f"private_workspace_{error.code}") from error
             try:
                 require_no_workspace_ipc_endpoints(preparation.private_view.view_fd)
@@ -1226,6 +1258,51 @@ class _CommandExecution:
     resource_observation: ResourceObservation | None
     timed_out: bool
     cancelled: bool
+    #: M2-B48.  What the private-execution lifecycle cleanup of this effect did
+    #: and left undone, and the process registry entry that retains the retry
+    #: handle if anything remains.  Carried here because the frame that closes
+    #: the runtime is not the frame that decides what the effect may claim.
+    lifecycle_cleanup: dict[str, Any] | None = None
+    lifecycle_cleanup_complete: bool = True
+    cleanup_registry_id: str | None = None
+
+
+#: M2-B48.  A command that ran to completion inside a view whose helper this
+#: controller has not finished cleaning up is not an ordinary green completion.
+#: The command's own facts are preserved exactly -- it started, it exited, its
+#: output is what it was -- and the tool outcome is classified rather than
+#: reported OK, so a positive receipt can never stand in front of an unresolved
+#: lifecycle cleanup.
+LIFECYCLE_CLEANUP_INCOMPLETE = "lifecycle_cleanup_incomplete"
+
+
+def _with_lifecycle_cleanup(
+    execution: _CommandExecution, cleanup: dict[str, Any] | None
+) -> _CommandExecution:
+    """Attach the cleanup truth to an execution, downgrading a hidden failure."""
+
+    complete = cleanup is None or bool(cleanup.get("cleanup_complete"))
+    registry_id = None if cleanup is None else cleanup.get("cleanup_registry_id")
+    result = execution.result
+    if not complete and result.outcome == "OK":
+        result = RunCommandResult.create(
+            request_fingerprint=result.request_fingerprint,
+            outcome="FAILED",
+            process_started=result.process_started,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            stdout_truncated=result.stdout_truncated,
+            stderr_truncated=result.stderr_truncated,
+            exit_code=result.exit_code,
+            error_code=LIFECYCLE_CLEANUP_INCOMPLETE,
+        )
+    return replace(
+        execution,
+        result=result,
+        lifecycle_cleanup=None if cleanup is None else dict(cleanup),
+        lifecycle_cleanup_complete=complete,
+        cleanup_registry_id=registry_id,
+    )
 
 
 def _run_command(
@@ -1243,6 +1320,12 @@ def _run_command(
     The private view was materialised during preparation, before STARTED.  The
     effect never sees the live authorized host workspace: only a trusted export
     of a closed change set mutates that workspace after quiescence.
+
+    M2-B48.  The lifecycle cleanup of that view is this function's business, not
+    a side effect of leaving it: every exit path -- refusal, containment
+    failure, completion -- passes through the single ``finally`` below, and what
+    that cleanup did and left undone is attached to the execution it returns
+    rather than dropped on the floor.
     """
 
     binding.recheck_root_identity()
@@ -1253,6 +1336,40 @@ def _run_command(
     # ownership transfers to the bound runtime for the duration of the launch.
     preparation.private_view = None
     runtime: BoundRuntime | None = None
+    closure: dict[str, Any] = {}
+
+    def close_view_once() -> dict[str, Any]:
+        if "cleanup" not in closure:
+            cleanup = dict(runtime.close() if runtime is not None else private_view.close())
+            # M2-B48.  The private-execution cleanup and the containment cleanup
+            # are two obligations of one effect.  A per-effect cgroup this
+            # controller created and could not remove is retained by the same
+            # process registry, and the effect may not report a settled
+            # lifecycle while it stands.
+            cgroup_entry = closure.get("cgroup_registry_id")
+            if cgroup_entry:
+                cleanup = {
+                    "cleanup_complete": False,
+                    "cleanup_retryable": True,
+                    "cleanup_registry_id": cleanup.get("cleanup_registry_id") or cgroup_entry,
+                    "cleanup_registry_ids": sorted(
+                        {
+                            entry
+                            for entry in (cleanup.get("cleanup_registry_id"), cgroup_entry)
+                            if entry
+                        }
+                    ),
+                    "private_execution_cleanup": cleanup,
+                    "effect_cgroup_registry_id": cgroup_entry,
+                }
+            closure["cleanup"] = cleanup
+        return closure["cleanup"]
+
+    def settled(execution: _CommandExecution) -> _CommandExecution:
+        """Close the view exactly once and attach what that cleanup left undone."""
+
+        return _with_lifecycle_cleanup(execution, close_view_once())
+
     try:
         try:
             runtime = BoundRuntime.bind(
@@ -1261,8 +1378,11 @@ def _run_command(
                 resolver=lambda: shutil.which("bwrap") or "",
             )
         except RuntimeBindingRefused:
-            private_view.close()
-            return _command_start_failure(request, "runtime_identity_bind_refused")
+            # The view is closed by the same single cleanup as every other exit,
+            # and the refusal carries its evidence: a bind refusal that left a
+            # helper of this controller unreaped may not be reported as a bare
+            # start failure.
+            return settled(_command_start_failure(request, "runtime_identity_bind_refused"))
 
         required_mechanism = binding.capsule_readiness.containment_mechanism
         try:
@@ -1287,7 +1407,7 @@ def _run_command(
                 cleanup = refusal.cleanup_evidence
                 quiescent = bool((cleanup.get("quiescence") or {}).get("quiescent", False))
                 removal = bool((cleanup.get("cgroup_removal") or {}).get("removed", False))
-                return _command_start_failure(
+                return settled(_command_start_failure(
                     request,
                     "cgroup_gate_release_outcome_unknown",
                     execution_outcome_semantics=(
@@ -1299,8 +1419,14 @@ def _run_command(
                         f"descriptor was closed, and the per-effect cgroup was removed ({removal}). "
                         "No completion and no export were recorded."
                     ),
-                )
-            return _command_start_failure(request, "cgroup_membership_unverified")
+                ))
+            return settled(_command_start_failure(request, "cgroup_membership_unverified"))
+
+        # M2-B48.  Whatever supervision could not remove is an obligation of
+        # this effect, recorded before anything else is decided so every exit
+        # below carries it.
+        if supervised.cleanup_registry_id:
+            closure["cgroup_registry_id"] = supervised.cleanup_registry_id
 
         process = supervised.process_observation
         export_error: str | None = None
@@ -1392,20 +1518,22 @@ def _run_command(
                 exit_code=process.exit_code,
                 error_code=None if outcome == "OK" else _command_failure_code(process),
             )
-        return _CommandExecution(
-            result=result,
-            process_observation=process,
-            stdout_observation=supervised.stdout_observation,
-            stderr_observation=supervised.stderr_observation,
-            resource_observation=supervised.resource_observation,
-            timed_out=process.timed_out,
-            cancelled=process.cancelled,
+        return settled(
+            _CommandExecution(
+                result=result,
+                process_observation=process,
+                stdout_observation=supervised.stdout_observation,
+                stderr_observation=supervised.stderr_observation,
+                resource_observation=supervised.resource_observation,
+                timed_out=process.timed_out,
+                cancelled=process.cancelled,
+            )
         )
     finally:
-        if runtime is not None:
-            runtime.close()
-        else:
-            private_view.close()
+        # M2-B48.  The one cleanup, on every path including an exception that
+        # escapes this function.  Its evidence is already attached to whatever
+        # was returned; here it only guarantees the cleanup happened.
+        close_view_once()
 
 
 def _command_start_failure(
@@ -1529,7 +1657,14 @@ def _command_failure_code(process: ProcessObservation) -> str:
 
 @dataclass(frozen=True)
 class EffectExecutionOutcome:
-    """Everything one execution of the shared substrate produced."""
+    """Everything one execution of the shared substrate produced.
+
+    M2-B48.  Including what its private-execution lifecycle cleanup left undone.
+    An outcome that could not carry that fact forced every caller to treat a
+    completed command and a completed *effect* as the same thing, which is
+    exactly what let a positive completion stand in front of a helper this
+    controller had not reaped.
+    """
 
     receipt: EffectReceipt
     reconciliation: EffectReconciliationReport
@@ -1539,6 +1674,54 @@ class EffectExecutionOutcome:
     reservation: EffectReservation | None
     effect_crossed_boundary: bool
     durable_at_effect_boundary: tuple[str, ...]
+    #: The lifecycle cleanup evidence of this effect, when it had one.
+    lifecycle_cleanup: dict[str, Any] | None = None
+    #: False when a helper, an acquisition, or a restoration of this effect is
+    #: still unresolved.  A green receipt cannot make this true.
+    lifecycle_cleanup_complete: bool = True
+    #: The process cleanup-registry entries that retain the retry handles.
+    cleanup_registry_ids: tuple[str, ...] = ()
+
+
+def _merge_cleanup_evidence(
+    execution: "_CommandExecution | None", preparation_cleanup: dict[str, Any] | None
+) -> dict[str, Any]:
+    """One lifecycle-cleanup verdict from every closure this effect performed.
+
+    M2-B48.  Two objects can each close part of one private execution -- the
+    effect closes the runtime it bound, the preparation closes whatever it still
+    holds -- so the effect's verdict is the conjunction of theirs.  Incomplete
+    anywhere is incomplete, and every registry entry that retains a retry handle
+    is named.
+    """
+
+    sources: list[dict[str, Any]] = []
+    if execution is not None and execution.lifecycle_cleanup is not None:
+        sources.append(dict(execution.lifecycle_cleanup))
+    if preparation_cleanup is not None:
+        sources.append(dict(preparation_cleanup))
+    complete = all(bool(entry.get("cleanup_complete")) for entry in sources)
+    named: set[str] = set()
+    for entry in sources:
+        if entry.get("cleanup_registry_id"):
+            named.add(str(entry["cleanup_registry_id"]))
+        for extra in entry.get("cleanup_registry_ids") or ():
+            if extra:
+                named.add(str(extra))
+    registry_ids = tuple(sorted(named))
+    evidence: dict[str, Any] | None
+    if not sources:
+        evidence = None
+    elif len(sources) == 1:
+        evidence = sources[0]
+    else:
+        evidence = {
+            "cleanup_complete": complete,
+            "cleanup_retryable": not complete,
+            "cleanup_registry_ids": list(registry_ids),
+            "closures": sources,
+        }
+    return {"evidence": evidence, "complete": complete, "registry_ids": registry_ids}
 
 
 class TypedReconciliationRefused(Exception):
@@ -1940,18 +2123,21 @@ class SharedEffectSubstrate:
         # receipt.
         preparation = prepare_effect(self._binding, proposal.tool_request)
         if preparation.refusal is not None:
-            try:
-                return self._refuse_after_reservation(
-                    specification=specification,
-                    proposal=proposal,
-                    decision=decision,
-                    reservation=reservation,
-                    receipt_id=receipt_id,
-                    receipts=receipts,
-                    result=preparation.refusal,
-                )
-            finally:
-                preparation.close()
+            # M2-B48.  The refusal is decided before the cleanup runs, but what
+            # the cleanup leaves undone belongs to the outcome, so the closure
+            # happens first and the refusal carries its evidence.
+            refused_cleanup = preparation.close()
+            refused = _merge_cleanup_evidence(None, refused_cleanup)
+            return self._refuse_after_reservation(
+                specification=specification,
+                proposal=proposal,
+                decision=decision,
+                reservation=reservation,
+                receipt_id=receipt_id,
+                receipts=receipts,
+                result=preparation.refusal,
+                lifecycle_cleanup=refused,
+            )
 
         # 6. durably publish the pre-effect STARTED lifecycle record.
         self._injector.check(FAULT_BEFORE_STARTED_PUBLICATION)
@@ -2001,6 +2187,7 @@ class SharedEffectSubstrate:
         # 7. cross the local effect boundary.
         durable_at_boundary = self._durable_pre_effect_state(proposal.proposal_id)
         self._injector.check(FAULT_SANDBOX_SUPERVISOR_DEATH)
+        preparation_cleanup: dict[str, Any] | None = None
         try:
             execution = self._cross_effect_boundary(
                 proposal.tool_request,
@@ -2015,7 +2202,12 @@ class SharedEffectSubstrate:
                 },
             )
         finally:
-            preparation.close()
+            # M2-B48.  What the preparation's own cleanup left undone is read
+            # rather than discarded.  For run_command the view was already
+            # closed by the effect itself; for every other tool this is the only
+            # closure there is.
+            preparation_cleanup = preparation.close()
+        lifecycle_cleanup = _merge_cleanup_evidence(execution, preparation_cleanup)
 
         # 8. observe the result, strictly after process-domain quiescence.
         self._injector.check(FAULT_AFTER_EFFECT_BEFORE_AFTER_OBSERVATIONS)
@@ -2212,6 +2404,9 @@ class SharedEffectSubstrate:
             reservation=reservation,
             effect_crossed_boundary=True,
             durable_at_effect_boundary=durable_at_boundary,
+            lifecycle_cleanup=lifecycle_cleanup["evidence"],
+            lifecycle_cleanup_complete=lifecycle_cleanup["complete"],
+            cleanup_registry_ids=lifecycle_cleanup["registry_ids"],
         )
 
     # -- the physical effect boundary ----------------------------------------
@@ -2385,8 +2580,15 @@ class SharedEffectSubstrate:
         receipt_id: str,
         receipts: list[PublicationReceipt],
         result: ToolResult,
+        lifecycle_cleanup: dict[str, Any] | None = None,
     ) -> EffectExecutionOutcome:
-        """A physical refusal proven before STARTED, so nothing ever started."""
+        """A physical refusal proven before STARTED, so nothing ever started.
+
+        M2-B48.  "Nothing started" is a statement about the effect boundary and
+        never about the cleanup: a materialisation that refused may still have
+        forked a helper this controller has not finished reaping, and that fact
+        travels with the refusal rather than being lost with the preparation.
+        """
 
         receipt = EffectReceipt.for_proposal(
             receipt_id=receipt_id,
@@ -2433,6 +2635,7 @@ class SharedEffectSubstrate:
             outcome="EFFECT_REFUSED",
             effect_receipt_fingerprint=receipt.receipt_fingerprint,
         )
+        cleanup = lifecycle_cleanup or {"evidence": None, "complete": True, "registry_ids": ()}
         return EffectExecutionOutcome(
             receipt=receipt,
             reconciliation=reconciliation,
@@ -2442,6 +2645,9 @@ class SharedEffectSubstrate:
             reservation=reservation,
             effect_crossed_boundary=False,
             durable_at_effect_boundary=(),
+            lifecycle_cleanup=cleanup["evidence"],
+            lifecycle_cleanup_complete=cleanup["complete"],
+            cleanup_registry_ids=tuple(cleanup["registry_ids"]),
         )
 
     def _publish_recovery_report(self, proposal_id: str, report: EffectReconciliationReport) -> None:
@@ -2723,6 +2929,7 @@ __all__ = [
     "ConfigurationRefused",
     "EffectExecutionOutcome",
     "EvidenceRootIsolationError",
+    "LIFECYCLE_CLEANUP_INCOMPLETE",
     "OBJECT_KIND_DECISION",
     "OBJECT_KIND_LIFECYCLE_STARTED",
     "OBJECT_KIND_PROPOSAL",
@@ -2739,6 +2946,9 @@ __all__ = [
     "WorkspaceFailure",
     "WorkspaceIpcEndpointRefused",
     "WorkspaceRefusal",
+    "cleanup_registry_evidence",
+    "drain_incomplete_cleanups",
+    "incomplete_cleanups",
     "observe_filesystem",
     "observe_git",
     "recover_run_index",

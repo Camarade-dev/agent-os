@@ -451,3 +451,153 @@ reaped has its acquisition released inside the abort.
 | callers propagate incomplete cleanup truthfully | `test_the_private_execution_view_propagates_incomplete_cleanup` |
 | delegated physical qualification, expired deadline | `test_an_expired_deadline_leaves_a_real_helper_unreaped_and_owned` |
 | delegated physical qualification, retry | `test_a_retry_reaps_the_exact_pid_and_releases_exactly_once` |
+
+---
+
+# F. One process owns one flag, and one cleanup outlives its frame (M2-B45 … M2-B48)
+
+Section E separated protocol closure from lifecycle completion and made an
+incomplete cleanup retryable. Four things were still true underneath it.
+
+## F1. Active ownership is process-wide, not object-local
+
+`PR_SET_CHILD_SUBREAPER` is a single flag on a single process. The restoration
+*debt* was already process-wide, but the *active* ownership — depth, baseline,
+owner PID, applied bit, and the lock serialising them — lived on whichever
+`ChildSubreaperOwnership` happened to be constructed. Two objects could
+therefore each own the one flag:
+
+* object A acquires: the flag reads 1, A's baseline is the 0 it found;
+* object B acquires: B's own depth is 0, so it takes the *fresh* path and reads
+  the residual 1 back as **its** baseline;
+* A releases: the flag is restored to 0 — while B still reports active
+  ownership, depth 1, `code=APPLIED`, and a valid reference.
+
+There is now exactly one `_ActiveOwnership` record and one `_OWNERSHIP_LOCK` per
+process, and every ownership object is a handle onto it:
+
+> One process-wide domain owns one original baseline, one refcount, one active
+> owner PID, one kernel-readback truth, one restoration state, and one lock. No
+> object may restore the flag while any process-wide reference remains, and no
+> object may report ownership the kernel contradicts.
+
+A fresh activation — and the discard of one inherited across `fork` — advances a
+**generation**. A `SubreaperReference` records the generation it was cut from
+and is valid only while that generation is live, the depth is positive, this PID
+is the owner, and nothing is owed. Nothing here relies on only one ownership
+object being constructed: an import discipline is not an invariant.
+
+## F2. A failed start is complete when it is settled
+
+`_UnsettledFailedStart.cleanup_complete` was `reaped and released`. A retry could
+therefore reap the exact child, receive `RESTORE_MISMATCH` from its single
+release, report the cleanup complete, and delete the only entry that could still
+settle it. Completion now requires four facts:
+
+> the exact child positively reaped; the exact reference released exactly once;
+> the restoration positively settled; and no outstanding process-wide debt.
+
+The retry order is fixed — reap, release once, settle — and the entry is removed
+only when all four hold.
+
+## F3. A retryable cleanup must be able to progress
+
+After a helper reap and an unsettled release, `close()` reported
+`cleanup_retryable=true` for ever: the reference was spent, the reap was done,
+and no production caller invoked the process-wide settlement. `close()` now
+performs that settlement itself, keeps the single release result immutably
+beside every settlement attempt, becomes terminal only on an exact baseline
+readback, and names the operation a retry would perform:
+`REAP_THE_EXACT_HELPER_PID`, `RELEASE_THE_ACQUISITION_ONCE`,
+`SETTLE_THE_PROCESS_WIDE_RESTORATION_DEBT`, `NOTHING_REMAINS`.
+
+## F4. Incomplete cleanup outlives the frame that detected it
+
+Every object could *return* incomplete cleanup evidence and the production call
+chain dropped all of it. A PID-bound process registry now retains each
+unresolved cleanup under a deterministic id (`cleanup-<pid>-<counter>`), records
+the helper PID and the ownership generation, drains boundedly and idempotently,
+removes an entry only when its cleanup is terminal, retains no completed object
+and no filesystem path, and refuses to start a further trusted helper at its
+declared capacity. The evidence travels materialisation refusal →
+`PrivateExecutionView.close` → `BoundRuntime.close` → `_run_command` →
+`_EffectPreparation.close` → `_execute_permitted_effect` →
+`EffectExecutionOutcome`, and:
+
+> a command that ran to completion inside a view whose cleanup did not is
+> classified `lifecycle_cleanup_incomplete`, never reported OK.
+
+The command's own facts — started, exit code, output — and the effect-boundary
+truth are preserved exactly; only the tool outcome is classified.
+
+## F5. Process ownership settled is not containment settled
+
+The first delegated qualification of this closure failed two tests on one leaked
+per-effect cgroup. The diagnosis is the fourth obligation:
+
+`EffectCgroup.close()` already refused, truthfully, to remove a cgroup that
+still held members, and kept its path so the removal could be retried. What
+nothing kept was the *object*. It was a local of the supervision frame, so the
+retry became unreachable the moment that frame returned, and the directory
+survived for the life of the controller. The registry retained the helper and
+the view — the process-ownership obligations — and lost the containment one.
+
+> A registry entry is removed only when **every** obligation of that effect is
+> positively terminal: the exact helper reap, the ownership release and its
+> restoration-debt settlement, descriptor closure, cgroup quiescence
+> verification, and removal of the exact owned per-effect cgroup. Process
+> ownership being settled does not settle a containment domain.
+
+Every retained handle answers one protocol, `settle_cleanup(deadline=...)`, so a
+drain discharges a helper, a view and a cgroup the same way and cannot silently
+skip a kind it does not recognise. For a cgroup the settlement is ordered:
+
+1. destroy the process domain as a kill domain;
+2. verify quiescence by a positively observed empty `cgroup.procs`;
+3. reap the exactly owned members, so a kill leaves no zombie holding the
+   domain;
+4. remove the exact owned directory and verify its absence.
+
+"Exact" is enforced by identity, not by name. The device and inode of the
+directory this controller created are recorded at creation and re-checked before
+`rmdir`, so a cgroup that was removed and recreated under the same name — a
+different cgroup, with different controller state and different members — is
+refused rather than destroyed.
+
+## F6. Test matrix addendum
+
+| Case | Test |
+| --- | --- |
+| two objects share one process-wide depth | `test_two_ownership_objects_share_one_process_wide_depth` |
+| a second object creates no second baseline | `test_a_second_object_does_not_create_a_second_baseline` |
+| releasing A while B holds keeps the flag set | `test_releasing_one_object_while_another_holds_keeps_the_flag_set` |
+| the final release restores the baseline once | `test_the_final_release_restores_the_original_baseline_exactly_once` |
+| the audited reproduction is impossible | `test_the_audited_reproduction_cannot_be_produced` |
+| a stale reference is invalid | `test_a_reference_from_a_replaced_activation_is_stale` |
+| inherited active state is discarded in the child | `test_an_inherited_active_state_is_discarded_safely_in_the_child` |
+| concurrent acquisitions cannot split ownership | `test_concurrent_acquisitions_are_serialized_and_cannot_split_ownership` |
+| a failed start with an unsettled restoration is retained | `test_a_reap_with_a_restore_mismatch_is_incomplete_and_retained` |
+| the next retry settles and removes the entry | `test_the_next_retry_settles_the_debt_and_removes_the_entry` |
+| the release happens exactly once across retries | `test_the_release_happens_exactly_once_across_every_retry` |
+| a helper close that mismatches is not terminal | `test_a_close_whose_restoration_mismatches_is_not_terminal` |
+| a later close settles the debt | `test_a_retry_after_a_mismatch_settles_the_debt` |
+| a failed settlement never claims completion | `test_a_failed_settlement_never_claims_completion` |
+| only incomplete cleanups are registered | `test_only_an_incomplete_cleanup_is_registered` |
+| the handle survives its wrapper | `test_the_registry_retains_the_handle_after_the_wrapper_is_destroyed` |
+| a forked child trusts no parent handle | `test_a_forked_child_trusts_no_parent_registry_handle` |
+| capacity refuses a new effect fail-closed | `test_registry_capacity_refuses_a_new_effect_fail_closed` |
+| the preparation returns its cleanup evidence | `test_the_preparation_close_returns_its_cleanup_evidence` |
+| `_run_command` propagates incomplete cleanup | `test_run_command_propagates_incomplete_cleanup_evidence` |
+| a completion cannot hide an unresolved cleanup | `test_a_completed_command_with_an_unresolved_cleanup_is_not_green` |
+| delegated physical qualification, two real owners | `test_two_real_owners_share_one_real_process_wide_flag` |
+| delegated physical qualification, real settlement | `test_a_real_helper_settles_its_restoration_on_a_later_close` |
+| delegated physical qualification, surviving cleanup | `test_an_incomplete_cleanup_survives_the_wrappers_that_detected_it` |
+| an unremovable cgroup is retained and registered | `test_an_unremovable_cgroup_is_retained_and_registered` |
+| a later bounded drain removes that exact cgroup | `test_a_later_bounded_drain_removes_that_exact_cgroup` |
+| the entry remains while removal fails | `test_the_entry_remains_while_removal_fails` |
+| the entry remains while membership is unreadable | `test_the_entry_remains_while_membership_is_unreadable` |
+| removal targets the owned identity only | `test_removal_is_attempted_only_for_the_exactly_owned_cgroup` |
+| no unrelated cgroup is removed | `test_no_unrelated_cgroup_is_removed_by_a_drain` |
+| kill, quiescence and removal are three observations | `test_the_settlement_evidence_states_each_step_separately` |
+| a removed cgroup is never registered | `test_a_removed_cgroup_is_never_registered` |
+| delegated physical qualification, real leaked domain | `test_a_real_unremovable_cgroup_is_retained_and_later_drained` |

@@ -1443,6 +1443,9 @@ class ValidationArtifactCoherenceTests(unittest.TestCase):
             "tests.test_admissible_paired_runner_m2_ownership_debt_reap_closure": (
                 "m2_ownership_debt_reap_closure_module"
             ),
+            "tests.test_admissible_paired_runner_m2_process_owner_cleanup_propagation_closure": (
+                "m2_process_owner_cleanup_propagation_closure_module"
+            ),
         }
         for module, field in modules.items():
             loader = unittest.defaultTestLoader.loadTestsFromName(module)

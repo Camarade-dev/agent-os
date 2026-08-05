@@ -1370,6 +1370,41 @@ def _apply_and_read_back_limits(
     return None, "", observed
 
 
+# --- M2-B48: an unremoved per-effect cgroup is a retained obligation ----------
+#
+# ``EffectCgroup.close()`` already refused, truthfully, to remove a cgroup that
+# still held members, and kept its path so the removal could be retried.  What
+# nothing kept was the *object*: it was a local of the supervision frame, so the
+# retry became unreachable the moment that frame returned and the directory
+# survived for the life of the controller.  The process cleanup registry retains
+# process-ownership obligations; it now retains this one too.
+
+#: What a retryable cgroup cleanup would do next.
+CGROUP_RETRY_REMOVE = "REMOVE_THE_EXACT_OWNED_EFFECT_CGROUP"
+CGROUP_RETRY_NONE = "NOTHING_REMAINS"
+
+#: The bound one settlement attempt may spend waiting for quiescence.  It is a
+#: cap, not a budget: a caller's deadline always wins where it is shorter.
+CGROUP_SETTLE_QUIESCENCE_SECONDS = 5.0
+
+#: Installed once by the module that owns the process cleanup registry.  It is a
+#: hook rather than an import so the containment layer keeps no dependency on
+#: the private-execution layer, and a caller that never installs one simply gets
+#: the previous behaviour: a truthful refusal with no retention.
+_CLEANUP_REGISTRAR: Any = None
+
+
+def set_cleanup_registrar(registrar: Any) -> None:
+    """Install the process-level owner of unresolved cgroup removals."""
+
+    global _CLEANUP_REGISTRAR
+    _CLEANUP_REGISTRAR = registrar
+
+
+def cleanup_registrar() -> Any:
+    return _CLEANUP_REGISTRAR
+
+
 class EffectCgroup:
     """One per-effect cgroup v2 subtree, or an inert object when undelegated.
 
@@ -1395,6 +1430,17 @@ class EffectCgroup:
         self.create_error: str | None = None
         self.attach_error: str | None = None
         self._removal_evidence: dict[str, Any] = {}
+        # M2-B48.  The identity of the directory this object created, so a
+        # removal only ever targets the exact cgroup this controller owns and
+        # never a replacement that happens to carry the same name.
+        self._owned_identity: str | None = None
+        self._owned_path: Path | None = None
+        # M2-B48.  The process cleanup-registry entry retaining this removal
+        # while it is unresolved.  A cgroup whose members outlived the effect is
+        # an obligation, not a footnote, and the frame that discovered it is not
+        # the frame that will discharge it.
+        self._registry_id: str | None = None
+        self._settlements: list[dict[str, Any]] = []
 
     @property
     def active(self) -> bool:
@@ -1439,6 +1485,8 @@ class EffectCgroup:
             self._remove(candidate)
             return False
         self._path = candidate
+        self._owned_path = candidate
+        self._owned_identity = _directory_identity(candidate)
         self.applied = dict(observed)
         return True
 
@@ -1638,6 +1686,29 @@ class EffectCgroup:
             }
             return True
         path = self._path
+        if not path.exists():
+            # M2-B48.  The directory this object owed is gone -- removed by a
+            # nested cleanup, or by the unit teardown that owns the whole
+            # subtree.  Absence is the outcome this obligation existed to reach,
+            # so it is recorded as verified and the entry is released.  This
+            # call still removed nothing, and does not say it did.
+            self._removal_evidence = {
+                "effect_path": str(path),
+                "removed": False,
+                "absence_verified": True,
+                "residual_path_exists": False,
+                "residual_members": [],
+                "membership_readable": True,
+                "identity_verified": True,
+                "detail": (
+                    f"{path} is already absent; this call removed nothing and the obligation is "
+                    "discharged"
+                ),
+            }
+            self._path = None
+            self._membership_verified = False
+            self._register_unsettled_removal()
+            return True
         membership = self.read_members()
         if not membership.usable:
             # M2-B35.  Removal eligibility is emptiness, and emptiness was not
@@ -1656,6 +1727,7 @@ class EffectCgroup:
                     "never removed and never reported removed"
                 ),
             }
+            self._register_unsettled_removal()
             return False
         if membership.observed_populated:
             live = membership.pids
@@ -1672,6 +1744,33 @@ class EffectCgroup:
                 "membership_readable": True,
                 "detail": f"{path} still holds {list(live)}; it is not removed and not called removed",
             }
+            self._register_unsettled_removal()
+            return False
+        # M2-B48.  The directory is emptied and removable; it is removed only if
+        # it is still the exact directory this object created.  A cgroup that
+        # was removed and recreated under the same name is a different cgroup
+        # with different controller state and different members, and removing it
+        # would be destroying somebody else's containment domain.
+        identity = _directory_identity(path)
+        if self._owned_identity is not None and identity != self._owned_identity:
+            self.attach_error = f"effect_cgroup_identity_changed:{identity}"
+            self._removal_evidence = {
+                "effect_path": str(path),
+                "removed": False,
+                "absence_verified": False,
+                "residual_path_exists": path.exists(),
+                "residual_members": [],
+                "membership_readable": True,
+                "identity_verified": False,
+                "owned_identity": self._owned_identity,
+                "observed_identity": identity,
+                "detail": (
+                    f"{path} is no longer the directory this controller created "
+                    f"({self._owned_identity} != {identity}); it is not removed and no other "
+                    "cgroup is removed in its place"
+                ),
+            }
+            self._register_unsettled_removal()
             return False
         removed, rmdir_error = self._remove(path)
         residual = path.exists()
@@ -1681,6 +1780,7 @@ class EffectCgroup:
             "absence_verified": not residual,
             "residual_path_exists": residual,
             "membership_readable": True,
+            "identity_verified": True,
             "rmdir_errno": rmdir_error,
             "detail": (
                 f"{path} was removed and its absence was verified"
@@ -1691,8 +1791,130 @@ class EffectCgroup:
         if removed and not residual:
             self._path = None
             self._membership_verified = False
+            self._register_unsettled_removal()
             return True
+        self._register_unsettled_removal()
         return False
+
+    # --- M2-B48: an unremoved cgroup is a retained obligation -----------------
+
+    @property
+    def removal_settled(self) -> bool:
+        """Whether this controller owes no further removal for this cgroup."""
+
+        if self._owned_path is None:
+            # Nothing was ever created -- an undelegated host, or a refused
+            # creation that already removed its own partial directory.
+            return True
+        return self._path is None and not self._owned_path.exists()
+
+    @property
+    def cleanup_registry_id(self) -> str | None:
+        return self._registry_id
+
+    @property
+    def owned_path(self) -> str | None:
+        return None if self._owned_path is None else str(self._owned_path)
+
+    def cleanup_evidence(self) -> dict[str, Any]:
+        """The uniform cleanup document the process registry records."""
+
+        settled = self.removal_settled
+        return {
+            "kind": "EFFECT_CGROUP",
+            "effect_path": self.owned_path,
+            "owned_identity": self._owned_identity,
+            "cleanup_complete": settled,
+            "cleanup_retryable": not settled,
+            "cleanup_retry_operation": (
+                CGROUP_RETRY_NONE if settled else CGROUP_RETRY_REMOVE
+            ),
+            "settlement_attempts": len(self._settlements),
+            "removal": dict(self._removal_evidence),
+            "last_settlement": dict(self._settlements[-1]) if self._settlements else {},
+            "helper_pid": 0,
+        }
+
+    def _register_unsettled_removal(self) -> None:
+        """Hand an unresolved removal to the process cleanup registry.
+
+        M2-B48.  ``close()`` truthfully refuses to remove a populated cgroup and
+        keeps its path so the removal can be retried -- but the object holding
+        that path was a local of the supervision frame, so once that frame
+        returned the retry was unreachable and the directory survived for the
+        life of the process.  The obligation is therefore registered where it is
+        discovered, exactly as an unresolved helper cleanup is, and released the
+        moment the removal is positively complete.
+        """
+
+        registrar = _CLEANUP_REGISTRAR
+        if registrar is None:  # pragma: no cover - the registrar is installed at import
+            return
+        try:
+            self._registry_id = registrar(self, self.cleanup_evidence())
+        except Exception:  # pragma: no cover - registration never breaks a cleanup
+            pass
+
+    def settle_cleanup(self, *, deadline: Any = None) -> dict[str, Any]:
+        """Discharge this cgroup's remaining removal obligation, boundedly.
+
+        The terminal sequence, in the accepted order: destroy the process domain
+        as a kill domain, wait boundedly for a positively observed empty
+        ``cgroup.procs``, reap the members this controller owns so a kill does
+        not leave a zombie holding the domain, and only then remove the exact
+        directory this object created and verify its absence.
+
+        Every step is an observation.  A membership that cannot be read is never
+        the empty list, a kill is never a quiescence, and a quiescence is never
+        a removal.
+        """
+
+        started = time.monotonic()
+        remaining = CGROUP_SETTLE_QUIESCENCE_SECONDS
+        if deadline is not None:
+            try:
+                remaining = min(remaining, float(deadline.remaining_seconds))
+            except Exception:  # pragma: no cover - a caller passing a foreign object
+                remaining = CGROUP_SETTLE_QUIESCENCE_SECONDS
+        attempt: dict[str, Any] = {
+            "effect_path": self.owned_path,
+            "kill_domain": None,
+            "quiescence": None,
+            "reaped_members": [],
+            "removal": None,
+            "granted_seconds": remaining,
+        }
+        if self.removal_settled:
+            attempt["detail"] = "nothing remains: the owned cgroup is already absent"
+            self._settlements.append(attempt)
+            self._register_unsettled_removal()
+            return attempt
+        membership = self.read_members()
+        observed = list(membership.pids) if membership.usable else []
+        if not membership.observed_empty:
+            attempt["kill_domain"] = self.kill_domain()
+        attempt["quiescence"] = self.wait_quiescent(max(0.0, remaining))
+        # A process this controller killed is still its child until it is
+        # reaped.  Only exactly owned PIDs are waited on; a member that is not
+        # this controller's child is left alone rather than guessed at.
+        for pid in observed:
+            if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+                continue
+            try:
+                waited, _status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                continue
+            except OSError:  # pragma: no cover - defensive
+                continue
+            if waited == pid:
+                attempt["reaped_members"].append(pid)
+        self.close()
+        attempt["removal"] = self.removal_evidence()
+        attempt["elapsed_seconds"] = time.monotonic() - started
+        attempt["settled"] = self.removal_settled
+        self._settlements.append(attempt)
+        self._register_unsettled_removal()
+        return attempt
 
     @staticmethod
     def _remove(path: Path) -> tuple[bool, str | None]:
@@ -1795,10 +2017,15 @@ __all__ = [
     "DEFAULT_MAX_FILE_SIZE_BYTES",
     "DEFAULT_MAX_OPEN_FILES",
     "DEFAULT_MAX_PROCESSES",
+    "CGROUP_RETRY_NONE",
+    "CGROUP_RETRY_REMOVE",
+    "CGROUP_SETTLE_QUIESCENCE_SECONDS",
     "EffectCgroup",
     "MECHANISM_CGROUP_AND_RLIMIT",
     "MECHANISM_NONE",
     "MECHANISM_RLIMIT",
+    "cleanup_registrar",
+    "set_cleanup_registrar",
     "ResourceBounds",
     "ResourceContainmentUnavailable",
     "containment_semantics",

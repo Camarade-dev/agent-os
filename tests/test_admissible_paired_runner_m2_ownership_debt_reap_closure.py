@@ -102,7 +102,9 @@ from _paired_runner_m2_fixtures import (  # noqa: E402
     build_specification,
     decision_for,
     guard_process_wide_cgroup_caches,
+    guard_process_wide_cleanup_registry,
     guard_process_wide_restoration_debt,
+    guard_process_wide_subreaper_ownership,
 )
 from admissible.paired_runner.durable_store import DurableObjectStore  # noqa: E402
 from admissible.paired_runner.effect_ledger import RunEffectLedger  # noqa: E402
@@ -143,9 +145,13 @@ class _OwnershipGuard:
 
     Three of them are genuinely process-wide: the child-subreaper flag itself,
     the M2-B42 restoration-debt latch that lives beside it, and the reference
-    depth of the module-level owner.  A test that leaves any of them changed
-    decides the outcome of every test that runs after it, so each is recorded
-    on entry and restored on exit -- including when an assertion fails.
+    depth of the ownership domain.
+
+    M2-B45 makes the third of those explicit.  The depth, baseline, owner PID,
+    applied bit and activation generation are one record per process addressed
+    by every ownership handle, so restoring "the singleton's fields" is no
+    longer a description of anything: what is recorded and put back is the
+    process-wide record itself, through the module's own capture and restore.
     """
 
     @staticmethod
@@ -153,16 +159,10 @@ class _OwnershipGuard:
         before, error = po.get_child_subreaper()
         test.assertIsNone(error, "this kernel does not expose PR_GET_CHILD_SUBREAPER")
         guard_process_wide_restoration_debt(test)
-        singleton = dict(CHILD_SUBREAPER.__dict__)
+        guard_process_wide_subreaper_ownership(test)
+        guard_process_wide_cleanup_registry(test)
 
         def restore() -> None:
-            # The singleton is the one ownership object the production path
-            # uses; a test that poisons it would otherwise refuse every later
-            # effect in this interpreter.  Its recorded fields are put back
-            # rather than a settlement being simulated.
-            for name, value in singleton.items():
-                if name != "_lock":
-                    setattr(CHILD_SUBREAPER, name, value)
             po.set_child_subreaper(int(before or 0))
 
         test.addCleanup(restore)
@@ -349,8 +349,19 @@ class NestedAcquisitionRevalidationTests(unittest.TestCase):
         after = self.ownership.state()
         self.assertEqual(after["depth"], before["depth"], "a refused acquisition counted a reference")
         self.assertEqual(after["depth"], 1)
-        self.assertTrue(reference.valid, "the outstanding reference was discarded by a refusal")
-        self.assertFalse(reference.released)
+        # The reference is *retained*: it was not released, not discarded, and it
+        # is still the exact handle that will release this acquisition once.
+        self.assertFalse(reference.released, "the outstanding reference was released by a refusal")
+        self.assertIn(reference, [reference])
+        self.assertEqual(reference.generation, po.ownership_generation())
+        # M2-B45.  It does not, however, still describe ownership: the kernel has
+        # been cleared underneath it and the process owes a restoration.  A
+        # handle that answered "valid" here would be the object-local snapshot
+        # speaking over a live contradiction, which is the defect this closes.
+        self.assertFalse(
+            reference.valid, "a handle reported valid ownership over a contradicted kernel flag"
+        )
+        self.assertFalse(self.ownership.active)
 
     def test_a_contradiction_preserves_the_original_baseline(self) -> None:
         self._held()
@@ -1255,12 +1266,42 @@ def _statuses(value) -> list[str]:
     return found
 
 
+def _accompanying_validation_report() -> dict:
+    """The validation report that was current when *this* closure was.
+
+    The M2 model keeps exactly one current validation report and a later pass
+    moves it.  These assertions are about this closure, so they follow the
+    report that accompanied it: the live report names the commit whose blob it
+    superseded, that blob is loaded from git, and its hash is checked against
+    the one the live report records.  Anchoring to whatever happens to be
+    current later would make this class assert another pass's claims.
+    """
+
+    report = _load(CURRENT_VALIDATION_REPORT)
+    seen: set[tuple[str, str]] = set()
+    while report.get("current_closure_key") != "m2_ownership_debt_reap_closure":
+        superseded = report["supersedes_prior_current_report"]
+        link = (superseded["commit"], superseded["path"])
+        assert link not in seen, "the superseded-report chain loops"
+        seen.add(link)
+        raw = subprocess.run(
+            ["git", "show", f"{superseded['commit']}:{superseded['path']}"],
+            cwd=REPOSITORY_ROOT,
+            check=True,
+            capture_output=True,
+        ).stdout
+        assert hashlib.sha256(raw).hexdigest() == superseded["sha256"], superseded["path"]
+        report = json.loads(raw.decode("utf-8"))
+    return report
+
+
 class ValidationArtifactSemanticCoherenceTests(unittest.TestCase):
     """A current artifact states one physical qualification state, or refuses."""
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.report = _load(CURRENT_VALIDATION_REPORT)
+        cls.live = _load(CURRENT_VALIDATION_REPORT)
+        cls.report = _accompanying_validation_report()
         cls.current = cls.report[cls.report["current_closure_key"]]
         cls.delegated = cls.current["delegated_run"]
 
@@ -1414,7 +1455,8 @@ class ClosureArtifactCoherenceTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.report = _load(CURRENT_VALIDATION_REPORT)
+        cls.live = _load(CURRENT_VALIDATION_REPORT)
+        cls.report = _accompanying_validation_report()
         cls.closure = _load(CLOSURE_REPORT)
         cls.matrix = _load(REQUIREMENT_MATRIX)
 
@@ -1432,7 +1474,7 @@ class ClosureArtifactCoherenceTests(unittest.TestCase):
             self.closure["schema_id"], "admissible.paired_runner.m2.ownership_debt_reap_closure_report"
         )
 
-    def test_the_current_validation_report_points_at_this_closure(self) -> None:
+    def test_the_validation_report_of_this_closure_points_at_it(self) -> None:
         self.assertTrue(self.report["is_current_validation_report"])
         self.assertEqual(self.report["starting_commit"], STARTING_COMMIT)
         self.assertEqual(self.report["branch"], BRANCH)
@@ -1442,6 +1484,17 @@ class ClosureArtifactCoherenceTests(unittest.TestCase):
         )
         self.assertEqual(self.report["current_closure_key"], "m2_ownership_debt_reap_closure")
         self.assertEqual(self.report["terminal_verdict"], self.closure["terminal_verdict"])
+        # Exactly one validation report is current -- whether or not that is
+        # still this closure's.  A later pass moves it and must record this
+        # closure as superseded rather than simply forgetting it.
+        self.assertTrue(self.live["is_current_validation_report"])
+        if self.live != self.report:
+            self.assertIn(
+                "implementation/M2_OWNERSHIP_DEBT_REAP_CLOSURE_REPORT.json",
+                self.live["superseded_closure_reports"],
+                "the later current report does not record this closure as superseded",
+            )
+            self.assertNotEqual(self.live["current_closure_key"], "m2_ownership_debt_reap_closure")
 
     def test_the_independent_audit_is_recorded_verbatim(self) -> None:
         self.assertEqual(
@@ -1530,7 +1583,10 @@ class ClosureArtifactCoherenceTests(unittest.TestCase):
             self.assertEqual(run["executed"], expected)
 
     def test_the_declared_module_counts_match_the_modules_on_disk(self) -> None:
-        counts = self.report["m2_test_count_semantics"]
+        # The modules on disk are the current ones, so the counts they are
+        # compared against must come from the current report; a frozen
+        # historical decomposition describes modules that have moved on.
+        counts = self.live["m2_test_count_semantics"]
         modules = {
             "tests.test_admissible_paired_runner_m2_b25_cgroup_topology": "m2_b25_topology_module",
             "tests.test_admissible_paired_runner_m2_b25_final_failclosed": (
@@ -1544,6 +1600,9 @@ class ClosureArtifactCoherenceTests(unittest.TestCase):
             ),
             "tests.test_admissible_paired_runner_m2_ownership_debt_reap_closure": (
                 "m2_ownership_debt_reap_closure_module"
+            ),
+            "tests.test_admissible_paired_runner_m2_process_owner_cleanup_propagation_closure": (
+                "m2_process_owner_cleanup_propagation_closure_module"
             ),
         }
         for module, field in modules.items():

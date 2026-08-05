@@ -242,3 +242,67 @@ def guard_process_wide_restoration_debt(test) -> None:
         _po._PROCESS_RESTORATION_DEBT = saved
 
     test.addCleanup(restore)
+
+
+def guard_process_wide_subreaper_ownership(test) -> None:
+    """Restore the one process-wide active subreaper ownership after a test.
+
+    M2-B45 makes the active ownership -- baseline, depth, owner PID, applied
+    bit and activation generation -- a single record per process rather than a
+    field of whichever :class:`ChildSubreaperOwnership` happened to be
+    constructed.  That is the invariant: two objects may not own one flag
+    independently.
+
+    It also means a test that acquires, poisons, or discards ownership through
+    *any* handle changes the conditions of every test after it, exactly as the
+    kernel flag and the restoration-debt latch already did.  Both process-wide
+    facts are therefore recorded on entry and put back on exit, including when
+    an assertion fails.  The record is mutated in place rather than replaced, so
+    handles that already exist keep addressing the live domain.
+    """
+
+    from admissible.paired_runner import process_ownership as _po
+
+    snapshot = _po.capture_process_ownership()
+
+    def restore() -> None:
+        _po.restore_process_ownership(snapshot)
+
+    test.addCleanup(restore)
+
+
+def guard_process_wide_cleanup_registry(test) -> None:
+    """Restore the process cleanup registry after a test (M2-B48).
+
+    The registry retains the retry handle of every private-execution cleanup
+    this process has not finished, which is precisely why it is process-level
+    and not owned by a local wrapper.  A test that leaves entries behind would
+    spend another test's registry capacity and would be drained by another
+    test's sweep, so what it found is put back and anything it added is closed.
+    """
+
+    from admissible.paired_runner import private_workspace as _pw
+    from admissible.paired_runner.process_ownership import Deadline as _Deadline
+
+    saved = _pw._CLEANUP_REGISTRY
+    fresh = type(saved)()
+    _pw._CLEANUP_REGISTRY = fresh
+
+    def restore() -> None:
+        # Anything this test left incomplete is discharged through the
+        # production drain rather than dropped or undone by hand: the guard
+        # restores the registry, it does not discard the obligations the
+        # registry existed to keep reachable, and it never removes a cgroup,
+        # reaps a child or restores a flag by any route the production code does
+        # not own.  A cleanup that genuinely cannot be settled stays retained,
+        # and the assertions of the test that produced it are what report it.
+        for _attempt in range(3):
+            if not fresh.entries():
+                break
+            try:
+                fresh.drain(deadline=_Deadline.after_ms(5_000, "registry_guard"))
+            except Exception:  # pragma: no cover - the guard never masks a failure
+                break
+        _pw._CLEANUP_REGISTRY = saved
+
+    test.addCleanup(restore)

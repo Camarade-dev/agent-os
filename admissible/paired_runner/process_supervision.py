@@ -205,6 +205,12 @@ class SupervisedProcessResult:
     stderr_text: str
     stdout_decode_status: str
     stderr_decode_status: str
+    #: M2-B48.  The process cleanup-registry entry retaining this effect's
+    #: unremoved per-effect cgroup, when the domain outlived the effect.  A
+    #: containment domain this controller created and could not remove is an
+    #: obligation the caller must be able to see and a later drain must be able
+    #: to discharge.
+    cleanup_registry_id: str | None = None
 
     @property
     def refused_non_utf8(self) -> bool:
@@ -466,6 +472,11 @@ def abort_gated_effect(
         cgroup.close()
         removal = cgroup.removal_evidence()
         evidence["cgroup_removal"] = removal
+        # M2-B48.  A removal this bounded path could not complete is retained by
+        # the process cleanup registry rather than ending with the local
+        # EffectCgroup object, so the exact owned cgroup stays removable.
+        evidence["cleanup_registry_id"] = cgroup.cleanup_registry_id
+        evidence["effect_cgroup_removal_settled"] = cgroup.removal_settled
         ownership.effect_cgroup_removed = bool(removal.get("removed"))
         budget.note("cgroup_removal", completed=ownership.effect_cgroup_removed)
 
@@ -707,6 +718,7 @@ def supervise_command(
             except OSError:  # pragma: no cover
                 pass
         cgroup.close()
+        spawn_failure_registry_id = cgroup.cleanup_registry_id
         end_wall, end_monotonic = _now()
         empty_stdout = _BoundedStream("stdout", max_output_bytes)
         empty_stderr = _BoundedStream("stderr", max_output_bytes)
@@ -743,6 +755,7 @@ def supervise_command(
             stderr_text=stderr_text,
             stdout_decode_status=stdout_status,
             stderr_decode_status=stderr_status,
+            cleanup_registry_id=spawn_failure_registry_id,
         )
 
     launcher_pid = process.pid
@@ -968,13 +981,20 @@ def supervise_command(
     # The namespace is gone, so the per-effect cgroup should have no members.
     # Removing a cgroup that still has live members is not reported as success.
     if not cgroup.close() and cgroup.directory_present:
+        # M2-B48.  The removal was refused truthfully and the obligation is now
+        # retained by the process cleanup registry, so the exact owned cgroup
+        # stays reachable for a later bounded drain instead of surviving for the
+        # life of this controller.
         containment = {
             **containment,
             "containment_availability": "NOT_MEASURED",
             "containment_semantics": (
                 "cgroup cleanup found live members; aggregate containment is not claimed after this effect"
             ),
+            "cleanup_registry_id": cgroup.cleanup_registry_id,
+            "effect_cgroup_removal": cgroup.removal_evidence(),
         }
+    cgroup_registry_id = cgroup.cleanup_registry_id
 
     if status is None:
         # Without the init's status document there is no process-domain
@@ -1013,6 +1033,7 @@ def supervise_command(
             stderr_text=stderr_text,
             stdout_decode_status=stdout_status,
             stderr_decode_status=stderr_status,
+            cleanup_registry_id=cgroup_registry_id,
         )
 
     escalation = tuple(str(item) for item in status.get("termination_escalation", ()) or ())
@@ -1057,6 +1078,7 @@ def supervise_command(
             stderr_text=stderr_text,
             stdout_decode_status=stdout_status,
             stderr_decode_status=stderr_status,
+            cleanup_registry_id=cgroup_registry_id,
         )
 
     return SupervisedProcessResult(
@@ -1093,6 +1115,7 @@ def supervise_command(
         stderr_text=stderr_text,
         stdout_decode_status=stdout_status,
         stderr_decode_status=stderr_status,
+        cleanup_registry_id=cgroup_registry_id,
     )
 
 

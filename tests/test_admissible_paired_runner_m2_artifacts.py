@@ -38,6 +38,8 @@ M2_SUBREAPER_DEADLINE_STARTING_COMMIT = "c30bf3d38445f59271b61ad4db8520ed053af28
 M2_SUBREAPER_DEADLINE_BRANCH = "paired-runner/m2-subreaper-deadline-closure"
 M2_OWNERSHIP_DEBT_REAP_STARTING_COMMIT = "2f7eaac796e6f4b3d93419ac3087183302b2a54e"
 M2_OWNERSHIP_DEBT_REAP_BRANCH = "paired-runner/m2-ownership-debt-reap-closure"
+M2_PROCESS_OWNER_CLEANUP_STARTING_COMMIT = "4a451c859bc528d6281bfd1368ab3ca74fd3933c"
+M2_PROCESS_OWNER_CLEANUP_BRANCH = "paired-runner/m2-process-owner-cleanup-propagation-closure"
 M2_SECOND_BRANCH = "paired-runner/m2-causal-index-and-ipc-repairs"
 M2_THIRD_BRANCH = "paired-runner/m2-private-workspace-and-bound-runtime"
 M2_FOURTH_BRANCH = "paired-runner/m2-fourth-critical-repair-retry"
@@ -54,6 +56,7 @@ M2_ARTIFACTS = (
     "M2_FINAL_PROTOCOL_LIFECYCLE_REPAIR_REPORT.json",
     "M2_SUBREAPER_DEADLINE_CLOSURE_REPORT.json",
     "M2_OWNERSHIP_DEBT_REAP_CLOSURE_REPORT.json",
+    "M2_PROCESS_OWNER_CLEANUP_PROPAGATION_CLOSURE_REPORT.json",
 )
 #: Historical reports of earlier passes.  A later pass may not rewrite them: the
 #: record of what an earlier closure claimed is itself evidence.
@@ -65,9 +68,10 @@ PRESERVED_HISTORICAL_ARTIFACTS = (
     "M2_B25_CGROUP_TOPOLOGY_REPAIR_REPORT.json",
     "M2_B25_FINAL_FAILCLOSED_REPAIR_REPORT.json",
     "M2_FINAL_PROTOCOL_LIFECYCLE_REPAIR_REPORT.json",
-    # This pass supersedes the subreaper/deadline closure, so that closure's
-    # report is historical from here on and may not be rewritten.
     "M2_SUBREAPER_DEADLINE_CLOSURE_REPORT.json",
+    # This pass supersedes the ownership-debt/reap closure, so that closure's
+    # report is historical from here on and may not be rewritten.
+    "M2_OWNERSHIP_DEBT_REAP_CLOSURE_REPORT.json",
 )
 PRESERVED_M1_ARTIFACTS = (
     "M1_SCHEMA_CATALOG.json",
@@ -140,13 +144,13 @@ class M2ArtifactTests(unittest.TestCase):
         # M2-M36: the canonical filename is the single *current* report, and the
         # superseded fourth-repair bytes live under a historical filename.
         self.assertTrue(report["is_current_validation_report"])
-        self.assertEqual(report["starting_commit"], M2_OWNERSHIP_DEBT_REAP_STARTING_COMMIT)
-        self.assertEqual(report["branch"], M2_OWNERSHIP_DEBT_REAP_BRANCH)
+        self.assertEqual(report["starting_commit"], M2_PROCESS_OWNER_CLEANUP_STARTING_COMMIT)
+        self.assertEqual(report["branch"], M2_PROCESS_OWNER_CLEANUP_BRANCH)
         self.assertIn(
             report["terminal_verdict"],
             {
-                "M2_OWNERSHIP_DEBT_REAP_CLOSURE_VERIFIED",
-                "M2_OWNERSHIP_DEBT_REAP_OPERATOR_QUALIFICATION_REQUIRED",
+                "M2_PROCESS_OWNER_CLEANUP_PROPAGATION_CLOSURE_VERIFIED",
+                "M2_PROCESS_OWNER_CLEANUP_PROPAGATION_OPERATOR_QUALIFICATION_REQUIRED",
             },
         )
         self.assertFalse(report["boundary_audit"]["milestone_3_started"])
@@ -163,7 +167,7 @@ class M2ArtifactTests(unittest.TestCase):
         self.assertTrue(report["known_limitations"])
         self.assertEqual(
             report["final_repair_report"],
-            "implementation/M2_OWNERSHIP_DEBT_REAP_CLOSURE_REPORT.json",
+            "implementation/M2_PROCESS_OWNER_CLEANUP_PROPAGATION_CLOSURE_REPORT.json",
         )
         # The pointer resolves, and the report it names agrees about the pass.
         closure = parse_canonical_json(
