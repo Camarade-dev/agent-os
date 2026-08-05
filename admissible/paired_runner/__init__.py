@@ -79,10 +79,13 @@ from .resource_limits import (
 )
 from .process_ownership import (
     ChildSubreaperOwnership,
+    ChildSubreaperUnavailable,
+    CleanupBudget,
     ControllerDeadlineExpired,
     Deadline,
     ProcessOwnershipEvidence,
     ReapOutcome,
+    SubreaperReference,
     ownership_architecture_description,
 )
 from .run_index import (
@@ -184,6 +187,8 @@ __all__ = [
     "CgroupMembershipUnreadable",
     "CgroupTopology",
     "ChildSubreaperOwnership",
+    "ChildSubreaperUnavailable",
+    "CleanupBudget",
     "ConfigurationRefused",
     "ControllerDeadlineExpired",
     "Deadline",
@@ -201,6 +206,7 @@ __all__ = [
     "RunIndexState",
     "SandboxUnavailable",
     "SeccompUnavailable",
+    "SubreaperReference",
     "WorkspaceIpcEndpointRefused",
     "build_program",
     "build_runtime_manifest",

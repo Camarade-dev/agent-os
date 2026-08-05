@@ -3,6 +3,35 @@
 Two defects share one root cause: the trusted controller delegated questions it
 was responsible for answering to a process it does not trust to answer them.
 
+The same root cause produced four further defects, closed here:
+
+M2-B37 -- an ownership guarantee is a precondition, not a preference
+    ``acquire`` reported that the process-wide flag could not be set and still
+    handed back a reference, and the launch path forked anyway.  A guarantee the
+    launch path is allowed to proceed without is not a guarantee.  Acquisition
+    now either returns state the kernel confirmed or raises, and nothing --
+    socket, fork, pidfd, helper, launcher -- is created before it succeeds.
+
+M2-B38 -- acquisition around a fork is failure-atomic
+    An acquisition taken before ``fork()`` outlived a ``fork()`` that failed, so
+    a process-wide flag stayed set for a helper that was never created.  Every
+    exit path between acquisition and successful ownership transfer now rolls
+    the acquisition back exactly once, idempotently, after the partially created
+    child is destroyed and reaped.
+
+M2-B39 -- a restoration is a readback, not a request
+    ``release`` compared the *write's* error code and reported RESTORED while
+    the readback it had already performed disagreed.  Restoration is now claimed
+    only when the kernel reads back exactly the intended value; every other
+    outcome is a distinct, truthful residual state.
+
+M2-B40 -- one deadline for one bounded cleanup
+    Stages of the abort path started fresh fixed-duration waits after the global
+    30-second deadline was exhausted.  :class:`CleanupBudget` is the single
+    absolute instant a whole cleanup spends: stages receive capped *views* of it
+    and never a new budget, and what each stage was granted, completed, or left
+    incomplete is recorded.
+
 M2-B33 -- controller-owned bounds
     Every helper round trip was a blocking read with no deadline the controller
     itself enforced.  A helper that is alive but wedged, stopped, or
@@ -91,6 +120,13 @@ LAUNCHER_REAP_DEADLINE_MS = 5_000
 HELPER_REAP_DEADLINE_MS = 5_000
 #: The whole bounded abort path, including every step above.
 ABORT_TOTAL_DEADLINE_MS = 30_000
+#: How long the controller waits for a helper to exit on its own request before
+#: it stops asking and kills it.  A portion of the shutdown deadline, never a
+#: second budget added to it.
+HELPER_COOPERATIVE_EXIT_DEADLINE_MS = 2_000
+#: The subreaper release/restoration stage of a bounded cleanup.  ``prctl`` does
+#: not block, so this bounds the stage's ledger entry rather than a wait.
+SUBREAPER_RESTORE_DEADLINE_MS = 1_000
 
 #: Polling granularity for bounded waits.  Small enough not to dominate the
 #: deadline, large enough not to spin.
@@ -108,18 +144,31 @@ class Deadline:
 
     expires_at_ns: int
     label: str = ""
+    #: The duration this deadline was *configured* with, in milliseconds.
+    #: M2-B40.  An instant alone cannot answer "what total was this bounded
+    #: operation given?", because by the time anything reads it some of that
+    #: total has already been spent: a 30 000 ms deadline read a hair later
+    #: reports 29 999 ms remaining.  The configured input is therefore carried
+    #: rather than re-derived, and the remaining time is recorded separately.
+    configured_ms: int | None = None
 
     @classmethod
-    def after(cls, seconds: float, label: str = "") -> "Deadline":
-        return cls(time.monotonic_ns() + int(max(0.0, seconds) * 1_000_000_000), label)
+    def after(cls, seconds: float, label: str = "", *, configured_ms: int | None = None) -> "Deadline":
+        bounded = max(0.0, seconds)
+        return cls(
+            time.monotonic_ns() + int(bounded * 1_000_000_000),
+            label,
+            int(round(bounded * 1000)) if configured_ms is None else int(configured_ms),
+        )
 
     @classmethod
     def after_ms(cls, milliseconds: int, label: str = "") -> "Deadline":
-        return cls.after(max(0, int(milliseconds)) / 1000.0, label)
+        exact = max(0, int(milliseconds))
+        return cls.after(exact / 1000.0, label, configured_ms=exact)
 
     @classmethod
     def already_expired(cls, label: str = "") -> "Deadline":
-        return cls(time.monotonic_ns(), label)
+        return cls(time.monotonic_ns(), label, 0)
 
     @property
     def remaining_seconds(self) -> float:
@@ -134,8 +183,10 @@ class Deadline:
 
         if other is None:
             return self
+        # The cap this sub-step was configured with survives being clipped: what
+        # the step asked for and what it was actually granted are two facts.
         return self if self.expires_at_ns <= other.expires_at_ns else Deadline(
-            other.expires_at_ns, self.label or other.label
+            other.expires_at_ns, self.label or other.label, self.configured_ms
         )
 
     def sub(self, milliseconds: int, label: str) -> "Deadline":
@@ -144,7 +195,12 @@ class Deadline:
         return Deadline.after_ms(milliseconds, label).bounded_by(self)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"label": self.label, "remaining_ms": int(self.remaining_seconds * 1000), "expired": self.expired}
+        return {
+            "label": self.label,
+            "configured_ms": self.configured_ms,
+            "remaining_ms": int(self.remaining_seconds * 1000),
+            "expired": self.expired,
+        }
 
 
 class ControllerDeadlineExpired(RuntimeError):
@@ -156,16 +212,220 @@ class ControllerDeadlineExpired(RuntimeError):
         self.detail = detail
 
 
+# --- M2-B40: one absolute deadline for one whole bounded cleanup --------------
+
+
+@dataclass
+class CleanupBudget:
+    """The single instant a whole bounded cleanup spends, plus its ledger.
+
+    A multi-stage cleanup that lets each stage start a fresh fixed-duration wait
+    has no total bound at all: the stated 30 seconds becomes 30 seconds *plus*
+    whatever the later stages ask for, and a caller that was promised a bounded
+    abort waits for an unbounded one.  This object is created once at the entry
+    to the cleanup and is the only source of time inside it.
+
+    Stages ask for time in one of three ways, and none of them can renew the
+    budget:
+
+    * :meth:`grant` returns a :class:`Deadline` capped by this one, for a step
+      that takes a deadline;
+    * :meth:`grant_seconds` returns the seconds a duration-taking primitive may
+      wait -- the remaining time, capped by the step's own maximum, and zero
+      once the budget is spent;
+    * :meth:`observe` records that a non-blocking step ran, and grants nothing.
+
+    Every grant is recorded with the remaining budget at the moment it was
+    made, so "this stage received a fresh five seconds after the deadline had
+    expired" is a statement the evidence can contradict.
+    """
+
+    deadline: Deadline
+    configured_total_ms: int
+    default_total_ms: int = 0
+    caller_supplied_deadline: bool = False
+    remaining_at_entry_ms: int = 0
+    started_ns: int = field(default_factory=time.monotonic_ns)
+    grants: list[dict[str, Any]] = field(default_factory=list)
+    completed_steps: list[str] = field(default_factory=list)
+    incomplete_steps: list[str] = field(default_factory=list)
+
+    @classmethod
+    def open(cls, deadline: "Deadline | None", *, total_ms: int, label: str) -> "CleanupBudget":
+        """Adopt the caller's whole deadline, or create the one and only one.
+
+        The configured total is the *input*, taken from the deadline itself:
+        a caller that hands in three seconds is owed evidence about three
+        seconds, and reporting the module default would misdescribe the bound
+        the caller chose.  It is deliberately not re-derived from the remaining
+        time, because a 30 000 ms deadline read a hair after it was created has
+        29 999 ms left and would misreport the configured total by a
+        millisecond.  How much of that total was already gone at entry is
+        recorded separately as ``remaining_at_entry_ms``, so neither fact is
+        inferred from the other.
+        """
+
+        if deadline is None:
+            whole = Deadline.after_ms(total_ms, label)
+            configured = int(total_ms)
+        else:
+            whole = deadline
+            configured = (
+                int(whole.configured_ms)
+                if whole.configured_ms is not None
+                else int(whole.remaining_seconds * 1000)
+            )
+        return cls(
+            deadline=whole,
+            configured_total_ms=configured,
+            default_total_ms=int(total_ms),
+            caller_supplied_deadline=deadline is not None,
+            remaining_at_entry_ms=int(whole.remaining_seconds * 1000),
+        )
+
+    @property
+    def remaining_ms(self) -> int:
+        return int(self.deadline.remaining_seconds * 1000)
+
+    @property
+    def exhausted(self) -> bool:
+        return self.deadline.expired
+
+    @property
+    def elapsed_ms(self) -> int:
+        return int((time.monotonic_ns() - self.started_ns) / 1_000_000)
+
+    def grant(self, stage: str, cap_ms: int) -> Deadline:
+        """A capped view of the one deadline.  Never a new budget."""
+
+        granted = self.deadline.sub(cap_ms, stage)
+        self._record(stage, int(granted.remaining_seconds * 1000), blocking=True, cap_ms=int(cap_ms))
+        return granted
+
+    def grant_seconds(self, stage: str, cap_seconds: float) -> float:
+        """The seconds a duration-taking primitive may wait: remaining, capped.
+
+        Zero once the budget is spent, which every such primitive must treat as
+        one non-blocking observation rather than as "no limit".
+        """
+
+        seconds = min(max(0.0, float(cap_seconds)), self.deadline.remaining_seconds)
+        self._record(stage, int(seconds * 1000), blocking=True, cap_ms=int(cap_seconds * 1000))
+        return seconds
+
+    def observe(self, stage: str) -> dict[str, Any]:
+        """Record a non-blocking step.  It waits for nothing, so it gets nothing."""
+
+        return self._record(stage, 0, blocking=False, cap_ms=0)
+
+    def _record(self, stage: str, granted_ms: int, *, blocking: bool, cap_ms: int) -> dict[str, Any]:
+        entry = {
+            "stage": stage,
+            "granted_ms": granted_ms,
+            "stage_maximum_ms": cap_ms,
+            "budget_remaining_ms": self.remaining_ms,
+            "deadline_expired_at_entry": self.exhausted,
+            "blocking": blocking,
+        }
+        self.grants.append(entry)
+        return dict(entry)
+
+    def note(self, stage: str, *, completed: bool) -> None:
+        """Record whether a stage finished the thing it claims, or did not."""
+
+        target = self.completed_steps if completed else self.incomplete_steps
+        other = self.incomplete_steps if completed else self.completed_steps
+        if stage in other:
+            other.remove(stage)
+        if stage not in target:
+            target.append(stage)
+
+    def granted_ms_for(self, stage: str) -> int | None:
+        for entry in reversed(self.grants):
+            if entry["stage"] == stage:
+                return int(entry["granted_ms"])
+        return None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "configured_total_ms": self.configured_total_ms,
+            "default_total_ms": self.default_total_ms,
+            "caller_supplied_deadline": self.caller_supplied_deadline,
+            "remaining_at_entry_ms": self.remaining_at_entry_ms,
+            "elapsed_ms": self.elapsed_ms,
+            "remaining_ms": self.remaining_ms,
+            "deadline_exhausted": self.exhausted,
+            "clock": "time.monotonic_ns",
+            "renewed_after_a_step": False,
+            "stage_grants": [dict(entry) for entry in self.grants],
+            "completed_steps": list(self.completed_steps),
+            "incomplete_steps": list(self.incomplete_steps),
+        }
+
+
 # --- child-subreaper ownership -----------------------------------------------
 
 PR_SET_CHILD_SUBREAPER = 36
 PR_GET_CHILD_SUBREAPER = 37
 
+#: Acquisition outcomes.  Exactly one of them permits a fork.
 SUBREAPER_APPLIED = "APPLIED"
-SUBREAPER_RESTORED = "RESTORED"
-SUBREAPER_HELD = "HELD_BY_AN_OUTER_ACQUISITION"
 SUBREAPER_UNAVAILABLE = "UNAVAILABLE_ON_THIS_KERNEL"
+#: M2-B37.  The three ways an acquisition can fail to be *established* while the
+#: syscall layer still returns.  Each is a refusal, never a held reference.
+SUBREAPER_SET_FAILED = "SET_FAILED"
+SUBREAPER_READBACK_FAILED = "READBACK_FAILED"
 SUBREAPER_READBACK_MISMATCH = "READBACK_MISMATCH"
+
+#: Release outcomes.  Exactly one of them is a restoration.
+SUBREAPER_RESTORED = "RESTORED"
+#: M2-B39.  A restoration that was requested but not observed, in each of the
+#: three ways it can fail to be observed.
+SUBREAPER_RESTORE_SET_FAILED = "RESTORE_SET_FAILED"
+SUBREAPER_RESTORE_READBACK_FAILED = "RESTORE_READBACK_FAILED"
+SUBREAPER_RESTORE_MISMATCH = "RESTORE_MISMATCH"
+#: An inner release under an outer acquisition: nothing is restored, and the
+#: flag is still required by somebody.
+SUBREAPER_REFERENCE_RETAINED = "REFERENCE_RETAINED"
+#: A release that released nothing, because the terminal one already happened
+#: or none was ever taken.  It never overwrites the terminal result.
+SUBREAPER_ALREADY_RELEASED = "ALREADY_RELEASED"
+#: The flag is not inherited across ``fork``, so an acquisition object carried
+#: into a child describes a flag the child does not hold.  The child discards
+#: it; it must never "restore" a process-wide value it never set.
+SUBREAPER_INHERITED_DISCARDED = "INHERITED_ACQUISITION_DISCARDED"
+
+#: Acquisition refusals: none of these may be followed by a fork.
+SUBREAPER_ACQUISITION_REFUSALS = (
+    SUBREAPER_UNAVAILABLE,
+    SUBREAPER_SET_FAILED,
+    SUBREAPER_READBACK_FAILED,
+    SUBREAPER_READBACK_MISMATCH,
+)
+#: The complete release state machine.
+SUBREAPER_RELEASE_RESULTS = (
+    SUBREAPER_RESTORED,
+    SUBREAPER_RESTORE_SET_FAILED,
+    SUBREAPER_RESTORE_READBACK_FAILED,
+    SUBREAPER_RESTORE_MISMATCH,
+    SUBREAPER_REFERENCE_RETAINED,
+    SUBREAPER_ALREADY_RELEASED,
+    SUBREAPER_INHERITED_DISCARDED,
+)
+
+
+class ChildSubreaperUnavailable(RuntimeError):
+    """The controller could not positively establish subreaper ownership.
+
+    M2-B37.  This is raised *before* anything is created, so a caller that sees
+    it knows no descriptor, process, or pidfd exists to clean up and that the
+    process-wide flag is exactly as it was.
+    """
+
+    def __init__(self, code: str, detail: str = "") -> None:
+        super().__init__(f"{code}:{detail}" if detail else code)
+        self.code = code
+        self.detail = detail
 
 
 def _libc() -> Any:
@@ -210,91 +470,223 @@ class ChildSubreaperOwnership:
         self._depth = 0
         self._previous: int | None = None
         self._owner_pid: int | None = None
-        self._code: str = SUBREAPER_UNAVAILABLE
+        self._code: str = SUBREAPER_ALREADY_RELEASED
         self._detail: str = "no acquisition has been made"
         self._applied = False
+        # M2-B39.  What a restoration intended, what the kernel actually read
+        # back, and whether the two agreed.  A restoration is claimed from the
+        # readback alone.
+        self._restore_intended: int | None = None
+        self._restore_observed: int | None = None
+        self._restoration_verified = False
+        self._cleanup_complete = True
+        self._released_nothing = True
 
     def _reset_after_fork_locked(self) -> None:
         # PR_SET_CHILD_SUBREAPER is not inherited across fork(), so a copy of
         # this object carried into a child describes a flag the child does not
-        # have.  It is re-derived rather than trusted.
+        # have.  It is discarded rather than trusted -- and in particular it is
+        # never "restored" by the child, which would write a process-wide value
+        # into a process that never set one.
         if self._owner_pid is not None and self._owner_pid != os.getpid():
             self._depth = 0
             self._previous = None
             self._applied = False
             self._owner_pid = None
-            self._code = SUBREAPER_UNAVAILABLE
-            self._detail = "the inherited acquisition described another process and was discarded"
+            self._restore_intended = None
+            self._restore_observed = None
+            self._restoration_verified = False
+            self._cleanup_complete = True
+            self._released_nothing = True
+            self._code = SUBREAPER_INHERITED_DISCARDED
+            self._detail = (
+                "the inherited acquisition described another process and was discarded; this "
+                "process restored nothing because it never set the flag"
+            )
+
+    def _refuse_locked(self, code: str, detail: str, *, rewrite_to: int | None = None) -> None:
+        """Fail an acquisition closed: hold nothing, and put the flag back.
+
+        M2-B37.  The caller is about to be told it may not fork.  It must also
+        be true that this failed attempt left the process-wide state exactly as
+        it found it, so a write that was made and then contradicted is undone
+        here and the observed result is recorded rather than assumed.
+        """
+
+        residual = None
+        if rewrite_to is not None:
+            rewrite_error = set_child_subreaper(rewrite_to)
+            residual, _ = get_child_subreaper()
+            detail = (
+                f"{detail}; the previous value {rewrite_to} was rewritten "
+                f"(error={rewrite_error}, observed={residual})"
+            )
+        self._depth = 0
+        self._previous = None
+        self._owner_pid = None
+        self._applied = False
+        self._restore_intended = rewrite_to
+        self._restore_observed = residual
+        self._restoration_verified = rewrite_to is None or residual == rewrite_to
+        self._cleanup_complete = self._restoration_verified
+        self._released_nothing = True
+        self._code = code
+        self._detail = detail
+        raise ChildSubreaperUnavailable(code, detail)
 
     def acquire(self) -> dict[str, Any]:
-        """Become a child subreaper for the lifetime of the caller's helper."""
+        """Positively establish subreaper ownership, or refuse to hold one.
+
+        M2-B37.  This returns only an acquisition the kernel confirmed.  The
+        previous behaviour -- returning a state that said the flag could not be
+        set while still counting a reference -- made the ownership guarantee
+        optional for a launch path that then proceeded as though it held one.
+
+        :raises ChildSubreaperUnavailable: the flag could not be read, could not
+            be set, or does not read back as set.  Nothing is held and the
+            process-wide state is left as it was found.
+        """
 
         with self._lock:
             self._reset_after_fork_locked()
-            if self._depth > 0:
+            if self._depth > 0 and self._applied:
+                # An outer acquisition already proved the kernel state; this one
+                # shares that single activation.
                 self._depth += 1
+                self._code = SUBREAPER_APPLIED
+                self._detail = (
+                    f"this controller (pid {os.getpid()}) is a child subreaper; {self._depth} "
+                    f"trusted helper acquisition(s) share it"
+                )
+                self._released_nothing = False
+                self._cleanup_complete = False
                 return self.state()
             previous, read_error = get_child_subreaper()
             if previous is None:
-                self._code = SUBREAPER_UNAVAILABLE
-                self._detail = f"PR_GET_CHILD_SUBREAPER failed: {read_error}"
-                self._applied = False
-                self._depth += 1
-                self._owner_pid = os.getpid()
-                return self.state()
+                self._refuse_locked(
+                    SUBREAPER_UNAVAILABLE, f"PR_GET_CHILD_SUBREAPER failed: {read_error}"
+                )
             write_error = set_child_subreaper(1)
             if write_error is not None:
-                self._code = SUBREAPER_UNAVAILABLE
-                self._detail = f"PR_SET_CHILD_SUBREAPER failed: {write_error}"
-                self._applied = False
-                self._depth += 1
-                self._owner_pid = os.getpid()
-                return self.state()
-            observed, _ = get_child_subreaper()
+                self._refuse_locked(
+                    SUBREAPER_SET_FAILED, f"PR_SET_CHILD_SUBREAPER(1) failed: {write_error}"
+                )
+            observed, observe_error = get_child_subreaper()
+            if observed is None:
+                self._refuse_locked(
+                    SUBREAPER_READBACK_FAILED,
+                    f"PR_GET_CHILD_SUBREAPER failed after setting 1: {observe_error}",
+                    rewrite_to=previous,
+                )
             if observed != 1:
                 # The write reported success; the kernel disagrees.  That is a
                 # claim, not an observation, and it is refused as one.
-                set_child_subreaper(previous)
-                self._code = SUBREAPER_READBACK_MISMATCH
-                self._detail = f"PR_GET_CHILD_SUBREAPER reads {observed} after setting 1"
-                self._applied = False
-                self._depth += 1
-                self._owner_pid = os.getpid()
-                return self.state()
+                self._refuse_locked(
+                    SUBREAPER_READBACK_MISMATCH,
+                    f"PR_GET_CHILD_SUBREAPER reads {observed} after setting 1",
+                    rewrite_to=previous,
+                )
             self._previous = previous
             self._applied = True
+            self._depth = 1
+            self._owner_pid = os.getpid()
             self._code = SUBREAPER_APPLIED
             self._detail = (
                 f"this controller (pid {os.getpid()}) is a child subreaper; the previous value "
                 f"{previous} is restored when the last trusted helper closes"
             )
-            self._depth += 1
-            self._owner_pid = os.getpid()
+            self._restore_intended = None
+            self._restore_observed = None
+            self._restoration_verified = False
+            self._cleanup_complete = False
+            self._released_nothing = False
             return self.state()
 
+    def acquire_reference(self) -> "SubreaperReference":
+        """Acquire, and hand back a handle that releases exactly once.
+
+        M2-B38.  A caller that is about to fork needs a rollback that cannot
+        double-release and cannot be forgotten.  The handle is validated before
+        it is returned: an object that does not describe an applied acquisition
+        owned by this PID is released and refused rather than carried forward.
+        """
+
+        reference = SubreaperReference(self, self.acquire())
+        if not reference.valid:
+            reference.release()
+            raise ChildSubreaperUnavailable(
+                SUBREAPER_READBACK_MISMATCH,
+                f"the acquisition object does not describe ownership held by pid {os.getpid()}: "
+                f"{reference.state}",
+            )
+        return reference
+
     def release(self) -> dict[str, Any]:
-        """Release one acquisition; restore the prior flag on the last one."""
+        """Release one acquisition; restore and *verify* on the last one.
+
+        M2-B39.  ``RESTORED`` is returned only when the kernel reads back
+        exactly the value this release intended.  A write that reported success
+        while the readback disagrees leaves a truthful residual state, because a
+        later consumer that reads RESTORED will assume the process-wide flag is
+        back at baseline and act on a flag that is still set.
+        """
 
         with self._lock:
             self._reset_after_fork_locked()
             if self._depth == 0:
+                # Nothing is held.  The terminal result of the release that did
+                # happen is preserved rather than overwritten by this repeat.
+                self._released_nothing = True
+                if self._code not in SUBREAPER_RELEASE_RESULTS:
+                    self._code = SUBREAPER_ALREADY_RELEASED
+                    self._detail = "no acquisition is held; this call released nothing"
                 return self.state()
             self._depth -= 1
+            self._released_nothing = False
             if self._depth > 0:
-                self._code = SUBREAPER_HELD
-                self._detail = f"{self._depth} trusted helper acquisition(s) still hold the flag"
-                return self.state()
-            if self._applied and self._previous is not None:
-                error = set_child_subreaper(self._previous)
-                observed, _ = get_child_subreaper()
-                self._code = SUBREAPER_RESTORED if error is None else SUBREAPER_READBACK_MISMATCH
+                self._code = SUBREAPER_REFERENCE_RETAINED
                 self._detail = (
-                    f"the child-subreaper flag was restored to {self._previous} (observed {observed})"
-                    if error is None
-                    else f"restoring the child-subreaper flag failed: {error}"
+                    f"{self._depth} trusted helper acquisition(s) still hold the flag; nothing was "
+                    "restored and nothing is claimed restored"
                 )
+                return self.state()
+            intended = self._previous if self._previous is not None else 0
+            set_error = set_child_subreaper(intended)
+            observed, read_error = get_child_subreaper()
+            if set_error is not None:
+                code = SUBREAPER_RESTORE_SET_FAILED
+                detail = (
+                    f"PR_SET_CHILD_SUBREAPER({intended}) failed: {set_error}; the process-wide "
+                    f"flag is not back at baseline (observed {observed})"
+                )
+            elif observed is None:
+                code = SUBREAPER_RESTORE_READBACK_FAILED
+                detail = (
+                    f"PR_GET_CHILD_SUBREAPER failed after restoring {intended}: {read_error}; the "
+                    "restoration was requested and never observed"
+                )
+            elif observed != intended:
+                code = SUBREAPER_RESTORE_MISMATCH
+                detail = (
+                    f"the child-subreaper flag was set to {intended} and reads {observed}; the "
+                    "restoration is not claimed and this process is still a child subreaper"
+                )
+            else:
+                code = SUBREAPER_RESTORED
+                detail = (
+                    f"the child-subreaper flag was restored to {intended} and the kernel reads "
+                    f"{observed}"
+                )
+            self._code = code
+            self._detail = detail
+            self._restore_intended = intended
+            self._restore_observed = observed
+            self._restoration_verified = code == SUBREAPER_RESTORED
+            self._cleanup_complete = code == SUBREAPER_RESTORED
             self._applied = False
-            self._previous = None
+            # The evidence of what was held survives a failed restoration: it is
+            # the only remaining record of what this process still owes.
+            self._previous = None if code == SUBREAPER_RESTORED else intended
             return self.state()
 
     @property
@@ -302,6 +694,13 @@ class ChildSubreaperOwnership:
         with self._lock:
             self._reset_after_fork_locked()
             return self._applied and self._depth > 0
+
+    @property
+    def cleanup_complete(self) -> bool:
+        """Whether this ownership left the process-wide flag at its baseline."""
+
+        with self._lock:
+            return self._cleanup_complete
 
     def state(self) -> dict[str, Any]:
         with self._lock:
@@ -312,7 +711,85 @@ class ChildSubreaperOwnership:
                 "depth": self._depth,
                 "previous_value": self._previous,
                 "owner_pid": self._owner_pid,
+                "restore_intended": self._restore_intended,
+                "restore_observed": self._restore_observed,
+                "restoration_verified": self._restoration_verified,
+                "cleanup_complete": self._cleanup_complete,
+                "released_nothing": self._released_nothing,
             }
+
+
+class SubreaperReference:
+    """One acquisition of the process-wide flag, released at most once.
+
+    M2-B38.  The rollback of a failed launch must be exact: releasing twice
+    would decrement an acquisition somebody else still needs, and not releasing
+    at all would leave the flag set for a helper that was never created.  The
+    handle makes both impossible, and repeating the rollback is a no-op that
+    reports the first release rather than performing a second.
+    """
+
+    def __init__(self, owner: ChildSubreaperOwnership, state: dict[str, Any]) -> None:
+        self._owner = owner
+        self._state = dict(state)
+        self._holder_pid = os.getpid()
+        self._released = False
+        self._release_state: dict[str, Any] = {}
+
+    @property
+    def state(self) -> dict[str, Any]:
+        return dict(self._state)
+
+    @property
+    def released(self) -> bool:
+        return self._released
+
+    @property
+    def holder_pid(self) -> int:
+        return self._holder_pid
+
+    @property
+    def valid(self) -> bool:
+        """Whether this handle describes ownership positively held by this PID."""
+
+        return (
+            not self._released
+            and self._holder_pid == os.getpid()
+            and self._state.get("code") == SUBREAPER_APPLIED
+            and bool(self._state.get("applied"))
+            and int(self._state.get("depth") or 0) > 0
+            and self._state.get("owner_pid") == os.getpid()
+        )
+
+    def release(self) -> dict[str, Any]:
+        """Release this acquisition once.  Idempotent, and never cross-process."""
+
+        if self._released:
+            return dict(self._release_state)
+        self._released = True
+        if self._holder_pid != os.getpid():
+            # A handle carried across fork() names a flag this process does not
+            # hold.  Releasing it here would restore a process-wide value this
+            # process never set.
+            self._release_state = {
+                "code": SUBREAPER_INHERITED_DISCARDED,
+                "detail": (
+                    f"the acquisition was taken by pid {self._holder_pid}; pid {os.getpid()} "
+                    "discarded it and restored nothing"
+                ),
+                "applied": False,
+                "depth": 0,
+                "previous_value": None,
+                "owner_pid": self._holder_pid,
+                "restore_intended": None,
+                "restore_observed": None,
+                "restoration_verified": False,
+                "cleanup_complete": True,
+                "released_nothing": True,
+            }
+            return dict(self._release_state)
+        self._release_state = self._owner.release()
+        return dict(self._release_state)
 
 
 #: The one subreaper owner for this controller process.
@@ -643,6 +1120,25 @@ def ownership_architecture_description() -> dict[str, Any]:
             "acquired before the first trusted helper is forked, reference-counted across "
             "concurrent effects, restored to its previous value when the last helper closes"
         ),
+        "acquisition_gate": (
+            "M2-B37.  Acquisition either returns kernel-confirmed state or raises "
+            "ChildSubreaperUnavailable.  No socket, fork, pidfd, helper, or launcher is created "
+            "before it succeeds, so the launch path can never proceed on an ownership guarantee "
+            "it does not hold."
+        ),
+        "fork_failure_rollback": (
+            "M2-B38.  Every exit path between acquisition and successful ownership transfer "
+            "destroys and reaps the partially created child, closes every descriptor, and then "
+            "releases the acquisition exactly once through a handle that cannot double-release."
+        ),
+        "restoration_claim": (
+            "M2-B39.  RESTORED is returned only when PR_GET_CHILD_SUBREAPER reads back exactly "
+            "the intended value.  RESTORE_SET_FAILED, RESTORE_READBACK_FAILED and "
+            "RESTORE_MISMATCH are truthful residual states that keep the intended and observed "
+            "values and mark the cleanup incomplete."
+        ),
+        "release_results": list(SUBREAPER_RELEASE_RESULTS),
+        "acquisition_refusals": list(SUBREAPER_ACQUISITION_REFUSALS),
         "residual": (
             "While the flag is held, an orphaned descendant of this controller that no effect owns "
             "would reparent here and is not reaped, because reaping it would require waitpid(-1) "
@@ -656,8 +1152,11 @@ __all__ = [
     "ABORT_TOTAL_DEADLINE_MS",
     "CHILD_SUBREAPER",
     "ChildSubreaperOwnership",
+    "ChildSubreaperUnavailable",
+    "CleanupBudget",
     "ControllerDeadlineExpired",
     "Deadline",
+    "HELPER_COOPERATIVE_EXIT_DEADLINE_MS",
     "HELPER_CONTROL_RPC_DEADLINE_MS",
     "HELPER_REAP_DEADLINE_MS",
     "HELPER_RELEASE_ACCEPT_DEADLINE_MS",
@@ -679,11 +1178,22 @@ __all__ = [
     "REAP_ROLES",
     "REAP_SUBREAPER_UNAVAILABLE",
     "ReapOutcome",
+    "SUBREAPER_ACQUISITION_REFUSALS",
+    "SUBREAPER_ALREADY_RELEASED",
     "SUBREAPER_APPLIED",
-    "SUBREAPER_HELD",
+    "SUBREAPER_INHERITED_DISCARDED",
+    "SUBREAPER_READBACK_FAILED",
     "SUBREAPER_READBACK_MISMATCH",
+    "SUBREAPER_REFERENCE_RETAINED",
+    "SUBREAPER_RELEASE_RESULTS",
     "SUBREAPER_RESTORED",
+    "SUBREAPER_RESTORE_DEADLINE_MS",
+    "SUBREAPER_RESTORE_MISMATCH",
+    "SUBREAPER_RESTORE_READBACK_FAILED",
+    "SUBREAPER_RESTORE_SET_FAILED",
+    "SUBREAPER_SET_FAILED",
     "SUBREAPER_UNAVAILABLE",
+    "SubreaperReference",
     "get_child_subreaper",
     "is_addressable_pid",
     "observe_process_exit",

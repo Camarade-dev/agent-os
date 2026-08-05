@@ -130,6 +130,7 @@ from _paired_runner_m2_fixtures import (  # noqa: E402
     build_proposal,
     build_specification,
     decision_for,
+    guard_process_wide_cgroup_caches,
 )
 from admissible.paired_runner.durable_store import DurableObjectStore  # noqa: E402
 from admissible.paired_runner.effect_ledger import RunEffectLedger  # noqa: E402
@@ -1046,6 +1047,7 @@ class MembershipFailClosedCallerTests(unittest.TestCase):
     """Every security-relevant caller refuses on an unreadable membership."""
 
     def setUp(self) -> None:
+        guard_process_wide_cgroup_caches(self)
         self.fake = _FakeCgroupParent()
         self.addCleanup(self.fake.close)
 
@@ -1240,6 +1242,10 @@ IMMUTABLE_HISTORICAL_REPORTS = (
     "M2_FOURTH_CRITICAL_REPAIR_REPORT.json",
     "M2_B25_CGROUP_TOPOLOGY_REPAIR_REPORT.json",
     "M2_B25_FINAL_FAILCLOSED_REPAIR_REPORT.json",
+    # This module's own repair report is historical from the moment a later
+    # pass supersedes it: the record of what an earlier closure claimed is
+    # itself evidence, and a later pass may not rewrite it.
+    "M2_FINAL_PROTOCOL_LIFECYCLE_REPAIR_REPORT.json",
     "M1_BOUNDED_REPAIR_REPORT.json",
     "M1_SECOND_BOUNDED_REPAIR_REPORT.json",
 )
@@ -1249,13 +1255,32 @@ def _load(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _is_ancestor(candidate: str, descendant: str) -> bool:
+    """Whether ``candidate`` is ``descendant`` or one of its ancestors."""
+
+    return (
+        subprocess.run(
+            ["git", "merge-base", "--is-ancestor", candidate, descendant],
+            cwd=REPOSITORY_ROOT,
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+
+
 class ValidationArtifactCoherenceTests(unittest.TestCase):
     """Third-party interpretation must be unambiguous."""
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.report = _load(CURRENT_VALIDATION_REPORT)
+        # This module's own repair report, which is now historical and immutable.
         cls.repair = _load(FINAL_REPAIR_REPORT)
+        # The closure the current validation report points at, whichever pass
+        # that is.  Following the pointer rather than naming one pass keeps
+        # these assertions true of the artifact set as it moves forward, and
+        # makes a report that points at a closure it disagrees with fail.
+        cls.current_repair = _load(REPOSITORY_ROOT / cls.report["final_repair_report"])
         cls.matrix = _load(REQUIREMENT_MATRIX)
 
     def test_exactly_one_validation_report_declares_itself_current(self) -> None:
@@ -1305,28 +1330,44 @@ class ValidationArtifactCoherenceTests(unittest.TestCase):
             "M2_B25_CGROUP_TOPOLOGY_REPAIR_VERIFIED",
         ):
             self.assertNotIn(stale, text, f"the current report still asserts {stale}")
-        self.assertEqual(self.report["starting_commit"], self.repair["starting_commit"])
-        self.assertEqual(self.report["branch"], self.repair["branch"])
+        self.assertEqual(self.report["starting_commit"], self.current_repair["starting_commit"])
+        self.assertEqual(self.report["branch"], self.current_repair["branch"])
+        self.assertEqual(
+            self.report["terminal_verdict"], self.current_repair["terminal_verdict"]
+        )
         # The independent audit's verdicts are recorded verbatim: they are the
         # governing defect statement, not a superseded self-claim.
+        self.assertIn("MILESTONE_3_NOT_PERMITTED", self.report["independent_audit_verdicts"])
         self.assertEqual(
             self.report["independent_audit_verdicts"],
-            ["M2_FINAL_INDEPENDENT_CLOSURE_REFUSED", "MILESTONE_3_NOT_PERMITTED"],
+            self.current_repair["independent_audit_verdicts"],
         )
         self.assertEqual(
-            self.report["independent_audit_sha256"], self.repair["independent_audit_sha256"]
+            self.report["independent_audit_sha256"],
+            self.current_repair["independent_audit_sha256"],
         )
 
     def test_a_prior_transcript_is_never_offered_as_qualifying_this_code(self) -> None:
         prior = self.report["prior_physical_qualification"]
-        self.assertEqual(prior["qualified_commit"], "f702509c06346d4f288a9f8b942d21fc1a38e2cb")
+        self.assertRegex(prior["qualified_commit"], r"^[0-9a-f]{40}$")
+        # The transcript describes code from this pass's starting commit or
+        # earlier.  Anchoring to the starting commit rather than to HEAD is
+        # deliberate: HEAD moves the moment this repair is committed, and a
+        # HEAD anchor would make the check pass before the commit and fail
+        # after it.
+        self.assertTrue(
+            _is_ancestor(prior["qualified_commit"], self.report["starting_commit"]),
+            "the prior transcript claims a commit this pass did not start from",
+        )
         self.assertFalse(prior["qualifies_this_repair"])
         self.assertIn("does not qualify", prior["scope"])
+        self.assertTrue(prior["transcript"], "the prior transcript is preserved, not discarded")
 
     def test_the_physical_qualification_state_is_internally_coherent(self) -> None:
         """Either a complete transcript, or an explicit absence.  Never both."""
 
-        run = self.report["m2_final_protocol_lifecycle_closure"]["delegated_run"]
+        closure = self.report[self.report["current_closure_key"]]
+        run = closure["delegated_run"]
         claimed = self.report["independent_validation"][
             "real_delegated_cgroup_qualification_of_this_repair"
         ]
@@ -1341,26 +1382,24 @@ class ValidationArtifactCoherenceTests(unittest.TestCase):
             self.assertEqual(run["errors"], 0)
             self.assertIn(f"Ran {run['executed']} tests", run["exact_result"])
             self.assertIn("OK", run["exact_result"])
-            self.assertEqual(
-                self.report["terminal_verdict"], "M2_FINAL_PROTOCOL_LIFECYCLE_REPAIR_VERIFIED"
-            )
+            self.assertIn("VERIFIED", self.report["terminal_verdict"])
+            self.assertNotIn("QUALIFICATION_REQUIRED", self.report["terminal_verdict"])
         else:
             self.assertFalse(claimed, "an unperformed run may not be claimed as qualification")
             self.assertIsNone(run["executed"])
             self.assertEqual(run["exact_result"], "")
-            self.assertEqual(
-                self.report["terminal_verdict"],
-                "M2_FINAL_PROTOCOL_LIFECYCLE_OPERATOR_QUALIFICATION_REQUIRED",
-            )
-        self.assertEqual(run, self.repair["delegated_physical_qualification"]["run"])
-        self.assertEqual(
+            self.assertIn("OPERATOR_QUALIFICATION_REQUIRED", self.report["terminal_verdict"])
+        self.assertEqual(run, self.current_repair["delegated_physical_qualification"]["run"])
+        # This module is always one of the modules the qualification must run.
+        self.assertIn(
+            "tests.test_admissible_paired_runner_m2_final_protocol_lifecycle",
             run["expected_modules"],
-            [
-                "tests.test_admissible_paired_runner_m2_b25_cgroup_topology",
-                "tests.test_admissible_paired_runner_m2_b25_final_failclosed",
-                "tests.test_admissible_paired_runner_m2_final_protocol_lifecycle",
-            ],
         )
+        for module in (
+            "tests.test_admissible_paired_runner_m2_b25_cgroup_topology",
+            "tests.test_admissible_paired_runner_m2_b25_final_failclosed",
+        ):
+            self.assertIn(module, run["expected_modules"], module)
 
     def test_the_current_verdict_matches_the_requirement_matrix(self) -> None:
         dispositions = {
@@ -1378,8 +1417,8 @@ class ValidationArtifactCoherenceTests(unittest.TestCase):
             "provider retry accounting is Milestone 3 work and is not closed here",
         )
 
-    def test_the_expected_delegated_total_matches_the_three_modules(self) -> None:
-        run = self.report["m2_final_protocol_lifecycle_closure"]["delegated_run"]
+    def test_the_expected_delegated_total_matches_the_qualification_modules(self) -> None:
+        run = self.report[self.report["current_closure_key"]]["delegated_run"]
         expected = sum(
             unittest.defaultTestLoader.loadTestsFromName(module).countTestCases()
             for module in run["expected_modules"]
@@ -1390,25 +1429,24 @@ class ValidationArtifactCoherenceTests(unittest.TestCase):
 
     def test_the_declared_module_counts_match_the_modules_on_disk(self) -> None:
         counts = self.report["m2_test_count_semantics"]
-        for module, field in (
-            ("tests.test_admissible_paired_runner_m2_b25_cgroup_topology", "m2_b25_topology_module"),
-            (
-                "tests.test_admissible_paired_runner_m2_b25_final_failclosed",
-                "m2_b25_final_failclosed_module",
+        modules = {
+            "tests.test_admissible_paired_runner_m2_b25_cgroup_topology": "m2_b25_topology_module",
+            "tests.test_admissible_paired_runner_m2_b25_final_failclosed": (
+                "m2_b25_final_failclosed_module"
             ),
-            (
-                "tests.test_admissible_paired_runner_m2_final_protocol_lifecycle",
-                "m2_final_protocol_lifecycle_module",
+            "tests.test_admissible_paired_runner_m2_final_protocol_lifecycle": (
+                "m2_final_protocol_lifecycle_module"
             ),
-        ):
+            "tests.test_admissible_paired_runner_m2_subreaper_deadline_closure": (
+                "m2_subreaper_deadline_closure_module"
+            ),
+        }
+        for module, field in modules.items():
             loader = unittest.defaultTestLoader.loadTestsFromName(module)
             self.assertEqual(loader.countTestCases(), counts[field], module)
         self.assertEqual(
             counts["m2_discovered_by_discovery"],
-            counts["m2_legacy_pre_b25"]
-            + counts["m2_b25_topology_module"]
-            + counts["m2_b25_final_failclosed_module"]
-            + counts["m2_final_protocol_lifecycle_module"],
+            counts["m2_legacy_pre_b25"] + sum(counts[field] for field in modules.values()),
         )
         self.assertEqual(
             counts["m2_discovered_by_discovery"],
@@ -1441,6 +1479,8 @@ class ValidationArtifactCoherenceTests(unittest.TestCase):
         )
         self.assertFalse(self.repair["independent_acceptance_claimed"])
         self.assertFalse(self.repair["installed_path_qualification_claimed"])
+        self.assertFalse(self.current_repair["independent_acceptance_claimed"])
+        self.assertFalse(self.current_repair["installed_path_qualification_claimed"])
 
     def test_the_repair_report_declares_the_bounded_findings_and_architecture(self) -> None:
         self.assertEqual(
@@ -1565,6 +1605,14 @@ class DelegatedProtocolLifecycleTests(unittest.TestCase):
                 "ADMISSIBLE_REQUIRE_DELEGATED_CGROUP=1 but no delegated cgroup v2 "
                 f"topology is available: {DELEGATION.detail}"
             )
+
+    def setUp(self) -> None:
+        # test_an_unreadable_membership_refuses_release_quiescence_and_removal
+        # drives the production revalidation into a cached topology failure.
+        # That failure is process-wide and permanent by design, so without this
+        # it would follow every later effect in the interpreter -- including a
+        # *nominal* one in another module -- and refuse it before exec.
+        guard_process_wide_cgroup_caches(self)
 
     def test_the_no_false_green_variable_forbids_skipping(self) -> None:
         if REQUIRE_DELEGATED:

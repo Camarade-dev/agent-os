@@ -343,3 +343,54 @@ New classified codes: `CGROUP_MEMBERSHIP_UNREADABLE`,
 | kill domain, quiescence, removal | `test_the_kill_domain_signals_nothing_it_could_not_observe`, `test_quiescence_is_never_claimed_over_an_unreadable_membership`, `test_removal_is_refused_over_an_unreadable_membership` |
 | no bare empty set on a failed read | `test_no_caller_can_receive_a_bare_empty_set_on_a_failed_read` |
 | delegated physical qualification | `test_an_unreadable_membership_refuses_release_quiescence_and_removal` |
+
+---
+
+# D. Bounded cleanup budget (M2-B40)
+
+Section B3 made the aggregate cgroup layer double as the kill domain, and the
+abort path destroys that domain, waits for quiescence, and removes the cgroup.
+Those three steps are part of one bounded operation, and quiescence in
+particular is a *wait*.
+
+`EffectCgroup.wait_quiescent(timeout_seconds)` is unchanged: it polls
+`cgroup.procs` until it observes an empty membership or the duration it was
+given elapses, and it claims quiescence only from a positive observation of an
+empty, readable membership. What changed is where that duration comes from.
+
+The abort path previously handed it `ABORT_QUIESCENCE_TIMEOUT_SECONDS` — a fresh
+5.0 seconds computed from the wall of the moment, independent of the 30-second
+total the abort had already declared and possibly already spent. The stated
+bound was therefore the total plus this wait, plus whatever the steps after it
+asked for.
+
+The duration is now `budget.grant_seconds("cgroup_quiescence",
+ABORT_QUIESCENCE_TIMEOUT_SECONDS)`: the remaining time of the one absolute
+deadline created at abort entry, capped at the stage maximum. Once that deadline
+is spent the grant is exactly `0.0`, which `wait_quiescent` treats as a single
+non-blocking membership read — an observation, not a claim, and never a new
+interval.
+
+Removal keeps its own rule. `close()` reads membership and calls `rmdir`;
+neither blocks, so removal runs even with nothing left of the budget, and it
+still reports `removed` only when the absence was verified. A cgroup whose
+membership could not be read is still never removed and never called removed.
+
+The per-stage grants, the configured total, the elapsed time, deadline
+exhaustion, and the completed and incomplete steps are recorded in the durable
+cleanup evidence under `cleanup_budget`. `quiescence_granted_ms` records, in
+integer milliseconds, exactly what this stage received.
+
+## D1. Test matrix addendum
+
+| Case | Test |
+| --- | --- |
+| quiescence receives `0.0` once the whole deadline is exhausted | `test_wait_quiescent_never_receives_a_new_fixed_five_seconds` |
+| quiescence receives the remaining duration while time is left | `test_wait_quiescent_receives_the_remaining_duration_when_time_is_left` |
+| an exhausted budget blocks on nothing | `test_an_already_expired_deadline_at_entry_blocks_on_nothing` |
+| removal after exhaustion still verifies what it claims | `test_the_deadline_expiring_before_removal_still_verifies_what_it_claims` |
+| no stage receives more than the budget had left | `test_every_stage_receives_only_the_remaining_time` |
+| the whole abort stays inside its configured total | `test_the_total_elapsed_time_stays_inside_the_configured_total` |
+| no successful field after unobserved exhaustion | `test_no_successful_field_is_claimed_after_unobserved_exhaustion` |
+| repeated bounded cleanup stays idempotent | `test_a_repeated_bounded_cleanup_stays_idempotent` |
+| delegated physical qualification | `test_a_wedged_effect_aborts_inside_the_configured_global_bound` |

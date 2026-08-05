@@ -34,6 +34,8 @@ M2_THIRD_STARTING_COMMIT = "68dd7c9a6be66319dc93eeedcec2e994a6119585"
 M2_FOURTH_STARTING_COMMIT = "1133d131c75ed07e79d949b6b3f2f40847a3218b"
 M2_FINAL_LIFECYCLE_STARTING_COMMIT = "fbadaeec4205c9b24aeaeaac6c73ca1e6e69a4ff"
 M2_FINAL_LIFECYCLE_BRANCH = "paired-runner/m2-final-protocol-lifecycle-repair"
+M2_SUBREAPER_DEADLINE_STARTING_COMMIT = "c30bf3d38445f59271b61ad4db8520ed053af281"
+M2_SUBREAPER_DEADLINE_BRANCH = "paired-runner/m2-subreaper-deadline-closure"
 M2_SECOND_BRANCH = "paired-runner/m2-causal-index-and-ipc-repairs"
 M2_THIRD_BRANCH = "paired-runner/m2-private-workspace-and-bound-runtime"
 M2_FOURTH_BRANCH = "paired-runner/m2-fourth-critical-repair-retry"
@@ -48,6 +50,7 @@ M2_ARTIFACTS = (
     "M2_THIRD_CRITICAL_REPAIR_REPORT.json",
     "M2_FOURTH_CRITICAL_REPAIR_REPORT.json",
     "M2_FINAL_PROTOCOL_LIFECYCLE_REPAIR_REPORT.json",
+    "M2_SUBREAPER_DEADLINE_CLOSURE_REPORT.json",
 )
 #: Historical reports of earlier passes.  A later pass may not rewrite them: the
 #: record of what an earlier closure claimed is itself evidence.
@@ -58,6 +61,7 @@ PRESERVED_HISTORICAL_ARTIFACTS = (
     "M2_FOURTH_CRITICAL_REPAIR_REPORT.json",
     "M2_B25_CGROUP_TOPOLOGY_REPAIR_REPORT.json",
     "M2_B25_FINAL_FAILCLOSED_REPAIR_REPORT.json",
+    "M2_FINAL_PROTOCOL_LIFECYCLE_REPAIR_REPORT.json",
 )
 PRESERVED_M1_ARTIFACTS = (
     "M1_SCHEMA_CATALOG.json",
@@ -130,13 +134,13 @@ class M2ArtifactTests(unittest.TestCase):
         # M2-M36: the canonical filename is the single *current* report, and the
         # superseded fourth-repair bytes live under a historical filename.
         self.assertTrue(report["is_current_validation_report"])
-        self.assertEqual(report["starting_commit"], M2_FINAL_LIFECYCLE_STARTING_COMMIT)
-        self.assertEqual(report["branch"], M2_FINAL_LIFECYCLE_BRANCH)
+        self.assertEqual(report["starting_commit"], M2_SUBREAPER_DEADLINE_STARTING_COMMIT)
+        self.assertEqual(report["branch"], M2_SUBREAPER_DEADLINE_BRANCH)
         self.assertIn(
             report["terminal_verdict"],
             {
-                "M2_FINAL_PROTOCOL_LIFECYCLE_REPAIR_VERIFIED",
-                "M2_FINAL_PROTOCOL_LIFECYCLE_OPERATOR_QUALIFICATION_REQUIRED",
+                "M2_SUBREAPER_DEADLINE_CLOSURE_VERIFIED",
+                "M2_SUBREAPER_DEADLINE_OPERATOR_QUALIFICATION_REQUIRED",
             },
         )
         self.assertFalse(report["boundary_audit"]["milestone_3_started"])
@@ -153,8 +157,15 @@ class M2ArtifactTests(unittest.TestCase):
         self.assertTrue(report["known_limitations"])
         self.assertEqual(
             report["final_repair_report"],
-            "implementation/M2_FINAL_PROTOCOL_LIFECYCLE_REPAIR_REPORT.json",
+            "implementation/M2_SUBREAPER_DEADLINE_CLOSURE_REPORT.json",
         )
+        # The pointer resolves, and the report it names agrees about the pass.
+        closure = parse_canonical_json(
+            (ROOT / report["final_repair_report"]).read_bytes()
+        )
+        self.assertEqual(closure["starting_commit"], report["starting_commit"])
+        self.assertEqual(closure["branch"], report["branch"])
+        self.assertEqual(closure["terminal_verdict"], report["terminal_verdict"])
 
     def test_the_repair_report_closes_every_audit_finding(self) -> None:
         report = parse_canonical_json((IMPLEMENTATION / "M2_CRITICAL_REPAIR_REPORT.json").read_bytes())

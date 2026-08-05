@@ -180,3 +180,35 @@ def initialise_git_repository(root: Path) -> bool:
 
 
 PYTHON = os.path.realpath(os.sys.executable)
+
+
+def guard_process_wide_cgroup_caches(test) -> None:
+    """Restore the process-wide topology and delegation caches after a test.
+
+    M2-B29 makes a cgroup topology contradiction fail closed *and cache the
+    failure*: a controller that once saw an unreadable ``cgroup.procs`` never
+    silently re-bootstraps its topology, and every later effect refuses cgroup
+    containment for the rest of that process's life.  That is the accepted
+    production behaviour and is not weakened here.
+
+    It does mean an injected contradiction outlives the test that injected it.
+    ``process_supervision._DELEGATION_CACHE`` and ``resource_limits._TOPOLOGY``
+    are module-level, so a fault-injection test leaves every later effect in the
+    same interpreter running with ``available=False`` -- which, on a host whose
+    readiness promised CGROUP_V2_AND_RLIMIT, turns the next *nominal* effect
+    into a hard ``cgroup_membership_unverified`` refusal.  The injecting test
+    therefore puts back the objects that were true before it ran.
+
+    The kernel state itself is never touched: these injections are mocked reads,
+    so restoring the cached observations restores the truth.
+    """
+
+    from admissible.paired_runner import process_supervision as _ps
+    from admissible.paired_runner import resource_limits as _rl
+
+    saved = (_ps._DELEGATION_CACHE, _ps._DELEGATION_PID, _rl._TOPOLOGY)
+
+    def restore() -> None:
+        _ps._DELEGATION_CACHE, _ps._DELEGATION_PID, _rl._TOPOLOGY = saved
+
+    test.addCleanup(restore)

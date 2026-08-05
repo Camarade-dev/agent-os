@@ -369,3 +369,237 @@ monotonicity invariant, the deadline primitive, a live silent helper, a helper
 held by `SIGSTOP`, helper loss before creation, before release, and after the
 gate write, the verified kernel semantics, and the delegated physical
 qualification of each.
+
+---
+
+# D. Subreaper and global-deadline closure (M2-B37, M2-B38, M2-B39, M2-B40)
+
+Section C established the ownership architecture and the per-operation
+deadlines. It did not make the ownership a precondition, did not make the
+acquisition failure-atomic, decided a restoration from the write rather than the
+readback, and left the abort path's tail spending fresh fixed durations. This
+section closes those four.
+
+## D1. Acquisition is a precondition of the fork (M2-B37)
+
+`ChildSubreaperOwnership.acquire()` previously had three failure paths —
+`PR_GET_CHILD_SUBREAPER` unreadable, `PR_SET_CHILD_SUBREAPER` refused, and a
+readback that disagreed with a write reporting success — and all three
+incremented the reference count and returned a state dict.
+`PrivateMountHelper.start()` ignored the returned code and forked regardless.
+The controller therefore created a trusted helper whose orphaned launcher it had
+no established right to reap, while `_subreaper_acquired` was `True` and the
+evidence spoke as though ownership had been proved.
+
+The acquisition is now the first thing `start()` does, and it either returns
+kernel-confirmed state or raises `ChildSubreaperUnavailable`:
+
+```text
+READ_THE_PREVIOUS_FLAG
+SET_THE_FLAG
+READ_IT_BACK
+REFUSE_UNLESS_THE_READBACK_IS_EXACTLY_1
+VALIDATE_THE_ACQUISITION_OBJECT_IS_OWNED_BY_THIS_PID
+CREATE_THE_SOCKET_PAIR
+FORK
+```
+
+On any refusal: `fork()` is not called; no helper or launcher process is
+created; no pidfd is created or retained; no success or started event is
+produced; the caller receives the classified
+`private_mountns_subreaper_unavailable`; the previous process-wide value is
+rewritten and the rewrite is observed; and no ownership reference is retained.
+
+Refusal codes: `UNAVAILABLE_ON_THIS_KERNEL`, `SET_FAILED`, `READBACK_FAILED`,
+`READBACK_MISMATCH`.
+
+The controller's only fork is `private_workspace._fork()`, so "acquisition
+failure never reaches `fork()`" is a property of one named call site rather than
+an ordering that has to be inferred. The helper's own fork of the launcher runs
+*inside* the helper process, which holds no acquisition — the flag is not
+inherited — and is not the trusted controller.
+
+This is fail-closed by design: a kernel or policy that refuses
+`PR_SET_CHILD_SUBREAPER` now refuses the whole effect rather than proceeding
+without proved ownership. The behaviour change is disclosed in the closure
+report's known limitations.
+
+## D2. The acquisition is failure-atomic around the fork (M2-B38)
+
+The acquisition must be taken before the fork, because the flag must be set
+before the child exists. Everything between it and the successful ownership
+transfer is therefore rollback territory. `socketpair()` now runs *after* the
+acquisition so a descriptor failure can be rolled back at all, and the fork is
+inside the guarded region.
+
+`_roll_back_failed_start()` runs on every failing exit path, in this order:
+
+```text
+DESTROY_AND_REAP_THE_CHILD
+CLOSE_EVERY_DESCRIPTOR
+RELEASE_THE_ACQUISITION_ONCE
+```
+
+The order is not incidental: releasing the acquisition while an orphan of this
+controller is still alive would restore the very flag that gives this process
+the right to reap it.
+
+The release goes through a `SubreaperReference` handle that releases at most
+once, so a repeated rollback reports the first release rather than decrementing
+an acquisition a concurrent effect still needs. A failed launch under a
+concurrent acquisition yields `REFERENCE_RETAINED`, the flag stays set, and the
+surviving effect keeps the ownership it still requires.
+
+Covered failures: `socketpair()` EMFILE, `fork()` EAGAIN, `fork()` ENOMEM, the
+parent-side uid/gid map write failing after a real fork, the READY handshake
+timing out, and any other exception raised before ownership transfers.
+
+## D3. A restoration is a readback (M2-B39)
+
+`release()` performed the readback and then discarded it, deciding `RESTORED`
+from the *write's* error code. A kernel that accepted
+`PR_SET_CHILD_SUBREAPER(0)` and still reported `1` therefore produced
+`RESTORED`, and a later consumer would act on a flag that was still set.
+
+The release state machine is now:
+
+| observation | result |
+| --- | --- |
+| an outer acquisition still holds it | `REFERENCE_RETAINED` |
+| the write failed | `RESTORE_SET_FAILED` |
+| the readback failed | `RESTORE_READBACK_FAILED` |
+| the readback disagrees with the intended value | `RESTORE_MISMATCH` |
+| the readback equals the intended value | `RESTORED` |
+| nothing is held | `ALREADY_RELEASED` |
+| the handle was carried across `fork()` | `INHERITED_ACQUISITION_DISCARDED` |
+
+The write's return value alone can never produce `RESTORED`.
+
+A failed restoration keeps `restore_intended`, `restore_observed`,
+`restoration_verified=false`, `cleanup_complete=false`, and `previous_value`, so
+the last evidence of what this process still owes is not silently decremented
+away. A repeated release performs nothing and returns the original terminal
+result with `released_nothing=true`; it never overwrites a `RESTORE_MISMATCH`
+with `ALREADY_RELEASED`.
+
+A handle or acquisition carried across `fork()` is discarded and the child
+writes nothing: it must never restore a process-wide value it never set. That
+the flag is not inherited is asserted by forking and reading it in the child,
+not assumed.
+
+## D4. One deadline for one bounded cleanup (M2-B40)
+
+`abort_gated_effect()` declared a 30-second total and then let its tail start
+fresh fixed durations: `wait_quiescent()` received a new 5.0 seconds computed
+from its own clock at call time, `_legacy_terminate_and_reap()` called
+`wait(timeout=CAPSULE_TEARDOWN_TIMEOUT_SECONDS)`, and `PrivateMountHelper.close()`
+spent a full `HELPER_SHUTDOWN_DEADLINE_MS` and then a *second*, fresh
+`HELPER_REAP_DEADLINE_MS`. The stated bound was the total plus whatever the tail
+asked for.
+
+`CleanupBudget` is created once at abort entry and is the only source of time
+inside it. Stages take capped views:
+
+| stage | grant |
+| --- | --- |
+| `release_state` | non-blocking |
+| `process_domain_kill` | non-blocking |
+| `launcher_terminate_and_reap` | a capped `Deadline`; its own sub-steps cap again |
+| `descriptor_closure` | non-blocking |
+| `cgroup_quiescence` | remaining seconds, capped at `ABORT_QUIESCENCE_TIMEOUT_SECONDS` |
+| `cgroup_removal` | non-blocking |
+| `subreaper_release` | a capped `Deadline`; `prctl` does not block |
+
+The helper RPC bypass, the pidfd exit observation, and the launcher and helper
+reaps are sub-steps of `launcher_terminate_and_reap` and are capped by the same
+instant it receives.
+
+Once the budget is spent, `grant_seconds` returns exactly `0.0` and `grant`
+returns an expired deadline. Every primitive treats that as one non-blocking
+observation: `wait_quiescent(0.0)` performs a single membership read,
+`reap_owned_child` a single `WNOHANG` `waitpid`, `observe_process_exit` a single
+`poll(0)`, and the legacy wait is skipped entirely. Quiescence, reap, removal,
+and restoration are never claimed without observation.
+
+`PrivateMountHelper.close()` accepts a caller deadline and creates at most one
+of its own. The cooperative steps — the shutdown exchange and the wait for a
+voluntary exit — share a bounded prefix (`HELPER_COOPERATIVE_EXIT_DEADLINE_MS`)
+of that one instant, and the forced kill-and-reap takes what is left, so the
+cooperative steps cannot spend the guarantee.
+
+The durable cleanup evidence records the ledger: `configured_total_ms`,
+`default_total_ms`, `caller_supplied_deadline`, `remaining_at_entry_ms`,
+`elapsed_ms`, `remaining_ms`, `deadline_exhausted`, `renewed_after_a_step`, the
+per-stage grants, and the completed and incomplete steps. Every recorded
+duration is an integer number of milliseconds, because the durable encoding
+forbids floating-point values.
+
+`configured_total_ms` is the *input* the caller chose, carried on the
+`Deadline` itself as `configured_ms` rather than re-derived from the time that
+happens to remain. Re-deriving it is wrong by construction: some of the total is
+always already spent by the time anything reads it, so a 30 000 ms deadline
+reports 29 999 ms remaining and would misdescribe the very bound the caller
+configured. How much of that total was already gone at entry is recorded
+separately as `remaining_at_entry_ms`, so neither fact is inferred from the
+other. A capped view keeps the cap its step asked for; what the step was
+actually granted is the ledger's `granted_ms`.
+
+The subreaper release is part of the cleanup: when the abort path takes the
+helper over, kills it and reaps it, that helper will never run its own shutdown,
+so the acquisition it holds would outlive every process that justified it.
+Nothing is released while the helper is alive — it still owns its acquisition
+and its own shutdown ends it.
+
+## D5. Tests
+
+`tests/test_admissible_paired_runner_m2_subreaper_deadline_closure.py` covers the
+acquisition gate against injected `prctl` failures with the fork primitive
+proved unreached, rollback for `EAGAIN`, `ENOMEM`, `EMFILE` and a real
+post-fork parent failure, the restoration state machine including the exact
+requested-0/observed-1 reproduction, a real `prctl` cycle verified before and
+after, a real forked child proving non-inheritance, the quiescence duration
+captured at the boundary it crosses, and the delegated physical qualification of
+each.
+
+## D6. What the first delegated qualification found
+
+The first delegated run of all 303 tests executed with zero skips and failed
+two of them. Both are recorded here because a closure that hides its own failed
+qualification is the defect this milestone keeps closing. Both were closed and
+the modified worktree was then re-qualified from scratch:
+
+```text
+Ran 309 tests in 106.293s
+
+OK
+```
+
+with zero skips, zero failures, and zero errors under `Delegate=yes`,
+`TasksMax=infinity`, `ADMISSIBLE_REQUIRE_DELEGATED_CGROUP=1`.
+
+**`configured_total_ms` was 29 999, not 30 000.** The budget re-derived the
+configured total from the deadline's remaining time, so any elapsed nanosecond
+between constructing the deadline and opening the budget cost a millisecond.
+Closed by carrying the configured duration on the `Deadline` (`configured_ms`)
+and recording `remaining_at_entry_ms` separately.
+
+**A nominal delegated effect returned a `FAILED` receipt.** The cause is not in
+the four repaired paths. `cgroup_delegation()` caches a topology contradiction
+permanently and never re-bootstraps it — the accepted M2-B29 behaviour — and
+`process_supervision._DELEGATION_CACHE` and `resource_limits._TOPOLOGY` are
+module-level. The lifecycle module's injected-membership-failure test therefore
+left every later effect in the same interpreter running with `available=False`;
+on a host whose readiness promised `CGROUP_V2_AND_RLIMIT` that turns the next
+*nominal* effect into a `cgroup_membership_unverified` refusal before exec.
+
+It surfaced only now because this closure added a fourth module with a nominal
+delegated effect *after* the injecting test; the lifecycle module's own nominal
+test runs before it and was unaffected.
+
+The production behaviour is correct and is not weakened. The leak is closed in
+the tests: `guard_process_wide_cgroup_caches` restores both module-level caches
+after any test that can inject a contradiction, and the nominal delegated tests
+assert a live delegation as an explicit precondition so "this controller has no
+usable topology right now" can never again be reported as "the nominal effect
+path is broken". Every delegated receipt assertion now renders the receipt
+classification and its causal evidence, so no physical failure is opaque again.

@@ -52,6 +52,8 @@ from .process_ownership import (
     ABORT_TOTAL_DEADLINE_MS,
     CHILD_SUBREAPER,
     REAPER_NONE,
+    SUBREAPER_RESTORE_DEADLINE_MS,
+    CleanupBudget,
     Deadline,
     ProcessOwnershipEvidence,
 )
@@ -278,12 +280,18 @@ def _close_owned_descriptors(descriptors: tuple[int, ...]) -> dict[str, Any]:
     return {"closed": sorted(closed), "already_closed": sorted(already)}
 
 
-def _legacy_terminate_and_reap(process: Any, ownership: ProcessOwnershipEvidence) -> bool:
+def _legacy_terminate_and_reap(
+    process: Any, ownership: ProcessOwnershipEvidence, budget: CleanupBudget
+) -> bool:
     """Bounded kill/wait/poll for a launcher object with no ownership interface.
 
     Test stand-ins and any future launcher implementation that does not carry
     the trusted-ownership interface are still cleaned up, but the reaper is
     recorded as unidentified rather than attributed to this controller.
+
+    M2-B40.  The wait takes what is left of the whole cleanup, capped by the
+    teardown maximum.  A zero grant means one non-blocking poll, never a fresh
+    teardown timeout started after the global deadline was already spent.
     """
 
     killed = False
@@ -294,8 +302,11 @@ def _legacy_terminate_and_reap(process: Any, ownership: ProcessOwnershipEvidence
         # Already gone, or the helper no longer answers.  Reaping below still
         # decides whether anything of ours is alive.
         killed = False
+    granted = budget.grant_seconds("legacy_launcher_wait", CAPSULE_TEARDOWN_TIMEOUT_SECONDS)
     try:
-        ownership.launcher_exit_code = process.wait(timeout=CAPSULE_TEARDOWN_TIMEOUT_SECONDS)
+        if granted <= 0.0:
+            raise TimeoutError("no cleanup time remains for a blocking wait")
+        ownership.launcher_exit_code = process.wait(timeout=granted)
         ownership.launcher_reaped = True
     except Exception:
         try:
@@ -340,11 +351,25 @@ def abort_gated_effect(
     recorded as four separate facts.  An empty cgroup proves the first; it is
     never presented as proof of the other three.
 
+    M2-B40.  One absolute monotonic deadline is created here, once, and every
+    stage below receives only a capped view of what is left of it: the release
+    state, the helper RPC bypass, the cgroup kill, the pidfd exit observation,
+    the launcher and helper reaps, descriptor closure, quiescence, cgroup
+    removal, and the subreaper release.  No stage starts a fresh fixed-duration
+    wait, so the whole path costs the configured total rather than the total
+    plus whatever the later stages ask for.  Once nothing remains, each
+    remaining stage performs one non-blocking observation and the evidence
+    records which steps completed and which did not; a step that could not
+    observe its outcome is never recorded as having achieved it.
+
     It never claims the command did not run.  That claim belongs to the release
     state, which is carried through untouched and monotonically.
     """
 
-    whole = deadline or Deadline.after_ms(ABORT_TOTAL_DEADLINE_MS, "abort_gated_effect")
+    budget = CleanupBudget.open(
+        deadline, total_ms=ABORT_TOTAL_DEADLINE_MS, label="abort_gated_effect"
+    )
+    whole = budget.deadline
     # M2-B32.  The launcher's own terminal outcome, where it has one, is the
     # truth of record: the evidence layer preserves the first terminal answer
     # rather than re-deriving a possibly weaker one at cleanup time.
@@ -373,26 +398,42 @@ def abort_gated_effect(
         "descriptors": None,
         "pipes_closed": 0,
         "controller_deadline_ms": ABORT_TOTAL_DEADLINE_MS,
+        "child_subreaper_at_entry": dict(ownership.child_subreaper),
+        "subreaper_release": None,
     }
+    # The release state is decided from records this controller already holds,
+    # so it costs no time -- but it is still a stage of the bounded path and is
+    # recorded as one.
+    budget.observe("release_state")
+    budget.note("release_state", completed=True)
 
     # 1. Destroy the whole process domain.  The effect cgroup is the kill domain
     #    where one exists, so a descendant that changed session or double-forked
     #    is still reached; nothing outside this cgroup is ever signalled.  This
     #    is a local kernel mechanism and never waits on the helper.
     if cgroup is not None:
+        budget.observe("process_domain_kill")
         kill_domain = cgroup.kill_domain()
         evidence["kill_domain"] = kill_domain
         ownership.process_domain_kill_requested = True
         ownership.process_domain_kill_mechanism = kill_domain.get("mechanism")
+        budget.note("process_domain_kill", completed=not kill_domain.get("errors"))
 
     # 2. Terminate and reap the launcher, boundedly, and record who reaped it.
+    #    The helper RPC bypass, the pidfd exit observation, the launcher reap
+    #    and the helper reap all happen inside this stage, each capped by the
+    #    same instant it is given here.
     if hasattr(process, "terminate_and_reap"):
-        ownership = process.terminate_and_reap(deadline=whole, evidence=ownership)
+        launcher_deadline = budget.grant("launcher_terminate_and_reap", ABORT_TOTAL_DEADLINE_MS)
+        ownership = process.terminate_and_reap(deadline=launcher_deadline, evidence=ownership)
         evidence["launcher_killed"] = ownership.launcher_exit_observed
     else:
-        evidence["launcher_killed"] = _legacy_terminate_and_reap(process, ownership)
+        evidence["launcher_killed"] = _legacy_terminate_and_reap(process, ownership, budget)
+    budget.note("launcher_exit_observation", completed=ownership.launcher_exit_observed)
+    budget.note("launcher_reap", completed=ownership.launcher_reaped)
 
-    # 3. Close every descriptor this controller owns.
+    # 3. Close every descriptor this controller owns.  Closing does not wait.
+    budget.observe("descriptor_closure")
     evidence["descriptors"] = _close_owned_descriptors(tuple(descriptors))
     closed_pipes = 0
     for pipe in pipes:
@@ -405,16 +446,53 @@ def abort_gated_effect(
         except OSError:  # pragma: no cover - defensive
             pass
     evidence["pipes_closed"] = closed_pipes
+    budget.note("descriptor_closure", completed=True)
 
-    # 4. Wait boundedly for quiescence, then remove the cgroup we own.
+    # 4. Wait boundedly for quiescence, then remove the cgroup we own.  The
+    #    quiescence wait receives what is left of the whole, capped by its own
+    #    maximum -- never a new five seconds after the whole is spent.  At zero
+    #    it performs exactly one membership read.
     if cgroup is not None:
-        quiescence = cgroup.wait_quiescent(ABORT_QUIESCENCE_TIMEOUT_SECONDS)
+        granted_seconds = budget.grant_seconds("cgroup_quiescence", ABORT_QUIESCENCE_TIMEOUT_SECONDS)
+        quiescence = cgroup.wait_quiescent(granted_seconds)
         evidence["quiescence"] = quiescence
+        evidence["quiescence_granted_ms"] = budget.granted_ms_for("cgroup_quiescence")
         ownership.cgroup_quiescent = bool(quiescence.get("quiescent"))
+        budget.note("cgroup_quiescence", completed=ownership.cgroup_quiescent)
+        # Removal is a membership read and an rmdir.  Neither waits, and both
+        # are observations, so it runs even with nothing left and still reports
+        # only what it verified.
+        budget.observe("cgroup_removal")
         cgroup.close()
         removal = cgroup.removal_evidence()
         evidence["cgroup_removal"] = removal
         ownership.effect_cgroup_removed = bool(removal.get("removed"))
+        budget.note("cgroup_removal", completed=ownership.effect_cgroup_removed)
+
+    # 5. Release the process-wide ownership this effect's helper held.  The
+    #    cleanup is not finished while a subreaper acquisition survives the
+    #    helper that justified it.
+    subreaper_deadline = budget.grant("subreaper_release", SUBREAPER_RESTORE_DEADLINE_MS)
+    release_ownership = getattr(process, "release_owned_subreaper", None)
+    if callable(release_ownership):
+        subreaper_release = release_ownership(subreaper_deadline)
+    else:
+        subreaper_release = {
+            "performed": False,
+            "reason": "this launcher object exposes no trusted-ownership interface",
+            "result": {},
+            "deadline": subreaper_deadline.to_dict(),
+        }
+    evidence["subreaper_release"] = subreaper_release
+    released_result = subreaper_release.get("result") or {}
+    budget.note(
+        "subreaper_release",
+        completed=(
+            not subreaper_release.get("performed")
+            or bool(released_result.get("cleanup_complete"))
+        ),
+    )
+    ownership.child_subreaper = CHILD_SUBREAPER.state()
 
     # The four lifecycle questions, kept apart, plus the legacy mirrors that
     # every existing caller and test reads.  Both come from one object, so they
@@ -431,6 +509,9 @@ def abort_gated_effect(
     evidence["cgroup_quiescent"] = ownership.cgroup_quiescent
     evidence["effect_cgroup_removed"] = ownership.effect_cgroup_removed
     evidence["deadline_expirations"] = list(ownership.deadline_expirations)
+    evidence["cleanup_budget"] = budget.to_dict()
+    evidence["deadline_exhausted"] = budget.exhausted
+    evidence["cleanup_complete"] = not budget.incomplete_steps
     return evidence
 
 

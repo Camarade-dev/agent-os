@@ -1063,8 +1063,10 @@ class ValidationReportCountTests(unittest.TestCase):
             counts["m2_legacy_pre_b25"]
             + counts["m2_b25_topology_module"]
             + counts["m2_b25_final_failclosed_module"]
-            # M2-M36 added the final protocol/lifecycle module to this milestone.
-            + counts["m2_final_protocol_lifecycle_module"],
+            # M2-M36 added the final protocol/lifecycle module to this milestone,
+            # and M2-B40 added the subreaper/deadline closure module.
+            + counts["m2_final_protocol_lifecycle_module"]
+            + counts["m2_subreaper_deadline_closure_module"],
             "the legacy and new modules must account for the whole discovery total",
         )
 

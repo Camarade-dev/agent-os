@@ -53,6 +53,7 @@ from .process_ownership import (
     ABORT_TOTAL_DEADLINE_MS,
     CHILD_SUBREAPER,
     HELPER_CONTROL_RPC_DEADLINE_MS,
+    HELPER_COOPERATIVE_EXIT_DEADLINE_MS,
     HELPER_REAP_DEADLINE_MS,
     HELPER_RELEASE_ACCEPT_DEADLINE_MS,
     HELPER_RELEASE_COMPLETION_DEADLINE_MS,
@@ -66,10 +67,14 @@ from .process_ownership import (
     REAPER_TRUSTED_CONTROLLER,
     REAP_ALREADY_REAPED,
     REAP_SUBREAPER_UNAVAILABLE,
+    SUBREAPER_RESTORE_DEADLINE_MS,
+    ChildSubreaperUnavailable,
     ControllerDeadlineExpired,
     Deadline,
     ProcessOwnershipEvidence,
     ReapOutcome,
+    SubreaperReference,
+    is_addressable_pid,
     observe_process_exit,
     open_process_descriptor,
     process_is_zombie,
@@ -317,6 +322,68 @@ def _recv_framed_within(
             sock.settimeout(previous)
         except OSError:  # pragma: no cover - the socket is already gone
             pass
+
+
+def _fork() -> int:
+    """The controller's single fork primitive (M2-B37).
+
+    Every trusted process this controller creates passes through here, so
+    "acquisition failure never reaches fork()" is a property of one call site
+    that a test can assert directly rather than an ordering it has to infer.
+    """
+
+    return os.fork()
+
+
+def _roll_back_failed_start(
+    *,
+    pid: int | None,
+    sockets: tuple[Any, ...],
+    descriptors: tuple[int, ...],
+    subreaper: SubreaperReference,
+) -> dict[str, Any]:
+    """Undo a partially created helper exactly once (M2-B38).
+
+    The order is not incidental.  The forked child is destroyed and reaped
+    *first*, because releasing the subreaper acquisition while an orphan of this
+    controller is still alive would restore the flag that gives this process the
+    right to reap it.  Descriptors are closed next, and the acquisition is
+    released last -- through the handle, so a repeated rollback releases
+    nothing a second time.
+    """
+
+    evidence: dict[str, Any] = {
+        "helper_pid": pid,
+        "helper_forked": pid is not None,
+        "helper_reaped": False,
+        "helper_exit_code": None,
+        "launcher_created": False,
+        "sockets_closed": 0,
+        "descriptors_closed": 0,
+        "subreaper": {},
+    }
+    if pid is not None and is_addressable_pid(pid):
+        outcome = _kill_and_reap_owned(
+            pid, Deadline.after_ms(HELPER_REAP_DEADLINE_MS, "helper_startup_reap")
+        )
+        evidence["helper_reaped"] = outcome.reaped
+        evidence["helper_exit_code"] = outcome.exit_code
+    for sock in sockets:
+        if sock is None:
+            continue
+        try:
+            sock.close()
+            evidence["sockets_closed"] = int(evidence["sockets_closed"]) + 1
+        except OSError:  # pragma: no cover - already closed
+            pass
+    for descriptor in descriptors:
+        try:
+            os.close(descriptor)
+            evidence["descriptors_closed"] = int(evidence["descriptors_closed"]) + 1
+        except OSError:  # pragma: no cover - already closed
+            pass
+    evidence["subreaper"] = subreaper.release()
+    return evidence
 
 
 def _helper_main(sock: socket.socket, *, size: str) -> None:  # pragma: no cover - child process
@@ -838,6 +905,17 @@ class SpawnedLauncher:
     def reap_outcome(self) -> ReapOutcome | None:
         return self._reap
 
+    def release_owned_subreaper(self, deadline: Deadline | None = None) -> dict[str, Any]:
+        """Close out the ownership this effect's helper held (M2-B40).
+
+        The bounded cleanup is not finished while a process-wide flag is still
+        held for a helper the cleanup itself destroyed.  Nothing is released
+        while the helper is alive: it still owns its acquisition and its own
+        shutdown will end it.
+        """
+
+        return self._helper.release_subreaper_if_reaped(deadline=deadline)
+
     # --- helper-mediated operations, each bounded by the controller ----------
 
     def poll(self) -> int | None:
@@ -913,6 +991,7 @@ class PrivateMountHelper:
         self._reap: ReapOutcome | None = None
         self._exit_observed = False
         self._subreaper_acquired = False
+        self._subreaper: SubreaperReference | None = None
         self._subreaper_state: dict[str, Any] = {}
 
     # --- protocol health ------------------------------------------------------
@@ -977,22 +1056,54 @@ class PrivateMountHelper:
 
     @classmethod
     def start(cls, *, size: str = DEFAULT_PRIVATE_TMPFS_SIZE) -> "PrivateMountHelper":
+        """Fork the trusted helper, or create nothing at all.
+
+        M2-B37.  The subreaper acquisition is the first thing this method does
+        and the launch cannot proceed without it.  The flag must be held
+        *before* the fork so that a helper which dies at any point afterwards --
+        including before it ever creates the launcher -- leaves its orphans
+        reparented to this controller rather than to an unrelated init.  A
+        controller that could not establish it would be forking a helper whose
+        orphans it has no right to reap, so it does not fork at all: no socket
+        pair, no child, no pidfd, and no helper object exist on that path.
+
+        M2-B38.  Between the acquisition and the successful ownership transfer
+        at the end, every exit path destroys and reaps the partially created
+        child, closes every descriptor this method opened, and releases the
+        acquisition exactly once.
+        """
+
         if not hasattr(os, "unshare"):
             raise PrivateWorkspaceError("private_mountns_unavailable", "os.unshare is absent")
-        parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM | socket.SOCK_CLOEXEC)
-        # M2-B34.  The subreaper flag is acquired *before* the fork so that a
-        # helper which dies at any point after this line -- including before it
-        # ever creates the launcher -- leaves its orphans reparented to this
-        # controller rather than to an unrelated init.
-        subreaper = CHILD_SUBREAPER.acquire()
-        deadline = Deadline.after_ms(HELPER_STARTUP_DEADLINE_MS, "helper_startup")
-        pid = os.fork()
-        if pid == 0:
-            parent.close()
-            _helper_main(child, size=size)
-            os._exit(0)
-        child.close()
         try:
+            subreaper = CHILD_SUBREAPER.acquire_reference()
+        except ChildSubreaperUnavailable as error:
+            # Nothing was created, so there is nothing to clean up, and the
+            # process-wide flag is exactly as this call found it.
+            raise PrivateWorkspaceError(
+                "private_mountns_subreaper_unavailable",
+                f"{error.code}: {error.detail}; no helper was forked and no launcher exists",
+            ) from error
+        parent: socket.socket | None = None
+        child: socket.socket | None = None
+        pid: int | None = None
+        received_fds: list[int] = []
+        try:
+            parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM | socket.SOCK_CLOEXEC)
+            deadline = Deadline.after_ms(HELPER_STARTUP_DEADLINE_MS, "helper_startup")
+            pid = _fork()
+            if pid == 0:  # pragma: no cover - child process
+                # The child never runs the parent's rollback: the flag is not
+                # inherited, pid 0 is not an addressable process, and an
+                # exception here must not let helper code escape into the
+                # controller's own failure path.
+                try:
+                    parent.close()
+                    _helper_main(child, size=size)
+                finally:
+                    os._exit(0)
+            child.close()
+            child = None
             parent.settimeout(max(deadline.remaining_seconds, 0.001))
             ready = parent.recv(5)
             if ready != b"READY":
@@ -1013,28 +1124,38 @@ class PrivateMountHelper:
                 detail = msg.decode("utf-8", "replace")
                 raise PrivateWorkspaceError("private_mountns_tmpfs_failed", detail)
             staging = msg[4:].decode("utf-8")
-            fds: list[int] = []
             for level, typ, data in anc:
                 if level == socket.SOL_SOCKET and typ == socket.SCM_RIGHTS:
-                    fds.extend(array.array("i", data).tolist())
-            if not fds:
+                    received_fds.extend(array.array("i", data).tolist())
+            if not received_fds:
                 raise PrivateWorkspaceError("private_mountns_tmpfs_failed", "missing-fd")
             parent.settimeout(None)
-            helper = cls(pid, parent, fds[0], staging)
+            helper = cls(pid, parent, received_fds[0], staging)
+            # Ownership of the acquisition, the socket, and the view descriptor
+            # transfers to the helper object here.  Past this line the rollback
+            # below is not reachable, and helper.close() owns the release.
+            helper._subreaper = subreaper
             helper._subreaper_acquired = True
-            helper._subreaper_state = subreaper
+            helper._subreaper_state = subreaper.state
             return helper
-        except TimeoutError as error:
-            parent.close()
-            _kill_and_reap_owned(pid, Deadline.after_ms(HELPER_REAP_DEADLINE_MS, "helper_startup_reap"))
-            CHILD_SUBREAPER.release()
-            raise HelperDeadlineExpired(
-                "helper_startup", f"the trusted helper did not become ready: {error}"
-            ) from error
-        except BaseException:
-            parent.close()
-            _kill_and_reap_owned(pid, Deadline.after_ms(HELPER_REAP_DEADLINE_MS, "helper_startup_reap"))
-            CHILD_SUBREAPER.release()
+        except BaseException as error:
+            rollback = _roll_back_failed_start(
+                pid=pid, sockets=(parent, child), descriptors=tuple(received_fds), subreaper=subreaper
+            )
+            if isinstance(error, TimeoutError):
+                raise HelperDeadlineExpired(
+                    "helper_startup",
+                    f"the trusted helper did not become ready: {error}; rollback={rollback}",
+                ) from error
+            if isinstance(error, OSError) and not isinstance(error, PrivateWorkspaceError):
+                # fork(), socketpair() and the /proc map writes all fail as
+                # OSError.  They are classified rather than allowed to escape
+                # raw, so every caller has one refusal type for "the helper was
+                # never created".
+                raise PrivateWorkspaceError(
+                    "private_mountns_helper_start_failed",
+                    f"{errno.errorcode.get(error.errno, error.errno)}: {error}; rollback={rollback}",
+                ) from error
             raise
 
     def spawn(
@@ -1198,6 +1319,60 @@ class PrivateMountHelper:
         if not reply.get("ok"):
             raise PrivateWorkspaceError("private_mountns_kill_failed", str(reply.get("error")))
 
+    def _release_subreaper(self) -> dict[str, Any]:
+        """Release this helper's acquisition once, whoever asks first.
+
+        ``close`` and the bounded abort path both reach this; the first one
+        releases and every later one reports that release rather than
+        performing a second (M2-B38, M2-B39).
+        """
+
+        if not self._subreaper_acquired:
+            return dict(self._subreaper_state)
+        self._subreaper_acquired = False
+        reference = self._subreaper
+        self._subreaper = None
+        self._subreaper_state = reference.release() if reference is not None else CHILD_SUBREAPER.release()
+        return dict(self._subreaper_state)
+
+    def release_subreaper_if_reaped(self, *, deadline: Deadline | None = None) -> dict[str, Any]:
+        """Release ownership for a helper this controller has already reaped.
+
+        M2-B40.  When the bounded abort path takes the helper over -- kills it
+        and reaps it -- that helper will never run its own shutdown, so the
+        process-wide acquisition justified by its lifetime would outlive every
+        process that justified it.  Releasing it belongs to the same bounded
+        cleanup.
+
+        ``prctl`` does not block, so the deadline bounds the *ledger entry* for
+        this stage rather than a wait: an exhausted budget still performs the
+        restoration, because refusing to restore a process-wide flag would leave
+        a worse residual than performing one non-blocking pair of syscalls.  The
+        restoration is still only *claimed* from its readback.
+        """
+
+        bound = deadline or Deadline.after_ms(SUBREAPER_RESTORE_DEADLINE_MS, "subreaper_release")
+        if not self._subreaper_acquired:
+            return {
+                "performed": False,
+                "reason": "this helper holds no acquisition to release",
+                "result": dict(self._subreaper_state),
+                "deadline": bound.to_dict(),
+            }
+        if not self._reaped:
+            return {
+                "performed": False,
+                "reason": "the helper is alive and still owns its acquisition",
+                "result": dict(self._subreaper_state),
+                "deadline": bound.to_dict(),
+            }
+        return {
+            "performed": True,
+            "reason": "the trusted controller reaped this helper, so its acquisition ends here",
+            "result": self._release_subreaper(),
+            "deadline": bound.to_dict(),
+        }
+
     def terminate_and_reap(self, *, deadline: Deadline | None = None) -> dict[str, Any]:
         """Kill and reap the helper this controller forked, boundedly.
 
@@ -1238,12 +1413,16 @@ class PrivateMountHelper:
         state["reap"] = outcome
         return state
 
-    def close(self) -> dict[str, Any]:
-        """Shut the helper down within a controller-owned deadline.
+    def close(self, *, deadline: Deadline | None = None) -> dict[str, Any]:
+        """Shut the helper down within one controller-owned deadline.
 
-        Every step is bounded.  A helper that does not answer the shutdown
-        request, or does not exit after it, is killed and reaped by the
-        controller rather than waited on forever.
+        M2-B40.  Every step spends the *same* instant.  The cooperative steps --
+        the shutdown exchange and the wait for a voluntary exit -- share a
+        bounded *prefix* of it, and the forced kill-and-reap takes what is left,
+        so the shutdown cannot cost a cooperative deadline plus a fresh reap
+        deadline after it and the cooperative steps cannot spend the guarantee.
+        A caller inside a larger bounded cleanup passes its own remaining time,
+        and this shutdown cannot outlive it.
         """
 
         if self._closed:
@@ -1254,12 +1433,16 @@ class PrivateMountHelper:
                 "subreaper": dict(self._subreaper_state),
             }
         self._closed = True
-        deadline = Deadline.after_ms(HELPER_SHUTDOWN_DEADLINE_MS, "helper_shutdown")
+        whole = deadline or Deadline.after_ms(HELPER_SHUTDOWN_DEADLINE_MS, "helper_shutdown")
+        # The cooperative prefix.  A helper that will not answer, or will not
+        # exit, spends only this much of the whole; the rest belongs to the
+        # kill-and-reap that does not depend on it.
+        cooperative = whole.sub(HELPER_COOPERATIVE_EXIT_DEADLINE_MS, "helper_cooperative_exit")
         graceful = False
         if not self._protocol_broken:
             try:
-                _send_framed_within(self.conn, {"op": "exit"}, (), deadline, "shutdown")
-                _recv_framed_within(self.conn, deadline, "shutdown")
+                _send_framed_within(self.conn, {"op": "exit"}, (), cooperative, "shutdown")
+                _recv_framed_within(self.conn, cooperative, "shutdown")
                 graceful = True
             except Exception:
                 graceful = False
@@ -1272,22 +1455,23 @@ class PrivateMountHelper:
         except OSError:  # pragma: no cover - already closed
             pass
         if not self._reaped:
-            outcome = reap_owned_child(self.pid, deadline, role=REAPER_TRUSTED_CONTROLLER)
+            # Still the cooperative prefix, so the forced path below always has
+            # what is left of the same bound.
+            outcome = reap_owned_child(self.pid, cooperative, role=REAPER_TRUSTED_CONTROLLER)
             if not outcome.reaped:
-                # It did not exit on request within the deadline.  It is this
-                # controller's child, so it is killed and reaped here.
+                # It did not exit on request within its share of the deadline.
+                # It is this controller's child, so it is killed and reaped
+                # here, within what remains of the same instant.
                 signal_process(self.pid, signal.SIGKILL)
                 outcome = reap_owned_child(
                     self.pid,
-                    Deadline.after_ms(HELPER_REAP_DEADLINE_MS, "helper_forced_reap"),
+                    whole.sub(HELPER_REAP_DEADLINE_MS, "helper_forced_reap"),
                     role=REAPER_TRUSTED_CONTROLLER,
                 )
             self._reap = outcome
             self._reaped = outcome.reaped
             self._exit_observed = self._exit_observed or outcome.reaped
-        if self._subreaper_acquired:
-            self._subreaper_acquired = False
-            self._subreaper_state = CHILD_SUBREAPER.release()
+        self._release_subreaper()
         return {
             "helper_pid": self.pid,
             "already_closed": False,
@@ -1297,6 +1481,7 @@ class PrivateMountHelper:
             "reaper_role": REAPER_NONE if self._reap is None else self._reap.reaper_role,
             "reaper_pid": None if self._reap is None else self._reap.reaper_pid,
             "subreaper": dict(self._subreaper_state),
+            "deadline": whole.to_dict(),
         }
 
 
