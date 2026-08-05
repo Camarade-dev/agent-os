@@ -46,6 +46,14 @@ from .cgroup_launch import (
     RELEASE_OUTCOME_UNKNOWN,
     RELEASE_PHASE_WRITE_NOT_ATTEMPTED,
     attach_and_verify_real,
+    monotonic_release_truth,
+)
+from .process_ownership import (
+    ABORT_TOTAL_DEADLINE_MS,
+    CHILD_SUBREAPER,
+    REAPER_NONE,
+    Deadline,
+    ProcessOwnershipEvidence,
 )
 from .resource_limits import (
     MECHANISM_CGROUP_AND_RLIMIT,
@@ -270,6 +278,40 @@ def _close_owned_descriptors(descriptors: tuple[int, ...]) -> dict[str, Any]:
     return {"closed": sorted(closed), "already_closed": sorted(already)}
 
 
+def _legacy_terminate_and_reap(process: Any, ownership: ProcessOwnershipEvidence) -> bool:
+    """Bounded kill/wait/poll for a launcher object with no ownership interface.
+
+    Test stand-ins and any future launcher implementation that does not carry
+    the trusted-ownership interface are still cleaned up, but the reaper is
+    recorded as unidentified rather than attributed to this controller.
+    """
+
+    killed = False
+    try:
+        process.kill()
+        killed = True
+    except Exception:
+        # Already gone, or the helper no longer answers.  Reaping below still
+        # decides whether anything of ours is alive.
+        killed = False
+    try:
+        ownership.launcher_exit_code = process.wait(timeout=CAPSULE_TEARDOWN_TIMEOUT_SECONDS)
+        ownership.launcher_reaped = True
+    except Exception:
+        try:
+            ownership.launcher_exit_code = process.poll()
+            ownership.launcher_reaped = ownership.launcher_exit_code is not None
+        except Exception:
+            ownership.launcher_reaped = False
+    ownership.launcher_exit_observed = ownership.launcher_reaped
+    ownership.launcher_reaper_role = REAPER_NONE
+    ownership.launcher_reap_detail = (
+        "this launcher object exposes no trusted-ownership interface, so no reaper identity is "
+        "claimed for it"
+    )
+    return killed
+
+
 def abort_gated_effect(
     *,
     process: Any,
@@ -278,6 +320,7 @@ def abort_gated_effect(
     pipes: tuple[Any, ...] = (),
     release_outcome: GateReleaseOutcome | None,
     reason: str,
+    deadline: Deadline | None = None,
 ) -> dict[str, Any]:
     """Fail one gated effect closed, boundedly, and record what was true.
 
@@ -287,15 +330,40 @@ def abort_gated_effect(
     or already-removed resources performs no further destruction and reports the
     same disposition rather than a second success.
 
+    M2-B33.  The whole path is bounded by one absolute monotonic deadline this
+    controller owns, and every helper round trip inside it is bounded by a
+    nested deadline that cannot outlive it.  A helper that is alive but wedged
+    is bypassed rather than waited on: the local cgroup kill, the local signal,
+    the local reap, and the local cgroup removal all proceed.
+
+    M2-B34.  Termination, exit observation, reap, and reaper identity are
+    recorded as four separate facts.  An empty cgroup proves the first; it is
+    never presented as proof of the other three.
+
     It never claims the command did not run.  That claim belongs to the release
-    state, which is carried through untouched.
+    state, which is carried through untouched and monotonically.
     """
 
+    whole = deadline or Deadline.after_ms(ABORT_TOTAL_DEADLINE_MS, "abort_gated_effect")
+    # M2-B32.  The launcher's own terminal outcome, where it has one, is the
+    # truth of record: the evidence layer preserves the first terminal answer
+    # rather than re-deriving a possibly weaker one at cleanup time.
+    recorded = getattr(process, "release_outcome", None)
+    if not isinstance(recorded, GateReleaseOutcome):
+        recorded = None
+    truth = monotonic_release_truth(
+        recorded,
+        release_outcome
+        or GateReleaseOutcome(
+            RELEASE_NOT_RELEASED, RELEASE_PHASE_WRITE_NOT_ATTEMPTED, "the gate was never reached"
+        ),
+    )
+
+    ownership = ProcessOwnershipEvidence()
+    ownership.child_subreaper = CHILD_SUBREAPER.state()
     evidence: dict[str, Any] = {
         "reason": reason,
-        "release": (release_outcome or GateReleaseOutcome(
-            RELEASE_NOT_RELEASED, RELEASE_PHASE_WRITE_NOT_ATTEMPTED, "the gate was never reached"
-        )).to_dict(),
+        "release": truth.to_dict(),
         "kill_domain": None,
         "launcher_killed": False,
         "launcher_reaped": False,
@@ -304,31 +372,25 @@ def abort_gated_effect(
         "cgroup_removal": None,
         "descriptors": None,
         "pipes_closed": 0,
+        "controller_deadline_ms": ABORT_TOTAL_DEADLINE_MS,
     }
 
     # 1. Destroy the whole process domain.  The effect cgroup is the kill domain
     #    where one exists, so a descendant that changed session or double-forked
-    #    is still reached; nothing outside this cgroup is ever signalled.
+    #    is still reached; nothing outside this cgroup is ever signalled.  This
+    #    is a local kernel mechanism and never waits on the helper.
     if cgroup is not None:
-        evidence["kill_domain"] = cgroup.kill_domain()
-    try:
-        process.kill()
-        evidence["launcher_killed"] = True
-    except Exception:
-        # Already gone, or the helper no longer answers.  Reaping below still
-        # decides whether anything of ours is alive.
-        evidence["launcher_killed"] = False
+        kill_domain = cgroup.kill_domain()
+        evidence["kill_domain"] = kill_domain
+        ownership.process_domain_kill_requested = True
+        ownership.process_domain_kill_mechanism = kill_domain.get("mechanism")
 
-    # 2. Reap the launcher we own.
-    try:
-        evidence["launcher_exit_code"] = process.wait(timeout=CAPSULE_TEARDOWN_TIMEOUT_SECONDS)
-        evidence["launcher_reaped"] = True
-    except Exception:
-        try:
-            evidence["launcher_exit_code"] = process.poll()
-            evidence["launcher_reaped"] = evidence["launcher_exit_code"] is not None
-        except Exception:
-            evidence["launcher_reaped"] = False
+    # 2. Terminate and reap the launcher, boundedly, and record who reaped it.
+    if hasattr(process, "terminate_and_reap"):
+        ownership = process.terminate_and_reap(deadline=whole, evidence=ownership)
+        evidence["launcher_killed"] = ownership.launcher_exit_observed
+    else:
+        evidence["launcher_killed"] = _legacy_terminate_and_reap(process, ownership)
 
     # 3. Close every descriptor this controller owns.
     evidence["descriptors"] = _close_owned_descriptors(tuple(descriptors))
@@ -346,9 +408,29 @@ def abort_gated_effect(
 
     # 4. Wait boundedly for quiescence, then remove the cgroup we own.
     if cgroup is not None:
-        evidence["quiescence"] = cgroup.wait_quiescent(ABORT_QUIESCENCE_TIMEOUT_SECONDS)
+        quiescence = cgroup.wait_quiescent(ABORT_QUIESCENCE_TIMEOUT_SECONDS)
+        evidence["quiescence"] = quiescence
+        ownership.cgroup_quiescent = bool(quiescence.get("quiescent"))
         cgroup.close()
-        evidence["cgroup_removal"] = cgroup.removal_evidence()
+        removal = cgroup.removal_evidence()
+        evidence["cgroup_removal"] = removal
+        ownership.effect_cgroup_removed = bool(removal.get("removed"))
+
+    # The four lifecycle questions, kept apart, plus the legacy mirrors that
+    # every existing caller and test reads.  Both come from one object, so they
+    # cannot disagree.
+    evidence["launcher_reaped"] = ownership.launcher_reaped
+    evidence["launcher_exit_code"] = ownership.launcher_exit_code
+    evidence["process_ownership"] = ownership.to_dict()
+    evidence["process_domain_kill_requested"] = ownership.process_domain_kill_requested
+    evidence["launcher_exit_observed"] = ownership.launcher_exit_observed
+    evidence["launcher_reaper_role"] = ownership.launcher_reaper_role
+    evidence["launcher_reaper_pid"] = ownership.launcher_reaper_pid
+    evidence["helper_exit_observed"] = ownership.helper_exit_observed
+    evidence["helper_reaped"] = ownership.helper_reaped
+    evidence["cgroup_quiescent"] = ownership.cgroup_quiescent
+    evidence["effect_cgroup_removed"] = ownership.effect_cgroup_removed
+    evidence["deadline_expirations"] = list(ownership.deadline_expirations)
     return evidence
 
 
@@ -381,7 +463,14 @@ def _containment_evidence(status: dict[str, Any] | None, mechanism: str, cgroup:
         # the controller asked for.
         described += [f"cgroup.{name}={value}" for name, value in sorted(cgroup.applied.items())]
         described.append(f"cgroup.effect_path={cgroup.path}")
-        described.append(f"cgroup.membership_verified={sorted(cgroup.members())}")
+        # M2-B35.  The membership that goes into durable evidence is the typed
+        # observation.  A read that failed is named as a failed read, never
+        # rendered as the empty list a reader would take for a clean exit.
+        membership = cgroup.read_members()
+        if membership.usable:
+            described.append(f"cgroup.membership_verified={list(membership.pids)}")
+        else:
+            described.append(f"cgroup.membership_read_refused={membership.refusal_detail()}")
     return {
         "containment_mechanism": mechanism,
         "containment_availability": "OBSERVED",
@@ -775,12 +864,20 @@ def supervise_command(
                 pass
 
     # Reap the launcher.  Its exit is the controller-side proof that the private
-    # PID namespace no longer exists.
+    # PID namespace no longer exists.  M2-B33: even here the wait is bounded by
+    # the controller, and a helper that can no longer answer is bypassed for the
+    # controller-owned kill-and-reap rather than waited on again.
     try:
         launcher_returncode = process.wait(timeout=CAPSULE_TEARDOWN_TIMEOUT_SECONDS)
     except TimeoutError:  # pragma: no cover - defensive
-        process.kill()
-        launcher_returncode = process.wait()
+        if hasattr(process, "terminate_and_reap"):
+            owned = process.terminate_and_reap(
+                deadline=Deadline.after_ms(ABORT_TOTAL_DEADLINE_MS, "supervise_final_reap")
+            )
+            launcher_returncode = owned.launcher_exit_code
+        else:
+            process.kill()
+            launcher_returncode = process.wait(timeout=CAPSULE_TEARDOWN_TIMEOUT_SECONDS)
 
     status = parse_capsule_status(bytes(status_bytes))
     end_wall, end_monotonic = _now()
@@ -934,6 +1031,7 @@ def controller_memory_bound(max_output_bytes: int) -> int:
 
 __all__ = [
     "ABORT_QUIESCENCE_TIMEOUT_SECONDS",
+    "ABORT_TOTAL_DEADLINE_MS",
     "CONTROLLER_FIXED_OVERHEAD_BYTES",
     "CancellationToken",
     "GRACE_PERIOD_MS",

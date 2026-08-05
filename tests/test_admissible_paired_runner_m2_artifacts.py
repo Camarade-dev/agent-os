@@ -32,6 +32,8 @@ M2_STARTING_COMMIT = "096dfbeb8845aaeda4c24f19e13fd144ceea4bfb"
 M2_SECOND_STARTING_COMMIT = "6383f765520e3d98c7359118704d063b6aa39b52"
 M2_THIRD_STARTING_COMMIT = "68dd7c9a6be66319dc93eeedcec2e994a6119585"
 M2_FOURTH_STARTING_COMMIT = "1133d131c75ed07e79d949b6b3f2f40847a3218b"
+M2_FINAL_LIFECYCLE_STARTING_COMMIT = "fbadaeec4205c9b24aeaeaac6c73ca1e6e69a4ff"
+M2_FINAL_LIFECYCLE_BRANCH = "paired-runner/m2-final-protocol-lifecycle-repair"
 M2_SECOND_BRANCH = "paired-runner/m2-causal-index-and-ipc-repairs"
 M2_THIRD_BRANCH = "paired-runner/m2-private-workspace-and-bound-runtime"
 M2_FOURTH_BRANCH = "paired-runner/m2-fourth-critical-repair-retry"
@@ -40,10 +42,12 @@ M2_ARTIFACTS = (
     "M2_CRASH_MATRIX.json",
     "M2_OUTPUT_SOAK_REPORT.json",
     "M2_VALIDATION_REPORT.json",
+    "M2_VALIDATION_REPORT_HISTORICAL_FOURTH_REPAIR.json",
     "M2_CRITICAL_REPAIR_REPORT.json",
     "M2_SECOND_CRITICAL_REPAIR_REPORT.json",
     "M2_THIRD_CRITICAL_REPAIR_REPORT.json",
     "M2_FOURTH_CRITICAL_REPAIR_REPORT.json",
+    "M2_FINAL_PROTOCOL_LIFECYCLE_REPAIR_REPORT.json",
 )
 #: Historical reports of earlier passes.  A later pass may not rewrite them: the
 #: record of what an earlier closure claimed is itself evidence.
@@ -51,6 +55,9 @@ PRESERVED_HISTORICAL_ARTIFACTS = (
     "M2_CRITICAL_REPAIR_REPORT.json",
     "M2_SECOND_CRITICAL_REPAIR_REPORT.json",
     "M2_THIRD_CRITICAL_REPAIR_REPORT.json",
+    "M2_FOURTH_CRITICAL_REPAIR_REPORT.json",
+    "M2_B25_CGROUP_TOPOLOGY_REPAIR_REPORT.json",
+    "M2_B25_FINAL_FAILCLOSED_REPAIR_REPORT.json",
 )
 PRESERVED_M1_ARTIFACTS = (
     "M1_SCHEMA_CATALOG.json",
@@ -120,11 +127,18 @@ class M2ArtifactTests(unittest.TestCase):
 
     def test_the_validation_report_records_the_exact_counts_and_verdict(self) -> None:
         report = parse_canonical_json((IMPLEMENTATION / "M2_VALIDATION_REPORT.json").read_bytes())
-        self.assertEqual(report["starting_commit"], M2_FOURTH_STARTING_COMMIT)
-        self.assertEqual(report["branch"], M2_FOURTH_BRANCH)
-        self.assertEqual(report["terminal_verdict"], "M2_FOURTH_CRITICAL_REPAIRS_REFUSED")
-        self.assertEqual(report["crash_point_count"], 25)
-        self.assertEqual(report["corruption_fixture_count"], 24)
+        # M2-M36: the canonical filename is the single *current* report, and the
+        # superseded fourth-repair bytes live under a historical filename.
+        self.assertTrue(report["is_current_validation_report"])
+        self.assertEqual(report["starting_commit"], M2_FINAL_LIFECYCLE_STARTING_COMMIT)
+        self.assertEqual(report["branch"], M2_FINAL_LIFECYCLE_BRANCH)
+        self.assertIn(
+            report["terminal_verdict"],
+            {
+                "M2_FINAL_PROTOCOL_LIFECYCLE_REPAIR_VERIFIED",
+                "M2_FINAL_PROTOCOL_LIFECYCLE_OPERATOR_QUALIFICATION_REQUIRED",
+            },
+        )
         self.assertFalse(report["boundary_audit"]["milestone_3_started"])
         for boundary, crossed in report["boundary_audit"].items():
             self.assertFalse(crossed, boundary)
@@ -137,7 +151,10 @@ class M2ArtifactTests(unittest.TestCase):
         )
         self.assertGreaterEqual(report["test_counts"]["total"], 305)
         self.assertTrue(report["known_limitations"])
-        self.assertEqual(report["fourth_repair_report"], "implementation/M2_FOURTH_CRITICAL_REPAIR_REPORT.json")
+        self.assertEqual(
+            report["final_repair_report"],
+            "implementation/M2_FINAL_PROTOCOL_LIFECYCLE_REPAIR_REPORT.json",
+        )
 
     def test_the_repair_report_closes_every_audit_finding(self) -> None:
         report = parse_canonical_json((IMPLEMENTATION / "M2_CRITICAL_REPAIR_REPORT.json").read_bytes())
@@ -251,6 +268,7 @@ class M2ArtifactTests(unittest.TestCase):
                 "identities.py",
                 "observation.py",
                 "private_workspace.py",
+                "process_ownership.py",
                 "process_supervision.py",
                 "reconciliation.py",
                 "resource_limits.py",

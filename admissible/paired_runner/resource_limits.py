@@ -222,6 +222,10 @@ TOPOLOGY_PROBE_NOT_EMPTY = "PROBE_NOT_EMPTY"
 TOPOLOGY_PROBE_CLEANUP_FAILED = "PROBE_CLEANUP_FAILED"
 TOPOLOGY_PROBE_RESIDUAL_PATH = "PROBE_RESIDUAL_PATH"
 TOPOLOGY_PROBE_DISAPPEARED = "PROBE_DISAPPEARED"
+#: M2-B35 -- a membership read that failed is never an observation of emptiness.
+TOPOLOGY_MEMBERSHIP_UNREADABLE = "CGROUP_MEMBERSHIP_UNREADABLE"
+TOPOLOGY_MEMBERSHIP_MALFORMED = "CGROUP_MEMBERSHIP_MALFORMED"
+TOPOLOGY_PROBE_MEMBERSHIP_UNREADABLE = "PROBE_MEMBERSHIP_UNREADABLE"
 
 TOPOLOGY_CODES = (
     TOPOLOGY_INITIALIZED,
@@ -250,7 +254,14 @@ TOPOLOGY_CODES = (
     TOPOLOGY_PROBE_CLEANUP_FAILED,
     TOPOLOGY_PROBE_RESIDUAL_PATH,
     TOPOLOGY_PROBE_DISAPPEARED,
+    TOPOLOGY_MEMBERSHIP_UNREADABLE,
+    TOPOLOGY_MEMBERSHIP_MALFORMED,
+    TOPOLOGY_PROBE_MEMBERSHIP_UNREADABLE,
 )
+
+
+def _membership_code(membership: "CgroupMembership") -> str:
+    return TOPOLOGY_MEMBERSHIP_MALFORMED if membership.malformed else TOPOLOGY_MEMBERSHIP_UNREADABLE
 
 
 class _Statfs(ctypes.Structure):
@@ -341,11 +352,135 @@ def _write_control(path: Path, payload: str) -> str | None:
     return None
 
 
-def _members_of(cgroup: Path) -> set[int]:
-    raw, _ = _read_control(cgroup / "cgroup.procs")
+# --- M2-B35: membership is a typed observation, never a bare set --------------
+#
+# ``_members_of`` used to map an unreadable ``cgroup.procs`` to ``set()``.  That
+# made two opposite facts identical: "the kernel says this cgroup is empty" and
+# "this controller could not read this cgroup at all".  Every security-relevant
+# decision downstream -- is the delegated parent depopulated, did the controller
+# land in its manager leaf, is the probe safe to remove, is the effect cgroup
+# empty before attach, did the launcher actually join it, is the domain
+# quiescent, may this cgroup be removed -- is a decision about emptiness, and
+# each of them silently accepted a failed read as a positive answer.
+#
+# The typed result below carries the read outcome, the parsed PIDs, the exact
+# path, the errno classification, and any malformed content, so a caller must
+# say which of the two facts it is acting on.
+
+
+class CgroupMembershipUnreadable(RuntimeError):
+    """A cgroup membership read failed and no emptiness may be inferred."""
+
+    def __init__(self, membership: "CgroupMembership") -> None:
+        super().__init__(membership.refusal_detail())
+        self.membership = membership
+
+
+@dataclass(frozen=True)
+class CgroupMembership:
+    """One observation of one ``cgroup.procs`` file.
+
+    ``opaque_member_count`` deserves its own field.  The kernel renders each
+    member in the *reader's* PID namespace and prints ``0`` for a member that
+    namespace cannot name.  A ``0`` is therefore neither a PID nor noise: it is
+    a live member this controller may not address.  Folding it into ``pids``
+    would invent a process; discarding it would report a populated cgroup as
+    empty.  It is counted separately and it defeats emptiness.
+    """
+
+    path: str
+    read_ok: bool
+    pids: tuple[int, ...] = ()
+    error_code: str | None = None
+    malformed: bool = False
+    malformed_detail: str = ""
+    opaque_member_count: int = 0
+
+    @property
+    def usable(self) -> bool:
+        """Whether this observation may be used to decide anything at all."""
+
+        return self.read_ok and not self.malformed
+
+    @property
+    def observed_empty(self) -> bool:
+        """Whether the kernel positively reported no members of any kind."""
+
+        return self.usable and not self.pids and not self.opaque_member_count
+
+    @property
+    def observed_populated(self) -> bool:
+        return self.usable and bool(self.pids or self.opaque_member_count)
+
+    @property
+    def fully_addressable(self) -> bool:
+        """Whether every member can be named, and therefore signalled, here."""
+
+        return self.usable and self.opaque_member_count == 0
+
+    def contains(self, pid: int) -> bool:
+        return self.usable and pid in self.pids
+
+    def refusal_detail(self) -> str:
+        if self.malformed:
+            return f"{self.path}/cgroup.procs holds unparseable content: {self.malformed_detail}"
+        if not self.read_ok:
+            return f"{self.path}/cgroup.procs is unreadable: {self.error_code}"
+        if self.opaque_member_count:
+            return (
+                f"{self.path}/cgroup.procs lists {self.opaque_member_count} member(s) that this "
+                "PID namespace cannot name"
+            )
+        return ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "path": self.path,
+            "read_ok": self.read_ok,
+            "pids": list(self.pids),
+            "error_code": self.error_code,
+            "malformed": self.malformed,
+            "malformed_detail": self.malformed_detail,
+            "opaque_member_count": self.opaque_member_count,
+            "usable": self.usable,
+            "observed_empty": self.observed_empty,
+            "fully_addressable": self.fully_addressable,
+        }
+
+
+def read_cgroup_members(cgroup: Path | str) -> CgroupMembership:
+    """Read one ``cgroup.procs`` and report what was actually observed.
+
+    An unreadable file and a readable file holding content that is not a list of
+    decimal PIDs are both refusals.  Neither is ever an empty set.
+    """
+
+    path = Path(cgroup)
+    raw, error = _read_control(path / "cgroup.procs")
     if raw is None:
-        return set()
-    return {int(token) for token in raw.split() if token.isdigit()}
+        return CgroupMembership(str(path), read_ok=False, error_code=error)
+    pids: list[int] = []
+    opaque = 0
+    rejected: list[str] = []
+    for token in raw.split():
+        if not token.isdigit():
+            rejected.append(token[:32])
+        elif int(token) > 0:
+            pids.append(int(token))
+        else:
+            opaque += 1
+    if rejected:
+        return CgroupMembership(
+            str(path),
+            read_ok=True,
+            pids=tuple(sorted(pids)),
+            malformed=True,
+            malformed_detail=f"unparseable tokens {sorted(rejected)}",
+            opaque_member_count=opaque,
+        )
+    return CgroupMembership(
+        str(path), read_ok=True, pids=tuple(sorted(pids)), opaque_member_count=opaque
+    )
 
 
 def _enabled_controllers(cgroup: Path) -> tuple[tuple[str, ...] | None, str | None]:
@@ -529,8 +664,13 @@ def _topology_is_still_true(topology: CgroupTopology) -> str | None:
     if manager.parent != parent:
         return f"the manager leaf {manager} is no longer a child of {parent}"
 
-    members = _members_of(manager)
-    if os.getpid() not in members:
+    members = read_cgroup_members(manager)
+    if not members.usable:
+        # M2-B35.  "I could not read the manager leaf" is not "the controller is
+        # in the manager leaf", and it is not "the controller is not".  It is a
+        # refusal to reuse a cached promise that can no longer be checked.
+        return members.refusal_detail()
+    if os.getpid() not in members.pids:
         return f"the controller is no longer a member of {manager}"
 
     if topology.cgroup2_required:
@@ -547,11 +687,21 @@ def _topology_is_still_true(topology: CgroupTopology) -> str | None:
         if current != expected:
             return f"the controller unified cgroup is now {current}, not {expected}"
 
-    residual = _members_of(parent)
-    if residual:
+    residual = read_cgroup_members(parent)
+    if not residual.usable:
+        # The reproduction the audit asks for: ``parent/cgroup.procs -> EACCES``
+        # must refuse.  Parent depopulation is the whole basis of the delegated
+        # topology, so a parent whose membership cannot be read invalidates the
+        # cached promise rather than passing as empty.
+        return residual.refusal_detail()
+    if residual.observed_populated:
         # A populated parent cannot distribute controllers; the promise is dead
-        # whether or not the subtree_control file still reads back.
-        return f"the delegated effect parent {parent} now holds {sorted(residual)}"
+        # whether or not the subtree_control file still reads back.  A member
+        # this PID namespace cannot name still populates the parent.
+        return (
+            f"the delegated effect parent {parent} now holds {list(residual.pids)}"
+            + (f" plus {residual.opaque_member_count} unnameable member(s)" if residual.opaque_member_count else "")
+        )
 
     raw_controllers, control_error = _read_control(parent / "cgroup.controllers")
     if raw_controllers is None:
@@ -739,7 +889,10 @@ def _bootstrap_topology(
         # it is not safe the leaf is left in place and reported, never hidden.
         moved_back = _write_control(parent / "cgroup.procs", str(pid)) is None
         removed = False
-        if not _members_of(manager):
+        # M2-B35.  A cgroup is removed only when its emptiness was observed.
+        # An unreadable membership leaves the leaf in place and says so.
+        leaf_members = read_cgroup_members(manager)
+        if leaf_members.observed_empty:
             try:
                 manager.rmdir()
                 removed = True
@@ -747,7 +900,10 @@ def _bootstrap_topology(
                 removed = False
         return _failed(
             code,
-            f"{detail}; rollback: controller_returned={moved_back} manager_leaf_removed={removed}",
+            (
+                f"{detail}; rollback: controller_returned={moved_back} manager_leaf_removed={removed}"
+                + ("" if leaf_members.usable else f" ({leaf_members.refusal_detail()})")
+            ),
             manager_leaf=str(manager),
             **common,
         )
@@ -756,7 +912,10 @@ def _bootstrap_topology(
     if move_error is not None:
         return _rollback(TOPOLOGY_CONTROLLER_MOVE_FAILED, f"{manager}/cgroup.procs: {move_error}")
 
-    if pid not in _members_of(manager):
+    manager_members = read_cgroup_members(manager)
+    if not manager_members.usable:
+        return _rollback(_membership_code(manager_members), manager_members.refusal_detail())
+    if pid not in manager_members.pids:
         return _rollback(
             TOPOLOGY_CONTROLLER_MOVE_NOT_OBSERVED,
             f"{pid} is not a member of {manager} after the move",
@@ -769,7 +928,18 @@ def _bootstrap_topology(
                 f"/proc/self/cgroup reports {observed}, not {manager.name}",
             )
 
-    remaining = _members_of(parent) - {pid}
+    parent_members = read_cgroup_members(parent)
+    if not parent_members.usable:
+        # M2-B35.  Positive readiness requires the parent to have been *observed*
+        # unpopulated.  A failed read is refused rather than counted as empty.
+        return _rollback(_membership_code(parent_members), parent_members.refusal_detail())
+    if parent_members.opaque_member_count:
+        return _rollback(
+            TOPOLOGY_PARENT_STILL_POPULATED,
+            f"the delegated parent holds {parent_members.opaque_member_count} member(s) this PID "
+            "namespace cannot name, so its depopulation cannot be observed",
+        )
+    remaining = set(parent_members.pids) - {pid}
     if remaining:
         # Unrelated processes are never moved.  Refusing here keeps the
         # no-internal-process constraint an observation rather than an action
@@ -844,11 +1014,18 @@ def _reuse_manager_leaf(
         "available_controllers": available,
         "owner_pid": pid,
     }
-    remaining = _members_of(parent)
-    if remaining:
+    parent_members = read_cgroup_members(parent)
+    if not parent_members.usable:
+        return _failed(_membership_code(parent_members), parent_members.refusal_detail(), **common)
+    if parent_members.observed_populated:
         return _failed(
             TOPOLOGY_PARENT_STILL_POPULATED,
-            f"the effect parent {parent} holds {sorted(remaining)}",
+            f"the effect parent {parent} holds {list(parent_members.pids)}"
+            + (
+                f" plus {parent_members.opaque_member_count} unnameable member(s)"
+                if parent_members.opaque_member_count
+                else ""
+            ),
             **common,
         )
     enabled, enabled_error = _enabled_controllers(parent)
@@ -984,10 +1161,12 @@ def _remove_owned_probe(probe: Path) -> dict[str, Any]:
     exact classification and with whether a residual path exists.
     """
 
+    membership = read_cgroup_members(probe)
     evidence: dict[str, Any] = {
         "probe_path": str(probe),
         "owned": True,
-        "members_before_removal": sorted(_members_of(probe)),
+        "members_before_removal": list(membership.pids),
+        "membership_read": membership.to_dict(),
         "rmdir_attempted": False,
         "rmdir_errno": None,
         "removed": False,
@@ -997,12 +1176,29 @@ def _remove_owned_probe(probe: Path) -> dict[str, Any]:
         "detail": "",
     }
 
-    if evidence["members_before_removal"]:
+    if not membership.usable:
+        # M2-B35.  A cgroup is never removed on the strength of a membership
+        # read that failed: it may hold live processes this controller cannot
+        # see, and removing it would be an unproven claim about the domain.
+        evidence["residual_path_exists"] = probe.exists()
+        evidence["code"] = TOPOLOGY_PROBE_MEMBERSHIP_UNREADABLE
+        evidence["detail"] = (
+            f"{membership.refusal_detail()}; an unreadable probe cgroup is never removed and "
+            "never reported removed"
+        )
+        return evidence
+
+    if membership.observed_populated:
         evidence["residual_path_exists"] = probe.exists()
         evidence["code"] = TOPOLOGY_PROBE_NOT_EMPTY
         evidence["detail"] = (
-            f"{probe} still holds {evidence['members_before_removal']}; an occupied probe cgroup "
-            "is never removed and never reported removed"
+            f"{probe} still holds {evidence['members_before_removal']}"
+            + (
+                f" plus {membership.opaque_member_count} unnameable member(s)"
+                if membership.opaque_member_count
+                else ""
+            )
+            + "; an occupied probe cgroup is never removed and never reported removed"
         )
         return evidence
 
@@ -1246,10 +1442,24 @@ class EffectCgroup:
         self.applied = dict(observed)
         return True
 
-    def members(self) -> set[int]:
+    def read_members(self) -> CgroupMembership:
+        """The typed membership observation for this effect cgroup (M2-B35)."""
+
         if self._path is None:
-            return set()
-        return _members_of(self._path)
+            return CgroupMembership("", read_ok=True, pids=())
+        return read_cgroup_members(self._path)
+
+    def members(self) -> set[int]:
+        """The observed member PIDs.
+
+        This raises rather than returning an empty set when the read failed: an
+        empty set is an answer, and a failed read is not.
+        """
+
+        membership = self.read_members()
+        if not membership.usable:
+            raise CgroupMembershipUnreadable(membership)
+        return set(membership.pids)
 
     def attach(self, pid: int) -> bool:
         if self._path is None:
@@ -1261,13 +1471,35 @@ class EffectCgroup:
         return True
 
     def attach_and_verify(self, pid: int) -> bool:
-        """Move ``pid`` into the cgroup and prove kernel membership before release."""
+        """Move ``pid`` into the cgroup and prove kernel membership before release.
+
+        Three separate observations, each of which must succeed on its own
+        terms: this cgroup was observed empty before the attach (it was created
+        by this controller moments ago and adopting an occupied cgroup is never
+        permitted), the write succeeded, and the kernel then listed exactly this
+        PID.  A membership read that fails at either end refuses; it is never
+        read as "empty" and never as "verified".
+        """
 
         if self._path is None:
             return False
+        before = self.read_members()
+        if not before.usable:
+            self.attach_error = f"pre_attach_membership_unreadable:{before.error_code or before.malformed_detail}"
+            return False
+        if before.observed_populated:
+            self.attach_error = (
+                f"effect_cgroup_not_empty_before_attach:{list(before.pids)}"
+                f"+{before.opaque_member_count}_unnameable"
+            )
+            return False
         if not self.attach(pid):
             return False
-        if pid not in self.members():
+        after = self.read_members()
+        if not after.usable:
+            self.attach_error = f"post_attach_membership_unreadable:{after.error_code or after.malformed_detail}"
+            return False
+        if pid not in after.pids:
             self.attach_error = "membership_not_observed"
             return False
         self._membership_verified = True
@@ -1276,9 +1508,11 @@ class EffectCgroup:
     def observed_membership(self, pid: int) -> dict[str, Any]:
         """Corroborating evidence for one member, from two independent files."""
 
+        membership = self.read_members()
         return {
             "effect_path": self.path,
-            "cgroup_procs_members": sorted(self.members()),
+            "cgroup_procs_members": list(membership.pids),
+            "cgroup_procs_read": membership.to_dict(),
             "proc_pid_cgroup": _pid_unified_cgroup(pid),
             "membership_verified": self._membership_verified,
         }
@@ -1297,46 +1531,80 @@ class EffectCgroup:
             "effect_path": self.path,
             "mechanism": None,
             "members_signalled": [],
+            "membership_readable": True,
             "errors": [],
         }
         if self._path is None:
             evidence["mechanism"] = "NO_CGROUP"
             return evidence
+        membership = self.read_members()
+        evidence["membership_readable"] = membership.usable
+        if not membership.usable:
+            evidence["errors"].append(f"cgroup.procs:{membership.refusal_detail()}")
         kill_file = self._path / "cgroup.kill"
         if kill_file.exists():
             error = _write_control(kill_file, "1\n")
             evidence["mechanism"] = "CGROUP_KILL"
-            evidence["members_signalled"] = sorted(self.members())
+            # cgroup.kill is atomic over the whole subtree and does not depend on
+            # this controller enumerating anything, so it is still the right
+            # action when the membership read failed -- but the member list that
+            # goes into the evidence is only ever what was actually observed.
+            evidence["members_signalled"] = list(membership.pids) if membership.usable else []
             if error is not None:
                 evidence["errors"].append(f"cgroup.kill:{error}")
             else:
                 return evidence
-        members = sorted(self.members())
         evidence["mechanism"] = "SIGKILL_MEMBERS" if evidence["mechanism"] is None else evidence["mechanism"]
-        for pid in members:
+        if not membership.fully_addressable:
+            # M2-B35.  Without a complete, observed member list there is nothing
+            # this controller may signal individually: a guessed PID is somebody
+            # else's process, and a member this PID namespace cannot name has no
+            # number to signal at all.
+            evidence["members_signalled"] = []
+            if membership.usable and membership.opaque_member_count:
+                evidence["errors"].append(
+                    f"unnameable_members:{membership.opaque_member_count}"
+                )
+            return evidence
+        for pid in membership.pids:
             try:
                 os.kill(pid, 9)
             except OSError as error:
                 evidence["errors"].append(f"{pid}:{_errno_name(error)}")
-        evidence["members_signalled"] = members
+        evidence["members_signalled"] = list(membership.pids)
         return evidence
 
     def wait_quiescent(self, timeout_seconds: float) -> dict[str, Any]:
-        """Wait, boundedly, for the cgroup to hold no members."""
+        """Wait, boundedly, for the cgroup to hold no members.
 
-        evidence: dict[str, Any] = {"effect_path": self.path, "quiescent": True, "residual_members": []}
+        Quiescence is a positive observation of an empty ``cgroup.procs``.  A
+        read that failed is reported as not-quiescent with its exact refusal,
+        never as the empty list that would have satisfied the caller.
+        """
+
+        evidence: dict[str, Any] = {
+            "effect_path": self.path,
+            "quiescent": True,
+            "residual_members": [],
+            "membership_readable": True,
+            "detail": "",
+        }
         if self._path is None:
             return evidence
         deadline = time.monotonic() + max(0.0, timeout_seconds)
         while True:
-            live = self.members()
-            if not live:
+            membership = self.read_members()
+            if membership.observed_empty:
                 evidence["quiescent"] = True
                 evidence["residual_members"] = []
+                evidence["membership_readable"] = True
                 return evidence
             if time.monotonic() >= deadline:
                 evidence["quiescent"] = False
-                evidence["residual_members"] = sorted(live)
+                evidence["membership_readable"] = membership.usable
+                evidence["residual_members"] = list(membership.pids)
+                evidence["opaque_member_count"] = membership.opaque_member_count
+                evidence["detail"] = membership.refusal_detail()
                 return evidence
             time.sleep(0.01)
 
@@ -1370,16 +1638,39 @@ class EffectCgroup:
             }
             return True
         path = self._path
-        live = self.members()
-        if live:
-            self.attach_error = f"live_members:{sorted(live)}"
+        membership = self.read_members()
+        if not membership.usable:
+            # M2-B35.  Removal eligibility is emptiness, and emptiness was not
+            # observed.  The cgroup stays, and the refusal says exactly why.
+            self.attach_error = f"membership_unreadable:{membership.error_code or membership.malformed_detail}"
+            self._removal_evidence = {
+                "effect_path": str(path),
+                "removed": False,
+                "absence_verified": False,
+                "residual_path_exists": path.exists(),
+                "residual_members": [],
+                "membership_readable": False,
+                "code": _membership_code(membership),
+                "detail": (
+                    f"{membership.refusal_detail()}; a cgroup whose membership cannot be read is "
+                    "never removed and never reported removed"
+                ),
+            }
+            return False
+        if membership.observed_populated:
+            live = membership.pids
+            self.attach_error = (
+                f"live_members:{list(live)}"
+                + (f"+{membership.opaque_member_count}_unnameable" if membership.opaque_member_count else "")
+            )
             self._removal_evidence = {
                 "effect_path": str(path),
                 "removed": False,
                 "absence_verified": False,
                 "residual_path_exists": True,
-                "residual_members": sorted(live),
-                "detail": f"{path} still holds {sorted(live)}; it is not removed and not called removed",
+                "residual_members": list(live),
+                "membership_readable": True,
+                "detail": f"{path} still holds {list(live)}; it is not removed and not called removed",
             }
             return False
         removed, rmdir_error = self._remove(path)
@@ -1389,6 +1680,7 @@ class EffectCgroup:
             "removed": bool(removed and not residual),
             "absence_verified": not residual,
             "residual_path_exists": residual,
+            "membership_readable": True,
             "rmdir_errno": rmdir_error,
             "detail": (
                 f"{path} was removed and its absence was verified"
@@ -1458,6 +1750,8 @@ __all__ = [
     "CORE_DUMP_BYTES",
     "CPU_SECONDS_HEADROOM",
     "CgroupDelegation",
+    "CgroupMembership",
+    "CgroupMembershipUnreadable",
     "CgroupTopology",
     "EFFECT_PREFIX",
     "MANAGER_LEAF_PREFIX",
@@ -1479,12 +1773,15 @@ __all__ = [
     "TOPOLOGY_LIMIT_WRITE_FAILED",
     "TOPOLOGY_MANAGER_COLLISION",
     "TOPOLOGY_MANAGER_CREATE_FAILED",
+    "TOPOLOGY_MEMBERSHIP_MALFORMED",
+    "TOPOLOGY_MEMBERSHIP_UNREADABLE",
     "TOPOLOGY_MISSING_CONTROLLERS",
     "TOPOLOGY_NO_UNIFIED_CGROUP_V2",
     "TOPOLOGY_NOT_INITIALIZED",
     "TOPOLOGY_PARENT_STILL_POPULATED",
     "TOPOLOGY_PROBE_CLEANUP_FAILED",
     "TOPOLOGY_PROBE_DISAPPEARED",
+    "TOPOLOGY_PROBE_MEMBERSHIP_UNREADABLE",
     "TOPOLOGY_PROBE_NOT_EMPTY",
     "TOPOLOGY_PROBE_RESIDUAL_PATH",
     "TOPOLOGY_STALE_CACHED_TOPOLOGY",
@@ -1508,5 +1805,6 @@ __all__ = [
     "delegation_from_topology_failure",
     "effective_mechanism",
     "probe_cgroup_delegation",
+    "read_cgroup_members",
     "revalidate_cgroup_topology",
 ]

@@ -36,15 +36,45 @@ from .cgroup_launch import (
     RELEASE_NOT_RELEASED,
     RELEASE_OUTCOME_UNKNOWN,
     RELEASE_PHASE_ACCEPTED,
-    RELEASE_PHASE_ALREADY_RELEASED,
+    RELEASE_PHASE_ACCEPT_DEADLINE_EXPIRED,
+    RELEASE_PHASE_COMPLETION_DEADLINE_EXPIRED,
     RELEASE_PHASE_NOT_GATED,
+    RELEASE_PHASE_NOT_REQUESTED,
     RELEASE_PHASE_REQUEST_NOT_SENT,
     RELEASE_PHASE_WRITE_COMPLETED,
     RELEASE_PHASE_WRITE_FAILED,
     RELEASE_PHASE_WRITE_NOT_ATTEMPTED,
     classify_release_frames,
     gate_child_before_exec,
+    monotonic_release_truth,
     release_gate,
+)
+from .process_ownership import (
+    ABORT_TOTAL_DEADLINE_MS,
+    CHILD_SUBREAPER,
+    HELPER_CONTROL_RPC_DEADLINE_MS,
+    HELPER_REAP_DEADLINE_MS,
+    HELPER_RELEASE_ACCEPT_DEADLINE_MS,
+    HELPER_RELEASE_COMPLETION_DEADLINE_MS,
+    HELPER_SHUTDOWN_DEADLINE_MS,
+    HELPER_STARTUP_DEADLINE_MS,
+    HELPER_WAIT_RPC_MARGIN_MS,
+    LAUNCHER_EXIT_OBSERVATION_DEADLINE_MS,
+    LAUNCHER_REAP_DEADLINE_MS,
+    REAPER_MOUNT_NAMESPACE_HELPER,
+    REAPER_NONE,
+    REAPER_TRUSTED_CONTROLLER,
+    REAP_ALREADY_REAPED,
+    REAP_SUBREAPER_UNAVAILABLE,
+    ControllerDeadlineExpired,
+    Deadline,
+    ProcessOwnershipEvidence,
+    ReapOutcome,
+    observe_process_exit,
+    open_process_descriptor,
+    process_is_zombie,
+    reap_owned_child,
+    signal_process,
 )
 from .observation import (
     M2_PREFIX,
@@ -159,6 +189,134 @@ def _recv_framed(sock: socket.socket) -> tuple[dict[str, Any], list[int]]:
             values.frombytes(data[: len(data) - (len(data) % values.itemsize)])
             fds.extend(int(value) for value in values)
     return json.loads(raw.decode("utf-8")), fds
+
+
+# --- M2-B33: controller-owned deadlines on the helper protocol ----------------
+#
+# The helper is a separate process.  Every operation that waits on it therefore
+# waits on something that may be alive and silent, stopped, wedged, or
+# protocol-deadlocked.  The bound below is enforced by *this* process: the
+# socket timeout is derived from an absolute monotonic instant this controller
+# owns, is recomputed before each underlying syscall so a sequence of reads
+# cannot renew its own budget, and is restored afterwards.
+#
+# A deadline that expires mid-frame destroys the framing: the controller cannot
+# know how many bytes of a length-prefixed message the helper already sent.  The
+# connection is therefore marked broken, and every later call on it refuses
+# immediately instead of blocking again.  That is what keeps the whole abort
+# path bounded rather than bounded-per-call.
+
+
+class HelperDeadlineExpired(PrivateWorkspaceError):
+    """A controller-owned deadline expired waiting for the trusted helper."""
+
+    def __init__(self, operation: str, detail: str = "") -> None:
+        super().__init__("private_mountns_helper_deadline", f"{operation}:{detail}" if detail else operation)
+        self.operation = operation
+
+
+class HelperProtocolBroken(PrivateWorkspaceError):
+    """The framed protocol lost its boundaries and may never be resumed."""
+
+    def __init__(self, detail: str = "") -> None:
+        super().__init__("private_mountns_helper_protocol_broken", detail)
+
+
+def _arm(sock: socket.socket, deadline: Deadline, operation: str) -> None:
+    """Point the socket at the controller's absolute deadline, or refuse now."""
+
+    remaining = deadline.remaining_seconds
+    if remaining <= 0.0:
+        raise HelperDeadlineExpired(operation, "the controller deadline had already expired")
+    sock.settimeout(remaining)
+
+
+def _send_framed_within(
+    sock: socket.socket,
+    payload: dict[str, Any],
+    fds: tuple[int, ...],
+    deadline: Deadline,
+    operation: str,
+) -> None:
+    """Send one frame under a controller-owned deadline.
+
+    A helper that stops reading can fill the socket buffer, so the send is
+    bounded too; an unbounded write to a wedged peer is the same defect as an
+    unbounded read from one.
+    """
+
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    previous = sock.gettimeout()
+    try:
+        _arm(sock, deadline, operation)
+        sock.sendall(struct.pack("!I", len(raw)))
+        if fds:
+            sent = 0
+            _arm(sock, deadline, operation)
+            sent = sock.sendmsg(
+                [raw], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", list(fds)))]
+            )
+            while sent < len(raw):
+                _arm(sock, deadline, operation)
+                sent += sock.send(raw[sent:])
+        else:
+            _arm(sock, deadline, operation)
+            sock.sendall(raw)
+    except TimeoutError as error:
+        raise HelperDeadlineExpired(operation, f"the request frame was not delivered: {error}") from error
+    finally:
+        try:
+            sock.settimeout(previous)
+        except OSError:  # pragma: no cover - the socket is already gone
+            pass
+
+
+def _recv_exact_within(sock: socket.socket, size: int, deadline: Deadline, operation: str) -> bytes:
+    chunks = bytearray()
+    while len(chunks) < size:
+        _arm(sock, deadline, operation)
+        try:
+            piece = sock.recv(size - len(chunks))
+        except TimeoutError as error:
+            raise HelperDeadlineExpired(operation, f"a partial frame stalled: {error}") from error
+        if not piece:
+            raise PrivateWorkspaceError("private_mountns_helper_closed", "short_read")
+        chunks.extend(piece)
+    return bytes(chunks)
+
+
+def _recv_framed_within(
+    sock: socket.socket, deadline: Deadline, operation: str
+) -> tuple[dict[str, Any], list[int]]:
+    """Receive one frame under a controller-owned deadline."""
+
+    previous = sock.gettimeout()
+    try:
+        header = _recv_exact_within(sock, 4, deadline, operation)
+        (length,) = struct.unpack("!I", header)
+        if length > 1 << 20:
+            raise PrivateWorkspaceError("private_mountns_frame_too_large", str(length))
+        _arm(sock, deadline, operation)
+        try:
+            raw, ancillary, _flags, _address = sock.recvmsg(length, socket.CMSG_SPACE(256))
+        except TimeoutError as error:
+            raise HelperDeadlineExpired(operation, f"the reply frame did not arrive: {error}") from error
+        if not raw and length:
+            raise PrivateWorkspaceError("private_mountns_helper_closed", "short_read")
+        if len(raw) < length:
+            raw += _recv_exact_within(sock, length - len(raw), deadline, operation)
+        fds: list[int] = []
+        for level, typ, data in ancillary or ():
+            if level == socket.SOL_SOCKET and typ == socket.SCM_RIGHTS:
+                values = array.array("i")
+                values.frombytes(data[: len(data) - (len(data) % values.itemsize)])
+                fds.extend(int(value) for value in values)
+        return json.loads(raw.decode("utf-8")), fds
+    finally:
+        try:
+            sock.settimeout(previous)
+        except OSError:  # pragma: no cover - the socket is already gone
+            pass
 
 
 def _helper_main(sock: socket.socket, *, size: str) -> None:  # pragma: no cover - child process
@@ -428,15 +586,29 @@ def _helper_main(sock: socket.socket, *, size: str) -> None:  # pragma: no cover
 
 @dataclass
 class SpawnedLauncher:
-    """Launcher process started inside the private mount namespace."""
+    """Launcher process started inside the private mount namespace.
+
+    The helper forked this process, so the helper is its parent and this
+    controller is its grandparent.  The controller nevertheless *owns* it:
+    it holds a pidfd for exit observation, and -- because it made itself a
+    child subreaper before the helper was forked -- it inherits the right to
+    reap this exact PID the moment the helper dies (M2-B34).
+    """
 
     pid: int
     stdout_fd: int
     stderr_fd: int
     _helper: "PrivateMountHelper"
     _awaiting_release: bool = False
-    #: The last release outcome observed for this launcher (M2-B30).
+    #: M2-B32.  The *terminal* release outcome.  Set exactly once, never
+    #: replaced, never downgraded.
     release_outcome: GateReleaseOutcome | None = None
+    _exit_descriptor: int | None = None
+    _exit_descriptor_detail: str = ""
+    _exit_descriptor_opened: bool = False
+    _reap: ReapOutcome | None = None
+
+    # --- M2-B32: terminal, monotonic release truth ---------------------------
 
     def release(self) -> GateReleaseOutcome:
         """Ask the trusted helper to open the gate and report what is known.
@@ -444,37 +616,280 @@ class SpawnedLauncher:
         This never raises on a release failure.  A raised exception cannot say
         which side of the gate write it came from, and the caller needs exactly
         that distinction to decide what it may claim about the command.
+
+        M2-B32.  Once any terminal outcome exists it is returned unchanged.  The
+        previous implementation kept only a *released* outcome and rebuilt every
+        other answer from ``_awaiting_release``, so a first call reporting
+        RELEASE_OUTCOME_UNKNOWN was followed by NOT_RELEASED -- a claim that no
+        instruction executed, made by a controller that never knew that.
         """
 
+        if self.release_outcome is not None:
+            return self.release_outcome
         if not self._awaiting_release:
-            phase = (
-                RELEASE_PHASE_ALREADY_RELEASED
-                if self.release_outcome is not None and self.release_outcome.released
-                else RELEASE_PHASE_NOT_GATED
+            self.release_outcome = GateReleaseOutcome(
+                RELEASE_NOT_RELEASED,
+                RELEASE_PHASE_NOT_GATED,
+                "this launcher was never placed behind a gate",
             )
-            if phase == RELEASE_PHASE_ALREADY_RELEASED:
-                return self.release_outcome
-            outcome = GateReleaseOutcome(
-                RELEASE_NOT_RELEASED, phase, "this launcher was never placed behind a gate"
-            )
-            self.release_outcome = outcome
-            return outcome
-        outcome = self._helper.release(self.pid)
+            return self.release_outcome
         self._awaiting_release = False
-        self.release_outcome = outcome
-        return outcome
+        self.release_outcome = monotonic_release_truth(None, self._helper.release(self.pid))
+        return self.release_outcome
+
+    def observed_release_outcome(self) -> GateReleaseOutcome:
+        """The public release-state accessor.  Never stronger than the truth.
+
+        Before any attempt this reports an interim, explicitly non-terminal
+        observation; afterwards it repeats the terminal outcome forever.
+        """
+
+        if self.release_outcome is not None:
+            return self.release_outcome
+        if self._awaiting_release:
+            return GateReleaseOutcome(
+                RELEASE_NOT_RELEASED,
+                RELEASE_PHASE_NOT_REQUESTED,
+                "no release request has been sent, so the gate write was never attempted",
+            )
+        return GateReleaseOutcome(
+            RELEASE_NOT_RELEASED,
+            RELEASE_PHASE_NOT_GATED,
+            "this launcher was never placed behind a gate",
+        )
+
+    # --- M2-B34: controller-owned exit observation and reap ------------------
+
+    def exit_descriptor(self) -> int | None:
+        """A pidfd for *observing* this launcher's exit; never a right to reap."""
+
+        if not self._exit_descriptor_opened:
+            self._exit_descriptor_opened = True
+            self._exit_descriptor, self._exit_descriptor_detail = open_process_descriptor(self.pid)
+        return self._exit_descriptor
+
+    def close_exit_descriptor(self) -> None:
+        if self._exit_descriptor is not None:
+            try:
+                os.close(self._exit_descriptor)
+            except OSError:  # pragma: no cover - already closed
+                pass
+            self._exit_descriptor = None
+
+    def _signal_owned(self, sig: int) -> dict[str, Any]:
+        """Signal this exact launcher without the helper, immune to PID reuse.
+
+        ``pidfd_send_signal`` names the process, not the number, so a launcher
+        that already exited and had its PID recycled cannot be confused with an
+        unrelated process.  ``os.kill`` is the fallback and is used only while
+        this controller has not observed a reap, which is the window in which
+        the PID cannot have been reused.
+        """
+
+        descriptor = self.exit_descriptor()
+        if descriptor is not None and hasattr(signal, "pidfd_send_signal"):
+            try:
+                signal.pidfd_send_signal(descriptor, int(sig))
+                return {"pid": self.pid, "signal": int(sig), "delivered": True, "error": None,
+                        "mechanism": "pidfd_send_signal"}
+            except ProcessLookupError:
+                return {"pid": self.pid, "signal": int(sig), "delivered": False, "error": "ESRCH",
+                        "mechanism": "pidfd_send_signal"}
+            except OSError as error:
+                return {"pid": self.pid, "signal": int(sig), "delivered": False,
+                        "error": errno.errorcode.get(error.errno, str(error.errno)),
+                        "mechanism": "pidfd_send_signal"}
+        if self._reap is not None and self._reap.reaped:
+            return {"pid": self.pid, "signal": int(sig), "delivered": False,
+                    "error": "ALREADY_REAPED_PID_MAY_BE_REUSED", "mechanism": "refused"}
+        evidence = signal_process(self.pid, int(sig))
+        evidence["mechanism"] = "kill"
+        return evidence
+
+    def terminate_and_reap(
+        self,
+        *,
+        deadline: Deadline | None = None,
+        evidence: ProcessOwnershipEvidence | None = None,
+    ) -> ProcessOwnershipEvidence:
+        """Destroy and reap this launcher within a controller-owned deadline.
+
+        The helper is preferred while it can still answer, because it is the
+        launcher's parent and its ``wait`` is the cheapest correct reap.  The
+        moment it cannot answer within the controller's deadline it is bypassed
+        entirely: the controller signals the launcher through its own pidfd,
+        kills and reaps the helper it forked, and then reaps the launcher the
+        kernel has reparented to it.  Every step is bounded and every claim is
+        recorded separately, so "the domain was killed" is never read as "the
+        launcher was reaped".
+        """
+
+        whole = deadline or Deadline.after_ms(ABORT_TOTAL_DEADLINE_MS, "terminate_and_reap")
+        record = evidence or ProcessOwnershipEvidence()
+        record.launcher_pid = self.pid
+        record.helper_pid = self._helper.pid
+        record.child_subreaper = CHILD_SUBREAPER.state()
+
+        if self._reap is not None and self._reap.reaped:
+            # Idempotent: a second cleanup reports the first reap and performs
+            # no second one.  Reaping twice is impossible; claiming it is not.
+            record.apply_launcher_reap(self._reap)
+            record.launcher_exit_observed = True
+            record.launcher_reap_code = REAP_ALREADY_REAPED
+            record.launcher_reap_detail = f"{self._reap.detail}; this call reaped nothing"
+            record.helper_exit_observed = self._helper.exit_observed
+            record.helper_reaped = self._helper.reaped
+            record.detail = "the launcher was already reaped by an earlier bounded cleanup"
+            return record
+
+        # 1. Ask the helper to kill while it can still answer; then signal
+        #    directly regardless, because the controller does not depend on it.
+        try:
+            self._helper.kill(self.pid, signal.SIGKILL, deadline=whole.sub(
+                HELPER_CONTROL_RPC_DEADLINE_MS, "helper_kill_rpc"
+            ))
+        except HelperDeadlineExpired:
+            record.record_deadline("helper_kill_rpc")
+            record.helper_bypassed = True
+        except PrivateWorkspaceError:
+            record.helper_bypassed = True
+        signalled = self._signal_owned(signal.SIGKILL)
+        record.detail = f"controller-owned signal: {signalled}"
+
+        # 2. Observe the exit.  This is a fact about the process, not about who
+        #    reaps it, and it is recorded as its own field.
+        observed, observation_detail = observe_process_exit(
+            self.exit_descriptor(),
+            self.pid,
+            whole.sub(LAUNCHER_EXIT_OBSERVATION_DEADLINE_MS, "launcher_exit_observation"),
+        )
+        record.launcher_exit_observed = observed
+        record.launcher_exit_detail = observation_detail
+        if not observed:
+            record.record_deadline("launcher_exit_observation")
+
+        # 3. Reap.  Prefer the helper, which is the launcher's parent.
+        if self._helper.protocol_usable:
+            try:
+                code = self._helper.wait(
+                    self.pid,
+                    timeout=0.0,
+                    deadline=whole.sub(HELPER_CONTROL_RPC_DEADLINE_MS, "helper_wait_rpc"),
+                )
+                self._reap = ReapOutcome(
+                    reaped=True,
+                    exit_code=code,
+                    reaper_role=REAPER_MOUNT_NAMESPACE_HELPER,
+                    reaper_pid=self._helper.pid,
+                    detail=f"the trusted mount-namespace helper (pid {self._helper.pid}) reaped {self.pid}",
+                )
+                record.apply_launcher_reap(self._reap)
+                record.launcher_zombie_remains = process_is_zombie(self.pid)
+                self.close_exit_descriptor()
+                return record
+            except HelperDeadlineExpired:
+                record.record_deadline("helper_wait_rpc")
+                record.helper_bypassed = True
+            except (TimeoutError, PrivateWorkspaceError):
+                record.helper_bypassed = True
+
+        # 4. The helper cannot answer.  Take ownership: kill and reap it, which
+        #    reparents the launcher to this controller, then reap the launcher.
+        record.helper_bypassed = True
+        helper_state = self._helper.terminate_and_reap(
+            deadline=whole.sub(HELPER_REAP_DEADLINE_MS, "helper_reap")
+        )
+        record.helper_exit_observed = bool(helper_state.get("exit_observed"))
+        helper_reap = helper_state.get("reap")
+        if isinstance(helper_reap, ReapOutcome):
+            record.apply_helper_reap(helper_reap)
+        if not record.helper_reaped and not helper_state.get("already_reaped"):
+            record.record_deadline("helper_reap")
+
+        outcome = reap_owned_child(
+            self.pid,
+            whole.sub(LAUNCHER_REAP_DEADLINE_MS, "launcher_reap"),
+            role=REAPER_TRUSTED_CONTROLLER,
+        )
+        if not outcome.reaped and not CHILD_SUBREAPER.active:
+            # Without the subreaper the orphaned launcher was reparented to some
+            # other ancestor.  That is recorded as an inability to prove a reap,
+            # never as a reap performed by an unnamed process.
+            outcome = ReapOutcome(
+                reaped=False,
+                exit_code=None,
+                reaper_role=REAPER_NONE,
+                reaper_pid=None,
+                detail=(
+                    f"{outcome.detail}; this controller is not a child subreaper, so an orphaned "
+                    "launcher is not reparented here and no reap can be proved"
+                ),
+                code=REAP_SUBREAPER_UNAVAILABLE,
+            )
+        self._reap = outcome
+        record.apply_launcher_reap(outcome)
+        if not outcome.reaped:
+            record.record_deadline("launcher_reap")
+        record.launcher_zombie_remains = process_is_zombie(self.pid)
+        self.close_exit_descriptor()
+        return record
+
+    @property
+    def reap_outcome(self) -> ReapOutcome | None:
+        return self._reap
+
+    # --- helper-mediated operations, each bounded by the controller ----------
 
     def poll(self) -> int | None:
-        return self._helper.poll(self.pid)
+        try:
+            return self._helper.poll(self.pid)
+        except HelperDeadlineExpired:
+            return self._poll_owned()
+        except HelperProtocolBroken:
+            return self._poll_owned()
+
+    def _poll_owned(self) -> int | None:
+        """Non-blocking controller-owned reap; ``None`` while it is not ours."""
+
+        if self._reap is not None and self._reap.reaped:
+            return self._reap.exit_code
+        outcome = reap_owned_child(
+            self.pid, Deadline.already_expired("owned_poll"), role=REAPER_TRUSTED_CONTROLLER
+        )
+        if outcome.reaped:
+            self._reap = outcome
+            return outcome.exit_code
+        return None
 
     def wait(self, timeout: float | None = None) -> int:
-        return self._helper.wait(self.pid, timeout=timeout)
+        if self._reap is not None and self._reap.reaped:
+            return int(self._reap.exit_code if self._reap.exit_code is not None else -9)
+        try:
+            return self._helper.wait(self.pid, timeout=timeout)
+        except (HelperDeadlineExpired, HelperProtocolBroken):
+            bound = (
+                Deadline.after_ms(LAUNCHER_REAP_DEADLINE_MS, "owned_wait")
+                if timeout is None
+                else Deadline.after(timeout, "owned_wait")
+            )
+            outcome = reap_owned_child(self.pid, bound, role=REAPER_TRUSTED_CONTROLLER)
+            if not outcome.reaped:
+                raise TimeoutError("launcher wait exceeded the controller deadline") from None
+            self._reap = outcome
+            return int(outcome.exit_code if outcome.exit_code is not None else -9)
 
     def kill(self, sig: int = signal.SIGKILL) -> None:
-        self._helper.kill(self.pid, sig)
+        try:
+            self._helper.kill(self.pid, sig)
+            return
+        except (HelperDeadlineExpired, HelperProtocolBroken):
+            pass
+        delivered = self._signal_owned(sig)
+        if not delivered["delivered"] and delivered["error"] not in {"ESRCH", None}:
+            raise PrivateWorkspaceError("private_mountns_kill_failed", str(delivered["error"]))
 
     def send_signal(self, sig: int) -> None:
-        self._helper.kill(self.pid, sig)
+        self.kill(sig)
 
 
 class PrivateMountHelper:
@@ -486,12 +901,91 @@ class PrivateMountHelper:
         self.view_fd = view_fd
         self.staging_path = staging_path
         self._closed = False
+        # M2-B33.  A deadline that expires mid-frame destroys the length-prefixed
+        # framing: the controller cannot know how much of a message the helper
+        # already sent.  Once that happens the connection is never used again,
+        # so a wedged helper costs one deadline in total rather than one per
+        # remaining call.
+        self._protocol_broken = False
+        self._broken_detail = ""
+        # M2-B34.  The helper is a direct child of this controller.
+        self._reaped = False
+        self._reap: ReapOutcome | None = None
+        self._exit_observed = False
+        self._subreaper_acquired = False
+        self._subreaper_state: dict[str, Any] = {}
+
+    # --- protocol health ------------------------------------------------------
+
+    @property
+    def protocol_usable(self) -> bool:
+        return not self._closed and not self._protocol_broken
+
+    @property
+    def protocol_broken_detail(self) -> str:
+        return self._broken_detail
+
+    @property
+    def reaped(self) -> bool:
+        return self._reaped
+
+    @property
+    def exit_observed(self) -> bool:
+        return self._exit_observed
+
+    @property
+    def subreaper_state(self) -> dict[str, Any]:
+        return dict(self._subreaper_state)
+
+    def _break_protocol(self, detail: str) -> None:
+        self._protocol_broken = True
+        if not self._broken_detail:
+            self._broken_detail = detail
+
+    def _rpc(
+        self,
+        payload: dict[str, Any],
+        deadline: Deadline,
+        operation: str,
+        *,
+        fds: tuple[int, ...] = (),
+    ) -> tuple[dict[str, Any], list[int]]:
+        """One bounded request/response round trip with the trusted helper."""
+
+        if self._closed:
+            raise PrivateWorkspaceError("private_mountns_helper_closed", operation)
+        if self._protocol_broken:
+            raise HelperProtocolBroken(f"{operation}: {self._broken_detail}")
+        try:
+            _send_framed_within(self.conn, payload, fds, deadline, operation)
+            return _recv_framed_within(self.conn, deadline, operation)
+        except HelperDeadlineExpired as error:
+            self._break_protocol(str(error))
+            raise
+        except PrivateWorkspaceError as error:
+            self._break_protocol(f"{operation}: {error}")
+            raise
+        except (OSError, ValueError) as error:
+            # A reset, a closed peer, or an unparseable frame all mean the same
+            # thing to the caller: this helper can no longer answer.  They are
+            # classified rather than allowed to escape as a raw transport error,
+            # so every caller has one refusal type to handle.
+            self._break_protocol(f"{operation}: {error}")
+            raise PrivateWorkspaceError(
+                "private_mountns_helper_closed", f"{operation}: {error}"
+            ) from error
 
     @classmethod
     def start(cls, *, size: str = DEFAULT_PRIVATE_TMPFS_SIZE) -> "PrivateMountHelper":
         if not hasattr(os, "unshare"):
             raise PrivateWorkspaceError("private_mountns_unavailable", "os.unshare is absent")
         parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM | socket.SOCK_CLOEXEC)
+        # M2-B34.  The subreaper flag is acquired *before* the fork so that a
+        # helper which dies at any point after this line -- including before it
+        # ever creates the launcher -- leaves its orphans reparented to this
+        # controller rather than to an unrelated init.
+        subreaper = CHILD_SUBREAPER.acquire()
+        deadline = Deadline.after_ms(HELPER_STARTUP_DEADLINE_MS, "helper_startup")
         pid = os.fork()
         if pid == 0:
             parent.close()
@@ -499,6 +993,7 @@ class PrivateMountHelper:
             os._exit(0)
         child.close()
         try:
+            parent.settimeout(max(deadline.remaining_seconds, 0.001))
             ready = parent.recv(5)
             if ready != b"READY":
                 raise PrivateWorkspaceError(
@@ -510,7 +1005,9 @@ class PrivateMountHelper:
             Path(f"/proc/{pid}/setgroups").write_text("deny\n", encoding="ascii")
             Path(f"/proc/{pid}/uid_map").write_text(f"{uid} {uid} 1\n", encoding="ascii")
             Path(f"/proc/{pid}/gid_map").write_text(f"{gid} {gid} 1\n", encoding="ascii")
+            parent.settimeout(max(deadline.remaining_seconds, 0.001))
             parent.sendall(b"MAPS")
+            parent.settimeout(max(deadline.remaining_seconds, 0.001))
             msg, anc, _flags, _addr = parent.recvmsg(4096, socket.CMSG_SPACE(4))
             if not msg.startswith(b"OKFD"):
                 detail = msg.decode("utf-8", "replace")
@@ -522,17 +1019,22 @@ class PrivateMountHelper:
                     fds.extend(array.array("i", data).tolist())
             if not fds:
                 raise PrivateWorkspaceError("private_mountns_tmpfs_failed", "missing-fd")
-            return cls(pid, parent, fds[0], staging)
+            parent.settimeout(None)
+            helper = cls(pid, parent, fds[0], staging)
+            helper._subreaper_acquired = True
+            helper._subreaper_state = subreaper
+            return helper
+        except TimeoutError as error:
+            parent.close()
+            _kill_and_reap_owned(pid, Deadline.after_ms(HELPER_REAP_DEADLINE_MS, "helper_startup_reap"))
+            CHILD_SUBREAPER.release()
+            raise HelperDeadlineExpired(
+                "helper_startup", f"the trusted helper did not become ready: {error}"
+            ) from error
         except BaseException:
             parent.close()
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
-            try:
-                os.waitpid(pid, 0)
-            except OSError:
-                pass
+            _kill_and_reap_owned(pid, Deadline.after_ms(HELPER_REAP_DEADLINE_MS, "helper_startup_reap"))
+            CHILD_SUBREAPER.release()
             raise
 
     def spawn(
@@ -544,17 +1046,17 @@ class PrivateMountHelper:
     ) -> SpawnedLauncher:
         if self._closed:
             raise PrivateWorkspaceError("private_mountns_helper_closed", "spawn")
-        _send_framed(
-            self.conn,
+        reply, fds = self._rpc(
             {
                 "op": "spawn",
                 "argv": list(argv),
                 "parent_fds": list(pass_fds),
                 "await_release": bool(await_release),
             },
-            pass_fds,
+            Deadline.after_ms(HELPER_CONTROL_RPC_DEADLINE_MS, "helper_spawn_rpc"),
+            "spawn",
+            fds=pass_fds,
         )
-        reply, fds = _recv_framed(self.conn)
         if not reply.get("ok"):
             raise PrivateWorkspaceError("private_mountns_spawn_failed", str(reply.get("error")))
         if len(fds) < 2:
@@ -567,24 +1069,49 @@ class PrivateMountHelper:
             _awaiting_release=bool(reply.get("await_release")),
         )
 
-    #: Trusted fault seam for the M2-B30 protocol tests.  It is set only by test
-    #: code on the controller side; the untrusted command never speaks this
-    #: protocol and cannot reach it.
+    #: Trusted fault seam for the M2-B30/M2-B33 protocol tests.  It is set only
+    #: by test code on the controller side; the untrusted command never speaks
+    #: this protocol and cannot reach it.
     release_fault: str | None = None
 
     def release(self, pid: int) -> GateReleaseOutcome:
-        """Two-phase gate release.  Returns a classified outcome, never raises."""
+        """Two-phase gate release, bounded by the controller.  Never raises.
 
+        Each acknowledgement has its own controller-owned deadline.  Expiry
+        before the accept frame and expiry after it are different phases, but
+        both are RELEASE_OUTCOME_UNKNOWN: in either case the helper may already
+        have written the gate, and this controller did not see it happen.  The
+        only outcomes that positively prove non-release are a terminal first
+        frame and a reported write failure -- statements the helper made about
+        a write it did not perform.
+        """
+
+        if self._closed or self._protocol_broken:
+            # No release request was ever put on the wire, so the helper cannot
+            # have written the gate.  That is a proof of non-release, not an
+            # inference from a failure.
+            return GateReleaseOutcome(
+                RELEASE_NOT_RELEASED,
+                RELEASE_PHASE_WRITE_NOT_ATTEMPTED,
+                f"no release request was sent: {self._broken_detail or 'the helper is closed'}",
+            )
         request: dict[str, Any] = {"op": "release", "pid": pid}
         if self.release_fault:
             request["fault"] = self.release_fault
+        accept_deadline = Deadline.after_ms(HELPER_RELEASE_ACCEPT_DEADLINE_MS, "release_accept")
         try:
-            _send_framed(self.conn, request)
+            _send_framed_within(self.conn, request, (), accept_deadline, "release_request")
+        except HelperDeadlineExpired as error:
+            self._break_protocol(str(error))
+            return GateReleaseOutcome(
+                RELEASE_OUTCOME_UNKNOWN,
+                RELEASE_PHASE_REQUEST_NOT_SENT,
+                f"the release request could not be delivered within the controller deadline: {error}",
+            )
         except OSError as error:
-            # The helper never saw a complete request frame that it could have
-            # acted on before this send failed, but a partially delivered frame
-            # leaves the helper blocked rather than releasing.  Either way this
-            # controller did not observe an accepted request.
+            # A partially delivered frame leaves the helper blocked rather than
+            # releasing, but this controller cannot see which happened.
+            self._break_protocol(f"release_request: {error}")
             return GateReleaseOutcome(
                 RELEASE_OUTCOME_UNKNOWN,
                 RELEASE_PHASE_REQUEST_NOT_SENT,
@@ -594,68 +1121,190 @@ class PrivateMountHelper:
         completion: dict[str, Any] | None = None
         transport = ""
         try:
-            accept, _fds = _recv_framed(self.conn)
+            accept, _fds = _recv_framed_within(self.conn, accept_deadline, "release_accept")
+        except HelperDeadlineExpired as error:
+            self._break_protocol(str(error))
+            return GateReleaseOutcome(
+                RELEASE_OUTCOME_UNKNOWN,
+                RELEASE_PHASE_ACCEPT_DEADLINE_EXPIRED,
+                (
+                    "the helper did not acknowledge acceptance within the controller deadline; it "
+                    f"may have written the gate without this controller seeing it: {error}"
+                ),
+            )
         except (OSError, ValueError, PrivateWorkspaceError) as error:
+            self._break_protocol(f"release_accept: {error}")
             transport = f"the accept frame was not received: {error}"
         if accept is not None and str(accept.get("phase") or "") == RELEASE_PHASE_ACCEPTED:
+            completion_deadline = Deadline.after_ms(
+                HELPER_RELEASE_COMPLETION_DEADLINE_MS, "release_completion"
+            )
             try:
-                completion, _fds = _recv_framed(self.conn)
+                completion, _fds = _recv_framed_within(
+                    self.conn, completion_deadline, "release_completion"
+                )
+            except HelperDeadlineExpired as error:
+                self._break_protocol(str(error))
+                return GateReleaseOutcome(
+                    RELEASE_OUTCOME_UNKNOWN,
+                    RELEASE_PHASE_COMPLETION_DEADLINE_EXPIRED,
+                    (
+                        "the helper accepted the request and then reported nothing within the "
+                        f"controller deadline; the gate write may have completed: {error}"
+                    ),
+                )
             except (OSError, ValueError, PrivateWorkspaceError) as error:
+                self._break_protocol(f"release_completion: {error}")
                 transport = f"the completion frame was not received: {error}"
         return classify_release_frames(accept, completion, transport_detail=transport)
 
-    def poll(self, pid: int) -> int | None:
-        _send_framed(self.conn, {"op": "poll", "pid": pid})
-        reply, _fds = _recv_framed(self.conn)
+    def poll(self, pid: int, *, deadline: Deadline | None = None) -> int | None:
+        reply, _fds = self._rpc(
+            {"op": "poll", "pid": pid},
+            deadline or Deadline.after_ms(HELPER_CONTROL_RPC_DEADLINE_MS, "helper_poll_rpc"),
+            "poll",
+        )
         if not reply.get("ok"):
             raise PrivateWorkspaceError("private_mountns_poll_failed", str(reply.get("error")))
         return reply.get("returncode")
 
-    def wait(self, pid: int, timeout: float | None = None) -> int:
+    def wait(self, pid: int, timeout: float | None = None, *, deadline: Deadline | None = None) -> int:
         payload: dict[str, Any] = {"op": "wait", "pid": pid}
         if timeout is not None:
             payload["timeout_seconds"] = float(timeout)
-        _send_framed(self.conn, payload)
-        reply, _fds = _recv_framed(self.conn)
+        # The helper may honour ``timeout`` itself.  The controller does not rely
+        # on that: its own bound is the caller's timeout plus a fixed margin, or
+        # the flat control-RPC deadline when the caller asked to wait forever.
+        if deadline is None:
+            milliseconds = (
+                HELPER_CONTROL_RPC_DEADLINE_MS
+                if timeout is None
+                else int(timeout * 1000) + HELPER_WAIT_RPC_MARGIN_MS
+            )
+            deadline = Deadline.after_ms(milliseconds, "helper_wait_rpc")
+        reply, _fds = self._rpc(payload, deadline, "wait")
         if not reply.get("ok"):
             if reply.get("error") == "timeout":
                 raise TimeoutError("launcher wait timed out")
             raise PrivateWorkspaceError("private_mountns_wait_failed", str(reply.get("error")))
         return int(reply["returncode"])
 
-    def kill(self, pid: int, sig: int = signal.SIGKILL) -> None:
-        _send_framed(self.conn, {"op": "kill", "pid": pid, "signal": int(sig)})
-        reply, _fds = _recv_framed(self.conn)
+    def kill(self, pid: int, sig: int = signal.SIGKILL, *, deadline: Deadline | None = None) -> None:
+        reply, _fds = self._rpc(
+            {"op": "kill", "pid": pid, "signal": int(sig)},
+            deadline or Deadline.after_ms(HELPER_CONTROL_RPC_DEADLINE_MS, "helper_kill_rpc"),
+            "kill",
+        )
         if not reply.get("ok"):
             raise PrivateWorkspaceError("private_mountns_kill_failed", str(reply.get("error")))
 
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+    def terminate_and_reap(self, *, deadline: Deadline | None = None) -> dict[str, Any]:
+        """Kill and reap the helper this controller forked, boundedly.
+
+        This is the controller-owned escape from a helper that is alive but
+        cannot answer.  Reaping the helper is also what hands the launcher to
+        this controller: the kernel reparents the orphan to the nearest
+        subreaper ancestor, which is this process.
+        """
+
+        bound = deadline or Deadline.after_ms(HELPER_REAP_DEADLINE_MS, "helper_reap")
+        state: dict[str, Any] = {
+            "helper_pid": self.pid,
+            "already_reaped": self._reaped,
+            "exit_observed": self._exit_observed,
+            "signal": None,
+            "reap": self._reap,
+        }
+        if self._reaped:
+            return state
+        state["signal"] = signal_process(self.pid, signal.SIGKILL)
+        descriptor, _detail = open_process_descriptor(self.pid)
         try:
-            _send_framed(self.conn, {"op": "exit"})
+            observed, _observation = observe_process_exit(descriptor, self.pid, bound)
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:  # pragma: no cover - already closed
+                    pass
+        self._exit_observed = observed or self._exit_observed
+        outcome = reap_owned_child(self.pid, bound, role=REAPER_TRUSTED_CONTROLLER)
+        self._reap = outcome
+        self._reaped = outcome.reaped
+        if outcome.reaped:
+            self._exit_observed = True
+        self._break_protocol("the helper was killed and reaped by the trusted controller")
+        state["exit_observed"] = self._exit_observed
+        state["reap"] = outcome
+        return state
+
+    def close(self) -> dict[str, Any]:
+        """Shut the helper down within a controller-owned deadline.
+
+        Every step is bounded.  A helper that does not answer the shutdown
+        request, or does not exit after it, is killed and reaped by the
+        controller rather than waited on forever.
+        """
+
+        if self._closed:
+            return {
+                "helper_pid": self.pid,
+                "already_closed": True,
+                "reaped": self._reaped,
+                "subreaper": dict(self._subreaper_state),
+            }
+        self._closed = True
+        deadline = Deadline.after_ms(HELPER_SHUTDOWN_DEADLINE_MS, "helper_shutdown")
+        graceful = False
+        if not self._protocol_broken:
             try:
-                _recv_framed(self.conn)
+                _send_framed_within(self.conn, {"op": "exit"}, (), deadline, "shutdown")
+                _recv_framed_within(self.conn, deadline, "shutdown")
+                graceful = True
             except Exception:
-                pass
-        except Exception:
-            try:
-                os.kill(self.pid, signal.SIGKILL)
-            except OSError:
-                pass
+                graceful = False
         try:
             self.conn.close()
-        except OSError:
+        except OSError:  # pragma: no cover - already closed
             pass
         try:
             os.close(self.view_fd)
-        except OSError:
+        except OSError:  # pragma: no cover - already closed
             pass
-        try:
-            os.waitpid(self.pid, 0)
-        except OSError:
-            pass
+        if not self._reaped:
+            outcome = reap_owned_child(self.pid, deadline, role=REAPER_TRUSTED_CONTROLLER)
+            if not outcome.reaped:
+                # It did not exit on request within the deadline.  It is this
+                # controller's child, so it is killed and reaped here.
+                signal_process(self.pid, signal.SIGKILL)
+                outcome = reap_owned_child(
+                    self.pid,
+                    Deadline.after_ms(HELPER_REAP_DEADLINE_MS, "helper_forced_reap"),
+                    role=REAPER_TRUSTED_CONTROLLER,
+                )
+            self._reap = outcome
+            self._reaped = outcome.reaped
+            self._exit_observed = self._exit_observed or outcome.reaped
+        if self._subreaper_acquired:
+            self._subreaper_acquired = False
+            self._subreaper_state = CHILD_SUBREAPER.release()
+        return {
+            "helper_pid": self.pid,
+            "already_closed": False,
+            "graceful_shutdown": graceful,
+            "reaped": self._reaped,
+            "exit_code": None if self._reap is None else self._reap.exit_code,
+            "reaper_role": REAPER_NONE if self._reap is None else self._reap.reaper_role,
+            "reaper_pid": None if self._reap is None else self._reap.reaper_pid,
+            "subreaper": dict(self._subreaper_state),
+        }
+
+
+def _kill_and_reap_owned(pid: int, deadline: Deadline) -> ReapOutcome:
+    """Destroy and reap one PID this controller forked, within a deadline."""
+
+    signal_process(pid, signal.SIGKILL)
+    return reap_owned_child(pid, deadline, role=REAPER_TRUSTED_CONTROLLER)
 
 
 def host_can_pathname_reach(view_fd: int) -> bool:

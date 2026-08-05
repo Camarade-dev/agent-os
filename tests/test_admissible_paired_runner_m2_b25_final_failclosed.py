@@ -127,6 +127,27 @@ def _write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+_REAL_MKDIR = Path.mkdir
+
+
+def _cgroupfs_mkdir(self_path, *args, **kwargs):
+    """Create a fixture cgroup carrying the interface files the kernel creates.
+
+    M2-B35.  cgroup2 creates ``cgroup.procs`` together with the cgroup itself,
+    so a fixture that omitted it would present an absent membership file where
+    the kernel always presents an empty one -- making "unreadable" and "empty"
+    indistinguishable in the fixture, which is exactly the ambiguity this repair
+    removes from the production code.  The patch applies only inside a
+    constructed cgroup tree, identified by its parent's ``cgroup.controllers``.
+    """
+
+    _REAL_MKDIR(self_path, *args, **kwargs)
+    if (self_path.parent / "cgroup.controllers").exists():
+        procs = self_path / "cgroup.procs"
+        if not procs.exists():
+            procs.write_text("", encoding="utf-8")
+
+
 def _cgroupfs_rmdir(test: unittest.TestCase) -> None:
     """Make an ordinary directory behave like a cgroup for ``rmdir``.
 
@@ -175,6 +196,10 @@ class _FakeParent:
             self.manager / "cgroup.procs",
             f"{os.getpid()}\n" if manager_procs is None else manager_procs,
         )
+        # Anything the production code creates beneath this parent from here on
+        # gets the interface files a real cgroup mkdir creates.
+        self._mkdir_patcher = mock.patch.object(Path, "mkdir", _cgroupfs_mkdir)
+        self._mkdir_patcher.start()
 
     def topology(self, **overrides) -> CgroupTopology:
         fields = {
@@ -209,6 +234,7 @@ class _FakeParent:
         )
 
     def close(self) -> None:
+        self._mkdir_patcher.stop()
         shutil.rmtree(self.root, ignore_errors=True)
 
 
@@ -1036,7 +1062,9 @@ class ValidationReportCountTests(unittest.TestCase):
             counts["m2_discovered_by_discovery"],
             counts["m2_legacy_pre_b25"]
             + counts["m2_b25_topology_module"]
-            + counts["m2_b25_final_failclosed_module"],
+            + counts["m2_b25_final_failclosed_module"]
+            # M2-M36 added the final protocol/lifecycle module to this milestone.
+            + counts["m2_final_protocol_lifecycle_module"],
             "the legacy and new modules must account for the whole discovery total",
         )
 
@@ -1133,8 +1161,8 @@ def _open_descriptor_count() -> int:
 def _live_pids_under(parent: Path) -> list[int]:
     live: list[int] = []
     for entry in sorted(parent.glob(f"{rl.EFFECT_PREFIX}*")):
-        live.extend(sorted(rl._members_of(entry)))
-    return live
+        live.extend(rl.read_cgroup_members(entry).pids)
+    return sorted(live)
 
 
 class DelegatedFinalFailClosedTests(unittest.TestCase):

@@ -244,3 +244,128 @@ leak, no per-effect cgroup leak, and truthful ambiguity evidence.
 case above deterministically and adds delegated physical qualification for the
 probe absence, revalidated repeated effects, the pre-release refusal, the lost
 acknowledgement, the nominal release, and cleanup idempotence.
+
+---
+
+# C. Final protocol and process-lifecycle repair (M2-B32, M2-B33, M2-B34)
+
+## C1. Release truth is terminal and monotonic (M2-B32)
+
+A release attempt that produced `NOT_RELEASED`, `RELEASED`, or
+`RELEASE_OUTCOME_UNKNOWN` has answered the question permanently. Every later
+call and every durable record repeats that same outcome.
+
+The defect this closes was specific: `SpawnedLauncher.release()` retained only a
+`RELEASED` outcome and rebuilt every other answer from `_awaiting_release`,
+which the first call had already cleared. A first call reporting
+`RELEASE_OUTCOME_UNKNOWN` / `EXECUTION_OUTCOME_UNKNOWN` was therefore followed by
+`NOT_RELEASED` / `NO_INSTRUCTION_EXECUTED` — a positive claim that the proposed
+command never ran, made by a controller that never held that evidence.
+
+* `cgroup_launch.monotonic_release_truth(previous, candidate)` is the single
+  point every caller and every evidence writer goes through. Once a terminal
+  outcome exists it is returned unchanged.
+* `release_truth_is_downgrade(previous, candidate)` makes the invariant
+  testable: after a terminal answer, *any* state change is a downgrade.
+* `SpawnedLauncher.observed_release_outcome()` is the public accessor. Before
+  any attempt it reports the interim phase `RELEASE_NOT_REQUESTED`, which is
+  never recorded as terminal; afterwards it repeats the terminal outcome.
+* `abort_gated_effect` reads the launcher's own terminal outcome, so a caller
+  that supplies a stronger outcome at cleanup time cannot overwrite it.
+
+No path in this milestone can physically resolve an unknown gate write after the
+fact, so no upgrade path exists either. Resolving evidence would require a new
+explicit API and new physical proof.
+
+## C2. Every external wait is bounded by this controller (M2-B33)
+
+A timeout implemented by the helper is a promise from the component that is
+failing. Each operation that depends on the helper now carries an **absolute
+monotonic** deadline this process enforces:
+
+| operation | constant |
+| --- | --- |
+| helper start-up | `HELPER_STARTUP_DEADLINE_MS` |
+| spawn | `HELPER_CONTROL_RPC_DEADLINE_MS` |
+| release accept frame | `HELPER_RELEASE_ACCEPT_DEADLINE_MS` |
+| release completion frame | `HELPER_RELEASE_COMPLETION_DEADLINE_MS` |
+| kill / poll | `HELPER_CONTROL_RPC_DEADLINE_MS` |
+| wait | caller timeout + `HELPER_WAIT_RPC_MARGIN_MS` |
+| shutdown, including failure cleanup | `HELPER_SHUTDOWN_DEADLINE_MS` |
+| launcher exit observation | `LAUNCHER_EXIT_OBSERVATION_DEADLINE_MS` |
+| launcher reap | `LAUNCHER_REAP_DEADLINE_MS` |
+| helper reap | `HELPER_REAP_DEADLINE_MS` |
+| the whole abort path | `ABORT_TOTAL_DEADLINE_MS` |
+
+The deadline is applied by setting and restoring the socket timeout from the
+remaining time before **each** underlying syscall, so a sequence of reads cannot
+renew its own budget. A nested deadline can never outlive its whole. There is no
+`signal.alarm`, `setitimer`, or `SIGALRM` handler anywhere in the package: a
+process-wide timer would corrupt unrelated operations.
+
+A deadline that expires mid-frame destroys the length-prefixed framing, so the
+connection is marked broken and every later call refuses immediately. A wedged
+helper therefore costs one deadline in total rather than one per remaining call.
+
+Classification: expiry before the accept frame and expiry after it are distinct
+phases (`RELEASE_ACCEPT_DEADLINE_EXPIRED`,
+`RELEASE_COMPLETION_DEADLINE_EXPIRED`) but both are `RELEASE_OUTCOME_UNKNOWN`,
+because in either case the helper may already have written the gate.
+`NOT_RELEASED` is produced only where the protocol proves non-release: a
+terminal first frame, a reported write failure, or a release request that was
+never put on the wire at all.
+
+After a helper deadline the controller stops asking. It signals the launcher
+through its own pidfd, kills and reaps the helper it forked, and reaps the
+launcher the kernel reparents to it. The local cgroup kill domain runs first and
+never waits on the helper.
+
+## C3. Proved ownership and reap after helper loss (M2-B34)
+
+The helper forks the launcher, so the launcher is the controller's grandchild.
+When the helper dies after the gate write, `cgroup.kill` still destroys the
+domain and an empty `cgroup.procs` still proves no live member — but neither
+says who observed the exit or who reaped it.
+
+**Chosen architecture: `CONTROLLER_CHILD_SUBREAPER_PLUS_PIDFD_OBSERVATION`.**
+The controller calls `prctl(PR_SET_CHILD_SUBREAPER, 1)` before forking the
+helper. The kernel then reparents the orphaned launcher to the nearest subreaper
+ancestor — this controller — so `waitpid` on that exact PID is a reap this
+process performed and can name. A pidfd carries exit observation only:
+`waitid(P_PIDFD, ...)` on a process that is not the caller's child fails with
+`ECHILD`, which is asserted physically rather than assumed.
+
+Lifecycle of the process-wide flag: acquired immediately before the first
+trusted helper is forked, reference counted across concurrent effects, read back
+after being set, and restored to its previous value when the last helper closes.
+An acquisition inherited across `fork()` records another process's PID and is
+discarded rather than trusted, because the kernel flag is not inherited.
+
+`waitpid` is only ever called on an owned PID. `is_addressable_pid()` makes
+`waitpid(-1)`, `waitpid(0)`, and `kill(-1, ...)` unreachable, so a concurrent
+unrelated child of this controller is never consumed.
+
+These lifecycle facts are recorded separately and are never collapsed:
+
+```text
+process_domain_kill_requested   launcher_exit_observed   launcher_reaped
+launcher_exit_code              launcher_reaper_role     launcher_reaper_pid
+launcher_zombie_remains         helper_exit_observed     helper_reaped
+helper_exit_code                cgroup_quiescent         effect_cgroup_removed
+```
+
+A repeated cleanup reports the first reap with `launcher_reap_code =
+ALREADY_REAPED` and performs no second one. Where the reap cannot be proved —
+no subreaper, or a deadline reached — that is recorded as an inability to prove
+it, never as a reap performed by an unnamed process.
+
+Rejected alternatives, and why, are recorded in
+`implementation/M2_FINAL_PROTOCOL_LIFECYCLE_REPAIR_REPORT.json`.
+
+## C4. Tests
+
+`tests/test_admissible_paired_runner_m2_final_protocol_lifecycle.py` covers the
+monotonicity invariant, the deadline primitive, a live silent helper, a helper
+held by `SIGSTOP`, helper loss before creation, before release, and after the
+gate write, the verified kernel semantics, and the delegated physical
+qualification of each.

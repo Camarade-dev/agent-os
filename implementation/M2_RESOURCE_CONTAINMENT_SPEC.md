@@ -261,3 +261,85 @@ nothing outside itself.
 | release states and phases | `ReleaseStateClassificationTests`, `ReleaseProtocolTests` |
 | bounded, idempotent, leak-free abort | `AbortGatedEffectTests` |
 | delegated physical qualification | `DelegatedFinalFailClosedTests` |
+
+---
+
+# C. Typed cgroup membership reads (M2-B35)
+
+## C1. An unreadable membership is not an empty one
+
+`_members_of()` mapped an unreadable `cgroup.procs` to `set()`. That made two
+opposite facts identical:
+
+```text
+"the kernel says this cgroup is empty"
+"this controller could not read this cgroup at all"
+```
+
+Every security-relevant decision downstream is a decision about emptiness, and
+each of them accepted a failed read as a positive answer.
+
+`read_cgroup_members(path) -> CgroupMembership` replaces it. The typed result
+carries:
+
+| field | meaning |
+| --- | --- |
+| `path` | the exact cgroup directory read |
+| `read_ok` | whether `cgroup.procs` could be read at all |
+| `error_code` | the errno name when it could not |
+| `pids` | the member PIDs this namespace can name |
+| `malformed` / `malformed_detail` | content that is not a list of decimal PIDs |
+| `opaque_member_count` | members this PID namespace cannot name |
+| `usable` | `read_ok and not malformed` — may this observation decide anything |
+| `observed_empty` | the kernel positively reported no members of any kind |
+| `fully_addressable` | every member can be named, and therefore signalled |
+
+`EffectCgroup.members()` raises `CgroupMembershipUnreadable` rather than
+returning an empty set, so no caller can receive a bare empty set on a failed
+read.
+
+## C2. Members this PID namespace cannot name
+
+The kernel renders `cgroup.procs` in the *reader's* PID namespace and prints `0`
+for a member that namespace cannot name. Physical inspection of the development
+host's root cgroup found 207 such entries. A `0` is neither a PID nor noise: it
+is a live member this controller may not address. Folding it into `pids` would
+invent a process; discarding it would report a populated cgroup as empty. It is
+counted separately, it defeats `observed_empty`, and it is never signalled
+individually.
+
+## C3. Every security-relevant caller fails closed
+
+| caller | behaviour on an unreadable or malformed read |
+| --- | --- |
+| `_topology_is_still_true` manager membership | refuse the cached topology |
+| `_topology_is_still_true` parent depopulation | refuse (`parent/cgroup.procs -> EACCES`) |
+| `_bootstrap_topology` controller-move verification | roll back, `CGROUP_MEMBERSHIP_UNREADABLE` |
+| `_bootstrap_topology` parent depopulation | roll back; readiness is never positive without observed emptiness |
+| `_bootstrap_topology` rollback | an owned leaf is removed only when observed empty |
+| `_reuse_manager_leaf` parent depopulation | refuse |
+| `_remove_owned_probe` | `PROBE_MEMBERSHIP_UNREADABLE`; `rmdir` is not attempted |
+| `attach_and_verify` pre-attach emptiness | refuse before any gate release |
+| `attach_and_verify` post-attach membership | refuse; membership is not verified |
+| `kill_domain` | `cgroup.kill` still runs; no member is signalled individually and none is claimed |
+| `wait_quiescent` | not quiescent, with the exact refusal recorded |
+| `close` | not removed, not called removed, cgroup left in place |
+| `_containment_evidence` | records `cgroup.membership_read_refused=…`, never an empty list |
+
+New classified codes: `CGROUP_MEMBERSHIP_UNREADABLE`,
+`CGROUP_MEMBERSHIP_MALFORMED`, `PROBE_MEMBERSHIP_UNREADABLE`.
+
+## C4. Test matrix addendum
+
+| Case | Test |
+| --- | --- |
+| readable empty vs unreadable vs malformed | `TypedMembershipReadTests` |
+| a member this namespace cannot name | `test_a_member_this_namespace_cannot_name_still_populates_the_cgroup` |
+| `parent/cgroup.procs -> EACCES` revalidation | `test_cache_revalidation_refuses_an_eacces_parent` |
+| unreadable manager leaf, malformed parent | `test_cache_revalidation_refuses_an_unreadable_manager_leaf`, `test_cache_revalidation_refuses_a_malformed_parent` |
+| bootstrap parent depopulation and move verification | `test_bootstrap_parent_depopulation_refuses_an_unreadable_parent`, `test_bootstrap_manager_verification_refuses_an_unreadable_leaf` |
+| probe emptiness and readiness | `test_probe_cleanup_refuses_to_remove_an_unreadable_probe`, `test_no_positive_readiness_is_built_over_an_unreadable_probe` |
+| pre-attach and post-attach | `test_pre_attach_emptiness_refuses_an_unreadable_effect_cgroup`, `test_pre_attach_refuses_a_cgroup_that_is_not_observed_empty`, `test_post_attach_verification_refuses_an_unreadable_read` |
+| kill domain, quiescence, removal | `test_the_kill_domain_signals_nothing_it_could_not_observe`, `test_quiescence_is_never_claimed_over_an_unreadable_membership`, `test_removal_is_refused_over_an_unreadable_membership` |
+| no bare empty set on a failed read | `test_no_caller_can_receive_a_bare_empty_set_on_a_failed_read` |
+| delegated physical qualification | `test_an_unreadable_membership_refuses_release_quiescence_and_removal` |

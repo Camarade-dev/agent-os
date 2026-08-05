@@ -74,17 +74,26 @@ RELEASE_PHASE_WRITE_FAILED = "RELEASE_WRITE_FAILED"
 RELEASE_PHASE_WRITE_COMPLETED = "RELEASE_WRITE_COMPLETED"
 RELEASE_PHASE_ACK_LOST = "RELEASE_ACK_LOST"
 RELEASE_PHASE_ACK_AMBIGUOUS = "RELEASE_ACK_AMBIGUOUS"
+#: M2-B32.  No release has been requested yet.  This is an interim observation
+#: from the public accessor and is never recorded as a terminal outcome.
+RELEASE_PHASE_NOT_REQUESTED = "RELEASE_NOT_REQUESTED"
+#: M2-B33.  A controller-owned deadline expired while waiting for the helper.
+RELEASE_PHASE_ACCEPT_DEADLINE_EXPIRED = "RELEASE_ACCEPT_DEADLINE_EXPIRED"
+RELEASE_PHASE_COMPLETION_DEADLINE_EXPIRED = "RELEASE_COMPLETION_DEADLINE_EXPIRED"
 
 RELEASE_PHASES = (
     RELEASE_PHASE_NOT_GATED,
+    RELEASE_PHASE_NOT_REQUESTED,
     RELEASE_PHASE_ALREADY_RELEASED,
     RELEASE_PHASE_REQUEST_NOT_SENT,
     RELEASE_PHASE_ACCEPT_FRAME_LOST,
+    RELEASE_PHASE_ACCEPT_DEADLINE_EXPIRED,
     RELEASE_PHASE_WRITE_NOT_ATTEMPTED,
     RELEASE_PHASE_ACCEPTED,
     RELEASE_PHASE_WRITE_FAILED,
     RELEASE_PHASE_WRITE_COMPLETED,
     RELEASE_PHASE_ACK_LOST,
+    RELEASE_PHASE_COMPLETION_DEADLINE_EXPIRED,
     RELEASE_PHASE_ACK_AMBIGUOUS,
 )
 
@@ -166,6 +175,52 @@ def classify_release_frames(
         RELEASE_PHASE_ACK_AMBIGUOUS,
         f"unrecognised completion frame: {sorted(completion_frame.items())}",
     )
+
+
+# --- M2-B32: release truth is terminal and monotonic --------------------------
+#
+# The first release attempt that produces any of the three states above has
+# answered the question permanently.  A later call cannot re-answer it, because
+# a later call has no new evidence: it inspects the same recorded outcome, and
+# the helper that could have supplied more is exactly the thing that failed.
+#
+# The forbidden move is specifically a *downgrade of uncertainty*: reporting
+# RELEASE_OUTCOME_UNKNOWN once and NOT_RELEASED afterwards claims stronger
+# non-execution evidence than the controller ever held, and NOT_RELEASED carries
+# the sentinel claim NO_INSTRUCTION_EXECUTED.  Nothing in this milestone can
+# physically resolve an unknown gate write after the fact, so no upgrade path
+# exists here either: a terminal outcome is returned unchanged.
+
+RELEASE_TRUTH_MONOTONICITY = (
+    "A release attempt that produced NOT_RELEASED, RELEASED, or RELEASE_OUTCOME_UNKNOWN has "
+    "answered the question terminally.  Every later call and every durable record repeats that "
+    "same outcome.  An unknown outcome is never later reported as NOT_RELEASED, and therefore "
+    "never later claims NO_INSTRUCTION_EXECUTED."
+)
+
+
+def release_truth_is_downgrade(
+    previous: GateReleaseOutcome | None, candidate: GateReleaseOutcome | None
+) -> bool:
+    """Whether replacing ``previous`` with ``candidate`` would weaken the truth."""
+
+    if previous is None or candidate is None:
+        return False
+    return previous.state != candidate.state
+
+
+def monotonic_release_truth(
+    previous: GateReleaseOutcome | None, candidate: GateReleaseOutcome | None
+) -> GateReleaseOutcome | None:
+    """Return the terminal release truth, which the first attempt fixed.
+
+    This is the single point every caller and every evidence writer goes
+    through, so "the state changed between two reads" is not expressible.
+    """
+
+    if previous is None:
+        return candidate
+    return previous
 
 
 class CgroupLaunchRefused(RuntimeError):
@@ -271,21 +326,27 @@ __all__ = [
     "RELEASE_OUTCOME_UNKNOWN",
     "RELEASE_PHASES",
     "RELEASE_PHASE_ACCEPTED",
+    "RELEASE_PHASE_ACCEPT_DEADLINE_EXPIRED",
     "RELEASE_PHASE_ACCEPT_FRAME_LOST",
     "RELEASE_PHASE_ACK_AMBIGUOUS",
     "RELEASE_PHASE_ACK_LOST",
     "RELEASE_PHASE_ALREADY_RELEASED",
+    "RELEASE_PHASE_COMPLETION_DEADLINE_EXPIRED",
     "RELEASE_PHASE_NOT_GATED",
+    "RELEASE_PHASE_NOT_REQUESTED",
     "RELEASE_PHASE_REQUEST_NOT_SENT",
     "RELEASE_PHASE_WRITE_COMPLETED",
     "RELEASE_PHASE_WRITE_FAILED",
     "RELEASE_PHASE_WRITE_NOT_ATTEMPTED",
     "RELEASE_RELEASED",
     "RELEASE_STATES",
+    "RELEASE_TRUTH_MONOTONICITY",
     "attach_and_verify_real",
     "classify_release_frames",
     "gate_child_before_exec",
     "launch_order_description",
+    "monotonic_release_truth",
     "release_gate",
+    "release_truth_is_downgrade",
     "require_real_cgroup_procs",
 ]

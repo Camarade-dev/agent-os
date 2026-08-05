@@ -21,6 +21,7 @@ happens inside a disposable temporary workspace owned by the test process.
 from __future__ import annotations
 
 from pathlib import Path
+import errno
 import os
 import shutil
 import tempfile
@@ -91,6 +92,45 @@ def delegated(test):
 # --- deterministic fixtures ---------------------------------------------------
 
 
+_REAL_MKDIR = Path.mkdir
+_REAL_RMDIR = Path.rmdir
+
+
+def _cgroupfs_rmdir(self_path):
+    """Remove a fixture cgroup the way cgroupfs removes a real one.
+
+    The kernel destroys a cgroup's interface files with the cgroup, and refuses
+    only when the cgroup still has children.  A plain tmpfs directory instead
+    reports ``ENOTEMPTY`` for the very interface files the fixture created,
+    which would test the fixture rather than the removal logic.
+    """
+
+    if not (self_path / "cgroup.procs").exists():
+        _REAL_RMDIR(self_path)
+        return
+    if any(child.is_dir() for child in self_path.iterdir()):
+        raise OSError(errno.ENOTEMPTY, "Directory not empty", str(self_path))
+    shutil.rmtree(self_path)
+
+
+def _cgroupfs_mkdir(self_path, *args, **kwargs):
+    """Create a fixture cgroup carrying the interface files the kernel creates.
+
+    M2-B35.  cgroup2 creates ``cgroup.procs`` together with the cgroup itself.
+    A fixture that omitted it would present an absent membership file where the
+    kernel always presents an empty one, making "unreadable" and "empty"
+    indistinguishable in the fixture -- exactly the ambiguity this milestone
+    removes from the production code.  The patch applies only inside a
+    constructed cgroup tree, identified by its parent's ``cgroup.controllers``.
+    """
+
+    _REAL_MKDIR(self_path, *args, **kwargs)
+    if (self_path.parent / "cgroup.controllers").exists():
+        procs = self_path / "cgroup.procs"
+        if not procs.exists():
+            procs.write_text("", encoding="utf-8")
+
+
 class _FakeCgroupTree:
     """An ordinary directory tree shaped like a delegated cgroup.
 
@@ -109,6 +149,12 @@ class _FakeCgroupTree:
         (self.parent / "cgroup.procs").write_text(
             f"{os.getpid()}\n" if procs is None else procs, encoding="utf-8"
         )
+        self._patchers = [
+            mock.patch.object(Path, "mkdir", _cgroupfs_mkdir),
+            mock.patch.object(Path, "rmdir", _cgroupfs_rmdir),
+        ]
+        for patcher in self._patchers:
+            patcher.start()
 
     def bootstrap(self, **overrides):
         return initialize_cgroup_topology(
@@ -123,6 +169,8 @@ class _FakeCgroupTree:
         return {entry.name for entry in self.parent.iterdir() if entry.is_dir()}
 
     def close(self) -> None:
+        for patcher in reversed(self._patchers):
+            patcher.stop()
         shutil.rmtree(self.root, ignore_errors=True)
 
 
@@ -276,14 +324,17 @@ class ManagerLeafBootstrapTests(unittest.TestCase):
     def test_controller_move_not_observed_rolls_back(self) -> None:
         tree = _FakeCgroupTree()
         self.addCleanup(tree.close)
-        real_members = rl._members_of
+        real_members = rl.read_cgroup_members
 
         def blind(path: Path):
-            if path.name.startswith(rl.MANAGER_LEAF_PREFIX):
-                return set()
+            if Path(path).name.startswith(rl.MANAGER_LEAF_PREFIX):
+                # A successful read that does not list the controller.  This is
+                # deliberately *not* an unreadable membership: it proves the
+                # move-not-observed branch, not the M2-B35 refusal branch.
+                return rl.CgroupMembership(str(path), read_ok=True, pids=())
             return real_members(path)
 
-        with mock.patch.object(rl, "_members_of", blind):
+        with mock.patch.object(rl, "read_cgroup_members", blind):
             topology = tree.bootstrap()
         self.assertEqual(topology.code, rl.TOPOLOGY_CONTROLLER_MOVE_NOT_OBSERVED)
         self.assertIn("controller_returned=True", topology.detail)
@@ -777,13 +828,13 @@ class _EffectCgroupObserver(threading.Thread):
     def run(self) -> None:
         while not self.stop_event.is_set():
             for entry in sorted(self.parent.glob(f"{rl.EFFECT_PREFIX}*")):
-                members = rl._members_of(entry)
-                if not members:
+                membership = rl.read_cgroup_members(entry)
+                if not membership.observed_populated:
                     continue
                 self.observations.append(
                     {
                         "path": str(entry),
-                        "members": sorted(members),
+                        "members": list(membership.pids),
                         "pids.max": rl._parse_limit(rl._read_control(entry / "pids.max")[0]),
                         "memory.max": rl._parse_limit(rl._read_control(entry / "memory.max")[0]),
                     }
@@ -845,8 +896,14 @@ class DelegatedCgroupTopologyTests(unittest.TestCase):
 
         self.assertTrue(rl.is_cgroup2_filesystem(parent))
         self.assertEqual(manager.parent, parent)
-        self.assertIn(os.getpid(), rl._members_of(manager))
-        self.assertEqual(rl._members_of(parent), set(), "the effect parent must be unpopulated")
+        manager_members = rl.read_cgroup_members(manager)
+        self.assertTrue(manager_members.usable, manager_members.refusal_detail())
+        self.assertIn(os.getpid(), manager_members.pids)
+        parent_members = rl.read_cgroup_members(parent)
+        self.assertTrue(
+            parent_members.observed_empty,
+            f"the effect parent must be observed unpopulated: {parent_members.to_dict()}",
+        )
         enabled, _ = rl._enabled_controllers(parent)
         self.assertEqual({"memory", "pids"} & set(enabled), {"memory", "pids"})
 
