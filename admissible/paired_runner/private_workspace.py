@@ -31,7 +31,21 @@ import time
 from typing import Any, Callable, ClassVar, Iterator
 
 from .canonical import Fingerprint, fingerprint, canonical_bytes
-from .cgroup_launch import gate_child_before_exec, release_gate
+from .cgroup_launch import (
+    GateReleaseOutcome,
+    RELEASE_NOT_RELEASED,
+    RELEASE_OUTCOME_UNKNOWN,
+    RELEASE_PHASE_ACCEPTED,
+    RELEASE_PHASE_ALREADY_RELEASED,
+    RELEASE_PHASE_NOT_GATED,
+    RELEASE_PHASE_REQUEST_NOT_SENT,
+    RELEASE_PHASE_WRITE_COMPLETED,
+    RELEASE_PHASE_WRITE_FAILED,
+    RELEASE_PHASE_WRITE_NOT_ATTEMPTED,
+    classify_release_frames,
+    gate_child_before_exec,
+    release_gate,
+)
 from .observation import (
     M2_PREFIX,
     M2_SCHEMA_VERSION,
@@ -266,19 +280,67 @@ def _helper_main(sock: socket.socket, *, size: str) -> None:  # pragma: no cover
                 os.close(stderr_r)
                 continue
             if op == "release":
+                # M2-B30.  The gate write is bracketed by two acknowledgements
+                # so the controller can tell "the write was never attempted"
+                # from "the write completed but the answer was lost".  The
+                # accept frame is deliberately sent *before* the write.
+                fault = str(request.get("fault") or "")
                 meta = children.get(int(request["pid"]))
                 if meta is None:
-                    _send_framed(sock, {"ok": False, "error": "unknown_pid"})
+                    _send_framed(
+                        sock,
+                        {
+                            "phase": RELEASE_PHASE_WRITE_NOT_ATTEMPTED,
+                            "ok": False,
+                            "released": False,
+                            "error": "unknown_pid",
+                        },
+                    )
                     continue
                 gate_w = meta.get("gate_w", -1)
-                if gate_w >= 0:
-                    try:
-                        release_gate(gate_w)
-                    except OSError as error:
-                        _send_framed(sock, {"ok": False, "error": str(error.errno)})
-                        continue
+                if gate_w < 0:
+                    _send_framed(
+                        sock,
+                        {
+                            "phase": RELEASE_PHASE_WRITE_NOT_ATTEMPTED,
+                            "ok": False,
+                            "released": False,
+                            "error": "no_gate",
+                        },
+                    )
+                    continue
+                _send_framed(
+                    sock,
+                    {"phase": RELEASE_PHASE_ACCEPTED, "ok": True, "released": False},
+                )
+                if fault == "die_before_write":
+                    # Trusted fault seam: the helper dies with the gate still
+                    # shut.  The controller must report an unknown outcome, not
+                    # "no instruction executed" -- it cannot see which side of
+                    # the write the helper died on.
+                    os._exit(70)
+                try:
+                    release_gate(gate_w)
+                except OSError as error:
                     meta["gate_w"] = -1
-                _send_framed(sock, {"ok": True})
+                    _send_framed(
+                        sock,
+                        {
+                            "phase": RELEASE_PHASE_WRITE_FAILED,
+                            "ok": False,
+                            "released": False,
+                            "error": str(error.errno),
+                        },
+                    )
+                    continue
+                meta["gate_w"] = -1
+                if fault == "die_after_write":
+                    # The gate is open and the acknowledgement never arrives.
+                    os._exit(71)
+                _send_framed(
+                    sock,
+                    {"phase": RELEASE_PHASE_WRITE_COMPLETED, "ok": True, "released": True},
+                )
                 continue
             if op == "poll":
                 pid = int(request["pid"])
@@ -373,11 +435,34 @@ class SpawnedLauncher:
     stderr_fd: int
     _helper: "PrivateMountHelper"
     _awaiting_release: bool = False
+    #: The last release outcome observed for this launcher (M2-B30).
+    release_outcome: GateReleaseOutcome | None = None
 
-    def release(self) -> None:
-        if self._awaiting_release:
-            self._helper.release(self.pid)
-            self._awaiting_release = False
+    def release(self) -> GateReleaseOutcome:
+        """Ask the trusted helper to open the gate and report what is known.
+
+        This never raises on a release failure.  A raised exception cannot say
+        which side of the gate write it came from, and the caller needs exactly
+        that distinction to decide what it may claim about the command.
+        """
+
+        if not self._awaiting_release:
+            phase = (
+                RELEASE_PHASE_ALREADY_RELEASED
+                if self.release_outcome is not None and self.release_outcome.released
+                else RELEASE_PHASE_NOT_GATED
+            )
+            if phase == RELEASE_PHASE_ALREADY_RELEASED:
+                return self.release_outcome
+            outcome = GateReleaseOutcome(
+                RELEASE_NOT_RELEASED, phase, "this launcher was never placed behind a gate"
+            )
+            self.release_outcome = outcome
+            return outcome
+        outcome = self._helper.release(self.pid)
+        self._awaiting_release = False
+        self.release_outcome = outcome
+        return outcome
 
     def poll(self) -> int | None:
         return self._helper.poll(self.pid)
@@ -482,11 +567,42 @@ class PrivateMountHelper:
             _awaiting_release=bool(reply.get("await_release")),
         )
 
-    def release(self, pid: int) -> None:
-        _send_framed(self.conn, {"op": "release", "pid": pid})
-        reply, _fds = _recv_framed(self.conn)
-        if not reply.get("ok"):
-            raise PrivateWorkspaceError("private_mountns_release_failed", str(reply.get("error")))
+    #: Trusted fault seam for the M2-B30 protocol tests.  It is set only by test
+    #: code on the controller side; the untrusted command never speaks this
+    #: protocol and cannot reach it.
+    release_fault: str | None = None
+
+    def release(self, pid: int) -> GateReleaseOutcome:
+        """Two-phase gate release.  Returns a classified outcome, never raises."""
+
+        request: dict[str, Any] = {"op": "release", "pid": pid}
+        if self.release_fault:
+            request["fault"] = self.release_fault
+        try:
+            _send_framed(self.conn, request)
+        except OSError as error:
+            # The helper never saw a complete request frame that it could have
+            # acted on before this send failed, but a partially delivered frame
+            # leaves the helper blocked rather than releasing.  Either way this
+            # controller did not observe an accepted request.
+            return GateReleaseOutcome(
+                RELEASE_OUTCOME_UNKNOWN,
+                RELEASE_PHASE_REQUEST_NOT_SENT,
+                f"the release request could not be delivered: {error}",
+            )
+        accept: dict[str, Any] | None = None
+        completion: dict[str, Any] | None = None
+        transport = ""
+        try:
+            accept, _fds = _recv_framed(self.conn)
+        except (OSError, ValueError, PrivateWorkspaceError) as error:
+            transport = f"the accept frame was not received: {error}"
+        if accept is not None and str(accept.get("phase") or "") == RELEASE_PHASE_ACCEPTED:
+            try:
+                completion, _fds = _recv_framed(self.conn)
+            except (OSError, ValueError, PrivateWorkspaceError) as error:
+                transport = f"the completion frame was not received: {error}"
+        return classify_release_frames(accept, completion, transport_detail=transport)
 
     def poll(self, pid: int) -> int | None:
         _send_framed(self.conn, {"op": "poll", "pid": pid})

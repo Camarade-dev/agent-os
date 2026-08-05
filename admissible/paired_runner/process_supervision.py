@@ -40,7 +40,13 @@ from .observation import (
     StreamObservation,
 )
 from .capsule_seccomp import open_program_descriptor
-from .cgroup_launch import attach_and_verify_real
+from .cgroup_launch import (
+    GateReleaseOutcome,
+    RELEASE_NOT_RELEASED,
+    RELEASE_OUTCOME_UNKNOWN,
+    RELEASE_PHASE_WRITE_NOT_ATTEMPTED,
+    attach_and_verify_real,
+)
 from .resource_limits import (
     MECHANISM_CGROUP_AND_RLIMIT,
     MECHANISM_NONE,
@@ -49,7 +55,9 @@ from .resource_limits import (
     ResourceBounds,
     ResourceContainmentUnavailable,
     containment_semantics,
+    delegation_from_topology_failure,
     effective_mechanism,
+    initialize_cgroup_topology,
     probe_cgroup_delegation,
 )
 from .runtime_binding import BoundRuntime
@@ -224,7 +232,124 @@ def cgroup_delegation(*, force: bool = False) -> CgroupDelegation:
         if _DELEGATION_CACHE is None or force or _DELEGATION_PID != os.getpid():
             _DELEGATION_CACHE = probe_cgroup_delegation(force=force)
             _DELEGATION_PID = os.getpid()
-        return _DELEGATION_CACHE
+            return _DELEGATION_CACHE
+        cached = _DELEGATION_CACHE
+        if not cached.available:
+            return cached
+        # M2-B29.  The cached object is a promise about kernel state, so it is
+        # never handed back on the strength of having been computed once.  Every
+        # production effect re-derives the topology from the kernel first; a
+        # contradiction fails closed and is *not* silently re-bootstrapped.
+        topology = initialize_cgroup_topology()
+        if not topology.initialized:
+            _DELEGATION_CACHE = delegation_from_topology_failure(topology)
+            return _DELEGATION_CACHE
+        return cached
+
+
+#: How long the abort path waits for the effect cgroup to become quiescent.
+ABORT_QUIESCENCE_TIMEOUT_SECONDS = 5.0
+
+
+def _close_owned_descriptors(descriptors: tuple[int, ...]) -> dict[str, Any]:
+    """Close exactly the descriptors this controller owns, once each."""
+
+    closed: list[int] = []
+    already: list[int] = []
+    for descriptor in descriptors:
+        if descriptor is None or descriptor < 0:
+            continue
+        try:
+            os.close(descriptor)
+            closed.append(descriptor)
+        except OSError:
+            # EBADF means this descriptor was already closed; that is the
+            # idempotent case, not a leak and not a second close of a
+            # descriptor some other part of the process now owns.
+            already.append(descriptor)
+    return {"closed": sorted(closed), "already_closed": sorted(already)}
+
+
+def abort_gated_effect(
+    *,
+    process: Any,
+    cgroup: EffectCgroup | None,
+    descriptors: tuple[int, ...] = (),
+    pipes: tuple[Any, ...] = (),
+    release_outcome: GateReleaseOutcome | None,
+    reason: str,
+) -> dict[str, Any]:
+    """Fail one gated effect closed, boundedly, and record what was true.
+
+    M2-B30.  This runs on every abnormal exit from the gate sequence, whether
+    the gate was positively not released or the outcome is unknown.  It is
+    idempotent: a second call over already-killed, already-reaped, already-closed
+    or already-removed resources performs no further destruction and reports the
+    same disposition rather than a second success.
+
+    It never claims the command did not run.  That claim belongs to the release
+    state, which is carried through untouched.
+    """
+
+    evidence: dict[str, Any] = {
+        "reason": reason,
+        "release": (release_outcome or GateReleaseOutcome(
+            RELEASE_NOT_RELEASED, RELEASE_PHASE_WRITE_NOT_ATTEMPTED, "the gate was never reached"
+        )).to_dict(),
+        "kill_domain": None,
+        "launcher_killed": False,
+        "launcher_reaped": False,
+        "launcher_exit_code": None,
+        "quiescence": None,
+        "cgroup_removal": None,
+        "descriptors": None,
+        "pipes_closed": 0,
+    }
+
+    # 1. Destroy the whole process domain.  The effect cgroup is the kill domain
+    #    where one exists, so a descendant that changed session or double-forked
+    #    is still reached; nothing outside this cgroup is ever signalled.
+    if cgroup is not None:
+        evidence["kill_domain"] = cgroup.kill_domain()
+    try:
+        process.kill()
+        evidence["launcher_killed"] = True
+    except Exception:
+        # Already gone, or the helper no longer answers.  Reaping below still
+        # decides whether anything of ours is alive.
+        evidence["launcher_killed"] = False
+
+    # 2. Reap the launcher we own.
+    try:
+        evidence["launcher_exit_code"] = process.wait(timeout=CAPSULE_TEARDOWN_TIMEOUT_SECONDS)
+        evidence["launcher_reaped"] = True
+    except Exception:
+        try:
+            evidence["launcher_exit_code"] = process.poll()
+            evidence["launcher_reaped"] = evidence["launcher_exit_code"] is not None
+        except Exception:
+            evidence["launcher_reaped"] = False
+
+    # 3. Close every descriptor this controller owns.
+    evidence["descriptors"] = _close_owned_descriptors(tuple(descriptors))
+    closed_pipes = 0
+    for pipe in pipes:
+        if pipe is None:
+            continue
+        try:
+            if not getattr(pipe, "closed", False):
+                pipe.close()
+                closed_pipes += 1
+        except OSError:  # pragma: no cover - defensive
+            pass
+    evidence["pipes_closed"] = closed_pipes
+
+    # 4. Wait boundedly for quiescence, then remove the cgroup we own.
+    if cgroup is not None:
+        evidence["quiescence"] = cgroup.wait_quiescent(ABORT_QUIESCENCE_TIMEOUT_SECONDS)
+        cgroup.close()
+        evidence["cgroup_removal"] = cgroup.removal_evidence()
+    return evidence
 
 
 def _containment_evidence(status: dict[str, Any] | None, mechanism: str, cgroup: EffectCgroup | None) -> dict[str, Any]:
@@ -462,35 +587,64 @@ def supervise_command(
         # Child is behind the trusted pipe gate.  Attach, prove membership from
         # a real cgroup2 procs file, then release.  Failure refuses before the
         # launcher image runs and therefore before the untrusted command exists.
+        owned_descriptors = (status_read, status_write, control_read, control_write, seccomp_fd)
         attached = attach_and_verify_real(cgroup, launcher_pid)
         if not attached:
-            try:
-                process.kill()
-            except Exception:
-                pass
-            try:
-                process.wait(timeout=CAPSULE_TEARDOWN_TIMEOUT_SECONDS)
-            except Exception:
-                pass
-            for descriptor in (status_read, status_write, control_read, control_write, seccomp_fd):
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-            stdout_pipe.close()
-            stderr_pipe.close()
-            cgroup.close()
+            # The gate was never reached, so the launcher image never ran and
+            # the untrusted command does not exist.  That is a positively
+            # established NOT_RELEASED, not an inference from an exception.
+            cleanup = abort_gated_effect(
+                process=process,
+                cgroup=cgroup,
+                descriptors=owned_descriptors,
+                pipes=(stdout_pipe, stderr_pipe),
+                release_outcome=GateReleaseOutcome(
+                    RELEASE_NOT_RELEASED,
+                    RELEASE_PHASE_WRITE_NOT_ATTEMPTED,
+                    f"membership was not verified: {cgroup.attach_error}",
+                ),
+                reason="cgroup_membership_unverified",
+            )
             if required_containment_mechanism == MECHANISM_CGROUP_AND_RLIMIT or delegation.available:
                 raise ResourceContainmentUnavailable(
-                    f"cgroup membership was not verified before exec: {cgroup.attach_error}"
+                    f"cgroup membership was not verified before exec: {cgroup.attach_error}",
+                    release_state=RELEASE_NOT_RELEASED,
+                    cleanup_evidence=cleanup,
                 )
         else:
+            # M2-B30.  ``release`` reports what the trusted helper acknowledged.
+            # Only a completed, acknowledged gate write permits the effect to
+            # continue; anything else -- including an ambiguous outcome -- aborts
+            # the whole process domain and refuses completion.
             try:
-                process.release()
-            except Exception as error:
+                release_outcome = process.release()
+            except Exception as error:  # pragma: no cover - the protocol classifies instead
+                release_outcome = GateReleaseOutcome(
+                    RELEASE_OUTCOME_UNKNOWN,
+                    "RELEASE_CALL_RAISED",
+                    f"{type(error).__name__}: {error}",
+                )
+            if not isinstance(release_outcome, GateReleaseOutcome):  # pragma: no cover - legacy seam
+                release_outcome = GateReleaseOutcome(
+                    RELEASE_OUTCOME_UNKNOWN,
+                    "RELEASE_RESULT_UNCLASSIFIED",
+                    f"release returned {type(release_outcome).__name__}",
+                )
+            if not release_outcome.released:
+                cleanup = abort_gated_effect(
+                    process=process,
+                    cgroup=cgroup,
+                    descriptors=owned_descriptors,
+                    pipes=(stdout_pipe, stderr_pipe),
+                    release_outcome=release_outcome,
+                    reason="gate_release_not_confirmed",
+                )
                 raise ResourceContainmentUnavailable(
-                    f"failed to release the gated launcher after cgroup attach: {error}"
-                ) from error
+                    "the gated launcher was not confirmed released after cgroup attach: "
+                    f"{release_outcome.state}/{release_outcome.phase} {release_outcome.detail}",
+                    release_state=release_outcome.state,
+                    cleanup_evidence=cleanup,
+                )
 
     mechanism = effective_mechanism(
         delegation,
@@ -498,21 +652,22 @@ def supervise_command(
         required_mechanism=required_containment_mechanism,
     )
     if mechanism == MECHANISM_NONE and required_containment_mechanism == MECHANISM_CGROUP_AND_RLIMIT:
-        try:
-            process.kill()
-            process.wait(timeout=CAPSULE_TEARDOWN_TIMEOUT_SECONDS)
-        except Exception:
-            pass
-        for descriptor in (status_read, status_write, control_read, control_write, seccomp_fd):
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-        stdout_pipe.close()
-        stderr_pipe.close()
-        cgroup.close()
+        cleanup = abort_gated_effect(
+            process=process,
+            cgroup=cgroup,
+            descriptors=(status_read, status_write, control_read, control_write, seccomp_fd),
+            pipes=(stdout_pipe, stderr_pipe),
+            release_outcome=GateReleaseOutcome(
+                RELEASE_NOT_RELEASED,
+                RELEASE_PHASE_WRITE_NOT_ATTEMPTED,
+                "membership was never verified, so the gate was never released",
+            ),
+            reason="required_mechanism_not_proven",
+        )
         raise ResourceContainmentUnavailable(
-            "readiness promised CGROUP_V2_AND_RLIMIT but membership was not verified"
+            "readiness promised CGROUP_V2_AND_RLIMIT but membership was not verified",
+            release_state=RELEASE_NOT_RELEASED,
+            cleanup_evidence=cleanup,
         )
 
     # The controller keeps only the read end of the status pipe and only the
@@ -778,6 +933,7 @@ def controller_memory_bound(max_output_bytes: int) -> int:
 
 
 __all__ = [
+    "ABORT_QUIESCENCE_TIMEOUT_SECONDS",
     "CONTROLLER_FIXED_OVERHEAD_BYTES",
     "CancellationToken",
     "GRACE_PERIOD_MS",
@@ -786,6 +942,8 @@ __all__ = [
     "STREAM_FINGERPRINT_DOMAINS",
     "SupervisedProcessResult",
     "TERMINATION_ESCALATION_ORDER",
+    "abort_gated_effect",
+    "cgroup_delegation",
     "controller_memory_bound",
     "stream_fingerprint_of",
     "supervise_command",

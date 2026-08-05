@@ -90,6 +90,7 @@ from .private_workspace import (
     compute_change_set,
 )
 from .process_supervision import CancellationToken, supervise_command
+from .cgroup_launch import RELEASE_OUTCOME_UNKNOWN
 from .resource_limits import MECHANISM_CGROUP_AND_RLIMIT, ResourceContainmentUnavailable
 from .runtime_binding import BoundRuntime, RuntimeBindingRefused
 from .sandbox import (
@@ -1269,7 +1270,29 @@ def _run_command(
                 start_hook=start_hook,
                 required_containment_mechanism=required_mechanism,
             )
-        except ResourceContainmentUnavailable:
+        except ResourceContainmentUnavailable as refusal:
+            # M2-B30.  When the trusted gate's release outcome is unknown this
+            # effect may not be recorded as "never started": the controller does
+            # not know which side of the gate write the helper failed on.  The
+            # process domain has been killed, reaped, and cleaned up, but the
+            # execution outcome is reported as unknown rather than as absent.
+            if getattr(refusal, "release_state", None) == RELEASE_OUTCOME_UNKNOWN:
+                cleanup = refusal.cleanup_evidence
+                quiescent = bool((cleanup.get("quiescence") or {}).get("quiescent", False))
+                removal = bool((cleanup.get("cgroup_removal") or {}).get("removed", False))
+                return _command_start_failure(
+                    request,
+                    "cgroup_gate_release_outcome_unknown",
+                    execution_outcome_semantics=(
+                        "EXECUTION_OUTCOME_UNKNOWN: the trusted gate write may have completed "
+                        "before the acknowledgement was lost, so it is not claimed that the "
+                        "proposed command never executed.  The effect process domain was killed "
+                        f"as a cgroup kill domain (quiescent={quiescent}), the launcher was "
+                        f"reaped ({bool(cleanup.get('launcher_reaped', False))}), every owned "
+                        f"descriptor was closed, and the per-effect cgroup was removed ({removal}). "
+                        "No completion and no export were recorded."
+                    ),
+                )
             return _command_start_failure(request, "cgroup_membership_unverified")
 
         process = supervised.process_observation
@@ -1378,8 +1401,21 @@ def _run_command(
             private_view.close()
 
 
-def _command_start_failure(request: RunCommandRequest, error_code: str) -> _CommandExecution:
-    """A launch that failed after STARTED still owes process-domain observations."""
+def _command_start_failure(
+    request: RunCommandRequest,
+    error_code: str,
+    *,
+    execution_outcome_semantics: str | None = None,
+) -> _CommandExecution:
+    """A launch that failed after STARTED still owes process-domain observations.
+
+    ``execution_outcome_semantics`` exists because a refusal around the trusted
+    gate can leave the controller genuinely unable to say whether the launcher
+    image ran (M2-B30).  ``ProcessObservation`` records the absence of an
+    observed process outcome; this sentence records whether that absence means
+    "nothing executed" or "the outcome is unknown", so the durable evidence
+    never overstates the first.
+    """
 
     from .canonical import Fingerprint
     from .observation import ProcessObservation, ResourceObservation, StreamObservation
@@ -1438,11 +1474,17 @@ def _command_start_failure(request: RunCommandRequest, error_code: str) -> _Comm
         child_max_rss_availability="NOT_MEASURED",
         controller_peak_retained_output_bytes=0,
         controller_peak_retained_availability="OBSERVED",
-        measurement_semantics="no process was started; containment was not observed",
+        measurement_semantics=(
+            execution_outcome_semantics
+            or "no process was started; containment was not observed"
+        ),
         containment_mechanism="NONE",
         containment_availability="NOT_MEASURED",
         containment_bounds=(),
-        containment_semantics="no resource containment was recorded for this effect",
+        containment_semantics=(
+            execution_outcome_semantics
+            or "no resource containment was recorded for this effect"
+        ),
     )
     result = RunCommandResult.create(
         request_fingerprint=request.request_fingerprint,

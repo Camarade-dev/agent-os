@@ -211,3 +211,53 @@ readiness has promised the cgroup layer.
 
 Under `ADMISSIBLE_REQUIRE_DELEGATED_CGROUP=1` the delegated tests fail rather
 than skip. A skipped delegated test is a closure failure, never a green run.
+
+# Addendum B: final fail-closed containment rules (M2-B28, M2-B29, M2-B30)
+
+Normative.
+
+## B1. Readiness may not outlive its evidence
+
+`CgroupDelegation.available` is a statement about a completed physical
+rehearsal **including its cleanup**. `probe_cleanup` records the probe path,
+members observed before removal, whether `rmdir` was attempted, its exact errno,
+whether removal succeeded, whether absence was verified, and whether a residual
+path exists. `available=true` with a residual probe cgroup is unreachable, and a
+probe over its own residue collides (`EFFECT_COLLISION`) rather than
+false-greening.
+
+## B2. A cached answer is revalidated before every effect
+
+`process_supervision.cgroup_delegation()` never returns a cached available
+result without re-deriving the topology from the kernel first (see
+M2_CGROUP_LAUNCH_PRIMITIVE_SPEC.md §B2). A contradiction yields
+`STALE_CACHED_TOPOLOGY`, and `effective_mechanism` then reports `NONE` when
+readiness had promised `CGROUP_V2_AND_RLIMIT`, so the effect refuses rather than
+degrading.
+
+## B3. Aggregate containment doubles as the kill domain
+
+Because every process of the effect is accounted to one per-effect cgroup, that
+cgroup is the termination boundary used by the abort path. It reaches every
+descendant, including one that changed session or double-forked, and it reaches
+nothing outside itself.
+
+## B4. Test matrix addendum
+
+| Case | Test |
+| --- | --- |
+| probe removed, absence verified | `test_a_successful_probe_removes_the_probe_and_verifies_its_absence` |
+| `rmdir` EBUSY / EACCES | `test_an_ebusy_rmdir_refuses_and_never_says_removed`, `test_an_eacces_rmdir_refuses_with_its_exact_errno` |
+| success with residual path | `test_a_success_that_leaves_the_path_behind_is_refused` |
+| unexpected disappearance | `test_an_unexpected_disappearance_is_classified_not_called_success` |
+| occupied probe | `test_an_occupied_probe_is_never_removed_and_never_reported_removed` |
+| cleanup precedes any positive result | `test_no_positive_result_is_constructed_before_cleanup_completes` |
+| repeat after cleanup failure | `test_a_repeated_probe_after_a_cleanup_failure_cannot_false_green` |
+| controller disabled / unreadable / missing | `StaleCachedTopologyTests` |
+| same basename, different full path | `test_the_same_basename_at_a_different_full_path_is_refused` |
+| replaced parent / leaf, nested leaf | `test_a_replaced_effect_parent_inode_is_refused`, `test_a_replaced_manager_leaf_is_refused`, `test_a_nested_manager_leaf_is_refused` |
+| parent regained a process | `test_a_parent_that_gained_an_unrelated_process_is_refused` |
+| supervisor cache revalidates / refuses | `SupervisorDelegationCacheTests` |
+| release states and phases | `ReleaseStateClassificationTests`, `ReleaseProtocolTests` |
+| bounded, idempotent, leak-free abort | `AbortGatedEffectTests` |
+| delegated physical qualification | `DelegatedFinalFailClosedTests` |

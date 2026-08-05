@@ -63,7 +63,9 @@ import math
 import os
 from pathlib import Path
 import re
+import stat
 import threading
+import time
 from typing import Any
 
 
@@ -96,7 +98,24 @@ CORE_DUMP_BYTES = 0
 
 
 class ResourceContainmentUnavailable(RuntimeError):
-    """The required bounds cannot be enforced, so no effect may be attempted."""
+    """The required bounds cannot be enforced, so no effect may be attempted.
+
+    ``release_state`` and ``cleanup_evidence`` are populated when the refusal
+    happened around the trusted gate (M2-B30).  They are what the caller uses to
+    decide what it may truthfully claim about whether the command ran, and they
+    are never inferred from the fact that an exception was raised.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        release_state: str | None = None,
+        cleanup_evidence: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.release_state = release_state
+        self.cleanup_evidence = dict(cleanup_evidence or {})
 
 
 @dataclass(frozen=True)
@@ -197,6 +216,12 @@ TOPOLOGY_LIMIT_WRITE_FAILED = "LIMIT_WRITE_FAILED"
 TOPOLOGY_LIMIT_READBACK_MISMATCH = "LIMIT_READBACK_MISMATCH"
 TOPOLOGY_STALE_CACHED_TOPOLOGY = "STALE_CACHED_TOPOLOGY"
 TOPOLOGY_NOT_INITIALIZED = "TOPOLOGY_NOT_INITIALIZED"
+#: M2-B28 -- probe cleanup outcomes.  A probe that cannot be proven gone is
+#: never reported as ``available``, and is never described as "removed".
+TOPOLOGY_PROBE_NOT_EMPTY = "PROBE_NOT_EMPTY"
+TOPOLOGY_PROBE_CLEANUP_FAILED = "PROBE_CLEANUP_FAILED"
+TOPOLOGY_PROBE_RESIDUAL_PATH = "PROBE_RESIDUAL_PATH"
+TOPOLOGY_PROBE_DISAPPEARED = "PROBE_DISAPPEARED"
 
 TOPOLOGY_CODES = (
     TOPOLOGY_INITIALIZED,
@@ -221,6 +246,10 @@ TOPOLOGY_CODES = (
     TOPOLOGY_LIMIT_READBACK_MISMATCH,
     TOPOLOGY_STALE_CACHED_TOPOLOGY,
     TOPOLOGY_NOT_INITIALIZED,
+    TOPOLOGY_PROBE_NOT_EMPTY,
+    TOPOLOGY_PROBE_CLEANUP_FAILED,
+    TOPOLOGY_PROBE_RESIDUAL_PATH,
+    TOPOLOGY_PROBE_DISAPPEARED,
 )
 
 
@@ -395,6 +424,14 @@ class CgroupTopology:
     enabled_controllers: tuple[str, ...] = ()
     owner_pid: int | None = None
     manager_leaf_created: bool = False
+    #: ``dev:ino`` of the two directories, so a path that was removed and
+    #: recreated under the same name is rejected rather than reused (M2-B29).
+    effect_parent_identity: str | None = None
+    manager_leaf_identity: str | None = None
+    #: The full unified-hierarchy path the controller must still report.
+    owner_unified_path: str | None = None
+    #: Whether cgroup2 evidence was required when this topology was derived.
+    cgroup2_required: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -409,6 +446,10 @@ class CgroupTopology:
             "enabled_controllers": list(self.enabled_controllers),
             "owner_pid": self.owner_pid,
             "manager_leaf_created": self.manager_leaf_created,
+            "effect_parent_identity": self.effect_parent_identity,
+            "manager_leaf_identity": self.manager_leaf_identity,
+            "owner_unified_path": self.owner_unified_path,
+            "cgroup2_required": self.cgroup2_required,
         }
 
 
@@ -420,24 +461,128 @@ _TOPOLOGY_LOCK = threading.RLock()
 _TOPOLOGY: CgroupTopology | None = None
 
 
+def _directory_identity(path: Path) -> str | None:
+    """``dev:ino`` of a directory, or ``None`` when it is not a directory.
+
+    A cgroup that was removed and recreated under the same name is a *different*
+    cgroup with different controller state.  Comparing names alone accepts the
+    replacement; comparing identity refuses it.
+    """
+
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(info.st_mode):
+        return None
+    return f"{info.st_dev}:{info.st_ino}"
+
+
+def _unified_path_of(root: Path | str, directory: Path | str) -> str:
+    """The unified-hierarchy path ``directory`` corresponds to under ``root``."""
+
+    relative = os.path.relpath(str(directory), str(root))
+    if relative in (".", ""):
+        return "/"
+    return "/" + relative.replace(os.sep, "/")
+
+
 def _topology_is_still_true(topology: CgroupTopology) -> str | None:
-    """Re-derive a cached topology from kernel state.  Returns a refusal detail."""
+    """Re-derive a cached topology from kernel state.  Returns a refusal detail.
+
+    M2-B29.  Every physically material property that made the cached answer true
+    is checked again here, because the cached Python object is a promise about
+    the kernel and the kernel is free to have changed.  Name equality, path
+    existence, and membership are not sufficient: a replaced directory, a parent
+    that regained a process, or a controller the kernel stopped distributing all
+    invalidate the promise while leaving those three checks green.
+    """
 
     if topology.owner_pid != os.getpid():
+        # A cache inherited across fork() describes the parent's topology.
         return f"cache_pid={topology.owner_pid} current_pid={os.getpid()}"
     if topology.manager_leaf is None or topology.effect_parent is None:
         return "cached topology has no manager leaf"
+    if topology.unified_root is None:
+        return "cached topology has no unified root"
+
+    root = Path(topology.unified_root)
     manager = Path(topology.manager_leaf)
-    if not manager.is_dir():
+    parent = Path(topology.effect_parent)
+
+    manager_identity = _directory_identity(manager)
+    if manager_identity is None:
         return f"the manager leaf {manager} no longer exists"
-    if not Path(topology.effect_parent).is_dir():
-        return f"the effect parent {topology.effect_parent} no longer exists"
-    if os.getpid() not in _members_of(manager):
+    parent_identity = _directory_identity(parent)
+    if parent_identity is None:
+        return f"the effect parent {parent} no longer exists"
+    if topology.manager_leaf_identity is not None and manager_identity != topology.manager_leaf_identity:
+        return (
+            f"the manager leaf {manager} is now {manager_identity}, not the cached "
+            f"{topology.manager_leaf_identity}; it was replaced"
+        )
+    if topology.effect_parent_identity is not None and parent_identity != topology.effect_parent_identity:
+        return (
+            f"the effect parent {parent} is now {parent_identity}, not the cached "
+            f"{topology.effect_parent_identity}; it was replaced"
+        )
+    if manager.parent != parent:
+        return f"the manager leaf {manager} is no longer a child of {parent}"
+
+    members = _members_of(manager)
+    if os.getpid() not in members:
         return f"the controller is no longer a member of {manager}"
-    current = _own_unified_cgroup()
-    if current is not None and Path(current).name != manager.name:
-        return f"the controller unified cgroup is now {current}, not {manager.name}"
+
+    if topology.cgroup2_required:
+        if not is_cgroup2_filesystem(parent):
+            return f"{parent} is no longer on a cgroup2 filesystem"
+        if not is_cgroup2_filesystem(manager):
+            return f"{manager} is no longer on a cgroup2 filesystem"
+        # The full unified path, resolved against the real mount -- not the
+        # basename, which two unrelated leaves can share.
+        expected = topology.owner_unified_path or _unified_path_of(root, manager)
+        current = _own_unified_cgroup()
+        if current is None:
+            return "the controller no longer reports a cgroup v2 unified hierarchy"
+        if current != expected:
+            return f"the controller unified cgroup is now {current}, not {expected}"
+
+    residual = _members_of(parent)
+    if residual:
+        # A populated parent cannot distribute controllers; the promise is dead
+        # whether or not the subtree_control file still reads back.
+        return f"the delegated effect parent {parent} now holds {sorted(residual)}"
+
+    raw_controllers, control_error = _read_control(parent / "cgroup.controllers")
+    if raw_controllers is None:
+        return f"{parent}/cgroup.controllers is unreadable: {control_error}"
+    available = tuple(raw_controllers.split())
+    missing = [name for name in REQUIRED_CONTROLLERS if name not in available]
+    if missing:
+        return f"{parent}/cgroup.controllers no longer offers {missing}"
+
+    enabled, enabled_error = _enabled_controllers(parent)
+    if enabled is None:
+        return f"{parent}/cgroup.subtree_control is unreadable: {enabled_error}"
+    absent = [name for name in REQUIRED_CONTROLLERS if name not in enabled]
+    if absent:
+        return f"{parent}/cgroup.subtree_control no longer enables {absent}"
+
+    if topology.enabled_controllers:
+        regressed = [name for name in topology.enabled_controllers if name not in enabled]
+        if regressed:
+            return f"the cached enabled controllers {regressed} are no longer enabled on {parent}"
+    if topology.available_controllers:
+        gone = [name for name in topology.available_controllers if name not in available]
+        if gone:
+            return f"the cached available controllers {gone} are no longer offered by {parent}"
     return None
+
+
+def revalidate_cgroup_topology(topology: CgroupTopology) -> str | None:
+    """Public form of the cached-topology revalidation (M2-B29)."""
+
+    return _topology_is_still_true(topology)
 
 
 def initialize_cgroup_topology(
@@ -537,6 +682,7 @@ def _bootstrap_topology(
             manager=own_directory,
             parent=own_directory.parent,
             pid=pid,
+            require_cgroup2=require_cgroup2,
         )
 
     parent = own_directory
@@ -666,12 +812,16 @@ def _bootstrap_topology(
         manager_leaf=str(manager),
         enabled_controllers=tuple(enabled),
         manager_leaf_created=True,
+        effect_parent_identity=_directory_identity(parent),
+        manager_leaf_identity=_directory_identity(manager),
+        owner_unified_path=_unified_path_of(root, manager),
+        cgroup2_required=require_cgroup2,
         **common,
     )
 
 
 def _reuse_manager_leaf(
-    *, root: Path, own: str, manager: Path, parent: Path, pid: int
+    *, root: Path, own: str, manager: Path, parent: Path, pid: int, require_cgroup2: bool = True
 ) -> CgroupTopology:
     """Reuse an existing manager leaf this process is already a member of."""
 
@@ -721,6 +871,10 @@ def _reuse_manager_leaf(
         detail=f"the existing trusted manager leaf {manager.name} was reused; no leaf was nested",
         enabled_controllers=tuple(enabled),
         manager_leaf_created=False,
+        effect_parent_identity=_directory_identity(parent),
+        manager_leaf_identity=_directory_identity(manager),
+        owner_unified_path=_unified_path_of(root, manager),
+        cgroup2_required=require_cgroup2,
         **common,
     )
 
@@ -776,6 +930,10 @@ class CgroupDelegation:
     manager_leaf: str | None = None
     enabled_controllers: tuple[str, ...] = ()
     probe_effect_limits: dict[str, int] = field(default_factory=dict)
+    #: M2-B28.  The completed, observed disposition of the probe cgroup.  A
+    #: positive result is constructed only after this records a verified
+    #: removal, so ``available`` can never coexist with a residual probe path.
+    probe_cleanup: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -788,10 +946,13 @@ class CgroupDelegation:
             "manager_leaf": self.manager_leaf,
             "enabled_controllers": list(self.enabled_controllers),
             "probe_effect_limits": dict(self.probe_effect_limits),
+            "probe_cleanup": dict(self.probe_cleanup),
         }
 
 
-def _delegation_from_failure(topology: CgroupTopology) -> CgroupDelegation:
+def _delegation_from_failure(
+    topology: CgroupTopology, *, probe_cleanup: dict[str, Any] | None = None
+) -> CgroupDelegation:
     return CgroupDelegation(
         available=False,
         detail=f"{topology.code}: {topology.detail}",
@@ -801,7 +962,86 @@ def _delegation_from_failure(topology: CgroupTopology) -> CgroupDelegation:
         code=topology.code,
         manager_leaf=topology.manager_leaf,
         enabled_controllers=topology.enabled_controllers,
+        probe_cleanup=dict(probe_cleanup or {}),
     )
+
+
+def delegation_from_topology_failure(
+    topology: CgroupTopology, *, probe_cleanup: dict[str, Any] | None = None
+) -> CgroupDelegation:
+    """Public form used by the supervisor when a cached topology goes stale."""
+
+    return _delegation_from_failure(topology, probe_cleanup=probe_cleanup)
+
+
+def _remove_owned_probe(probe: Path) -> dict[str, Any]:
+    """Remove the probe cgroup this process created and prove it is gone.
+
+    M2-B28.  The word "removed" is only ever produced by this function, and only
+    when ``rmdir`` succeeded *and* the path was then observed to be absent.
+    Every other outcome -- ``EBUSY``, ``EACCES``, a success that left the path
+    behind, a disappearance this process did not perform -- is reported with its
+    exact classification and with whether a residual path exists.
+    """
+
+    evidence: dict[str, Any] = {
+        "probe_path": str(probe),
+        "owned": True,
+        "members_before_removal": sorted(_members_of(probe)),
+        "rmdir_attempted": False,
+        "rmdir_errno": None,
+        "removed": False,
+        "absence_verified": False,
+        "residual_path_exists": None,
+        "code": None,
+        "detail": "",
+    }
+
+    if evidence["members_before_removal"]:
+        evidence["residual_path_exists"] = probe.exists()
+        evidence["code"] = TOPOLOGY_PROBE_NOT_EMPTY
+        evidence["detail"] = (
+            f"{probe} still holds {evidence['members_before_removal']}; an occupied probe cgroup "
+            "is never removed and never reported removed"
+        )
+        return evidence
+
+    evidence["rmdir_attempted"] = True
+    try:
+        probe.rmdir()
+    except FileNotFoundError as error:
+        # This process created the probe and has not removed it.  Something else
+        # did.  Disappearance is not proof of a safe, expected removal, so it is
+        # classified rather than treated as success.
+        evidence["rmdir_errno"] = _errno_name(error)
+        evidence["residual_path_exists"] = probe.exists()
+        evidence["code"] = TOPOLOGY_PROBE_DISAPPEARED
+        evidence["detail"] = (
+            f"{probe} was already gone when this process removed it (ENOENT); the owned probe "
+            "cgroup's lifecycle was not under this controller's sole control"
+        )
+        return evidence
+    except OSError as error:
+        evidence["rmdir_errno"] = _errno_name(error)
+        evidence["residual_path_exists"] = probe.exists()
+        evidence["code"] = TOPOLOGY_PROBE_CLEANUP_FAILED
+        evidence["detail"] = f"{probe}: rmdir failed with {evidence['rmdir_errno']}"
+        return evidence
+
+    # rmdir returned success.  That is a claim, not an observation; check.
+    still_there = probe.exists()
+    evidence["residual_path_exists"] = still_there
+    if still_there:
+        evidence["code"] = TOPOLOGY_PROBE_RESIDUAL_PATH
+        evidence["detail"] = (
+            f"rmdir reported success but {probe} still exists; no availability is claimed over a "
+            "residual probe cgroup"
+        )
+        return evidence
+    evidence["removed"] = True
+    evidence["absence_verified"] = True
+    evidence["detail"] = f"{probe} was removed and its absence was verified"
+    return evidence
 
 
 def probe_cgroup_delegation(*, force: bool = False) -> CgroupDelegation:
@@ -852,39 +1092,55 @@ def probe_cgroup_delegation(*, force: bool = False) -> CgroupDelegation:
                 enabled_controllers=topology.enabled_controllers,
             )
         )
-    try:
-        code, detail, observed = _apply_and_read_back_limits(probe, intended)
-        if code is not None:
-            return _delegation_from_failure(
-                _failed(
-                    code,
-                    detail,
-                    unified_root=topology.unified_root,
-                    effect_parent=str(parent),
-                    manager_leaf=topology.manager_leaf,
-                    available_controllers=topology.available_controllers,
-                    enabled_controllers=topology.enabled_controllers,
-                )
-            )
-        return CgroupDelegation(
-            available=True,
-            detail=(
-                "a real effect cgroup was created beneath the delegated parent, carried finite "
-                f"{sorted(observed)} read back from the kernel, and was removed"
+    def _refuse(code: str, detail: str, cleanup: dict[str, Any] | None = None) -> CgroupDelegation:
+        return _delegation_from_failure(
+            _failed(
+                code,
+                detail,
+                unified_root=topology.unified_root,
+                effect_parent=str(parent),
+                manager_leaf=topology.manager_leaf,
+                available_controllers=topology.available_controllers,
+                enabled_controllers=topology.enabled_controllers,
             ),
-            unified_root=topology.unified_root,
-            delegated_path=topology.effect_parent,
-            controllers=topology.available_controllers,
-            code=TOPOLOGY_INITIALIZED,
-            manager_leaf=topology.manager_leaf,
-            enabled_controllers=topology.enabled_controllers,
-            probe_effect_limits=observed,
+            probe_cleanup=cleanup,
         )
-    finally:
-        try:
-            probe.rmdir()
-        except OSError:  # pragma: no cover - the probe cgroup is ours and empty
-            pass
+
+    # M2-B28.  Nothing below constructs a positive result.  The limits are
+    # rehearsed, the probe is removed, and its absence is verified *first*; only
+    # then is availability stated, and the statement is built from the cleanup
+    # evidence rather than asserted alongside it.
+    code, detail, observed = _apply_and_read_back_limits(probe, intended)
+    cleanup = _remove_owned_probe(probe)
+    if code is not None:
+        return _refuse(code, f"{detail}; probe cleanup: {cleanup['detail'] or 'removed'}", cleanup)
+    if cleanup["code"] is not None:
+        # The rehearsal itself succeeded, but this controller cannot prove it
+        # left the delegated parent as it found it.  Refuse: a residual probe
+        # cgroup would collide with the next probe and is never called removed.
+        return _refuse(cleanup["code"], cleanup["detail"], cleanup)
+    if not cleanup["removed"] or not cleanup["absence_verified"]:  # pragma: no cover - defensive
+        return _refuse(
+            TOPOLOGY_PROBE_CLEANUP_FAILED,
+            f"probe cleanup did not prove removal: {cleanup}",
+            cleanup,
+        )
+    return CgroupDelegation(
+        available=True,
+        detail=(
+            "a real effect cgroup was created beneath the delegated parent, carried finite "
+            f"{sorted(observed)} read back from the kernel, and was removed with its absence "
+            "verified"
+        ),
+        unified_root=topology.unified_root,
+        delegated_path=topology.effect_parent,
+        controllers=topology.available_controllers,
+        code=TOPOLOGY_INITIALIZED,
+        manager_leaf=topology.manager_leaf,
+        enabled_controllers=topology.enabled_controllers,
+        probe_effect_limits=observed,
+        probe_cleanup=cleanup,
+    )
 
 
 def _apply_and_read_back_limits(
@@ -942,6 +1198,7 @@ class EffectCgroup:
         }
         self.create_error: str | None = None
         self.attach_error: str | None = None
+        self._removal_evidence: dict[str, Any] = {}
 
     @property
     def active(self) -> bool:
@@ -1026,28 +1283,132 @@ class EffectCgroup:
             "membership_verified": self._membership_verified,
         }
 
+    def kill_domain(self) -> dict[str, Any]:
+        """Terminate every process accounted to this cgroup, and nothing else.
+
+        ``cgroup.kill`` is used when the kernel offers it, because it is atomic
+        over the whole subtree and cannot race a fork.  Where it is absent the
+        observed members are signalled individually, which is bounded by the
+        membership list this cgroup owns: no unrelated process is ever reached,
+        because a PID that is not in *this* cgroup is never signalled.
+        """
+
+        evidence: dict[str, Any] = {
+            "effect_path": self.path,
+            "mechanism": None,
+            "members_signalled": [],
+            "errors": [],
+        }
+        if self._path is None:
+            evidence["mechanism"] = "NO_CGROUP"
+            return evidence
+        kill_file = self._path / "cgroup.kill"
+        if kill_file.exists():
+            error = _write_control(kill_file, "1\n")
+            evidence["mechanism"] = "CGROUP_KILL"
+            evidence["members_signalled"] = sorted(self.members())
+            if error is not None:
+                evidence["errors"].append(f"cgroup.kill:{error}")
+            else:
+                return evidence
+        members = sorted(self.members())
+        evidence["mechanism"] = "SIGKILL_MEMBERS" if evidence["mechanism"] is None else evidence["mechanism"]
+        for pid in members:
+            try:
+                os.kill(pid, 9)
+            except OSError as error:
+                evidence["errors"].append(f"{pid}:{_errno_name(error)}")
+        evidence["members_signalled"] = members
+        return evidence
+
+    def wait_quiescent(self, timeout_seconds: float) -> dict[str, Any]:
+        """Wait, boundedly, for the cgroup to hold no members."""
+
+        evidence: dict[str, Any] = {"effect_path": self.path, "quiescent": True, "residual_members": []}
+        if self._path is None:
+            return evidence
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        while True:
+            live = self.members()
+            if not live:
+                evidence["quiescent"] = True
+                evidence["residual_members"] = []
+                return evidence
+            if time.monotonic() >= deadline:
+                evidence["quiescent"] = False
+                evidence["residual_members"] = sorted(live)
+                return evidence
+            time.sleep(0.01)
+
+    def removal_evidence(self) -> dict[str, Any]:
+        """The truthful disposition of this cgroup after :meth:`close`."""
+
+        return dict(self._removal_evidence)
+
     def close(self) -> bool:
-        """Remove the subtree.  Returns False if live members prevent removal."""
+        """Remove the subtree.  Returns False if live members prevent removal.
+
+        Idempotent: after a successful removal the object holds no path, and a
+        repeated call is a no-op that neither touches the filesystem nor reports
+        a second success as though it had removed something again.
+        """
 
         if self._path is None:
+            # Idempotent: either nothing was ever created, or a previous call
+            # removed it.  Neither is a second removal, and neither is reported
+            # as one.
+            self._removal_evidence = {
+                "effect_path": self._removal_evidence.get("effect_path"),
+                "removed": False,
+                "absence_verified": True,
+                "residual_path_exists": False,
+                "detail": (
+                    "the per-effect cgroup is already absent; this call removed nothing"
+                    if self._removal_evidence
+                    else "no per-effect cgroup was ever created"
+                ),
+            }
             return True
+        path = self._path
         live = self.members()
         if live:
             self.attach_error = f"live_members:{sorted(live)}"
+            self._removal_evidence = {
+                "effect_path": str(path),
+                "removed": False,
+                "absence_verified": False,
+                "residual_path_exists": True,
+                "residual_members": sorted(live),
+                "detail": f"{path} still holds {sorted(live)}; it is not removed and not called removed",
+            }
             return False
-        removed = self._remove(self._path)
-        if removed:
+        removed, rmdir_error = self._remove(path)
+        residual = path.exists()
+        self._removal_evidence = {
+            "effect_path": str(path),
+            "removed": bool(removed and not residual),
+            "absence_verified": not residual,
+            "residual_path_exists": residual,
+            "rmdir_errno": rmdir_error,
+            "detail": (
+                f"{path} was removed and its absence was verified"
+                if removed and not residual
+                else f"{path}: rmdir removed={removed} errno={rmdir_error} residual_path={residual}"
+            ),
+        }
+        if removed and not residual:
             self._path = None
             self._membership_verified = False
-        return removed
+            return True
+        return False
 
     @staticmethod
-    def _remove(path: Path) -> bool:
+    def _remove(path: Path) -> tuple[bool, str | None]:
         try:
             path.rmdir()
-            return True
-        except OSError:
-            return False
+            return True, None
+        except OSError as error:
+            return False, _errno_name(error)
 
 
 # --- the mechanism actually in force ----------------------------------------
@@ -1122,6 +1483,10 @@ __all__ = [
     "TOPOLOGY_NO_UNIFIED_CGROUP_V2",
     "TOPOLOGY_NOT_INITIALIZED",
     "TOPOLOGY_PARENT_STILL_POPULATED",
+    "TOPOLOGY_PROBE_CLEANUP_FAILED",
+    "TOPOLOGY_PROBE_DISAPPEARED",
+    "TOPOLOGY_PROBE_NOT_EMPTY",
+    "TOPOLOGY_PROBE_RESIDUAL_PATH",
     "TOPOLOGY_STALE_CACHED_TOPOLOGY",
     "TOPOLOGY_SUBTREE_CONTROL_UNREADABLE",
     "TOPOLOGY_SUBTREE_CONTROL_WRITE_FAILED",
@@ -1140,6 +1505,8 @@ __all__ = [
     "ResourceBounds",
     "ResourceContainmentUnavailable",
     "containment_semantics",
+    "delegation_from_topology_failure",
     "effective_mechanism",
     "probe_cgroup_delegation",
+    "revalidate_cgroup_topology",
 ]

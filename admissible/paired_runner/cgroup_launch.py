@@ -20,6 +20,7 @@ injected through ``subprocess.Popen(preexec_fn=...)``.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import errno
 import os
 from pathlib import Path
@@ -36,6 +37,135 @@ LAUNCH_ORDER = (
     "RELEASE_GATE",
     "EXEC_LAUNCHER",
 )
+
+# --- M2-B30: the release-state model ----------------------------------------
+#
+# A gate release is an instruction handed to the trusted helper across a socket.
+# An exception raised by the caller therefore answers "did the call finish?",
+# never "did the gate open?".  Those are different questions, and conflating
+# them produced a claim -- "the command never ran" -- that the controller was
+# not in a position to make.
+#
+# The protocol below separates them.  The helper acknowledges *twice*: once when
+# the request has been accepted and the gate write has not yet been attempted,
+# and once after the write has either completed or failed.  Which
+# acknowledgements arrived is what decides the state:
+#
+#   no accept frame ................ RELEASE_OUTCOME_UNKNOWN
+#   accept, then no completion ..... RELEASE_OUTCOME_UNKNOWN  (ack lost)
+#   terminal first frame ........... NOT_RELEASED   (write never attempted)
+#   completion says write failed ... NOT_RELEASED
+#   completion says written ........ RELEASED
+
+RELEASE_NOT_RELEASED = "NOT_RELEASED"
+RELEASE_RELEASED = "RELEASED"
+RELEASE_OUTCOME_UNKNOWN = "RELEASE_OUTCOME_UNKNOWN"
+
+RELEASE_STATES = (RELEASE_NOT_RELEASED, RELEASE_RELEASED, RELEASE_OUTCOME_UNKNOWN)
+
+#: Protocol phases, in the order the trusted helper passes through them.
+RELEASE_PHASE_NOT_GATED = "NOT_GATED"
+RELEASE_PHASE_ALREADY_RELEASED = "ALREADY_RELEASED"
+RELEASE_PHASE_REQUEST_NOT_SENT = "RELEASE_REQUEST_NOT_SENT"
+RELEASE_PHASE_ACCEPT_FRAME_LOST = "RELEASE_ACCEPT_FRAME_LOST"
+RELEASE_PHASE_WRITE_NOT_ATTEMPTED = "RELEASE_WRITE_NOT_ATTEMPTED"
+RELEASE_PHASE_ACCEPTED = "RELEASE_ACCEPTED"
+RELEASE_PHASE_WRITE_FAILED = "RELEASE_WRITE_FAILED"
+RELEASE_PHASE_WRITE_COMPLETED = "RELEASE_WRITE_COMPLETED"
+RELEASE_PHASE_ACK_LOST = "RELEASE_ACK_LOST"
+RELEASE_PHASE_ACK_AMBIGUOUS = "RELEASE_ACK_AMBIGUOUS"
+
+RELEASE_PHASES = (
+    RELEASE_PHASE_NOT_GATED,
+    RELEASE_PHASE_ALREADY_RELEASED,
+    RELEASE_PHASE_REQUEST_NOT_SENT,
+    RELEASE_PHASE_ACCEPT_FRAME_LOST,
+    RELEASE_PHASE_WRITE_NOT_ATTEMPTED,
+    RELEASE_PHASE_ACCEPTED,
+    RELEASE_PHASE_WRITE_FAILED,
+    RELEASE_PHASE_WRITE_COMPLETED,
+    RELEASE_PHASE_ACK_LOST,
+    RELEASE_PHASE_ACK_AMBIGUOUS,
+)
+
+
+@dataclass(frozen=True)
+class GateReleaseOutcome:
+    """What the controller may truthfully say about one gate release."""
+
+    state: str
+    phase: str
+    detail: str = ""
+
+    @property
+    def released(self) -> bool:
+        return self.state == RELEASE_RELEASED
+
+    @property
+    def not_released(self) -> bool:
+        return self.state == RELEASE_NOT_RELEASED
+
+    @property
+    def unknown(self) -> bool:
+        return self.state == RELEASE_OUTCOME_UNKNOWN
+
+    @property
+    def sentinel_claim(self) -> str:
+        """What may be claimed about whether the gated image ran."""
+
+        if self.state == RELEASE_RELEASED:
+            return "THE_LAUNCHER_WAS_RELEASED"
+        if self.state == RELEASE_NOT_RELEASED:
+            return "NO_INSTRUCTION_EXECUTED"
+        return "EXECUTION_OUTCOME_UNKNOWN"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "release_state": self.state,
+            "release_phase": self.phase,
+            "release_detail": self.detail,
+            "sentinel_claim": self.sentinel_claim,
+        }
+
+
+def classify_release_frames(
+    accept_frame: dict[str, Any] | None,
+    completion_frame: dict[str, Any] | None,
+    *,
+    transport_detail: str = "",
+) -> GateReleaseOutcome:
+    """Decide the release state from what the helper actually acknowledged."""
+
+    if accept_frame is None:
+        return GateReleaseOutcome(
+            RELEASE_OUTCOME_UNKNOWN, RELEASE_PHASE_ACCEPT_FRAME_LOST, transport_detail
+        )
+    phase = str(accept_frame.get("phase") or "")
+    if phase != RELEASE_PHASE_ACCEPTED:
+        # The helper answered terminally before touching the gate.
+        return GateReleaseOutcome(
+            RELEASE_NOT_RELEASED,
+            phase or RELEASE_PHASE_WRITE_NOT_ATTEMPTED,
+            str(accept_frame.get("error") or ""),
+        )
+    if completion_frame is None:
+        return GateReleaseOutcome(
+            RELEASE_OUTCOME_UNKNOWN, RELEASE_PHASE_ACK_LOST, transport_detail
+        )
+    completion_phase = str(completion_frame.get("phase") or "")
+    if completion_phase == RELEASE_PHASE_WRITE_COMPLETED and completion_frame.get("released"):
+        return GateReleaseOutcome(RELEASE_RELEASED, RELEASE_PHASE_WRITE_COMPLETED, "")
+    if completion_phase == RELEASE_PHASE_WRITE_FAILED:
+        return GateReleaseOutcome(
+            RELEASE_NOT_RELEASED, RELEASE_PHASE_WRITE_FAILED, str(completion_frame.get("error") or "")
+        )
+    # Anything else is a frame this controller does not understand.  It is never
+    # read as "nothing happened".
+    return GateReleaseOutcome(
+        RELEASE_OUTCOME_UNKNOWN,
+        RELEASE_PHASE_ACK_AMBIGUOUS,
+        f"unrecognised completion frame: {sorted(completion_frame.items())}",
+    )
 
 
 class CgroupLaunchRefused(RuntimeError):
@@ -135,8 +265,25 @@ def launch_order_description() -> dict[str, Any]:
 __all__ = [
     "CGROUP2_SUPER_MAGIC",
     "CgroupLaunchRefused",
+    "GateReleaseOutcome",
     "LAUNCH_ORDER",
+    "RELEASE_NOT_RELEASED",
+    "RELEASE_OUTCOME_UNKNOWN",
+    "RELEASE_PHASES",
+    "RELEASE_PHASE_ACCEPTED",
+    "RELEASE_PHASE_ACCEPT_FRAME_LOST",
+    "RELEASE_PHASE_ACK_AMBIGUOUS",
+    "RELEASE_PHASE_ACK_LOST",
+    "RELEASE_PHASE_ALREADY_RELEASED",
+    "RELEASE_PHASE_NOT_GATED",
+    "RELEASE_PHASE_REQUEST_NOT_SENT",
+    "RELEASE_PHASE_WRITE_COMPLETED",
+    "RELEASE_PHASE_WRITE_FAILED",
+    "RELEASE_PHASE_WRITE_NOT_ATTEMPTED",
+    "RELEASE_RELEASED",
+    "RELEASE_STATES",
     "attach_and_verify_real",
+    "classify_release_frames",
     "gate_child_before_exec",
     "launch_order_description",
     "release_gate",

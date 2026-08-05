@@ -153,3 +153,94 @@ fault coverage of every transition above, plus delegated physical tests that
 drive the production `SharedEffectSubstrate` path. Under
 `ADMISSIBLE_REQUIRE_DELEGATED_CGROUP=1` the physical tests fail rather than
 skip; a skipped delegated test is a closure failure.
+
+# Addendum B: final fail-closed repair (M2-B28, M2-B29, M2-B30)
+
+Normative. This addendum extends, and does not replace, Addendum A.
+
+## B1. Probe cleanup truthfulness (M2-B28)
+
+`probe_cgroup_delegation()` may construct a positive result only after all of
+the following have completed **and been observed**:
+
+1. the manager topology was initialized or revalidated;
+2. a real probe-effect cgroup was created;
+3. `pids.max` was written and read back exactly;
+4. `memory.max` was written and read back exactly;
+5. the probe cgroup was observed to hold no members;
+6. the owned probe cgroup was removed;
+7. the probe path was observed to be absent.
+
+Removal failure returns a refused, classified result carrying the exact errno
+and whether a residual path exists. `PROBE_NOT_EMPTY`, `PROBE_CLEANUP_FAILED`,
+`PROBE_RESIDUAL_PATH`, and `PROBE_DISAPPEARED` are the classifications. `ENOENT`
+is `PROBE_DISAPPEARED`: this controller created the probe and did not remove it,
+so its disappearance is not evidence of a safe, expected removal. The word
+"removed" is produced only by verified absence. No unowned cgroup is created,
+mutated, or removed on any path.
+
+## B2. Cached-topology revalidation (M2-B29)
+
+Before a cached topology or a cached delegation result is reused for a
+production effect or a positive readiness answer, the following are re-derived
+from the kernel: owner PID identity; existence of the manager leaf and the
+effect parent; `dev:ino` identity of both, so a directory removed and recreated
+under the same name is refused; the manager leaf is still a child of the effect
+parent; the controller is still a member of the manager leaf; both directories
+are still on a cgroup2 filesystem; the controller's **full** unified path from
+`/proc/self/cgroup` — never the basename — equals the recorded path; the
+delegated effect parent holds no processes; `cgroup.controllers` still offers
+`memory` and `pids`; `cgroup.subtree_control` is readable and still enables
+them; and no cached controller set has regressed.
+
+Any contradiction returns `STALE_CACHED_TOPOLOGY` with a precise reason. The
+refusal is cached: nothing is silently re-bootstrapped, no process is moved, no
+controller is re-enabled, no effect cgroup is created, and a promised
+`CGROUP_V2_AND_RLIMIT` is never downgraded to `RLIMIT`. A cache inherited across
+`fork()` is never reused by the child.
+
+## B3. Release-state model (M2-B30)
+
+The trusted helper acknowledges a gate release **twice**: once when the request
+has been accepted and the write has not yet been attempted, and once after the
+write completed or failed. The controller derives exactly one of:
+
+| observation | state |
+| --- | --- |
+| terminal first frame (`RELEASE_WRITE_NOT_ATTEMPTED`) | `NOT_RELEASED` |
+| completion frame reports the write failed | `NOT_RELEASED` |
+| completion frame reports the write completed | `RELEASED` |
+| accept frame not received | `RELEASE_OUTCOME_UNKNOWN` |
+| accept received, completion lost | `RELEASE_OUTCOME_UNKNOWN` |
+| unrecognised completion frame | `RELEASE_OUTCOME_UNKNOWN` |
+
+`release()` does not raise on a protocol failure: an exception cannot say which
+side of the write it came from. Gate-before-exec ordering, membership
+verification before the release request, and the nominal successful release are
+unchanged. No untrusted acknowledgement exists: only the trusted helper speaks
+this protocol.
+
+## B4. Bounded cleanup on refusal or ambiguity
+
+On `NOT_RELEASED` and on `RELEASE_OUTCOME_UNKNOWN` alike, the effect is refused,
+completion and export are refused, and `abort_gated_effect` runs: the effect
+cgroup is used as a kill domain (`cgroup.kill` where the kernel offers it,
+otherwise `SIGKILL` to exactly its observed members and to nothing else); the
+owned launcher is killed and reaped; every owned descriptor and pipe is closed;
+quiescence is awaited under a bounded timeout; the owned per-effect cgroup is
+removed and its absence verified, or its residual state is recorded truthfully.
+Cleanup is idempotent: a repeated call removes nothing further and reports no
+second success.
+
+Under `RELEASE_OUTCOME_UNKNOWN` the evidence states
+`EXECUTION_OUTCOME_UNKNOWN`. It is never claimed that the sentinel is absent or
+that no instruction executed. The guaranteed properties there are: no successful
+completion or export, bounded termination, no live process leak, no descriptor
+leak, no per-effect cgroup leak, and truthful ambiguity evidence.
+
+## B5. Tests
+
+`tests/test_admissible_paired_runner_m2_b25_final_failclosed.py` covers every
+case above deterministically and adds delegated physical qualification for the
+probe absence, revalidated repeated effects, the pre-release refusal, the lost
+acknowledgement, the nominal release, and cleanup idempotence.
