@@ -32,6 +32,24 @@ M2-B40 -- one deadline for one bounded cleanup
     and never a new budget, and what each stage was granted, completed, or left
     incomplete is recorded.
 
+M2-B41 -- a nested acquisition is an acquisition
+    The cached branch of ``acquire`` incremented the reference count without
+    asking the kernel anything, so a second acquisition could be declared valid
+    while the process-wide flag had been cleared or contradicted underneath it.
+    Every acquisition that can authorize a fork now reads
+    ``PR_GET_CHILD_SUBREAPER`` immediately before it increments the depth, and a
+    contradiction refuses without changing depth, references, or the baseline.
+
+M2-B42 -- a failed restoration is a debt, not a footnote
+    After a restoration failed verification the object was left at depth zero
+    with nothing owed on paper, so the next ``acquire`` read the *residual*
+    kernel value as a fresh baseline and a later release could report a green
+    restoration to the wrong value.  A failed restoration now latches explicit
+    process-wide ownership debt: the original baseline is immutable, every new
+    acquisition refuses, and only :meth:`ChildSubreaperOwnership.
+    settle_restoration_debt` -- which claims nothing it did not read back --
+    clears it.
+
 M2-B33 -- controller-owned bounds
     Every helper round trip was a blocking read with no deadline the controller
     itself enforced.  A helper that is alive but wedged, stopped, or
@@ -402,6 +420,28 @@ SUBREAPER_ACQUISITION_REFUSALS = (
     SUBREAPER_READBACK_FAILED,
     SUBREAPER_READBACK_MISMATCH,
 )
+#: M2-B41 / M2-B42.  Refusals that come from the *ownership state* rather than
+#: from a syscall this acquisition made: the live kernel contradicted an
+#: acquisition this object already holds, or the process still owes a
+#: restoration nobody has settled.  They are refusals in exactly the same sense
+#: -- none of them may be followed by a fork -- and they are declared separately
+#: because they are the answers to different questions.
+SUBREAPER_NESTED_READBACK_FAILED = "NESTED_ACQUISITION_READBACK_FAILED"
+SUBREAPER_NESTED_CONTRADICTED = "NESTED_ACQUISITION_KERNEL_CONTRADICTED"
+SUBREAPER_NESTED_NOT_OWNED = "NESTED_ACQUISITION_NOT_OWNED_BY_THIS_PID"
+SUBREAPER_DEBT_OUTSTANDING = "RESTORATION_DEBT_OUTSTANDING"
+
+SUBREAPER_OWNERSHIP_STATE_REFUSALS = (
+    SUBREAPER_NESTED_READBACK_FAILED,
+    SUBREAPER_NESTED_CONTRADICTED,
+    SUBREAPER_NESTED_NOT_OWNED,
+    SUBREAPER_DEBT_OUTSTANDING,
+)
+#: Every code after which a fork is forbidden.  A consumer that wants the whole
+#: gate reads this rather than either half of it.
+SUBREAPER_FORK_FORBIDDEN_CODES = (
+    SUBREAPER_ACQUISITION_REFUSALS + SUBREAPER_OWNERSHIP_STATE_REFUSALS
+)
 #: The complete release state machine.
 SUBREAPER_RELEASE_RESULTS = (
     SUBREAPER_RESTORED,
@@ -412,6 +452,65 @@ SUBREAPER_RELEASE_RESULTS = (
     SUBREAPER_ALREADY_RELEASED,
     SUBREAPER_INHERITED_DISCARDED,
 )
+#: The release results that leave the process-wide flag away from the baseline
+#: this ownership owes.  Each of them latches debt (M2-B42); every other result
+#: settles what this release was responsible for.
+SUBREAPER_UNSETTLED_RESULTS = (
+    SUBREAPER_RESTORE_SET_FAILED,
+    SUBREAPER_RESTORE_READBACK_FAILED,
+    SUBREAPER_RESTORE_MISMATCH,
+)
+
+# --- M2-B42: the ownership state machine, stated rather than implied ----------
+
+#: Nothing is held and nothing is owed.
+SUBREAPER_STATE_CLEAN = "CLEAN_UNOWNED"
+#: One acquisition is held and the kernel confirmed it.
+SUBREAPER_STATE_OWNED = "ACTIVELY_OWNED"
+#: More than one acquisition shares the single activation.
+SUBREAPER_STATE_NESTED = "NESTED_REFERENCE_RETAINED"
+#: A restoration was attempted and not observed.  The baseline is still owed.
+SUBREAPER_STATE_RESTORATION_OWED = "RESTORATION_OWED"
+#: The live kernel contradicted an acquisition this object holds, or could not
+#: be read at all.  Nothing here may authorize a fork.
+SUBREAPER_STATE_POISONED = "POISONED_UNREADABLE"
+#: The last release restored the baseline and the kernel read it back.
+SUBREAPER_STATE_TERMINAL_RESTORED = "TERMINAL_RESTORED"
+#: A copy carried across ``fork`` describing a flag this process never set.
+SUBREAPER_STATE_INHERITED_DISCARDED = "INHERITED_DISCARDED"
+
+SUBREAPER_STATES = (
+    SUBREAPER_STATE_CLEAN,
+    SUBREAPER_STATE_OWNED,
+    SUBREAPER_STATE_NESTED,
+    SUBREAPER_STATE_RESTORATION_OWED,
+    SUBREAPER_STATE_POISONED,
+    SUBREAPER_STATE_TERMINAL_RESTORED,
+    SUBREAPER_STATE_INHERITED_DISCARDED,
+)
+#: The states in which no new acquisition may be granted.
+SUBREAPER_DEBT_STATES = (SUBREAPER_STATE_RESTORATION_OWED, SUBREAPER_STATE_POISONED)
+
+
+#: M2-B42.  The debt is a fact about *this process's* flag, not about one
+#: object's bookkeeping, so it lives beside the flag rather than inside whichever
+#: :class:`ChildSubreaperOwnership` happened to incur it.  Replacing the
+#: ownership object -- including replacing the module-level singleton -- must not
+#: be a way to forget what the process still owes.  The entry records the PID
+#: that incurred it, so a ``fork`` child (which inherits this module's memory but
+#: not the flag) neither owes it nor can settle it.
+_DEBT_LOCK = threading.RLock()
+_PROCESS_RESTORATION_DEBT: dict[str, Any] | None = None
+
+
+def process_restoration_debt() -> dict[str, Any] | None:
+    """The unresolved process-wide restoration this process owes, if any."""
+
+    with _DEBT_LOCK:
+        debt = _PROCESS_RESTORATION_DEBT
+        if debt is None or int(debt.get("owner_pid") or 0) != os.getpid():
+            return None
+        return dict(debt)
 
 
 class ChildSubreaperUnavailable(RuntimeError):
@@ -481,6 +580,39 @@ class ChildSubreaperOwnership:
         self._restoration_verified = False
         self._cleanup_complete = True
         self._released_nothing = True
+        self._state: str = SUBREAPER_STATE_CLEAN
+
+    # M2-B42.  The one explicit latch for unresolved process-wide ownership
+    # debt.  While it exists no acquisition is granted, the baseline it records
+    # is immutable, and nothing but a positively verified settlement clears it.
+    # It is stored beside the flag it describes, so a second ownership object --
+    # or a replacement of the singleton -- inherits the debt rather than a clean
+    # slate.
+
+    @property
+    def _debt(self) -> dict[str, Any] | None:
+        with _DEBT_LOCK:
+            return _PROCESS_RESTORATION_DEBT
+
+    @_debt.setter
+    def _debt(self, value: dict[str, Any] | None) -> None:
+        global _PROCESS_RESTORATION_DEBT
+        with _DEBT_LOCK:
+            _PROCESS_RESTORATION_DEBT = value
+
+    def _owed(self) -> dict[str, Any] | None:
+        """The debt *this process* owes, without mutating anything.
+
+        A latch left in this module's memory by a ``fork`` parent describes the
+        parent's flag.  Reading it here would make a child report -- and refuse
+        over -- a debt it does not owe, so it is filtered by PID at every read
+        that is not allowed to have side effects.
+        """
+
+        debt = self._debt
+        if debt is None or int(debt.get("owner_pid") or 0) != os.getpid():
+            return None
+        return debt
 
     def _reset_after_fork_locked(self) -> None:
         # PR_SET_CHILD_SUBREAPER is not inherited across fork(), so a copy of
@@ -488,6 +620,11 @@ class ChildSubreaperOwnership:
         # have.  It is discarded rather than trusted -- and in particular it is
         # never "restored" by the child, which would write a process-wide value
         # into a process that never set one.
+        #
+        # M2-B42.  The same is true of the debt: what the parent owes is a fact
+        # about the parent's process-wide flag.  The child neither inherits it
+        # nor can settle it, so its copy is discarded here and the parent's
+        # latch -- which lives in the parent's memory -- is untouched.
         if self._owner_pid is not None and self._owner_pid != os.getpid():
             self._depth = 0
             self._previous = None
@@ -498,11 +635,75 @@ class ChildSubreaperOwnership:
             self._restoration_verified = False
             self._cleanup_complete = True
             self._released_nothing = True
+            self._debt = None
+            self._state = SUBREAPER_STATE_INHERITED_DISCARDED
             self._code = SUBREAPER_INHERITED_DISCARDED
             self._detail = (
                 "the inherited acquisition described another process and was discarded; this "
                 "process restored nothing because it never set the flag"
             )
+        elif self._debt is not None and int(self._debt.get("owner_pid") or 0) != os.getpid():
+            # A latch whose owner PID is not this process describes another
+            # process's flag.  It is discarded rather than carried, and a child
+            # can therefore neither settle nor overwrite what its parent owes.
+            self._debt = None
+            self._state = SUBREAPER_STATE_INHERITED_DISCARDED
+            self._code = SUBREAPER_INHERITED_DISCARDED
+            self._detail = (
+                "the inherited restoration debt described another process and was discarded; this "
+                "process owes nothing because it never set the flag"
+            )
+
+    # --- M2-B42: the debt latch ------------------------------------------------
+
+    def _latch_debt_locked(
+        self,
+        kind: str,
+        *,
+        owed_baseline: int | None,
+        intended: int | None,
+        observed: int | None,
+        detail: str,
+        state: str,
+    ) -> None:
+        """Record unresolved ownership debt.  The first baseline is the baseline.
+
+        A second failure never redefines what is owed: the original baseline is
+        the only value that can end this debt, and overwriting it with whatever
+        the kernel happens to read now is precisely the defect this closes.
+        """
+
+        if self._debt is None:
+            self._debt = {
+                "kind": kind,
+                "owed_baseline": None if owed_baseline is None else int(owed_baseline),
+                "owner_pid": os.getpid(),
+                "first_detail": detail,
+                "last_intended": None if intended is None else int(intended),
+                "last_observed": None if observed is None else int(observed),
+                "attempts": 0,
+                "settled": False,
+            }
+        else:
+            self._debt["last_intended"] = None if intended is None else int(intended)
+            self._debt["last_observed"] = None if observed is None else int(observed)
+        self._debt["last_kind"] = kind
+        self._debt["last_detail"] = detail
+        self._state = state
+
+    def _refuse_owing_locked(self, code: str, detail: str) -> None:
+        """Refuse without disturbing anything this object still holds or owes.
+
+        M2-B41 / M2-B42.  Unlike :meth:`_refuse_locked`, which fails a *fresh*
+        acquisition closed and puts the flag back, this refusal happens while
+        references may still be outstanding and a baseline is still owed.  It
+        therefore changes no depth, no reference, and no baseline: it only
+        refuses, and says exactly what was expected and what was observed.
+        """
+
+        self._code = code
+        self._detail = detail
+        raise ChildSubreaperUnavailable(code, detail)
 
     def _refuse_locked(self, code: str, detail: str, *, rewrite_to: int | None = None) -> None:
         """Fail an acquisition closed: hold nothing, and put the flag back.
@@ -532,7 +733,81 @@ class ChildSubreaperOwnership:
         self._released_nothing = True
         self._code = code
         self._detail = detail
+        if not self._restoration_verified:
+            # M2-B42.  Putting the previous value back *is* a restoration, and a
+            # restoration that its own readback contradicts leaves the same debt
+            # a failed release leaves: this process is holding a process-wide
+            # value it did not choose and owes the baseline it recorded.
+            self._latch_debt_locked(
+                code,
+                owed_baseline=rewrite_to,
+                intended=rewrite_to,
+                observed=residual,
+                detail=detail,
+                state=SUBREAPER_STATE_RESTORATION_OWED,
+            )
+        else:
+            self._state = SUBREAPER_STATE_CLEAN
         raise ChildSubreaperUnavailable(code, detail)
+
+    def _revalidate_nested_locked(self) -> int:
+        """Prove the live process-wide state before a nested acquisition counts.
+
+        M2-B41.  A cached ``_applied`` flag is a memory of a syscall made at
+        some earlier instant.  The question a second acquisition asks is whether
+        *this process, right now* is a child subreaper, because the answer is
+        what authorizes the fork that follows.  It is therefore asked of the
+        kernel, immediately before the depth is incremented, and a contradiction
+        refuses rather than being counted.
+        """
+
+        observed, read_error = get_child_subreaper()
+        if observed is None:
+            detail = (
+                f"PR_GET_CHILD_SUBREAPER failed while revalidating a nested acquisition: "
+                f"{read_error}; expected 1, observed nothing readable"
+            )
+            self._latch_debt_locked(
+                SUBREAPER_NESTED_READBACK_FAILED,
+                owed_baseline=self._previous,
+                intended=1,
+                observed=None,
+                detail=detail,
+                state=SUBREAPER_STATE_POISONED,
+            )
+            self._cleanup_complete = False
+            self._refuse_owing_locked(SUBREAPER_NESTED_READBACK_FAILED, detail)
+        if observed != 1:
+            detail = (
+                f"a nested acquisition was refused: this process is no longer a child subreaper "
+                f"(expected 1, observed {observed}); the depth, the outstanding references and the "
+                f"original baseline {self._previous} are unchanged and nothing was forked"
+            )
+            self._latch_debt_locked(
+                SUBREAPER_NESTED_CONTRADICTED,
+                owed_baseline=self._previous,
+                intended=1,
+                observed=observed,
+                detail=detail,
+                state=SUBREAPER_STATE_POISONED,
+            )
+            self._cleanup_complete = False
+            self._refuse_owing_locked(SUBREAPER_NESTED_CONTRADICTED, detail)
+        if self._owner_pid != os.getpid():  # pragma: no cover - defensive
+            detail = (
+                f"the acquisition being nested was taken by pid {self._owner_pid}; pid "
+                f"{os.getpid()} may not count a reference to it"
+            )
+            self._latch_debt_locked(
+                SUBREAPER_NESTED_NOT_OWNED,
+                owed_baseline=self._previous,
+                intended=1,
+                observed=observed,
+                detail=detail,
+                state=SUBREAPER_STATE_POISONED,
+            )
+            self._refuse_owing_locked(SUBREAPER_NESTED_NOT_OWNED, detail)
+        return int(observed)
 
     def acquire(self) -> dict[str, Any]:
         """Positively establish subreaper ownership, or refuse to hold one.
@@ -549,17 +824,36 @@ class ChildSubreaperOwnership:
 
         with self._lock:
             self._reset_after_fork_locked()
+            if self._debt is not None:
+                # M2-B42.  Unresolved process-wide ownership debt.  Granting an
+                # acquisition here would let the residual kernel value become a
+                # new baseline, and a later release would then report a green
+                # restoration to a value this process never found.
+                self._refuse_owing_locked(
+                    SUBREAPER_DEBT_OUTSTANDING,
+                    (
+                        f"this process owes an unresolved restoration of the child-subreaper flag "
+                        f"to {self._debt['owed_baseline']} ({self._debt['last_kind']}: last "
+                        f"intended {self._debt['last_intended']}, last observed "
+                        f"{self._debt['last_observed']}); no acquisition is granted and nothing is "
+                        "forked until it is positively settled"
+                    ),
+                )
             if self._depth > 0 and self._applied:
-                # An outer acquisition already proved the kernel state; this one
-                # shares that single activation.
+                # M2-B41.  An outer acquisition proved the kernel state at some
+                # earlier instant; this one shares that single activation only
+                # if the kernel still agrees, asked now.
+                self._revalidate_nested_locked()
                 self._depth += 1
                 self._code = SUBREAPER_APPLIED
                 self._detail = (
                     f"this controller (pid {os.getpid()}) is a child subreaper; {self._depth} "
-                    f"trusted helper acquisition(s) share it"
+                    f"trusted helper acquisition(s) share it, and the kernel was re-read and "
+                    "confirmed before this one was counted"
                 )
                 self._released_nothing = False
                 self._cleanup_complete = False
+                self._state = SUBREAPER_STATE_NESTED
                 return self.state()
             previous, read_error = get_child_subreaper()
             if previous is None:
@@ -600,6 +894,7 @@ class ChildSubreaperOwnership:
             self._restoration_verified = False
             self._cleanup_complete = False
             self._released_nothing = False
+            self._state = SUBREAPER_STATE_OWNED
             return self.state()
 
     def acquire_reference(self) -> "SubreaperReference":
@@ -644,6 +939,7 @@ class ChildSubreaperOwnership:
             self._depth -= 1
             self._released_nothing = False
             if self._depth > 0:
+                self._state = SUBREAPER_STATE_NESTED if self._debt is None else self._state
                 self._code = SUBREAPER_REFERENCE_RETAINED
                 self._detail = (
                     f"{self._depth} trusted helper acquisition(s) still hold the flag; nothing was "
@@ -687,23 +983,173 @@ class ChildSubreaperOwnership:
             # The evidence of what was held survives a failed restoration: it is
             # the only remaining record of what this process still owes.
             self._previous = None if code == SUBREAPER_RESTORED else intended
+            if code in SUBREAPER_UNSETTLED_RESULTS:
+                # M2-B42.  The restoration was attempted and not observed, so
+                # the baseline is still owed and no later acquisition may
+                # redefine it.
+                self._latch_debt_locked(
+                    code,
+                    owed_baseline=intended,
+                    intended=intended,
+                    observed=observed,
+                    detail=detail,
+                    state=SUBREAPER_STATE_RESTORATION_OWED,
+                )
+            elif self._debt is None:
+                self._state = SUBREAPER_STATE_TERMINAL_RESTORED
             return self.state()
+
+    def settle_restoration_debt(self) -> dict[str, Any]:
+        """Positively resolve unresolved ownership debt, or leave it standing.
+
+        M2-B42.  This is the only operation that can clear the latch, and it
+        clears it only when the kernel reads back exactly the baseline that is
+        owed.  It is deliberately explicit: ``state()``, ``acquire()``,
+        ``release()`` and replacing the object all leave the debt exactly where
+        they found it, because a debt that a read can discharge is not a debt.
+
+        It is PID-bound, and it refuses while any reference is still
+        outstanding: a settlement that restored the baseline underneath a live
+        helper would take away the very right to reap that helper's orphans.
+        """
+
+        with self._lock:
+            self._reset_after_fork_locked()
+            if self._debt is None:
+                return {
+                    "performed": False,
+                    "settled": False,
+                    "reason": "this process owes no unresolved restoration",
+                    "owed_baseline": None,
+                    "observed": None,
+                    "set_error": None,
+                    "read_error": None,
+                    "attempts": 0,
+                    "state": self.state(),
+                }
+            if int(self._debt.get("owner_pid") or 0) != os.getpid():  # pragma: no cover - defensive
+                return {
+                    "performed": False,
+                    "settled": False,
+                    "reason": (
+                        f"the debt was incurred by pid {self._debt.get('owner_pid')}; pid "
+                        f"{os.getpid()} may not settle another process's flag"
+                    ),
+                    "owed_baseline": self._debt["owed_baseline"],
+                    "observed": None,
+                    "set_error": None,
+                    "read_error": None,
+                    "attempts": int(self._debt["attempts"]),
+                    "state": self.state(),
+                }
+            if self._depth > 0:
+                return {
+                    "performed": False,
+                    "settled": False,
+                    "reason": (
+                        f"{self._depth} acquisition(s) are still outstanding; the baseline may not "
+                        "be restored underneath a helper that still needs this flag"
+                    ),
+                    "owed_baseline": self._debt["owed_baseline"],
+                    "observed": None,
+                    "set_error": None,
+                    "read_error": None,
+                    "attempts": int(self._debt["attempts"]),
+                    "state": self.state(),
+                }
+            owed = self._debt["owed_baseline"]
+            if owed is None:  # pragma: no cover - defensive
+                return {
+                    "performed": False,
+                    "settled": False,
+                    "reason": "the owed baseline was never observed, so nothing can be restored",
+                    "owed_baseline": None,
+                    "observed": None,
+                    "set_error": None,
+                    "read_error": None,
+                    "attempts": int(self._debt["attempts"]),
+                    "state": self.state(),
+                }
+            owed = int(owed)
+            set_error = set_child_subreaper(owed)
+            observed, read_error = get_child_subreaper()
+            self._debt["attempts"] = int(self._debt["attempts"]) + 1
+            self._debt["last_intended"] = owed
+            self._debt["last_observed"] = None if observed is None else int(observed)
+            attempts = int(self._debt["attempts"])
+            settled = set_error is None and observed is not None and int(observed) == owed
+            if settled:
+                self._debt = None
+                self._state = SUBREAPER_STATE_TERMINAL_RESTORED
+                self._code = SUBREAPER_RESTORED
+                self._detail = (
+                    f"the owed child-subreaper baseline {owed} was restored and the kernel reads "
+                    f"{observed} after {attempts} settlement attempt(s)"
+                )
+                self._restore_intended = owed
+                self._restore_observed = int(observed)
+                self._restoration_verified = True
+                self._cleanup_complete = True
+                self._previous = None
+            else:
+                self._debt["last_kind"] = SUBREAPER_DEBT_OUTSTANDING
+                self._debt["last_detail"] = (
+                    f"settlement attempt {attempts} wrote {owed} (error={set_error}) and read back "
+                    f"{observed} (error={read_error}); the debt stands"
+                )
+                self._detail = self._debt["last_detail"]
+                self._restore_intended = owed
+                self._restore_observed = None if observed is None else int(observed)
+                self._restoration_verified = False
+                self._cleanup_complete = False
+            return {
+                "performed": True,
+                "settled": settled,
+                "reason": (
+                    "the kernel read back the owed baseline"
+                    if settled
+                    else "the kernel did not read back the owed baseline"
+                ),
+                "owed_baseline": owed,
+                "observed": None if observed is None else int(observed),
+                "set_error": set_error,
+                "read_error": read_error,
+                "attempts": attempts,
+                "state": self.state(),
+            }
 
     @property
     def active(self) -> bool:
         with self._lock:
             self._reset_after_fork_locked()
-            return self._applied and self._depth > 0
+            # M2-B41.  A poisoned or owing ownership is never reported active:
+            # every consumer of this property reads it as "this process is a
+            # child subreaper", and that is exactly what a contradiction denies.
+            return self._applied and self._depth > 0 and self._owed() is None
 
     @property
     def cleanup_complete(self) -> bool:
         """Whether this ownership left the process-wide flag at its baseline."""
 
         with self._lock:
-            return self._cleanup_complete
+            return self._cleanup_complete and self._owed() is None
+
+    @property
+    def debt_outstanding(self) -> bool:
+        """Whether an unresolved process-wide restoration is owed (M2-B42)."""
+
+        with self._lock:
+            return self._owed() is not None
+
+    @property
+    def ownership_state(self) -> str:
+        with self._lock:
+            return self._state
 
     def state(self) -> dict[str, Any]:
         with self._lock:
+            owed = self._owed()
+            debt = None if owed is None else dict(owed)
             return {
                 "code": self._code,
                 "detail": self._detail,
@@ -714,8 +1160,16 @@ class ChildSubreaperOwnership:
                 "restore_intended": self._restore_intended,
                 "restore_observed": self._restore_observed,
                 "restoration_verified": self._restoration_verified,
-                "cleanup_complete": self._cleanup_complete,
+                # An outstanding debt is an incomplete cleanup by definition, so
+                # the document and the property cannot disagree about it.
+                "cleanup_complete": self._cleanup_complete and debt is None,
                 "released_nothing": self._released_nothing,
+                "ownership_state": self._state,
+                "debt_outstanding": debt is not None,
+                "restoration_debt": debt,
+                "original_baseline": (
+                    debt["owed_baseline"] if debt is not None else self._previous
+                ),
             }
 
 
@@ -1137,8 +1591,25 @@ def ownership_architecture_description() -> dict[str, Any]:
             "RESTORE_MISMATCH are truthful residual states that keep the intended and observed "
             "values and mark the cleanup incomplete."
         ),
+        "nested_acquisition_revalidation": (
+            "M2-B41.  Every acquisition that can authorize a fork -- including a nested one that "
+            "shares an existing activation -- reads PR_GET_CHILD_SUBREAPER immediately before the "
+            "depth is incremented, requires exactly 1, and requires the acquisition being nested "
+            "to belong to this PID.  A contradiction refuses, latches debt, and leaves the depth, "
+            "the outstanding references and the original baseline exactly as it found them."
+        ),
+        "restoration_debt": (
+            "M2-B42.  A restoration that its own readback contradicts latches explicit "
+            "process-wide ownership debt.  While it stands, every acquisition refuses, no helper "
+            "is forked, the original baseline is immutable, and neither state(), acquire(), "
+            "release() nor replacing the object clears it.  settle_restoration_debt() is the only "
+            "operation that can, and only when the kernel reads back the owed baseline exactly."
+        ),
+        "ownership_states": list(SUBREAPER_STATES),
         "release_results": list(SUBREAPER_RELEASE_RESULTS),
         "acquisition_refusals": list(SUBREAPER_ACQUISITION_REFUSALS),
+        "ownership_state_refusals": list(SUBREAPER_OWNERSHIP_STATE_REFUSALS),
+        "fork_forbidden_codes": list(SUBREAPER_FORK_FORBIDDEN_CODES),
         "residual": (
             "While the flag is held, an orphaned descendant of this controller that no effect owns "
             "would reparent here and is not reaped, because reaping it would require waitpid(-1) "
@@ -1181,7 +1652,14 @@ __all__ = [
     "SUBREAPER_ACQUISITION_REFUSALS",
     "SUBREAPER_ALREADY_RELEASED",
     "SUBREAPER_APPLIED",
+    "SUBREAPER_DEBT_OUTSTANDING",
+    "SUBREAPER_DEBT_STATES",
+    "SUBREAPER_FORK_FORBIDDEN_CODES",
     "SUBREAPER_INHERITED_DISCARDED",
+    "SUBREAPER_NESTED_CONTRADICTED",
+    "SUBREAPER_NESTED_NOT_OWNED",
+    "SUBREAPER_NESTED_READBACK_FAILED",
+    "SUBREAPER_OWNERSHIP_STATE_REFUSALS",
     "SUBREAPER_READBACK_FAILED",
     "SUBREAPER_READBACK_MISMATCH",
     "SUBREAPER_REFERENCE_RETAINED",
@@ -1192,7 +1670,16 @@ __all__ = [
     "SUBREAPER_RESTORE_READBACK_FAILED",
     "SUBREAPER_RESTORE_SET_FAILED",
     "SUBREAPER_SET_FAILED",
+    "SUBREAPER_STATES",
+    "SUBREAPER_STATE_CLEAN",
+    "SUBREAPER_STATE_INHERITED_DISCARDED",
+    "SUBREAPER_STATE_NESTED",
+    "SUBREAPER_STATE_OWNED",
+    "SUBREAPER_STATE_POISONED",
+    "SUBREAPER_STATE_RESTORATION_OWED",
+    "SUBREAPER_STATE_TERMINAL_RESTORED",
     "SUBREAPER_UNAVAILABLE",
+    "SUBREAPER_UNSETTLED_RESULTS",
     "SubreaperReference",
     "get_child_subreaper",
     "is_addressable_pid",
@@ -1200,6 +1687,7 @@ __all__ = [
     "open_process_descriptor",
     "ownership_architecture_description",
     "process_is_zombie",
+    "process_restoration_debt",
     "process_present",
     "reap_owned_child",
     "set_child_subreaper",

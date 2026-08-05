@@ -394,3 +394,60 @@ integer milliseconds, exactly what this stage received.
 | no successful field after unobserved exhaustion | `test_no_successful_field_is_claimed_after_unobserved_exhaustion` |
 | repeated bounded cleanup stays idempotent | `test_a_repeated_bounded_cleanup_stays_idempotent` |
 | delegated physical qualification | `test_a_wedged_effect_aborts_inside_the_configured_global_bound` |
+
+---
+
+# E. Process-lifecycle completion is not protocol closure (M2-B43)
+
+Section D bounded the whole cleanup with one absolute deadline. A bound that
+expires is not a failure of the bound — it is the point at which the cleanup
+must say what it did not finish.
+
+The trusted mount-namespace helper is a direct child of this controller and
+holds the process-wide subreaper acquisition that was taken before it was
+forked. Its shutdown therefore owes three distinct facts, not one:
+
+* the framed protocol is closed;
+* the exact helper PID is positively reaped;
+* the acquisition that its lifetime justified is released.
+
+These were previously collapsed into a single `_closed` flag set on entry, so a
+shutdown whose reap failed still released the acquisition, reported the
+restoration complete, and refused to retry. The residual was a live or zombie
+child of this controller, no longer reapable through a flag the controller had
+just given back.
+
+The lifecycle is now recorded as separate facts — `protocol_open`,
+`protocol_closed`, `helper_alive`, `helper_exit_observed`, `helper_reaped`,
+`ownership_retained`, `ownership_released`, `cleanup_complete` — and the
+containment rule is:
+
+> Subreaper ownership may not be released until every helper process for that
+> ownership reference is positively reaped.
+
+An incomplete cleanup is retryable, not terminal. A later call with a live
+budget forces the exit, reaps that exact PID, releases the exact reference, and
+returns `cleanup_complete`. Once complete, a repeat performs nothing. The
+release happens exactly once on either path.
+
+The bounded abort path is unchanged in its ordering and keeps its accepted
+behaviour: a helper that is still alive keeps its acquisition, because its own
+shutdown will end it, and only a helper this controller has itself killed and
+reaped has its acquisition released inside the abort.
+
+## E1. Test matrix addendum
+
+| Case | Test |
+| --- | --- |
+| an expired deadline leaves the helper unreaped and owned | `test_an_expired_deadline_leaves_the_helper_unreaped_and_owned` |
+| cleanup is incomplete while the helper remains | `test_cleanup_is_incomplete_while_the_helper_remains` |
+| no release is attempted before the reap | `test_no_release_is_attempted_before_the_reap` |
+| a retry with a live budget reaps then releases | `test_a_second_call_with_a_live_budget_reaps_then_releases` |
+| the release happens exactly once | `test_the_release_happens_exactly_once` |
+| a completed cleanup reaps and releases nothing | `test_a_repeated_call_after_completion_reaps_and_releases_nothing` |
+| a zombie helper is reaped before the release | `test_a_zombie_helper_is_positively_reaped_before_the_release` |
+| a concurrent unrelated child is never reaped | `test_a_concurrent_unrelated_child_is_never_reaped` |
+| the failed-start rollback follows the same ordering | `test_a_rollback_over_an_unreaped_child_retains_the_acquisition` |
+| callers propagate incomplete cleanup truthfully | `test_the_private_execution_view_propagates_incomplete_cleanup` |
+| delegated physical qualification, expired deadline | `test_an_expired_deadline_leaves_a_real_helper_unreaped_and_owned` |
+| delegated physical qualification, retry | `test_a_retry_reaps_the_exact_pid_and_releases_exactly_once` |

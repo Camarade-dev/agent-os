@@ -68,6 +68,7 @@ from .process_ownership import (
     REAP_ALREADY_REAPED,
     REAP_SUBREAPER_UNAVAILABLE,
     SUBREAPER_RESTORE_DEADLINE_MS,
+    SUBREAPER_UNSETTLED_RESULTS,
     ChildSubreaperUnavailable,
     ControllerDeadlineExpired,
     Deadline,
@@ -78,6 +79,7 @@ from .process_ownership import (
     observe_process_exit,
     open_process_descriptor,
     process_is_zombie,
+    process_present,
     reap_owned_child,
     signal_process,
 )
@@ -335,6 +337,84 @@ def _fork() -> int:
     return os.fork()
 
 
+#: M2-B43.  Failed starts whose forked child could not be reaped inside the
+#: rollback's own deadline, and whose acquisition is therefore still held.  The
+#: rollback raises, so without somewhere to keep the handle the retry would be
+#: unreachable and the only remaining choice would be to release ownership over
+#: an unreaped child.  Entries are PID-bound and are removed the moment their
+#: reap and their single release both succeed.
+_UNSETTLED_FAILED_STARTS: list["_UnsettledFailedStart"] = []
+
+
+class _UnsettledFailedStart:
+    """One partially created helper whose cleanup is incomplete but retryable."""
+
+    def __init__(self, *, helper_pid: int, subreaper: SubreaperReference) -> None:
+        self.helper_pid = helper_pid
+        self.subreaper = subreaper
+        self.owner_pid = os.getpid()
+        self.reaped = False
+        self.reap: ReapOutcome | None = None
+        self.released = False
+        self.release_state: dict[str, Any] = {}
+
+    @property
+    def cleanup_complete(self) -> bool:
+        return self.reaped and self.released
+
+    def retry(self, *, deadline: Deadline | None = None) -> dict[str, Any]:
+        """Reap the exact child, then release the acquisition exactly once."""
+
+        bound = deadline or Deadline.after_ms(HELPER_REAP_DEADLINE_MS, "failed_start_retry")
+        if self.owner_pid != os.getpid():  # pragma: no cover - defensive
+            return {
+                "helper_pid": self.helper_pid,
+                "performed": False,
+                "reason": (
+                    f"the failed start belongs to pid {self.owner_pid}; pid {os.getpid()} owns "
+                    "neither the child nor the acquisition"
+                ),
+                "helper_reaped": self.reaped,
+                "subreaper_released": self.released,
+                "cleanup_complete": False,
+            }
+        if not self.reaped:
+            outcome = _kill_and_reap_owned(self.helper_pid, bound)
+            self.reap = outcome
+            self.reaped = outcome.reaped
+        if self.reaped and not self.released:
+            # Reap first, release second.  Never the other way round.
+            self.released = True
+            self.release_state = self.subreaper.release()
+            if self in _UNSETTLED_FAILED_STARTS:
+                _UNSETTLED_FAILED_STARTS.remove(self)
+        return {
+            "helper_pid": self.helper_pid,
+            "performed": True,
+            "reason": "",
+            "helper_reaped": self.reaped,
+            "helper_exit_code": None if self.reap is None else self.reap.exit_code,
+            "helper_zombie": process_is_zombie(self.helper_pid),
+            "helper_present": process_present(self.helper_pid),
+            "subreaper_released": self.released,
+            "subreaper": dict(self.release_state),
+            "cleanup_complete": self.cleanup_complete,
+            "deadline": bound.to_dict(),
+        }
+
+
+def unsettled_failed_starts() -> tuple["_UnsettledFailedStart", ...]:
+    """Failed starts this process has not finished cleaning up (M2-B43)."""
+
+    return tuple(_UNSETTLED_FAILED_STARTS)
+
+
+def retry_unsettled_failed_starts(*, deadline: Deadline | None = None) -> list[dict[str, Any]]:
+    """Retry every incomplete failed-start cleanup with a fresh bounded budget."""
+
+    return [pending.retry(deadline=deadline) for pending in tuple(_UNSETTLED_FAILED_STARTS)]
+
+
 def _roll_back_failed_start(
     *,
     pid: int | None,
@@ -342,7 +422,7 @@ def _roll_back_failed_start(
     descriptors: tuple[int, ...],
     subreaper: SubreaperReference,
 ) -> dict[str, Any]:
-    """Undo a partially created helper exactly once (M2-B38).
+    """Undo a partially created helper exactly once (M2-B38, M2-B43).
 
     The order is not incidental.  The forked child is destroyed and reaped
     *first*, because releasing the subreaper acquisition while an orphan of this
@@ -350,6 +430,12 @@ def _roll_back_failed_start(
     right to reap it.  Descriptors are closed next, and the acquisition is
     released last -- through the handle, so a repeated rollback releases
     nothing a second time.
+
+    M2-B43.  If that reap does not happen, the release does not happen either.
+    A child this controller forked and could not reap is exactly the case where
+    ownership must be retained, so the rollback keeps the acquisition, records
+    the cleanup as incomplete, and leaves a retryable entry behind rather than
+    restoring a flag it still needs.
     """
 
     evidence: dict[str, Any] = {
@@ -362,12 +448,14 @@ def _roll_back_failed_start(
         "descriptors_closed": 0,
         "subreaper": {},
     }
-    if pid is not None and is_addressable_pid(pid):
+    owned_child = pid is not None and is_addressable_pid(pid)
+    if owned_child:
         outcome = _kill_and_reap_owned(
             pid, Deadline.after_ms(HELPER_REAP_DEADLINE_MS, "helper_startup_reap")
         )
         evidence["helper_reaped"] = outcome.reaped
         evidence["helper_exit_code"] = outcome.exit_code
+        evidence["helper_reap_code"] = outcome.code
     for sock in sockets:
         if sock is None:
             continue
@@ -382,7 +470,22 @@ def _roll_back_failed_start(
             evidence["descriptors_closed"] = int(evidence["descriptors_closed"]) + 1
         except OSError:  # pragma: no cover - already closed
             pass
+    if owned_child and not evidence["helper_reaped"]:
+        pending = _UnsettledFailedStart(helper_pid=int(pid), subreaper=subreaper)
+        _UNSETTLED_FAILED_STARTS.append(pending)
+        evidence["subreaper"] = dict(subreaper.state)
+        evidence["subreaper_released"] = False
+        evidence["ownership_retained"] = True
+        evidence["cleanup_complete"] = False
+        evidence["cleanup_retryable"] = True
+        return evidence
+    # Nothing was forked, the pid never named a process this controller owns, or
+    # the child is positively reaped.  Only now may the acquisition end.
     evidence["subreaper"] = subreaper.release()
+    evidence["subreaper_released"] = True
+    evidence["ownership_retained"] = False
+    evidence["cleanup_complete"] = True
+    evidence["cleanup_retryable"] = False
     return evidence
 
 
@@ -970,6 +1073,35 @@ class SpawnedLauncher:
         self.kill(sig)
 
 
+# --- M2-B43: protocol closure and lifecycle completion are different states ---
+#
+# ``close()`` used to answer one question -- "has this been closed?" -- and use
+# the answer for two: whether the protocol may still be spoken, and whether
+# anything remains to clean up.  A helper that could not be reaped inside the
+# deadline therefore had its ownership released anyway and could never be
+# retried.  The two questions are now separate, and the second one is answered
+# from the facts below rather than from a flag set on entry.
+
+#: The protocol is open; the helper is alive and answering.
+HELPER_LIFECYCLE_PROTOCOL_OPEN = "PROTOCOL_OPEN"
+#: The protocol is closed and the helper is still a live process.
+HELPER_LIFECYCLE_HELPER_ALIVE = "PROTOCOL_CLOSED_HELPER_ALIVE"
+#: The helper's exit was observed; nobody has reaped it yet.
+HELPER_LIFECYCLE_EXIT_OBSERVED = "PROTOCOL_CLOSED_EXIT_OBSERVED"
+#: This controller reaped the helper and still holds its acquisition.
+HELPER_LIFECYCLE_REAPED_OWNERSHIP_RETAINED = "REAPED_OWNERSHIP_RETAINED"
+#: The helper is reaped, the acquisition is released, and nothing is owed.
+HELPER_LIFECYCLE_CLEANUP_COMPLETE = "CLEANUP_COMPLETE"
+
+HELPER_LIFECYCLE_STATES = (
+    HELPER_LIFECYCLE_PROTOCOL_OPEN,
+    HELPER_LIFECYCLE_HELPER_ALIVE,
+    HELPER_LIFECYCLE_EXIT_OBSERVED,
+    HELPER_LIFECYCLE_REAPED_OWNERSHIP_RETAINED,
+    HELPER_LIFECYCLE_CLEANUP_COMPLETE,
+)
+
+
 class PrivateMountHelper:
     """Long-lived user+mount namespace holding the private tmpfs and spawn service."""
 
@@ -978,7 +1110,13 @@ class PrivateMountHelper:
         self.conn = conn
         self.view_fd = view_fd
         self.staging_path = staging_path
+        # Protocol closure only.  M2-B43: this says the framed protocol may no
+        # longer be spoken; it says nothing about whether the helper has been
+        # reaped or whether its ownership has ended.
         self._closed = False
+        self._graceful = False
+        self._cleanup_complete = False
+        self._closes = 0
         # M2-B33.  A deadline that expires mid-frame destroys the length-prefixed
         # framing: the controller cannot know how much of a message the helper
         # already sent.  Once that happens the connection is never used again,
@@ -993,6 +1131,7 @@ class PrivateMountHelper:
         self._subreaper_acquired = False
         self._subreaper: SubreaperReference | None = None
         self._subreaper_state: dict[str, Any] = {}
+        self._subreaper_released = False
 
     # --- protocol health ------------------------------------------------------
 
@@ -1015,6 +1154,71 @@ class PrivateMountHelper:
     @property
     def subreaper_state(self) -> dict[str, Any]:
         return dict(self._subreaper_state)
+
+    # --- M2-B43: the lifecycle, as separate facts ------------------------------
+
+    @property
+    def protocol_closed(self) -> bool:
+        return self._closed
+
+    @property
+    def ownership_retained(self) -> bool:
+        """Whether this helper still holds the acquisition it was started with."""
+
+        return self._subreaper_acquired
+
+    @property
+    def restoration_settled(self) -> bool:
+        """Whether the release this helper performed left nothing owed."""
+
+        code = self._subreaper_state.get("code")
+        return code not in SUBREAPER_UNSETTLED_RESULTS
+
+    @property
+    def cleanup_complete(self) -> bool:
+        """Positively reaped, ownership ended, and nothing owed (M2-B43).
+
+        Protocol closure is not this.  A helper whose socket is shut but whose
+        process is still an unreaped child of this controller has an incomplete
+        cleanup, and saying otherwise is the claim this closes.
+        """
+
+        return self._cleanup_complete
+
+    def _recompute_cleanup_locked(self) -> None:
+        self._cleanup_complete = bool(
+            self._reaped and not self._subreaper_acquired and self.restoration_settled
+        )
+
+    def lifecycle(self) -> dict[str, Any]:
+        """The eight lifecycle facts, kept apart so none can stand for another."""
+
+        alive = process_present(self.pid) and not self._reaped
+        if self._cleanup_complete:
+            state = HELPER_LIFECYCLE_CLEANUP_COMPLETE
+        elif self._reaped:
+            state = HELPER_LIFECYCLE_REAPED_OWNERSHIP_RETAINED
+        elif self._exit_observed:
+            state = HELPER_LIFECYCLE_EXIT_OBSERVED
+        elif self._closed:
+            state = HELPER_LIFECYCLE_HELPER_ALIVE
+        else:
+            state = HELPER_LIFECYCLE_PROTOCOL_OPEN
+        return {
+            "state": state,
+            "helper_pid": self.pid,
+            "protocol_open": not self._closed,
+            "protocol_closed": self._closed,
+            "helper_alive": alive,
+            "helper_zombie": process_is_zombie(self.pid),
+            "helper_exit_observed": self._exit_observed,
+            "helper_reaped": self._reaped,
+            "ownership_retained": self._subreaper_acquired,
+            "ownership_released": self._subreaper_released,
+            "restoration_settled": self.restoration_settled,
+            "cleanup_complete": self._cleanup_complete,
+            "close_calls": self._closes,
+        }
 
     def _break_protocol(self, detail: str) -> None:
         self._protocol_broken = True
@@ -1325,6 +1529,11 @@ class PrivateMountHelper:
         ``close`` and the bounded abort path both reach this; the first one
         releases and every later one reports that release rather than
         performing a second (M2-B38, M2-B39).
+
+        M2-B43.  Every caller must already have proved the helper is reaped.
+        This method does not re-derive that: it is the single release site, and
+        the ordering is enforced at each of the three call sites that can reach
+        it, each of which refuses to call it over a live or unreaped helper.
         """
 
         if not self._subreaper_acquired:
@@ -1333,6 +1542,8 @@ class PrivateMountHelper:
         reference = self._subreaper
         self._subreaper = None
         self._subreaper_state = reference.release() if reference is not None else CHILD_SUBREAPER.release()
+        self._subreaper_released = True
+        self._recompute_cleanup_locked()
         return dict(self._subreaper_state)
 
     def release_subreaper_if_reaped(self, *, deadline: Deadline | None = None) -> dict[str, Any]:
@@ -1357,19 +1568,27 @@ class PrivateMountHelper:
                 "performed": False,
                 "reason": "this helper holds no acquisition to release",
                 "result": dict(self._subreaper_state),
+                "helper_reaped": self._reaped,
+                "ownership_retained": False,
                 "deadline": bound.to_dict(),
             }
         if not self._reaped:
+            # M2-B43.  The ordering is the invariant: ownership outlives an
+            # unreaped helper, never the other way round.
             return {
                 "performed": False,
                 "reason": "the helper is alive and still owns its acquisition",
                 "result": dict(self._subreaper_state),
+                "helper_reaped": False,
+                "ownership_retained": True,
                 "deadline": bound.to_dict(),
             }
         return {
             "performed": True,
             "reason": "the trusted controller reaped this helper, so its acquisition ends here",
             "result": self._release_subreaper(),
+            "helper_reaped": True,
+            "ownership_retained": self._subreaper_acquired,
             "deadline": bound.to_dict(),
         }
 
@@ -1409,8 +1628,10 @@ class PrivateMountHelper:
         if outcome.reaped:
             self._exit_observed = True
         self._break_protocol("the helper was killed and reaped by the trusted controller")
+        self._recompute_cleanup_locked()
         state["exit_observed"] = self._exit_observed
         state["reap"] = outcome
+        state["lifecycle"] = self.lifecycle()
         return state
 
     def close(self, *, deadline: Deadline | None = None) -> dict[str, Any]:
@@ -1425,39 +1646,47 @@ class PrivateMountHelper:
         and this shutdown cannot outlive it.
         """
 
-        if self._closed:
-            return {
-                "helper_pid": self.pid,
-                "already_closed": True,
-                "reaped": self._reaped,
-                "subreaper": dict(self._subreaper_state),
-            }
-        self._closed = True
         whole = deadline or Deadline.after_ms(HELPER_SHUTDOWN_DEADLINE_MS, "helper_shutdown")
+        if self._closed and self._cleanup_complete:
+            # Terminal.  The protocol is closed, the helper is reaped, its
+            # ownership is released, and nothing is owed, so there is nothing
+            # left for a repeat to do.  Both conditions are required: the
+            # bounded abort path can reap the helper and end its ownership
+            # before any shutdown runs, and the socket and view descriptor this
+            # object still owns are closed exactly once, below.
+            return self._closure_evidence(whole, already_closed=True, released_here=False)
+        self._closes += 1
+        first = not self._closed
+        self._closed = True
         # The cooperative prefix.  A helper that will not answer, or will not
         # exit, spends only this much of the whole; the rest belongs to the
         # kill-and-reap that does not depend on it.
         cooperative = whole.sub(HELPER_COOPERATIVE_EXIT_DEADLINE_MS, "helper_cooperative_exit")
-        graceful = False
-        if not self._protocol_broken:
+        if first:
+            if not self._protocol_broken:
+                try:
+                    _send_framed_within(self.conn, {"op": "exit"}, (), cooperative, "shutdown")
+                    _recv_framed_within(self.conn, cooperative, "shutdown")
+                    self._graceful = True
+                except Exception:
+                    self._graceful = False
             try:
-                _send_framed_within(self.conn, {"op": "exit"}, (), cooperative, "shutdown")
-                _recv_framed_within(self.conn, cooperative, "shutdown")
-                graceful = True
-            except Exception:
-                graceful = False
-        try:
-            self.conn.close()
-        except OSError:  # pragma: no cover - already closed
-            pass
-        try:
-            os.close(self.view_fd)
-        except OSError:  # pragma: no cover - already closed
-            pass
+                self.conn.close()
+            except OSError:  # pragma: no cover - already closed
+                pass
+            try:
+                os.close(self.view_fd)
+            except OSError:  # pragma: no cover - already closed
+                pass
         if not self._reaped:
-            # Still the cooperative prefix, so the forced path below always has
-            # what is left of the same bound.
-            outcome = reap_owned_child(self.pid, cooperative, role=REAPER_TRUSTED_CONTROLLER)
+            # Still the cooperative prefix on the first close, so the forced
+            # path below always has what is left of the same bound.  A retry has
+            # already asked this helper to exit and has already closed the
+            # socket it would have answered on, so it spends nothing waiting for
+            # a request it cannot repeat: one non-blocking observation, then the
+            # forced path within the budget this call was given.
+            patient = cooperative if first else Deadline.already_expired("helper_retry_probe")
+            outcome = reap_owned_child(self.pid, patient, role=REAPER_TRUSTED_CONTROLLER)
             if not outcome.reaped:
                 # It did not exit on request within its share of the deadline.
                 # It is this controller's child, so it is killed and reaped
@@ -1471,16 +1700,42 @@ class PrivateMountHelper:
             self._reap = outcome
             self._reaped = outcome.reaped
             self._exit_observed = self._exit_observed or outcome.reaped
-        self._release_subreaper()
+        # M2-B43.  The release is conditional on the reap, and on nothing else.
+        # An unreaped helper keeps its ownership: releasing here would hand back
+        # the process-wide flag that gives this controller the right to reap the
+        # very process it just failed to reap, and would leave a zombie whose
+        # reaper nobody can name.
+        released_here = False
+        if self._reaped:
+            released_here = self._subreaper_acquired
+            self._release_subreaper()
+        self._recompute_cleanup_locked()
+        return self._closure_evidence(whole, already_closed=False, released_here=released_here)
+
+    def _closure_evidence(
+        self, whole: Deadline, *, already_closed: bool, released_here: bool
+    ) -> dict[str, Any]:
+        """What this shutdown did, and what it left undone (M2-B43)."""
+
         return {
             "helper_pid": self.pid,
-            "already_closed": False,
-            "graceful_shutdown": graceful,
+            "already_closed": already_closed,
+            "graceful_shutdown": self._graceful,
             "reaped": self._reaped,
             "exit_code": None if self._reap is None else self._reap.exit_code,
             "reaper_role": REAPER_NONE if self._reap is None else self._reap.reaper_role,
             "reaper_pid": None if self._reap is None else self._reap.reaper_pid,
+            "reap_code": None if self._reap is None else self._reap.code,
+            "reap_detail": "" if self._reap is None else self._reap.detail,
             "subreaper": dict(self._subreaper_state),
+            "subreaper_released_by_this_call": released_here,
+            "ownership_retained": self._subreaper_acquired,
+            "restoration_settled": self.restoration_settled,
+            "cleanup_complete": self._cleanup_complete,
+            "cleanup_retryable": not self._cleanup_complete,
+            "helper_present": process_present(self.pid),
+            "helper_zombie": process_is_zombie(self.pid),
+            "lifecycle": self.lifecycle(),
             "deadline": whole.to_dict(),
         }
 
@@ -1987,6 +2242,9 @@ class PrivateExecutionView:
     source_snapshot: SourceSnapshotIdentity
     view_identity: PrivateExecutionViewIdentity
     _closed: bool = False
+    #: M2-B43.  The last closure evidence, kept so a caller that must decide
+    #: whether anything remains to clean up reads a fact rather than a flag.
+    _closure: dict[str, Any] | None = None
 
     @property
     def view_fd(self) -> int:
@@ -2077,11 +2335,28 @@ class PrivateExecutionView:
         tree_sha, _, _, _ = snapshot_tree_identity(source_fd)
         return tree_sha != self.source_snapshot.tree_sha256
 
-    def close(self) -> None:
-        if self._closed:
-            return
+    @property
+    def cleanup_complete(self) -> bool:
+        """Whether this view's helper is reaped and its ownership ended."""
+
+        return self.helper.cleanup_complete
+
+    def close(self, *, deadline: Deadline | None = None) -> dict[str, Any]:
+        """Close the view and report what the shutdown left undone (M2-B43).
+
+        Idempotent once the cleanup is complete, and retryable until it is: a
+        view whose helper survived its deadline still owns a process this
+        controller must reap, and a ``_closed`` flag that swallowed the retry is
+        what made that unreachable.
+        """
+
         self._closed = True
-        self.helper.close()
+        # The helper owns the idempotence: a completed lifecycle answers
+        # immediately and performs nothing, and an incomplete one retries.  The
+        # view keeps the answer rather than deciding it, so the two can never
+        # disagree about whether anything is left to do.
+        self._closure = self.helper.close(deadline=deadline)
+        return dict(self._closure)
 
 
 def _tree_map(root_fd: int) -> dict[str, tuple[str, str | None]]:

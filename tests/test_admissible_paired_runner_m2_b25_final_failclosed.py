@@ -1064,9 +1064,11 @@ class ValidationReportCountTests(unittest.TestCase):
             + counts["m2_b25_topology_module"]
             + counts["m2_b25_final_failclosed_module"]
             # M2-M36 added the final protocol/lifecycle module to this milestone,
-            # and M2-B40 added the subreaper/deadline closure module.
+            # M2-B40 added the subreaper/deadline closure module, and M2-B43
+            # added the ownership-debt/reap closure module.
             + counts["m2_final_protocol_lifecycle_module"]
-            + counts["m2_subreaper_deadline_closure_module"],
+            + counts["m2_subreaper_deadline_closure_module"]
+            + counts["m2_ownership_debt_reap_closure_module"],
             "the legacy and new modules must account for the whole discovery total",
         )
 

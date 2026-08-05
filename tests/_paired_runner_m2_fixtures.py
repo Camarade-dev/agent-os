@@ -212,3 +212,33 @@ def guard_process_wide_cgroup_caches(test) -> None:
         _ps._DELEGATION_CACHE, _ps._DELEGATION_PID, _rl._TOPOLOGY = saved
 
     test.addCleanup(restore)
+
+
+def guard_process_wide_restoration_debt(test) -> None:
+    """Restore the process-wide subreaper restoration debt after a test.
+
+    M2-B42 makes a failed restoration latch explicit process-wide ownership
+    debt: until it is positively settled every acquisition refuses, no helper is
+    forked, and the original baseline is immutable.  That is the accepted
+    production behaviour and is not weakened here.
+
+    It does mean an *injected* restoration failure outlives the test that
+    injected it, because the latch lives beside the process-wide flag rather
+    than inside whichever ownership object incurred it -- which is the whole
+    point: replacing the object may not be a way to forget what the process
+    owes.  A test that injects one therefore puts back the latch that was true
+    before it ran, exactly as an injected topology contradiction does.
+
+    The kernel flag itself is restored separately by the flag guard; these
+    injections are mocked syscalls, so restoring the recorded latch restores the
+    truth.
+    """
+
+    from admissible.paired_runner import process_ownership as _po
+
+    saved = _po._PROCESS_RESTORATION_DEBT
+
+    def restore() -> None:
+        _po._PROCESS_RESTORATION_DEBT = saved
+
+    test.addCleanup(restore)

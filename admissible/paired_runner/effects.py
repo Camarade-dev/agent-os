@@ -881,6 +881,8 @@ class _EffectPreparation:
     handle: int = -1
     refusal: ToolResult | None = None
     private_view: PrivateExecutionView | None = None
+    #: M2-B43.  The private view's last closure evidence.
+    private_view_cleanup: dict[str, Any] | None = None
 
     def close(self) -> None:
         if self.handle >= 0:
@@ -890,8 +892,13 @@ class _EffectPreparation:
                 pass
             self.handle = -1
         if self.private_view is not None:
-            self.private_view.close()
-            self.private_view = None
+            # M2-B43.  The view is dropped only once its helper is positively
+            # reaped and its ownership ended.  Dropping the reference over an
+            # incomplete cleanup would make the retry unreachable and leave an
+            # unreaped child of this controller with nobody holding its handle.
+            self.private_view_cleanup = self.private_view.close()
+            if self.private_view_cleanup.get("cleanup_complete"):
+                self.private_view = None
         self.chain.close()
 
 

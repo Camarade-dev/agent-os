@@ -603,3 +603,126 @@ assert a live delegation as an explicit precondition so "this controller has no
 usable topology right now" can never again be reported as "the nominal effect
 path is broken". Every delegated receipt assertion now renders the receipt
 classification and its causal evidence, so no physical failure is opaque again.
+
+---
+
+# E. Ownership debt and reap closure (M2-B41, M2-B42, M2-B43)
+
+Section D established that acquisition is a precondition of the fork, that it
+is failure-atomic around it, and that a restoration is a readback.  It left
+three statements the code could still make untruthfully.
+
+## E1. A nested acquisition is an acquisition (M2-B41)
+
+`ChildSubreaperOwnership.acquire()` had a cached branch: with a positive depth
+and `_applied` set it incremented the reference count and returned, without
+asking the kernel anything.  `_applied` is a memory of a syscall made at some
+earlier instant; the question a second acquisition asks is whether *this
+process, right now* is a child subreaper, because that is what authorizes the
+fork that follows it.
+
+Every acquisition that can authorize a fork therefore reads
+`PR_GET_CHILD_SUBREAPER` immediately before the depth is incremented:
+
+1. read the flag;
+2. require exactly `1`;
+3. require the acquisition being nested to belong to this PID;
+4. require that no unresolved restoration debt stands;
+5. only then increment the depth.
+
+A readback that fails, or that returns anything other than `1`, is a refusal.
+The refusal changes nothing: the depth, the outstanding references and the
+original baseline are exactly as they were, no fork happens, and the classified
+`ChildSubreaperUnavailable` carries the expected and the observed value.  The
+ownership object is poisoned, so a repeated contradictory acquisition stays
+refused, and `active` stops reporting a process that the kernel says is no
+longer a child subreaper.
+
+## E2. A failed restoration is a debt (M2-B42)
+
+After a final release failed its restoration verification, the object was left
+at depth zero with `_applied` false and nothing owed on paper.  The next
+`acquire()` read the *residual* kernel value as a fresh baseline, overwrote the
+original one, and a later release could report `RESTORED` to a value this
+process never found.
+
+A failed restoration now latches explicit process-wide ownership debt.  It is
+created by `RESTORE_SET_FAILED`, `RESTORE_READBACK_FAILED` and
+`RESTORE_MISMATCH` on a final release, by a refused acquisition whose rewrite of
+the previous value its own readback contradicts, and by a nested acquisition the
+live kernel contradicted.  While it stands:
+
+* every acquisition refuses with `RESTORATION_DEBT_OUTSTANDING`;
+* no helper is forked;
+* the original baseline is immutable — a later failure updates what was last
+  intended and last observed, never what is owed;
+* `state()`, `acquire()`, `release()` and replacing the ownership object all
+  leave it exactly where they found it.
+
+It is stored beside the flag it describes rather than inside the object that
+incurred it, because the debt is a fact about this process's flag: replacing the
+ownership object, including the module-level singleton, must not be a way to
+forget it.  It records the PID that incurred it, so a `fork` child — which
+inherits this module's memory but not the flag — neither owes it nor can settle
+it.
+
+`settle_restoration_debt()` is the only operation that can clear it.  It writes
+the owed baseline, reads it back, and clears the latch only on an exact match;
+anything else leaves the debt standing with its attempt count incremented.  It
+refuses while any reference is outstanding, because restoring the baseline under
+a live helper would take back the very right to reap that helper's orphans.
+
+The ownership state machine is stated rather than implied:
+`CLEAN_UNOWNED`, `ACTIVELY_OWNED`, `NESTED_REFERENCE_RETAINED`,
+`RESTORATION_OWED`, `POISONED_UNREADABLE`, `TERMINAL_RESTORED`,
+`INHERITED_DISCARDED`.
+
+## E3. Reap before release, and retry what did not finish (M2-B43)
+
+`PrivateMountHelper.close()` set one flag on entry and used it for two
+questions.  A helper that could not be reaped inside the deadline had its
+subreaper ownership released anyway — the very flag that grants the right to
+reap it — reported the restoration complete, and could never be retried, because
+the second call returned immediately.  A real helper could therefore remain an
+unreaped zombie while the controller's depth was zero and the flag was restored.
+
+Protocol closure and lifecycle completion are now separate states:
+
+| state | meaning |
+| --- | --- |
+| `PROTOCOL_OPEN` | the framed protocol may still be spoken |
+| `PROTOCOL_CLOSED_HELPER_ALIVE` | the socket is shut; the helper is a live child |
+| `PROTOCOL_CLOSED_EXIT_OBSERVED` | the exit was observed; nobody has reaped it |
+| `REAPED_OWNERSHIP_RETAINED` | reaped; the acquisition has not ended yet |
+| `CLEANUP_COMPLETE` | reaped, released, and nothing owed |
+
+The ordering is: observe or force the exit, reap the exact PID, then release the
+acquisition exactly once.  Ownership is released only after a positive reap, at
+every site that can release it — `close()`, `release_subreaper_if_reaped()`, and
+the failed-start retry.  `close()` is idempotent once the cleanup is complete
+and retries the reap on every later call while it is not; a later call with a
+live budget forces the exit, reaps that exact PID, releases the exact reference,
+and returns a terminal result.  `waitpid` is still only ever called on a single
+owned PID, so a concurrent unrelated child of this controller is never consumed.
+
+The same rule governs the failed-start rollback.  A child this controller forked
+and could not reap keeps its acquisition, is recorded as an incomplete cleanup,
+and leaves a retryable entry behind, so the reap and the single release stay
+reachable rather than being traded for a released flag.
+`PrivateExecutionView.close()`, `BoundRuntime.close()` and
+`_EffectPreparation.close()` return and propagate that evidence, and the effect
+preparation keeps its view while the cleanup is incomplete so the retry has a
+handle to use.
+
+## E4. Tests
+
+`tests/test_admissible_paired_runner_m2_ownership_debt_reap_closure.py` covers
+the nested revalidation against a really cleared flag and an injected readback
+failure with the fork primitive proved unreached, the debt latch across all
+three failed-restoration results plus object replacement and a real `fork`
+child, settlement in both directions, the expired-deadline close that leaves a
+real helper unreaped with its ownership retained, the retry that reaps that
+exact PID and releases exactly once, a real zombie reaped before the release, a
+concurrent unrelated child left alone, the failed-start rollback ordering, the
+caller propagation, and the semantic coherence of the current validation
+artifacts.

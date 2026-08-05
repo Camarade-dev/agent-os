@@ -39,6 +39,9 @@ class BoundRuntime:
     init_identity: FileIdentity
     launcher_identity: FileIdentity
     _closed: bool = False
+    #: M2-B43.  The private view's last closure evidence, including whether its
+    #: helper was positively reaped and its ownership ended.
+    private_view_cleanup: dict[str, Any] | None = None
 
     @classmethod
     def bind(
@@ -155,16 +158,25 @@ class BoundRuntime:
             os.close(launcher[0])
             raise
 
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        for handle in (self.launcher_fd, self.interpreter_fd, self.init_fd, self.workspace_fd):
-            try:
-                os.close(handle)
-            except OSError:
-                pass
-        self.private_view.close()
+    def close(self) -> dict[str, Any]:
+        """Close the bound descriptors and the private view it holds.
+
+        M2-B43.  The descriptors are closed exactly once; the private view's
+        closure is attempted on every call while its cleanup is incomplete, and
+        its evidence is returned rather than discarded, so a caller is never
+        told a shutdown finished when a helper of this controller is still an
+        unreaped child.
+        """
+
+        if not self._closed:
+            self._closed = True
+            for handle in (self.launcher_fd, self.interpreter_fd, self.init_fd, self.workspace_fd):
+                try:
+                    os.close(handle)
+                except OSError:
+                    pass
+        self.private_view_cleanup = self.private_view.close()
+        return dict(self.private_view_cleanup)
 
 
 def _open_verified_regular(path: str, label: str, expected: dict[str, Any]) -> tuple[int, FileIdentity]:

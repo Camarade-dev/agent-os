@@ -104,6 +104,7 @@ from _paired_runner_m2_fixtures import (  # noqa: E402
     build_specification,
     decision_for,
     guard_process_wide_cgroup_caches,
+    guard_process_wide_restoration_debt,
 )
 from admissible.paired_runner.durable_store import DurableObjectStore  # noqa: E402
 from admissible.paired_runner.effect_ledger import RunEffectLedger  # noqa: E402
@@ -147,17 +148,24 @@ SENTINEL_SCRIPT = "open('sentinel.txt', 'w').write('the command executed')\n"
 
 
 class _FlagGuard:
-    """Restore the process-wide subreaper flag whatever a test did to it.
+    """Restore the process-wide subreaper state whatever a test did to it.
 
     The flag is genuinely process-wide, so a test that leaves it set changes the
     conditions of every test that runs after it.  Each test that touches it
     therefore records the value it found and puts that value back.
+
+    M2-B42 adds a second process-wide fact with the same property: an injected
+    restoration failure latches ownership debt that, by design, no later
+    acquisition may step over and no replacement object may forget.  A test that
+    can produce one restores the latch it found, for exactly the reason it
+    restores the flag it found.
     """
 
     @staticmethod
     def install(test: unittest.TestCase) -> int:
         before, error = po.get_child_subreaper()
         test.assertIsNone(error, "this kernel does not expose PR_GET_CHILD_SUBREAPER")
+        guard_process_wide_restoration_debt(test)
 
         def restore() -> None:
             po.set_child_subreaper(int(before or 0))
@@ -879,6 +887,13 @@ class SubreaperRestorationStateMachineTests(unittest.TestCase):
                 self.assertFalse(result["restoration_verified"], name)
                 self.assertFalse(result["cleanup_complete"], name)
                 po.set_child_subreaper(self.before)
+                # M2-B42.  Each injection latches process-wide ownership debt,
+                # and the next iteration may not step over it: the loop settles
+                # it explicitly, which is also the only way production clears
+                # one.  No iteration is therefore decided by its predecessor.
+                settlement = ownership.settle_restoration_debt()
+                self.assertTrue(settlement["settled"], settlement)
+                self.assertIsNone(po.process_restoration_debt(), name)
 
 
 class KernelSubreaperRestorationTests(unittest.TestCase):
@@ -1435,13 +1450,38 @@ def _load(path: Path) -> dict:
 
 
 class ClosureArtifactCoherenceTests(unittest.TestCase):
-    """The closure report, the current validation report and the matrix agree."""
+    """This closure's report and the validation report that accompanied it agree.
+
+    The M2 model keeps exactly one *current* validation report, and a later pass
+    moves it.  These assertions are about this closure, so they follow the
+    report that was current when this closure was: the live report names the
+    commit whose blob it superseded, and that blob is loaded here and checked
+    against the hash the live report records.  Anchoring to whatever happens to
+    be current later would make this class assert another pass's claims.
+    """
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.report = _load(CURRENT_VALIDATION_REPORT)
+        cls.live = _load(CURRENT_VALIDATION_REPORT)
+        cls.report = cls._accompanying_report()
         cls.closure = _load(CLOSURE_REPORT)
         cls.matrix = _load(REQUIREMENT_MATRIX)
+
+    @classmethod
+    def _accompanying_report(cls) -> dict:
+        if cls.live.get("current_closure_key") == "m2_subreaper_deadline_closure":
+            return cls.live
+        superseded = cls.live["supersedes_prior_current_report"]
+        raw = subprocess.run(
+            ["git", "show", f"{superseded['commit']}:{superseded['path']}"],
+            cwd=REPOSITORY_ROOT,
+            check=True,
+            capture_output=True,
+        ).stdout
+        import hashlib
+
+        assert hashlib.sha256(raw).hexdigest() == superseded["sha256"], superseded["path"]
+        return json.loads(raw.decode("utf-8"))
 
     def test_the_closure_report_declares_the_bounded_findings(self) -> None:
         self.assertEqual(
@@ -1456,7 +1496,7 @@ class ClosureArtifactCoherenceTests(unittest.TestCase):
             self.closure["schema_id"], "admissible.paired_runner.m2.subreaper_deadline_closure_report"
         )
 
-    def test_the_current_validation_report_points_at_this_closure(self) -> None:
+    def test_the_validation_report_of_this_closure_points_at_it(self) -> None:
         self.assertTrue(self.report["is_current_validation_report"])
         self.assertEqual(self.report["starting_commit"], STARTING_COMMIT)
         self.assertEqual(self.report["branch"], BRANCH)
@@ -1465,6 +1505,18 @@ class ClosureArtifactCoherenceTests(unittest.TestCase):
             "implementation/M2_SUBREAPER_DEADLINE_CLOSURE_REPORT.json",
         )
         self.assertEqual(self.report["current_closure_key"], "m2_subreaper_deadline_closure")
+
+    def test_exactly_one_validation_report_is_current(self) -> None:
+        """Whether or not that is still this closure's."""
+
+        self.assertTrue(self.live["is_current_validation_report"])
+        if self.live is not self.report:
+            self.assertIn(
+                "implementation/M2_SUBREAPER_DEADLINE_CLOSURE_REPORT.json",
+                self.live["superseded_closure_reports"],
+                "the later current report does not record this closure as superseded",
+            )
+            self.assertNotEqual(self.live["current_closure_key"], "m2_subreaper_deadline_closure")
 
     def test_the_independent_audit_is_recorded_verbatim(self) -> None:
         self.assertEqual(
@@ -1523,8 +1575,11 @@ class ClosureArtifactCoherenceTests(unittest.TestCase):
         self.assertEqual(run, self.closure["delegated_physical_qualification"]["run"])
         self.assertEqual(run["expected_modules"], list(QUALIFICATION_MODULES))
 
-    def test_the_expected_delegated_total_matches_the_four_modules(self) -> None:
-        run = self.report[self.report["current_closure_key"]]["delegated_run"]
+    def test_the_expected_delegated_total_matches_the_qualification_modules(self) -> None:
+        # The expected total is a fact about the qualification that must run
+        # against the modules as they stand, so it is read from the current
+        # report; a frozen historical total describes modules that have moved on.
+        run = self.live[self.live["current_closure_key"]]["delegated_run"]
         expected = sum(
             unittest.defaultTestLoader.loadTestsFromName(module).countTestCases()
             for module in run["expected_modules"]
@@ -1532,9 +1587,13 @@ class ClosureArtifactCoherenceTests(unittest.TestCase):
         self.assertEqual(run["expected_total"], expected)
         if run["executed"] is not None:
             self.assertEqual(run["executed"], expected)
+        for module in QUALIFICATION_MODULES:
+            self.assertIn(module, run["expected_modules"], module)
 
     def test_the_declared_module_counts_match_the_modules_on_disk(self) -> None:
-        counts = self.report["m2_test_count_semantics"]
+        # The modules on disk are the current ones, so the counts they are
+        # compared against must come from the current report.
+        counts = self.live["m2_test_count_semantics"]
         for module, field in (
             ("tests.test_admissible_paired_runner_m2_b25_cgroup_topology", "m2_b25_topology_module"),
             (
@@ -1549,6 +1608,10 @@ class ClosureArtifactCoherenceTests(unittest.TestCase):
                 "tests.test_admissible_paired_runner_m2_subreaper_deadline_closure",
                 "m2_subreaper_deadline_closure_module",
             ),
+            (
+                "tests.test_admissible_paired_runner_m2_ownership_debt_reap_closure",
+                "m2_ownership_debt_reap_closure_module",
+            ),
         ):
             loader = unittest.defaultTestLoader.loadTestsFromName(module)
             self.assertEqual(loader.countTestCases(), counts[field], module)
@@ -1558,7 +1621,8 @@ class ClosureArtifactCoherenceTests(unittest.TestCase):
             + counts["m2_b25_topology_module"]
             + counts["m2_b25_final_failclosed_module"]
             + counts["m2_final_protocol_lifecycle_module"]
-            + counts["m2_subreaper_deadline_closure_module"],
+            + counts["m2_subreaper_deadline_closure_module"]
+            + counts["m2_ownership_debt_reap_closure_module"],
         )
 
     def test_the_closure_report_records_every_declared_deadline(self) -> None:
@@ -1821,6 +1885,10 @@ class InjectedTopologyFailureIsolationTests(unittest.TestCase):
             (
                 "tests.test_admissible_paired_runner_m2_subreaper_deadline_closure",
                 "DelegatedSubreaperDeadlineTests",
+            ),
+            (
+                "tests.test_admissible_paired_runner_m2_ownership_debt_reap_closure",
+                "DelegatedOwnershipDebtReapTests",
             ),
         ):
             with self.subTest(cls=f"{module_name}.{class_name}"):
