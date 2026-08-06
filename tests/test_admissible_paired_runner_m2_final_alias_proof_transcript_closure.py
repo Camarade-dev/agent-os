@@ -91,6 +91,11 @@ IMPLEMENTATION = REPOSITORY_ROOT / "implementation"
 BRANCH = "paired-runner/m2-final-alias-proof-transcript-closure"
 STARTING_COMMIT = "90a33c610b58900fc40f617de1508f4192dc03d1"
 STARTING_COMMIT_PARENT = "6d687d4c778ae917f925da18aa89b2c53cdac911"
+#: The single commit this closure produced on top of its starting commit, and
+#: the commit the external exact-commit transcript and receipt are bound to.  It
+#: is history: the shape of this closure's own bounded range is fixed for good,
+#: and later bounded passes stand on top of it without changing it.
+CLOSURE_COMMIT = "d3a16b2eb342cdf8624fb94f60dce3cd773bfc6c"
 INDEPENDENT_AUDIT_SHA256 = (
     "85e28e4e590e6ee2e59075192eb37d95c16962804a26fc4d92eaa9ef0f90a7c2"
 )
@@ -1634,13 +1639,28 @@ class DelegatedFinalAliasProofTranscriptTests(unittest.TestCase):
             branch.startswith("paired-runner/m2-"),
             f"this module is qualified only on a bounded Milestone 2 closure branch: {branch!r}",
         )
-        self.assertEqual(_git("merge-base", STARTING_COMMIT, "HEAD"), STARTING_COMMIT)
+        # This closure's own bounded range, which is a statement about history
+        # and therefore stays true however many later bounded passes are added on
+        # top of it: the closure commit exists, it carries the declared starting
+        # commit as its sole parent, that starting commit still carries its own
+        # declared parent, exactly one commit separates the two, and the closure
+        # commit is an ancestor of the revision under test.  A later legitimate
+        # descendant may never falsify a historical closure, so no maximum is
+        # imposed on the commits that stand on top of this one; the bounded range
+        # of a *current* qualification is proved by its own external receipt,
+        # whose bounded_range_count this module verifies elsewhere.
+        self.assertEqual(_git("rev-parse", f"{CLOSURE_COMMIT}^{{commit}}"), CLOSURE_COMMIT)
+        self.assertEqual(_git("rev-parse", f"{CLOSURE_COMMIT}^"), STARTING_COMMIT)
         self.assertEqual(_git("rev-parse", f"{STARTING_COMMIT}^"), STARTING_COMMIT_PARENT)
-        ahead = int(_git("rev-list", "--count", f"{STARTING_COMMIT}..HEAD"))
-        self.assertLessEqual(
-            ahead,
-            1 if branch == BRANCH else 2,
-            "more than one commit stands on top of this closure's starting point",
+        self.assertEqual(
+            int(_git("rev-list", "--count", f"{STARTING_COMMIT}..{CLOSURE_COMMIT}")),
+            1,
+            "this closure is not exactly one commit on top of its starting point",
+        )
+        self.assertEqual(
+            _git("merge-base", CLOSURE_COMMIT, "HEAD"),
+            CLOSURE_COMMIT,
+            "the revision under test does not descend from this closure's commit",
         )
 
     @delegated
