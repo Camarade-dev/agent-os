@@ -310,10 +310,10 @@ class ManagerLeafBootstrapTests(unittest.TestCase):
         self.addCleanup(tree.close)
         real_write = rl._write_control
 
-        def failing(path: Path, payload: str):
+        def failing(path: Path, payload: str, **kwargs):
             if path.parent.name.startswith(rl.MANAGER_LEAF_PREFIX):
                 return "EACCES"
-            return real_write(path, payload)
+            return real_write(path, payload, **kwargs)
 
         with mock.patch.object(rl, "_write_control", failing):
             topology = tree.bootstrap()
@@ -326,13 +326,13 @@ class ManagerLeafBootstrapTests(unittest.TestCase):
         self.addCleanup(tree.close)
         real_members = rl.read_cgroup_members
 
-        def blind(path: Path):
+        def blind(path: Path, **kwargs):
             if Path(path).name.startswith(rl.MANAGER_LEAF_PREFIX):
                 # A successful read that does not list the controller.  This is
                 # deliberately *not* an unreadable membership: it proves the
                 # move-not-observed branch, not the M2-B35 refusal branch.
                 return rl.CgroupMembership(str(path), read_ok=True, pids=())
-            return real_members(path)
+            return real_members(path, **kwargs)
 
         with mock.patch.object(rl, "read_cgroup_members", blind):
             topology = tree.bootstrap()
@@ -344,10 +344,10 @@ class ManagerLeafBootstrapTests(unittest.TestCase):
         self.addCleanup(tree.close)
         real_write = rl._write_control
 
-        def failing(path: Path, payload: str):
+        def failing(path: Path, payload: str, **kwargs):
             if path.name == "cgroup.subtree_control":
                 return "EBUSY"
-            return real_write(path, payload)
+            return real_write(path, payload, **kwargs)
 
         with mock.patch.object(rl, "_write_control", failing):
             topology = tree.bootstrap()
@@ -360,10 +360,10 @@ class ManagerLeafBootstrapTests(unittest.TestCase):
         self.addCleanup(tree.close)
         real_read = rl._read_control
 
-        def failing(path: Path):
+        def failing(path: Path, **kwargs):
             if path.name == "cgroup.subtree_control":
                 return None, "ENODEV"
-            return real_read(path)
+            return real_read(path, **kwargs)
 
         with mock.patch.object(rl, "_read_control", failing):
             topology = tree.bootstrap()
@@ -374,10 +374,10 @@ class ManagerLeafBootstrapTests(unittest.TestCase):
         self.addCleanup(tree.close)
         real_read = rl._read_control
 
-        def partial(path: Path):
+        def partial(path: Path, **kwargs):
             if path.name == "cgroup.subtree_control":
                 return "memory", None
-            return real_read(path)
+            return real_read(path, **kwargs)
 
         with mock.patch.object(rl, "_read_control", partial):
             topology = tree.bootstrap()
@@ -390,10 +390,10 @@ class ManagerLeafBootstrapTests(unittest.TestCase):
         self.addCleanup(tree.close)
         real_read = rl._read_control
 
-        def wrong(path: Path):
+        def wrong(path: Path, **kwargs):
             if path.name == "cgroup.subtree_control":
                 return "cpu io", None
-            return real_read(path)
+            return real_read(path, **kwargs)
 
         with mock.patch.object(rl, "_read_control", wrong):
             topology = tree.bootstrap()
@@ -559,10 +559,10 @@ class KernelWriteTests(unittest.TestCase):
         (self.directory / "pids.max").write_text("", encoding="utf-8")
         (self.directory / "memory.max").write_text("", encoding="utf-8")
 
-        def surprising(path: Path):
+        def surprising(path: Path, **kwargs):
             if path.name == "pids.max":
                 return "unbounded", None
-            return real_read(path)
+            return real_read(path, **kwargs)
 
         with mock.patch.object(rl, "_read_control", surprising):
             code, detail, observed = rl._apply_and_read_back_limits(
@@ -575,10 +575,10 @@ class KernelWriteTests(unittest.TestCase):
         real_read = rl._read_control
         (self.directory / "pids.max").write_text("", encoding="utf-8")
 
-        def wrong(path: Path):
+        def wrong(path: Path, **kwargs):
             if path.name == "pids.max":
                 return "63\n", None
-            return real_read(path)
+            return real_read(path, **kwargs)
 
         with mock.patch.object(rl, "_read_control", wrong):
             code, detail, _ = rl._apply_and_read_back_limits(self.directory, {"pids.max": 64})
@@ -660,7 +660,7 @@ class EffectCgroupTests(unittest.TestCase):
         with mock.patch.object(
             rl,
             "_write_control",
-            lambda path, payload: "EACCES" if path.name == "pids.max" else real_write(path, payload),
+            lambda path, payload, **kw: "EACCES" if path.name == "pids.max" else real_write(path, payload, **kw),
         ):
             cgroup = self._cgroup("wfail")
             self.assertFalse(cgroup.create())
@@ -672,7 +672,7 @@ class EffectCgroupTests(unittest.TestCase):
         with mock.patch.object(
             rl,
             "_write_control",
-            lambda path, payload: "EACCES" if path.name == "memory.max" else real_write(path, payload),
+            lambda path, payload, **kw: "EACCES" if path.name == "memory.max" else real_write(path, payload, **kw),
         ):
             cgroup = self._cgroup("mfail")
             self.assertFalse(cgroup.create())
@@ -684,7 +684,7 @@ class EffectCgroupTests(unittest.TestCase):
         with mock.patch.object(
             rl,
             "_read_control",
-            lambda path: ("1\n", None) if path.name == "pids.max" else real_read(path),
+            lambda path, **kw: ("1\n", None) if path.name == "pids.max" else real_read(path, **kw),
         ):
             cgroup = self._cgroup("prb")
             self.assertFalse(cgroup.create())
@@ -696,7 +696,7 @@ class EffectCgroupTests(unittest.TestCase):
         with mock.patch.object(
             rl,
             "_read_control",
-            lambda path: ("max\n", None) if path.name == "memory.max" else real_read(path),
+            lambda path, **kw: ("max\n", None) if path.name == "memory.max" else real_read(path, **kw),
         ):
             cgroup = self._cgroup("mrb")
             self.assertFalse(cgroup.create())

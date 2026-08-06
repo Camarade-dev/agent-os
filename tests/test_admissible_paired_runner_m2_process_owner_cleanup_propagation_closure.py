@@ -1480,8 +1480,8 @@ class _FakeEffectParent:
         # and removal steps are three distinct observations here as well.
         real_write = rl._write_control
 
-        def killing_write(path, text):
-            error = real_write(path, text)
+        def killing_write(path, text, **kwargs):
+            error = real_write(path, text, **kwargs)
             procs = Path(path).parent / "cgroup.procs"
             # The kernel never recreates an interface file it does not have, so
             # a membership that cannot be read stays unreadable through a kill.
@@ -1570,10 +1570,10 @@ class EffectCgroupRemovalObligationTests(unittest.TestCase):
         entry_id = cgroup.cleanup_registry_id
         real_write = rl._write_control
 
-        def failing_kill(path, text):
+        def failing_kill(path, text, **kwargs):
             if Path(path).name == "cgroup.kill":
                 return "EPERM"
-            return real_write(path, text)
+            return real_write(path, text, **kwargs)
 
         # The domain cannot be destroyed, so it never becomes quiescent and the
         # removal keeps failing.  The obligation is not thereby discharged.
@@ -1751,6 +1751,35 @@ PHYSICAL_STATUSES = (
 )
 
 
+def _accompanying_validation_report() -> dict:
+    """The validation report that was current when *this* closure was.
+
+    The M2 model keeps exactly one current validation report and a later pass
+    moves it.  These assertions are about this closure, so they follow the
+    report that accompanied it: the live report names the commit whose blob it
+    superseded, that blob is loaded from git, and its hash is checked against
+    the one the live report records.  Anchoring to whatever happens to be
+    current later would make this class assert another pass's claims.
+    """
+
+    report = _load(CURRENT_VALIDATION_REPORT)
+    seen: set = set()
+    while report.get("current_closure_key") != "m2_process_owner_cleanup_propagation_closure":
+        superseded = report["supersedes_prior_current_report"]
+        link = (superseded["commit"], superseded["path"])
+        assert link not in seen, "the superseded-report chain loops"
+        seen.add(link)
+        raw = subprocess.run(
+            ["git", "show", f"{superseded['commit']}:{superseded['path']}"],
+            cwd=REPOSITORY_ROOT,
+            check=True,
+            capture_output=True,
+        ).stdout
+        assert hashlib.sha256(raw).hexdigest() == superseded["sha256"], superseded["path"]
+        report = json.loads(raw.decode("utf-8"))
+    return report
+
+
 def _load(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -1767,7 +1796,8 @@ class CurrentArtifactSemanticTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.report = _load(CURRENT_VALIDATION_REPORT)
+        cls.live = _load(CURRENT_VALIDATION_REPORT)
+        cls.report = _accompanying_validation_report()
         cls.closure = _load(CLOSURE_REPORT)
 
     def setUp(self) -> None:
@@ -1803,8 +1833,14 @@ class CurrentArtifactSemanticTests(unittest.TestCase):
                     ),
                 )
         # And the operation the code names for an unsettled cleanup is one a
-        # production caller performs, not a label.
-        source = inspect.getsource(pw.PrivateMountHelper.close)
+        # production caller performs, not a label.  M2-B53 made ``close`` a
+        # serialising wrapper around the body that performs the shutdown, so the
+        # claim is checked against the whole shutdown -- the wrapper and the body
+        # it delegates to -- rather than against whichever of the two happens to
+        # hold the call today.
+        source = inspect.getsource(pw.PrivateMountHelper.close) + inspect.getsource(
+            pw.PrivateMountHelper._close_locked
+        )
         self.assertIn("_settle_restoration_debt", source)
 
     def test_a_completion_claim_is_rejected_while_debt_remains(self) -> None:
@@ -1916,7 +1952,8 @@ class ClosureArtifactCoherenceTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.report = _load(CURRENT_VALIDATION_REPORT)
+        cls.live = _load(CURRENT_VALIDATION_REPORT)
+        cls.report = _accompanying_validation_report()
         cls.closure = _load(CLOSURE_REPORT)
         cls.matrix = _load(REQUIREMENT_MATRIX)
 
@@ -1948,6 +1985,18 @@ class ClosureArtifactCoherenceTests(unittest.TestCase):
             "implementation/M2_OWNERSHIP_DEBT_REAP_CLOSURE_REPORT.json",
             self.report["superseded_closure_reports"],
         )
+        # Exactly one report declares itself current, and a later pass that
+        # moved it records this closure among the reports it superseded.
+        self.assertTrue(self.live["is_current_validation_report"])
+        if self.live != self.report:
+            self.assertIn(
+                "implementation/M2_PROCESS_OWNER_CLEANUP_PROPAGATION_CLOSURE_REPORT.json",
+                self.live["superseded_closure_reports"],
+            )
+            self.assertNotEqual(
+                self.live["current_closure_key"],
+                "m2_process_owner_cleanup_propagation_closure",
+            )
 
     def test_the_independent_audit_is_recorded_verbatim(self) -> None:
         self.assertEqual(self.closure["independent_audit_sha256"], INDEPENDENT_AUDIT_SHA256)
@@ -2089,7 +2138,10 @@ class ClosureArtifactCoherenceTests(unittest.TestCase):
             self.assertEqual(run["executed"], expected)
 
     def test_the_declared_module_counts_match_the_modules_on_disk(self) -> None:
-        counts = self.report["m2_test_count_semantics"]
+        # The modules on disk are the current ones, so the counts they are
+        # compared against must come from the current report; a frozen
+        # historical decomposition describes modules that have moved on.
+        counts = self.live["m2_test_count_semantics"]
         modules = {
             "tests.test_admissible_paired_runner_m2_b25_cgroup_topology": "m2_b25_topology_module",
             "tests.test_admissible_paired_runner_m2_b25_final_failclosed": (
@@ -2106,6 +2158,9 @@ class ClosureArtifactCoherenceTests(unittest.TestCase):
             ),
             "tests.test_admissible_paired_runner_m2_process_owner_cleanup_propagation_closure": (
                 "m2_process_owner_cleanup_propagation_closure_module"
+            ),
+            "tests.test_admissible_paired_runner_m2_cgroup_identity_reap_registry_serialization_closure": (
+                "m2_cgroup_identity_reap_registry_serialization_closure_module"
             ),
         }
         for module, field in modules.items():

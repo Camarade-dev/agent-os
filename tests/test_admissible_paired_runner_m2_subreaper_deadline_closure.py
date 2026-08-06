@@ -1420,7 +1420,12 @@ class BoundedHelperShutdownTests(unittest.TestCase):
             po.HELPER_SHUTDOWN_DEADLINE_MS,
             "the cooperative prefix can consume the whole shutdown deadline",
         )
-        source = inspect.getsource(PrivateMountHelper.close)
+        # M2-B53 made ``close`` a serialising wrapper around the body that
+        # performs the shutdown, so the whole shutdown -- the wrapper plus the
+        # body it delegates to -- is what may create at most one deadline.
+        source = inspect.getsource(PrivateMountHelper.close) + inspect.getsource(
+            PrivateMountHelper._close_locked
+        )
         self.assertEqual(
             source.count("Deadline.after_ms"), 1, "a shutdown step started a fresh deadline"
         )
@@ -1665,6 +1670,10 @@ class ClosureArtifactCoherenceTests(unittest.TestCase):
                 "tests.test_admissible_paired_runner_m2_process_owner_cleanup_propagation_closure",
                 "m2_process_owner_cleanup_propagation_closure_module",
             ),
+            (
+                "tests.test_admissible_paired_runner_m2_cgroup_identity_reap_registry_serialization_closure",
+                "m2_cgroup_identity_reap_registry_serialization_closure_module",
+            ),
         ):
             loader = unittest.defaultTestLoader.loadTestsFromName(module)
             self.assertEqual(loader.countTestCases(), counts[field], module)
@@ -1676,7 +1685,8 @@ class ClosureArtifactCoherenceTests(unittest.TestCase):
             + counts["m2_final_protocol_lifecycle_module"]
             + counts["m2_subreaper_deadline_closure_module"]
             + counts["m2_ownership_debt_reap_closure_module"]
-            + counts["m2_process_owner_cleanup_propagation_closure_module"],
+            + counts["m2_process_owner_cleanup_propagation_closure_module"]
+            + counts["m2_cgroup_identity_reap_registry_serialization_closure_module"],
         )
 
     def test_the_closure_report_records_every_declared_deadline(self) -> None:

@@ -51,13 +51,16 @@ from .cgroup_launch import (
 from .process_ownership import (
     ABORT_TOTAL_DEADLINE_MS,
     CHILD_SUBREAPER,
+    REAPER_MOUNT_NAMESPACE_HELPER,
     REAPER_NONE,
+    REAPER_TRUSTED_CONTROLLER,
     SUBREAPER_RESTORE_DEADLINE_MS,
     CleanupBudget,
     Deadline,
     ProcessOwnershipEvidence,
 )
 from .resource_limits import (
+    CGROUP_REGISTRY_SATURATED,
     MECHANISM_CGROUP_AND_RLIMIT,
     MECHANISM_NONE,
     CgroupDelegation,
@@ -418,6 +421,13 @@ def abort_gated_effect(
     #    is still reached; nothing outside this cgroup is ever signalled.  This
     #    is a local kernel mechanism and never waits on the helper.
     if cgroup is not None:
+        # M2-B51.  The exact launcher is an owned process obligation of this
+        # domain.  Recording it here means the containment settlement below --
+        # and any later drain -- accounts for the exact PID rather than for
+        # whatever the membership happened to list.
+        launcher_pid = getattr(process, "pid", None)
+        if isinstance(launcher_pid, int) and not isinstance(launcher_pid, bool):
+            cgroup.record_owned_process(launcher_pid, role="GATED_LAUNCHER")
         budget.observe("process_domain_kill")
         kill_domain = cgroup.kill_domain()
         evidence["kill_domain"] = kill_domain
@@ -437,6 +447,19 @@ def abort_gated_effect(
         evidence["launcher_killed"] = _legacy_terminate_and_reap(process, ownership, budget)
     budget.note("launcher_exit_observation", completed=ownership.launcher_exit_observed)
     budget.note("launcher_reap", completed=ownership.launcher_reaped)
+    # M2-B51.  A reap this bounded path positively performed, attributed to the
+    # component that performed it, is the only thing that discharges the
+    # launcher's process obligation.  An unreaped launcher leaves it standing and
+    # the cgroup obligation stays retained however empty the directory is.
+    if cgroup is not None and ownership.launcher_reaped:
+        launcher_pid = getattr(process, "pid", None)
+        if isinstance(launcher_pid, int) and not isinstance(launcher_pid, bool):
+            cgroup.note_trusted_reap(
+                launcher_pid,
+                reaper_role=ownership.launcher_reaper_role or REAPER_TRUSTED_CONTROLLER,
+                reaper_pid=ownership.launcher_reaper_pid,
+                detail="the bounded abort path observed the launcher reaped",
+            )
 
     # 3. Close every descriptor this controller owns.  Closing does not wait.
     budget.observe("descriptor_closure")
@@ -669,6 +692,20 @@ def supervise_command(
     delegation = cgroup_delegation()
     cgroup = EffectCgroup(delegation, bounds, f"{os.getpid()}-{start_monotonic}")
     created = cgroup.create()
+    # M2-B52.  A creation refused because this process already holds its capacity
+    # of unresolved cleanups is fail-closed whatever mechanism was promised: the
+    # containment obligation this effect would create could not be retained, so
+    # the effect does not begin.  Nothing has been forked at this point.
+    if not created and str(cgroup.create_error or "").startswith(CGROUP_REGISTRY_SATURATED):
+        for descriptor in (status_read, status_write, control_read, control_write, seccomp_fd):
+            try:
+                os.close(descriptor)
+            except OSError:  # pragma: no cover
+                pass
+        raise ResourceContainmentUnavailable(
+            "the process cleanup registry is at capacity, so no per-effect cgroup was created "
+            f"and no effect was started: {cgroup.create_error}"
+        )
     if required_containment_mechanism == MECHANISM_CGROUP_AND_RLIMIT and not created:
         for descriptor in (status_read, status_write, control_read, control_write, seccomp_fd):
             try:
@@ -771,6 +808,11 @@ def supervise_command(
         # a real cgroup2 procs file, then release.  Failure refuses before the
         # launcher image runs and therefore before the untrusted command exists.
         owned_descriptors = (status_read, status_write, control_read, control_write, seccomp_fd)
+        # M2-B51.  The launcher is the process this controller owns inside the
+        # domain.  It is recorded as an obligation *before* the attach, so a
+        # cleanup that follows any later failure has an exact PID to account for
+        # rather than a membership snapshot to guess from.
+        cgroup.record_owned_process(launcher_pid, role="GATED_LAUNCHER")
         attached = attach_and_verify_real(cgroup, launcher_pid)
         if not attached:
             # The gate was never reached, so the launcher image never ran and
@@ -972,6 +1014,32 @@ def supervise_command(
         else:
             process.kill()
             launcher_returncode = process.wait(timeout=CAPSULE_TEARDOWN_TIMEOUT_SECONDS)
+
+    # M2-B51.  The launcher has been waited on.  Whoever performed that wait --
+    # the trusted mount-namespace helper through its protocol, or this
+    # controller directly once it owned the orphan -- is named here against the
+    # exact PID, so the containment settlement can discharge the process
+    # obligation from positive evidence instead of reading ``ECHILD`` as an
+    # answer it is not.
+    if launcher_returncode is not None:
+        reap_outcome = getattr(process, "reap_outcome", None)
+        if reap_outcome is not None and getattr(reap_outcome, "reaped", False):
+            cgroup.note_trusted_reap(
+                launcher_pid,
+                reaper_role=reap_outcome.reaper_role,
+                reaper_pid=reap_outcome.reaper_pid,
+                detail=f"the trusted controller reaped the launcher: {reap_outcome.code}",
+            )
+        else:
+            cgroup.note_trusted_reap(
+                launcher_pid,
+                reaper_role=REAPER_MOUNT_NAMESPACE_HELPER,
+                reaper_pid=getattr(runtime.private_view.helper, "pid", None),
+                detail=(
+                    "the trusted mount-namespace helper waited on the launcher it forked and "
+                    f"reported exit {launcher_returncode}"
+                ),
+            )
 
     status = parse_capsule_status(bytes(status_bytes))
     end_wall, end_monotonic = _now()

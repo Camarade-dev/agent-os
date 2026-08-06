@@ -1357,6 +1357,13 @@ class SubreaperReference:
         self._generation = int(state.get("generation", ownership_generation()))
         self._released = False
         self._release_state: dict[str, Any] = {}
+        # M2-B53.  A reference is a linear capability: exactly one caller may
+        # spend it, whatever the thread interleaving.  The unprotected
+        # check-then-set this replaces let two threads both observe
+        # ``_released is False`` and both call the owner's release, decrementing
+        # one acquisition twice -- and let a second caller that lost the race
+        # read back an empty document as though it were the terminal result.
+        self._release_lock = threading.Lock()
 
     @property
     def state(self) -> dict[str, Any]:
@@ -1409,12 +1416,26 @@ class SubreaperReference:
         return self._owner.settle_restoration_debt()
 
     def release(self) -> dict[str, Any]:
-        """Release this acquisition once.  Idempotent, and never cross-process."""
+        """Release this acquisition once.  Idempotent, and never cross-process.
 
+        M2-B53.  Serialised end to end: the already-released check, the owner
+        release, and the publication of the terminal document happen under one
+        lock, so concurrent callers perform exactly one owner release between
+        them and every one of them receives the same coherent result rather than
+        the empty dictionary a loser of the race used to read.  A release the
+        owner could not complete leaves the reference unspent, because a handle
+        marked released over an acquisition still held is the double-release
+        this closes in the other direction.
+        """
+
+        with self._release_lock:
+            return self._release_locked()
+
+    def _release_locked(self) -> dict[str, Any]:
         if self._released:
             return dict(self._release_state)
-        self._released = True
         if self._holder_pid != os.getpid():
+            self._released = True
             # A handle carried across fork() names a flag this process does not
             # hold.  Releasing it here would restore a process-wide value this
             # process never set.
@@ -1435,7 +1456,13 @@ class SubreaperReference:
                 "released_nothing": True,
             }
             return dict(self._release_state)
-        self._release_state = self._owner.release()
+        # The owner release is performed *before* the handle is marked spent, so
+        # an owner that could not complete synchronously leaves a handle that is
+        # still the reachable capability rather than one that reports a release
+        # nothing performed.
+        state = self._owner.release()
+        self._release_state = state
+        self._released = True
         return dict(self._release_state)
 
 

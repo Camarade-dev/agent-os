@@ -1069,8 +1069,10 @@ class ValidationReportCountTests(unittest.TestCase):
             + counts["m2_final_protocol_lifecycle_module"]
             + counts["m2_subreaper_deadline_closure_module"]
             + counts["m2_ownership_debt_reap_closure_module"]
-            # ...and M2-B48 added the process-owner/cleanup-propagation module.
-            + counts["m2_process_owner_cleanup_propagation_closure_module"],
+            # ...and M2-B48 added the process-owner/cleanup-propagation module,
+            # and M2-B50 the cgroup-identity/reap/registry-serialization module.
+            + counts["m2_process_owner_cleanup_propagation_closure_module"]
+            + counts["m2_cgroup_identity_reap_registry_serialization_closure_module"],
             "the legacy and new modules must account for the whole discovery total",
         )
 

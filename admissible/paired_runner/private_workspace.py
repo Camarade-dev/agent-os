@@ -27,6 +27,7 @@ import signal
 import socket
 import stat
 import struct
+import threading
 import time
 from typing import Any, Callable, ClassVar, Iterator
 
@@ -70,6 +71,7 @@ from .process_ownership import (
     SUBREAPER_RESTORE_DEADLINE_MS,
     SUBREAPER_UNSETTLED_RESULTS,
     ChildSubreaperUnavailable,
+    CleanupBudget,
     ControllerDeadlineExpired,
     Deadline,
     ProcessOwnershipEvidence,
@@ -85,7 +87,12 @@ from .process_ownership import (
     reap_owned_child,
     signal_process,
 )
-from .resource_limits import set_cleanup_registrar as _set_cleanup_registrar
+from .resource_limits import (
+    _release_unregistered as _release_unregistered_cleanup,
+    _retain_unregistered as _retain_unregistered_cleanup,
+    set_cleanup_registrar as _set_cleanup_registrar,
+    unregistered_cleanups as _unregistered_cleanups,
+)
 from .observation import (
     M2_PREFIX,
     M2_SCHEMA_VERSION,
@@ -384,6 +391,10 @@ class _UnsettledFailedStart:
         self.settlements: list[dict[str, Any]] = []
         self.retries = 0
         self.last_retry: dict[str, Any] = {}
+        # M2-B53.  The retry is a lifecycle transition -- reap, release once,
+        # settle -- and two callers reaching it together must perform one of
+        # each between them, not two.
+        self._lock = threading.RLock()
 
     @property
     def restoration_settled(self) -> bool:
@@ -420,8 +431,16 @@ class _UnsettledFailedStart:
         return settlement
 
     def retry(self, *, deadline: Deadline | None = None) -> dict[str, Any]:
-        """Reap the exact child, release once, then settle what the release owes."""
+        """Reap the exact child, release once, then settle what the release owes.
 
+        M2-B53.  Serialised: concurrent retries reap once, release once and
+        settle once between them.
+        """
+
+        with self._lock:
+            return self._retry_locked(deadline=deadline)
+
+    def _retry_locked(self, *, deadline: Deadline | None = None) -> dict[str, Any]:
         bound = deadline or Deadline.after_ms(HELPER_REAP_DEADLINE_MS, "failed_start_retry")
         if self.owner_pid != os.getpid():  # pragma: no cover - defensive
             return {
@@ -542,6 +561,10 @@ CLEANUP_RETRY_RELEASE = "RELEASE_THE_ACQUISITION_ONCE"
 CLEANUP_RETRY_SETTLE = "SETTLE_THE_PROCESS_WIDE_RESTORATION_DEBT"
 #: M2-B48.  The obligation process ownership being settled does not settle.
 CLEANUP_RETRY_REMOVE_CGROUP = "REMOVE_THE_EXACT_OWNED_EFFECT_CGROUP"
+#: M2-B51.  The obligation an absent cgroup does not discharge.
+CLEANUP_RETRY_REAP_OWNED = "REAP_THE_EXACT_OWNED_PROCESSES"
+#: M2-B52.  The obligation exists and the registry has not retained it yet.
+CLEANUP_RETRY_REGISTER = "REGISTER_THE_UNRESOLVED_OBLIGATION"
 CLEANUP_RETRY_NONE = "NOTHING_REMAINS"
 
 
@@ -570,16 +593,81 @@ class CleanupRegistrySaturated(PrivateWorkspaceError):
         super().__init__("cleanup_registry_saturated", detail)
 
 
+class CleanupRegistrationFailed(PrivateWorkspaceError):
+    """An obligation exists and the registry could not be made to retain it."""
+
+    def __init__(self, detail: str = "") -> None:
+        super().__init__("cleanup_registration_failed", detail)
+
+
+# --- M2-B52: capacity is reserved before an obligation may be created ---------
+#
+# ``require_capacity()`` and ``record()`` were two operations with a whole effect
+# between them.  ``require_capacity()`` checked and returned; ``record()`` then
+# allocated an id and inserted unconditionally, so the check could pass at 63,
+# the effect could run, and the insertion could take the registry to 65 -- or two
+# threads could each pass the check at 63 and each insert.  A reservation closes
+# the gap: it is taken atomically before anything can create the obligation, it
+# is carried through the effect, and it is either converted into exactly one
+# entry or given back.
+
+#: How long a whole registry drain may spend, for a caller that supplies no
+#: deadline of its own.  M2-B54: this is the total for the *drain*, not a
+#: per-entry allowance, so sixty-four entries cost this once.
+CLEANUP_DRAIN_TOTAL_DEADLINE_MS = HELPER_SHUTDOWN_DEADLINE_MS
+
+
+class _CapacityReservation:
+    """One unit of registry capacity, held before the obligation exists."""
+
+    def __init__(self, registry: "_IncompleteCleanupRegistry", reservation_id: str, label: str) -> None:
+        self._registry = registry
+        self.reservation_id = reservation_id
+        self.label = label
+        self.owner_pid = os.getpid()
+        self.active = True
+        self.converted_to: str | None = None
+
+    def release(self) -> bool:
+        """Give the capacity back.  Idempotent, and never releases twice."""
+
+        return self._registry._release_reservation(self)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "reservation_id": self.reservation_id,
+            "label": self.label,
+            "owner_pid": self.owner_pid,
+            "active": self.active,
+            "converted_to": self.converted_to,
+        }
+
+
 class _IncompleteCleanup:
     """One retained handle to a cleanup this process has not finished."""
 
-    def __init__(self, entry_id: str, kind: str, handle: Any, evidence: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        entry_id: str,
+        kind: str,
+        handle: Any,
+        evidence: dict[str, Any],
+        *,
+        generation: int = 0,
+    ) -> None:
         self.entry_id = entry_id
         self.kind = kind
         self.handle = handle
         self.owner_pid = os.getpid()
         self.helper_pid = int(evidence.get("helper_pid") or 0)
         self.registered_generation = int(evidence.get("ownership_generation") or 0)
+        #: M2-B53.  The registry generation this entry was inserted under.  A
+        #: drain that finishes settling an entry may only publish or remove the
+        #: entry it claimed, never whatever now stands under the same id.
+        self.generation = int(generation)
+        #: M2-B53.  Whether a drain currently owns this entry.  Two drains may
+        #: not settle one handle at the same time.
+        self.claimed_by: int | None = None
         #: M2-B48.  The exact cgroup this entry owes a removal for, when it owes
         #: one.  It is the containment path this controller created, never a
         #: workspace or repository path, and it is retained because a removal
@@ -615,12 +703,21 @@ class _IncompleteCleanup:
             "owner_pid": self.owner_pid,
             "helper_pid": self.helper_pid,
             "ownership_generation": self.registered_generation,
+            "registry_generation": self.generation,
+            "claimed": self.claimed_by is not None,
             "effect_cgroup_path": self.cleanup.get("effect_path"),
             "owned_identity": self.cleanup.get("owned_identity"),
             "drain_attempts": self.drains,
             "cleanup_complete": bool(self.cleanup.get("cleanup_complete")),
             "cleanup_retryable": bool(self.cleanup.get("cleanup_retryable")),
             "cleanup_retry_operation": self.cleanup.get("cleanup_retry_operation"),
+            "containment_settled": bool(self.cleanup.get("containment_settled")),
+            "process_obligations_complete": bool(
+                self.cleanup.get("process_obligations_complete", True)
+            ),
+            "unresolved_owned_processes": list(
+                self.cleanup.get("unresolved_owned_processes") or ()
+            ),
             "reaped": bool(self.cleanup.get("reaped")),
             "ownership_retained": bool(self.cleanup.get("ownership_retained")),
             "restoration_settled": bool(self.cleanup.get("restoration_settled")),
@@ -635,110 +732,277 @@ class _IncompleteCleanupRegistry:
     PID-bound by construction: a ``fork`` child inherits this module's memory but
     owns none of the processes, descriptors, or acquisitions the entries
     describe, so it discards them rather than retrying a parent's cleanup.
+
+    M2-B52.  One lock covers every transition: the fork check, the capacity
+    arithmetic, the id allocation, the insertion, the removal, the evidence
+    snapshot, the drain claim, and the fork reset.  It is never held across a
+    blocking settlement -- a drain claims under the lock, settles outside it, and
+    reacquires it to publish -- so a slow helper shutdown cannot stall an
+    unrelated registration.
     """
 
     def __init__(self) -> None:
+        self._lock = threading.RLock()
         self._owner_pid = os.getpid()
         self._entries: dict[str, _IncompleteCleanup] = {}
+        self._reservations: dict[str, _CapacityReservation] = {}
         self._counter = 0
+        self._reservation_counter = 0
+        self._generation = 0
 
-    def _reset_after_fork(self) -> None:
+    # --- state, always under the one lock -------------------------------------
+
+    def _reset_after_fork_locked(self) -> None:
         if self._owner_pid != os.getpid():
             self._owner_pid = os.getpid()
             self._entries = {}
+            self._reservations = {}
             self._counter = 0
+            self._reservation_counter = 0
+            self._generation = 0
+
+    def _reset_after_fork(self) -> None:
+        with self._lock:
+            self._reset_after_fork_locked()
+
+    def _held_locked(self) -> int:
+        """Combined reservations and retained entries.  Never one without the other."""
+
+        return len(self._entries) + len(self._reservations)
 
     @property
     def owner_pid(self) -> int:
-        self._reset_after_fork()
-        return self._owner_pid
+        with self._lock:
+            self._reset_after_fork_locked()
+            return self._owner_pid
 
     def saturated(self) -> bool:
-        self._reset_after_fork()
-        return len(self._entries) >= CLEANUP_REGISTRY_CAPACITY
+        with self._lock:
+            self._reset_after_fork_locked()
+            return self._held_locked() >= CLEANUP_REGISTRY_CAPACITY
+
+    def _saturation_detail(self) -> str:
+        return (
+            f"pid {os.getpid()} holds {len(self._entries)} unresolved private-execution "
+            f"cleanups and {len(self._reservations)} outstanding reservations, which is the "
+            f"capacity of {CLEANUP_REGISTRY_CAPACITY}; no further obligation is created until "
+            "they are drained"
+        )
+
+    def reserve(self, label: str = "") -> _CapacityReservation:
+        """Take one unit of capacity atomically, or refuse fail-closed.
+
+        The reservation is what makes "refuse before the effect" true rather than
+        hoped for: it is held from before the fork or the ``mkdir`` until the
+        obligation is either registered or positively completed.
+        """
+
+        with self._lock:
+            self._reset_after_fork_locked()
+            if self._held_locked() >= CLEANUP_REGISTRY_CAPACITY:
+                raise CleanupRegistrySaturated(self._saturation_detail())
+            self._reservation_counter += 1
+            reservation_id = f"reservation-{self._owner_pid}-{self._reservation_counter:06d}"
+            reservation = _CapacityReservation(self, reservation_id, label)
+            self._reservations[reservation_id] = reservation
+            return reservation
+
+    def _release_reservation(self, reservation: _CapacityReservation) -> bool:
+        with self._lock:
+            self._reset_after_fork_locked()
+            if not reservation.active:
+                return False
+            reservation.active = False
+            self._reservations.pop(reservation.reservation_id, None)
+            return True
+
+    def outstanding_reservations(self) -> tuple[_CapacityReservation, ...]:
+        with self._lock:
+            self._reset_after_fork_locked()
+            return tuple(self._reservations.values())
 
     def require_capacity(self) -> None:
-        """Refuse a new private execution view fail-closed at capacity."""
+        """Refuse a new private execution view fail-closed at capacity.
 
-        if self.saturated():
-            raise CleanupRegistrySaturated(
-                f"pid {os.getpid()} holds {len(self._entries)} unresolved private-execution "
-                f"cleanups, which is the capacity of {CLEANUP_REGISTRY_CAPACITY}; no further "
-                "helper is started until they are drained"
-            )
+        Retained for callers that only need the refusal; :meth:`reserve` is what
+        a caller that is about to create an obligation must use, because a check
+        that does not hold the capacity it checked for holds nothing.
+        """
 
-    def record(self, handle: Any, evidence: dict[str, Any]) -> str | None:
+        with self._lock:
+            self._reset_after_fork_locked()
+            if self._held_locked() >= CLEANUP_REGISTRY_CAPACITY:
+                raise CleanupRegistrySaturated(self._saturation_detail())
+
+    def record(
+        self,
+        handle: Any,
+        evidence: dict[str, Any],
+        *,
+        reservation: _CapacityReservation | None = None,
+    ) -> str | None:
         """Retain an incomplete cleanup, or release a completed one.
 
         Registration is driven by the evidence rather than by the caller, so a
         completed cleanup is never registered and an incomplete one is retained
         wherever it is detected.
+
+        M2-B52.  Insertion consumes the reservation the obligation was created
+        under.  An insertion with no reservation still has to fit inside the
+        capacity in its own right, so a direct call can never take the registry
+        past its bound.
         """
 
-        self._reset_after_fork()
-        existing = getattr(handle, "_registry_id", None)
-        if evidence.get("cleanup_complete"):
-            if existing is not None:
-                self._entries.pop(existing, None)
-                handle._registry_id = None
-            return None
-        if existing is not None and existing in self._entries:
-            self._entries[existing].cleanup = dict(evidence)
-            return existing
-        kind = _CLEANUP_KINDS.get(type(handle).__name__, CLEANUP_KIND_HELPER)
-        self._counter += 1
-        entry_id = f"cleanup-{self._owner_pid}-{self._counter:06d}"
-        self._entries[entry_id] = _IncompleteCleanup(entry_id, kind, handle, evidence)
-        handle._registry_id = entry_id
-        return entry_id
+        with self._lock:
+            self._reset_after_fork_locked()
+            existing = getattr(handle, "_registry_id", None)
+            if evidence.get("cleanup_complete"):
+                if existing is not None:
+                    self._entries.pop(existing, None)
+                    handle._registry_id = None
+                if reservation is not None and reservation.active:
+                    self._release_reservation(reservation)
+                return None
+            if existing is not None and existing in self._entries:
+                self._entries[existing].cleanup = dict(evidence)
+                if reservation is not None and reservation.active:
+                    # The obligation is already retained under one entry; the
+                    # reservation it was created under is spent on that entry.
+                    reservation.converted_to = existing
+                    self._release_reservation(reservation)
+                return existing
+            reserved = reservation is not None and reservation.active
+            if not reserved and len(self._entries) >= CLEANUP_REGISTRY_CAPACITY:
+                raise CleanupRegistrySaturated(self._saturation_detail())
+            kind = _CLEANUP_KINDS.get(type(handle).__name__, CLEANUP_KIND_HELPER)
+            self._counter += 1
+            self._generation += 1
+            entry_id = f"cleanup-{self._owner_pid}-{self._counter:06d}"
+            self._entries[entry_id] = _IncompleteCleanup(
+                entry_id, kind, handle, evidence, generation=self._generation
+            )
+            handle._registry_id = entry_id
+            if reserved:
+                reservation.converted_to = entry_id
+                self._release_reservation(reservation)
+            return entry_id
 
     def entry(self, entry_id: str) -> _IncompleteCleanup | None:
-        self._reset_after_fork()
-        return self._entries.get(entry_id)
+        with self._lock:
+            self._reset_after_fork_locked()
+            return self._entries.get(entry_id)
 
     def entries(self) -> tuple[_IncompleteCleanup, ...]:
-        self._reset_after_fork()
-        return tuple(self._entries.values())
+        with self._lock:
+            self._reset_after_fork_locked()
+            return tuple(self._entries.values())
 
     def evidence(self) -> dict[str, Any]:
-        self._reset_after_fork()
-        return {
-            "owner_pid": self._owner_pid,
-            "reading_pid": os.getpid(),
-            "capacity": CLEANUP_REGISTRY_CAPACITY,
-            "retained": len(self._entries),
-            "saturated": self.saturated(),
-            "entries": [entry.evidence() for entry in self._entries.values()],
-        }
+        with self._lock:
+            self._reset_after_fork_locked()
+            return {
+                "owner_pid": self._owner_pid,
+                "reading_pid": os.getpid(),
+                "capacity": CLEANUP_REGISTRY_CAPACITY,
+                "retained": len(self._entries),
+                "reserved": len(self._reservations),
+                "held": self._held_locked(),
+                "saturated": self._held_locked() >= CLEANUP_REGISTRY_CAPACITY,
+                "reservations": [row.to_dict() for row in self._reservations.values()],
+                "entries": [entry.evidence() for entry in self._entries.values()],
+            }
+
+    # --- M2-B53/M2-B54: one claim per entry, one deadline per drain -----------
+
+    def _claim_locked(self, entry: _IncompleteCleanup, token: int) -> bool:
+        if entry.claimed_by is not None:
+            return False
+        if self._entries.get(entry.entry_id) is not entry:
+            return False
+        entry.claimed_by = token
+        return True
 
     def drain(self, *, deadline: Deadline | None = None) -> list[dict[str, Any]]:
-        """Retry every retained cleanup once, boundedly.  Idempotent."""
+        """Retry every retained cleanup once, inside one absolute deadline.
 
-        self._reset_after_fork()
+        M2-B54.  The whole drain spends one instant.  Every claimed entry
+        receives only what is left of it, capped by the per-entry maximum, so
+        sixty-four entries cost the configured total once rather than
+        sixty-four times.  Once nothing remains, the remaining entries are
+        reported with non-blocking evidence and are retained unattempted; they
+        are not given a fresh budget and are not silently dropped.
+
+        M2-B53.  An entry is claimed by at most one drain, the claim is taken
+        under the registry lock, the settlement happens outside it, and the
+        result is published only if the entry claimed is still the entry
+        registered.
+        """
+
+        budget = CleanupBudget.open(
+            deadline, total_ms=CLEANUP_DRAIN_TOTAL_DEADLINE_MS, label="cleanup_drain"
+        )
+        token = threading.get_ident()
         results: list[dict[str, Any]] = []
-        for entry in tuple(self._entries.values()):
-            bound = deadline or Deadline.after_ms(HELPER_SHUTDOWN_DEADLINE_MS, "cleanup_drain")
-            cleanup = entry.retry(deadline=bound)
+        with self._lock:
+            self._reset_after_fork_locked()
+            candidates = tuple(self._entries.values())
+        for entry in candidates:
+            with self._lock:
+                if not self._claim_locked(entry, token):
+                    # Another drain owns it.  It is neither settled twice nor
+                    # reported as this drain's work.
+                    continue
+            try:
+                attempted = not budget.exhausted
+                if attempted:
+                    granted = budget.grant(f"drain:{entry.entry_id}", HELPER_SHUTDOWN_DEADLINE_MS)
+                    cleanup = entry.retry(deadline=granted)
+                    granted_ms = int(granted.remaining_seconds * 1000)
+                else:
+                    budget.observe(f"drain:{entry.entry_id}")
+                    cleanup = dict(entry.cleanup)
+                    granted_ms = 0
+                budget.note(f"drain:{entry.entry_id}", completed=bool(cleanup.get("cleanup_complete")))
+            finally:
+                with self._lock:
+                    if self._entries.get(entry.entry_id) is entry:
+                        entry.claimed_by = None
+                    else:  # pragma: no cover - the entry was replaced mid-settlement
+                        entry.claimed_by = None
+            with self._lock:
+                still_registered = self._entries.get(entry.entry_id) is entry
             results.append(
                 {
                     "entry_id": entry.entry_id,
                     "kind": entry.kind,
                     "helper_pid": entry.helper_pid,
                     "drain_attempts": entry.drains,
+                    "attempted": attempted,
+                    "granted_ms": granted_ms,
+                    "deadline_exhausted": budget.exhausted,
                     "cleanup_complete": bool(cleanup.get("cleanup_complete")),
                     "cleanup_retryable": bool(cleanup.get("cleanup_retryable")),
                     "cleanup_retry_operation": cleanup.get("cleanup_retry_operation"),
                     "effect_cgroup_path": cleanup.get("effect_path"),
-                    "removed": entry.entry_id not in self._entries,
+                    "retained": still_registered,
+                    "removed": not still_registered,
                 }
             )
+        self._last_drain = budget.to_dict()
         return results
+
+    def last_drain_budget(self) -> dict[str, Any]:
+        """The ledger of the most recent drain, for durable evidence (M2-B54)."""
+
+        return dict(getattr(self, "_last_drain", {}) or {})
 
 
 _CLEANUP_REGISTRY = _IncompleteCleanupRegistry()
 
 
-def _record_cleanup(handle: Any, evidence: dict[str, Any]) -> str | None:
+def _record_cleanup(
+    handle: Any, evidence: dict[str, Any], *, reservation: Any | None = None
+) -> str | None:
     """The registrar the containment layer calls, resolved at call time.
 
     A function rather than a bound method: the registry object is the process's,
@@ -746,7 +1010,13 @@ def _record_cleanup(handle: Any, evidence: dict[str, Any]) -> str | None:
     to through a captured reference.
     """
 
-    return _CLEANUP_REGISTRY.record(handle, evidence)
+    return _CLEANUP_REGISTRY.record(handle, evidence, reservation=reservation)
+
+
+def _reserve_cleanup_capacity(label: str = "") -> _CapacityReservation:
+    """The reserver the containment layer calls before it creates a cgroup."""
+
+    return _CLEANUP_REGISTRY.reserve(label)
 
 
 # M2-B48.  The containment layer discovers unremoved per-effect cgroups and this
@@ -754,7 +1024,11 @@ def _record_cleanup(handle: Any, evidence: dict[str, Any]) -> str | None:
 # a hook rather than an import so containment keeps no knowledge of private
 # execution, and installing it here means every unresolved removal in this
 # process is retained wherever it is discovered.
-_set_cleanup_registrar(_record_cleanup)
+#
+# M2-B52.  The reserver travels the same way and for the same reason: capacity
+# must be taken before the containment layer creates the directory that would
+# become an obligation this process could not retain.
+_set_cleanup_registrar(_record_cleanup, reserver=_reserve_cleanup_capacity)
 
 
 def incomplete_cleanups() -> tuple[_IncompleteCleanup, ...]:
@@ -766,13 +1040,47 @@ def incomplete_cleanups() -> tuple[_IncompleteCleanup, ...]:
 def cleanup_registry_evidence() -> dict[str, Any]:
     """The registry's durable evidence.  It names no filesystem path."""
 
-    return _CLEANUP_REGISTRY.evidence()
+    evidence = _CLEANUP_REGISTRY.evidence()
+    evidence["unregistered_obligations"] = len(_unregistered_cleanups())
+    evidence["last_drain"] = _CLEANUP_REGISTRY.last_drain_budget()
+    return evidence
 
 
 def drain_incomplete_cleanups(*, deadline: Deadline | None = None) -> list[dict[str, Any]]:
-    """Retry every retained incomplete cleanup within one bounded budget."""
+    """Retry every retained incomplete cleanup within one bounded budget.
 
-    return _CLEANUP_REGISTRY.drain(deadline=deadline)
+    M2-B52.  Obligations whose registration the registrar refused are retried
+    here too: they are the ones with no entry to be found by, so a drain that
+    only walked the registry would leave exactly the handles that were hardest
+    to reach.
+    """
+
+    results = _CLEANUP_REGISTRY.drain(deadline=deadline)
+    for handle in _unregistered_cleanups():
+        settlement = handle.settle_cleanup(
+            deadline=deadline or Deadline.after_ms(CLEANUP_DRAIN_TOTAL_DEADLINE_MS, "cleanup_drain")
+        )
+        cleanup = handle.cleanup_evidence()
+        results.append(
+            {
+                "entry_id": None,
+                "kind": _CLEANUP_KINDS.get(type(handle).__name__, CLEANUP_KIND_HELPER),
+                "helper_pid": int(cleanup.get("helper_pid") or 0),
+                "drain_attempts": int(cleanup.get("settlement_attempts") or 0),
+                "attempted": True,
+                "granted_ms": 0,
+                "deadline_exhausted": False,
+                "cleanup_complete": bool(cleanup.get("cleanup_complete")),
+                "cleanup_retryable": bool(cleanup.get("cleanup_retryable")),
+                "cleanup_retry_operation": cleanup.get("cleanup_retry_operation"),
+                "effect_cgroup_path": cleanup.get("effect_path"),
+                "registration_failure": cleanup.get("registration_failure"),
+                "retained": handle in _unregistered_cleanups(),
+                "removed": False,
+                "settlement": settlement,
+            }
+        )
+    return results
 
 
 def _roll_back_failed_start(
@@ -1531,6 +1839,16 @@ class PrivateMountHelper:
         # wrapper that could have dropped it.
         self._registry_id: str | None = None
         self._last_closure: dict[str, Any] = {}
+        # M2-B52.  The capacity this helper's cleanup obligation was created
+        # under, taken before the fork and converted into exactly one registry
+        # entry -- or given back -- when the lifecycle ends.
+        self._reservation: Any = None
+        self._registration_failure: dict[str, Any] | None = None
+        # M2-B53.  A helper handle is reachable from the frame that created it
+        # and from the process registry drain at the same time.  One lifecycle
+        # transition at a time: the reap, the single release, the settlement and
+        # the descriptor closure are performed by exactly one of them.
+        self._lifecycle_lock = threading.RLock()
 
     # --- protocol health ------------------------------------------------------
 
@@ -1698,16 +2016,21 @@ class PrivateMountHelper:
 
         if not hasattr(os, "unshare"):
             raise PrivateWorkspaceError("private_mountns_unavailable", "os.unshare is absent")
-        # M2-B48.  A process already holding its capacity of unresolved cleanups
-        # forks nothing further.  Refusing here is fail-closed and pre-effect:
-        # no acquisition, no socket pair, no child, and no descriptor exists on
-        # this path, exactly as an unavailable acquisition leaves none.
-        _CLEANUP_REGISTRY.require_capacity()
+        # M2-B48/M2-B52.  A process already holding its capacity of unresolved
+        # cleanups forks nothing further.  The capacity is *reserved* rather than
+        # merely checked, so the fork below cannot happen against a capacity
+        # another thread took in between, and the reservation is what the
+        # obligation this helper may become is later registered under.  Refusing
+        # here is fail-closed and pre-effect: no acquisition, no socket pair, no
+        # child, and no descriptor exists on this path, exactly as an unavailable
+        # acquisition leaves none.
+        reservation = _CLEANUP_REGISTRY.reserve("private-mount-helper")
         try:
             subreaper = CHILD_SUBREAPER.acquire_reference()
         except ChildSubreaperUnavailable as error:
             # Nothing was created, so there is nothing to clean up, and the
             # process-wide flag is exactly as this call found it.
+            reservation.release()
             raise PrivateWorkspaceError(
                 "private_mountns_subreaper_unavailable",
                 f"{error.code}: {error.detail}; no helper was forked and no launcher exists",
@@ -1765,11 +2088,17 @@ class PrivateMountHelper:
             helper._subreaper = subreaper
             helper._subreaper_acquired = True
             helper._subreaper_state = subreaper.state
+            helper._reservation = reservation
             return helper
         except BaseException as error:
             rollback = _roll_back_failed_start(
                 pid=pid, sockets=(parent, child), descriptors=tuple(received_fds), subreaper=subreaper
             )
+            # The helper object was never handed the reservation, so the capacity
+            # this start took is given straight back.  A failed start that could
+            # not be reaped is retained by ``_UNSETTLED_FAILED_STARTS`` and is
+            # accounted there, not here.
+            reservation.release()
             if isinstance(error, TimeoutError):
                 raise HelperDeadlineExpired(
                     "helper_startup",
@@ -1958,8 +2287,15 @@ class PrivateMountHelper:
         This method does not re-derive that: it is the single release site, and
         the ordering is enforced at each of the three call sites that can reach
         it, each of which refuses to call it over a live or unreaped helper.
+
+        M2-B53.  Serialised: a local close and a registry drain reaching this
+        helper concurrently release its acquisition exactly once between them.
         """
 
+        with self._lifecycle_lock:
+            return self._release_subreaper_locked()
+
+    def _release_subreaper_locked(self) -> dict[str, Any]:
         if not self._subreaper_acquired:
             return dict(self._subreaper_state)
         self._subreaper_acquired = False
@@ -1983,8 +2319,14 @@ class PrivateMountHelper:
         attempted on the call that discovers the debt as well as on every later
         one.  It claims nothing it did not read back: the ownership document it
         records is the one the settlement returned.
+
+        M2-B53.  Serialised with the release it follows and the reap before it.
         """
 
+        with self._lifecycle_lock:
+            return self._settle_restoration_debt_locked()
+
+    def _settle_restoration_debt_locked(self) -> dict[str, Any]:
         if not self._subreaper_released or self.restoration_settled:
             return {}
         settler = self._subreaper_settler
@@ -2015,6 +2357,10 @@ class PrivateMountHelper:
         restoration is still only *claimed* from its readback.
         """
 
+        with self._lifecycle_lock:
+            return self._release_subreaper_if_reaped_locked(deadline=deadline)
+
+    def _release_subreaper_if_reaped_locked(self, *, deadline: Deadline | None = None) -> dict[str, Any]:
         bound = deadline or Deadline.after_ms(SUBREAPER_RESTORE_DEADLINE_MS, "subreaper_release")
         if not self._subreaper_acquired:
             return {
@@ -2052,8 +2398,15 @@ class PrivateMountHelper:
         cannot answer.  Reaping the helper is also what hands the launcher to
         this controller: the kernel reparents the orphan to the nearest
         subreaper ancestor, which is this process.
+
+        M2-B53.  Serialised: a concurrent close and abort kill and reap this
+        helper exactly once between them.
         """
 
+        with self._lifecycle_lock:
+            return self._terminate_and_reap_locked(deadline=deadline)
+
+    def _terminate_and_reap_locked(self, *, deadline: Deadline | None = None) -> dict[str, Any]:
         bound = deadline or Deadline.after_ms(HELPER_REAP_DEADLINE_MS, "helper_reap")
         state: dict[str, Any] = {
             "helper_pid": self.pid,
@@ -2097,8 +2450,17 @@ class PrivateMountHelper:
         deadline after it and the cooperative steps cannot spend the guarantee.
         A caller inside a larger bounded cleanup passes its own remaining time,
         and this shutdown cannot outlive it.
+
+        M2-B53.  The whole shutdown is one serialised lifecycle transition: a
+        local close and a registry drain arriving together perform one reap, one
+        release and one settlement between them, and both receive the same
+        coherent closure document.
         """
 
+        with self._lifecycle_lock:
+            return self._close_locked(deadline=deadline)
+
+    def _close_locked(self, *, deadline: Deadline | None = None) -> dict[str, Any]:
         whole = deadline or Deadline.after_ms(HELPER_SHUTDOWN_DEADLINE_MS, "helper_shutdown")
         if self._closed and self._cleanup_complete:
             # Terminal.  The protocol is closed, the helper is reaped, its
@@ -2161,6 +2523,9 @@ class PrivateMountHelper:
         released_here = False
         if self._reaped:
             released_here = self._subreaper_acquired
+            # The public, serialising entry point: the lifecycle lock is
+            # re-entrant, so this is the same single release site every other
+            # caller reaches rather than a second, private one.
             self._release_subreaper()
         # M2-B47.  The release is spent; what it could not observe is settled
         # here.  This is what makes the advertised retry a retry: without it a
@@ -2223,8 +2588,42 @@ class PrivateMountHelper:
         evidence["cleanup_retry_operation"] = _cleanup_retry_operation(evidence)
         # M2-B48.  Registration is the last step, so the entry it creates
         # carries the evidence this call produced.
+        #
+        # M2-B52.  It is also a step that can fail, and a failure here used to be
+        # swallowed: the closure returned an ordinary document advertising a
+        # retry, with no registry id and no surviving process-level handle, so
+        # the obligation existed and nothing could reach it.  The failure is now
+        # typed, the cleanup is not called complete over it, and the handle is
+        # retained at process level until a later drain registers or settles it.
         self._last_closure = evidence
-        evidence["cleanup_registry_id"] = _CLEANUP_REGISTRY.record(self, evidence)
+        try:
+            evidence["cleanup_registry_id"] = _CLEANUP_REGISTRY.record(
+                self, evidence, reservation=self._reservation
+            )
+        except Exception as error:
+            self._registration_failure = {
+                "code": "CLEANUP_REGISTRATION_FAILED",
+                "error": type(error).__name__,
+                "detail": str(error),
+                "helper_pid": self.pid,
+            }
+            evidence["cleanup_registry_id"] = None
+            evidence["cleanup_registration_failure"] = dict(self._registration_failure)
+            evidence["cleanup_complete"] = False
+            evidence["cleanup_retryable"] = True
+            evidence["cleanup_retry_operation"] = CLEANUP_RETRY_REGISTER
+            _retain_unregistered_cleanup(self)
+            self._last_closure = evidence
+            return evidence
+        self._registration_failure = None
+        evidence["cleanup_registration_failure"] = None
+        _release_unregistered_cleanup(self)
+        if self._reservation is not None and not getattr(self._reservation, "active", False):
+            # The reservation was either converted into the entry above or given
+            # back with the completion; either way this helper no longer holds
+            # capacity it is not using.
+            self._reservation = None
+        self._last_closure = evidence
         return evidence
 
 

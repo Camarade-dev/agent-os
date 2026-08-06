@@ -1086,10 +1086,10 @@ class MembershipFailClosedCallerTests(unittest.TestCase):
         self.addCleanup(tree.close)
         real = rl.read_cgroup_members
 
-        def failing(path):
+        def failing(path, **kwargs):
             if Path(path) == tree.parent:
                 return CgroupMembership(str(path), read_ok=False, error_code="EACCES")
-            return real(path)
+            return real(path, **kwargs)
 
         with mock.patch.object(rl, "read_cgroup_members", failing):
             topology = rl.initialize_cgroup_topology(
@@ -1108,10 +1108,10 @@ class MembershipFailClosedCallerTests(unittest.TestCase):
         self.addCleanup(tree.close)
         real = rl.read_cgroup_members
 
-        def failing(path):
+        def failing(path, **kwargs):
             if Path(path).name.startswith(rl.MANAGER_LEAF_PREFIX):
                 return CgroupMembership(str(path), read_ok=False, error_code="EACCES")
-            return real(path)
+            return real(path, **kwargs)
 
         with mock.patch.object(rl, "read_cgroup_members", failing):
             topology = rl.initialize_cgroup_topology(
@@ -1141,10 +1141,10 @@ class MembershipFailClosedCallerTests(unittest.TestCase):
         ):
             real = rl.read_cgroup_members
 
-            def failing(path):
+            def failing(path, **kwargs):
                 if Path(path).name.startswith(rl.PROBE_PREFIX):
                     return CgroupMembership(str(path), read_ok=False, error_code="EACCES")
-                return real(path)
+                return real(path, **kwargs)
 
             with mock.patch.object(rl, "read_cgroup_members", failing):
                 delegation = rl.probe_cgroup_delegation(force=True)
@@ -1446,6 +1446,9 @@ class ValidationArtifactCoherenceTests(unittest.TestCase):
             "tests.test_admissible_paired_runner_m2_process_owner_cleanup_propagation_closure": (
                 "m2_process_owner_cleanup_propagation_closure_module"
             ),
+            "tests.test_admissible_paired_runner_m2_cgroup_identity_reap_registry_serialization_closure": (
+                "m2_cgroup_identity_reap_registry_serialization_closure_module"
+            ),
         }
         for module, field in modules.items():
             loader = unittest.defaultTestLoader.loadTestsFromName(module)
@@ -1744,7 +1747,7 @@ class DelegatedProtocolLifecycleTests(unittest.TestCase):
                 real = rl.read_cgroup_members
                 seen = {"effect_reads": 0}
 
-                def failing(path, stage=stage, seen=seen):
+                def failing(path, stage=stage, seen=seen, **kwargs):
                     name = Path(path).name
                     if stage == "revalidation" and name.startswith(rl.MANAGER_LEAF_PREFIX):
                         return CgroupMembership(str(path), read_ok=False, error_code="EACCES")
@@ -1756,7 +1759,7 @@ class DelegatedProtocolLifecycleTests(unittest.TestCase):
                             return CgroupMembership(str(path), read_ok=False, error_code="EACCES")
                         if stage == "cleanup" and seen["effect_reads"] >= 3:
                             return CgroupMembership(str(path), read_ok=False, error_code="EACCES")
-                    return real(path)
+                    return real(path, **kwargs)
 
                 with mock.patch.object(rl, "read_cgroup_members", failing):
                     outcome = harness.command(SENTINEL_SCRIPT)

@@ -601,3 +601,204 @@ refused rather than destroyed.
 | kill, quiescence and removal are three observations | `test_the_settlement_evidence_states_each_step_separately` |
 | a removed cgroup is never registered | `test_a_removed_cgroup_is_never_registered` |
 | delegated physical qualification, real leaked domain | `test_a_real_unremovable_cgroup_is_retained_and_later_drained` |
+
+---
+
+# G. Exact identity, separate reap, bounded retention (M2-B50 … M2-B54)
+
+Five closures, each of which removes a way for this substrate to say something
+that is not so.
+
+## G1. Ownership is a descriptor, not a name (M2-B50)
+
+`stat(path)` followed by `write(path/"cgroup.kill")` resolves one name twice,
+and anything may happen in between.  The identity comparison that used to guard
+only the final `rmdir` therefore protected nothing that mattered: by the time it
+ran, a same-named replacement had already been enumerated, had already received
+`cgroup.kill`, had already had its members signalled individually, and had
+already been waited on for quiescence.
+
+An `EffectCgroup` now retains a *capability*:
+
+* a directory descriptor opened on the created cgroup with `O_DIRECTORY` and
+  `O_NOFOLLOW`, so a name that has become a symlink or a regular file fails at
+  the open rather than after a write has reached it;
+* the `st_dev:st_ino` observed **through** that descriptor;
+* a descriptor for the delegated parent, which is what proves the owned name
+  still resolves to the owned object;
+* the leaf name, and an explicit released state.
+
+Every one of these is descriptor-relative: the `cgroup.procs` read, the
+`cgroup.procs` write that attaches, the `pids.max` and `memory.max` writes and
+readbacks, the `cgroup.kill` presence probe, the `cgroup.kill` write, the
+quiescence membership reads, and the removal-eligibility read.
+
+`verify_owned_identity()` runs before the attach, before `kill_domain`, again
+between the enumeration and the per-member signals, before `close`'s membership
+read, and again immediately before the `rmdir`.  It answers three questions
+separately and never collapses them: is the retained descriptor still the
+directory it was opened on, does the owned name still resolve to that exact
+object, and — when it does not — is the object itself gone or has it merely been
+displaced by something this controller may not touch.
+
+| code | meaning |
+| --- | --- |
+| `EXACT_OWNED_CGROUP` | proved; the action may proceed |
+| `NO_RETAINED_DIRECTORY_DESCRIPTOR` | exactness cannot be proved at all |
+| `RETAINED_DESCRIPTOR_IDENTITY_CHANGED` | the descriptor is not what it was |
+| `PATHNAME_NAMES_A_DIFFERENT_OBJECT` | a replacement holds the name |
+| `PATHNAME_IS_NOT_A_DIRECTORY` | a symlink or a file holds the name |
+| `PATHNAME_ABSENT` | the name is gone; the descriptor decides the rest |
+| `PARENT_DIRECTORY_UNREADABLE` | nothing is proved, so nothing is done |
+
+Disappearance is a positive observation, not an absence of evidence.  The
+obligation is discharged only when the descriptor proves the created object is
+gone — `ENODEV` or `ESTALE` from an interface-file open through it, or an
+interface file that is no longer there together with a name that no longer
+resolves to the owned inode.  A same-named replacement is never adopted, never
+read, never signalled and never removed.
+
+Linux offers no `rmdir` by descriptor.  The removal is therefore a
+verify-then-act-then-prove sequence: the owned identity is proved immediately
+before the `rmdir`, and afterwards the retained descriptor is asked whether the
+owned object is the object that went away.  The post-condition is recorded
+rather than assumed.
+
+## G2. Containment cleanup and process cleanup are two obligations (M2-B51)
+
+A removed cgroup proves the containment domain is gone.  It proves nothing about
+whether the processes this controller owned inside it were reaped: `cgroup.kill`
+leaves zombies, a zombie belongs to no cgroup, a settlement that took one
+non-blocking `waitpid` over a snapshot taken *before* the kill misses anything
+that joined afterwards, and `ECHILD` means "not this controller's child" — which
+is equally true of a process somebody else reaped and of one nobody did.
+
+Exact process obligations are therefore retained per PID, independently of
+membership:
+
+| state | meaning |
+| --- | --- |
+| `PENDING` | not yet positively accounted for |
+| `REAPED_BY_THIS_CONTROLLER` | `waitpid` on this exact PID returned it |
+| `REAPED_BY_A_NAMED_TRUSTED_COMPONENT` | durable evidence names the reaper |
+| `UNRESOLVED` | `waitpid` refused and no reaper can be named |
+
+Only the middle two are terminal.  `cleanup_complete` is
+`containment_settled AND process_obligations_complete`, and the two facts are
+separate fields in the cleanup document and in the registry entry.
+
+Ownership is never inferred from arbitrary membership.  A member is adopted as
+an obligation only when it is proved to be this controller's direct child from
+`/proc/<pid>/status`; every other member is killed by the domain and never
+waited on, because a `waitpid` on a PID this process does not own is at best an
+`ECHILD` and at worst a wait on an unrelated child a PID reuse handed over.  The
+production supervision path records the launcher as an owned process before the
+attach and names its reaper — the trusted controller or the mount-namespace
+helper — after the wait, on both the nominal and the abort path.
+
+## G3. Capacity is reserved before the obligation exists (M2-B52)
+
+`require_capacity()` checked and returned; `record()` then allocated an id and
+inserted unconditionally, with a whole effect in between and no lock anywhere.
+The check could pass at 63, the effect could run, and the insertion could take
+the registry past its bound — or two threads could each pass the check and each
+insert.
+
+Capacity is now *reserved*: one unit taken atomically against retained entries
+plus outstanding reservations, before `PrivateMountHelper.start` forks and
+before `EffectCgroup.create` calls `mkdir`.  The token is carried through and is
+either converted into exactly one entry or given back.  An insertion with no
+reservation must still fit inside the capacity in its own right.  A saturated
+process creates no directory and forks no helper.
+
+A registrar exception is no longer swallowed.  It becomes a typed
+`CLEANUP_REGISTRATION_FAILED` lifecycle failure, the cleanup is not called
+complete over it, and the handle is retained in a PID-bound process-level list
+that `drain_incomplete_cleanups` also drains — because an obligation nothing can
+name is exactly the leak the registry exists to prevent.
+
+## G4. Linear release and serialised cleanup (M2-B53)
+
+Every reference and cleanup handle is a linear capability.  `SubreaperReference`
+holds a lock covering the released check, the owner release and the publication
+of the terminal document, and the owner release happens *before* the handle is
+marked spent, so a release that could not complete leaves the capability
+unspent.  `PrivateMountHelper`, `_UnsettledFailedStart` and `EffectCgroup` each
+hold a re-entrant lifecycle lock over their reap, release, settlement and
+removal.
+
+The registry never holds its global lock across a blocking cleanup: a drain
+claims an entry under the lock, settles it under the handle's lock outside the
+lock, and reacquires the lock to publish or remove — and only if the entry it
+claimed is still the entry registered.  Entries carry a monotonic registry
+generation, so a stale claim cannot remove a newer entry.
+
+## G5. One deadline for one whole drain (M2-B54)
+
+A drain with no caller deadline used to create a fresh helper-shutdown deadline
+*inside* the loop, so at capacity a "bounded" drain could spend sixty-four
+complete budgets.  One `CleanupBudget` is now opened before the iteration and
+every claimed entry receives a capped view of what is left of it.  Once the
+budget is spent the remaining entries receive one non-blocking evidence read,
+are reported with `attempted=false`, and are retained.  A repeated drain is a new
+caller-owned operation and may be given a new explicit deadline.  The ledger —
+configured total, elapsed, remaining, exhaustion and per-entry grants, all
+integers — is published as `cleanup_registry_evidence().last_drain`.
+
+## G6. Test matrix addendum
+
+| property | test |
+| --- | --- |
+| creation binds a descriptor and its identity | `test_creation_binds_a_directory_descriptor_and_its_identity` |
+| a populated replacement receives no `cgroup.kill` | `test_a_populated_replacement_receives_no_cgroup_kill` |
+| a populated replacement receives no per-member signal | `test_a_populated_replacement_receives_no_per_member_signal` |
+| a symlink replacement is refused before any I/O | `test_a_symlink_replacement_is_refused_before_any_read_or_write` |
+| a swap after the check cannot redirect the action | `test_a_swap_between_the_check_and_the_action_cannot_redirect_it` |
+| reads still address the original object | `test_membership_reads_still_address_the_original_object` |
+| removal targets only the exact owned object | `test_final_removal_targets_only_the_exact_owned_object` |
+| external disappearance discharges, adopts nothing | `test_external_disappearance_discharges_without_adopting_a_replacement` |
+| an unreadable parent refuses | `test_an_unreadable_parent_refuses_rather_than_claiming_exactness` |
+| an attach into a replacement is refused | `test_an_attach_into_a_replacement_is_refused` |
+| the capability is released only when nothing remains | `test_the_capability_is_released_only_once_nothing_remains` |
+| `waitpid == 0` retains and reports incomplete | `test_waitpid_zero_retains_the_entry_and_reports_incomplete` |
+| a later retry positively reaps and completes | `test_a_later_retry_positively_reaps_and_completes` |
+| an absent cgroup with an unreaped child is incomplete | `test_cgroup_removal_with_an_unreaped_owned_child_stays_incomplete` |
+| `ECHILD` without evidence stays unresolved | `test_echild_without_trusted_evidence_stays_unresolved` |
+| `ECHILD` with exact evidence is accepted | `test_echild_with_exact_trusted_evidence_is_accepted` |
+| a late joiner is still handled truthfully | `test_a_process_that_joins_after_the_snapshot_is_still_handled_truthfully` |
+| an unrelated member is never waited on | `test_a_member_that_is_not_this_controllers_child_is_never_waited_on` |
+| an exact owned PID is reaped once | `test_an_exact_owned_pid_is_reaped_once` |
+| containment and reap are separate fields | `test_containment_and_reap_are_separate_evidence_fields` |
+| capacity counts reservations and entries | `test_the_capacity_counts_reservations_and_entries_together` |
+| the sixty-fifth obligation is refused | `test_the_sixty_fifth_obligation_is_refused` |
+| a direct `record` cannot exceed the capacity | `test_direct_record_cannot_exceed_the_capacity` |
+| concurrent reservations at 63 allow exactly one | `test_concurrent_reservations_at_sixty_three_allow_exactly_one_more` |
+| concurrent records never exceed the capacity | `test_concurrent_records_never_exceed_the_capacity` |
+| a reservation converts exactly once | `test_a_reservation_converts_exactly_once` |
+| a reservation is released on clean completion | `test_a_reservation_is_released_on_a_clean_completion` |
+| a cgroup reserves before it creates the directory | `test_a_cgroup_reserves_before_it_creates_the_directory` |
+| a forked child trusts no parent reservation | `test_a_forked_child_trusts_no_parent_reservation_or_entry` |
+| concurrent registry operations stay coherent | `test_concurrent_record_remove_and_evidence_stay_coherent` |
+| a registrar exception cannot lose a cgroup obligation | `test_a_registrar_exception_cannot_lose_a_cgroup_obligation` |
+| a registrar exception cannot lose a helper obligation | `test_a_registrar_exception_cannot_lose_a_helper_obligation` |
+| two simultaneous releases call the owner once | `test_two_simultaneous_releases_call_the_owner_once` |
+| a failed owner release leaves the reference unspent | `test_an_owner_release_that_raises_leaves_the_reference_unspent` |
+| concurrent helper close and drain settle once | `test_concurrent_helper_close_and_drain_reap_and_release_once` |
+| concurrent cgroup close and drain remove once | `test_concurrent_cgroup_close_and_drain_remove_once` |
+| concurrent failed-start retries settle once | `test_concurrent_failed_start_retries_settle_once` |
+| two drains cannot claim the same entry | `test_two_drains_cannot_claim_the_same_entry` |
+| a stale drain cannot remove a newer entry | `test_a_stale_drain_cannot_remove_a_newer_generation_entry` |
+| nested registry and handle operations do not deadlock | `test_nested_registry_and_handle_operations_do_not_deadlock` |
+| two slow entries share one total budget | `test_two_slow_entries_share_one_total_budget` |
+| 64 entries cannot multiply the configured bound | `test_sixty_four_entries_cannot_multiply_the_configured_bound` |
+| later entries receive less or zero time | `test_later_entries_receive_less_or_zero_time` |
+| an already-expired drain blocks on nothing | `test_an_already_expired_drain_blocks_on_nothing` |
+| a repeated drain is a new caller-owned operation | `test_a_repeated_drain_is_a_new_caller_owned_operation` |
+| the drain ledger records the total and exhaustion | `test_the_drain_ledger_records_the_configured_total_and_exhaustion` |
+| no float appears in durable deadline evidence | `test_no_float_appears_in_the_durable_deadline_evidence` |
+| delegated physical: a real replacement is never signalled | `test_a_real_replacement_cgroup_is_never_signalled` |
+| delegated physical: a real delayed reap holds the obligation | `test_a_real_delayed_reap_keeps_the_obligation_until_it_happens` |
+| delegated physical: real capacity exhaustion refuses | `test_real_capacity_exhaustion_refuses_a_real_effect` |
+| delegated physical: a real concurrent close and drain | `test_a_real_concurrent_close_and_drain_settle_once` |
+| delegated physical: a real multi-entry bounded drain | `test_a_real_multi_entry_drain_shares_one_deadline` |
+| delegated physical: the nominal path is unchanged | `test_a_nominal_effect_completes_and_retains_nothing` |

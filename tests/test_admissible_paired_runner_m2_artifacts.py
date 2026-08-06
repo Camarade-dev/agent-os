@@ -40,6 +40,10 @@ M2_OWNERSHIP_DEBT_REAP_STARTING_COMMIT = "2f7eaac796e6f4b3d93419ac3087183302b2a5
 M2_OWNERSHIP_DEBT_REAP_BRANCH = "paired-runner/m2-ownership-debt-reap-closure"
 M2_PROCESS_OWNER_CLEANUP_STARTING_COMMIT = "4a451c859bc528d6281bfd1368ab3ca74fd3933c"
 M2_PROCESS_OWNER_CLEANUP_BRANCH = "paired-runner/m2-process-owner-cleanup-propagation-closure"
+M2_CGROUP_IDENTITY_STARTING_COMMIT = "fd4e9fb409f648da356f90b9ca2c211183267354"
+M2_CGROUP_IDENTITY_BRANCH = (
+    "paired-runner/m2-cgroup-identity-reap-registry-serialization-closure"
+)
 M2_SECOND_BRANCH = "paired-runner/m2-causal-index-and-ipc-repairs"
 M2_THIRD_BRANCH = "paired-runner/m2-private-workspace-and-bound-runtime"
 M2_FOURTH_BRANCH = "paired-runner/m2-fourth-critical-repair-retry"
@@ -57,6 +61,7 @@ M2_ARTIFACTS = (
     "M2_SUBREAPER_DEADLINE_CLOSURE_REPORT.json",
     "M2_OWNERSHIP_DEBT_REAP_CLOSURE_REPORT.json",
     "M2_PROCESS_OWNER_CLEANUP_PROPAGATION_CLOSURE_REPORT.json",
+    "M2_CGROUP_IDENTITY_REAP_REGISTRY_SERIALIZATION_CLOSURE_REPORT.json",
 )
 #: Historical reports of earlier passes.  A later pass may not rewrite them: the
 #: record of what an earlier closure claimed is itself evidence.
@@ -72,6 +77,9 @@ PRESERVED_HISTORICAL_ARTIFACTS = (
     # This pass supersedes the ownership-debt/reap closure, so that closure's
     # report is historical from here on and may not be rewritten.
     "M2_OWNERSHIP_DEBT_REAP_CLOSURE_REPORT.json",
+    # ...and this pass supersedes the process-owner/cleanup-propagation closure,
+    # so its report is historical from here on for the same reason.
+    "M2_PROCESS_OWNER_CLEANUP_PROPAGATION_CLOSURE_REPORT.json",
 )
 PRESERVED_M1_ARTIFACTS = (
     "M1_SCHEMA_CATALOG.json",
@@ -144,13 +152,14 @@ class M2ArtifactTests(unittest.TestCase):
         # M2-M36: the canonical filename is the single *current* report, and the
         # superseded fourth-repair bytes live under a historical filename.
         self.assertTrue(report["is_current_validation_report"])
-        self.assertEqual(report["starting_commit"], M2_PROCESS_OWNER_CLEANUP_STARTING_COMMIT)
-        self.assertEqual(report["branch"], M2_PROCESS_OWNER_CLEANUP_BRANCH)
+        self.assertEqual(report["starting_commit"], M2_CGROUP_IDENTITY_STARTING_COMMIT)
+        self.assertEqual(report["starting_commit_parent"], M2_PROCESS_OWNER_CLEANUP_STARTING_COMMIT)
+        self.assertEqual(report["branch"], M2_CGROUP_IDENTITY_BRANCH)
         self.assertIn(
             report["terminal_verdict"],
             {
-                "M2_PROCESS_OWNER_CLEANUP_PROPAGATION_CLOSURE_VERIFIED",
-                "M2_PROCESS_OWNER_CLEANUP_PROPAGATION_OPERATOR_QUALIFICATION_REQUIRED",
+                "M2_CGROUP_IDENTITY_REAP_REGISTRY_SERIALIZATION_CLOSURE_VERIFIED",
+                "M2_CGROUP_IDENTITY_REAP_REGISTRY_SERIALIZATION_OPERATOR_QUALIFICATION_REQUIRED",
             },
         )
         self.assertFalse(report["boundary_audit"]["milestone_3_started"])
@@ -167,7 +176,7 @@ class M2ArtifactTests(unittest.TestCase):
         self.assertTrue(report["known_limitations"])
         self.assertEqual(
             report["final_repair_report"],
-            "implementation/M2_PROCESS_OWNER_CLEANUP_PROPAGATION_CLOSURE_REPORT.json",
+            "implementation/M2_CGROUP_IDENTITY_REAP_REGISTRY_SERIALIZATION_CLOSURE_REPORT.json",
         )
         # The pointer resolves, and the report it names agrees about the pass.
         closure = parse_canonical_json(
@@ -176,6 +185,8 @@ class M2ArtifactTests(unittest.TestCase):
         self.assertEqual(closure["starting_commit"], report["starting_commit"])
         self.assertEqual(closure["branch"], report["branch"])
         self.assertEqual(closure["terminal_verdict"], report["terminal_verdict"])
+        # M2-M55: one canonical current run object, byte-identical in both.
+        self.assertEqual(closure["canonical_current_run"], report["canonical_current_run"])
 
     def test_the_repair_report_closes_every_audit_finding(self) -> None:
         report = parse_canonical_json((IMPLEMENTATION / "M2_CRITICAL_REPAIR_REPORT.json").read_bytes())
