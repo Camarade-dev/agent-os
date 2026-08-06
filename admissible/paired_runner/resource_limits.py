@@ -733,6 +733,300 @@ def _descriptor_identity(handle: int) -> tuple[str | None, bool]:
     return f"{info.st_dev}:{info.st_ino}", stat.S_ISDIR(info.st_mode)
 
 
+# --- M2-B56: one trusted mutation boundary per cgroup parent ------------------
+#
+# M2-B50 made every read and every destructive action descriptor-relative and
+# preceded each by a proof that the retained descriptor still addresses the
+# created object.  The final removal was still an exception, and the exception
+# mattered: the proof was taken, the frame then resolved a *pathname*, and
+# ``Path.rmdir`` removed whatever that name resolved to at syscall time.  A
+# substitution landing in between destroyed a cgroup this controller never
+# owned, and the evidence said the owned object had been removed and its absence
+# verified.
+#
+# Linux offers no remove-by-handle primitive for a directory.  ``unlinkat(dirfd,
+# name, AT_REMOVEDIR)`` -- which is what ``os.rmdir(name, dir_fd=...)`` is --
+# pins the *parent* exactly, so a parent that was renamed or replaced can no
+# longer be reached through a stale name; it does not pin the child, because the
+# kernel resolves the child name at call time.  Exactness of the child therefore
+# cannot come from the syscall, and this module does not pretend that it does.
+#
+# It comes from an explicit exclusion boundary instead: one process-wide lock per
+# delegated parent, taken by *every* create, remove, replacement and final
+# removal this controller performs under that parent, and held across the whole
+# verify/remove/prove critical section.  Inside that boundary a same-name
+# replacement performed by this controller is impossible, because the mutation
+# that would perform it is waiting on the same lock.
+#
+# The boundary is exactly as wide as the trusted computing base it names.  A
+# process *outside* this controller's TCB is not excluded by a userspace lock,
+# and no claim is made that it is.  Against that threat model this code fails
+# closed: it refuses the removal, retains the obligation, and classifies the
+# refusal, rather than removing an object whose exactness it cannot prove.
+
+#: The exact object this controller created was removed, and its absence proved.
+CGROUP_REMOVAL_EXACT = "EXACT_OWNED_CGROUP_REMOVED"
+#: The owned object was already gone; this call removed nothing and says so.
+CGROUP_REMOVAL_ALREADY_ABSENT = "OWNED_CGROUP_ALREADY_ABSENT"
+#: The owned name resolves to a different object.  It is not removed, not read,
+#: not signalled, and the obligation stays open.
+CGROUP_REMOVAL_REPLACEMENT_REFUSED = "SAME_NAME_REPLACEMENT_REFUSED"
+#: Neither presence nor absence of the owned object could be proved.
+CGROUP_REMOVAL_IDENTITY_AMBIGUOUS = "OWNED_IDENTITY_AMBIGUOUS"
+#: The exclusion boundary could not be entered or held, so no destructive
+#: primitive may run at all under the declared TCB.
+CGROUP_REMOVAL_BOUNDARY_UNAVAILABLE = "REMOVAL_UNAVAILABLE_UNDER_THE_DECLARED_TCB"
+#: The cgroup still holds members, or its membership could not be read.
+CGROUP_REMOVAL_NOT_EMPTY = "OWNED_CGROUP_NOT_OBSERVED_EMPTY"
+#: ``rmdir`` itself failed.  The obligation stays open with the exact errno.
+CGROUP_REMOVAL_FAILED = "OWNED_CGROUP_REMOVAL_FAILED"
+
+#: The retained parent descriptor no longer fstats as the directory the owned
+#: cgroup was created under.
+CGROUP_IDENTITY_PARENT_REPLACED = "PARENT_DESCRIPTOR_IDENTITY_CHANGED"
+
+#: The exact boundary this module claims, stated so a reader never has to infer
+#: it from the code and never mistakes it for hostile-host atomicity.
+CGROUP_MUTATION_TCB = {
+    "boundary": "one process-wide lock per delegated cgroup parent, keyed by the parent dev:ino",
+    "serialized_operations": (
+        "create",
+        "rename",
+        "remove",
+        "replace",
+        "final_removal",
+    ),
+    "excludes": "every controller-owned mutation of a child under that parent, in this process",
+    "does_not_exclude": (
+        "a mutation performed by a process outside this controller's trusted computing base"
+    ),
+    "kernel_primitive": "os.rmdir(name, dir_fd=parent_fd) -- unlinkat(dirfd, name, AT_REMOVEDIR)",
+    "kernel_primitive_pins": "the parent exactly; the child name is resolved by the kernel at call time",
+    "remove_by_handle_available": False,
+    "atomicity_claimed_against_a_hostile_host": False,
+    "outside_the_boundary": "removal is refused, the obligation is retained, and the refusal is classified",
+}
+
+
+class _CgroupMutationBoundary:
+    """The held exclusion boundary for one delegated cgroup parent."""
+
+    __slots__ = ("_domains", "_identity", "_lock")
+
+    def __init__(self, domains: "_CgroupMutationDomains", identity: str) -> None:
+        self._domains = domains
+        self._identity = identity
+        self._lock: threading.RLock | None = None
+
+    @property
+    def identity(self) -> str:
+        return self._identity
+
+    def __enter__(self) -> "_CgroupMutationBoundary":
+        self._lock = self._domains._acquire(self._identity)
+        return self
+
+    def __exit__(self, *exception: object) -> None:
+        lock, self._lock = self._lock, None
+        if lock is not None:
+            self._domains._release(self._identity, lock)
+
+
+class _CgroupMutationDomains:
+    """Every controller-owned cgroup mutation in this process, serialized.
+
+    One re-entrant lock per parent identity rather than one global lock: two
+    effects under two different delegated parents have nothing to exclude each
+    other from, and a single global lock would make an unrelated slow settlement
+    stall them.  The locks are PID-bound like every other process-wide fact here,
+    because a forked child inherits this memory and owns none of the descriptors
+    the identities were derived from.
+    """
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._domains: dict[str, threading.RLock] = {}
+        self._depth: dict[str, int] = {}
+        self._owner_pid = os.getpid()
+        self._held = threading.local()
+
+    def _reset_after_fork_locked(self) -> None:
+        if self._owner_pid != os.getpid():
+            self._owner_pid = os.getpid()
+            self._domains = {}
+            self._depth = {}
+            self._held = threading.local()
+
+    def _stack(self) -> list[str]:
+        stack = getattr(self._held, "stack", None)
+        if stack is None:
+            stack = []
+            self._held.stack = stack
+        return stack
+
+    def _acquire(self, identity: str) -> threading.RLock:
+        with self._guard:
+            self._reset_after_fork_locked()
+            lock = self._domains.get(identity)
+            if lock is None:
+                lock = threading.RLock()
+                self._domains[identity] = lock
+            self._depth[identity] = self._depth.get(identity, 0) + 1
+        lock.acquire()
+        self._stack().append(identity)
+        return lock
+
+    def _release(self, identity: str, lock: threading.RLock) -> None:
+        stack = self._stack()
+        for index in range(len(stack) - 1, -1, -1):
+            if stack[index] == identity:
+                del stack[index]
+                break
+        lock.release()
+        with self._guard:
+            remaining = self._depth.get(identity, 1) - 1
+            if remaining <= 0:
+                self._depth.pop(identity, None)
+                # Nobody is inside this domain and nobody is waiting to be, so
+                # the lock object is dropped rather than accumulated for the life
+                # of the process.
+                self._domains.pop(identity, None)
+            else:
+                self._depth[identity] = remaining
+
+    def held(self, identity: str) -> bool:
+        """Whether *this thread* is currently inside ``identity``'s boundary."""
+
+        return identity in self._stack()
+
+    def evidence(self) -> dict[str, Any]:
+        with self._guard:
+            self._reset_after_fork_locked()
+            return {
+                "owner_pid": self._owner_pid,
+                "reading_pid": os.getpid(),
+                "open_domains": sorted(self._depth),
+                "held_by_this_thread": list(self._stack()),
+                "trusted_computing_base": dict(CGROUP_MUTATION_TCB),
+            }
+
+
+class _NoMutationBoundary:
+    """Used only where the parent's identity cannot be read at all.
+
+    It excludes nothing and says so.  It is never used on the final destructive
+    removal of an owned obligation -- that path refuses outright rather than
+    proceeding without the boundary -- only on the readiness probe teardown and
+    the manager-leaf bootstrap, whose every outcome is separately classified and
+    neither of which ever reports a removal it did not verify.
+    """
+
+    identity = None
+
+    def __enter__(self) -> "_NoMutationBoundary":
+        return self
+
+    def __exit__(self, *exception: object) -> None:
+        return None
+
+
+_NO_MUTATION_BOUNDARY = _NoMutationBoundary()
+
+_CGROUP_MUTATION_DOMAINS = _CgroupMutationDomains()
+
+
+def cgroup_mutation_boundary(identity: str) -> _CgroupMutationBoundary:
+    """The exclusion boundary for every controller-owned mutation under a parent."""
+
+    return _CgroupMutationBoundary(_CGROUP_MUTATION_DOMAINS, identity)
+
+
+def cgroup_mutation_boundary_held(identity: str) -> bool:
+    """Whether this thread holds the boundary for ``identity``."""
+
+    return _CGROUP_MUTATION_DOMAINS.held(identity)
+
+
+def cgroup_mutation_domains_evidence() -> dict[str, Any]:
+    """The declared boundary and what is open inside it, for durable evidence."""
+
+    return _CGROUP_MUTATION_DOMAINS.evidence()
+
+
+def cgroup_mutation_domain_of(path: Path | str) -> str | None:
+    """The mutation-domain identity of a parent named by a path, or ``None``."""
+
+    try:
+        info = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(info.st_mode):
+        return None
+    return f"{info.st_dev}:{info.st_ino}"
+
+
+def _rmdir_owned_child(parent_fd: int, leaf: str) -> tuple[bool, str | None]:
+    """Remove one named child, relative to the retained parent descriptor.
+
+    ``unlinkat(parent_fd, leaf, AT_REMOVEDIR)``.  The parent is pinned by the
+    descriptor rather than re-resolved from a pathname, so a parent that was
+    renamed or replaced cannot be reached at all.  The child name is still
+    resolved by the kernel, which is why this is only ever called from inside the
+    exclusion boundary and only after the name has been proved, under that same
+    boundary, to map to the exact owned object.
+    """
+
+    try:
+        os.rmdir(leaf, dir_fd=parent_fd)
+        return True, None
+    except OSError as error:
+        return False, _errno_name(error)
+
+
+# --- M2-B57: one monotonic order for every cleanup obligation -----------------
+#
+# A drain spends one budget across two collections -- the registry's entries and
+# the handles whose registration failed -- and "one budget" is only meaningful if
+# the order the obligations are spent in is fixed.  Every obligation therefore
+# takes a process-wide sequence number when it is incurred, and a drain walks the
+# merged list in ascending sequence: the order in which this process took the
+# obligations on.  Exhaustion then propagates across both collections in whatever
+# order they were actually incurred, rather than one collection always being
+# served first because of where its loop happens to sit.
+
+_OBLIGATION_SEQUENCE = 0
+_OBLIGATION_SEQUENCE_PID = os.getpid()
+_OBLIGATION_SEQUENCE_LOCK = threading.Lock()
+
+
+def next_cleanup_obligation_sequence() -> int:
+    """The next monotonic obligation number for this process."""
+
+    global _OBLIGATION_SEQUENCE, _OBLIGATION_SEQUENCE_PID
+    with _OBLIGATION_SEQUENCE_LOCK:
+        if _OBLIGATION_SEQUENCE_PID != os.getpid():
+            # A forked child owns none of the parent's obligations, so it counts
+            # its own from the beginning.
+            _OBLIGATION_SEQUENCE = 0
+            _OBLIGATION_SEQUENCE_PID = os.getpid()
+        _OBLIGATION_SEQUENCE += 1
+        return _OBLIGATION_SEQUENCE
+
+
+def cleanup_obligation_sequence_of(handle: Any) -> int:
+    """The sequence a handle was retained under, stamping one if it has none."""
+
+    existing = getattr(handle, "_cleanup_obligation_sequence", None)
+    if isinstance(existing, int) and existing > 0:
+        return existing
+    sequence = next_cleanup_obligation_sequence()
+    try:
+        handle._cleanup_obligation_sequence = sequence
+    except Exception:  # pragma: no cover - a handle that refuses attributes
+        return sequence
+    return sequence
+
+
 def _unified_path_of(root: Path | str, directory: Path | str) -> str:
     """The unified-hierarchy path ``directory`` corresponds to under ``root``."""
 
@@ -985,9 +1279,22 @@ def _bootstrap_topology(
         "owner_pid": pid,
     }
 
+    # M2-B56.  The manager leaf is created under, and rolled back from, the same
+    # delegated parent every effect cgroup lives under, so both are controller-
+    # owned mutations that take the parent's exclusion boundary.
+    _mutation_domain = cgroup_mutation_domain_of(parent)
+
+    def _boundary() -> Any:
+        return (
+            cgroup_mutation_boundary(_mutation_domain)
+            if _mutation_domain is not None
+            else _NO_MUTATION_BOUNDARY
+        )
+
     manager = parent / f"{MANAGER_LEAF_PREFIX}-{pid}"
     try:
-        manager.mkdir(mode=0o700)
+        with _boundary():
+            manager.mkdir(mode=0o700)
     except FileExistsError:
         return _failed(
             TOPOLOGY_MANAGER_COLLISION,
@@ -1014,7 +1321,8 @@ def _bootstrap_topology(
         leaf_members = read_cgroup_members(manager)
         if leaf_members.observed_empty:
             try:
-                manager.rmdir()
+                with _boundary():
+                    manager.rmdir()
                 removed = True
             except OSError:
                 removed = False
@@ -1323,8 +1631,18 @@ def _remove_owned_probe(probe: Path) -> dict[str, Any]:
         return evidence
 
     evidence["rmdir_attempted"] = True
+    # M2-B56.  The probe's removal is a controller-owned mutation under the same
+    # delegated parent every effect cgroup is created and removed under, so it
+    # takes the same exclusion boundary.  A probe teardown and a concurrent
+    # effect removal cannot interleave under one parent.
+    domain = cgroup_mutation_domain_of(probe.parent)
+    boundary = (
+        cgroup_mutation_boundary(domain) if domain is not None else _NO_MUTATION_BOUNDARY
+    )
+    evidence["mutation_boundary"] = domain
     try:
-        probe.rmdir()
+        with boundary:
+            probe.rmdir()
     except FileNotFoundError as error:
         # This process created the probe and has not removed it.  Something else
         # did.  Disappearance is not proof of a safe, expected removal, so it is
@@ -1507,7 +1825,19 @@ def _apply_and_read_back_limits(
 #: What a retryable cgroup cleanup would do next.
 CGROUP_RETRY_REMOVE = "REMOVE_THE_EXACT_OWNED_EFFECT_CGROUP"
 CGROUP_RETRY_REAP = "REAP_THE_EXACT_OWNED_PROCESSES"
+#: M2-B57.  The resource is fully discharged and the only thing still owed is the
+#: registry entry the registrar refused.  It is bookkeeping: it removes nothing,
+#: signals nothing and blocks on nothing, and a drain must never present it as an
+#: outstanding destructive obligation.
+CGROUP_RETRY_RECORD = "RECORD_THE_COMPLETED_CLEANUP"
 CGROUP_RETRY_NONE = "NOTHING_REMAINS"
+
+#: What an incomplete cleanup still owes.  Exactly one of these is true at a time,
+#: and none of them is inferred from another.
+OUTSTANDING_CONTAINMENT = "THE_OWNED_CGROUP_IS_STILL_PRESENT"
+OUTSTANDING_PROCESSES = "AN_OWNED_PROCESS_IS_UNREAPED"
+OUTSTANDING_REGISTRATION = "THE_RESOURCE_IS_DISCHARGED_AND_ONLY_THE_REGISTRY_ENTRY_IS_OWED"
+OUTSTANDING_NOTHING = "NOTHING_REMAINS"
 
 # --- M2-B51: containment cleanup and process cleanup are two obligations ------
 #
@@ -1625,6 +1955,9 @@ def _retain_unregistered(handle: Any) -> None:
             _UNREGISTERED_CLEANUPS.clear()
             _UNREGISTERED_OWNER_PID = os.getpid()
         if all(existing is not handle for existing in _UNREGISTERED_CLEANUPS):
+            # M2-B57.  The obligation takes its place in the one process-wide
+            # order a drain spends its single budget in.
+            cleanup_obligation_sequence_of(handle)
             _UNREGISTERED_CLEANUPS.append(handle)
 
 
@@ -1637,12 +1970,19 @@ def _release_unregistered(handle: Any) -> None:
 
 
 def unregistered_cleanups() -> tuple[Any, ...]:
-    """Obligations this process holds that the registrar refused to retain."""
+    """Obligations this process holds that the registrar refused to retain.
+
+    M2-B57.  Returned in the one process-wide obligation order, so a drain that
+    merges this collection with the registry's entries spends its single budget
+    in the order the obligations were actually incurred.
+    """
 
     with _UNREGISTERED_LOCK:
         if _UNREGISTERED_OWNER_PID != os.getpid():
             return ()
-        return tuple(_UNREGISTERED_CLEANUPS)
+        return tuple(
+            sorted(_UNREGISTERED_CLEANUPS, key=cleanup_obligation_sequence_of)
+        )
 
 
 class EffectCgroup:
@@ -1675,6 +2015,8 @@ class EffectCgroup:
         # never a replacement that happens to carry the same name.
         self._owned_identity: str | None = None
         self._owned_path: Path | None = None
+        # M2-B56.  The classified disposition of the last final-removal attempt.
+        self._removal_disposition: dict[str, Any] = {}
         # M2-B50.  Ownership as a capability rather than a name: the directory
         # descriptor opened on the cgroup this object created, the descriptor of
         # the parent that holds its name, and the leaf itself.  Every read that
@@ -1683,6 +2025,13 @@ class EffectCgroup:
         # to the object, and what a removal is checked against.
         self._dir_fd: int | None = None
         self._parent_fd: int | None = None
+        # M2-B56.  The identity of the delegated parent this cgroup was created
+        # under, recorded through the parent descriptor at creation.  It is what
+        # the exclusion boundary is keyed by, and what proves -- inside that
+        # boundary, immediately before the removal -- that the descriptor a
+        # destructive syscall is made relative to is still the parent this
+        # controller created its child in.
+        self._parent_identity: str | None = None
         self._leaf: str = f"{EFFECT_PREFIX}{label}"
         self._descriptors_released = False
         #: Latched once the exact created object is positively observed gone.
@@ -1809,11 +2158,13 @@ class EffectCgroup:
 
         Called before every membership read that informs a destructive action,
         before every controller write, before ``cgroup.kill``, before every
-        per-member signal and before removal.  It answers three separate
-        questions and never collapses them: is the retained descriptor still the
-        directory it was opened on, does the owned name still resolve to that
-        exact object, and -- when it does not -- is the object itself gone or has
-        it merely been displaced by something this controller may not touch.
+        per-member signal and before removal.  It answers four separate questions
+        and never collapses them: is the retained *parent* descriptor still the
+        delegated parent this cgroup was created under (M2-B56), is the retained
+        descriptor still the directory it was opened on, does the owned name
+        still resolve to that exact object, and -- when it does not -- is the
+        object itself gone or has it merely been displaced by something this
+        controller may not touch.
         """
 
         evidence: dict[str, Any] = {
@@ -1826,6 +2177,13 @@ class EffectCgroup:
             "name_identity": None,
             "object_present": None,
             "name_present": None,
+            "parent_identity": self._parent_identity,
+            "observed_parent_identity": None,
+            "mutation_boundary_held": (
+                None
+                if self._parent_identity is None
+                else cgroup_mutation_boundary_held(self._parent_identity)
+            ),
         }
         if self._owned_path is None:
             evidence["detail"] = "no per-effect cgroup was ever created"
@@ -1836,6 +2194,25 @@ class EffectCgroup:
                 "cannot be proved and nothing is signalled, written or removed"
             )
             evidence["object_present"] = self._owned_object_present()
+            return evidence
+        # M2-B56.  The parent first.  The name lookup below and the removal
+        # itself are both made *relative to this descriptor*, so a descriptor
+        # that stopped being the delegated parent would make every later answer a
+        # statement about somebody else's directory.
+        observed_parent, parent_is_directory = _descriptor_identity(self._parent_fd)
+        evidence["observed_parent_identity"] = observed_parent
+        if (
+            observed_parent is None
+            or not parent_is_directory
+            or (self._parent_identity is not None and observed_parent != self._parent_identity)
+        ):
+            evidence["code"] = CGROUP_IDENTITY_PARENT_REPLACED
+            evidence["detail"] = (
+                f"the retained parent descriptor for {self._owned_path} now reads "
+                f"{observed_parent!r} (directory={parent_is_directory}) and not "
+                f"{self._parent_identity!r}; nothing is read, written, signalled or removed "
+                "relative to it"
+            )
             return evidence
         observed, is_directory = _descriptor_identity(self._dir_fd)
         evidence["observed_identity"] = observed
@@ -1908,6 +2285,13 @@ class EffectCgroup:
         reserved *first*.  A process already holding its capacity of unresolved
         cleanups creates no directory, so the obligation that could not be
         retained is never brought into existence.
+
+        M2-B56.  The creation happens inside the parent's exclusion boundary, and
+        so does the rollback that removes a partial directory.  Creation is one
+        of the controller-owned mutations a concurrent final removal must be
+        excluded from: without that, this ``mkdir`` is exactly the operation that
+        could put a same-named replacement under a name another thread is about
+        to remove.
         """
 
         if not self._delegation.available or self._delegation.delegated_path is None:
@@ -1923,6 +2307,18 @@ class EffectCgroup:
             self.create_error = f"{CGROUP_IDENTITY_PARENT_UNREADABLE}:{parent_error}"
             self._release_reservation()
             return False
+        parent_identity, parent_is_directory = _descriptor_identity(parent_fd)
+        if parent_identity is None or not parent_is_directory:
+            self.create_error = f"{CGROUP_IDENTITY_PARENT_UNREADABLE}:{parent_identity!r}"
+            self._close_handle(parent_fd)
+            self._release_reservation()
+            return False
+        with cgroup_mutation_boundary(parent_identity):
+            return self._create_inside_boundary(parent, parent_fd, parent_identity)
+
+    def _create_inside_boundary(
+        self, parent: Path, parent_fd: int, parent_identity: str
+    ) -> bool:
         candidate = parent / self._leaf
         try:
             candidate.mkdir(mode=0o700)
@@ -1963,6 +2359,7 @@ class EffectCgroup:
             return False
         self._dir_fd = dir_fd
         self._parent_fd = parent_fd
+        self._parent_identity = parent_identity
         self._owned_identity = identity
         code, detail, observed = _apply_and_read_back_limits(
             candidate, self.intended, dir_fd=dir_fd
@@ -1974,6 +2371,7 @@ class EffectCgroup:
             self._remove(candidate)
             self._release_descriptors()
             self._owned_identity = None
+            self._parent_identity = None
             self._release_reservation()
             return False
         self._path = candidate
@@ -2401,6 +2799,19 @@ class EffectCgroup:
 
         return dict(self._removal_evidence)
 
+    def removal_disposition(self) -> dict[str, Any]:
+        """The classified outcome of the last final-removal attempt (M2-B56).
+
+        One of ``EXACT_OWNED_CGROUP_REMOVED``, ``OWNED_CGROUP_ALREADY_ABSENT``,
+        ``SAME_NAME_REPLACEMENT_REFUSED``, ``OWNED_IDENTITY_AMBIGUOUS``,
+        ``OWNED_CGROUP_NOT_OBSERVED_EMPTY``, ``OWNED_CGROUP_REMOVAL_FAILED`` or
+        ``REMOVAL_UNAVAILABLE_UNDER_THE_DECLARED_TCB``.  "The owned object was
+        removed" and "something disappeared" are different facts and are never
+        the same word.
+        """
+
+        return dict(self._removal_disposition)
+
     def close(self) -> bool:
         """Remove the subtree.  Returns False if live members prevent removal.
 
@@ -2532,65 +2943,324 @@ class EffectCgroup:
             }
             self._register_unsettled_removal()
             return False
-        # M2-B48/M2-B50.  The directory is emptied and removable; exactness is
-        # proved once more immediately before the removal, because the
-        # membership read and the ``rmdir`` are two separate moments.  A cgroup
-        # that was removed and recreated under the same name is a different
-        # cgroup with different controller state and different members, and
-        # removing it would be destroying somebody else's containment domain.
-        before_removal = self.verify_owned_identity()
-        if not before_removal["verified"]:
-            self._refuse_identity("remove", before_removal)
-            self.attach_error = f"effect_cgroup_identity_changed:{before_removal.get('name_identity')}"
-            self._removal_evidence = {
-                "effect_path": str(path),
+        # M2-B48/M2-B50/M2-B56.  The directory is emptied and removable.  Every
+        # remaining step -- the final identity proof, the emptiness proof, the
+        # removal itself and the proof of absence -- happens inside the parent's
+        # exclusion boundary and never touches a pathname the boundary does not
+        # cover.  Nothing between the proof and the syscall may re-point the
+        # destructive operation, because every controller-owned mutation that
+        # could re-point it is waiting on the same lock.
+        disposition = self._remove_exact_owned_child()
+        self._removal_disposition = dict(disposition)
+        self._removal_evidence = dict(disposition["removal_evidence"])
+        if disposition["code"] not in (CGROUP_REMOVAL_EXACT, CGROUP_REMOVAL_ALREADY_ABSENT):
+            if disposition.get("identity") is not None:
+                self._refuse_identity("remove", disposition["identity"])
+            if disposition.get("attach_error"):
+                self.attach_error = disposition["attach_error"]
+            self._register_unsettled_removal()
+            return False
+        self._path = None
+        self._membership_verified = False
+        self._register_unsettled_removal()
+        return True
+
+    # --- M2-B56: the final destructive primitive, bound to the boundary -------
+
+    def _mutation_domain_identity(self) -> str | None:
+        """The exclusion domain this cgroup's removal belongs to.
+
+        The *live* identity of the retained parent descriptor, so the lock taken
+        is the lock every other controller-owned mutation of a child under that
+        same physical directory takes.  ``None`` when there is no descriptor to
+        derive it from, which is a refusal rather than a fallback.
+        """
+
+        if self._parent_fd is None:
+            return None
+        observed, is_directory = _descriptor_identity(self._parent_fd)
+        if observed is None or not is_directory:
+            return None
+        return observed
+
+    def _boundary_unavailable(self, detail: str) -> dict[str, Any]:
+        path = self._owned_path
+        return {
+            "code": CGROUP_REMOVAL_BOUNDARY_UNAVAILABLE,
+            "identity": None,
+            "attach_error": f"{CGROUP_REMOVAL_BOUNDARY_UNAVAILABLE}:{detail}",
+            "removal_evidence": {
+                "effect_path": None if path is None else str(path),
                 "removed": False,
                 "absence_verified": False,
-                "residual_path_exists": bool(before_removal.get("name_present")),
+                "residual_path_exists": None if path is None else path.exists(),
                 "residual_members": [],
                 "membership_readable": True,
                 "identity_verified": False,
                 "owned_identity": self._owned_identity,
-                "observed_identity": (
-                    before_removal.get("name_identity") or before_removal.get("observed_identity")
-                ),
-                "identity": before_removal,
-                "code": before_removal["code"],
+                "removal_disposition": CGROUP_REMOVAL_BOUNDARY_UNAVAILABLE,
+                "mutation_boundary_held": False,
+                "trusted_computing_base": dict(CGROUP_MUTATION_TCB),
+                "code": CGROUP_REMOVAL_BOUNDARY_UNAVAILABLE,
                 "detail": (
-                    f"{path} is no longer the directory this controller created "
-                    f"({before_removal['detail']}); it is not removed and no other cgroup is "
-                    "removed in its place"
+                    f"{detail}; under the declared trusted computing base no destructive "
+                    "primitive may run without the parent's exclusion boundary, so nothing is "
+                    "removed and the obligation is retained"
                 ),
+            },
+        }
+
+    def _remove_exact_owned_child(self) -> dict[str, Any]:
+        """Remove the exact owned cgroup, or refuse and keep the obligation.
+
+        The whole critical section is inside one exclusion boundary: the parent
+        identity, the name-to-child mapping taken with no symlink following, the
+        retained child descriptor identity, the observed emptiness, the removal,
+        and the proof that the owned object is the object that went away.  The
+        separately overridable pathname callback :meth:`_remove` is deliberately
+        not reachable from here -- a destructive primitive that a caller can
+        redirect is exactly the shape this finding closes.
+        """
+
+        path = self._owned_path
+        if path is None:  # pragma: no cover - close() checked this already
+            return self._boundary_unavailable("no per-effect cgroup was ever created")
+        if self._parent_fd is None or self._dir_fd is None:
+            return self._boundary_unavailable(
+                f"{path} has no retained parent and child descriptor pair"
+            )
+        domain = self._mutation_domain_identity()
+        if domain is None:
+            return self._boundary_unavailable(
+                f"the parent descriptor of {path} no longer identifies a directory"
+            )
+        with cgroup_mutation_boundary(domain):
+            return self._remove_inside_boundary(path, domain)
+
+    def _remove_inside_boundary(self, path: Path, domain: str) -> dict[str, Any]:
+        base: dict[str, Any] = {
+            "effect_path": str(path),
+            "owned_identity": self._owned_identity,
+            "mutation_boundary": domain,
+            "mutation_boundary_held": cgroup_mutation_boundary_held(domain),
+            "trusted_computing_base": dict(CGROUP_MUTATION_TCB),
+            "membership_readable": True,
+            "residual_members": [],
+        }
+        if not base["mutation_boundary_held"]:  # pragma: no cover - just acquired
+            return self._boundary_unavailable(f"{path}: the exclusion boundary was not held")
+
+        # (1) parent identity, (2) name-to-child identity with no symlink
+        # following, (3) retained child descriptor identity -- all inside the
+        # boundary, all through descriptors, none of them a pathname resolution
+        # the boundary does not cover.
+        identity = self.verify_owned_identity()
+        if not identity["verified"]:
+            if identity["code"] == CGROUP_IDENTITY_NAME_ABSENT and identity["object_present"] is False:
+                # The exact object is gone.  This call removed nothing, and the
+                # obligation is discharged because the outcome it existed to
+                # reach has been reached.
+                return {
+                    "code": CGROUP_REMOVAL_ALREADY_ABSENT,
+                    "identity": None,
+                    "attach_error": None,
+                    "removal_evidence": {
+                        **base,
+                        "removed": False,
+                        "absence_verified": True,
+                        "residual_path_exists": False,
+                        "identity_verified": True,
+                        "identity": identity,
+                        "removal_disposition": CGROUP_REMOVAL_ALREADY_ABSENT,
+                        "code": CGROUP_REMOVAL_ALREADY_ABSENT,
+                        "detail": (
+                            f"the cgroup this controller created at {path} was already gone when "
+                            "the removal boundary was entered; this call removed nothing and the "
+                            "obligation is positively discharged"
+                        ),
+                    },
+                }
+            replaced = identity["code"] in (
+                CGROUP_IDENTITY_NAME_REPLACED,
+                CGROUP_IDENTITY_NAME_NOT_A_DIRECTORY,
+            )
+            code = (
+                CGROUP_REMOVAL_REPLACEMENT_REFUSED if replaced else CGROUP_REMOVAL_IDENTITY_AMBIGUOUS
+            )
+            return {
+                "code": code,
+                "identity": identity,
+                "attach_error": f"effect_cgroup_identity_changed:{identity['code']}",
+                "removal_evidence": {
+                    **base,
+                    "removed": False,
+                    "absence_verified": False,
+                    "residual_path_exists": bool(identity.get("name_present")),
+                    "identity_verified": False,
+                    "observed_identity": (
+                        identity.get("name_identity") or identity.get("observed_identity")
+                    ),
+                    "identity": identity,
+                    "replacement_present": bool(identity.get("name_present")),
+                    "replacement_identity": identity.get("name_identity"),
+                    "removal_disposition": code,
+                    "code": code,
+                    "detail": (
+                        f"{path} is not the directory this controller created "
+                        f"({identity['detail']}); it is not removed, no other cgroup is removed "
+                        "in its place, and the obligation is retained"
+                    ),
+                },
             }
-            self._register_unsettled_removal()
-            return False
-        removed, rmdir_error = self._remove(path)
-        # M2-B50.  "rmdir returned success" is a claim about a name.  Whether the
-        # object this controller owned is the object that went away is a
-        # question only the retained descriptor can answer, and it is asked.
+        # A named object whose ``dev`` differs is a different filesystem object
+        # even before its inode is compared, and is stated separately so the
+        # refusal never rests on string equality alone.
+        owned_device = (self._owned_identity or ":").split(":", 1)[0]
+        named_device = (identity.get("name_identity") or ":").split(":", 1)[0]
+        if owned_device != named_device:  # pragma: no cover - implied by the identity proof
+            return {
+                "code": CGROUP_REMOVAL_REPLACEMENT_REFUSED,
+                "identity": identity,
+                "attach_error": f"effect_cgroup_device_changed:{named_device}",
+                "removal_evidence": {
+                    **base,
+                    "removed": False,
+                    "absence_verified": False,
+                    "residual_path_exists": True,
+                    "identity_verified": False,
+                    "identity": identity,
+                    "removal_disposition": CGROUP_REMOVAL_REPLACEMENT_REFUSED,
+                    "code": CGROUP_REMOVAL_REPLACEMENT_REFUSED,
+                    "detail": (
+                        f"{path} now names a device {named_device} and not {owned_device}; it is "
+                        "not removed"
+                    ),
+                },
+            }
+        # (4) emptiness, observed inside the boundary through the child's own
+        # descriptor.  The membership read before the boundary was entered is not
+        # reused: a cgroup that gained a member between them must not be removed.
+        membership = self.read_members()
+        if not membership.observed_empty:
+            return {
+                "code": CGROUP_REMOVAL_NOT_EMPTY,
+                "identity": None,
+                "attach_error": (
+                    f"membership_unreadable:{membership.error_code or membership.malformed_detail}"
+                    if not membership.usable
+                    else f"live_members:{list(membership.pids)}"
+                ),
+                "removal_evidence": {
+                    **base,
+                    "removed": False,
+                    "absence_verified": False,
+                    "residual_path_exists": True,
+                    "residual_members": list(membership.pids) if membership.usable else [],
+                    "membership_readable": membership.usable,
+                    "identity_verified": True,
+                    "identity": identity,
+                    "removal_disposition": CGROUP_REMOVAL_NOT_EMPTY,
+                    "code": CGROUP_REMOVAL_NOT_EMPTY,
+                    "detail": (
+                        f"{path} was not observed empty inside the removal boundary "
+                        f"({membership.refusal_detail() or list(membership.pids)}); it is not "
+                        "removed and not called removed"
+                    ),
+                },
+            }
+        # (5) the last thing before the syscall is the name-to-object proof
+        # again, taken through the retained parent descriptor.  Inside the
+        # boundary nothing this controller owns can have moved the name since
+        # step (1); this re-proof is what narrows the window for anything
+        # *outside* the declared trusted computing base to the syscall boundary
+        # itself, and it is the reason the emptiness read above is not the last
+        # observation the removal rests on.
+        final = self.verify_owned_identity()
+        if not final["verified"]:
+            replaced = final["code"] in (
+                CGROUP_IDENTITY_NAME_REPLACED,
+                CGROUP_IDENTITY_NAME_NOT_A_DIRECTORY,
+            )
+            code = (
+                CGROUP_REMOVAL_REPLACEMENT_REFUSED if replaced else CGROUP_REMOVAL_IDENTITY_AMBIGUOUS
+            )
+            return {
+                "code": code,
+                "identity": final,
+                "attach_error": f"effect_cgroup_identity_changed:{final['code']}",
+                "removal_evidence": {
+                    **base,
+                    "removed": False,
+                    "absence_verified": False,
+                    "residual_path_exists": bool(final.get("name_present")),
+                    "identity_verified": False,
+                    "identity": final,
+                    "replacement_present": bool(final.get("name_present")),
+                    "replacement_identity": final.get("name_identity"),
+                    "removal_disposition": code,
+                    "code": code,
+                    "detail": (
+                        f"{path} stopped being the exact cgroup this controller created between "
+                        f"the emptiness proof and the removal ({final['detail']}); nothing was "
+                        "removed and the obligation is retained"
+                    ),
+                },
+            }
+        base["identity_reproved_immediately_before_removal"] = True
+        # (6) the removal, relative to the retained parent descriptor.
+        removed, rmdir_error = _rmdir_owned_child(self._parent_fd, self._leaf)
+        # (7) "rmdir returned success" is a claim about a name.  Whether the
+        # object this controller owned is the object that went away is a question
+        # only the retained descriptor can answer, and it is asked -- still
+        # inside the boundary, so nothing this controller owns can have re-created
+        # the name since.  An owned object that is still there after a successful
+        # rmdir means something else went away, and that is never called a
+        # removal of the owned object.
         owned_gone = self._owned_object_present() is False
         residual = path.exists() or not owned_gone
-        self._removal_evidence = {
-            "effect_path": str(path),
-            "removed": bool(removed and not residual),
-            "absence_verified": not residual,
-            "residual_path_exists": residual,
-            "membership_readable": True,
-            "identity_verified": True,
-            "rmdir_errno": rmdir_error,
-            "detail": (
-                f"{path} was removed and its absence was verified"
-                if removed and not residual
-                else f"{path}: rmdir removed={removed} errno={rmdir_error} residual_path={residual}"
-            ),
-        }
         if removed and not residual:
-            self._path = None
-            self._membership_verified = False
-            self._register_unsettled_removal()
-            return True
-        self._register_unsettled_removal()
-        return False
+            return {
+                "code": CGROUP_REMOVAL_EXACT,
+                "identity": None,
+                "attach_error": None,
+                "removal_evidence": {
+                    **base,
+                    "removed": True,
+                    "absence_verified": True,
+                    "residual_path_exists": False,
+                    "identity_verified": True,
+                    "identity": identity,
+                    "rmdir_errno": None,
+                    "removal_disposition": CGROUP_REMOVAL_EXACT,
+                    "code": CGROUP_REMOVAL_EXACT,
+                    "detail": (
+                        f"the exact cgroup {self._owned_identity} this controller created at "
+                        f"{path} was removed inside the parent's exclusion boundary and its "
+                        "absence was verified through the retained descriptor"
+                    ),
+                },
+            }
+        code = CGROUP_REMOVAL_FAILED if not removed else CGROUP_REMOVAL_IDENTITY_AMBIGUOUS
+        return {
+            "code": code,
+            "identity": None,
+            "attach_error": f"{code}:{rmdir_error}",
+            "removal_evidence": {
+                **base,
+                "removed": False,
+                "absence_verified": False,
+                "residual_path_exists": residual,
+                "identity_verified": True,
+                "identity": identity,
+                "rmdir_errno": rmdir_error,
+                "removal_disposition": code,
+                "code": code,
+                "detail": (
+                    f"{path}: rmdir removed={removed} errno={rmdir_error} residual_path={residual}; "
+                    "the obligation is retained"
+                ),
+            },
+        }
 
     # --- M2-B48: an unremoved cgroup is a retained obligation -----------------
 
@@ -2650,18 +3320,48 @@ class EffectCgroup:
         containment = self.removal_settled
         processes = self.process_obligations_complete
         complete = containment and processes and self._registration_failure is None
+        # M2-B57.  What is *outstanding* and what could not be *written down* are
+        # two different facts, and folding them together produced an untruth: a
+        # cgroup this controller had already removed, whose registration then
+        # failed, reported that it still owed a removal.  A drain reading that
+        # would report an outstanding destructive obligation over an object that
+        # no longer exists.  The retry operation therefore names the work that
+        # actually remains, and the resource state is carried separately.
+        resource_outstanding = not (containment and processes)
+        # ``outstanding_work`` is a *set*, not a choice.  Containment, process
+        # lifecycle and registration are three independent obligations -- keeping
+        # them apart is the whole of M2-B51 -- and a populated cgroup whose owned
+        # child is also unreaped owes both.  A scalar field could name only one
+        # of them, so it reported a true fact while suppressing another equally
+        # true one, and a reader could not tell "the cgroup is gone and a child
+        # is unreaped" from "the cgroup is still there and a child is unreaped".
+        # The single *next* operation keeps the accepted reap-before-release
+        # precedence and is reported separately.
+        outstanding: list[str] = []
+        if not containment:
+            outstanding.append(OUTSTANDING_CONTAINMENT)
+        if not processes:
+            outstanding.append(OUTSTANDING_PROCESSES)
+        if containment and processes and self._registration_failure is not None:
+            # The resource is fully discharged; the only thing still owed is the
+            # registry entry the registrar refused, which destroys nothing.
+            outstanding.append(OUTSTANDING_REGISTRATION)
         if complete:
             operation = CGROUP_RETRY_NONE
         elif not processes:
             operation = CGROUP_RETRY_REAP
-        else:
+        elif not containment:
             operation = CGROUP_RETRY_REMOVE
+        else:
+            operation = CGROUP_RETRY_RECORD
         return {
             "kind": "EFFECT_CGROUP",
             "effect_path": self.owned_path,
             "owned_identity": self._owned_identity,
             "containment_settled": containment,
             "process_obligations_complete": processes,
+            "resource_outstanding": resource_outstanding,
+            "outstanding_work": tuple(outstanding) or (OUTSTANDING_NOTHING,),
             "owned_process_obligations": [
                 dict(row) for _pid, row in sorted(self._owned_processes.items())
             ],
@@ -2672,6 +3372,12 @@ class EffectCgroup:
             "identity_refusals": [dict(row) for row in self._identity_refusals],
             "registration_failure": self.registration_failure,
             "settlement_attempts": len(self._settlements),
+            # M2-B56.  Containment and reap were already separate facts; the
+            # *classification* of the last removal attempt is a third, so a
+            # reader can tell "the exact owned object was removed" from "a
+            # replacement was refused" from "the object was already gone".
+            "removal_disposition": self._removal_disposition.get("code"),
+            "mutation_boundary": dict(CGROUP_MUTATION_TCB),
             "removal": dict(self._removal_evidence),
             "last_settlement": dict(self._settlements[-1]) if self._settlements else {},
             "helper_pid": 0,
@@ -2833,6 +3539,20 @@ class EffectCgroup:
 
     @staticmethod
     def _remove(path: Path) -> tuple[bool, str | None]:
+        """Remove a directory this frame created moments ago, by pathname.
+
+        M2-B56.  This is the *creation rollback* primitive and nothing else.  It
+        runs inside :meth:`create`'s exclusion boundary, on a directory this
+        frame has just made and nothing else has been told about, before any
+        obligation over it exists.  The final destructive removal of an owned
+        effect cgroup does not come through here: it is
+        :meth:`_remove_inside_boundary`, which acts relative to the retained
+        parent descriptor after proving identity inside the boundary.  A
+        separately overridable pathname callback is exactly the shape that let a
+        substitution redirect the final removal, so the final removal no longer
+        has one.
+        """
+
         try:
             path.rmdir()
             return True, None
@@ -2937,13 +3657,33 @@ __all__ = [
     "CGROUP_IDENTITY_NAME_NOT_A_DIRECTORY",
     "CGROUP_IDENTITY_NAME_REPLACED",
     "CGROUP_IDENTITY_NO_DESCRIPTOR",
+    "CGROUP_IDENTITY_PARENT_REPLACED",
     "CGROUP_IDENTITY_PARENT_UNREADABLE",
     "CGROUP_IDENTITY_VERIFIED",
+    "CGROUP_MUTATION_TCB",
     "CGROUP_REGISTRATION_FAILED",
     "CGROUP_REGISTRY_SATURATED",
+    "CGROUP_REMOVAL_ALREADY_ABSENT",
+    "CGROUP_REMOVAL_BOUNDARY_UNAVAILABLE",
+    "CGROUP_REMOVAL_EXACT",
+    "CGROUP_REMOVAL_FAILED",
+    "CGROUP_REMOVAL_IDENTITY_AMBIGUOUS",
+    "CGROUP_REMOVAL_NOT_EMPTY",
+    "CGROUP_REMOVAL_REPLACEMENT_REFUSED",
+    "cgroup_mutation_boundary",
+    "cgroup_mutation_boundary_held",
+    "cgroup_mutation_domain_of",
+    "cgroup_mutation_domains_evidence",
+    "cleanup_obligation_sequence_of",
+    "next_cleanup_obligation_sequence",
     "CGROUP_RETRY_NONE",
     "CGROUP_RETRY_REAP",
+    "CGROUP_RETRY_RECORD",
     "CGROUP_RETRY_REMOVE",
+    "OUTSTANDING_CONTAINMENT",
+    "OUTSTANDING_NOTHING",
+    "OUTSTANDING_PROCESSES",
+    "OUTSTANDING_REGISTRATION",
     "CGROUP_SETTLE_QUIESCENCE_SECONDS",
     "EffectCgroup",
     "MECHANISM_CGROUP_AND_RLIMIT",

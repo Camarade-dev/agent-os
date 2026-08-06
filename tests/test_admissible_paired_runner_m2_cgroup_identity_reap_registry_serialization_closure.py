@@ -74,6 +74,7 @@ owner authority, a broker, a mint, a witness, or a network.
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
 import json
 import os
 import shutil
@@ -259,17 +260,44 @@ def _cgroupfs_mkdir(self_path, *args, **kwargs):
             kill.write_text("0\n", encoding="utf-8")
 
 
+_REAL_OS_RMDIR = os.rmdir
+
+
 def _cgroupfs_rmdir(test: unittest.TestCase) -> None:
-    """Make an ordinary directory behave like a cgroup for ``rmdir``."""
+    """Make an ordinary directory behave like a cgroup for ``rmdir``.
+
+    Both forms.  The kernel destroys a cgroup's interface files with the cgroup
+    and refuses only when the cgroup still has children; a tmpfs directory
+    instead reports ``ENOTEMPTY`` for the very control files this fixture wrote.
+    Since M2-B56 the exact removal is ``os.rmdir(name, dir_fd=parent_fd)`` --
+    ``unlinkat(dirfd, name, AT_REMOVEDIR)`` -- so the descriptor-relative form is
+    modelled here too.  Modelling it is what keeps these tests about the removal
+    logic rather than about the fixture.
+    """
 
     def rmdir(self_path):
         if any(child.is_dir() for child in self_path.iterdir()):
             raise OSError(18, "Directory not empty")
         shutil.rmtree(self_path)
 
-    patcher = mock.patch.object(Path, "rmdir", rmdir)
-    patcher.start()
-    test.addCleanup(patcher.stop)
+    def os_rmdir(path, *, dir_fd=None):
+        if dir_fd is None:
+            return _REAL_OS_RMDIR(path)
+        target = Path(os.readlink(f"/proc/self/fd/{dir_fd}")) / str(path)
+        if not target.is_dir():
+            return _REAL_OS_RMDIR(path, dir_fd=dir_fd)
+        if any(child.is_dir() for child in target.iterdir()):
+            raise OSError(18, "Directory not empty", str(target))
+        for child in target.iterdir():
+            child.unlink()
+        return _REAL_OS_RMDIR(path, dir_fd=dir_fd)
+
+    for patcher in (
+        mock.patch.object(Path, "rmdir", rmdir),
+        mock.patch.object(os, "rmdir", os_rmdir),
+    ):
+        patcher.start()
+        test.addCleanup(patcher.stop)
 
 
 class _FakeEffectParent:
@@ -1228,14 +1256,19 @@ class SerializedCleanupHandleTests(unittest.TestCase):
         self.assertFalse(cgroup.close())
         (Path(cgroup.path) / "cgroup.procs").write_text("", encoding="utf-8")
         removals: list[str] = []
-        real_remove = rl.EffectCgroup._remove
+        # M2-B56.  The destructive primitive of the final removal is the
+        # descriptor-relative one, not the overridable pathname callback that
+        # used to sit outside the identity boundary.  The counter is therefore
+        # wrapped around the primitive the removal actually reaches; it calls
+        # through to the real one and only records what really happened.
+        real_remove = rl._rmdir_owned_child
         lock = threading.Lock()
 
-        def recording(path):
-            removed, error = real_remove(path)
+        def recording(parent_fd, leaf):
+            removed, error = real_remove(parent_fd, leaf)
             if removed:
                 with lock:
-                    removals.append(str(path))
+                    removals.append(leaf)
             return removed, error
 
         start = threading.Barrier(2)
@@ -1248,7 +1281,7 @@ class SerializedCleanupHandleTests(unittest.TestCase):
             start.wait()
             pw.drain_incomplete_cleanups(deadline=Deadline.after_ms(RETRY_BUDGET_MS, "drain"))
 
-        with mock.patch.object(rl.EffectCgroup, "_remove", staticmethod(recording)):
+        with mock.patch.object(rl, "_rmdir_owned_child", recording):
             threads = [threading.Thread(target=local), threading.Thread(target=drain)]
             for thread in threads:
                 thread.start()
@@ -1467,13 +1500,43 @@ def _canonical_run(document: dict) -> dict:
     return document["canonical_current_run"]
 
 
+def _accompanying_validation_report() -> dict:
+    """The validation report that was current when *this* closure was.
+
+    The M2 model keeps exactly one current validation report and a later pass
+    moves it.  These assertions are about this closure, so they follow the
+    report that accompanied it: the live report names the commit whose blob it
+    superseded, that blob is loaded from git, and its hash is checked against
+    the one the live report records.  Anchoring to whatever happens to be
+    current later would make this class assert another pass's claims.
+    """
+
+    report = json.loads(VALIDATION_REPORT.read_text(encoding="utf-8"))
+    seen: set = set()
+    while report.get("current_closure_key") != "m2_cgroup_identity_reap_registry_serialization_closure":
+        superseded = report["supersedes_prior_current_report"]
+        link = (superseded["commit"], superseded["path"])
+        assert link not in seen, "the superseded-report chain loops"
+        seen.add(link)
+        raw = subprocess.run(
+            ["git", "show", f"{superseded['commit']}:{superseded['path']}"],
+            cwd=REPOSITORY_ROOT,
+            check=True,
+            capture_output=True,
+        ).stdout
+        assert hashlib.sha256(raw).hexdigest() == superseded["sha256"], superseded["path"]
+        report = json.loads(raw.decode("utf-8"))
+    return report
+
+
 class CanonicalCurrentValidationTests(unittest.TestCase):
     """Exactly one current run object, and every current field derives from it."""
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.closure = json.loads(CLOSURE_REPORT.read_text(encoding="utf-8"))
-        cls.validation = json.loads(VALIDATION_REPORT.read_text(encoding="utf-8"))
+        cls.validation = _accompanying_validation_report()
+        cls.live = json.loads(VALIDATION_REPORT.read_text(encoding="utf-8"))
         cls.matrix = json.loads(REQUIREMENT_MATRIX.read_text(encoding="utf-8"))
 
     def test_the_canonical_run_object_is_byte_identical_in_both_reports(self) -> None:
@@ -1525,9 +1588,25 @@ class CanonicalCurrentValidationTests(unittest.TestCase):
         self.assertEqual(self.validation["branch"], BRANCH)
         self.assertEqual(self.validation["starting_commit"], STARTING_COMMIT)
         self.assertEqual(self.validation["starting_commit_parent"], STARTING_COMMIT_PARENT)
+        # Exactly one report declares itself current, and a later pass that moved
+        # it records this closure among the reports it superseded.
+        self.assertTrue(self.live["is_current_validation_report"])
+        if self.live != self.validation:
+            self.assertIn(
+                "implementation/M2_CGROUP_IDENTITY_REAP_REGISTRY_SERIALIZATION_CLOSURE_REPORT.json",
+                self.live["superseded_closure_reports"],
+            )
+            self.assertNotEqual(
+                self.live["current_closure_key"],
+                "m2_cgroup_identity_reap_registry_serialization_closure",
+            )
 
     def test_the_current_count_matches_live_module_discovery(self) -> None:
-        run = _canonical_run(self.validation)
+        # Whatever report is *current* must describe the corpus that is on disk
+        # now.  This closure's own totals are historical once a later pass moves
+        # the current report, and a historical total may never be checked against
+        # a live count.
+        run = _canonical_run(self.live)
         discovered = 0
         for path in sorted(Path(REPOSITORY_ROOT / "tests").glob("test_admissible_paired_runner_m2*.py")):
             module = unittest.defaultTestLoader.loadTestsFromName(f"tests.{path.stem}")
@@ -1959,14 +2038,16 @@ class DelegatedCgroupIdentityReapRegistryTests(unittest.TestCase):
         self.assertFalse(cgroup.close(), "a populated cgroup was reported removed")
         helper.close(deadline=Deadline.after_ms(RETRY_BUDGET_MS, "helper_close"))
         removals: list[str] = []
-        real_remove = rl.EffectCgroup._remove
+        # M2-B56.  Wrapped around the descriptor-relative primitive the final
+        # removal actually reaches, calling through to the real one.
+        real_remove = rl._rmdir_owned_child
         lock = threading.Lock()
 
-        def recording(target):
-            removed, error = real_remove(target)
+        def recording(parent_fd, leaf):
+            removed, error = real_remove(parent_fd, leaf)
             if removed:
                 with lock:
-                    removals.append(str(target))
+                    removals.append(leaf)
             return removed, error
 
         start = threading.Barrier(2)
@@ -1979,7 +2060,7 @@ class DelegatedCgroupIdentityReapRegistryTests(unittest.TestCase):
             start.wait()
             pw.drain_incomplete_cleanups(deadline=Deadline.after_ms(RETRY_BUDGET_MS, "drain"))
 
-        with mock.patch.object(rl.EffectCgroup, "_remove", staticmethod(recording)):
+        with mock.patch.object(rl, "_rmdir_owned_child", recording):
             threads = [threading.Thread(target=local), threading.Thread(target=drain)]
             for thread in threads:
                 thread.start()

@@ -1607,6 +1607,9 @@ class ClosureArtifactCoherenceTests(unittest.TestCase):
             "tests.test_admissible_paired_runner_m2_cgroup_identity_reap_registry_serialization_closure": (
                 "m2_cgroup_identity_reap_registry_serialization_closure_module"
             ),
+            "tests.test_admissible_paired_runner_m2_exact_removal_global_drain_reservation_provenance_closure": (
+                "m2_exact_removal_global_drain_reservation_provenance_closure_module"
+            ),
         }
         for module, field in modules.items():
             loader = unittest.defaultTestLoader.loadTestsFromName(module)

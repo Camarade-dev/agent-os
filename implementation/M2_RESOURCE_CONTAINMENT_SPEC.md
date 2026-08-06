@@ -802,3 +802,145 @@ integers — is published as `cleanup_registry_evidence().last_drain`.
 | delegated physical: a real concurrent close and drain | `test_a_real_concurrent_close_and_drain_settle_once` |
 | delegated physical: a real multi-entry bounded drain | `test_a_real_multi_entry_drain_shares_one_deadline` |
 | delegated physical: the nominal path is unchanged | `test_a_nominal_effect_completes_and_retains_nothing` |
+
+---
+
+## M2-B56 — the trusted mutation boundary of the final cgroup removal
+
+### What the kernel gives, and what it does not
+
+Linux offers no remove-by-handle primitive for a directory. The strongest
+primitive available is
+
+```
+unlinkat(parent_fd, name, AT_REMOVEDIR)      /* os.rmdir(name, dir_fd=parent_fd) */
+```
+
+which pins the **parent** exactly — a parent that has been renamed or replaced
+can no longer be reached through a stale pathname — but which still resolves the
+**child** name in the kernel at call time. Exactness of the child therefore
+cannot come from the syscall, and this specification does not claim that it does.
+
+A pathname check followed by a pathname removal is consequently insufficient on
+its own, and was the defect: the controller proved the retained identity, the
+frame then resolved a pathname, and `rmdir` removed whatever that name resolved
+to at that instant. A substitution landing in between destroyed a cgroup this
+controller never owned, and the evidence reported the owned object removed and
+its absence verified.
+
+### The declared boundary
+
+Exactness comes from an explicit exclusion boundary instead:
+
+* **one process-wide re-entrant lock per delegated cgroup parent**, keyed by that
+  parent's `dev:ino` as read through a retained descriptor;
+* taken by **every** controller-owned mutation of a child under that parent —
+  `EffectCgroup.create`, the final removal, the readiness probe teardown, and the
+  manager-leaf bootstrap and rollback;
+* **entered before the final identity verification** and held across the whole
+  critical section.
+
+Inside the boundary, in this order and with no pathname resolution the boundary
+does not cover:
+
+1. the retained **parent** descriptor is proved to still be the delegated parent
+   the child was created under (`PARENT_DESCRIPTOR_IDENTITY_CHANGED` otherwise);
+2. the owned **name** is proved to map to the owned `dev:ino`, with
+   `follow_symlinks=False`;
+3. the retained **child** descriptor is proved to still be the created object;
+4. the child's `dev` is compared separately from its inode;
+5. the child is proved **empty** through its own descriptor — never through a
+   membership read taken before the boundary was entered;
+6. the name-to-object mapping is **re-proved immediately before the syscall**;
+7. the removal runs as `os.rmdir(leaf, dir_fd=parent_fd)`;
+8. the owned identity is proved **absent** through the retained child descriptor.
+
+The separately overridable pathname callback `EffectCgroup._remove` is retained
+only as the creation-rollback primitive and is unreachable from the final
+removal. A destructive primitive a caller can redirect is the shape this finding
+removes from that path.
+
+### The trusted computing base, stated
+
+`CGROUP_MUTATION_TCB` records the boundary in the code and in every removal's
+durable evidence:
+
+| field | value |
+| --- | --- |
+| `boundary` | one process-wide lock per delegated cgroup parent, keyed by the parent `dev:ino` |
+| `serialized_operations` | create, rename, remove, replace, final_removal |
+| `excludes` | every controller-owned mutation of a child under that parent, in this process |
+| `does_not_exclude` | a mutation performed by a process outside this controller's trusted computing base |
+| `kernel_primitive` | `os.rmdir(name, dir_fd=parent_fd)` — `unlinkat(dirfd, name, AT_REMOVEDIR)` |
+| `kernel_primitive_pins` | the parent exactly; the child name is resolved by the kernel at call time |
+| `remove_by_handle_available` | `false` |
+| `atomicity_claimed_against_a_hostile_host` | `false` |
+| `outside_the_boundary` | removal is refused, the obligation is retained, and the refusal is classified |
+
+Within that boundary a same-name replacement is impossible, because the mutation
+that would create one is waiting on the same lock. Outside it — a process that is
+not part of this controller's trusted computing base — no userspace construction
+can exclude a racing mutation, and none is claimed. Against that threat model the
+implementation fails closed: it refuses the removal, retains the obligation, and
+records which of the classified outcomes occurred.
+
+### The classified dispositions
+
+| disposition | meaning |
+| --- | --- |
+| `EXACT_OWNED_CGROUP_REMOVED` | the exact created object was removed and its absence proved |
+| `OWNED_CGROUP_ALREADY_ABSENT` | the owned object was already gone; nothing was removed and the obligation is positively discharged |
+| `SAME_NAME_REPLACEMENT_REFUSED` | the owned name resolves to a different object; it is not read, not signalled and not removed |
+| `OWNED_IDENTITY_AMBIGUOUS` | neither presence nor absence of the owned object could be proved |
+| `OWNED_CGROUP_NOT_OBSERVED_EMPTY` | membership was populated or unreadable inside the boundary |
+| `OWNED_CGROUP_REMOVAL_FAILED` | `rmdir` itself failed; the exact errno is retained |
+| `REMOVAL_UNAVAILABLE_UNDER_THE_DECLARED_TCB` | the boundary or the descriptor pair could not be held; no destructive primitive ran |
+
+Only the first two discharge the obligation. `removal_disposition` travels in
+`removal_evidence()` and in `cleanup_evidence()` beside the already separate
+containment and reap fields, so "the owned object was removed" and "something
+disappeared" are never the same word.
+
+## M2-B57 — one drain, one budget, two collections
+
+One call to `drain_incomplete_cleanups()` opens exactly one `CleanupBudget`, at
+the outermost entry, from the caller's deadline when there is one and otherwise
+from `CLEANUP_DRAIN_TOTAL_DEADLINE_MS`. Nothing below it may open another: the
+registry drain adopts the shared budget, each obligation receives a `grant` from
+it, and a nested `drain_incomplete_cleanups()` reached from inside a settlement
+joins the budget already running on that thread.
+
+Both collections — the registry's entries and the handles retained after a
+registrar failure — are walked as **one merged list in ascending process-wide
+obligation sequence**, the order in which this process incurred them. Exhaustion
+therefore propagates across both in whichever order they were actually incurred.
+An obligation reached after the budget is spent is **not attempted**: it is
+retained exactly as it was and reported `attempted=false` with
+`unattempted_reason=SHARED_BUDGET_EXHAUSTED`. One ledger, `cleanup_drain_ledger()`,
+records the configured total, the elapsed total, every grant, the attempts, the
+unattempted, the retained and the exhaustion — once, over both collections.
+
+## M2-B58 — a reservation is a linear, registry-issued capability
+
+Each registry carries an immutable identity and a PID-bound epoch that advances
+on every fork reset; the reservation table lives under the same lock as the
+capacity arithmetic and the entries. Each reservation carries its issuing
+registry object and identity, its owner PID, its epoch, its id, and an explicit
+lifecycle state (`RESERVED` / `CONSUMED` / `RELEASED`); `active` is a read-only
+property and the class has `__slots__`, so no public method can make a foreign
+token appear current.
+
+Under the registry lock, a token that would grant capacity is proved on all of:
+the exact type, `token._registry is self`, the registry identity, the owner PID,
+the epoch, the id being outstanding in *this* registry's table, the object under
+that id being this exact object, and the state being `RESERVED`. Then one atomic
+transition: the exact reservation leaves the table, exactly one cleanup entry is
+inserted, the token is marked `CONSUMED`. An insertion that raises restores the
+reservation to the table and to `RESERVED`, so capacity is never lost to a
+half-finished conversion.
+
+Any mismatch refuses with `CleanupReservationRefused` **before** the insertion,
+mutates neither the registry's valid state nor the foreign token, and appends a
+classified refusal to the durable evidence. `_release_reservation` performs the
+same proof, so a foreign or stale token can neither release capacity nor be
+mutated by a registry that never issued it.

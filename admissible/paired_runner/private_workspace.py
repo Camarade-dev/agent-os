@@ -90,6 +90,8 @@ from .process_ownership import (
 from .resource_limits import (
     _release_unregistered as _release_unregistered_cleanup,
     _retain_unregistered as _retain_unregistered_cleanup,
+    cleanup_obligation_sequence_of as _obligation_sequence_of,
+    next_cleanup_obligation_sequence as _next_obligation_sequence,
     set_cleanup_registrar as _set_cleanup_registrar,
     unregistered_cleanups as _unregistered_cleanups,
 )
@@ -616,20 +618,235 @@ class CleanupRegistrationFailed(PrivateWorkspaceError):
 #: per-entry allowance, so sixty-four entries cost this once.
 CLEANUP_DRAIN_TOTAL_DEADLINE_MS = HELPER_SHUTDOWN_DEADLINE_MS
 
+#: M2-B58.  One counter per interpreter, so two registries alive at the same
+#: moment can never carry the same identity and a token cannot be presented to
+#: the wrong one.
+_REGISTRY_SEQUENCE = 0
+_REGISTRY_SEQUENCE_LOCK = threading.Lock()
+
+#: M2-B57.  The one budget a drain is currently spending on this thread.  A
+#: nested cleanup path that reaches :func:`drain_incomplete_cleanups` again joins
+#: it rather than minting a second full budget, which is the same mistake as
+#: giving each handle a fresh deadline, one stack frame further down.
+_ACTIVE_DRAIN = threading.local()
+
+#: Why an obligation was not attempted.  A drain that ran out of budget says so
+#: rather than reporting an attempt that did not happen.
+DRAIN_UNATTEMPTED_BUDGET_EXHAUSTED = "SHARED_BUDGET_EXHAUSTED"
+#: An alias: another obligation in the same drain owns the same exact resource.
+DRAIN_UNATTEMPTED_ALIAS = "THE_CANONICAL_OBLIGATION_FOR_THIS_RESOURCE_WAS_SETTLED"
+#: The resource is gone; only bookkeeping remains, and bookkeeping is not a
+#: cleanup primitive and is never run on a spent budget.
+DRAIN_UNATTEMPTED_RESOURCE_DISCHARGED = "THE_RESOURCE_IS_ALREADY_DISCHARGED"
+
+# --- M2-B57: exactly one truthful state per obligation, per drain -------------
+#
+# The delegated qualification refused this closure on a single row: an
+# unregistered obligation reported ``attempted=false`` with
+# ``SHARED_BUDGET_EXHAUSTED`` and a retry operation naming a cgroup removal,
+# while the cgroup it named had already been removed -- by its own ordinary
+# ``close()``, before the drain began, under that removal's own exclusion
+# boundary.  Nothing had bypassed the budget and no two obligations aliased one
+# resource; the *evidence model* was wrong.  A registrar failure made
+# ``cleanup_complete`` false, and a false ``cleanup_complete`` was read as "a
+# destructive obligation is still outstanding".
+#
+# A drain row now carries exactly one of these states, and the state is derived
+# from what the obligation actually still owes rather than from the budget alone.
+
+#: Settled using a grant from the one shared budget.
+DRAIN_STATE_ATTEMPTED = "ATTEMPTED_UNDER_A_GRANT_FROM_THE_SHARED_BUDGET"
+#: Genuinely untouched: the resource is still outstanding and there was no time.
+DRAIN_STATE_RETAINED_UNATTEMPTED = "RETAINED_UNTOUCHED_BECAUSE_THE_SHARED_BUDGET_WAS_EXHAUSTED"
+#: The exact same underlying resource was settled by another obligation here.
+DRAIN_STATE_DISCHARGED_BY_CANONICAL = "DISCHARGED_BY_THE_CANONICAL_OBLIGATION_FOR_THE_SAME_RESOURCE"
+#: The resource is discharged on its own evidence; only bookkeeping is owed.
+DRAIN_STATE_RESOURCE_DISCHARGED = "RESOURCE_ALREADY_DISCHARGED_BOOKKEEPING_OUTSTANDING"
+#: Attempted or reached, and something real is still owed.
+DRAIN_STATE_UNRESOLVED = "UNRESOLVED_AND_RETAINED"
+
+DRAIN_STATES = (
+    DRAIN_STATE_ATTEMPTED,
+    DRAIN_STATE_RETAINED_UNATTEMPTED,
+    DRAIN_STATE_DISCHARGED_BY_CANONICAL,
+    DRAIN_STATE_RESOURCE_DISCHARGED,
+    DRAIN_STATE_UNRESOLVED,
+)
+
+
+class DrainEvidenceContradiction(PrivateWorkspaceError):
+    """A drain row would have described a state the resource contradicts."""
+
+    def __init__(self, detail: str = "") -> None:
+        super().__init__("drain_evidence_contradiction", detail)
+
+
+def _resource_outstanding(cleanup: dict[str, Any]) -> bool:
+    """Whether this obligation still owes work on a real resource.
+
+    Bookkeeping is not a resource.  An obligation whose cgroup is gone and whose
+    owned processes are all accounted for owes nothing destructive, however the
+    registrar behaved, and may never be reported as an unattempted removal.
+    """
+
+    if "resource_outstanding" in cleanup:
+        return bool(cleanup["resource_outstanding"])
+    # A handle that predates the field -- a helper or a view -- is outstanding
+    # exactly while its own cleanup is incomplete.
+    return not bool(cleanup.get("cleanup_complete"))
+
+
+def _classify_drain_row(
+    *,
+    attempted: bool,
+    cleanup: dict[str, Any],
+    alias_of: str | None,
+) -> tuple[str, str | None]:
+    """The one truthful state of this obligation in this drain, and its reason.
+
+    ``RETAINED_UNTOUCHED_BECAUSE_THE_SHARED_BUDGET_WAS_EXHAUSTED`` is reserved
+    for an obligation whose resource really is still outstanding.  An obligation
+    whose resource is gone is never described that way, whatever the budget did.
+    """
+
+    outstanding = _resource_outstanding(cleanup)
+    if alias_of is not None:
+        return DRAIN_STATE_DISCHARGED_BY_CANONICAL, DRAIN_UNATTEMPTED_ALIAS
+    if attempted:
+        if bool(cleanup.get("cleanup_complete")):
+            return DRAIN_STATE_ATTEMPTED, None
+        return DRAIN_STATE_UNRESOLVED, None
+    if not outstanding:
+        return DRAIN_STATE_RESOURCE_DISCHARGED, DRAIN_UNATTEMPTED_RESOURCE_DISCHARGED
+    return DRAIN_STATE_RETAINED_UNATTEMPTED, DRAIN_UNATTEMPTED_BUDGET_EXHAUSTED
+
+
+def _guard_drain_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Refuse to emit a row whose own fields contradict each other.
+
+    The invariant this closure was refused on, enforced where the row is built
+    rather than only where it is read: an obligation may not be reported as
+    untouched-for-lack-of-budget unless its resource really is still outstanding.
+    """
+
+    state = row["state"]
+    if state not in DRAIN_STATES:  # pragma: no cover - the table above is closed
+        raise DrainEvidenceContradiction(f"unknown drain state {state!r}")
+    if state == DRAIN_STATE_RETAINED_UNATTEMPTED and not row["resource_outstanding"]:
+        raise DrainEvidenceContradiction(
+            f"{row.get('effect_cgroup_path')!r} was reported untouched for lack of budget while "
+            "its resource is already discharged"
+        )
+    if state == DRAIN_STATE_ATTEMPTED and not row["attempted"]:  # pragma: no cover - defensive
+        raise DrainEvidenceContradiction("an unattempted obligation was reported as attempted")
+    return row
+
+
+# --- M2-B58: a reservation is a linear, registry-issued capability ------------
+#
+# ``reservation is not None and reservation.active`` was the whole validity test.
+# It proved nothing about *whose* capacity the token represented: a token issued
+# by another registry instance, a token whose registry had since been PID-reset,
+# a token already spent, and a plain object with an ``active`` attribute were all
+# accepted, and each of them skipped the capacity check the reservation existed
+# to have already passed.  A stale token surviving a PID-bound reset was enough
+# to put a second entry into a registry whose capacity was one.
+#
+# A reservation now carries its whole provenance -- issuing registry object and
+# identity, owner PID, registry epoch, id -- and the registry additionally
+# proves that the exact object it is being handed is the exact object standing
+# in its own reservation table under that id.  That last check is what makes the
+# capability unforgeable: a token nobody issued is in no table, and a token the
+# registry issued and has since taken back is no longer in it either.
+
+#: The token holds capacity and has not been spent.
+RESERVATION_RESERVED = "RESERVED"
+#: The token became exactly one cleanup entry.
+RESERVATION_CONSUMED = "CONSUMED"
+#: The token gave its capacity back without becoming an entry.
+RESERVATION_RELEASED = "RELEASED"
+
+#: Why a reservation was refused.  Each is a separate fact, never a single
+#: "invalid": a stale token and a forged one are different failures.
+RESERVATION_REFUSED_FOREIGN_TYPE = "RESERVATION_IS_NOT_A_REGISTRY_ISSUED_CAPABILITY"
+RESERVATION_REFUSED_FOREIGN_REGISTRY = "RESERVATION_WAS_ISSUED_BY_ANOTHER_REGISTRY"
+RESERVATION_REFUSED_FOREIGN_PID = "RESERVATION_BELONGS_TO_ANOTHER_PROCESS"
+RESERVATION_REFUSED_STALE_EPOCH = "RESERVATION_PREDATES_THE_CURRENT_REGISTRY_EPOCH"
+RESERVATION_REFUSED_NOT_IN_TABLE = "RESERVATION_ID_IS_NOT_OUTSTANDING"
+RESERVATION_REFUSED_NOT_THE_SAME_OBJECT = "RESERVATION_ID_STANDS_FOR_A_DIFFERENT_OBJECT"
+RESERVATION_REFUSED_ALREADY_CONSUMED = "RESERVATION_WAS_ALREADY_CONSUMED"
+RESERVATION_REFUSED_ALREADY_RELEASED = "RESERVATION_WAS_ALREADY_RELEASED"
+
+
+class CleanupReservationRefused(PrivateWorkspaceError):
+    """A reservation could not be proved to be this registry's live capability."""
+
+    def __init__(self, code: str, detail: str = "") -> None:
+        super().__init__("cleanup_reservation_refused", f"{code}:{detail}" if detail else code)
+        self.code = code
+
 
 class _CapacityReservation:
-    """One unit of registry capacity, held before the obligation exists."""
+    """One unit of registry capacity, held before the obligation exists.
 
-    def __init__(self, registry: "_IncompleteCleanupRegistry", reservation_id: str, label: str) -> None:
+    Linear: it becomes exactly one cleanup entry or it is given back, once.  It
+    carries the identity of the registry that issued it, the PID that owned that
+    registry, and the epoch the registry was in, and it exposes no method that
+    could make any of them say something else.
+    """
+
+    __slots__ = (
+        "_registry",
+        "_state",
+        "converted_to",
+        "epoch",
+        "label",
+        "owner_pid",
+        "registry_identity",
+        "reservation_id",
+    )
+
+    def __init__(
+        self,
+        registry: "_IncompleteCleanupRegistry",
+        reservation_id: str,
+        label: str,
+        *,
+        registry_identity: str,
+        epoch: int,
+    ) -> None:
         self._registry = registry
         self.reservation_id = reservation_id
         self.label = label
         self.owner_pid = os.getpid()
-        self.active = True
+        self.registry_identity = registry_identity
+        self.epoch = int(epoch)
+        self._state = RESERVATION_RESERVED
         self.converted_to: str | None = None
 
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @property
+    def active(self) -> bool:
+        """Whether this token still holds capacity.
+
+        Read-only.  A settable ``active`` was a public method for making a spent
+        or foreign token look current, which is precisely what a linear
+        capability may not have.
+        """
+
+        return self._state == RESERVATION_RESERVED
+
     def release(self) -> bool:
-        """Give the capacity back.  Idempotent, and never releases twice."""
+        """Give the capacity back.  Idempotent, and never releases twice.
+
+        Returns ``False`` when this token holds nothing to give back, including
+        when the registry that issued it no longer recognises it -- a token that
+        outlived a PID reset releases nothing and takes nothing away from the
+        registry now standing in its place.
+        """
 
         return self._registry._release_reservation(self)
 
@@ -638,6 +855,9 @@ class _CapacityReservation:
             "reservation_id": self.reservation_id,
             "label": self.label,
             "owner_pid": self.owner_pid,
+            "registry_identity": self.registry_identity,
+            "epoch": self.epoch,
+            "state": self._state,
             "active": self.active,
             "converted_to": self.converted_to,
         }
@@ -654,10 +874,14 @@ class _IncompleteCleanup:
         evidence: dict[str, Any],
         *,
         generation: int = 0,
+        sequence: int = 0,
     ) -> None:
         self.entry_id = entry_id
         self.kind = kind
         self.handle = handle
+        #: M2-B57.  Where this obligation sits in the one process-wide order a
+        #: drain spends its single budget in.
+        self.sequence = int(sequence) or _next_obligation_sequence()
         self.owner_pid = os.getpid()
         self.helper_pid = int(evidence.get("helper_pid") or 0)
         self.registered_generation = int(evidence.get("ownership_generation") or 0)
@@ -700,6 +924,7 @@ class _IncompleteCleanup:
         return {
             "entry_id": self.entry_id,
             "kind": self.kind,
+            "sequence": self.sequence,
             "owner_pid": self.owner_pid,
             "helper_pid": self.helper_pid,
             "ownership_generation": self.registered_generation,
@@ -742,6 +967,7 @@ class _IncompleteCleanupRegistry:
     """
 
     def __init__(self) -> None:
+        global _REGISTRY_SEQUENCE
         self._lock = threading.RLock()
         self._owner_pid = os.getpid()
         self._entries: dict[str, _IncompleteCleanup] = {}
@@ -749,6 +975,16 @@ class _IncompleteCleanupRegistry:
         self._counter = 0
         self._reservation_counter = 0
         self._generation = 0
+        # M2-B58.  The immutable identity of this exact registry object, and the
+        # PID-bound epoch a reservation is valid within.  The identity separates
+        # two registries alive at once; the epoch separates this registry from
+        # what it was before a fork reset it.  Neither is derived from anything a
+        # token can carry, so a token can only match by having been issued here.
+        with _REGISTRY_SEQUENCE_LOCK:
+            _REGISTRY_SEQUENCE += 1
+            self._identity = f"cleanup-registry-{os.getpid()}-{_REGISTRY_SEQUENCE:06d}"
+        self._epoch = 1
+        self._reservation_refusals: list[dict[str, Any]] = []
 
     # --- state, always under the one lock -------------------------------------
 
@@ -760,6 +996,76 @@ class _IncompleteCleanupRegistry:
             self._counter = 0
             self._reservation_counter = 0
             self._generation = 0
+            # M2-B58.  The epoch advances rather than resetting: a token the
+            # parent issued names the epoch it was issued in, and the child must
+            # never be able to reach an epoch a parent's token could match.
+            self._epoch += 1
+            self._reservation_refusals = []
+
+    @property
+    def registry_identity(self) -> str:
+        return self._identity
+
+    @property
+    def epoch(self) -> int:
+        with self._lock:
+            self._reset_after_fork_locked()
+            return self._epoch
+
+    def reservation_refusals(self) -> tuple[dict[str, Any], ...]:
+        with self._lock:
+            return tuple(dict(row) for row in self._reservation_refusals)
+
+    # --- M2-B58: proving a token is this registry's live capability ------------
+
+    def _classify_reservation_locked(self, token: Any) -> str | None:
+        """``None`` when the token is this registry's live capability.
+
+        Every element of the provenance is checked separately and none of them
+        is inferred from another.  The last two are what make the capability
+        unforgeable: the id must be outstanding *in this registry's own table*,
+        and the object standing under it must be this exact object.
+        """
+
+        if not isinstance(token, _CapacityReservation):
+            return RESERVATION_REFUSED_FOREIGN_TYPE
+        if token._registry is not self or token.registry_identity != self._identity:
+            return RESERVATION_REFUSED_FOREIGN_REGISTRY
+        if token.owner_pid != os.getpid():
+            return RESERVATION_REFUSED_FOREIGN_PID
+        if token.epoch != self._epoch:
+            return RESERVATION_REFUSED_STALE_EPOCH
+        if token.state == RESERVATION_CONSUMED:
+            return RESERVATION_REFUSED_ALREADY_CONSUMED
+        if token.state == RESERVATION_RELEASED:
+            return RESERVATION_REFUSED_ALREADY_RELEASED
+        outstanding = self._reservations.get(token.reservation_id)
+        if outstanding is None:
+            return RESERVATION_REFUSED_NOT_IN_TABLE
+        if outstanding is not token:
+            return RESERVATION_REFUSED_NOT_THE_SAME_OBJECT
+        return None
+
+    def _refuse_reservation_locked(self, token: Any, code: str, operation: str) -> dict[str, Any]:
+        """Record a classified refusal.  The refused token is not touched."""
+
+        record = {
+            "operation": operation,
+            "code": code,
+            "registry_identity": self._identity,
+            "registry_epoch": self._epoch,
+            "reading_pid": os.getpid(),
+            "token_type": type(token).__name__,
+            "token_reservation_id": getattr(token, "reservation_id", None),
+            "token_registry_identity": getattr(token, "registry_identity", None),
+            "token_owner_pid": getattr(token, "owner_pid", None),
+            "token_epoch": getattr(token, "epoch", None),
+            "token_state": getattr(token, "state", None),
+            "held": self._held_locked(),
+            "capacity": CLEANUP_REGISTRY_CAPACITY,
+        }
+        self._reservation_refusals.append(record)
+        return record
 
     def _reset_after_fork(self) -> None:
         with self._lock:
@@ -802,19 +1108,50 @@ class _IncompleteCleanupRegistry:
             if self._held_locked() >= CLEANUP_REGISTRY_CAPACITY:
                 raise CleanupRegistrySaturated(self._saturation_detail())
             self._reservation_counter += 1
-            reservation_id = f"reservation-{self._owner_pid}-{self._reservation_counter:06d}"
-            reservation = _CapacityReservation(self, reservation_id, label)
+            reservation_id = (
+                f"reservation-{self._owner_pid}-{self._epoch}-{self._reservation_counter:06d}"
+            )
+            reservation = _CapacityReservation(
+                self,
+                reservation_id,
+                label,
+                registry_identity=self._identity,
+                epoch=self._epoch,
+            )
             self._reservations[reservation_id] = reservation
             return reservation
 
-    def _release_reservation(self, reservation: _CapacityReservation) -> bool:
+    def _release_reservation(self, reservation: Any) -> bool:
+        """Give one unit of capacity back, if this token actually holds one.
+
+        M2-B58.  The provenance is proved first.  A foreign, stale or already
+        spent token releases nothing, is not mutated, and cannot take capacity
+        away from a registry that never issued it.
+        """
+
         with self._lock:
             self._reset_after_fork_locked()
-            if not reservation.active:
+            refusal = self._classify_reservation_locked(reservation)
+            if refusal is not None:
+                self._refuse_reservation_locked(reservation, refusal, "release")
                 return False
-            reservation.active = False
+            reservation._state = RESERVATION_RELEASED
             self._reservations.pop(reservation.reservation_id, None)
             return True
+
+    def _consume_reservation_locked(self, reservation: Any, entry_id: str) -> None:
+        """The one atomic transition: outstanding reservation -> one entry."""
+
+        self._reservations.pop(reservation.reservation_id, None)
+        reservation._state = RESERVATION_CONSUMED
+        reservation.converted_to = entry_id
+
+    def _restore_reservation_locked(self, reservation: _CapacityReservation) -> None:
+        """Undo a consumption whose insertion did not complete."""
+
+        reservation._state = RESERVATION_RESERVED
+        reservation.converted_to = None
+        self._reservations[reservation.reservation_id] = reservation
 
     def outstanding_reservations(self) -> tuple[_CapacityReservation, ...]:
         with self._lock:
@@ -851,6 +1188,12 @@ class _IncompleteCleanupRegistry:
         under.  An insertion with no reservation still has to fit inside the
         capacity in its own right, so a direct call can never take the registry
         past its bound.
+
+        M2-B58.  The reservation is proved to be *this* registry's live,
+        outstanding, unspent capability before it grants anything.  A token that
+        cannot be proved is refused before the insertion, is not mutated, and
+        takes nothing from the registry's own accounting; the refusal is
+        classified and recorded.
         """
 
         with self._lock:
@@ -860,32 +1203,90 @@ class _IncompleteCleanupRegistry:
                 if existing is not None:
                     self._entries.pop(existing, None)
                     handle._registry_id = None
-                if reservation is not None and reservation.active:
-                    self._release_reservation(reservation)
+                self._settle_spent_reservation_locked(reservation, None, "record_complete")
                 return None
             if existing is not None and existing in self._entries:
                 self._entries[existing].cleanup = dict(evidence)
-                if reservation is not None and reservation.active:
-                    # The obligation is already retained under one entry; the
-                    # reservation it was created under is spent on that entry.
-                    reservation.converted_to = existing
-                    self._release_reservation(reservation)
+                # The obligation is already retained under one entry; the
+                # reservation it was created under is spent on that entry.
+                self._settle_spent_reservation_locked(reservation, existing, "record_existing")
                 return existing
-            reserved = reservation is not None and reservation.active
+            reserved = False
+            if reservation is not None:
+                refusal = self._classify_reservation_locked(reservation)
+                if refusal is not None:
+                    record = self._refuse_reservation_locked(reservation, refusal, "record")
+                    raise CleanupReservationRefused(
+                        refusal,
+                        (
+                            f"{self._identity} epoch {self._epoch} pid {os.getpid()} holds "
+                            f"{record['held']} of {CLEANUP_REGISTRY_CAPACITY}; the reservation "
+                            f"offered ({record['token_reservation_id']!r} from "
+                            f"{record['token_registry_identity']!r}, owner pid "
+                            f"{record['token_owner_pid']!r}, epoch {record['token_epoch']!r}, "
+                            f"state {record['token_state']!r}) is not this registry's live "
+                            "capability, so it grants no capacity and no entry is inserted"
+                        ),
+                    )
+                reserved = True
             if not reserved and len(self._entries) >= CLEANUP_REGISTRY_CAPACITY:
                 raise CleanupRegistrySaturated(self._saturation_detail())
             kind = _CLEANUP_KINDS.get(type(handle).__name__, CLEANUP_KIND_HELPER)
             self._counter += 1
             self._generation += 1
             entry_id = f"cleanup-{self._owner_pid}-{self._counter:06d}"
-            self._entries[entry_id] = _IncompleteCleanup(
-                entry_id, kind, handle, evidence, generation=self._generation
-            )
-            handle._registry_id = entry_id
             if reserved:
-                reservation.converted_to = entry_id
-                self._release_reservation(reservation)
+                # One atomic transition, entirely under the one lock: the exact
+                # reservation leaves the table, exactly one entry takes its
+                # place, and the token is marked spent.  If the entry cannot be
+                # constructed the reservation goes back, so the capacity it held
+                # is never lost to a half-finished conversion.
+                self._consume_reservation_locked(reservation, entry_id)
+            try:
+                self._entries[entry_id] = _IncompleteCleanup(
+                    entry_id,
+                    kind,
+                    handle,
+                    evidence,
+                    generation=self._generation,
+                    sequence=_obligation_sequence_of(handle),
+                )
+            except Exception:
+                self._entries.pop(entry_id, None)
+                if reserved:
+                    self._restore_reservation_locked(reservation)
+                raise
+            handle._registry_id = entry_id
             return entry_id
+
+    def _settle_spent_reservation_locked(
+        self, reservation: Any, entry_id: str | None, operation: str
+    ) -> None:
+        """Give back a token that is not going to become a *new* entry.
+
+        A token this registry cannot prove is left exactly as it is: refusing to
+        release a foreign reservation and refusing to mutate it are the same
+        requirement, because a registry that "released" somebody else's token
+        would be reporting an accounting change it did not make.
+        """
+
+        if reservation is None:
+            return
+        refusal = self._classify_reservation_locked(reservation)
+        if refusal is not None:
+            if refusal not in (
+                RESERVATION_REFUSED_ALREADY_CONSUMED,
+                RESERVATION_REFUSED_ALREADY_RELEASED,
+            ):
+                # An already-spent token of this registry's own is the ordinary
+                # repeated-registration case and is not a refusal worth
+                # recording; anything else is.
+                self._refuse_reservation_locked(reservation, refusal, operation)
+            return
+        if entry_id is not None:
+            reservation.converted_to = entry_id
+        reservation._state = RESERVATION_RELEASED
+        self._reservations.pop(reservation.reservation_id, None)
 
     def entry(self, entry_id: str) -> _IncompleteCleanup | None:
         with self._lock:
@@ -903,12 +1304,15 @@ class _IncompleteCleanupRegistry:
             return {
                 "owner_pid": self._owner_pid,
                 "reading_pid": os.getpid(),
+                "registry_identity": self._identity,
+                "epoch": self._epoch,
                 "capacity": CLEANUP_REGISTRY_CAPACITY,
                 "retained": len(self._entries),
                 "reserved": len(self._reservations),
                 "held": self._held_locked(),
                 "saturated": self._held_locked() >= CLEANUP_REGISTRY_CAPACITY,
                 "reservations": [row.to_dict() for row in self._reservations.values()],
+                "reservation_refusals": [dict(row) for row in self._reservation_refusals],
                 "entries": [entry.evidence() for entry in self._entries.values()],
             }
 
@@ -922,7 +1326,85 @@ class _IncompleteCleanupRegistry:
         entry.claimed_by = token
         return True
 
-    def drain(self, *, deadline: Deadline | None = None) -> list[dict[str, Any]]:
+    def pending(self) -> tuple[_IncompleteCleanup, ...]:
+        """The retained entries, in the one process-wide obligation order."""
+
+        with self._lock:
+            self._reset_after_fork_locked()
+            return tuple(sorted(self._entries.values(), key=lambda entry: entry.sequence))
+
+    def drain_entry(
+        self,
+        entry: _IncompleteCleanup,
+        *,
+        budget: CleanupBudget,
+        token: int,
+        alias_of: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Settle one claimed entry out of the caller's shared budget.
+
+        ``None`` means another drain owns the entry: it is neither settled twice
+        nor reported as this drain's work.
+
+        M2-B53.  The claim is taken under the registry lock, the settlement
+        happens outside it, and the result is published only if the entry claimed
+        is still the entry registered.
+
+        M2-B57.  The budget belongs to the caller.  This method never opens one,
+        so an entry can never receive a fresh full deadline of its own, and the
+        *grant itself* is the gate: an obligation that receives no time runs no
+        cleanup primitive at all, rather than running one against an instant that
+        has already passed.
+        """
+
+        with self._lock:
+            if not self._claim_locked(entry, token):
+                return None
+        stage = f"drain:{entry.entry_id}"
+        try:
+            granted, granted_ms, attempted = _grant_or_observe(budget, stage, alias_of=alias_of)
+            if attempted:
+                cleanup = entry.retry(deadline=granted)
+            else:
+                cleanup = dict(entry.cleanup)
+            budget.note(stage, completed=bool(cleanup.get("cleanup_complete")))
+        finally:
+            with self._lock:
+                entry.claimed_by = None
+        with self._lock:
+            still_registered = self._entries.get(entry.entry_id) is entry
+        state, reason = _classify_drain_row(
+            attempted=attempted, cleanup=cleanup, alias_of=alias_of
+        )
+        return _guard_drain_row(
+            {
+                "entry_id": entry.entry_id,
+                "collection": "REGISTERED",
+                "sequence": entry.sequence,
+                "kind": entry.kind,
+                "helper_pid": entry.helper_pid,
+                "drain_attempts": entry.drains,
+                "attempted": attempted,
+                "state": state,
+                "unattempted_reason": reason,
+                "alias_of": alias_of,
+                "resource_outstanding": _resource_outstanding(cleanup),
+                "outstanding_work": cleanup.get("outstanding_work"),
+                "resource_identity": cleanup.get("owned_identity"),
+                "granted_ms": granted_ms,
+                "deadline_exhausted": budget.exhausted,
+                "cleanup_complete": bool(cleanup.get("cleanup_complete")),
+                "cleanup_retryable": bool(cleanup.get("cleanup_retryable")),
+                "cleanup_retry_operation": cleanup.get("cleanup_retry_operation"),
+                "effect_cgroup_path": cleanup.get("effect_path"),
+                "retained": still_registered,
+                "removed": not still_registered,
+            }
+        )
+
+    def drain(
+        self, *, deadline: Deadline | None = None, budget: CleanupBudget | None = None
+    ) -> list[dict[str, Any]]:
         """Retry every retained cleanup once, inside one absolute deadline.
 
         M2-B54.  The whole drain spends one instant.  Every claimed entry
@@ -932,63 +1414,29 @@ class _IncompleteCleanupRegistry:
         reported with non-blocking evidence and are retained unattempted; they
         are not given a fresh budget and are not silently dropped.
 
-        M2-B53.  An entry is claimed by at most one drain, the claim is taken
-        under the registry lock, the settlement happens outside it, and the
-        result is published only if the entry claimed is still the entry
-        registered.
+        M2-B57.  ``budget`` is the caller's whole budget when the caller has one.
+        A registry drain reached from :func:`drain_incomplete_cleanups` shares
+        that object with the unregistered collection, so the two can never spend
+        the configured total twice between them.  Only a caller that owns no
+        budget -- a direct sweep of the registry alone -- opens one here, and it
+        opens exactly one.
         """
 
-        budget = CleanupBudget.open(
-            deadline, total_ms=CLEANUP_DRAIN_TOTAL_DEADLINE_MS, label="cleanup_drain"
-        )
+        if budget is None:
+            budget = CleanupBudget.open(
+                deadline, total_ms=CLEANUP_DRAIN_TOTAL_DEADLINE_MS, label="cleanup_drain"
+            )
+            owns_ledger = True
+        else:
+            owns_ledger = False
         token = threading.get_ident()
         results: list[dict[str, Any]] = []
-        with self._lock:
-            self._reset_after_fork_locked()
-            candidates = tuple(self._entries.values())
-        for entry in candidates:
-            with self._lock:
-                if not self._claim_locked(entry, token):
-                    # Another drain owns it.  It is neither settled twice nor
-                    # reported as this drain's work.
-                    continue
-            try:
-                attempted = not budget.exhausted
-                if attempted:
-                    granted = budget.grant(f"drain:{entry.entry_id}", HELPER_SHUTDOWN_DEADLINE_MS)
-                    cleanup = entry.retry(deadline=granted)
-                    granted_ms = int(granted.remaining_seconds * 1000)
-                else:
-                    budget.observe(f"drain:{entry.entry_id}")
-                    cleanup = dict(entry.cleanup)
-                    granted_ms = 0
-                budget.note(f"drain:{entry.entry_id}", completed=bool(cleanup.get("cleanup_complete")))
-            finally:
-                with self._lock:
-                    if self._entries.get(entry.entry_id) is entry:
-                        entry.claimed_by = None
-                    else:  # pragma: no cover - the entry was replaced mid-settlement
-                        entry.claimed_by = None
-            with self._lock:
-                still_registered = self._entries.get(entry.entry_id) is entry
-            results.append(
-                {
-                    "entry_id": entry.entry_id,
-                    "kind": entry.kind,
-                    "helper_pid": entry.helper_pid,
-                    "drain_attempts": entry.drains,
-                    "attempted": attempted,
-                    "granted_ms": granted_ms,
-                    "deadline_exhausted": budget.exhausted,
-                    "cleanup_complete": bool(cleanup.get("cleanup_complete")),
-                    "cleanup_retryable": bool(cleanup.get("cleanup_retryable")),
-                    "cleanup_retry_operation": cleanup.get("cleanup_retry_operation"),
-                    "effect_cgroup_path": cleanup.get("effect_path"),
-                    "retained": still_registered,
-                    "removed": not still_registered,
-                }
-            )
-        self._last_drain = budget.to_dict()
+        for entry in self.pending():
+            row = self.drain_entry(entry, budget=budget, token=token)
+            if row is not None:
+                results.append(row)
+        if owns_ledger:
+            self._last_drain = budget.to_dict()
         return results
 
     def last_drain_budget(self) -> dict[str, Any]:
@@ -996,8 +1444,17 @@ class _IncompleteCleanupRegistry:
 
         return dict(getattr(self, "_last_drain", {}) or {})
 
+    def publish_drain_ledger(self, ledger: dict[str, Any]) -> None:
+        """Adopt the shared ledger of a drain that covered both collections."""
+
+        self._last_drain = dict(ledger)
+
 
 _CLEANUP_REGISTRY = _IncompleteCleanupRegistry()
+
+#: M2-B57.  The one ledger of the most recent whole drain, covering the
+#: registered entries and the registrar-refused obligations together.
+_LAST_DRAIN_LEDGER: dict[str, Any] = {}
 
 
 def _record_cleanup(
@@ -1041,9 +1498,96 @@ def cleanup_registry_evidence() -> dict[str, Any]:
     """The registry's durable evidence.  It names no filesystem path."""
 
     evidence = _CLEANUP_REGISTRY.evidence()
-    evidence["unregistered_obligations"] = len(_unregistered_cleanups())
-    evidence["last_drain"] = _CLEANUP_REGISTRY.last_drain_budget()
+    unregistered = _unregistered_cleanups()
+    evidence["unregistered_obligations"] = len(unregistered)
+    evidence["unregistered_obligation_sequences"] = [
+        _obligation_sequence_of(handle) for handle in unregistered
+    ]
+    # M2-B57.  One ledger over both collections, not one per collection.
+    evidence["last_drain"] = dict(_LAST_DRAIN_LEDGER) or _CLEANUP_REGISTRY.last_drain_budget()
     return evidence
+
+
+def _grant_or_observe(
+    budget: CleanupBudget, stage: str, *, alias_of: str | None = None
+) -> tuple[Deadline | None, int, bool]:
+    """Take a grant from the one shared budget, or take nothing and do nothing.
+
+    M2-B57.  The *grant* is the gate, not a check taken just before it.  A
+    settlement handed an instant that has already passed still runs every
+    non-blocking step it owns -- it kills, it reaps, it removes -- so "the budget
+    was exhausted" and "no cleanup primitive ran" were two different facts, and a
+    zero-millisecond grant was enough to perform a real destructive removal.  A
+    grant that carries no time is therefore no grant at all: nothing is settled,
+    and the obligation is retained exactly as it was found.
+
+    An alias never takes a second grant: the resource it names is being settled
+    once, by its canonical obligation.
+    """
+
+    if alias_of is not None:
+        budget.observe(stage)
+        return None, 0, False
+    if budget.exhausted:
+        budget.observe(stage)
+        return None, 0, False
+    granted = budget.grant(stage, HELPER_SHUTDOWN_DEADLINE_MS)
+    granted_ms = int(granted.remaining_seconds * 1000)
+    if granted_ms <= 0 or granted.expired:
+        # The budget ran out between the check and the grant.  A settlement
+        # cannot be given zero time and still be called an attempt.
+        return None, 0, False
+    return granted, granted_ms, True
+
+
+def _drain_unregistered_obligation(
+    handle: Any, *, budget: CleanupBudget, sequence: int, alias_of: str | None = None
+) -> dict[str, Any]:
+    """Settle one registrar-refused obligation out of the shared budget.
+
+    M2-B57.  It receives a *grant* -- what is left of the one drain budget,
+    capped by the per-obligation maximum -- and never a deadline of its own.
+    Without a grant it is not attempted at all: it is retained exactly as it was,
+    no cleanup primitive runs, and the row says which of the truthful states it
+    is in.  In particular an obligation whose resource is already discharged is
+    never reported as an untouched, outstanding removal.
+    """
+
+    stage = f"drain:unregistered:{sequence}"
+    granted, granted_ms, attempted = _grant_or_observe(budget, stage, alias_of=alias_of)
+    settlement: dict[str, Any] | None = None
+    if attempted:
+        settlement = handle.settle_cleanup(deadline=granted)
+    cleanup = handle.cleanup_evidence()
+    budget.note(stage, completed=bool(cleanup.get("cleanup_complete")))
+    state, reason = _classify_drain_row(attempted=attempted, cleanup=cleanup, alias_of=alias_of)
+    return _guard_drain_row(
+        {
+            "entry_id": None,
+            "collection": "UNREGISTERED",
+            "sequence": sequence,
+            "kind": _CLEANUP_KINDS.get(type(handle).__name__, CLEANUP_KIND_HELPER),
+            "helper_pid": int(cleanup.get("helper_pid") or 0),
+            "drain_attempts": int(cleanup.get("settlement_attempts") or 0),
+            "attempted": attempted,
+            "state": state,
+            "unattempted_reason": reason,
+            "alias_of": alias_of,
+            "resource_outstanding": _resource_outstanding(cleanup),
+            "outstanding_work": cleanup.get("outstanding_work"),
+            "resource_identity": cleanup.get("owned_identity"),
+            "granted_ms": granted_ms,
+            "deadline_exhausted": budget.exhausted,
+            "cleanup_complete": bool(cleanup.get("cleanup_complete")),
+            "cleanup_retryable": bool(cleanup.get("cleanup_retryable")),
+            "cleanup_retry_operation": cleanup.get("cleanup_retry_operation"),
+            "effect_cgroup_path": cleanup.get("effect_path"),
+            "registration_failure": cleanup.get("registration_failure"),
+            "retained": any(existing is handle for existing in _unregistered_cleanups()),
+            "removed": False,
+            "settlement": settlement,
+        }
+    )
 
 
 def drain_incomplete_cleanups(*, deadline: Deadline | None = None) -> list[dict[str, Any]]:
@@ -1053,34 +1597,146 @@ def drain_incomplete_cleanups(*, deadline: Deadline | None = None) -> list[dict[
     here too: they are the ones with no entry to be found by, so a drain that
     only walked the registry would leave exactly the handles that were hardest
     to reach.
+
+    M2-B57.  One call has exactly one absolute budget, and that one budget covers
+    the registered entries, the registry bookkeeping the drain needs, the
+    obligations retained after a registrar failure, and every retry and evidence
+    operation any of them performs.  It is created here, at the outermost entry,
+    and nothing below may create another: the registry adopts it, each obligation
+    receives a grant from it, and a nested drain reached from inside a settlement
+    joins it rather than minting a second one.
+
+    The two collections are walked as one list in ascending obligation sequence
+    -- the order in which this process took the obligations on -- so exhaustion
+    propagates across both in whichever order they were actually incurred, and
+    neither collection is systematically served first.
     """
 
-    results = _CLEANUP_REGISTRY.drain(deadline=deadline)
-    for handle in _unregistered_cleanups():
-        settlement = handle.settle_cleanup(
-            deadline=deadline or Deadline.after_ms(CLEANUP_DRAIN_TOTAL_DEADLINE_MS, "cleanup_drain")
+    outer = getattr(_ACTIVE_DRAIN, "budget", None)
+    if outer is not None:
+        # A nested drain.  It spends what is left of the budget already running
+        # on this thread; converting a grant back into a full budget is the same
+        # defect one frame deeper.
+        return _drain_within(outer, publish=False)
+    budget = CleanupBudget.open(
+        deadline, total_ms=CLEANUP_DRAIN_TOTAL_DEADLINE_MS, label="cleanup_drain"
+    )
+    _ACTIVE_DRAIN.budget = budget
+    try:
+        return _drain_within(budget, publish=True)
+    finally:
+        _ACTIVE_DRAIN.budget = None
+
+
+def _resource_identity_of(obligation: Any, collection: str) -> str | None:
+    """The exact resource an obligation names, or ``None`` when it cannot prove one.
+
+    M2-B57.  The *identity* of the owned object -- its ``dev:ino`` -- never its
+    pathname.  Two obligations under one pathname may be two different cgroups,
+    and two handles for one cgroup may disagree about the name it is reachable
+    by.  An obligation that cannot prove an exact identity is never treated as
+    an alias of anything: it is drained on its own terms and retained.
+    """
+
+    handle = obligation.handle if collection == "REGISTERED" else obligation
+    try:
+        identity = handle.cleanup_evidence().get("owned_identity")
+    except Exception:  # pragma: no cover - a handle whose evidence refuses
+        return None
+    return identity if isinstance(identity, str) and identity else None
+
+
+def _drain_within(budget: CleanupBudget, *, publish: bool) -> list[dict[str, Any]]:
+    global _LAST_DRAIN_LEDGER
+    token = threading.get_ident()
+    work: list[tuple[int, str, Any]] = [
+        (entry.sequence, "REGISTERED", entry) for entry in _CLEANUP_REGISTRY.pending()
+    ]
+    work.extend(
+        (_obligation_sequence_of(handle), "UNREGISTERED", handle)
+        for handle in _unregistered_cleanups()
+    )
+    work.sort(key=lambda row: (row[0], row[1]))
+    # M2-B57.  One underlying resource is settled once and spends one grant.  The
+    # first obligation in the deterministic order that names an exact identity is
+    # that resource's canonical obligation; any later obligation naming the same
+    # exact identity is its alias, is reported as discharged by it, and takes no
+    # second grant.  Identity is proved, never guessed from a pathname.
+    canonical: dict[str, str] = {}
+    seen_objects: dict[int, str] = {}
+    results: list[dict[str, Any]] = []
+    for sequence, collection, obligation in work:
+        identity = _resource_identity_of(obligation, collection)
+        alias_of: str | None = None
+        label = f"{collection}:{sequence}"
+        if identity is not None:
+            handle = obligation.handle if collection == "REGISTERED" else obligation
+            if id(handle) in seen_objects:
+                alias_of = seen_objects[id(handle)]
+            elif identity in canonical:
+                alias_of = canonical[identity]
+            else:
+                canonical[identity] = label
+                seen_objects[id(handle)] = label
+        if collection == "REGISTERED":
+            row = _CLEANUP_REGISTRY.drain_entry(
+                obligation, budget=budget, token=token, alias_of=alias_of
+            )
+            if row is None:
+                continue
+        else:
+            row = _drain_unregistered_obligation(
+                obligation, budget=budget, sequence=sequence, alias_of=alias_of
+            )
+        row["label"] = label
+        row["canonical_for_resource"] = alias_of is None and identity is not None
+        results.append(row)
+    if publish:
+        ledger = budget.to_dict()
+        ledger["collections"] = {
+            "REGISTERED": sum(1 for row in results if row["collection"] == "REGISTERED"),
+            "UNREGISTERED": sum(1 for row in results if row["collection"] == "UNREGISTERED"),
+        }
+        ledger["obligations_attempted"] = sum(1 for row in results if row["attempted"])
+        ledger["obligations_unattempted"] = sum(1 for row in results if not row["attempted"])
+        ledger["obligations_retained"] = sum(1 for row in results if row["retained"])
+        ledger["states"] = {
+            state: sum(1 for row in results if row["state"] == state)
+            for state in DRAIN_STATES
+            if any(row["state"] == state for row in results)
+        }
+        ledger["aliases_discharged_by_a_canonical_obligation"] = sum(
+            1 for row in results if row["alias_of"] is not None
         )
-        cleanup = handle.cleanup_evidence()
-        results.append(
+        ledger["distinct_resources"] = len(
+            {row["resource_identity"] for row in results if row["resource_identity"]}
+        )
+        ledger["order"] = [
             {
-                "entry_id": None,
-                "kind": _CLEANUP_KINDS.get(type(handle).__name__, CLEANUP_KIND_HELPER),
-                "helper_pid": int(cleanup.get("helper_pid") or 0),
-                "drain_attempts": int(cleanup.get("settlement_attempts") or 0),
-                "attempted": True,
-                "granted_ms": 0,
-                "deadline_exhausted": False,
-                "cleanup_complete": bool(cleanup.get("cleanup_complete")),
-                "cleanup_retryable": bool(cleanup.get("cleanup_retryable")),
-                "cleanup_retry_operation": cleanup.get("cleanup_retry_operation"),
-                "effect_cgroup_path": cleanup.get("effect_path"),
-                "registration_failure": cleanup.get("registration_failure"),
-                "retained": handle in _unregistered_cleanups(),
-                "removed": False,
-                "settlement": settlement,
+                "sequence": row["sequence"],
+                "collection": row["collection"],
+                "state": row["state"],
+                "resource_outstanding": row["resource_outstanding"],
+                "alias_of": row["alias_of"],
             }
-        )
+            for row in results
+        ]
+        ledger["ordering"] = "ascending process-wide cleanup obligation sequence"
+        _LAST_DRAIN_LEDGER = ledger
+        _CLEANUP_REGISTRY.publish_drain_ledger(ledger)
     return results
+
+
+def cleanup_drain_ledger() -> dict[str, Any]:
+    """The one ledger of the most recent whole drain (M2-B57).
+
+    It covers both collections: what the configured total was, how much of it was
+    spent, every grant, which obligations were attempted, which were left
+    unattempted because the shared budget was exhausted, and which remain
+    retained.
+    """
+
+    return dict(_LAST_DRAIN_LEDGER)
 
 
 def _roll_back_failed_start(
@@ -3965,7 +4621,30 @@ __all__ = [
     "SCHEMA_TRANSACTIONAL_EXPORT_RESERVATION",
     "SourceSnapshotIdentity",
     "SpawnedLauncher",
+    "CleanupReservationRefused",
+    "DRAIN_STATES",
+    "DRAIN_STATE_ATTEMPTED",
+    "DRAIN_STATE_DISCHARGED_BY_CANONICAL",
+    "DRAIN_STATE_RESOURCE_DISCHARGED",
+    "DRAIN_STATE_RETAINED_UNATTEMPTED",
+    "DRAIN_STATE_UNRESOLVED",
+    "DRAIN_UNATTEMPTED_ALIAS",
+    "DRAIN_UNATTEMPTED_BUDGET_EXHAUSTED",
+    "DRAIN_UNATTEMPTED_RESOURCE_DISCHARGED",
+    "DrainEvidenceContradiction",
+    "RESERVATION_CONSUMED",
+    "RESERVATION_REFUSED_ALREADY_CONSUMED",
+    "RESERVATION_REFUSED_ALREADY_RELEASED",
+    "RESERVATION_REFUSED_FOREIGN_PID",
+    "RESERVATION_REFUSED_FOREIGN_REGISTRY",
+    "RESERVATION_REFUSED_FOREIGN_TYPE",
+    "RESERVATION_REFUSED_NOT_IN_TABLE",
+    "RESERVATION_REFUSED_NOT_THE_SAME_OBJECT",
+    "RESERVATION_REFUSED_STALE_EPOCH",
+    "RESERVATION_RELEASED",
+    "RESERVATION_RESERVED",
     "apply_export",
+    "cleanup_drain_ledger",
     "cleanup_registry_evidence",
     "compute_change_set",
     "drain_incomplete_cleanups",

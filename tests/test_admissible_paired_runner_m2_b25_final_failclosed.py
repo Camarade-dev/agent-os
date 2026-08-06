@@ -148,6 +148,9 @@ def _cgroupfs_mkdir(self_path, *args, **kwargs):
             procs.write_text("", encoding="utf-8")
 
 
+_REAL_OS_RMDIR = os.rmdir
+
+
 def _cgroupfs_rmdir(test: unittest.TestCase) -> None:
     """Make an ordinary directory behave like a cgroup for ``rmdir``.
 
@@ -155,6 +158,11 @@ def _cgroupfs_rmdir(test: unittest.TestCase) -> None:
     only when the cgroup still has children.  A tmpfs fixture instead reports
     ``ENOTEMPTY`` for the control files this code itself wrote, which would test
     the fixture rather than the cleanup logic.
+
+    Both forms are modelled.  Since M2-B56 the exact removal is
+    ``os.rmdir(name, dir_fd=parent_fd)`` -- ``unlinkat(dirfd, name,
+    AT_REMOVEDIR)`` -- because the parent must be pinned by a descriptor rather
+    than re-resolved from a pathname.
     """
 
     def rmdir(self_path):
@@ -162,9 +170,24 @@ def _cgroupfs_rmdir(test: unittest.TestCase) -> None:
             raise OSError(errno.ENOTEMPTY, "Directory not empty")
         shutil.rmtree(self_path)
 
-    patcher = mock.patch.object(Path, "rmdir", rmdir)
-    patcher.start()
-    test.addCleanup(patcher.stop)
+    def os_rmdir(path, *, dir_fd=None):
+        if dir_fd is None:
+            return _REAL_OS_RMDIR(path)
+        target = Path(os.readlink(f"/proc/self/fd/{dir_fd}")) / str(path)
+        if not target.is_dir():
+            return _REAL_OS_RMDIR(path, dir_fd=dir_fd)
+        if any(child.is_dir() for child in target.iterdir()):
+            raise OSError(errno.ENOTEMPTY, "Directory not empty", str(target))
+        for child in target.iterdir():
+            child.unlink()
+        return _REAL_OS_RMDIR(path, dir_fd=dir_fd)
+
+    for patcher in (
+        mock.patch.object(Path, "rmdir", rmdir),
+        mock.patch.object(os, "rmdir", os_rmdir),
+    ):
+        patcher.start()
+        test.addCleanup(patcher.stop)
 
 
 class _FakeParent:
@@ -1070,9 +1093,11 @@ class ValidationReportCountTests(unittest.TestCase):
             + counts["m2_subreaper_deadline_closure_module"]
             + counts["m2_ownership_debt_reap_closure_module"]
             # ...and M2-B48 added the process-owner/cleanup-propagation module,
-            # and M2-B50 the cgroup-identity/reap/registry-serialization module.
+            # M2-B50 the cgroup-identity/reap/registry-serialization module, and
+            # M2-B56 the exact-removal/global-drain/reservation-provenance module.
             + counts["m2_process_owner_cleanup_propagation_closure_module"]
-            + counts["m2_cgroup_identity_reap_registry_serialization_closure_module"],
+            + counts["m2_cgroup_identity_reap_registry_serialization_closure_module"]
+            + counts["m2_exact_removal_global_drain_reservation_provenance_closure_module"],
             "the legacy and new modules must account for the whole discovery total",
         )
 

@@ -1438,17 +1438,41 @@ def _cgroupfs_mkdir(self_path, *args, **kwargs):
             kill.write_text("0\n", encoding="utf-8")
 
 
+_REAL_OS_RMDIR = os.rmdir
+
+
 def _cgroupfs_rmdir(test: unittest.TestCase) -> None:
-    """Make an ordinary directory behave like a cgroup for ``rmdir``."""
+    """Make an ordinary directory behave like a cgroup for ``rmdir``.
+
+    Both forms.  Since M2-B56 the exact removal is
+    ``os.rmdir(name, dir_fd=parent_fd)``, so the descriptor-relative form is
+    modelled alongside the pathname one; without it these tests would be about
+    the fixture's tmpfs control files rather than about the removal logic.
+    """
 
     def rmdir(self_path):
         if any(child.is_dir() for child in self_path.iterdir()):
             raise OSError(18, "Directory not empty")
         shutil.rmtree(self_path)
 
-    patcher = mock.patch.object(Path, "rmdir", rmdir)
-    patcher.start()
-    test.addCleanup(patcher.stop)
+    def os_rmdir(path, *, dir_fd=None):
+        if dir_fd is None:
+            return _REAL_OS_RMDIR(path)
+        target = Path(os.readlink(f"/proc/self/fd/{dir_fd}")) / str(path)
+        if not target.is_dir():
+            return _REAL_OS_RMDIR(path, dir_fd=dir_fd)
+        if any(child.is_dir() for child in target.iterdir()):
+            raise OSError(18, "Directory not empty", str(target))
+        for child in target.iterdir():
+            child.unlink()
+        return _REAL_OS_RMDIR(path, dir_fd=dir_fd)
+
+    for patcher in (
+        mock.patch.object(Path, "rmdir", rmdir),
+        mock.patch.object(os, "rmdir", os_rmdir),
+    ):
+        patcher.start()
+        test.addCleanup(patcher.stop)
 
 
 class _FakeEffectParent:
@@ -2161,6 +2185,9 @@ class ClosureArtifactCoherenceTests(unittest.TestCase):
             ),
             "tests.test_admissible_paired_runner_m2_cgroup_identity_reap_registry_serialization_closure": (
                 "m2_cgroup_identity_reap_registry_serialization_closure_module"
+            ),
+            "tests.test_admissible_paired_runner_m2_exact_removal_global_drain_reservation_provenance_closure": (
+                "m2_exact_removal_global_drain_reservation_provenance_closure_module"
             ),
         }
         for module, field in modules.items():
