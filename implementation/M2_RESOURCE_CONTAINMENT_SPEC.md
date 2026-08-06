@@ -944,3 +944,135 @@ mutates neither the registry's valid state nor the foreign token, and appends a
 classified refusal to the durable evidence. `_release_reservation` performs the
 same proof, so a foreign or stale token can neither release capacity nor be
 mutated by a registry that never issued it.
+
+## M2-B59 — an alias is discharged by a canonical result, never by a relationship
+
+Canonicalisation by exact resource identity decides **who settles a shared
+resource**. It does not, by itself, decide that the resource was settled.
+
+The drain identified the alias relationship before the canonical obligation ran,
+and the row classifier then prioritised `alias_of` over everything the canonical
+obligation actually did. Two obligations naming one exact owned cgroup, with the
+canonical settlement left unresolved, therefore produced:
+
+```
+canonical: attempted=true  state=UNRESOLVED_AND_RETAINED                              outstanding=true
+alias:     attempted=false state=DISCHARGED_BY_THE_CANONICAL_OBLIGATION_FOR_THE_SAME_RESOURCE  outstanding=true
+```
+
+— a cleanup claim over a resource that was still standing.
+
+Each exact-resource identity group is now an explicit state machine:
+
+1. **select** one canonical obligation deterministically — the first in the one
+   process-wide ascending obligation sequence that proves an exact identity;
+2. **execute, observe or claim** it;
+3. **publish** exactly one canonical result;
+4. **classify** every alias of that identity from that exact published result.
+
+A `_CanonicalResult` carries the canonical obligation identity, the exact
+resource identity, attempted status, the grant in milliseconds, the settlement
+outcome, `resource_outstanding` after settlement, retention, the classified
+terminal state, and a monotonic evidence publication generation.
+
+`DISCHARGED_BY_CANONICAL` is permitted only when the canonical result belongs to
+the same exact resource identity, publication is complete, the canonical
+`resource_outstanding` is false, the canonical state is one of the two that
+positively prove discharge (`ATTEMPTED_UNDER_A_GRANT_FROM_THE_SHARED_BUDGET` or
+`RESOURCE_ALREADY_DISCHARGED_BOOKKEEPING_OUTSTANDING`), and the alias's own
+evidence independently agrees that its resource is no longer outstanding.
+
+A canonical obligation that remains unresolved, is retained, receives no grant
+after budget exhaustion, raises before publication, or is concurrently claimed by
+another drain with no visible terminal result publishes **nothing**. Its aliases
+are then reported
+`RETAINED_BECAUSE_THE_CANONICAL_OBLIGATION_FOR_THE_SAME_RESOURCE_DID_NOT_DISCHARGE_IT`
+with `unattempted_reason=THE_CANONICAL_OBLIGATION_FOR_THIS_RESOURCE_DID_NOT_DISCHARGE_IT`
+— truthfully retained, and still spending no second settlement grant.
+
+Terminal canonical results are published to a PID-bound, process-wide table keyed
+by exact resource identity, so a drain whose canonical obligation is owned by
+another drain may discharge an alias only from the terminal result that other
+drain actually published, for that exact identity.
+
+The row guard refuses, where the row is built, every contradictory shape:
+`DISCHARGED_BY_CANONICAL` over an outstanding resource; a discharge naming a
+canonical result that is missing, unpublished, for a different exact identity,
+itself outstanding, or non-terminal; and an alias waiting on its canonical
+obligation that nevertheless spent a grant. The refusal is
+`DrainEvidenceContradiction`.
+
+The ledger separates `aliases_discharged_by_a_canonical_obligation` from
+`aliases_retained_pending_canonical` and `aliases_identified`, and publishes
+`canonical_results` alongside per-row `canonical_proved_discharge`.
+
+## M2-B60 — one combined capacity, enforced by every insertion
+
+Held capacity is, and has always been, `len(entries) + len(live_reservations)`.
+`reserve()`, `saturated()`, `require_capacity()` and the saturation detail all
+enforce and report that. A reservation-less `record()` checked `len(entries)`
+alone, so at capacity one a single live reservation plus one direct insertion
+produced `reserved=1 retained=1 held=2 capacity=1`.
+
+Inside the same registry critical section, and before the counter, the
+generation, the entry, the handle or the token is touched:
+
+```python
+if reservation is None and self._held_locked() >= CLEANUP_REGISTRY_CAPACITY:
+    raise CleanupRegistrySaturated(...)
+```
+
+No check is performed outside the lock, no capacity is reserved after insertion,
+and the atomic reservation-conversion path of M2-B52/M2-B58 is unchanged. A
+refusal mutates nothing — not the entries, not the reservation table, not the
+sequence accounting, not the handle, not the token — and the classified refusal
+record itself consumes no registry capacity.
+
+The invariant is therefore true at every externally visible state:
+
+```
+len(entries) + len(live_reservations) <= CLEANUP_REGISTRY_CAPACITY
+```
+
+## M2-M62 — the declared mutation TCB is not broader than the code
+
+`CGROUP_MUTATION_TCB` declares every controller-owned child creation, rename,
+replacement, removal and final removal under a delegated parent serialized by one
+mutation boundary per parent identity. Effect creation, manager-leaf creation and
+rollback, the final removal, and the probe's own removal all entered it. Probe
+creation ran `probe.mkdir(mode=0o700)` outside it, so the declaration claimed
+more than the code delivered.
+
+The preferred resolution is taken: the declaration is kept and the code is made
+to support it. `_create_probe_inside_boundary()` resolves the parent's directory
+identity, enters `cgroup_mutation_boundary(parent_identity)`, and holds it across
+
+* re-verification that the parent is still the object the domain was keyed on,
+* the collision check,
+* the `mkdir`,
+* the created-object identity capture,
+* and the rollback of a creation whose identity cannot be read,
+
+before releasing. A parent whose identity cannot be read yields no boundary, and
+the probe is refused with `EFFECT_CREATE_FAILED` rather than created outside the
+declared trusted computing base.
+
+**No lock-order inversion exists.** The boundary is one re-entrant lock per
+parent identity. This path acquires exactly one domain and nests no other
+acquisition inside it; the manager-leaf boundary is entered and released inside
+`initialize_cgroup_topology()` before probe creation begins; probe removal
+re-enters the same domain on the same thread re-entrantly. No two domains are
+ever held at once by any of these paths.
+
+**No same-name cross-class collision is possible.** The three controller-owned
+child namespaces — `admissible-manager`, `admissible-effect-` and
+`admissible-probe-` — are disjoint by construction and are declared together as
+`CONTROLLER_OWNED_CHILD_PREFIXES`, so a probe creation and an effect creation
+serialized by one boundary can never contend for one name.
+
+`CgroupDelegation.probe_creation` records the mutation domain the creation held,
+whether it was held, and the identity of the object created, so a reader checks
+the declaration against what the creation actually did. Nothing here claims
+atomicity against a hostile host: a mutation performed by a process outside this
+controller's trusted computing base is not excluded by a userspace lock, and the
+declaration says so.

@@ -1097,7 +1097,10 @@ class ValidationReportCountTests(unittest.TestCase):
             # M2-B56 the exact-removal/global-drain/reservation-provenance module.
             + counts["m2_process_owner_cleanup_propagation_closure_module"]
             + counts["m2_cgroup_identity_reap_registry_serialization_closure_module"]
-            + counts["m2_exact_removal_global_drain_reservation_provenance_closure_module"],
+            + counts["m2_exact_removal_global_drain_reservation_provenance_closure_module"]
+            # ...and M2-B59 the alias-truth / combined-capacity / artifact-
+            # coherence / mutation-TCB closure module.
+            + counts["m2_alias_capacity_artifact_tcb_closure_module"],
             "the legacy and new modules must account for the whole discovery total",
         )
 

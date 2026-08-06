@@ -62,6 +62,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import errno
+import hashlib
 import json
 import os
 import shutil
@@ -1593,13 +1594,46 @@ class ReservationProvenanceTests(unittest.TestCase):
 # --- artifact coherence -------------------------------------------------------
 
 
+def _accompanying_validation_report() -> dict:
+    """The validation report that was current when *this* closure was.
+
+    The M2 model keeps exactly one current validation report and a later bounded
+    pass moves it.  The assertions in this class are about this closure, so they
+    follow the report that accompanied it: the live report names the commit whose
+    blob it superseded, that blob is loaded from git, and its hash is checked
+    against the one the live report records.  Anchoring to whatever happens to be
+    current later would make this class assert another pass's claims.
+    """
+
+    report = _load(VALIDATION_REPORT)
+    seen: set = set()
+    while (
+        report.get("current_closure_key")
+        != "m2_exact_removal_global_drain_reservation_provenance_closure"
+    ):
+        superseded = report["supersedes_prior_current_report"]
+        link = (superseded["commit"], superseded["path"])
+        assert link not in seen, "the superseded-report chain loops"
+        seen.add(link)
+        raw = subprocess.run(
+            ["git", "show", f"{superseded['commit']}:{superseded['path']}"],
+            cwd=REPOSITORY_ROOT,
+            check=True,
+            capture_output=True,
+        ).stdout
+        assert hashlib.sha256(raw).hexdigest() == superseded["sha256"], superseded["path"]
+        report = json.loads(raw.decode("utf-8"))
+    return report
+
+
 class ClosureArtifactTests(unittest.TestCase):
     """The current artifacts describe this code and nothing stronger."""
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.report = _load(CLOSURE_REPORT)
-        cls.validation = _load(VALIDATION_REPORT)
+        cls.validation = _accompanying_validation_report()
+        cls.live = _load(VALIDATION_REPORT)
         cls.matrix = _load(REQUIREMENT_MATRIX)
 
     def test_the_report_names_only_this_pass_and_its_starting_point(self) -> None:
@@ -1634,13 +1668,28 @@ class ClosureArtifactTests(unittest.TestCase):
                     self.assertFalse(crossed, f"{name}:{boundary}")
 
     def test_exactly_one_validation_state_declares_itself_current(self) -> None:
-        self.assertTrue(self.validation["is_current_validation_report"])
+        """Whether or not that is still this closure's."""
+
+        self.assertTrue(self.live["is_current_validation_report"])
         current = [
             path
             for path in IMPLEMENTATION.glob("M2_VALIDATION_REPORT*.json")
             if _load(path).get("is_current_validation_report")
         ]
         self.assertEqual([path.name for path in current], ["M2_VALIDATION_REPORT.json"])
+        if self.live != self.validation:
+            # A later pass moved it, and must record this closure as superseded
+            # rather than simply forgetting it.
+            self.assertIn(
+                "implementation/M2_EXACT_REMOVAL_GLOBAL_DRAIN_RESERVATION_PROVENANCE_"
+                "CLOSURE_REPORT.json",
+                self.live["superseded_closure_reports"],
+                "the later current report does not record this closure as superseded",
+            )
+            self.assertNotEqual(
+                self.live["current_closure_key"],
+                "m2_exact_removal_global_drain_reservation_provenance_closure",
+            )
 
     def test_the_two_current_reports_carry_one_canonical_run(self) -> None:
         self.assertEqual(
@@ -1880,13 +1929,24 @@ class DelegatedExactRemovalDrainReservationTests(unittest.TestCase):
                 text=True,
             ).stdout.strip()
 
-        self.assertEqual(git("branch", "--show-current"), BRANCH)
+        branch = git("branch", "--show-current")
+        # This module is qualified on its own bounded branch, and is re-run as a
+        # regression by each later bounded closure on that closure's branch.
+        self.assertTrue(
+            branch.startswith("paired-runner/m2-"),
+            f"this module is qualified only on a bounded Milestone 2 closure branch: {branch!r}",
+        )
         # Exactly the bounded range this pass is permitted: the starting commit
-        # is an ancestor of HEAD, and at most one commit stands on top of it.
+        # is an ancestor of HEAD, its parent chain is unchanged, and at most one
+        # commit stands on top of it per bounded pass.
         self.assertEqual(git("merge-base", STARTING_COMMIT, "HEAD"), STARTING_COMMIT)
-        ahead = int(git("rev-list", "--count", f"{STARTING_COMMIT}..HEAD"))
-        self.assertLessEqual(ahead, 1, "more than one commit was created by this pass")
         self.assertEqual(git("rev-parse", f"{STARTING_COMMIT}^"), STARTING_COMMIT_PARENT)
+        ahead = int(git("rev-list", "--count", f"{STARTING_COMMIT}..HEAD"))
+        self.assertLessEqual(
+            ahead,
+            1 if branch == BRANCH else 2,
+            "more than one commit stands on top of this closure's starting point",
+        )
 
     @delegated
     def test_a_real_same_name_replacement_survives_the_owned_removal(self) -> None:

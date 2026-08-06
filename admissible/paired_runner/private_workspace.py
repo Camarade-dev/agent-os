@@ -633,8 +633,14 @@ _ACTIVE_DRAIN = threading.local()
 #: Why an obligation was not attempted.  A drain that ran out of budget says so
 #: rather than reporting an attempt that did not happen.
 DRAIN_UNATTEMPTED_BUDGET_EXHAUSTED = "SHARED_BUDGET_EXHAUSTED"
-#: An alias: another obligation in the same drain owns the same exact resource.
+#: An alias: another obligation in the same drain owns the same exact resource,
+#: and its published canonical result positively proves the resource is gone.
 DRAIN_UNATTEMPTED_ALIAS = "THE_CANONICAL_OBLIGATION_FOR_THIS_RESOURCE_WAS_SETTLED"
+#: M2-B59.  An alias whose canonical obligation did *not* discharge the resource.
+#: It takes no second grant and it is not called discharged either.
+DRAIN_UNATTEMPTED_CANONICAL_UNRESOLVED = (
+    "THE_CANONICAL_OBLIGATION_FOR_THIS_RESOURCE_DID_NOT_DISCHARGE_IT"
+)
 #: The resource is gone; only bookkeeping remains, and bookkeeping is not a
 #: cleanup primitive and is never run on a spent budget.
 DRAIN_UNATTEMPTED_RESOURCE_DISCHARGED = "THE_RESOURCE_IS_ALREADY_DISCHARGED"
@@ -658,8 +664,16 @@ DRAIN_UNATTEMPTED_RESOURCE_DISCHARGED = "THE_RESOURCE_IS_ALREADY_DISCHARGED"
 DRAIN_STATE_ATTEMPTED = "ATTEMPTED_UNDER_A_GRANT_FROM_THE_SHARED_BUDGET"
 #: Genuinely untouched: the resource is still outstanding and there was no time.
 DRAIN_STATE_RETAINED_UNATTEMPTED = "RETAINED_UNTOUCHED_BECAUSE_THE_SHARED_BUDGET_WAS_EXHAUSTED"
-#: The exact same underlying resource was settled by another obligation here.
+#: The exact same underlying resource was settled by another obligation here,
+#: and that obligation's published result proves it.
 DRAIN_STATE_DISCHARGED_BY_CANONICAL = "DISCHARGED_BY_THE_CANONICAL_OBLIGATION_FOR_THE_SAME_RESOURCE"
+#: M2-B59.  An alias whose canonical obligation is unresolved, retained,
+#: unattempted, claimed elsewhere without a terminal result, or which threw
+#: before publishing one.  The resource is still outstanding and nothing here
+#: claims otherwise; a second settlement grant is still not spent on it.
+DRAIN_STATE_RETAINED_PENDING_CANONICAL = (
+    "RETAINED_BECAUSE_THE_CANONICAL_OBLIGATION_FOR_THE_SAME_RESOURCE_DID_NOT_DISCHARGE_IT"
+)
 #: The resource is discharged on its own evidence; only bookkeeping is owed.
 DRAIN_STATE_RESOURCE_DISCHARGED = "RESOURCE_ALREADY_DISCHARGED_BOOKKEEPING_OUTSTANDING"
 #: Attempted or reached, and something real is still owed.
@@ -669,8 +683,16 @@ DRAIN_STATES = (
     DRAIN_STATE_ATTEMPTED,
     DRAIN_STATE_RETAINED_UNATTEMPTED,
     DRAIN_STATE_DISCHARGED_BY_CANONICAL,
+    DRAIN_STATE_RETAINED_PENDING_CANONICAL,
     DRAIN_STATE_RESOURCE_DISCHARGED,
     DRAIN_STATE_UNRESOLVED,
+)
+
+#: The states that positively prove the canonical obligation's own resource is
+#: no longer outstanding.  Only these may discharge an alias (M2-B59).
+DRAIN_STATES_PROVING_DISCHARGE = (
+    DRAIN_STATE_ATTEMPTED,
+    DRAIN_STATE_RESOURCE_DISCHARGED,
 )
 
 
@@ -679,6 +701,185 @@ class DrainEvidenceContradiction(PrivateWorkspaceError):
 
     def __init__(self, detail: str = "") -> None:
         super().__init__("drain_evidence_contradiction", detail)
+
+
+# --- M2-B59: an alias is discharged by a *result*, never by a relationship ----
+#
+# The drain identified the alias relationship before the canonical obligation
+# ran, and the classifier then prioritised ``alias_of`` over everything the
+# canonical obligation actually did.  The independently reproduced consequence
+# was a false cleanup claim over a resource that was still standing:
+#
+#     canonical: attempted=true  state=UNRESOLVED_AND_RETAINED  outstanding=true
+#     alias:     attempted=false state=DISCHARGED_BY_CANONICAL  outstanding=true
+#
+# Sharing a resource with an obligation that failed to settle it is not a
+# discharge.  Each exact-resource identity group is now an explicit state
+# machine: one canonical obligation is selected deterministically, it is
+# executed, observed or claimed, exactly one canonical *result* is published,
+# and every alias is classified from that exact published result -- or from
+# nothing, in which case the alias is truthfully retained.
+
+
+class _CanonicalResult:
+    """The one published outcome of one exact resource's canonical obligation.
+
+    Publication is a separate, explicit step from selection.  A canonical
+    obligation that is selected but throws, is claimed by another drain, or
+    never reaches a terminal state leaves this object *unpublished*, and an
+    unpublished result discharges nothing.
+    """
+
+    __slots__ = (
+        "attempted",
+        "generation",
+        "grant_ms",
+        "label",
+        "published",
+        "resource_identity",
+        "resource_outstanding",
+        "retained",
+        "settlement_complete",
+        "state",
+        "unresolved_reason",
+    )
+
+    def __init__(self, *, resource_identity: str, label: str, generation: int) -> None:
+        self.resource_identity = resource_identity
+        self.label = label
+        self.generation = generation
+        self.published = False
+        self.attempted = False
+        self.grant_ms = 0
+        self.settlement_complete = False
+        self.resource_outstanding = True
+        self.retained = True
+        self.state: str | None = None
+        self.unresolved_reason: str | None = None
+
+    def publish(self, row: dict[str, Any]) -> None:
+        """Adopt the canonical obligation's own finished row as the result."""
+
+        self.attempted = bool(row["attempted"])
+        self.grant_ms = int(row["granted_ms"])
+        self.settlement_complete = bool(row["cleanup_complete"])
+        self.resource_outstanding = bool(row["resource_outstanding"])
+        self.retained = bool(row["retained"])
+        self.state = row["state"]
+        self.published = True
+
+    def unresolved(self, reason: str) -> None:
+        """Record why no result exists.  Nothing is published (M2-B59)."""
+
+        self.published = False
+        self.unresolved_reason = reason
+
+    def proves_discharge_of(self, resource_identity: str) -> bool:
+        """Whether this result positively proves *that exact* resource is gone."""
+
+        if not self.published:
+            return False
+        if self.resource_identity != resource_identity:
+            return False
+        if self.resource_outstanding:
+            return False
+        if self.state not in DRAIN_STATES_PROVING_DISCHARGE:
+            return False
+        return True
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "canonical_label": self.label,
+            "resource_identity": self.resource_identity,
+            "publication_generation": self.generation,
+            "published": self.published,
+            "attempted": self.attempted,
+            "granted_ms": self.grant_ms,
+            "settlement_complete": self.settlement_complete,
+            "resource_outstanding": self.resource_outstanding,
+            "retained": self.retained,
+            "state": self.state,
+            "unresolved_reason": self.unresolved_reason,
+            "proves_discharge": self.proves_discharge_of(self.resource_identity),
+        }
+
+
+#: Why a canonical obligation published no result.  Each is a distinct, real
+#: way for the state machine to end without proof, and none of them discharges.
+CANONICAL_UNPUBLISHED_THREW = "THE_CANONICAL_OBLIGATION_RAISED_BEFORE_PUBLICATION"
+CANONICAL_UNPUBLISHED_CLAIMED = "THE_CANONICAL_OBLIGATION_IS_CLAIMED_BY_ANOTHER_DRAIN"
+CANONICAL_UNPUBLISHED_NOT_REACHED = "THE_CANONICAL_OBLIGATION_WAS_NOT_REACHED"
+
+#: Every terminal canonical result this process has published, by exact resource
+#: identity, with one monotonic publication generation.  A drain whose own
+#: canonical obligation was claimed by another drain reads the terminal result
+#: that drain published here; without one, nothing is discharged.  PID-bound
+#: like every other process-wide fact: a forked child inherits this memory and
+#: owns none of the resources the identities were read from.
+_CANONICAL_RESULTS: dict[str, _CanonicalResult] = {}
+_CANONICAL_RESULT_LOCK = threading.Lock()
+_CANONICAL_RESULT_GENERATION = 0
+_CANONICAL_RESULT_PID = os.getpid()
+
+#: How many terminal canonical results this process retains.  The table is a
+#: convenience for a drain whose canonical obligation another drain owns, not a
+#: ledger, so it is bounded for the same reason the cleanup registry is: an
+#: unbounded process-wide dictionary turns a long-lived controller into a slow
+#: memory leak.  Eviction is fail-closed by construction -- an evicted result can
+#: only make a later alias *less* likely to be called discharged, never more --
+#: and the oldest publication is the one that goes.
+CANONICAL_RESULT_RETENTION = CLEANUP_REGISTRY_CAPACITY * 4
+
+
+def _reset_canonical_results_locked() -> None:
+    global _CANONICAL_RESULT_GENERATION, _CANONICAL_RESULT_PID
+    if _CANONICAL_RESULT_PID != os.getpid():
+        _CANONICAL_RESULT_PID = os.getpid()
+        _CANONICAL_RESULT_GENERATION = 0
+        _CANONICAL_RESULTS.clear()
+
+
+def _next_canonical_generation() -> int:
+    global _CANONICAL_RESULT_GENERATION
+    with _CANONICAL_RESULT_LOCK:
+        _reset_canonical_results_locked()
+        _CANONICAL_RESULT_GENERATION += 1
+        return _CANONICAL_RESULT_GENERATION
+
+
+def _publish_canonical_result(result: _CanonicalResult) -> None:
+    """Make a terminal canonical result readable by every other drain."""
+
+    if not result.published:  # pragma: no cover - publication is the caller's gate
+        return
+    with _CANONICAL_RESULT_LOCK:
+        _reset_canonical_results_locked()
+        existing = _CANONICAL_RESULTS.get(result.resource_identity)
+        if existing is not None and existing.generation > result.generation:
+            return
+        _CANONICAL_RESULTS[result.resource_identity] = result
+        while len(_CANONICAL_RESULTS) > CANONICAL_RESULT_RETENTION:
+            oldest = min(_CANONICAL_RESULTS, key=lambda key: _CANONICAL_RESULTS[key].generation)
+            del _CANONICAL_RESULTS[oldest]
+
+
+def _published_canonical_result(resource_identity: str) -> _CanonicalResult | None:
+    """A published result that positively proves *that exact* resource is gone."""
+
+    with _CANONICAL_RESULT_LOCK:
+        _reset_canonical_results_locked()
+        result = _CANONICAL_RESULTS.get(resource_identity)
+    if result is None or not result.proves_discharge_of(resource_identity):
+        return None
+    return result
+
+
+def published_canonical_results() -> dict[str, dict[str, Any]]:
+    """Every terminal canonical result this process has published (M2-B59)."""
+
+    with _CANONICAL_RESULT_LOCK:
+        _reset_canonical_results_locked()
+        return {identity: row.to_dict() for identity, row in _CANONICAL_RESULTS.items()}
 
 
 def _resource_outstanding(cleanup: dict[str, Any]) -> bool:
@@ -701,17 +902,35 @@ def _classify_drain_row(
     attempted: bool,
     cleanup: dict[str, Any],
     alias_of: str | None,
+    canonical_result: _CanonicalResult | None = None,
+    resource_identity: str | None = None,
 ) -> tuple[str, str | None]:
     """The one truthful state of this obligation in this drain, and its reason.
 
     ``RETAINED_UNTOUCHED_BECAUSE_THE_SHARED_BUDGET_WAS_EXHAUSTED`` is reserved
     for an obligation whose resource really is still outstanding.  An obligation
     whose resource is gone is never described that way, whatever the budget did.
+
+    M2-B59.  An alias is classified from the *published canonical result* for its
+    own exact resource identity, never from the alias relationship.  Without a
+    result that positively proves the exact shared resource is no longer
+    outstanding, the alias is retained and says which canonical obligation it is
+    waiting on -- it is not called discharged, and it still spends no grant.
     """
 
     outstanding = _resource_outstanding(cleanup)
     if alias_of is not None:
-        return DRAIN_STATE_DISCHARGED_BY_CANONICAL, DRAIN_UNATTEMPTED_ALIAS
+        if (
+            resource_identity is not None
+            and canonical_result is not None
+            and canonical_result.proves_discharge_of(resource_identity)
+            and not outstanding
+        ):
+            return DRAIN_STATE_DISCHARGED_BY_CANONICAL, DRAIN_UNATTEMPTED_ALIAS
+        return (
+            DRAIN_STATE_RETAINED_PENDING_CANONICAL,
+            DRAIN_UNATTEMPTED_CANONICAL_UNRESOLVED,
+        )
     if attempted:
         if bool(cleanup.get("cleanup_complete")):
             return DRAIN_STATE_ATTEMPTED, None
@@ -721,12 +940,21 @@ def _classify_drain_row(
     return DRAIN_STATE_RETAINED_UNATTEMPTED, DRAIN_UNATTEMPTED_BUDGET_EXHAUSTED
 
 
-def _guard_drain_row(row: dict[str, Any]) -> dict[str, Any]:
+def _guard_drain_row(
+    row: dict[str, Any], *, canonical_result: _CanonicalResult | None = None
+) -> dict[str, Any]:
     """Refuse to emit a row whose own fields contradict each other.
 
-    The invariant this closure was refused on, enforced where the row is built
-    rather than only where it is read: an obligation may not be reported as
+    The invariant the previous closure was refused on, enforced where the row is
+    built rather than only where it is read: an obligation may not be reported as
     untouched-for-lack-of-budget unless its resource really is still outstanding.
+
+    M2-B59 adds the discharge shapes.  ``DISCHARGED_BY_CANONICAL`` over a
+    resource that is still outstanding is the exact false cleanup claim the
+    independent audit reproduced, and it is refused here rather than emitted and
+    contradicted downstream.  So is a discharge naming a canonical result that is
+    missing, unpublished, for a different exact resource identity, or which
+    itself reports the resource as outstanding.
     """
 
     state = row["state"]
@@ -739,6 +967,34 @@ def _guard_drain_row(row: dict[str, Any]) -> dict[str, Any]:
         )
     if state == DRAIN_STATE_ATTEMPTED and not row["attempted"]:  # pragma: no cover - defensive
         raise DrainEvidenceContradiction("an unattempted obligation was reported as attempted")
+    if state == DRAIN_STATE_DISCHARGED_BY_CANONICAL:
+        identity = row.get("resource_identity")
+        if row["resource_outstanding"]:
+            raise DrainEvidenceContradiction(
+                f"{row.get('effect_cgroup_path')!r} was reported discharged by the canonical "
+                f"obligation {row.get('alias_of')!r} while its own resource is still outstanding"
+            )
+        if canonical_result is None or not canonical_result.published:
+            raise DrainEvidenceContradiction(
+                f"{row.get('effect_cgroup_path')!r} was reported discharged by a canonical "
+                "obligation that published no result"
+            )
+        if identity is None or not canonical_result.proves_discharge_of(identity):
+            raise DrainEvidenceContradiction(
+                f"{row.get('effect_cgroup_path')!r} was reported discharged by the canonical "
+                f"result of {canonical_result.resource_identity!r}, which does not prove the "
+                f"discharge of {identity!r} (state {canonical_result.state!r}, outstanding "
+                f"{canonical_result.resource_outstanding!r})"
+            )
+    if state == DRAIN_STATE_RETAINED_PENDING_CANONICAL:
+        if row["alias_of"] is None:  # pragma: no cover - defensive
+            raise DrainEvidenceContradiction(
+                "an obligation with no canonical obligation was reported as waiting on one"
+            )
+        if row["attempted"] or row["granted_ms"]:  # pragma: no cover - defensive
+            raise DrainEvidenceContradiction(
+                "an alias waiting on its canonical obligation spent a second settlement grant"
+            )
     return row
 
 
@@ -1189,6 +1445,13 @@ class _IncompleteCleanupRegistry:
         capacity in its own right, so a direct call can never take the registry
         past its bound.
 
+        M2-B60.  "Inside the capacity" is the *combined* count -- retained
+        entries plus live reservations -- because that is the quantity the bound
+        is stated over and the quantity every other gate here enforces.  A
+        reservation-less insertion that only counted entries could take the
+        registry past its bound whenever any capacity was committed to an
+        outstanding reservation.
+
         M2-B58.  The reservation is proved to be *this* registry's live,
         outstanding, unspent capability before it grants anything.  A token that
         cannot be proved is refused before the insertion, is not mutated, and
@@ -1229,7 +1492,18 @@ class _IncompleteCleanupRegistry:
                         ),
                     )
                 reserved = True
-            if not reserved and len(self._entries) >= CLEANUP_REGISTRY_CAPACITY:
+            if reservation is None and self._held_locked() >= CLEANUP_REGISTRY_CAPACITY:
+                # M2-B60.  Held capacity is entries *and* live reservations --
+                # that is what ``reserve()``, ``saturated()`` and
+                # ``require_capacity()`` have always meant by it -- so a
+                # reservation-less insertion is bounded by the same combined
+                # count.  Checking ``len(self._entries)`` alone let a direct
+                # ``record()`` walk past a registry whose whole capacity was
+                # already committed to outstanding reservations: at capacity one,
+                # one reservation and one direct insertion produced held=2.  The
+                # refusal happens here, inside the one critical section and
+                # before the counter, the generation, the entry, the handle or
+                # the token is touched, so nothing is mutated by a refusal.
                 raise CleanupRegistrySaturated(self._saturation_detail())
             kind = _CLEANUP_KINDS.get(type(handle).__name__, CLEANUP_KIND_HELPER)
             self._counter += 1
@@ -1340,6 +1614,8 @@ class _IncompleteCleanupRegistry:
         budget: CleanupBudget,
         token: int,
         alias_of: str | None = None,
+        canonical_result: _CanonicalResult | None = None,
+        resource_identity: str | None = None,
     ) -> dict[str, Any] | None:
         """Settle one claimed entry out of the caller's shared budget.
 
@@ -1355,6 +1631,10 @@ class _IncompleteCleanupRegistry:
         *grant itself* is the gate: an obligation that receives no time runs no
         cleanup primitive at all, rather than running one against an instant that
         has already passed.
+
+        M2-B59.  ``canonical_result`` is the published outcome of the canonical
+        obligation for ``resource_identity``.  It is what an alias row is
+        classified from; the alias relationship on its own discharges nothing.
         """
 
         with self._lock:
@@ -1374,7 +1654,11 @@ class _IncompleteCleanupRegistry:
         with self._lock:
             still_registered = self._entries.get(entry.entry_id) is entry
         state, reason = _classify_drain_row(
-            attempted=attempted, cleanup=cleanup, alias_of=alias_of
+            attempted=attempted,
+            cleanup=cleanup,
+            alias_of=alias_of,
+            canonical_result=canonical_result,
+            resource_identity=resource_identity,
         )
         return _guard_drain_row(
             {
@@ -1388,6 +1672,7 @@ class _IncompleteCleanupRegistry:
                 "state": state,
                 "unattempted_reason": reason,
                 "alias_of": alias_of,
+                "canonical_result": None if canonical_result is None else canonical_result.to_dict(),
                 "resource_outstanding": _resource_outstanding(cleanup),
                 "outstanding_work": cleanup.get("outstanding_work"),
                 "resource_identity": cleanup.get("owned_identity"),
@@ -1399,7 +1684,8 @@ class _IncompleteCleanupRegistry:
                 "effect_cgroup_path": cleanup.get("effect_path"),
                 "retained": still_registered,
                 "removed": not still_registered,
-            }
+            },
+            canonical_result=canonical_result,
         )
 
     def drain(
@@ -1541,7 +1827,13 @@ def _grant_or_observe(
 
 
 def _drain_unregistered_obligation(
-    handle: Any, *, budget: CleanupBudget, sequence: int, alias_of: str | None = None
+    handle: Any,
+    *,
+    budget: CleanupBudget,
+    sequence: int,
+    alias_of: str | None = None,
+    canonical_result: _CanonicalResult | None = None,
+    resource_identity: str | None = None,
 ) -> dict[str, Any]:
     """Settle one registrar-refused obligation out of the shared budget.
 
@@ -1560,7 +1852,13 @@ def _drain_unregistered_obligation(
         settlement = handle.settle_cleanup(deadline=granted)
     cleanup = handle.cleanup_evidence()
     budget.note(stage, completed=bool(cleanup.get("cleanup_complete")))
-    state, reason = _classify_drain_row(attempted=attempted, cleanup=cleanup, alias_of=alias_of)
+    state, reason = _classify_drain_row(
+        attempted=attempted,
+        cleanup=cleanup,
+        alias_of=alias_of,
+        canonical_result=canonical_result,
+        resource_identity=resource_identity,
+    )
     return _guard_drain_row(
         {
             "entry_id": None,
@@ -1573,6 +1871,7 @@ def _drain_unregistered_obligation(
             "state": state,
             "unattempted_reason": reason,
             "alias_of": alias_of,
+            "canonical_result": None if canonical_result is None else canonical_result.to_dict(),
             "resource_outstanding": _resource_outstanding(cleanup),
             "outstanding_work": cleanup.get("outstanding_work"),
             "resource_identity": cleanup.get("owned_identity"),
@@ -1586,7 +1885,8 @@ def _drain_unregistered_obligation(
             "retained": any(existing is handle for existing in _unregistered_cleanups()),
             "removed": False,
             "settlement": settlement,
-        }
+        },
+        canonical_result=canonical_result,
     )
 
 
@@ -1660,15 +1960,52 @@ def _drain_within(budget: CleanupBudget, *, publish: bool) -> list[dict[str, Any
     # M2-B57.  One underlying resource is settled once and spends one grant.  The
     # first obligation in the deterministic order that names an exact identity is
     # that resource's canonical obligation; any later obligation naming the same
-    # exact identity is its alias, is reported as discharged by it, and takes no
-    # second grant.  Identity is proved, never guessed from a pathname.
+    # exact identity is its alias and takes no second grant.  Identity is proved,
+    # never guessed from a pathname.
+    #
+    # M2-B59.  Selecting the canonical obligation is where the shared resource is
+    # *settled*, not where an alias is *discharged*.  Each exact-resource identity
+    # is walked as an explicit state machine -- select, execute or claim, publish
+    # exactly one result, then classify the aliases from that exact result -- so a
+    # canonical obligation that leaves the resource standing leaves its aliases
+    # truthfully retained rather than silently reported as cleaned up.
     canonical: dict[str, str] = {}
+    canonical_results: dict[str, _CanonicalResult] = {}
     seen_objects: dict[int, str] = {}
     results: list[dict[str, Any]] = []
+
+    def _settle(
+        collection: str,
+        obligation: Any,
+        sequence: int,
+        *,
+        alias_of: str | None,
+        canonical_result: _CanonicalResult | None,
+        identity: str | None,
+    ) -> dict[str, Any] | None:
+        if collection == "REGISTERED":
+            return _CLEANUP_REGISTRY.drain_entry(
+                obligation,
+                budget=budget,
+                token=token,
+                alias_of=alias_of,
+                canonical_result=canonical_result,
+                resource_identity=identity,
+            )
+        return _drain_unregistered_obligation(
+            obligation,
+            budget=budget,
+            sequence=sequence,
+            alias_of=alias_of,
+            canonical_result=canonical_result,
+            resource_identity=identity,
+        )
+
     for sequence, collection, obligation in work:
         identity = _resource_identity_of(obligation, collection)
         alias_of: str | None = None
         label = f"{collection}:{sequence}"
+        result: _CanonicalResult | None = None
         if identity is not None:
             handle = obligation.handle if collection == "REGISTERED" else obligation
             if id(handle) in seen_objects:
@@ -1678,16 +2015,64 @@ def _drain_within(budget: CleanupBudget, *, publish: bool) -> list[dict[str, Any
             else:
                 canonical[identity] = label
                 seen_objects[id(handle)] = label
-        if collection == "REGISTERED":
-            row = _CLEANUP_REGISTRY.drain_entry(
-                obligation, budget=budget, token=token, alias_of=alias_of
+                result = _CanonicalResult(
+                    resource_identity=identity,
+                    label=label,
+                    generation=_next_canonical_generation(),
+                )
+                canonical_results[identity] = result
+            if alias_of is not None:
+                # The alias is classified from the canonical *result*.  This
+                # drain's own result is preferred; a terminal result another
+                # drain published for the exact same resource identity is the
+                # only other thing that may discharge it, and a resource with no
+                # published result at all discharges nothing.
+                result = canonical_results.get(identity)
+                if result is None or not result.published:
+                    published = _published_canonical_result(identity)
+                    if published is not None:
+                        result = published
+                    elif result is None:
+                        result = _CanonicalResult(
+                            resource_identity=identity,
+                            label=alias_of,
+                            generation=_next_canonical_generation(),
+                        )
+                        result.unresolved(CANONICAL_UNPUBLISHED_NOT_REACHED)
+        if alias_of is None and result is not None:
+            # The canonical obligation for this exact resource.  It is executed
+            # first, and its result is published before any alias of it is
+            # classified; a raise before publication publishes nothing.
+            try:
+                row = _settle(
+                    collection,
+                    obligation,
+                    sequence,
+                    alias_of=None,
+                    canonical_result=None,
+                    identity=identity,
+                )
+            except BaseException:
+                result.unresolved(CANONICAL_UNPUBLISHED_THREW)
+                raise
+            if row is None:
+                # Another drain owns it and this one saw no terminal result.
+                result.unresolved(CANONICAL_UNPUBLISHED_CLAIMED)
+                continue
+            result.publish(row)
+            _publish_canonical_result(result)
+            row["canonical_result"] = result.to_dict()
+        else:
+            row = _settle(
+                collection,
+                obligation,
+                sequence,
+                alias_of=alias_of,
+                canonical_result=result,
+                identity=identity,
             )
             if row is None:
                 continue
-        else:
-            row = _drain_unregistered_obligation(
-                obligation, budget=budget, sequence=sequence, alias_of=alias_of
-            )
         row["label"] = label
         row["canonical_for_resource"] = alias_of is None and identity is not None
         results.append(row)
@@ -1705,12 +2090,23 @@ def _drain_within(budget: CleanupBudget, *, publish: bool) -> list[dict[str, Any
             for state in DRAIN_STATES
             if any(row["state"] == state for row in results)
         }
+        # M2-B59.  An alias that was *reported discharged* and an alias that was
+        # merely *found to be an alias* are two different counts, and reporting
+        # the second under the first is exactly the false cleanup claim this
+        # closure removes.
         ledger["aliases_discharged_by_a_canonical_obligation"] = sum(
-            1 for row in results if row["alias_of"] is not None
+            1 for row in results if row["state"] == DRAIN_STATE_DISCHARGED_BY_CANONICAL
         )
+        ledger["aliases_retained_pending_canonical"] = sum(
+            1 for row in results if row["state"] == DRAIN_STATE_RETAINED_PENDING_CANONICAL
+        )
+        ledger["aliases_identified"] = sum(1 for row in results if row["alias_of"] is not None)
         ledger["distinct_resources"] = len(
             {row["resource_identity"] for row in results if row["resource_identity"]}
         )
+        ledger["canonical_results"] = [
+            result.to_dict() for _identity, result in sorted(canonical_results.items())
+        ]
         ledger["order"] = [
             {
                 "sequence": row["sequence"],
@@ -1718,6 +2114,9 @@ def _drain_within(budget: CleanupBudget, *, publish: bool) -> list[dict[str, Any
                 "state": row["state"],
                 "resource_outstanding": row["resource_outstanding"],
                 "alias_of": row["alias_of"],
+                "canonical_proved_discharge": bool(
+                    (row.get("canonical_result") or {}).get("proves_discharge")
+                ),
             }
             for row in results
         ]
@@ -4621,15 +5020,22 @@ __all__ = [
     "SCHEMA_TRANSACTIONAL_EXPORT_RESERVATION",
     "SourceSnapshotIdentity",
     "SpawnedLauncher",
+    "CANONICAL_RESULT_RETENTION",
+    "CANONICAL_UNPUBLISHED_CLAIMED",
+    "CANONICAL_UNPUBLISHED_NOT_REACHED",
+    "CANONICAL_UNPUBLISHED_THREW",
     "CleanupReservationRefused",
     "DRAIN_STATES",
+    "DRAIN_STATES_PROVING_DISCHARGE",
     "DRAIN_STATE_ATTEMPTED",
     "DRAIN_STATE_DISCHARGED_BY_CANONICAL",
     "DRAIN_STATE_RESOURCE_DISCHARGED",
+    "DRAIN_STATE_RETAINED_PENDING_CANONICAL",
     "DRAIN_STATE_RETAINED_UNATTEMPTED",
     "DRAIN_STATE_UNRESOLVED",
     "DRAIN_UNATTEMPTED_ALIAS",
     "DRAIN_UNATTEMPTED_BUDGET_EXHAUSTED",
+    "DRAIN_UNATTEMPTED_CANONICAL_UNRESOLVED",
     "DRAIN_UNATTEMPTED_RESOURCE_DISCHARGED",
     "DrainEvidenceContradiction",
     "RESERVATION_CONSUMED",
@@ -4651,6 +5057,7 @@ __all__ = [
     "host_can_pathname_reach",
     "incomplete_cleanups",
     "private_ipc_host_visible",
+    "published_canonical_results",
     "recover_export",
     "retry_unsettled_failed_starts",
     "snapshot_tree_identity",

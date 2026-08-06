@@ -1539,6 +1539,11 @@ class CgroupDelegation:
     #: positive result is constructed only after this records a verified
     #: removal, so ``available`` can never coexist with a residual probe path.
     probe_cleanup: dict[str, Any] = field(default_factory=dict)
+    #: M2-M62.  The parent mutation boundary the probe creation held, and the
+    #: identity of the object it created.  A reader can therefore check the
+    #: declared TCB against what the creation actually did rather than trusting
+    #: the declaration.
+    probe_creation: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1552,11 +1557,15 @@ class CgroupDelegation:
             "enabled_controllers": list(self.enabled_controllers),
             "probe_effect_limits": dict(self.probe_effect_limits),
             "probe_cleanup": dict(self.probe_cleanup),
+            "probe_creation": dict(self.probe_creation),
         }
 
 
 def _delegation_from_failure(
-    topology: CgroupTopology, *, probe_cleanup: dict[str, Any] | None = None
+    topology: CgroupTopology,
+    *,
+    probe_cleanup: dict[str, Any] | None = None,
+    probe_creation: dict[str, Any] | None = None,
 ) -> CgroupDelegation:
     return CgroupDelegation(
         available=False,
@@ -1568,6 +1577,7 @@ def _delegation_from_failure(
         manager_leaf=topology.manager_leaf,
         enabled_controllers=topology.enabled_controllers,
         probe_cleanup=dict(probe_cleanup or {}),
+        probe_creation=dict(probe_creation or {}),
     )
 
 
@@ -1678,6 +1688,91 @@ def _remove_owned_probe(probe: Path) -> dict[str, Any]:
     return evidence
 
 
+#: M2-M62.  The three controller-owned child namespaces under one delegated
+#: parent.  They are disjoint by construction, so a probe creation and an effect
+#: creation serialized by the same boundary can never contend for one name --
+#: which is why covering probe creation costs the effect path nothing.
+CONTROLLER_OWNED_CHILD_PREFIXES = (MANAGER_LEAF_PREFIX, EFFECT_PREFIX, PROBE_PREFIX)
+
+
+def _create_probe_inside_boundary(probe: Path, parent: Path) -> dict[str, Any]:
+    """Create the readiness probe under the parent's exclusion boundary.
+
+    The whole controller-owned mutation happens inside one boundary: the
+    parent's identity is proved, the collision is checked, the directory is
+    created, the created object's identity is captured, and a creation that
+    cannot be proved is rolled back -- all before the boundary is released.  A
+    parent whose identity cannot be read yields no boundary at all, so the probe
+    is refused rather than created outside the trusted computing base this
+    module declares.
+
+    Exactly one mutation domain is entered and nothing is acquired inside it, so
+    this path cannot invert a lock order with probe removal, manager-leaf
+    creation, effect creation or the final removal, each of which likewise holds
+    at most this one domain.
+    """
+
+    outcome: dict[str, Any] = {
+        "code": None,
+        "detail": "",
+        "mutation_boundary": None,
+        "boundary_held": False,
+        "probe_identity": None,
+    }
+    domain = cgroup_mutation_domain_of(parent)
+    if domain is None:
+        outcome["code"] = TOPOLOGY_EFFECT_CREATE_FAILED
+        outcome["detail"] = (
+            f"{parent} has no readable directory identity, so the parent mutation boundary "
+            "cannot be entered; no probe cgroup is created outside the declared TCB"
+        )
+        return outcome
+    outcome["mutation_boundary"] = domain
+    with cgroup_mutation_boundary(domain):
+        outcome["boundary_held"] = cgroup_mutation_boundary_held(domain)
+        # Inside the boundary, prove the parent is still the object the domain
+        # was keyed on.  A parent replaced between the read and the acquisition
+        # would mean this lock excludes mutations of a different directory.
+        if cgroup_mutation_domain_of(parent) != domain:
+            outcome["code"] = TOPOLOGY_EFFECT_CREATE_FAILED
+            outcome["detail"] = (
+                f"{parent} was replaced between reading its identity and entering its mutation "
+                "boundary; no probe cgroup is created under an unproved parent"
+            )
+            return outcome
+        if probe.exists():
+            outcome["code"] = TOPOLOGY_EFFECT_COLLISION
+            outcome["detail"] = f"{probe} already exists"
+            return outcome
+        try:
+            probe.mkdir(mode=0o700)
+        except FileExistsError:
+            outcome["code"] = TOPOLOGY_EFFECT_COLLISION
+            outcome["detail"] = f"{probe} already exists"
+            return outcome
+        except OSError as error:
+            outcome["code"] = TOPOLOGY_EFFECT_CREATE_FAILED
+            outcome["detail"] = f"{probe}: {_errno_name(error)}"
+            return outcome
+        identity = _directory_identity(probe)
+        if identity is None:
+            # The object this call created cannot be named exactly.  Roll the
+            # creation back here, still inside the boundary that created it,
+            # rather than leaving an unidentifiable child under the parent.
+            try:
+                probe.rmdir()
+            except OSError:  # pragma: no cover - the directory was just created
+                pass
+            outcome["code"] = TOPOLOGY_EFFECT_CREATE_FAILED
+            outcome["detail"] = (
+                f"{probe} was created and its identity could not be read; the partial creation "
+                "was rolled back inside the same mutation boundary"
+            )
+            return outcome
+        outcome["probe_identity"] = identity
+    return outcome
+
+
 def probe_cgroup_delegation(*, force: bool = False) -> CgroupDelegation:
     """Physically rehearse everything a per-effect cgroup will later need.
 
@@ -1700,32 +1795,30 @@ def probe_cgroup_delegation(*, force: bool = False) -> CgroupDelegation:
         "memory.max": bounds.max_address_space_bytes,
     }
     probe = parent / f"{PROBE_PREFIX}{os.getpid()}"
-    try:
-        probe.mkdir(mode=0o700)
-    except FileExistsError:
+    # M2-M62.  Creating the probe is a controller-owned creation of a child under
+    # the delegated parent, which is exactly what CGROUP_MUTATION_TCB declares
+    # serialized.  It used to be the one such mutation that ran outside the
+    # boundary -- effect creation, manager-leaf creation, final removal and the
+    # probe's own removal all took it -- so the declaration was broader than the
+    # code supported.  It is taken here, and held across the parent identity
+    # proof, the collision check, the ``mkdir``, the created-object identity
+    # capture and the rollback of a partial creation, so the declared boundary is
+    # true rather than aspirational.
+    created = _create_probe_inside_boundary(probe, parent)
+    if created["code"] is not None:
         return _delegation_from_failure(
             _failed(
-                TOPOLOGY_EFFECT_COLLISION,
-                f"{probe} already exists",
+                created["code"],
+                created["detail"],
                 unified_root=topology.unified_root,
                 effect_parent=str(parent),
                 manager_leaf=topology.manager_leaf,
                 available_controllers=topology.available_controllers,
                 enabled_controllers=topology.enabled_controllers,
-            )
+            ),
+            probe_creation=created,
         )
-    except OSError as error:
-        return _delegation_from_failure(
-            _failed(
-                TOPOLOGY_EFFECT_CREATE_FAILED,
-                f"{probe}: {_errno_name(error)}",
-                unified_root=topology.unified_root,
-                effect_parent=str(parent),
-                manager_leaf=topology.manager_leaf,
-                available_controllers=topology.available_controllers,
-                enabled_controllers=topology.enabled_controllers,
-            )
-        )
+
     def _refuse(code: str, detail: str, cleanup: dict[str, Any] | None = None) -> CgroupDelegation:
         return _delegation_from_failure(
             _failed(
@@ -1738,6 +1831,7 @@ def probe_cgroup_delegation(*, force: bool = False) -> CgroupDelegation:
                 enabled_controllers=topology.enabled_controllers,
             ),
             probe_cleanup=cleanup,
+            probe_creation=created,
         )
 
     # M2-B28.  Nothing below constructs a positive result.  The limits are
@@ -1774,6 +1868,7 @@ def probe_cgroup_delegation(*, force: bool = False) -> CgroupDelegation:
         enabled_controllers=topology.enabled_controllers,
         probe_effect_limits=observed,
         probe_cleanup=cleanup,
+        probe_creation=created,
     )
 
 
@@ -3612,6 +3707,7 @@ __all__ = [
     "CgroupTopology",
     "EFFECT_PREFIX",
     "MANAGER_LEAF_PREFIX",
+    "CONTROLLER_OWNED_CHILD_PREFIXES",
     "PROBE_PREFIX",
     "REQUIRED_CONTROLLERS",
     "TOPOLOGY_CODES",
