@@ -50,6 +50,8 @@ M2_EXACT_REMOVAL_BRANCH = (
 )
 M2_ALIAS_CAPACITY_STARTING_COMMIT = "6d687d4c778ae917f925da18aa89b2c53cdac911"
 M2_ALIAS_CAPACITY_BRANCH = "paired-runner/m2-alias-capacity-artifact-tcb-closure"
+M2_FINAL_ALIAS_PROOF_STARTING_COMMIT = "90a33c610b58900fc40f617de1508f4192dc03d1"
+M2_FINAL_ALIAS_PROOF_BRANCH = "paired-runner/m2-final-alias-proof-transcript-closure"
 M2_SECOND_BRANCH = "paired-runner/m2-causal-index-and-ipc-repairs"
 M2_THIRD_BRANCH = "paired-runner/m2-private-workspace-and-bound-runtime"
 M2_FOURTH_BRANCH = "paired-runner/m2-fourth-critical-repair-retry"
@@ -70,6 +72,7 @@ M2_ARTIFACTS = (
     "M2_CGROUP_IDENTITY_REAP_REGISTRY_SERIALIZATION_CLOSURE_REPORT.json",
     "M2_EXACT_REMOVAL_GLOBAL_DRAIN_RESERVATION_PROVENANCE_CLOSURE_REPORT.json",
     "M2_ALIAS_CAPACITY_ARTIFACT_TCB_CLOSURE_REPORT.json",
+    "M2_FINAL_ALIAS_PROOF_TRANSCRIPT_CLOSURE_REPORT.json",
 )
 #: Historical reports of earlier passes.  A later pass may not rewrite them: the
 #: record of what an earlier closure claimed is itself evidence.
@@ -95,6 +98,13 @@ PRESERVED_HISTORICAL_ARTIFACTS = (
     # provenance closure, whose independent audit refused final closure with
     # B59, B60, M61 and M62.
     "M2_EXACT_REMOVAL_GLOBAL_DRAIN_RESERVATION_PROVENANCE_CLOSURE_REPORT.json",
+    # ...and this pass supersedes the alias-truth/combined-capacity/artifact-
+    # coherence/mutation-TCB closure, whose independent audit refused final
+    # closure with B63 and M64.  M2-M64 withdraws the full-transcript claim that
+    # report carried; the withdrawal is recorded in the current report rather
+    # than written back over these bytes, because the record of what an earlier
+    # closure claimed is itself the evidence the withdrawal is about.
+    "M2_ALIAS_CAPACITY_ARTIFACT_TCB_CLOSURE_REPORT.json",
 )
 PRESERVED_M1_ARTIFACTS = (
     "M1_SCHEMA_CATALOG.json",
@@ -167,14 +177,14 @@ class M2ArtifactTests(unittest.TestCase):
         # M2-M36: the canonical filename is the single *current* report, and the
         # superseded fourth-repair bytes live under a historical filename.
         self.assertTrue(report["is_current_validation_report"])
-        self.assertEqual(report["starting_commit"], M2_ALIAS_CAPACITY_STARTING_COMMIT)
-        self.assertEqual(report["starting_commit_parent"], M2_EXACT_REMOVAL_STARTING_COMMIT)
-        self.assertEqual(report["branch"], M2_ALIAS_CAPACITY_BRANCH)
+        self.assertEqual(report["starting_commit"], M2_FINAL_ALIAS_PROOF_STARTING_COMMIT)
+        self.assertEqual(report["starting_commit_parent"], M2_ALIAS_CAPACITY_STARTING_COMMIT)
+        self.assertEqual(report["branch"], M2_FINAL_ALIAS_PROOF_BRANCH)
         self.assertIn(
             report["terminal_verdict"],
             {
-                "M2_ALIAS_CAPACITY_ARTIFACT_TCB_CLOSURE_VERIFIED",
-                "M2_ALIAS_CAPACITY_ARTIFACT_TCB_OPERATOR_QUALIFICATION_REQUIRED",
+                "M2_FINAL_ALIAS_PROOF_TRANSCRIPT_CLOSURE_VERIFIED",
+                "M2_FINAL_ALIAS_PROOF_TRANSCRIPT_OPERATOR_QUALIFICATION_REQUIRED",
             },
         )
         self.assertFalse(report["boundary_audit"]["milestone_3_started"])
@@ -191,7 +201,7 @@ class M2ArtifactTests(unittest.TestCase):
         self.assertTrue(report["known_limitations"])
         self.assertEqual(
             report["final_repair_report"],
-            "implementation/M2_ALIAS_CAPACITY_ARTIFACT_TCB_CLOSURE_REPORT.json",
+            "implementation/M2_FINAL_ALIAS_PROOF_TRANSCRIPT_CLOSURE_REPORT.json",
         )
         # The pointer resolves, and the report it names agrees about the pass.
         closure = parse_canonical_json(

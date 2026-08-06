@@ -1099,8 +1099,10 @@ class ValidationReportCountTests(unittest.TestCase):
             + counts["m2_cgroup_identity_reap_registry_serialization_closure_module"]
             + counts["m2_exact_removal_global_drain_reservation_provenance_closure_module"]
             # ...and M2-B59 the alias-truth / combined-capacity / artifact-
-            # coherence / mutation-TCB closure module.
-            + counts["m2_alias_capacity_artifact_tcb_closure_module"],
+            # coherence / mutation-TCB closure module, and M2-B63 the final
+            # alias-proof / exact-commit transcript closure module.
+            + counts["m2_alias_capacity_artifact_tcb_closure_module"]
+            + counts["m2_final_alias_proof_transcript_closure_module"],
             "the legacy and new modules must account for the whole discovery total",
         )
 

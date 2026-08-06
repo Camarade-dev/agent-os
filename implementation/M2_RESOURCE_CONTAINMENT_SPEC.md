@@ -1076,3 +1076,122 @@ the declaration against what the creation actually did. Nothing here claims
 atomicity against a hostile host: a mutation performed by a process outside this
 controller's trusted computing base is not excluded by a userspace lock, and the
 declaration says so.
+
+## M2-B63 — a discharge names the authority that proves it
+
+An alias relationship is not a proof source. Neither is membership of an
+exact-resource group. Before this closure a later drain could name the canonical
+obligation *it* had selected for the group while accepting a terminal result
+another drain had published:
+
+```
+alias_of                         = REGISTERED:2
+canonical_result.canonical_label = UNREGISTERED:1
+state                            = DISCHARGED_BY_THE_CANONICAL_OBLIGATION_FOR_THE_SAME_RESOURCE
+```
+
+The resource really was discharged. The evidence credited the discharge to an
+obligation that had proved nothing, which is a false attribution over a true
+fact — and an attribution is the whole content of a cleanup claim.
+
+Four facts are therefore distinct, and every drain row carries all four:
+
+| field | meaning |
+| --- | --- |
+| `group_canonical_label` | the canonical obligation this drain selected for this exact resource |
+| `discharge_proof_source_label` | the obligation whose result actually proves the discharge |
+| `discharge_proof_generation` | which publication of that result was read |
+| `discharge_proof_origin` | where the proof came from |
+
+`discharge_proof_origin` is a closed set:
+
+```
+CURRENT_DRAIN_CANONICAL        this drain's own canonical obligation for this resource
+OTHER_DRAIN_PUBLISHED_RESULT   a terminal result published by another or an earlier drain
+OWN_POSITIVE_OBSERVATION       this obligation's own exact observation of the resource
+NONE                           nothing proves a discharge here
+```
+
+The origin is decided in `_drain_within`, **where the result is selected**, and is
+carried into the row. It is never inferred by comparing a result's label with
+`alias_of`: two drains may use the same label for different obligations, so a
+label comparison would silently re-introduce the defect whenever the labels
+happened to coincide.
+
+`DISCHARGED_BY_THE_CANONICAL_OBLIGATION_FOR_THE_SAME_RESOURCE` is now reachable
+only when
+
+* `group_canonical_label == discharge_proof_source_label == canonical_result.canonical_label`, and
+* the exact result belongs to the same resource identity, is fully published, is
+  terminal and noncontradictory, positively proves discharge, and reports
+  `resource_outstanding == false`.
+
+Otherwise:
+
+* a terminal published result for the same identity discharges the alias as
+  `RESOURCE_DISCHARGED_BY_PUBLISHED_RESULT_FOR_SAME_IDENTITY`, naming that
+  result's own label and generation;
+* an alias whose own exact observation proves the resource absent is
+  `RESOURCE_DISCHARGED_ON_THIS_OBLIGATIONS_OWN_EXACT_OBSERVATION`, attributed to
+  itself and carrying no publication generation, because an observation is not a
+  publication;
+* an alias with no positive source stays
+  `RETAINED_BECAUSE_THE_CANONICAL_OBLIGATION_FOR_THE_SAME_RESOURCE_DID_NOT_DISCHARGE_IT`,
+  names no proof, and still spends no second settlement grant.
+
+`_guard_drain_row()` refuses, where the row is built, a current-canonical state
+with a mismatched source label, generation or origin; a published-result state
+without a source label and generation, or naming a different publication; a
+source result for another resource identity; an unpublished or nonterminal source
+result; any positive discharge over an outstanding resource; any positive
+discharge whose origin is `NONE`; an own-observation state without a positive
+observation of its own; and any row whose prose reason disagrees with its
+structured origin. The drain ledger counts the three discharge authorities
+separately, so "an alias was found" and "an alias was proved discharged, by
+this" are never one number.
+
+## M2-M64 — repository truth and external audit evidence are separate
+
+A commit cannot contain the transcript of a run performed against that same
+commit: adding the bytes changes the tree the run qualified, and the artifact
+then describes a revision that no longer exists. The repository therefore
+describes the evidence contract honestly and the exact-commit evidence is
+transported externally, bound to the commit by hash rather than by inclusion.
+
+A current artifact may record
+
+* the starting commit's delegated qualification, explicitly as history that does
+  not qualify the revision the closure produces;
+* this pass's delegated qualification of the **uncommitted worktree**, with
+  `scope = PRECOMMIT_WORKTREE` and `qualifies_exact_commit = false`;
+* the exact external evidence contract, explicitly pending.
+
+It may not claim exact-commit delegated verification before the exact-commit run,
+complete transcript availability unless the bytes are actually present, a byte
+count or a hash over bytes it does not carry, independent acceptance,
+installed-path qualification, or Milestone 3.
+
+After the single bounded commit the restricted qualifier runs the full delegated
+suite against the exact clean commit and writes, outside the repository,
+
+```
+PAIRED_RUNNER_M2_FINAL_EXACT_COMMIT_DELEGATED_TRANSCRIPT_<commit>.txt
+PAIRED_RUNNER_M2_FINAL_EXACT_COMMIT_DELEGATED_RECEIPT_<commit>.json
+```
+
+The receipt carries the repository path, branch, exact commit, exact parent,
+bounded range count, clean-worktree assertion, command and mode, module list,
+environment requirement, exit code, transcript byte count and SHA-256, the parsed
+`Ran N tests in ...` line, the parsed final status, the skip, failure and error
+counts, and the start and end timestamps. No repository mutation may occur after
+that run.
+
+The final audit-bundle builder receives both paths, verifies the transcript's
+hash and byte count against the receipt and the receipt's binding to the exact
+commit and parent, and carries both as first-class manifest-covered members. It
+refuses when either file is absent or empty, when the receipt cannot be parsed or
+is missing a required field, when the hash or byte count disagrees, when the
+receipt names another commit or parent, when the bounded range is not exactly one
+commit, when the worktree was not clean, when the module list is not the ten
+qualification modules, or when the run was not `OK` with zero skips, failures and
+errors.

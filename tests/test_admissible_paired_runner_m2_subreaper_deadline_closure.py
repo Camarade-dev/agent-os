@@ -1684,6 +1684,12 @@ class ClosureArtifactCoherenceTests(unittest.TestCase):
                 "tests.test_admissible_paired_runner_m2_alias_capacity_artifact_tcb_closure",
                 "m2_alias_capacity_artifact_tcb_closure_module",
             ),
+            # ...and M2-B63 the final alias-proof / exact-commit transcript
+            # closure module.
+            (
+                "tests.test_admissible_paired_runner_m2_final_alias_proof_transcript_closure",
+                "m2_final_alias_proof_transcript_closure_module",
+            ),
         ):
             loader = unittest.defaultTestLoader.loadTestsFromName(module)
             self.assertEqual(loader.countTestCases(), counts[field], module)
@@ -1698,7 +1704,8 @@ class ClosureArtifactCoherenceTests(unittest.TestCase):
             + counts["m2_process_owner_cleanup_propagation_closure_module"]
             + counts["m2_cgroup_identity_reap_registry_serialization_closure_module"]
             + counts["m2_exact_removal_global_drain_reservation_provenance_closure_module"]
-            + counts["m2_alias_capacity_artifact_tcb_closure_module"],
+            + counts["m2_alias_capacity_artifact_tcb_closure_module"]
+            + counts["m2_final_alias_proof_transcript_closure_module"],
         )
 
     def test_the_closure_report_records_every_declared_deadline(self) -> None:

@@ -641,6 +641,12 @@ DRAIN_UNATTEMPTED_ALIAS = "THE_CANONICAL_OBLIGATION_FOR_THIS_RESOURCE_WAS_SETTLE
 DRAIN_UNATTEMPTED_CANONICAL_UNRESOLVED = (
     "THE_CANONICAL_OBLIGATION_FOR_THIS_RESOURCE_DID_NOT_DISCHARGE_IT"
 )
+#: M2-B63.  An alias discharged by a terminal result published for this exact
+#: identity by another drain.  The prose says *published result*, because that is
+#: what proved it -- not the canonical obligation this drain happened to select.
+DRAIN_UNATTEMPTED_PUBLISHED_RESULT = (
+    "A_TERMINAL_PUBLISHED_RESULT_FOR_THIS_EXACT_RESOURCE_PROVES_IT_DISCHARGED"
+)
 #: The resource is gone; only bookkeeping remains, and bookkeeping is not a
 #: cleanup primitive and is never run on a spent budget.
 DRAIN_UNATTEMPTED_RESOURCE_DISCHARGED = "THE_RESOURCE_IS_ALREADY_DISCHARGED"
@@ -674,6 +680,19 @@ DRAIN_STATE_DISCHARGED_BY_CANONICAL = "DISCHARGED_BY_THE_CANONICAL_OBLIGATION_FO
 DRAIN_STATE_RETAINED_PENDING_CANONICAL = (
     "RETAINED_BECAUSE_THE_CANONICAL_OBLIGATION_FOR_THE_SAME_RESOURCE_DID_NOT_DISCHARGE_IT"
 )
+#: M2-B63.  A terminal result published for this exact resource identity by
+#: another drain -- or by an earlier drain in this process -- positively proves
+#: the resource is gone.  That result is a *different authority* from the
+#: canonical obligation this drain selected, and it is named as itself.
+DRAIN_STATE_DISCHARGED_BY_PUBLISHED_RESULT = (
+    "RESOURCE_DISCHARGED_BY_PUBLISHED_RESULT_FOR_SAME_IDENTITY"
+)
+#: M2-B63.  The alias's own exact observation proves the resource absent, with no
+#: canonical result involved at all.  It is a discharge; it is not a canonical
+#: discharge, and it may not be reported as one.
+DRAIN_STATE_DISCHARGED_BY_OWN_OBSERVATION = (
+    "RESOURCE_DISCHARGED_ON_THIS_OBLIGATIONS_OWN_EXACT_OBSERVATION"
+)
 #: The resource is discharged on its own evidence; only bookkeeping is owed.
 DRAIN_STATE_RESOURCE_DISCHARGED = "RESOURCE_ALREADY_DISCHARGED_BOOKKEEPING_OUTSTANDING"
 #: Attempted or reached, and something real is still owed.
@@ -683,6 +702,8 @@ DRAIN_STATES = (
     DRAIN_STATE_ATTEMPTED,
     DRAIN_STATE_RETAINED_UNATTEMPTED,
     DRAIN_STATE_DISCHARGED_BY_CANONICAL,
+    DRAIN_STATE_DISCHARGED_BY_PUBLISHED_RESULT,
+    DRAIN_STATE_DISCHARGED_BY_OWN_OBSERVATION,
     DRAIN_STATE_RETAINED_PENDING_CANONICAL,
     DRAIN_STATE_RESOURCE_DISCHARGED,
     DRAIN_STATE_UNRESOLVED,
@@ -693,6 +714,53 @@ DRAIN_STATES = (
 DRAIN_STATES_PROVING_DISCHARGE = (
     DRAIN_STATE_ATTEMPTED,
     DRAIN_STATE_RESOURCE_DISCHARGED,
+)
+
+#: M2-B63.  The states that positively assert *this row's own* resource is no
+#: longer outstanding.  Each one must name the exact authority that proves it.
+DRAIN_STATES_POSITIVE_DISCHARGE = (
+    DRAIN_STATE_DISCHARGED_BY_CANONICAL,
+    DRAIN_STATE_DISCHARGED_BY_PUBLISHED_RESULT,
+    DRAIN_STATE_DISCHARGED_BY_OWN_OBSERVATION,
+    DRAIN_STATE_RESOURCE_DISCHARGED,
+)
+
+# --- M2-B63: the claim names the authority that actually proves it ------------
+#
+# A later drain could name ``alias_of = REGISTERED:2`` -- the canonical
+# obligation *this* drain selected for the group -- while accepting a terminal
+# published result whose real source was ``UNREGISTERED:1``, published by another
+# drain entirely.  The resource was genuinely discharged; the evidence credited
+# the discharge to an obligation that had proved nothing.  An alias relationship
+# is not a proof source, and neither is group membership.
+#
+# Four facts are therefore kept apart, and each row carries all four:
+#
+#     group_canonical_label       the canonical selected for this group, here
+#     discharge_proof_source_label the obligation whose result actually proves it
+#     discharge_proof_generation   which publication of that result was read
+#     discharge_proof_origin       where that proof came from
+#
+# The origin is decided structurally, where the result is selected -- not
+# inferred from a label comparison, because two drains may well use the same
+# label for different obligations.
+
+#: The proof is this drain's own canonical obligation for this exact resource.
+DISCHARGE_PROOF_ORIGIN_CURRENT_DRAIN_CANONICAL = "CURRENT_DRAIN_CANONICAL"
+#: The proof is a terminal result published for this exact identity by another
+#: drain, or by an earlier drain in this process.
+DISCHARGE_PROOF_ORIGIN_OTHER_DRAIN_PUBLISHED_RESULT = "OTHER_DRAIN_PUBLISHED_RESULT"
+#: The proof is this obligation's own exact observation of the resource.
+DISCHARGE_PROOF_ORIGIN_OWN_POSITIVE_OBSERVATION = "OWN_POSITIVE_OBSERVATION"
+#: Nothing proves a discharge here.  A positive state may never carry this.
+DISCHARGE_PROOF_ORIGIN_NONE = "NONE"
+
+#: The closed set.  A row carrying anything else is refused where it is built.
+DISCHARGE_PROOF_ORIGINS = (
+    DISCHARGE_PROOF_ORIGIN_CURRENT_DRAIN_CANONICAL,
+    DISCHARGE_PROOF_ORIGIN_OTHER_DRAIN_PUBLISHED_RESULT,
+    DISCHARGE_PROOF_ORIGIN_OWN_POSITIVE_OBSERVATION,
+    DISCHARGE_PROOF_ORIGIN_NONE,
 )
 
 
@@ -897,6 +965,21 @@ def _resource_outstanding(cleanup: dict[str, Any]) -> bool:
     return not bool(cleanup.get("cleanup_complete"))
 
 
+#: The one reason each state is allowed to give.  Prose that disagrees with the
+#: structured fields is exactly the attribution defect M2-B63 closes, so the two
+#: are bound together and the row guard refuses any other pairing.
+_DRAIN_STATE_REASONS = {
+    DRAIN_STATE_ATTEMPTED: None,
+    DRAIN_STATE_UNRESOLVED: None,
+    DRAIN_STATE_RETAINED_UNATTEMPTED: DRAIN_UNATTEMPTED_BUDGET_EXHAUSTED,
+    DRAIN_STATE_DISCHARGED_BY_CANONICAL: DRAIN_UNATTEMPTED_ALIAS,
+    DRAIN_STATE_DISCHARGED_BY_PUBLISHED_RESULT: DRAIN_UNATTEMPTED_PUBLISHED_RESULT,
+    DRAIN_STATE_DISCHARGED_BY_OWN_OBSERVATION: DRAIN_UNATTEMPTED_RESOURCE_DISCHARGED,
+    DRAIN_STATE_RESOURCE_DISCHARGED: DRAIN_UNATTEMPTED_RESOURCE_DISCHARGED,
+    DRAIN_STATE_RETAINED_PENDING_CANONICAL: DRAIN_UNATTEMPTED_CANONICAL_UNRESOLVED,
+}
+
+
 def _classify_drain_row(
     *,
     attempted: bool,
@@ -904,8 +987,10 @@ def _classify_drain_row(
     alias_of: str | None,
     canonical_result: _CanonicalResult | None = None,
     resource_identity: str | None = None,
-) -> tuple[str, str | None]:
-    """The one truthful state of this obligation in this drain, and its reason.
+    label: str | None = None,
+    proof_origin: str = DISCHARGE_PROOF_ORIGIN_NONE,
+) -> tuple[str, str | None, dict[str, Any]]:
+    """The one truthful state of this obligation, its reason, and its proof.
 
     ``RETAINED_UNTOUCHED_BECAUSE_THE_SHARED_BUDGET_WAS_EXHAUSTED`` is reserved
     for an obligation whose resource really is still outstanding.  An obligation
@@ -916,28 +1001,84 @@ def _classify_drain_row(
     result that positively proves the exact shared resource is no longer
     outstanding, the alias is retained and says which canonical obligation it is
     waiting on -- it is not called discharged, and it still spends no grant.
+
+    M2-B63.  A positive row also names the authority that proves it.  The
+    canonical obligation selected for the group and the obligation whose result
+    actually proves the discharge are two separate fields, because they are two
+    separate facts: a result published by another drain discharges the resource
+    under its *own* label and generation and is reported as such.  ``proof_origin``
+    is supplied by the caller that selected the result, so the origin is a fact
+    about where the result came from rather than a guess from its label.
     """
 
     outstanding = _resource_outstanding(cleanup)
+    group_canonical_label = (
+        alias_of if alias_of is not None else (label if resource_identity is not None else None)
+    )
+
+    def proof(source: str | None, generation: int | None, origin: str) -> dict[str, Any]:
+        return {
+            "group_canonical_label": group_canonical_label,
+            "discharge_proof_source_label": source,
+            "discharge_proof_generation": generation,
+            "discharge_proof_origin": origin,
+        }
+
     if alias_of is not None:
-        if (
+        proved = (
             resource_identity is not None
             and canonical_result is not None
             and canonical_result.proves_discharge_of(resource_identity)
-            and not outstanding
-        ):
-            return DRAIN_STATE_DISCHARGED_BY_CANONICAL, DRAIN_UNATTEMPTED_ALIAS
+        )
+        if proved and not outstanding:
+            if proof_origin == DISCHARGE_PROOF_ORIGIN_CURRENT_DRAIN_CANONICAL:
+                return (
+                    DRAIN_STATE_DISCHARGED_BY_CANONICAL,
+                    DRAIN_UNATTEMPTED_ALIAS,
+                    proof(
+                        canonical_result.label,
+                        canonical_result.generation,
+                        DISCHARGE_PROOF_ORIGIN_CURRENT_DRAIN_CANONICAL,
+                    ),
+                )
+            # Discharged, but by a result this drain's canonical obligation did
+            # not produce.  Crediting it to that obligation would be the exact
+            # misattribution M2-B63 closes.
+            return (
+                DRAIN_STATE_DISCHARGED_BY_PUBLISHED_RESULT,
+                DRAIN_UNATTEMPTED_PUBLISHED_RESULT,
+                proof(
+                    canonical_result.label,
+                    canonical_result.generation,
+                    DISCHARGE_PROOF_ORIGIN_OTHER_DRAIN_PUBLISHED_RESULT,
+                ),
+            )
+        if not outstanding:
+            # No canonical result proves anything, and yet this obligation's own
+            # exact observation says the resource is absent.  That is a real
+            # discharge on a real authority -- its own -- and it is not canonical.
+            return (
+                DRAIN_STATE_DISCHARGED_BY_OWN_OBSERVATION,
+                DRAIN_UNATTEMPTED_RESOURCE_DISCHARGED,
+                proof(label, None, DISCHARGE_PROOF_ORIGIN_OWN_POSITIVE_OBSERVATION),
+            )
         return (
             DRAIN_STATE_RETAINED_PENDING_CANONICAL,
             DRAIN_UNATTEMPTED_CANONICAL_UNRESOLVED,
+            proof(None, None, DISCHARGE_PROOF_ORIGIN_NONE),
         )
+    own = (
+        proof(label, None, DISCHARGE_PROOF_ORIGIN_OWN_POSITIVE_OBSERVATION)
+        if not outstanding
+        else proof(None, None, DISCHARGE_PROOF_ORIGIN_NONE)
+    )
     if attempted:
         if bool(cleanup.get("cleanup_complete")):
-            return DRAIN_STATE_ATTEMPTED, None
-        return DRAIN_STATE_UNRESOLVED, None
+            return DRAIN_STATE_ATTEMPTED, None, own
+        return DRAIN_STATE_UNRESOLVED, None, own
     if not outstanding:
-        return DRAIN_STATE_RESOURCE_DISCHARGED, DRAIN_UNATTEMPTED_RESOURCE_DISCHARGED
-    return DRAIN_STATE_RETAINED_UNATTEMPTED, DRAIN_UNATTEMPTED_BUDGET_EXHAUSTED
+        return DRAIN_STATE_RESOURCE_DISCHARGED, DRAIN_UNATTEMPTED_RESOURCE_DISCHARGED, own
+    return DRAIN_STATE_RETAINED_UNATTEMPTED, DRAIN_UNATTEMPTED_BUDGET_EXHAUSTED, own
 
 
 def _guard_drain_row(
@@ -955,11 +1096,21 @@ def _guard_drain_row(
     contradicted downstream.  So is a discharge naming a canonical result that is
     missing, unpublished, for a different exact resource identity, or which
     itself reports the resource as outstanding.
+
+    M2-B63 adds the attribution shapes.  A positive discharge must name the exact
+    authority that proves it: the current canonical only when the proof really
+    came from it, a published result only under that result's own label and
+    generation, an own observation only on a positive observation of its own, and
+    never a prose reason that disagrees with the structured origin.
     """
 
     state = row["state"]
     if state not in DRAIN_STATES:  # pragma: no cover - the table above is closed
         raise DrainEvidenceContradiction(f"unknown drain state {state!r}")
+    origin = row.get("discharge_proof_origin")
+    source = row.get("discharge_proof_source_label")
+    generation = row.get("discharge_proof_generation")
+    group_label = row.get("group_canonical_label")
     if state == DRAIN_STATE_RETAINED_UNATTEMPTED and not row["resource_outstanding"]:
         raise DrainEvidenceContradiction(
             f"{row.get('effect_cgroup_path')!r} was reported untouched for lack of budget while "
@@ -986,6 +1137,89 @@ def _guard_drain_row(
                 f"discharge of {identity!r} (state {canonical_result.state!r}, outstanding "
                 f"{canonical_result.resource_outstanding!r})"
             )
+        if origin != DISCHARGE_PROOF_ORIGIN_CURRENT_DRAIN_CANONICAL:
+            raise DrainEvidenceContradiction(
+                f"{row.get('effect_cgroup_path')!r} was reported discharged by the canonical "
+                f"obligation of this drain with proof origin {origin!r}"
+            )
+        if source is None or source != group_label or source != canonical_result.label:
+            raise DrainEvidenceContradiction(
+                f"{row.get('effect_cgroup_path')!r} credits its discharge to the group canonical "
+                f"{group_label!r} naming {source!r} as the proof source, while the result that "
+                f"proves it was published by {canonical_result.label!r}"
+            )
+        if generation != canonical_result.generation:
+            raise DrainEvidenceContradiction(
+                f"{row.get('effect_cgroup_path')!r} names publication generation {generation!r} "
+                f"while the result that proves it is generation {canonical_result.generation!r}"
+            )
+    if state == DRAIN_STATE_DISCHARGED_BY_PUBLISHED_RESULT:
+        identity = row.get("resource_identity")
+        if row["resource_outstanding"]:
+            raise DrainEvidenceContradiction(
+                f"{row.get('effect_cgroup_path')!r} was reported discharged by the published "
+                f"result of {source!r} while its own resource is still outstanding"
+            )
+        if canonical_result is None or not canonical_result.published:
+            raise DrainEvidenceContradiction(
+                f"{row.get('effect_cgroup_path')!r} was reported discharged by a published result "
+                "that does not exist or was never published"
+            )
+        if identity is None or not canonical_result.proves_discharge_of(identity):
+            raise DrainEvidenceContradiction(
+                f"{row.get('effect_cgroup_path')!r} was reported discharged by the published "
+                f"result of {canonical_result.resource_identity!r}, which does not prove the "
+                f"discharge of {identity!r} (state {canonical_result.state!r}, outstanding "
+                f"{canonical_result.resource_outstanding!r})"
+            )
+        if not source or generation is None:
+            raise DrainEvidenceContradiction(
+                f"{row.get('effect_cgroup_path')!r} was reported discharged by a published result "
+                f"without naming it: source {source!r}, generation {generation!r}"
+            )
+        if source != canonical_result.label or generation != canonical_result.generation:
+            raise DrainEvidenceContradiction(
+                f"{row.get('effect_cgroup_path')!r} names {source!r} generation {generation!r} as "
+                f"its proof source while the result read was {canonical_result.label!r} "
+                f"generation {canonical_result.generation!r}"
+            )
+        if origin != DISCHARGE_PROOF_ORIGIN_OTHER_DRAIN_PUBLISHED_RESULT:
+            raise DrainEvidenceContradiction(
+                f"{row.get('effect_cgroup_path')!r} was discharged by a published result with "
+                f"proof origin {origin!r}"
+            )
+    if state == DRAIN_STATE_DISCHARGED_BY_OWN_OBSERVATION:
+        if row["resource_outstanding"]:
+            raise DrainEvidenceContradiction(
+                f"{row.get('effect_cgroup_path')!r} claims its own observation proves a discharge "
+                "while that same observation reports the resource outstanding"
+            )
+        if origin != DISCHARGE_PROOF_ORIGIN_OWN_POSITIVE_OBSERVATION:
+            raise DrainEvidenceContradiction(
+                f"{row.get('effect_cgroup_path')!r} claims an own observation with proof origin "
+                f"{origin!r}"
+            )
+        if source is None or source != row.get("label"):
+            raise DrainEvidenceContradiction(
+                f"{row.get('effect_cgroup_path')!r} attributes its own observation to {source!r} "
+                f"rather than to itself, {row.get('label')!r}"
+            )
+        if generation is not None:
+            raise DrainEvidenceContradiction(
+                f"{row.get('effect_cgroup_path')!r} claims an own observation carrying publication "
+                f"generation {generation!r}; an observation is not a publication"
+            )
+    if state == DRAIN_STATE_RESOURCE_DISCHARGED:
+        if row["resource_outstanding"]:  # pragma: no cover - defensive
+            raise DrainEvidenceContradiction(
+                f"{row.get('effect_cgroup_path')!r} was reported already discharged while its "
+                "resource is still outstanding"
+            )
+        if origin != DISCHARGE_PROOF_ORIGIN_OWN_POSITIVE_OBSERVATION:
+            raise DrainEvidenceContradiction(
+                f"{row.get('effect_cgroup_path')!r} was reported already discharged with proof "
+                f"origin {origin!r}"
+            )
     if state == DRAIN_STATE_RETAINED_PENDING_CANONICAL:
         if row["alias_of"] is None:  # pragma: no cover - defensive
             raise DrainEvidenceContradiction(
@@ -995,6 +1229,24 @@ def _guard_drain_row(
             raise DrainEvidenceContradiction(
                 "an alias waiting on its canonical obligation spent a second settlement grant"
             )
+        if origin != DISCHARGE_PROOF_ORIGIN_NONE or source is not None or generation is not None:
+            raise DrainEvidenceContradiction(
+                f"a retained alias named a discharge proof: origin {origin!r}, source {source!r}, "
+                f"generation {generation!r}"
+            )
+    if origin not in DISCHARGE_PROOF_ORIGINS:
+        raise DrainEvidenceContradiction(f"unknown discharge proof origin {origin!r}")
+    if state in DRAIN_STATES_POSITIVE_DISCHARGE:
+        if origin == DISCHARGE_PROOF_ORIGIN_NONE or not source:
+            raise DrainEvidenceContradiction(
+                f"{row.get('effect_cgroup_path')!r} asserts {state!r} while naming no authority "
+                f"that proves it: origin {origin!r}, source {source!r}"
+            )
+    if "unattempted_reason" in row and row["unattempted_reason"] != _DRAIN_STATE_REASONS[state]:
+        raise DrainEvidenceContradiction(
+            f"{row.get('effect_cgroup_path')!r} reports {state!r} with the reason "
+            f"{row['unattempted_reason']!r}, which describes a different authority"
+        )
     return row
 
 
@@ -1613,9 +1865,11 @@ class _IncompleteCleanupRegistry:
         *,
         budget: CleanupBudget,
         token: int,
+        label: str | None = None,
         alias_of: str | None = None,
         canonical_result: _CanonicalResult | None = None,
         resource_identity: str | None = None,
+        proof_origin: str = DISCHARGE_PROOF_ORIGIN_NONE,
     ) -> dict[str, Any] | None:
         """Settle one claimed entry out of the caller's shared budget.
 
@@ -1635,11 +1889,19 @@ class _IncompleteCleanupRegistry:
         M2-B59.  ``canonical_result`` is the published outcome of the canonical
         obligation for ``resource_identity``.  It is what an alias row is
         classified from; the alias relationship on its own discharges nothing.
+
+        M2-B63.  ``label`` is this obligation's own name and ``proof_origin`` says
+        where ``canonical_result`` came from, so the row can name the authority
+        that actually proves a discharge rather than the group's canonical.
         """
 
         with self._lock:
             if not self._claim_locked(entry, token):
                 return None
+        # The one process-wide obligation name.  A registry drain reached
+        # directly names its own entries the same way the whole-process drain
+        # does, so a row means the same thing whichever entry point produced it.
+        label = label if label is not None else f"REGISTERED:{entry.sequence}"
         stage = f"drain:{entry.entry_id}"
         try:
             granted, granted_ms, attempted = _grant_or_observe(budget, stage, alias_of=alias_of)
@@ -1653,17 +1915,20 @@ class _IncompleteCleanupRegistry:
                 entry.claimed_by = None
         with self._lock:
             still_registered = self._entries.get(entry.entry_id) is entry
-        state, reason = _classify_drain_row(
+        state, reason, proof = _classify_drain_row(
             attempted=attempted,
             cleanup=cleanup,
             alias_of=alias_of,
             canonical_result=canonical_result,
             resource_identity=resource_identity,
+            label=label,
+            proof_origin=proof_origin,
         )
         return _guard_drain_row(
             {
                 "entry_id": entry.entry_id,
                 "collection": "REGISTERED",
+                "label": label,
                 "sequence": entry.sequence,
                 "kind": entry.kind,
                 "helper_pid": entry.helper_pid,
@@ -1672,6 +1937,7 @@ class _IncompleteCleanupRegistry:
                 "state": state,
                 "unattempted_reason": reason,
                 "alias_of": alias_of,
+                **proof,
                 "canonical_result": None if canonical_result is None else canonical_result.to_dict(),
                 "resource_outstanding": _resource_outstanding(cleanup),
                 "outstanding_work": cleanup.get("outstanding_work"),
@@ -1831,9 +2097,11 @@ def _drain_unregistered_obligation(
     *,
     budget: CleanupBudget,
     sequence: int,
+    label: str | None = None,
     alias_of: str | None = None,
     canonical_result: _CanonicalResult | None = None,
     resource_identity: str | None = None,
+    proof_origin: str = DISCHARGE_PROOF_ORIGIN_NONE,
 ) -> dict[str, Any]:
     """Settle one registrar-refused obligation out of the shared budget.
 
@@ -1846,23 +2114,27 @@ def _drain_unregistered_obligation(
     """
 
     stage = f"drain:unregistered:{sequence}"
+    label = label if label is not None else f"UNREGISTERED:{sequence}"
     granted, granted_ms, attempted = _grant_or_observe(budget, stage, alias_of=alias_of)
     settlement: dict[str, Any] | None = None
     if attempted:
         settlement = handle.settle_cleanup(deadline=granted)
     cleanup = handle.cleanup_evidence()
     budget.note(stage, completed=bool(cleanup.get("cleanup_complete")))
-    state, reason = _classify_drain_row(
+    state, reason, proof = _classify_drain_row(
         attempted=attempted,
         cleanup=cleanup,
         alias_of=alias_of,
         canonical_result=canonical_result,
         resource_identity=resource_identity,
+        label=label,
+        proof_origin=proof_origin,
     )
     return _guard_drain_row(
         {
             "entry_id": None,
             "collection": "UNREGISTERED",
+            "label": label,
             "sequence": sequence,
             "kind": _CLEANUP_KINDS.get(type(handle).__name__, CLEANUP_KIND_HELPER),
             "helper_pid": int(cleanup.get("helper_pid") or 0),
@@ -1871,6 +2143,7 @@ def _drain_unregistered_obligation(
             "state": state,
             "unattempted_reason": reason,
             "alias_of": alias_of,
+            **proof,
             "canonical_result": None if canonical_result is None else canonical_result.to_dict(),
             "resource_outstanding": _resource_outstanding(cleanup),
             "outstanding_work": cleanup.get("outstanding_work"),
@@ -1979,26 +2252,32 @@ def _drain_within(budget: CleanupBudget, *, publish: bool) -> list[dict[str, Any
         obligation: Any,
         sequence: int,
         *,
+        label: str,
         alias_of: str | None,
         canonical_result: _CanonicalResult | None,
         identity: str | None,
+        proof_origin: str = DISCHARGE_PROOF_ORIGIN_NONE,
     ) -> dict[str, Any] | None:
         if collection == "REGISTERED":
             return _CLEANUP_REGISTRY.drain_entry(
                 obligation,
                 budget=budget,
                 token=token,
+                label=label,
                 alias_of=alias_of,
                 canonical_result=canonical_result,
                 resource_identity=identity,
+                proof_origin=proof_origin,
             )
         return _drain_unregistered_obligation(
             obligation,
             budget=budget,
             sequence=sequence,
+            label=label,
             alias_of=alias_of,
             canonical_result=canonical_result,
             resource_identity=identity,
+            proof_origin=proof_origin,
         )
 
     for sequence, collection, obligation in work:
@@ -2006,6 +2285,7 @@ def _drain_within(budget: CleanupBudget, *, publish: bool) -> list[dict[str, Any
         alias_of: str | None = None
         label = f"{collection}:{sequence}"
         result: _CanonicalResult | None = None
+        proof_origin = DISCHARGE_PROOF_ORIGIN_NONE
         if identity is not None:
             handle = obligation.handle if collection == "REGISTERED" else obligation
             if id(handle) in seen_objects:
@@ -2027,18 +2307,27 @@ def _drain_within(budget: CleanupBudget, *, publish: bool) -> list[dict[str, Any
                 # drain published for the exact same resource identity is the
                 # only other thing that may discharge it, and a resource with no
                 # published result at all discharges nothing.
+                #
+                # M2-B63.  Which of those two it was is recorded here, where it is
+                # known, and carried into the row: the group's canonical
+                # obligation and the obligation whose result proves the discharge
+                # are separate facts and are separately named.
                 result = canonical_results.get(identity)
+                proof_origin = DISCHARGE_PROOF_ORIGIN_CURRENT_DRAIN_CANONICAL
                 if result is None or not result.published:
                     published = _published_canonical_result(identity)
                     if published is not None:
                         result = published
-                    elif result is None:
-                        result = _CanonicalResult(
-                            resource_identity=identity,
-                            label=alias_of,
-                            generation=_next_canonical_generation(),
-                        )
-                        result.unresolved(CANONICAL_UNPUBLISHED_NOT_REACHED)
+                        proof_origin = DISCHARGE_PROOF_ORIGIN_OTHER_DRAIN_PUBLISHED_RESULT
+                    else:
+                        proof_origin = DISCHARGE_PROOF_ORIGIN_NONE
+                        if result is None:
+                            result = _CanonicalResult(
+                                resource_identity=identity,
+                                label=alias_of,
+                                generation=_next_canonical_generation(),
+                            )
+                            result.unresolved(CANONICAL_UNPUBLISHED_NOT_REACHED)
         if alias_of is None and result is not None:
             # The canonical obligation for this exact resource.  It is executed
             # first, and its result is published before any alias of it is
@@ -2048,6 +2337,7 @@ def _drain_within(budget: CleanupBudget, *, publish: bool) -> list[dict[str, Any
                     collection,
                     obligation,
                     sequence,
+                    label=label,
                     alias_of=None,
                     canonical_result=None,
                     identity=identity,
@@ -2067,13 +2357,14 @@ def _drain_within(budget: CleanupBudget, *, publish: bool) -> list[dict[str, Any
                 collection,
                 obligation,
                 sequence,
+                label=label,
                 alias_of=alias_of,
                 canonical_result=result,
                 identity=identity,
+                proof_origin=proof_origin,
             )
             if row is None:
                 continue
-        row["label"] = label
         row["canonical_for_resource"] = alias_of is None and identity is not None
         results.append(row)
     if publish:
@@ -2097,6 +2388,21 @@ def _drain_within(budget: CleanupBudget, *, publish: bool) -> list[dict[str, Any
         ledger["aliases_discharged_by_a_canonical_obligation"] = sum(
             1 for row in results if row["state"] == DRAIN_STATE_DISCHARGED_BY_CANONICAL
         )
+        # M2-B63.  An alias discharged by *this* drain's canonical obligation and
+        # an alias discharged by a result published elsewhere are two different
+        # counts over two different authorities, and reporting the second under
+        # the first is the misattribution this closure removes.
+        ledger["aliases_discharged_by_a_published_result"] = sum(
+            1 for row in results if row["state"] == DRAIN_STATE_DISCHARGED_BY_PUBLISHED_RESULT
+        )
+        ledger["aliases_discharged_by_their_own_observation"] = sum(
+            1 for row in results if row["state"] == DRAIN_STATE_DISCHARGED_BY_OWN_OBSERVATION
+        )
+        ledger["discharge_proof_origins"] = {
+            origin: sum(1 for row in results if row["discharge_proof_origin"] == origin)
+            for origin in DISCHARGE_PROOF_ORIGINS
+            if any(row["discharge_proof_origin"] == origin for row in results)
+        }
         ledger["aliases_retained_pending_canonical"] = sum(
             1 for row in results if row["state"] == DRAIN_STATE_RETAINED_PENDING_CANONICAL
         )
@@ -2114,6 +2420,10 @@ def _drain_within(budget: CleanupBudget, *, publish: bool) -> list[dict[str, Any
                 "state": row["state"],
                 "resource_outstanding": row["resource_outstanding"],
                 "alias_of": row["alias_of"],
+                "group_canonical_label": row["group_canonical_label"],
+                "discharge_proof_source_label": row["discharge_proof_source_label"],
+                "discharge_proof_generation": row["discharge_proof_generation"],
+                "discharge_proof_origin": row["discharge_proof_origin"],
                 "canonical_proved_discharge": bool(
                     (row.get("canonical_result") or {}).get("proves_discharge")
                 ),
@@ -5025,10 +5335,18 @@ __all__ = [
     "CANONICAL_UNPUBLISHED_NOT_REACHED",
     "CANONICAL_UNPUBLISHED_THREW",
     "CleanupReservationRefused",
+    "DISCHARGE_PROOF_ORIGINS",
+    "DISCHARGE_PROOF_ORIGIN_CURRENT_DRAIN_CANONICAL",
+    "DISCHARGE_PROOF_ORIGIN_NONE",
+    "DISCHARGE_PROOF_ORIGIN_OTHER_DRAIN_PUBLISHED_RESULT",
+    "DISCHARGE_PROOF_ORIGIN_OWN_POSITIVE_OBSERVATION",
     "DRAIN_STATES",
+    "DRAIN_STATES_POSITIVE_DISCHARGE",
     "DRAIN_STATES_PROVING_DISCHARGE",
     "DRAIN_STATE_ATTEMPTED",
     "DRAIN_STATE_DISCHARGED_BY_CANONICAL",
+    "DRAIN_STATE_DISCHARGED_BY_OWN_OBSERVATION",
+    "DRAIN_STATE_DISCHARGED_BY_PUBLISHED_RESULT",
     "DRAIN_STATE_RESOURCE_DISCHARGED",
     "DRAIN_STATE_RETAINED_PENDING_CANONICAL",
     "DRAIN_STATE_RETAINED_UNATTEMPTED",
@@ -5036,6 +5354,7 @@ __all__ = [
     "DRAIN_UNATTEMPTED_ALIAS",
     "DRAIN_UNATTEMPTED_BUDGET_EXHAUSTED",
     "DRAIN_UNATTEMPTED_CANONICAL_UNRESOLVED",
+    "DRAIN_UNATTEMPTED_PUBLISHED_RESULT",
     "DRAIN_UNATTEMPTED_RESOURCE_DISCHARGED",
     "DrainEvidenceContradiction",
     "RESERVATION_CONSUMED",

@@ -1453,9 +1453,13 @@ class ValidationArtifactCoherenceTests(unittest.TestCase):
                 "m2_exact_removal_global_drain_reservation_provenance_closure_module"
             ),
             # M2-B59 added the alias-truth / combined-capacity / artifact-
-            # coherence / mutation-TCB closure module to this milestone.
+            # coherence / mutation-TCB closure module to this milestone, and
+            # M2-B63 the final alias-proof / exact-commit transcript module.
             "tests.test_admissible_paired_runner_m2_alias_capacity_artifact_tcb_closure": (
                 "m2_alias_capacity_artifact_tcb_closure_module"
+            ),
+            "tests.test_admissible_paired_runner_m2_final_alias_proof_transcript_closure": (
+                "m2_final_alias_proof_transcript_closure_module"
             ),
         }
         for module, field in modules.items():

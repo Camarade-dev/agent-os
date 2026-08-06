@@ -633,7 +633,17 @@ class CanonicalResultAliasDischargeTests(unittest.TestCase):
         rows = self.drain()
         self.assertEqual(len(rows), 1, rows)
         alias = rows[0]
-        self.assertEqual(alias["state"], pw.DRAIN_STATE_DISCHARGED_BY_CANONICAL)
+        # M2-B63.  The resource really is discharged, but not by the canonical
+        # obligation this drain selected, so the row names the published result
+        # that proves it rather than crediting the group's canonical.
+        self.assertEqual(alias["state"], pw.DRAIN_STATE_DISCHARGED_BY_PUBLISHED_RESULT)
+        self.assertEqual(
+            alias["discharge_proof_origin"],
+            pw.DISCHARGE_PROOF_ORIGIN_OTHER_DRAIN_PUBLISHED_RESULT,
+        )
+        self.assertEqual(alias["discharge_proof_source_label"], published.label)
+        self.assertEqual(alias["discharge_proof_generation"], published.generation)
+        self.assertNotEqual(alias["discharge_proof_source_label"], alias["group_canonical_label"])
         self.assertEqual(alias["canonical_result"]["resource_identity"], "12:34")
         self.assertTrue(alias["canonical_result"]["proves_discharge"])
         self.assertEqual(alias["granted_ms"], 0)
@@ -763,7 +773,14 @@ class DrainRowGuardTests(unittest.TestCase):
             "state": pw.DRAIN_STATE_DISCHARGED_BY_CANONICAL,
             "attempted": False,
             "granted_ms": 0,
+            "label": "UNREGISTERED:2",
             "alias_of": "UNREGISTERED:1",
+            # M2-B63: the group's canonical obligation, the obligation whose
+            # result proves the discharge, and which publication of it was read.
+            "group_canonical_label": "UNREGISTERED:1",
+            "discharge_proof_source_label": "UNREGISTERED:1",
+            "discharge_proof_generation": 1,
+            "discharge_proof_origin": pw.DISCHARGE_PROOF_ORIGIN_CURRENT_DRAIN_CANONICAL,
             "resource_outstanding": False,
             "resource_identity": "1:2",
             "effect_cgroup_path": "/fixture/alias",
@@ -1572,7 +1589,11 @@ class ClosureArtifactCoherenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.closure = _load(CLOSURE_REPORT)
-        cls.validation = _load(VALIDATION_REPORT)
+        # These assertions are about *this* closure, so they follow the report
+        # that accompanied it rather than whatever is current later; anchoring to
+        # the live report would make this class assert another pass's claims.
+        cls.validation = _accompanying_validation_report(CLOSURE_KEY)
+        cls.live = _load(VALIDATION_REPORT)
         cls.matrix = _load(REQUIREMENT_MATRIX)
         cls.current_run = cls.validation["canonical_current_run"]
         cls.delegated_run = cls.current_run["delegated_physical"]
@@ -1615,7 +1636,9 @@ class ClosureArtifactCoherenceTests(unittest.TestCase):
         self.assertEqual(self.closure["milestone_3_status"], "NOT_PERMITTED_AND_NOT_STARTED")
 
     def test_exactly_one_validation_state_declares_itself_current(self) -> None:
-        self.assertTrue(self.validation["is_current_validation_report"])
+        """Whether or not that is still this closure's."""
+
+        self.assertTrue(self.live["is_current_validation_report"])
         current = [
             path
             for path in IMPLEMENTATION.glob("M2_VALIDATION_REPORT*.json")
@@ -1624,6 +1647,15 @@ class ClosureArtifactCoherenceTests(unittest.TestCase):
         self.assertEqual([path.name for path in current], ["M2_VALIDATION_REPORT.json"])
         self.assertEqual(self.validation["current_closure_key"], CLOSURE_KEY)
         self.assertIn(CLOSURE_KEY, self.validation)
+        if self.live != self.validation:
+            # A later pass moved it, and must record this closure as superseded
+            # rather than simply forgetting it.
+            self.assertIn(
+                "implementation/M2_ALIAS_CAPACITY_ARTIFACT_TCB_CLOSURE_REPORT.json",
+                self.live["superseded_closure_reports"],
+                "the later current report does not record this closure as superseded",
+            )
+            self.assertNotEqual(self.live["current_closure_key"], CLOSURE_KEY)
 
     def test_the_two_current_reports_carry_one_canonical_run(self) -> None:
         self.assertEqual(self.closure["canonical_current_run"], self.current_run)
@@ -1953,11 +1985,21 @@ class DelegatedAliasCapacityArtifactTcbTests(unittest.TestCase):
             self.skipTest("ADMISSIBLE_REQUIRE_DELEGATED_CGROUP is not set")
 
     def test_the_branch_and_revision_are_the_ones_under_qualification(self) -> None:
-        self.assertEqual(_git("branch", "--show-current"), BRANCH)
+        branch = _git("branch", "--show-current")
+        # This module is qualified on its own bounded branch, and is re-run as a
+        # regression by each later bounded closure on that closure's branch.
+        self.assertTrue(
+            branch.startswith("paired-runner/m2-"),
+            f"this module is qualified only on a bounded Milestone 2 closure branch: {branch!r}",
+        )
         self.assertEqual(_git("merge-base", STARTING_COMMIT, "HEAD"), STARTING_COMMIT)
-        ahead = int(_git("rev-list", "--count", f"{STARTING_COMMIT}..HEAD"))
-        self.assertLessEqual(ahead, 1, "more than one commit was created by this pass")
         self.assertEqual(_git("rev-parse", f"{STARTING_COMMIT}^"), STARTING_COMMIT_PARENT)
+        ahead = int(_git("rev-list", "--count", f"{STARTING_COMMIT}..HEAD"))
+        self.assertLessEqual(
+            ahead,
+            1 if branch == BRANCH else 2,
+            "more than one commit stands on top of this closure's starting point",
+        )
 
     @delegated
     def test_a_real_unresolved_canonical_never_discharges_its_alias(self) -> None:
