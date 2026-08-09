@@ -2,12 +2,18 @@
 
 **Status:** `CURRENT_CANONICAL_REPOSITORY_ENTRY_POINT`  
 **Research program:** `STOPPED_FOR_CURRENT_PROGRAM_PURPOSES`  
-**Industrial/system program:** `OPEN_AND_SEPARATE_FROM_RESEARCH_NOVELTY`
+**Admissible architecture/build program:** `PARKED_NO_ACTIVE_BUILD`  
+**M2 necessity hypothesis:** `CLOSED_NOT_ESTABLISHED`  
+**Originating high-assurance workflow problem:** `OPEN_AS_ENGINEERING_PROBLEM`
 
 This document is the repository entry point for the current Admissible thesis,
-research status, and document hierarchy. It does not rewrite historical
-artefacts. Where a registered object was adopted or externally accepted, that
-object remains the authority for the historical decision.
+research status, architecture/build disposition, and document hierarchy. It does
+not rewrite historical artefacts. Where a registered object was adopted or
+externally accepted, that object remains the authority for the historical
+decision.
+
+The latest owner-accepted architecture disposition is recorded in
+[`ADMISSIBLE_DIFFERENTIAL_ASSURANCE_DELTA_CLOSURE_V0.md`](ADMISSIBLE_DIFFERENTIAL_ASSURANCE_DELTA_CLOSURE_V0.md).
 
 ## 1. Current system framing
 
@@ -19,9 +25,11 @@ and:
 
 > **The model decides what could be done. Admissible decides what may be done.**
 
-These are **not research-novelty claims**.
+These are **not research-novelty claims** and do not, after the differential
+assurance closure, establish that a distinct large Admissible architecture is
+necessary.
 
-The post-NQI architectural boundary is:
+The post-NQI architectural boundary remains:
 
 ```text
 model / planner
@@ -30,11 +38,11 @@ model / planner
 → checks authority/evidence/policy and the effect contract it has been given
 → authorizes, refuses, or asks for evidence/authority
 → effect boundary
-→ owns the physical commit semantics it is actually capable of owning
+→ owns the physical/external commit semantics it is actually capable of owning
 → returns grounded effect evidence/status when available
 ```
 
-Admissible governance must not be described as creating authoritative physical
+Admissible governance must not be described as creating authoritative external
 commit truth merely by keeping more history or moving settlement state into the
 orchestration layer.
 
@@ -73,23 +81,24 @@ The adopted disposition:
 ## 3. What NQI changed
 
 The accepted NQI01–NQI05 chain did not establish an Admissible-specific
-continuity primitive. It progressively localized the surviving hard
-settlement property to the physical effect boundary.
+continuity primitive. It progressively localized the surviving hard settlement
+property to the effect boundary actually capable of establishing the effect.
 
 The canonical repository-facing synthesis is
 [`research/ADMISSIBLE_POST_NQI05_SYNTHESIS.md`](research/ADMISSIBLE_POST_NQI05_SYNTHESIS.md).
 
-Residual M2 continuity/effect machinery remains:
+Residual M2 continuity/effect machinery remains historically classified as:
 
 `CONDITIONAL_CANDIDATE_EXPERIMENTAL_APPARATUS`
 
-M2 may be useful where a selected experiment genuinely requires physically
-justified scored→executed/effect identity. Sunk cost, implementation depth, or
-engineering difficulty are not evidence that M2 is a necessary research or
-security primitive.
+M2 may be useful where a chosen system architecture genuinely requires its
+process-lifecycle, containment, cleanup, or forensic machinery. Sunk cost,
+implementation depth, or engineering difficulty are not evidence that M2 is a
+necessary research, security, or global-assurance primitive.
 
 The M2 implementation/qualification branch remains separate from `master`.
-This documentation closure does not merge, cherry-pick, or promote that branch.
+Nothing in the current documentation closure merges, cherry-picks, or promotes
+that branch.
 
 ## 4. Final research status
 
@@ -109,27 +118,71 @@ non-distinctness was established.
 The exact research closure is summarized in
 [`research/ADMISSIBLE_RESEARCH_CLOSURE.md`](research/ADMISSIBLE_RESEARCH_CLOSURE.md).
 
-Current owner disposition for this repository closure:
+Current research disposition:
 
 - the dedicated novelty research phase is stopped for current program purposes;
-- no SV-01 rerun, substitute benchmark, M3 selection, long-running workload
-  selection, or new novelty question is part of this work;
-- a future research program would require a separate owner decision and a fresh
-  evidence/protocol chain rather than inheriting SV-01 eligibility.
+- there is no active Admissible research question;
+- no SV-01 rerun, substitute benchmark, or new novelty campaign is authorized;
+- any future research effort requires a separate owner decision and a fresh
+  evidence/protocol chain.
 
-## 5. Industrial/system status
+## 5. Differential assurance / architecture disposition
+
+After research closure, a bounded differential assurance audit tested whether
+the originating high-assurance workflow problem still required a distinct large
+Admissible/M2 architecture.
+
+The first audit rejected a broad `GO` and retained only a narrow provisional
+`PIVOT` around candidate → execution → evidence → audit → publication identity.
+
+A stronger delta kill-test then compared that residual against a composed
+no-M2 architecture using contemporary state-bound evidence, canonical action
+identity, durable signed workflow lineage, disposable capability-separated
+execution, independent verification, and authoritative expected-state remote
+publication.
+
+The owner-accepted terminal disposition is:
+
+`PARK — HIGH`
+
+with:
+
+```text
+ADMISSIBLE_REQUIRED_NEW_ASSURANCE_ARCHITECTURE = PARKED
+M2_NECESSITY_HYPOTHESIS = CLOSED_NOT_ESTABLISHED
+M2_IMPLEMENTATION_REPLACEMENT_TEST = WITHDRAWN
+ACTIVE_M3 = NONE
+ACTIVE_ADMISSIBLE_BUILD = NONE
+```
+
+The closure does **not** claim that a turnkey high-assurance autonomous workflow
+system already exists. It establishes only that current evidence does not
+justify further major investment in Admissible/M2 as the required new
+architecture for that problem.
+
+The exact repository-facing disposition is
+[`ADMISSIBLE_DIFFERENTIAL_ASSURANCE_DELTA_CLOSURE_V0.md`](ADMISSIBLE_DIFFERENTIAL_ASSURANCE_DELTA_CLOSURE_V0.md).
+
+## 6. Originating industrial/system problem
 
 `INDUSTRIAL_SYSTEM_VALUE != RESEARCH_NOVELTY`
 
-The industrial/system direction remains open and unrefuted by the research
-program. A long-running system may still be valuable if proposal, authority,
-effect, evidence, continuation, repair, and owner-intervention semantics remain
-coherent under real complexity.
+and now also:
 
-This does **not** establish production readiness, deployment fitness, or
-benchmark superiority.
+`ORIGINATING_PROBLEM_VALUE != ADMISSIBLE_ARCHITECTURE_NECESSITY`
 
-## 6. Publicly demonstrated surface
+The originating problem remains open as an engineering problem: long-running,
+complex agentic workflows may still need explicit separation between work,
+claims, evidence, authority, acceptance, recovery, and authoritative progress.
+
+The current decision is not to continue building a large Admissible architecture
+without new evidence that existing composed mechanisms fail on a material fault
+class that Admissible uniquely or necessarily closes.
+
+This does **not** establish production readiness, deployment fitness, benchmark
+superiority, or that the general problem is solved.
+
+## 7. Publicly demonstrated surface
 
 The bounded public demonstration is
 [`public/ADMISSIBLE_PUBLIC_CANONICAL_DEMO_V0.1.md`](public/ADMISSIBLE_PUBLIC_CANONICAL_DEMO_V0.1.md).
@@ -150,20 +203,24 @@ completion message is not automatically the authoritative result; a documented
 incident replay includes a refusal and separately evaluated correction; and a
 separate historical live run records persisted effect evidence.
 
-It does not silently inherit the private research packet.
+It does not silently inherit the private research packet or the later
+architecture-necessity closure.
 
-## 7. Document hierarchy
+## 8. Document hierarchy
 
 ### Current
 
-1. **This file** — current canonical thesis/program/status entry point.
-2. [`research/ADMISSIBLE_POST_LITERATURE_THESIS_V0.6.md`](research/ADMISSIBLE_POST_LITERATURE_THESIS_V0.6.md)
+1. **This file** — current canonical thesis/program/build-status entry point.
+2. [`ADMISSIBLE_DIFFERENTIAL_ASSURANCE_DELTA_CLOSURE_V0.md`](ADMISSIBLE_DIFFERENTIAL_ASSURANCE_DELTA_CLOSURE_V0.md)
+   — owner-accepted `PARK` disposition for Admissible/M2 as a required new
+   assurance architecture.
+3. [`research/ADMISSIBLE_POST_LITERATURE_THESIS_V0.6.md`](research/ADMISSIBLE_POST_LITERATURE_THESIS_V0.6.md)
    — byte-identical operative V0.6 object later adopted by the owner.
-3. [`research/ADMISSIBLE_POST_NQI05_SYNTHESIS.md`](research/ADMISSIBLE_POST_NQI05_SYNTHESIS.md)
+4. [`research/ADMISSIBLE_POST_NQI05_SYNTHESIS.md`](research/ADMISSIBLE_POST_NQI05_SYNTHESIS.md)
    — accepted NQI implications and effect-boundary/M2 allocation.
-4. [`research/ADMISSIBLE_RESEARCH_CLOSURE.md`](research/ADMISSIBLE_RESEARCH_CLOSURE.md)
+5. [`research/ADMISSIBLE_RESEARCH_CLOSURE.md`](research/ADMISSIBLE_RESEARCH_CLOSURE.md)
    — final SV-01 and dedicated-research status.
-5. [`public/ADMISSIBLE_PUBLIC_CANONICAL_DEMO_V0.1.md`](public/ADMISSIBLE_PUBLIC_CANONICAL_DEMO_V0.1.md)
+6. [`public/ADMISSIBLE_PUBLIC_CANONICAL_DEMO_V0.1.md`](public/ADMISSIBLE_PUBLIC_CANONICAL_DEMO_V0.1.md)
    — bounded public evidence-backed demo.
 
 ### Historical / superseded as current thesis
@@ -181,10 +238,10 @@ current research thesis or benchmark plan:
   Admissible thesis.
 
 Their bytes are intentionally preserved; their historical status is established
-by this current entry point and the repository history rather than by rewriting
-them retroactively.
+by this current entry point and repository history rather than by rewriting them
+retroactively.
 
-## 8. Hard non-claims
+## 9. Hard non-claims
 
 Current documentation does **not** claim:
 
@@ -196,8 +253,17 @@ Current documentation does **not** claim:
 - that the SV-01 benchmark was executed;
 - universal safety;
 - production readiness;
-- M2 necessity as a security or research primitive;
-- Admissible ownership of physical commit/settlement semantics;
+- M2 necessity as a security, research, or global-assurance primitive;
+- that M2 has no reusable component value;
+- that the originating high-assurance workflow problem is solved turnkey;
+- that the strongest no-M2 composition has integrated independent production
+  qualification;
+- Admissible ownership of physical/external commit or settlement semantics;
 - independent M2 acceptance or installed/clean-host qualification;
 - that the documented public replay is a matched live refusal-to-authorization
   pair.
+
+The current investment conclusion is narrower:
+
+> At the 2026-08-09 evidence cutoff, there is no established basis for further
+> major investment in Admissible/M2 as a required new assurance architecture.
