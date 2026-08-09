@@ -321,10 +321,28 @@ provenance inputs, not runtime authority merely because they are present.
 
 ## Further technical documentation
 
+### Current thesis, research status, and evidence boundary
+
+- [Current Admissible thesis and program status](docs/ADMISSIBLE_CURRENT_STATUS.md)
+- [Owner-adopted post-literature thesis V0.6 — byte-identical operative object](docs/research/ADMISSIBLE_POST_LITERATURE_THESIS_V0.6.md)
+- [Post-NQI05 architectural and program synthesis](docs/research/ADMISSIBLE_POST_NQI05_SYNTHESIS.md)
+- [Research closure and SV-01 final status](docs/research/ADMISSIBLE_RESEARCH_CLOSURE.md)
+- [Public canonical demo V0.1](docs/public/ADMISSIBLE_PUBLIC_CANONICAL_DEMO_V0.1.md)
+
+### Product and execution documentation
+
 - [Native executor and authority boundary](docs/admissible-native-executor-canary.md)
 - [Build Week read-only evidence replay](docs/admissible-build-week-demo.md)
-- [Admissible thesis](docs/Admissible_THESIS.md)
 - [Agent OS lineage boundary](docs/admissible-agent-os-lineage.md)
+
+### Historical thesis and benchmark provenance
+
+These files remain for provenance; they are **not the current Admissible research
+thesis or scientific benchmark plan**:
+
+- [Pre-literature Admissible V0.2 thesis draft](docs/Admissible_THESIS.md)
+- [Pre-literature Admissible benchmark draft](docs/Admissible_BENCHMARK_SPEC.md)
+- [Historical Agent OS thesis](docs/thesis.md)
 
 ## License
 
